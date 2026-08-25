@@ -6,13 +6,14 @@
 
 **Architecture:** The Go Agent embeds selected OpenTelemetry Collector component factories behind DBPilot-owned policy and engine interfaces; neither Vector nor a standalone Collector process is installed. DBPilot policy is validated and compiled into an in-memory receiver/processor/exporter pipeline, while a DBPilot segment spool provides bounded durable delivery and a custom gRPC exporter enforces mTLS identity. Typed command execution and production database adapters remain separate follow-up plans.
 
-**Tech Stack:** Go 1.24 language floor built with Go 1.27.0, gRPC, Protobuf, buf, OpenTelemetry Collector/Contrib v0.158.0 Go components, bbolt for small state, length-prefixed CRC-protected segment files for payloads, testify, Linux systemd packaging.
+**Tech Stack:** Go 1.25 language floor built with Go 1.27.0, gRPC, Protobuf, buf, OpenTelemetry Collector/Contrib v0.158.0 Go components, bbolt for small state, length-prefixed CRC-protected segment files for payloads, testify, Linux systemd packaging.
 
 **Spec:** `docs/superpowers/specs/2026-08-25-dbpilot-agent-platform-design.md` and `docs/superpowers/specs/2026-08-25-dbpilot-platform-integration-design.md`
 
 ## Global Constraints
 
 - `dbpilot-agent` is one process and one deployable binary; it must not install, start, expose, or require Vector or a standalone OpenTelemetry Collector.
+- Go modules declare `go 1.25`; Go 1.27.0 is the pinned build toolchain.
 - Server and Agent support Linux amd64 on CentOS 7+ and Kylin V10+; Agent also supports Linux arm64 for Kylin ARM environments.
 - Linux release builds use `CGO_ENABLED=0`; amd64 builds use `GOAMD64=v1`.
 - Agent accepts only signed, versioned DBPilot policy. It never accepts raw Vector, OTel Collector, executable, or shell configuration from Server.
