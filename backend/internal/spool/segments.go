@@ -321,6 +321,15 @@ func (s *Store) auditIOFailure(class DataClass, err error) error {
 	return err
 }
 
+func (s *Store) activeContainsAudit() bool {
+	for _, item := range s.entries[AuditLog] {
+		if item.file == s.activeFile {
+			return true
+		}
+	}
+	return false
+}
+
 // sealActive promotes the fsynced active segment only when it contains
 // records. The metadata is updated after the rename; recovery can rebuild it
 // if the process stops between those operations.
@@ -431,14 +440,59 @@ func atomicReplace(path string, contents []byte) error {
 		return err
 	}
 	if runtime.GOOS == "windows" {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Rename cannot replace an existing file on Windows. Keep the old,
+		// fsynced segment as a recovery backup until the new file is in place.
+		// Open restores a lone backup after an interrupted replacement.
+		backup := path + ".previous"
+		if _, err := os.Lstat(backup); err == nil {
+			return fmt.Errorf("stale segment replacement backup: %s", backup)
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		if err := os.Rename(path, backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Rename(tmpPath, path); err != nil {
+			return err
+		}
+		if err := syncDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+		if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDirectory(filepath.Dir(path))
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
 	return syncDirectory(filepath.Dir(path))
+}
+
+// restoreReplacementBackups completes or rolls back an interrupted Windows
+// replacement before the normal segment scanner sees any data. A backup is
+// removed only if the replacement destination exists; otherwise it is the
+// last durable copy and is restored.
+func restoreReplacementBackups(directory string) error {
+	backups, err := filepath.Glob(filepath.Join(directory, "*.previous"))
+	if err != nil {
+		return err
+	}
+	for _, backup := range backups {
+		target := strings.TrimSuffix(backup, ".previous")
+		if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+			if err := os.Rename(backup, target); err != nil {
+				return err
+			}
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := os.Remove(backup); err != nil {
+			return err
+		}
+	}
+	return syncDirectory(directory)
 }
 
 func (s *Store) usedBytes() int64 {

@@ -87,12 +87,23 @@ func (s *Store) Close() error {
 	if s.db == nil {
 		return nil
 	}
-	if err := s.sealActive(); err != nil {
-		return err
+	hadAuditActive := s.activeContainsAudit()
+	sealErr := s.sealActive()
+	if sealErr != nil && hadAuditActive {
+		s.findings[FindingAuditSpoolIOFailure] = struct{}{}
 	}
 	err := s.db.Close()
 	s.db = nil
-	return err
+	if err != nil && hadAuditActive {
+		s.findings[FindingAuditSpoolIOFailure] = struct{}{}
+	}
+	if sealErr != nil {
+		return sealErr
+	}
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Open validates and creates a private root, opens bbolt metadata, and scans
@@ -113,6 +124,9 @@ func Open(root string, limits Limits) (*Store, error) {
 		if err := ensurePrivateDirectory(directory); err != nil {
 			return nil, err
 		}
+	}
+	if err := restoreReplacementBackups(segments); err != nil {
+		return nil, fmt.Errorf("recover spool replacement: %w", err)
 	}
 	statePath := filepath.Join(root, "state.db")
 	if info, err := os.Lstat(statePath); err == nil && info.Mode()&os.ModeSymlink != 0 {

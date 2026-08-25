@@ -321,6 +321,60 @@ func TestPendingRejectsClosedStore(t *testing.T) {
 	}
 }
 
+func TestCloseAuditSealFailureRaisesHealthFinding(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := spool.Open(root, spool.Limits{MaxBytes: 4096, SegmentBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.AuditLog, batch("audit-close", 20, 1)); err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Join(root, "segments", "active.open")
+	if err := os.Rename(active, filepath.Join(root, "moved-active")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err == nil {
+		t.Fatal("Close() error = nil")
+	}
+	if !contains(store.HealthFindings(), spool.FindingAuditSpoolIOFailure) {
+		t.Fatalf("findings = %v", store.HealthFindings())
+	}
+}
+
+func TestOpenRestoresReplacementBackupAfterInterruptedCompaction(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	limits := spool.Limits{MaxBytes: 4096, SegmentBytes: 100}
+	store, err := spool.Open(root, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.Log, batch("persist", 20, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := filepath.Glob(filepath.Join(root, "segments", "*.seg"))
+	if err != nil || len(segments) != 1 {
+		t.Fatalf("sealed segments = %v, %v", segments, err)
+	}
+	if err := os.Rename(segments[0], segments[0]+".previous"); err != nil {
+		t.Fatal(err)
+	}
+	store, err = spool.Open(root, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	pending, err := store.Pending(ctx, spool.Log, 10)
+	if err != nil || len(pending) != 1 || pending[0].ID != "persist" {
+		t.Fatalf("recovered pending = %#v, %v", pending, err)
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
