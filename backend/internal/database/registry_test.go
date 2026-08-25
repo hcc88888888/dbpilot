@@ -78,6 +78,36 @@ func TestRegistryOpenRejectsInvalidInstanceConfig(t *testing.T) {
 				config.QueryTimeout = 61 * time.Second
 			},
 		},
+		{
+			name: "TLS CA is not a secret reference",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CASecretRef = "ca.pem"
+			},
+		},
+		{
+			name: "TLS certificate is not a secret reference",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CertificateSecretRef = "-----BEGIN CERTIFICATE-----"
+			},
+		},
+		{
+			name: "TLS key is not a secret reference",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.KeySecretRef = "-----BEGIN PRIVATE KEY-----"
+			},
+		},
+		{
+			name: "TLS certificate has no key",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CertificateSecretRef = "secret://runtime/client-cert"
+			},
+		},
+		{
+			name: "TLS key has no certificate",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.KeySecretRef = "secret://runtime/client-key"
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -89,6 +119,44 @@ func TestRegistryOpenRejectsInvalidInstanceConfig(t *testing.T) {
 				t.Fatal("Open() error = nil, want invalid-config rejection")
 			}
 		})
+	}
+}
+
+func TestRegistryOpenAcceptsPairedTLSSecretReferences(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(MySQLFamily, &fakeFactory{}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	config := validInstanceConfig()
+	config.TLS = TLSConfig{
+		CASecretRef:          "secret://runtime/ca",
+		CertificateSecretRef: "secret://runtime/client-cert",
+		KeySecretRef:         "secret://runtime/client-key",
+	}
+
+	if _, err := registry.Open(context.Background(), config); err != nil {
+		t.Fatalf("Open() error = %v, want paired TLS secret references accepted", err)
+	}
+}
+
+func TestRegistryRejectsTypedNilFactory(t *testing.T) {
+	registry := NewRegistry()
+	var factory nilFactoryFunc
+
+	if err := registry.Register(MySQLFamily, factory); err == nil {
+		t.Fatal("Register() error = nil, want typed-nil factory rejection")
+	}
+}
+
+func TestRegistryOpenRejectsTypedNilAdapter(t *testing.T) {
+	registry := NewRegistry()
+	var adapter nilAdapterFunc
+	if err := registry.Register(MySQLFamily, &fakeFactory{adapter: adapter}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if _, err := registry.Open(context.Background(), validInstanceConfig()); err == nil {
+		t.Fatal("Open() error = nil, want typed-nil adapter rejection")
 	}
 }
 
@@ -195,3 +263,25 @@ func (f *fakeAdapter) Close() error {
 	f.closeCalls++
 	return nil
 }
+
+type nilFactoryFunc func()
+
+func (nilFactoryFunc) Capabilities() CapabilityMatrix { return CapabilityMatrix{} }
+
+func (nilFactoryFunc) Open(context.Context, InstanceConfig) (Adapter, error) {
+	return &fakeAdapter{}, nil
+}
+
+type nilAdapterFunc func()
+
+func (nilAdapterFunc) Family() EngineFamily { return MySQLFamily }
+
+func (nilAdapterFunc) Capabilities() CapabilityMatrix { return CapabilityMatrix{} }
+
+func (nilAdapterFunc) Ping(context.Context) error { return nil }
+
+func (nilAdapterFunc) QueryMetric(context.Context, string, map[string]any) ([]MetricRow, error) {
+	return nil, nil
+}
+
+func (nilAdapterFunc) Close() error { return nil }

@@ -32,7 +32,7 @@ func (r *registry) Register(family EngineFamily, factory Factory) error {
 	if strings.TrimSpace(string(family)) == "" {
 		return fmt.Errorf("database family is required")
 	}
-	if factoryIsNil(factory) {
+	if isNilInterface(factory) {
 		return fmt.Errorf("database factory for %q is required", family)
 	}
 
@@ -64,7 +64,7 @@ func (r *registry) Open(ctx context.Context, config InstanceConfig) (Adapter, er
 	if err != nil {
 		return nil, fmt.Errorf("open %q database adapter: %w", config.Family, err)
 	}
-	if adapter == nil {
+	if isNilInterface(adapter) {
 		return nil, fmt.Errorf("open %q database adapter: factory returned nil adapter", config.Family)
 	}
 	return adapter, nil
@@ -93,11 +93,36 @@ func validateInstanceConfig(config InstanceConfig) error {
 	if err := validateSecretRef(config.SecretRef); err != nil {
 		return err
 	}
+	if err := validateTLSConfig(config.TLS); err != nil {
+		return err
+	}
 	if err := validateTimeout("connect", config.ConnectTimeout); err != nil {
 		return err
 	}
 	if err := validateTimeout("query", config.QueryTimeout); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateTLSConfig(config TLSConfig) error {
+	for _, secret := range []struct {
+		name string
+		ref  string
+	}{
+		{name: "CA", ref: config.CASecretRef},
+		{name: "certificate", ref: config.CertificateSecretRef},
+		{name: "key", ref: config.KeySecretRef},
+	} {
+		if secret.ref == "" {
+			continue
+		}
+		if err := validateSecretRef(secret.ref); err != nil {
+			return fmt.Errorf("database TLS %s secret reference: %w", secret.name, err)
+		}
+	}
+	if (config.CertificateSecretRef == "") != (config.KeySecretRef == "") {
+		return fmt.Errorf("database TLS certificate and key secret references must be paired")
 	}
 	return nil
 }
@@ -164,10 +189,15 @@ func cloneCapabilities(capabilities CapabilityMatrix) CapabilityMatrix {
 	return copy
 }
 
-func factoryIsNil(factory Factory) bool {
-	if factory == nil {
+func isNilInterface(value any) bool {
+	if value == nil {
 		return true
 	}
-	value := reflect.ValueOf(factory)
-	return value.Kind() == reflect.Ptr && value.IsNil()
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
