@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package dbpilot.telemetry.v1;
+
+option go_package = "dbpilot.local/platform/gen/telemetry/v1;telemetryv1";
+
+service TelemetryIngest {
+  rpc PushLogBatch(LogBatch) returns (BatchAck);
+  rpc PushMetricBatch(MetricBatch) returns (BatchAck);
+  rpc ReportPolicyStatus(PolicyStatus) returns (PolicyStatusAck);
+}
+
+message LogBatch {
+  string batch_id = 1;
+  string agent_id = 2;
+  string source_id = 3;
+  string category = 4;
+  uint64 first_offset = 5;
+  uint64 last_offset = 6;
+  bytes payload = 7;
+  bytes checksum = 8;
+  int64 created_at_unix = 9;
+}
+
+message MetricBatch {
+  string batch_id = 1;
+  string agent_id = 2;
+  string source_id = 3;
+  bytes payload = 4;
+  bytes checksum = 5;
+  int64 created_at_unix = 6;
+}
+
+message BatchAck {
+  string batch_id = 1;
+  bool accepted = 2;
+  bool retryable = 3;
+  string error_code = 4;
+}
+
+message PolicyStatus {
+  string agent_id = 1;
+  int64 version = 2;
+  string state = 3;
+  string error_code = 4;
+  int64 reported_at_unix = 5;
+}
+
+message PolicyStatusAck {
+  bool accepted = 1;
+  bool retryable = 2;
+  string error_code = 3;
+}

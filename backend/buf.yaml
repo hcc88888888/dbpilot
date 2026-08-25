@@ -1,0 +1,8 @@
+version: v2
+modules:
+  - path: api
+lint:
+  use:
+    - MINIMAL
+  except:
+    - PACKAGE_DIRECTORY_MATCH
