@@ -1,5 +1,7 @@
 # DBPilot Agent Control Plane Foundation Implementation Plan
 
+> **Superseded on 2026-08-26:** Agent architecture was revised to a single-process, single-binary design with an embedded OpenTelemetry-based telemetry engine, operating-system and custom log collection, custom metrics, segment spool storage, and CentOS 7 / Kylin V10 compatibility requirements. Do not execute this plan further. A replacement plan will be written after the revised specifications are approved.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a testable vertical slice in which a DBPilot Agent registers, sends heartbeats and capabilities, receives a signed structured job, executes it through a safe handler, and reports an auditable result.

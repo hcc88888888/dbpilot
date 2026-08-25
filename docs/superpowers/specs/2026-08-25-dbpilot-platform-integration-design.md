@@ -133,13 +133,15 @@ Review API
 
 ## 10. 监控和性能数据
 
-DBPilot Agent 是统一安装入口。基础指标通过 Prometheus Remote Write 或 OTLP 写入 VictoriaMetrics；Grafana 仅用于图表定义和渲染，不承担业务权限。
+DBPilot Agent 是统一安装入口，也是数据库、主机、操作系统日志、自定义文件和自定义指标的统一采集入口。Agent 为 Go 单进程单二进制，不运行独立 Vector；其内部复用 OpenTelemetry Collector Go 组件构建 receiver / processor / exporter 管道，Vector 只作为功能、背压和可靠性设计参考。
+
+日志和指标先进入 DBPilot Ingest Gateway，由 Gateway 根据 Agent mTLS 身份补充并校验租户、项目、主机和实例信息。基础指标写入 VictoriaMetrics；数据库日志、操作系统日志、审计日志和 SQL 样本写入 ClickHouse；原始日志归档写入企业 S3。Grafana 仅用于图表定义和渲染，不承担业务权限。
 
 PMM 不作为统一监控底座。需要 MySQL、PostgreSQL 或 MongoDB 深度 Query Analytics 时，可选择性复用其采集器、指标定义或算法，但数据必须转换为 DBPilot 的 `QueryDigest`、`QuerySample`、`WaitEvent`、`LockEvent` 和 `DiagnosticFinding` 模型。
 
 ## 11. Agent 与数据库适配器
 
-DBPilot Agent 负责主机指标、数据库指标、日志、本地缓存、工具执行和结构化命令。它可托管外部 Exporter，但外部组件不能绕过 Agent 直接接受高风险任务。
+DBPilot Agent 负责主机指标、数据库指标、数据库日志、操作系统日志、自定义文件、自定义指标、本地缓存、工具执行和结构化命令。采集内核与命令执行器共享 Agent 身份和控制通道，但在代码、权限和资源配额上隔离。Agent 不接受原始 Vector/OTel 配置，也不允许采集策略提供任意 Shell。
 
 Adapter 按连接、元数据、指标、会话、锁、Explain、审计和操作声明能力。HBase、Neo4j 和 MongoDB 使用各自查询模型，不伪装成传统 SQL 数据库。
 
@@ -149,13 +151,13 @@ DB-GPT 或 LLM 不直接持有生产数据库凭据。AI 只能调用 DBPilot To
 
 ## 13. 技术栈收敛
 
-- Go：Control Plane、Agent、网关、调度、监控和执行服务。
+- Go：Control Plane、Agent、网关、调度、监控和执行服务；Agent 内嵌 OTel Collector Go 组件。
 - Python：SQLFluff、SQLGlot、AI 和诊断算法。
 - Java：仅用于必须依赖 JDBC 或 Java SDK 的数据库插件。
 - gRPC + Protobuf：内部服务和 Agent 协议。
-- PostgreSQL：控制面数据；VictoriaMetrics：指标；ClickHouse：审计和 SQL 样本；MinIO：报告和任务产物；NATS JetStream：事件与任务通知。
+- PostgreSQL：控制面数据和首期任务 Outbox；VictoriaMetrics：指标；ClickHouse：日志、审计和 SQL 样本；企业 S3：原始日志、报告和任务产物。
 
-引入 Kafka、Elasticsearch 或额外微服务必须以容量或功能需求为依据，不在第一阶段默认部署。
+第一阶段不默认引入 NATS、Kafka、Elasticsearch 或额外微服务。任务量或事件解耦需求明确后再引入 NATS JetStream；日志量需要独立流式缓冲时再评估 Kafka。
 
 ## 14. 统一事件和审计
 
@@ -177,6 +179,8 @@ DB-GPT 或 LLM 不直接持有生产数据库凭据。AI 只能调用 DBPilot To
 - 模块与开源引擎之间使用契约测试和固定输入输出样本。
 - 每个数据库 Adapter 使用容器或专用测试环境做兼容测试；商业数据库使用隔离测试实例。
 - Agent 命令执行覆盖签名错误、过期、重放、超时、取消和断网恢复。
+- Agent 采集测试覆盖文件轮转、截断、多行、编码、journald 游标、checkpoint、背压、磁盘满、断网恢复、配置原子切换和高基数拦截。
+- 发布测试覆盖 Linux amd64/arm64 静态构建，以及 CentOS 7、麒麟 V10 x86_64/arm64 的真实环境冒烟测试。
 - SQL 审核使用多方言黄金样本集；开源依赖升级必须重新运行回归集。
 - 端到端测试覆盖登录、查询、审核、审批、执行和审计闭环。
 
