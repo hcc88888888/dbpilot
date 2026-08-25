@@ -1,8 +1,8 @@
-# DataPilot Agent 与多数据库运维平台设计规格
+# DBPilot Agent 与多数据库运维平台设计规格
 
 ## 1. 目标与范围
 
-第一阶段建立 DataPilot Agent 与控制面的最小可用闭环，为 Oracle、MySQL、MariaDB、达梦、OceanBase、HBase、Neo4j、MongoDB、TiDB、PostgreSQL 和 openGauss 提供统一的实例注册、心跳、基础指标采集和受控运维任务执行能力。
+第一阶段建立 DBPilot Agent 与控制面的最小可用闭环，为 Oracle、MySQL、MariaDB、达梦、OceanBase、HBase、Neo4j、MongoDB、TiDB、PostgreSQL 和 openGauss 提供统一的实例注册、心跳、基础指标采集和受控运维任务执行能力。
 
 本阶段不实现完整 SQL 审核引擎、自治管理或 AI 根因诊断；这些能力在 Agent 协议稳定后作为上层服务接入。
 
@@ -19,7 +19,7 @@ Control Plane (Go)
     ├── Metrics / Audit API
     └── Agent Gateway (gRPC + mTLS)
              │
-        DataPilot Agent (Go)
+        DBPilot Agent (Go)
              ├── Host Collector
              ├── Database Adapters
              ├── Log Collector
@@ -95,7 +95,7 @@ Adapter 分为连接、元数据、指标、操作和审计五个能力域。数
 - 指标：VictoriaMetrics 或 Prometheus Remote Write。
 - 审计与 SQL 样本：ClickHouse；对象和报告：MinIO。
 - 可视化：现有前端逐步替换为 React + TypeScript，指标图表嵌入 Grafana 或使用 Grafana API。
-- 遥测：OpenTelemetry Collector / Grafana Alloy；命令执行保持为 DataPilot 自研 Runtime。
+- 遥测：OpenTelemetry Collector / Grafana Alloy；命令执行保持为 DBPilot 自研 Runtime。
 
 ## 7. 失败处理与可观测性
 

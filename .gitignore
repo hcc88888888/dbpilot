@@ -1,0 +1,6 @@
+.worktrees/
+.superpowers/
+backend/gen/
+backend/*.db
+backend/*.pem
+backend/bin/
