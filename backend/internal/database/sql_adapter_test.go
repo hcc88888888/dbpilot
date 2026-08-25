@@ -2,11 +2,20 @@ package database
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,7 +28,7 @@ func TestMySQLFactoryBuildsFixedDriverDSNWithTLS(t *testing.T) {
 	config.Database = "app data"
 	config.TLS = TLSConfig{Enabled: true, ServerName: "db.internal.test"}
 
-	adapter, err := NewMySQLFactory(opener, staticCatalog{}).Open(context.Background(), config)
+	adapter, err := mysqlFactoryForTest(opener, staticCatalog{}).Open(context.Background(), config)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -28,7 +37,7 @@ func TestMySQLFactoryBuildsFixedDriverDSNWithTLS(t *testing.T) {
 	if got, want := opener.driverName, "mysql"; got != want {
 		t.Fatalf("driver name = %q, want fixed %q", got, want)
 	}
-	if got, want := opener.dsn, "readonly@tcp(db.example.test:3306)/app%20data?readTimeout=15s&timeout=5s&tls=true&writeTimeout=15s"; got != want {
+	if got, want := opener.dsn, "readonly:runtime-password@tcp(db.example.test:3306)/app%20data?readTimeout=15s&timeout=5s&tls=custom&writeTimeout=15s"; got != want {
 		t.Fatalf("DSN = %q, want %q", got, want)
 	}
 	if got := adapter.Family(); got != MySQLFamily {
@@ -44,7 +53,7 @@ func TestPostgresFactoryBuildsFixedDriverDSNWithTLS(t *testing.T) {
 	config.Database = "app data"
 	config.TLS = TLSConfig{Enabled: true, ServerName: "db.internal.test"}
 
-	adapter, err := NewPostgresFactory(opener, staticCatalog{}).Open(context.Background(), config)
+	adapter, err := postgresFactoryForTest(opener, staticCatalog{}).Open(context.Background(), config)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -53,7 +62,7 @@ func TestPostgresFactoryBuildsFixedDriverDSNWithTLS(t *testing.T) {
 	if got, want := opener.driverName, "postgres"; got != want {
 		t.Fatalf("driver name = %q, want fixed %q", got, want)
 	}
-	if got, want := opener.dsn, "postgres://readonly@db.example.test:5432/app%20data?connect_timeout=5&sslmode=verify-full&statement_timeout=15000"; got != want {
+	if got, want := opener.dsn, "postgres://readonly:runtime-password@db.example.test:5432/app%20data?connect_timeout=5&sslmode=verify-full&statement_timeout=15000"; got != want {
 		t.Fatalf("DSN = %q, want %q", got, want)
 	}
 	if got := adapter.Family(); got != PostgresFamily {
@@ -63,7 +72,7 @@ func TestPostgresFactoryBuildsFixedDriverDSNWithTLS(t *testing.T) {
 
 func TestAdapterPingUsesConnectionDeadline(t *testing.T) {
 	state := &sqlDriverState{}
-	adapter, err := NewMySQLFactory(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily))
+	adapter, err := mysqlFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -86,7 +95,7 @@ func TestAdapterQueryMetricSelectsFamilyTemplateAndUsesQueryDeadline(t *testing.
 		PostgresFamily: {template.ID: template},
 	}}
 	state := &sqlDriverState{columns: []string{"value"}, rows: [][]driver.Value{{int64(9)}}}
-	adapter, err := NewPostgresFactory(&fakeSQLOpener{db: newTestSQLDB(t, state)}, catalog).Open(context.Background(), adapterTestConfig(PostgresFamily))
+	adapter, err := postgresFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, state)}, catalog).Open(context.Background(), adapterTestConfig(PostgresFamily))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -114,7 +123,7 @@ func TestMySQLFactoryRequiresExplicitMySQLProtocolFamily(t *testing.T) {
 	for _, family := range []EngineFamily{MariaDBFamily, TiDBFamily, OceanBaseFamily} {
 		t.Run(string(family), func(t *testing.T) {
 			state := &sqlDriverState{}
-			adapter, err := NewMySQLFactory(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(family))
+			adapter, err := mysqlFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(family))
 			if err != nil {
 				t.Fatalf("Open() error = %v", err)
 			}
@@ -125,14 +134,14 @@ func TestMySQLFactoryRequiresExplicitMySQLProtocolFamily(t *testing.T) {
 		})
 	}
 
-	if _, err := NewMySQLFactory(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Open(context.Background(), adapterTestConfig(PostgresFamily)); err == nil {
+	if _, err := mysqlFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Open(context.Background(), adapterTestConfig(PostgresFamily)); err == nil {
 		t.Fatal("Open() error = nil, want PostgreSQL family rejected by MySQL factory")
 	}
 }
 
 func TestPostgresFactoryRequiresExplicitPostgresProtocolFamily(t *testing.T) {
 	state := &sqlDriverState{}
-	adapter, err := NewPostgresFactory(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(OpenGaussFamily))
+	adapter, err := postgresFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(OpenGaussFamily))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -141,14 +150,14 @@ func TestPostgresFactoryRequiresExplicitPostgresProtocolFamily(t *testing.T) {
 		t.Fatalf("Family() = %q, want explicitly selected family %q", got, OpenGaussFamily)
 	}
 
-	if _, err := NewPostgresFactory(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily)); err == nil {
+	if _, err := postgresFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily)); err == nil {
 		t.Fatal("Open() error = nil, want MySQL family rejected by PostgreSQL factory")
 	}
 }
 
 func TestAdapterCapabilitiesDifferByProtocol(t *testing.T) {
-	mysql := NewMySQLFactory(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Capabilities()
-	postgres := NewPostgresFactory(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Capabilities()
+	mysql := mysqlFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Capabilities()
+	postgres := postgresFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}, staticCatalog{}).Capabilities()
 	if !mysql.ReadOnlySQL || !mysql.Metrics || mysql.Transactions {
 		t.Fatalf("MySQL capabilities = %#v, want read-only metrics without transaction access", mysql)
 	}
@@ -159,7 +168,7 @@ func TestAdapterCapabilitiesDifferByProtocol(t *testing.T) {
 
 func TestAdapterCloseIsIdempotent(t *testing.T) {
 	state := &sqlDriverState{}
-	adapter, err := NewMySQLFactory(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily))
+	adapter, err := mysqlFactoryForTest(&fakeSQLOpener{db: newTestSQLDB(t, state)}, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -171,6 +180,60 @@ func TestAdapterCloseIsIdempotent(t *testing.T) {
 	}
 	if got, want := state.closeCalls, 1; got != want {
 		t.Fatalf("driver Close calls = %d, want %d", got, want)
+	}
+}
+
+func TestMySQLFactoryResolvesRuntimeCredentialsAndTLSWithoutLeakingReferences(t *testing.T) {
+	caPEM, certificatePEM, keyPEM := testTLSMaterial(t)
+	resolver := &fakeSecretResolver{secrets: map[string][]byte{
+		"secret://runtime/db-primary":  []byte("password with spaces"),
+		"secret://runtime/database-ca": caPEM,
+		"secret://runtime/client-cert": certificatePEM,
+		"secret://runtime/client-key":  keyPEM,
+	}}
+	state := &sqlDriverState{}
+	opener := &fakeSQLOpener{db: newTestSQLDB(t, state)}
+	config := adapterTestConfig(MySQLFamily)
+	config.TLS = TLSConfig{
+		Enabled:              true,
+		ServerName:           "db.internal.test",
+		CASecretRef:          "secret://runtime/database-ca",
+		CertificateSecretRef: "secret://runtime/client-cert",
+		KeySecretRef:         "secret://runtime/client-key",
+	}
+
+	adapter, err := NewMySQLFactoryWithRuntime(opener, staticCatalog{}, resolver).Open(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer adapter.Close()
+
+	if got, want := resolver.references, []string{"secret://runtime/db-primary", "secret://runtime/database-ca", "secret://runtime/client-cert", "secret://runtime/client-key"}; !slices.Equal(got, want) {
+		t.Fatalf("resolved references = %q, want %q", got, want)
+	}
+	if !strings.Contains(opener.dsn, "password+with+spaces") {
+		t.Fatalf("DSN does not contain the resolved password: %q", opener.dsn)
+	}
+	if strings.Contains(opener.dsn, config.SecretRef) || strings.Contains(opener.dsn, config.TLS.CASecretRef) || strings.Contains(opener.dsn, config.TLS.CertificateSecretRef) || strings.Contains(opener.dsn, config.TLS.KeySecretRef) {
+		t.Fatalf("DSN leaked a secret reference: %q", opener.dsn)
+	}
+	if opener.tlsConfig == nil || opener.tlsConfig.ServerName != "db.internal.test" || opener.tlsConfig.RootCAs == nil || len(opener.tlsConfig.Certificates) != 1 {
+		t.Fatalf("TLS config = %#v, want server name, CA pool, and client certificate", opener.tlsConfig)
+	}
+}
+
+func TestFactoryRejectsTLSWhenOpenerCannotApplyIt(t *testing.T) {
+	config := adapterTestConfig(PostgresFamily)
+	config.TLS = TLSConfig{Enabled: true, ServerName: "db.internal.test"}
+	resolver := &fakeSecretResolver{secrets: map[string][]byte{config.SecretRef: []byte("password")}}
+	opener := basicSQLOpener{delegate: &fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}}
+
+	_, err := NewPostgresFactoryWithRuntime(opener, staticCatalog{}, resolver).Open(context.Background(), config)
+	if err == nil {
+		t.Fatal("Open() error = nil, want TLS mapping rejection")
+	}
+	if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), config.SecretRef) {
+		t.Fatalf("Open() error leaked a secret: %v", err)
 	}
 }
 
@@ -187,11 +250,80 @@ func adapterTestConfig(family EngineFamily) InstanceConfig {
 	}
 }
 
+func mysqlFactoryForTest(opener SQLOpener, catalog TemplateCatalog) Factory {
+	return NewMySQLFactoryWithRuntime(opener, catalog, adapterTestResolver())
+}
+
+func postgresFactoryForTest(opener SQLOpener, catalog TemplateCatalog) Factory {
+	return NewPostgresFactoryWithRuntime(opener, catalog, adapterTestResolver())
+}
+
+func adapterTestResolver() SecretResolver {
+	return &fakeSecretResolver{secrets: map[string][]byte{"secret://runtime/db-primary": []byte("runtime-password")}}
+}
+
+type fakeSecretResolver struct {
+	secrets    map[string][]byte
+	references []string
+}
+
+func (resolver *fakeSecretResolver) ResolveSecret(_ context.Context, reference string) ([]byte, error) {
+	resolver.references = append(resolver.references, reference)
+	secret, ok := resolver.secrets[reference]
+	if !ok {
+		return nil, errors.New("secret was not found")
+	}
+	return append([]byte(nil), secret...), nil
+}
+
+func testTLSMaterial(t *testing.T) ([]byte, []byte, []byte) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	now := time.Now()
+	certificate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "database-test-ca"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, certificate, certificate, publicKey, privateKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate() error = %v", err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("MarshalPKCS8PrivateKey() error = %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return certificatePEM, certificatePEM, keyPEM
+}
+
 type fakeSQLOpener struct {
 	db         *sql.DB
 	err        error
 	driverName string
 	dsn        string
+	tlsConfig  *tls.Config
+}
+
+func (opener *fakeSQLOpener) OpenWithTLS(driverName, dsn string, config *tls.Config) (*sql.DB, error) {
+	opener.driverName = driverName
+	opener.dsn = dsn
+	opener.tlsConfig = config.Clone()
+	return opener.db, opener.err
+}
+
+type basicSQLOpener struct{ delegate *fakeSQLOpener }
+
+func (opener basicSQLOpener) Open(driverName, dsn string) (*sql.DB, error) {
+	return opener.delegate.Open(driverName, dsn)
 }
 
 func (opener *fakeSQLOpener) Open(driverName, dsn string) (*sql.DB, error) {

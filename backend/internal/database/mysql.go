@@ -2,6 +2,8 @@ package database
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -20,6 +22,20 @@ type SQLOpener interface {
 	Open(driverName, dataSourceName string) (*sql.DB, error)
 }
 
+// TLSOpeningSQLOpener opens a database after securely applying an ephemeral
+// TLS configuration. Implementations must not persist or log the supplied
+// certificate material.
+type TLSOpeningSQLOpener interface {
+	SQLOpener
+	OpenWithTLS(driverName, dataSourceName string, config *tls.Config) (*sql.DB, error)
+}
+
+// SecretResolver resolves runtime-only secret references. Returned values are
+// never copied to policy structures, logs, or adapter errors.
+type SecretResolver interface {
+	ResolveSecret(context.Context, string) ([]byte, error)
+}
+
 // SQLOpenerFunc adapts an Open function to SQLOpener.
 type SQLOpenerFunc func(driverName, dataSourceName string) (*sql.DB, error)
 
@@ -31,16 +47,24 @@ type sqlProtocolFactory struct {
 	protocol     EngineFamily
 	opener       SQLOpener
 	catalog      TemplateCatalog
+	resolver     SecretResolver
 	capabilities CapabilityMatrix
 }
 
 // NewMySQLFactory creates adapters for explicitly selected MySQL-protocol
 // families. It never derives a protocol or driver from user-controlled input.
 func NewMySQLFactory(opener SQLOpener, catalog TemplateCatalog) Factory {
+	return NewMySQLFactoryWithRuntime(opener, catalog, nil)
+}
+
+// NewMySQLFactoryWithRuntime creates a MySQL-protocol factory with the
+// runtime-only resolver needed to consume credential and TLS secret refs.
+func NewMySQLFactoryWithRuntime(opener SQLOpener, catalog TemplateCatalog, resolver SecretResolver) Factory {
 	return &sqlProtocolFactory{
 		protocol: mysqlDriverName,
 		opener:   opener,
 		catalog:  catalog,
+		resolver: resolver,
 		capabilities: CapabilityMatrix{
 			ReadOnlySQL: true,
 			Metrics:     true,
@@ -65,15 +89,22 @@ func (factory *sqlProtocolFactory) Open(ctx context.Context, config InstanceConf
 	if isNilInterface(factory.catalog) {
 		return nil, errors.New("database metric template catalog is required")
 	}
+	if isNilInterface(factory.resolver) {
+		return nil, errors.New("database runtime secret resolver is required")
+	}
 	if !factory.accepts(config.Family) {
 		return nil, fmt.Errorf("database family %q does not use %s protocol", config.Family, factory.protocol)
 	}
 
-	dsn, err := factory.dsn(config)
+	password, tlsConfig, err := resolveRuntimeConnection(ctx, config, factory.resolver)
 	if err != nil {
 		return nil, err
 	}
-	database, err := factory.opener.Open(string(factory.protocol), dsn)
+	dsn, err := factory.dsn(config, password)
+	if err != nil {
+		return nil, err
+	}
+	database, err := factory.openDatabase(dsn, tlsConfig)
 	if err != nil {
 		return nil, fmt.Errorf("open %s database: %w", factory.protocol, err)
 	}
@@ -95,6 +126,17 @@ func (factory *sqlProtocolFactory) Open(ctx context.Context, config InstanceConf
 	return adapter, nil
 }
 
+func (factory *sqlProtocolFactory) openDatabase(dsn string, tlsConfig *tls.Config) (*sql.DB, error) {
+	if tlsConfig == nil {
+		return factory.opener.Open(string(factory.protocol), dsn)
+	}
+	tlsOpener, ok := factory.opener.(TLSOpeningSQLOpener)
+	if !ok {
+		return nil, errors.New("database SQL opener cannot apply TLS settings")
+	}
+	return tlsOpener.OpenWithTLS(string(factory.protocol), dsn, tlsConfig)
+}
+
 func (factory *sqlProtocolFactory) accepts(family EngineFamily) bool {
 	if factory.protocol == mysqlDriverName {
 		switch family {
@@ -107,14 +149,14 @@ func (factory *sqlProtocolFactory) accepts(family EngineFamily) bool {
 	return family == PostgresFamily || family == OpenGaussFamily
 }
 
-func (factory *sqlProtocolFactory) dsn(config InstanceConfig) (string, error) {
+func (factory *sqlProtocolFactory) dsn(config InstanceConfig, password []byte) (string, error) {
 	if factory.protocol == mysqlDriverName {
-		return mysqlDSN(config)
+		return mysqlDSN(config, password)
 	}
-	return postgresDSN(config)
+	return postgresDSN(config, password)
 }
 
-func mysqlDSN(config InstanceConfig) (string, error) {
+func mysqlDSN(config InstanceConfig, password []byte) (string, error) {
 	address, err := url.Parse(config.Address)
 	if err != nil {
 		return "", fmt.Errorf("parse MySQL address: %w", err)
@@ -128,9 +170,69 @@ func mysqlDSN(config InstanceConfig) (string, error) {
 		"writeTimeout": []string{config.QueryTimeout.String()},
 	}
 	if config.TLS.Enabled {
-		parameters.Set("tls", "true")
+		parameters.Set("tls", "custom")
 	}
-	return fmt.Sprintf("%s@tcp(%s)/%s?%s", config.User, address.Host, url.PathEscape(config.Database), parameters.Encode()), nil
+	return fmt.Sprintf("%s:%s@tcp(%s)/%s?%s", config.User, url.QueryEscape(string(password)), address.Host, url.PathEscape(config.Database), parameters.Encode()), nil
+}
+
+func resolveRuntimeConnection(ctx context.Context, config InstanceConfig, resolver SecretResolver) ([]byte, *tls.Config, error) {
+	resolverContext, cancel := context.WithTimeout(ctx, config.ConnectTimeout)
+	defer cancel()
+	password, err := resolveRuntimeSecret(resolverContext, resolver, config.SecretRef, "credential")
+	if err != nil {
+		return nil, nil, err
+	}
+	if !config.TLS.Enabled {
+		if config.TLS.ServerName != "" || config.TLS.CASecretRef != "" || config.TLS.CertificateSecretRef != "" || config.TLS.KeySecretRef != "" {
+			return nil, nil, errors.New("database TLS settings require TLS to be enabled")
+		}
+		return password, nil, nil
+	}
+
+	address, err := url.Parse(config.Address)
+	if err != nil || address.Hostname() == "" {
+		return nil, nil, errors.New("database TLS address is invalid")
+	}
+	serverName := config.TLS.ServerName
+	if serverName == "" {
+		serverName = address.Hostname()
+	}
+	configTLS := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
+	if config.TLS.CASecretRef != "" {
+		certificateAuthority, err := resolveRuntimeSecret(resolverContext, resolver, config.TLS.CASecretRef, "CA")
+		if err != nil {
+			return nil, nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(certificateAuthority) {
+			return nil, nil, errors.New("database TLS CA certificate is invalid")
+		}
+		configTLS.RootCAs = pool
+	}
+	if config.TLS.CertificateSecretRef != "" {
+		certificatePEM, err := resolveRuntimeSecret(resolverContext, resolver, config.TLS.CertificateSecretRef, "client certificate")
+		if err != nil {
+			return nil, nil, err
+		}
+		keyPEM, err := resolveRuntimeSecret(resolverContext, resolver, config.TLS.KeySecretRef, "client key")
+		if err != nil {
+			return nil, nil, err
+		}
+		certificate, err := tls.X509KeyPair(certificatePEM, keyPEM)
+		if err != nil {
+			return nil, nil, errors.New("database TLS client certificate is invalid")
+		}
+		configTLS.Certificates = []tls.Certificate{certificate}
+	}
+	return password, configTLS, nil
+}
+
+func resolveRuntimeSecret(ctx context.Context, resolver SecretResolver, reference, kind string) ([]byte, error) {
+	value, err := resolver.ResolveSecret(ctx, reference)
+	if err != nil || len(value) == 0 {
+		return nil, fmt.Errorf("resolve database %s secret", kind)
+	}
+	return value, nil
 }
 
 type sqlAdapter struct {
@@ -195,7 +297,7 @@ func (queryer sqlQueryer) QueryContext(ctx context.Context, statement string, ar
 	return queryer.database.QueryContext(ctx, statement, arguments...)
 }
 
-func postgresDSN(config InstanceConfig) (string, error) {
+func postgresDSN(config InstanceConfig, password []byte) (string, error) {
 	address, err := url.Parse(config.Address)
 	if err != nil {
 		return "", fmt.Errorf("parse PostgreSQL address: %w", err)
@@ -213,7 +315,7 @@ func postgresDSN(config InstanceConfig) (string, error) {
 	}
 	return (&url.URL{
 		Scheme:   "postgres",
-		User:     url.User(config.User),
+		User:     url.UserPassword(config.User, string(password)),
 		Host:     address.Host,
 		Path:     "/" + strings.TrimPrefix(config.Database, "/"),
 		RawQuery: parameters.Encode(),
