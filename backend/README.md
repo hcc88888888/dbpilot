@@ -85,3 +85,16 @@ Run those commands on CentOS 7 amd64, Kylin V10 amd64, and Kylin V10 arm64
 with a real mTLS test gateway and journald permissions. This Windows worktree
 cannot record those Linux-specific systemd/journald results; release approval
 requires attaching the three runner logs.
+
+### Windows Docker/Kylin verification
+
+Windows development can verify the Linux executable inside an approved Kylin
+V10 Docker image. Build the amd64/arm64 artifacts first, then run
+`scripts/verify-kylin-docker.ps1` with `-Image` set to the enterprise Kylin
+image and the matching `-Architecture`. The script rejects missing Docker,
+missing images, non-Kylin `/etc/os-release`, architecture mismatches, and
+startup failures. It never substitutes a generic Linux image for Kylin.
+
+This container check covers executable compatibility and bootstrap startup.
+Systemd, journald ACLs, kernel metrics, eBPF, and real Kylin service behavior
+must still be verified on Kylin V10 amd64/arm64 VM or bare-metal runners.
