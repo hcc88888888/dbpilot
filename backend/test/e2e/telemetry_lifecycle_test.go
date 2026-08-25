@@ -23,6 +23,7 @@ import (
 	"dbpilot.local/platform/internal/ingest"
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
+	"dbpilot.local/platform/internal/telemetry"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,24 +33,31 @@ import (
 )
 
 func TestTelemetryLifecycleRetainsFailedBatchesAcrossRestartAndDeliversViaMTLS(t *testing.T) {
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll("dbpilot-spool")) })
 	directory := t.TempDir()
 	logPath := filepath.Join(directory, "application.log")
-	require.NoError(t, os.WriteFile(logPath, []byte("before rotation\n"), 0o600))
-	rotated := logPath + ".1"
-	require.NoError(t, os.Rename(logPath, rotated))
-	require.NoError(t, os.WriteFile(logPath, []byte("after rotation\n"), 0o600))
+	require.NoError(t, os.WriteFile(logPath, []byte("runtime collection "+time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o600))
 
 	store, err := spool.Open(filepath.Join(directory, "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 512})
 	require.NoError(t, err)
-	appendFileBatch(t, store, "rotated", "file-log", rotated)
-	appendFileBatch(t, store, "current", "file-log", logPath)
-	require.NoError(t, store.Append(context.Background(), spool.Metric, spool.Batch{ID: "host", SourceID: "host-metrics", CreatedAt: time.Now().UTC(), Payload: []byte("cpu=1"), Priority: 1}))
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	envelope, err := policy.Sign(private, policy.Policy{AgentID: "agent-a", Version: 1, IssuedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Sources: []policy.Source{{ID: "file-log", Kind: policy.SourceFileLog, Path: logPath, Interval: 5 * time.Second, Params: map[string]string{"start_at": "beginning"}}}, Limits: policy.Limits{MaxSpoolBytes: 1 << 20, MaxBatchBytes: 1 << 16, MaxEventsPerSec: 100}})
+	require.NoError(t, err)
+	signedPolicy, err := policy.Verify(public, envelope, time.Now())
+	require.NoError(t, err)
+	engine := telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store))
+	result, err := engine.Apply(context.Background(), signedPolicy)
+	require.NoError(t, err)
+	require.Equal(t, telemetry.ApplyActive, result.State)
+	require.Eventually(t, func() bool { return len(pending(t, store, spool.Log)) == 1 }, 5*time.Second, 20*time.Millisecond)
 
 	failed := exporter.NewClient(unavailableIngest{}, store, "agent-a")
 	failedCtx, cancelFailed := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	err = failed.SendPending(failedCtx)
 	cancelFailed()
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NoError(t, engine.Stop(context.Background()))
 	require.NoError(t, store.Close())
 
 	store, err = spool.Open(filepath.Join(directory, "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 512})
@@ -59,25 +67,13 @@ func TestTelemetryLifecycleRetainsFailedBatchesAcrossRestartAndDeliversViaMTLS(t
 	defer closeGateway()
 	require.NoError(t, exporter.NewClient(client, store, "agent-a").SendPending(context.Background()))
 	require.Empty(t, pending(t, store, spool.Log))
-	require.Empty(t, pending(t, store, spool.Metric))
 	received := service.ReceivedBatches()
-	require.Len(t, received, 3)
+	require.Len(t, received, 1)
 	for _, batch := range received {
 		require.Equal(t, "agent-a", batch.AgentID)
+		require.Equal(t, "file-log", batch.SourceID)
 	}
-
-	_, private, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	_, err = policy.Sign(private, policy.Policy{AgentID: "agent-a", Version: 1, IssuedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Sources: []policy.Source{{ID: "file-log", Kind: policy.SourceFileLog, Path: logPath, Interval: 5 * time.Second}}, Limits: policy.Limits{MaxSpoolBytes: 1 << 20, MaxBatchBytes: 1 << 16, MaxEventsPerSec: 100}})
-	require.NoError(t, err)
 	assertClosedPolicySurface(t)
-}
-
-func appendFileBatch(t *testing.T, store *spool.Store, id, source, path string) {
-	t.Helper()
-	payload, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.NoError(t, store.Append(context.Background(), spool.Log, spool.Batch{ID: id, SourceID: source, CreatedAt: time.Now().UTC(), Payload: payload, Priority: 1}))
 }
 
 func pending(t *testing.T, store *spool.Store, class spool.DataClass) []spool.Batch {

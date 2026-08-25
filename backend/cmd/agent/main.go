@@ -158,7 +158,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	client := telemetryv1.NewTelemetryIngestClient(connection)
 	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
-	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder()), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}})
+	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}})
 	return runtime.Run(ctx)
 }
 

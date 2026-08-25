@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -126,10 +127,10 @@ func validatePath(raw string, env ValidationEnvironment) error {
 }
 
 func validatePathSyntax(raw string) error {
-	if raw == "" || !path.IsAbs(raw) {
+	if raw == "" || (!filepath.IsAbs(raw) && !path.IsAbs(raw)) {
 		return ErrPathTraversal
 	}
-	for _, part := range strings.Split(raw, "/") {
+	for _, part := range strings.Split(filepath.ToSlash(raw), "/") {
 		if part == ".." {
 			return ErrPathTraversal
 		}

@@ -2,12 +2,27 @@ package telemetry
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dbpilot.local/platform/internal/policy"
+	"dbpilot.local/platform/internal/spool"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/extension"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/processor"
+	"go.opentelemetry.io/collector/receiver"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
+	"go.uber.org/zap"
 )
 
 const defaultHealthCheckTimeout = 5 * time.Second
@@ -38,22 +53,421 @@ type Candidate interface {
 	Version() uint64
 }
 
-// EmbeddedBuilder is the minimal concrete lifecycle bridge for the linked
-// agent binary. Component-specific receivers are compiled before this point;
-// the candidate keeps their lifecycle under Engine ownership.
-type EmbeddedBuilder struct{}
-
-func NewEmbeddedBuilder() EmbeddedBuilder { return EmbeddedBuilder{} }
-func (EmbeddedBuilder) Build(_ context.Context, cfg RuntimeConfig) (Candidate, error) {
-	return embeddedCandidate{version: cfg.PolicyVersion()}, nil
+// SpoolAppender is the narrow durability boundary used by the concrete
+// collector exporter. spool.Store satisfies it without exposing its segment
+// representation to OTel components.
+type SpoolAppender interface {
+	Append(context.Context, spool.DataClass, spool.Batch) error
 }
 
-type embeddedCandidate struct{ version uint64 }
+// EmbeddedBuilder instantiates only the receivers and processors in the
+// DBPilot catalog and routes their output to the local durable spool.
+type EmbeddedBuilder struct{ spool SpoolAppender }
 
-func (c embeddedCandidate) Start(context.Context) error   { return nil }
-func (c embeddedCandidate) Healthy(context.Context) error { return nil }
-func (c embeddedCandidate) Stop(context.Context) error    { return nil }
-func (c embeddedCandidate) Version() uint64               { return c.version }
+func NewEmbeddedBuilder(store SpoolAppender) EmbeddedBuilder { return EmbeddedBuilder{spool: store} }
+
+func (b EmbeddedBuilder) Build(ctx context.Context, cfg RuntimeConfig) (Candidate, error) {
+	if b.spool == nil {
+		return nil, errors.New("embedded collector requires a spool")
+	}
+	if err := validateEmbeddedGraph(cfg); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	candidate := &embeddedCandidate{
+		version: cfg.PolicyVersion(),
+		host:    embeddedHost{extensions: make(map[component.ID]component.Component)},
+	}
+	settings := component.TelemetrySettings{
+		Logger:         zap.NewNop(),
+		TracerProvider: tracenoop.NewTracerProvider(),
+		MeterProvider:  metricnoop.NewMeterProvider(),
+	}
+	catalog := NewCatalog().(*catalog)
+	if err := candidate.buildExtensions(ctx, cfg, catalog, settings); err != nil {
+		return nil, err
+	}
+	if err := candidate.buildPipelines(ctx, cfg, catalog, settings, b.spool); err != nil {
+		_ = candidate.Stop(context.Background())
+		return nil, err
+	}
+	return candidate, nil
+}
+
+func validateEmbeddedGraph(cfg RuntimeConfig) error {
+	if cfg.PolicyVersion() == 0 || len(cfg.receivers) == 0 || len(cfg.pipelines) == 0 {
+		return errors.New("invalid embedded collector graph")
+	}
+	exporter, ok := cfg.Exporter("dbpilot")
+	if !ok || exporter.MaxBatchBytes <= 0 {
+		return errors.New("invalid DBPilot spool exporter")
+	}
+	for receiverID, source := range cfg.sources {
+		receiver, ok := cfg.receivers[receiverID]
+		if !ok || receiver.id != receiverID || receiver.kind == "" || source.PipelineID == "" {
+			return fmt.Errorf("invalid receiver graph entry %q", receiverID)
+		}
+		pipeline, ok := cfg.pipelines[source.PipelineID]
+		if !ok || !containsID(pipeline.receiverIDs, receiverID) || !containsID(pipeline.exporterIDs, "dbpilot") {
+			return fmt.Errorf("receiver %q is not routed to DBPilot spool exporter", receiverID)
+		}
+		for _, processorID := range pipeline.processorIDs {
+			if _, ok := cfg.processors[processorID]; !ok {
+				return fmt.Errorf("pipeline %q references unknown processor %q", pipeline.id, processorID)
+			}
+		}
+	}
+	return nil
+}
+
+func containsID(ids []string, target string) bool {
+	for _, id := range ids {
+		if id == target {
+			return true
+		}
+	}
+	return false
+}
+
+type embeddedCandidate struct {
+	version uint64
+	host    embeddedHost
+
+	mu         sync.Mutex
+	started    bool
+	stopped    bool
+	extensions []extension.Extension
+	processors []component.Component
+	receivers  []component.Component
+}
+
+func (c *embeddedCandidate) Version() uint64 { return c.version }
+
+func (c *embeddedCandidate) buildExtensions(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings) error {
+	for _, extensionID := range sortedKeys(cfg.extensions) {
+		entry := cfg.extensions[extensionID]
+		if entry.kind != "file_storage" || allowed.fileStorageFactory() == nil {
+			return fmt.Errorf("unsupported embedded extension %q", extensionID)
+		}
+		id, err := componentID(extensionID)
+		if err != nil {
+			return err
+		}
+		componentExtension, err := allowed.fileStorageFactory().Create(ctx, extension.Settings{ID: id, TelemetrySettings: settings}, entry.config)
+		if err != nil {
+			return fmt.Errorf("create extension %q: %w", extensionID, err)
+		}
+		c.extensions = append(c.extensions, componentExtension)
+		c.host.extensions[id] = componentExtension
+	}
+	return nil
+}
+
+func (c *embeddedCandidate) buildPipelines(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, store SpoolAppender) error {
+	exporter, _ := cfg.Exporter("dbpilot")
+	logNext, err := newSpoolLogsConsumer(store, c.version, exporter)
+	if err != nil {
+		return err
+	}
+	metricNext, err := newSpoolMetricsConsumer(store, c.version, exporter)
+	if err != nil {
+		return err
+	}
+	logProcessors, err := c.buildLogProcessors(ctx, cfg, allowed, settings, logNext)
+	if err != nil {
+		return err
+	}
+	metricProcessors, err := c.buildMetricProcessors(ctx, cfg, allowed, settings, metricNext)
+	if err != nil {
+		return err
+	}
+	for _, receiverID := range cfg.ReceiverIDs() {
+		entry := cfg.receivers[receiverID]
+		source := cfg.sources[receiverID]
+		factory, ok := allowed.ReceiverFactory(entry.kind)
+		if !ok {
+			return fmt.Errorf("receiver %q is not in the embedded catalog", entry.kind)
+		}
+		id, err := componentID(receiverID)
+		if err != nil {
+			return err
+		}
+		receiverSettings := receiver.Settings{ID: id, TelemetrySettings: settings}
+		switch source.PipelineID {
+		case logsPipelineID:
+			next, err := tagLogsConsumer(logProcessors, source.ResourceAttributes)
+			if err != nil {
+				return err
+			}
+			componentReceiver, err := factory.CreateLogs(ctx, receiverSettings, entry.config, next)
+			if err != nil {
+				return fmt.Errorf("create log receiver %q: %w", receiverID, err)
+			}
+			c.receivers = append(c.receivers, componentReceiver)
+		case metricsPipelineID:
+			next, err := tagMetricsConsumer(metricProcessors, source.ResourceAttributes)
+			if err != nil {
+				return err
+			}
+			componentReceiver, err := factory.CreateMetrics(ctx, receiverSettings, entry.config, next)
+			if err != nil {
+				return fmt.Errorf("create metrics receiver %q: %w", receiverID, err)
+			}
+			c.receivers = append(c.receivers, componentReceiver)
+		default:
+			return fmt.Errorf("unsupported pipeline %q", source.PipelineID)
+		}
+	}
+	return nil
+}
+
+func (c *embeddedCandidate) buildLogProcessors(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, next consumer.Logs) (consumer.Logs, error) {
+	for index := len(cfg.ProcessorIDs()) - 1; index >= 0; index-- {
+		processorID := cfg.ProcessorIDs()[index]
+		entry := cfg.processors[processorID]
+		factory, ok := allowed.ProcessorFactory(entry.kind)
+		if !ok {
+			return nil, fmt.Errorf("processor %q is not in the embedded catalog", entry.kind)
+		}
+		id, err := componentID(processorID)
+		if err != nil {
+			return nil, err
+		}
+		componentProcessor, err := factory.CreateLogs(ctx, processor.Settings{ID: id, TelemetrySettings: settings}, entry.config, next)
+		if err != nil {
+			return nil, fmt.Errorf("create log processor %q: %w", processorID, err)
+		}
+		c.processors = append(c.processors, componentProcessor)
+		next = componentProcessor
+	}
+	return next, nil
+}
+
+func (c *embeddedCandidate) buildMetricProcessors(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, next consumer.Metrics) (consumer.Metrics, error) {
+	for index := len(cfg.ProcessorIDs()) - 1; index >= 0; index-- {
+		processorID := cfg.ProcessorIDs()[index]
+		entry := cfg.processors[processorID]
+		factory, ok := allowed.ProcessorFactory(entry.kind)
+		if !ok {
+			return nil, fmt.Errorf("processor %q is not in the embedded catalog", entry.kind)
+		}
+		id, err := componentID(processorID)
+		if err != nil {
+			return nil, err
+		}
+		componentProcessor, err := factory.CreateMetrics(ctx, processor.Settings{ID: id, TelemetrySettings: settings}, entry.config, next)
+		if err != nil {
+			return nil, fmt.Errorf("create metrics processor %q: %w", processorID, err)
+		}
+		c.processors = append(c.processors, componentProcessor)
+		next = componentProcessor
+	}
+	return next, nil
+}
+
+func componentID(raw string) (component.ID, error) {
+	var id component.ID
+	if err := id.UnmarshalText([]byte(raw)); err != nil {
+		return component.ID{}, fmt.Errorf("invalid component ID %q: %w", raw, err)
+	}
+	return id, nil
+}
+
+func (c *embeddedCandidate) Start(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started && !c.stopped {
+		return nil
+	}
+	if c.stopped {
+		return errors.New("embedded collector has been stopped")
+	}
+	if ctx == nil {
+		return errors.New("embedded collector start requires a context")
+	}
+	for _, componentExtension := range c.extensions {
+		if err := componentExtension.Start(ctx, &c.host); err != nil {
+			c.shutdownLocked(context.Background())
+			return fmt.Errorf("start embedded extension: %w", err)
+		}
+	}
+	for _, componentProcessor := range c.processors {
+		if err := componentProcessor.Start(ctx, &c.host); err != nil {
+			c.shutdownLocked(context.Background())
+			return fmt.Errorf("start embedded processor: %w", err)
+		}
+	}
+	for _, componentReceiver := range c.receivers {
+		if err := componentReceiver.Start(ctx, &c.host); err != nil {
+			c.shutdownLocked(context.Background())
+			return fmt.Errorf("start embedded receiver: %w", err)
+		}
+	}
+	c.started = true
+	return nil
+}
+
+func (c *embeddedCandidate) Healthy(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.started || c.stopped || len(c.receivers) == 0 || len(c.processors) == 0 {
+		return errors.New("embedded collector components are not running")
+	}
+	for _, componentReceiver := range c.receivers {
+		if componentReceiver == nil {
+			return errors.New("embedded collector receiver is unavailable")
+		}
+	}
+	return nil
+}
+
+func (c *embeddedCandidate) Stop(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return nil
+	}
+	c.stopped = true
+	return c.shutdownLocked(ctx)
+}
+
+func (c *embeddedCandidate) shutdownLocked(ctx context.Context) error {
+	var errs []error
+	for index := len(c.receivers) - 1; index >= 0; index-- {
+		if err := c.receivers[index].Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for index := len(c.processors) - 1; index >= 0; index-- {
+		if err := c.processors[index].Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for index := len(c.extensions) - 1; index >= 0; index-- {
+		if err := c.extensions[index].Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+type embeddedHost struct {
+	extensions map[component.ID]component.Component
+}
+
+func (h *embeddedHost) GetExtensions() map[component.ID]component.Component {
+	return maps.Clone(h.extensions)
+}
+
+func tagLogsConsumer(next consumer.Logs, attributes map[string]string) (consumer.Logs, error) {
+	return consumer.NewLogs(func(ctx context.Context, logs plog.Logs) error {
+		for index := 0; index < logs.ResourceLogs().Len(); index++ {
+			resource := logs.ResourceLogs().At(index).Resource().Attributes()
+			for key, value := range attributes {
+				resource.PutStr(key, value)
+			}
+		}
+		return next.ConsumeLogs(ctx, logs)
+	})
+}
+
+func tagMetricsConsumer(next consumer.Metrics, attributes map[string]string) (consumer.Metrics, error) {
+	return consumer.NewMetrics(func(ctx context.Context, metrics pmetric.Metrics) error {
+		for index := 0; index < metrics.ResourceMetrics().Len(); index++ {
+			resource := metrics.ResourceMetrics().At(index).Resource().Attributes()
+			for key, value := range attributes {
+				resource.PutStr(key, value)
+			}
+		}
+		return next.ConsumeMetrics(ctx, metrics)
+	})
+}
+
+type spoolLogsConsumer struct {
+	store    SpoolAppender
+	version  uint64
+	exporter ExporterConfig
+	sequence atomic.Uint64
+}
+
+func newSpoolLogsConsumer(store SpoolAppender, version uint64, exporter ExporterConfig) (consumer.Logs, error) {
+	c := &spoolLogsConsumer{store: store, version: version, exporter: exporter}
+	return consumer.NewLogs(c.ConsumeLogs)
+}
+
+func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) error {
+	for index := 0; index < logs.ResourceLogs().Len(); index++ {
+		one := plog.NewLogs()
+		logs.ResourceLogs().At(index).CopyTo(one.ResourceLogs().AppendEmpty())
+		payload, err := (&plog.ProtoMarshaler{}).MarshalLogs(one)
+		if err != nil {
+			return err
+		}
+		if err := c.exporter.ValidateBatchBytes(int64(len(payload))); err != nil {
+			return err
+		}
+		if err := c.store.Append(ctx, spool.Log, spool.Batch{ID: c.batchID("log"), SourceID: sourceID(one.ResourceLogs().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type spoolMetricsConsumer struct {
+	store    SpoolAppender
+	version  uint64
+	exporter ExporterConfig
+	sequence atomic.Uint64
+}
+
+func newSpoolMetricsConsumer(store SpoolAppender, version uint64, exporter ExporterConfig) (consumer.Metrics, error) {
+	c := &spoolMetricsConsumer{store: store, version: version, exporter: exporter}
+	return consumer.NewMetrics(c.ConsumeMetrics)
+}
+
+func (c *spoolMetricsConsumer) ConsumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
+	for index := 0; index < metrics.ResourceMetrics().Len(); index++ {
+		one := pmetric.NewMetrics()
+		metrics.ResourceMetrics().At(index).CopyTo(one.ResourceMetrics().AppendEmpty())
+		payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(one)
+		if err != nil {
+			return err
+		}
+		if err := c.exporter.ValidateBatchBytes(int64(len(payload))); err != nil {
+			return err
+		}
+		if err := c.store.Append(ctx, spool.Metric, spool.Batch{ID: c.batchID("metric"), SourceID: sourceID(one.ResourceMetrics().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *spoolLogsConsumer) batchID(kind string) string {
+	return batchID(c.version, kind, c.sequence.Add(1))
+}
+
+func (c *spoolMetricsConsumer) batchID(kind string) string {
+	return batchID(c.version, kind, c.sequence.Add(1))
+}
+
+func batchID(version uint64, kind string, sequence uint64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%d/%s/%d", version, kind, sequence)))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func sourceID(attributes pcommon.Map) string {
+	if value, ok := attributes.Get("dbpilot.source.id"); ok && value.Type() == pcommon.ValueTypeStr {
+		return value.Str()
+	}
+	return "unknown"
+}
 
 // ApplyState describes the outcome of a policy application attempt.
 type ApplyState string

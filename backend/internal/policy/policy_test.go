@@ -52,6 +52,15 @@ func TestValidateAcceptsFileSourceWithinAllowedRoot(t *testing.T) {
 	}
 }
 
+// A platform-native absolute path is required for the embedded file receiver
+// to run on the Agent's host operating system.
+func TestValidateStructuralAcceptsNativeAbsoluteFilePath(t *testing.T) {
+	p := validPolicy(fileSource(filepath.Join(t.TempDir(), "application.log")))
+	if err := policy.ValidateStructural(p); err != nil {
+		t.Fatalf("ValidateStructural() error = %v", err)
+	}
+}
+
 func TestValidateRejectsPathTraversal(t *testing.T) {
 	p := validPolicy(fileSource("/var/log/app/../secrets.log"))
 	err := policy.Validate(p, testEnvironment(func(path string) (string, error) { return path, nil }))
