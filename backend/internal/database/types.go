@@ -13,13 +13,17 @@ import (
 type EngineFamily string
 
 const (
-	MySQLFamily    EngineFamily = "mysql"
-	PostgresFamily EngineFamily = "postgres"
-	OracleFamily   EngineFamily = "oracle"
-	DamengFamily   EngineFamily = "dameng"
-	MongoFamily    EngineFamily = "mongo"
-	HBaseFamily    EngineFamily = "hbase"
-	Neo4JFamily    EngineFamily = "neo4j"
+	MySQLFamily     EngineFamily = "mysql"
+	MariaDBFamily   EngineFamily = "mariadb"
+	TiDBFamily      EngineFamily = "tidb"
+	OceanBaseFamily EngineFamily = "oceanbase"
+	PostgresFamily  EngineFamily = "postgres"
+	OpenGaussFamily EngineFamily = "opengauss"
+	OracleFamily    EngineFamily = "oracle"
+	DamengFamily    EngineFamily = "dameng"
+	MongoFamily     EngineFamily = "mongo"
+	HBaseFamily     EngineFamily = "hbase"
+	Neo4JFamily     EngineFamily = "neo4j"
 )
 
 // TLSConfig contains non-secret TLS connection settings. Certificate material
