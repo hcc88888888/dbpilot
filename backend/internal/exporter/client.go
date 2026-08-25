@@ -12,6 +12,7 @@ import (
 
 	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
 	"dbpilot.local/platform/internal/spool"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -19,6 +20,20 @@ import (
 const pendingScanLimit = 1
 
 var ErrPermanentRejection = errors.New("telemetry batch permanently rejected")
+
+// PermanentRejectionError exposes the gateway's typed rejection information
+// to the runtime while retaining ErrPermanentRejection for simple callers.
+type PermanentRejectionError struct {
+	BatchID    string
+	Reason     string
+	StatusCode codes.Code
+	Err        error
+}
+
+func (e *PermanentRejectionError) Error() string {
+	return fmt.Sprintf("%v: batch=%s reason=%s status=%s", ErrPermanentRejection, e.BatchID, e.Reason, e.StatusCode)
+}
+func (e *PermanentRejectionError) Unwrap() error { return errors.Join(ErrPermanentRejection, e.Err) }
 
 // PendingStore is the narrow spool view needed by the exporter.
 type PendingStore interface {
@@ -94,6 +109,12 @@ func (c *Client) deliver(ctx context.Context, item pendingBatch) error {
 			return err
 		}
 		ack, err := c.push(ctx, item)
+		if err == nil && ack == nil {
+			return c.invalidAck(item.batch.ID, "empty acknowledgement")
+		}
+		if err == nil && ack.BatchId != item.batch.ID {
+			return c.invalidAck(item.batch.ID, "ack batch_id does not match sent batch")
+		}
 		if err == nil && ack.Accepted {
 			return c.store.Ack(ctx, item.class, item.batch.ID)
 		}
@@ -103,11 +124,18 @@ func (c *Client) deliver(ctx context.Context, item pendingBatch) error {
 				detail = "gateway rejected batch"
 			}
 			c.store.RecordHealthFinding("TELEMETRY_PERMANENT_REJECTION", detail)
-			return fmt.Errorf("%w: %s", ErrPermanentRejection, detail)
+			return c.permanent(item.batch.ID, detail, codes.OK, nil)
 		}
-		if err != nil && isPermanentRPC(err) {
-			c.store.RecordHealthFinding("TELEMETRY_PERMANENT_REJECTION", status.Code(err).String())
-			return fmt.Errorf("%w: %v", ErrPermanentRejection, err)
+		if err != nil {
+			if reason, permanent := permanentGatewayReason(err); permanent {
+				c.store.RecordHealthFinding("TELEMETRY_PERMANENT_REJECTION", reason)
+				return c.permanent(item.batch.ID, reason, status.Code(err), err)
+			}
+			if isPermanentRPC(err) {
+				reason := status.Code(err).String()
+				c.store.RecordHealthFinding("TELEMETRY_PERMANENT_REJECTION", reason)
+				return c.permanent(item.batch.ID, reason, status.Code(err), err)
+			}
 		}
 		if err := wait(ctx, backoff); err != nil {
 			return err
@@ -117,6 +145,15 @@ func (c *Client) deliver(ctx context.Context, item pendingBatch) error {
 			backoff = c.maxBackoff
 		}
 	}
+}
+
+func (c *Client) invalidAck(batchID, detail string) error {
+	c.store.RecordHealthFinding("TELEMETRY_INVALID_ACK", detail)
+	return c.permanent(batchID, "INVALID_ACK", codes.Unknown, errors.New(detail))
+}
+
+func (c *Client) permanent(batchID, reason string, code codes.Code, err error) error {
+	return &PermanentRejectionError{BatchID: batchID, Reason: reason, StatusCode: code, Err: err}
 }
 
 func (c *Client) push(ctx context.Context, item pendingBatch) (*telemetryv1.BatchAck, error) {
@@ -134,6 +171,20 @@ func isPermanentRPC(err error) bool {
 	default:
 		return false
 	}
+}
+
+func permanentGatewayReason(err error) (string, bool) {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.ResourceExhausted {
+		return "", false
+	}
+	for _, detail := range st.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if ok && info.Domain == "dbpilot.telemetry" && info.Reason == "BATCH_TOO_LARGE" {
+			return info.Reason, true
+		}
+	}
+	return "", false
 }
 
 func wait(ctx context.Context, delay time.Duration) error {

@@ -76,6 +76,43 @@ func TestIngestReturnsSameAcceptedAckForDuplicateBatch(t *testing.T) {
 	assert.Len(t, service.ReceivedBatches(), 1)
 }
 
+func TestIngestDeduplicatesConcurrentRequestsAtomically(t *testing.T) {
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
+	batch := validLogBatch("concurrent", "agent-a", []byte("payload"))
+	var wait sync.WaitGroup
+	errors := make(chan error, 16)
+	for range 16 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, err := service.PushLogBatch(contextWithSPIFFEAgent(t, "agent-a"), batch)
+			errors <- err
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	assert.Len(t, service.ReceivedBatches(), 1)
+}
+
+func TestReportPolicyStatusUsesVerifiedSPIFFEIdentity(t *testing.T) {
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
+
+	ack, err := service.ReportPolicyStatus(contextWithSPIFFEAgent(t, "agent-a"), &telemetryv1.PolicyStatus{AgentId: "agent-a"})
+	require.NoError(t, err)
+	assert.True(t, ack.Accepted)
+
+	_, err = service.ReportPolicyStatus(contextWithSPIFFEAgent(t, "agent-a"), &telemetryv1.PolicyStatus{AgentId: "agent-b"})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+
+	_, err = service.ReportPolicyStatus(contextWithSPIFFEAgent(t, "agent-b"), &telemetryv1.PolicyStatus{AgentId: "agent-b"})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
 func validLogBatch(id, agentID string, payload []byte) *telemetryv1.LogBatch {
 	checksum := sha256.Sum256(payload)
 	return &telemetryv1.LogBatch{BatchId: id, AgentId: agentID, SourceId: "source", Payload: payload, Checksum: checksum[:]}

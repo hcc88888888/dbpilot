@@ -15,6 +15,7 @@ import (
 	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -44,6 +45,7 @@ type Service struct {
 	telemetryv1.UnimplementedTelemetryIngestServer
 	identities AgentIdentityResolver
 	dedup      BatchDeduplicator
+	dedupMu    sync.Mutex
 	receivedMu sync.Mutex
 	received   []BatchMetadata
 }
@@ -76,26 +78,26 @@ func (s *Service) PushMetricBatch(ctx context.Context, batch *telemetryv1.Metric
 	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum)
 }
 
-func (s *Service) ReportPolicyStatus(_ context.Context, _ *telemetryv1.PolicyStatus) (*telemetryv1.PolicyStatusAck, error) {
+func (s *Service) ReportPolicyStatus(ctx context.Context, report *telemetryv1.PolicyStatus) (*telemetryv1.PolicyStatusAck, error) {
+	if report == nil {
+		return nil, status.Error(codes.InvalidArgument, "policy status is required")
+	}
+	if _, err := s.authorize(ctx, report.AgentId); err != nil {
+		return nil, err
+	}
 	return &telemetryv1.PolicyStatusAck{Accepted: true}, nil
 }
 
 func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID string, payload, checksum []byte) (*telemetryv1.BatchAck, error) {
-	authenticatedAgentID, err := verifiedSPIFFEAgent(ctx)
+	authenticatedAgentID, err := s.authorize(ctx, claimedAgentID)
 	if err != nil {
-		return nil, status.Error(codes.Unauthenticated, err.Error())
-	}
-	if claimedAgentID == "" || subtle.ConstantTimeCompare([]byte(authenticatedAgentID), []byte(claimedAgentID)) != 1 {
-		return nil, status.Error(codes.PermissionDenied, "claimed agent does not match verified certificate identity")
-	}
-	if s.identities == nil || !s.identities.KnownAgent(ctx, authenticatedAgentID) {
-		return nil, status.Error(codes.PermissionDenied, "unknown agent")
+		return nil, err
 	}
 	if batchID == "" || sourceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "batch_id and source_id are required")
 	}
 	if len(payload) > MaxBatchPayloadBytes {
-		return nil, status.Error(codes.ResourceExhausted, "batch payload exceeds maximum size")
+		return nil, batchTooLargeError()
 	}
 	expected := sha256.Sum256(payload)
 	if len(checksum) != len(expected) || subtle.ConstantTimeCompare(expected[:], checksum) != 1 {
@@ -104,6 +106,8 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	if s.dedup == nil {
 		return nil, status.Error(codes.Internal, "batch deduplicator is unavailable")
 	}
+	s.dedupMu.Lock()
+	defer s.dedupMu.Unlock()
 	if ack, ok := s.dedup.Lookup(authenticatedAgentID, batchID); ok {
 		return ack, nil
 	}
@@ -113,6 +117,28 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	s.received = append(s.received, BatchMetadata{BatchID: batchID, AgentID: authenticatedAgentID, SourceID: sourceID, PayloadBytes: len(payload), ReceivedAt: time.Now().UTC()})
 	s.receivedMu.Unlock()
 	return ack, nil
+}
+
+func (s *Service) authorize(ctx context.Context, claimedAgentID string) (string, error) {
+	authenticatedAgentID, err := verifiedSPIFFEAgent(ctx)
+	if err != nil {
+		return "", status.Error(codes.Unauthenticated, err.Error())
+	}
+	if claimedAgentID == "" || subtle.ConstantTimeCompare([]byte(authenticatedAgentID), []byte(claimedAgentID)) != 1 {
+		return "", status.Error(codes.PermissionDenied, "claimed agent does not match verified certificate identity")
+	}
+	if s.identities == nil || !s.identities.KnownAgent(ctx, authenticatedAgentID) {
+		return "", status.Error(codes.PermissionDenied, "unknown agent")
+	}
+	return authenticatedAgentID, nil
+}
+
+func batchTooLargeError() error {
+	st, err := status.New(codes.ResourceExhausted, "batch payload exceeds maximum size").WithDetails(&errdetails.ErrorInfo{Reason: "BATCH_TOO_LARGE", Domain: "dbpilot.telemetry"})
+	if err != nil {
+		return status.Error(codes.ResourceExhausted, "batch payload exceeds maximum size")
+	}
+	return st.Err()
 }
 
 // ReceivedBatches returns the local contract gateway's metadata view.

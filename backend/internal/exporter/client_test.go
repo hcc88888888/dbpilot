@@ -11,7 +11,10 @@ import (
 	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestSendPendingAcknowledgesAcceptedBatchesOldestFirst(t *testing.T) {
@@ -55,6 +58,49 @@ func TestSendPendingRecordsPermanentRejectionWithoutAcknowledging(t *testing.T) 
 	require.ErrorIs(t, err, ErrPermanentRejection)
 	assert.Empty(t, store.acks)
 	assert.Equal(t, []healthFinding{{"TELEMETRY_PERMANENT_REJECTION", "CHECKSUM_INVALID"}}, store.findings)
+}
+
+func TestSendPendingTreatsTypedGatewayOversizeAsPermanent(t *testing.T) {
+	store := &fakeStore{pending: map[spool.DataClass][]spool.Batch{spool.Log: {testBatch("oversize", time.Now())}}}
+	api := &fakeIngest{err: gatewayOversizeError()}
+
+	err := NewClient(api, store, "agent-a").SendPending(context.Background())
+
+	var permanent *PermanentRejectionError
+	require.ErrorAs(t, err, &permanent)
+	assert.Equal(t, codes.ResourceExhausted, permanent.StatusCode)
+	assert.Equal(t, "BATCH_TOO_LARGE", permanent.Reason)
+	assert.Empty(t, store.acks)
+	assert.Len(t, api.sent, 1)
+	assert.Equal(t, []healthFinding{{"TELEMETRY_PERMANENT_REJECTION", "BATCH_TOO_LARGE"}}, store.findings)
+}
+
+func TestSendPendingRetriesUntypedResourceExhaustion(t *testing.T) {
+	store := &fakeStore{pending: map[spool.DataClass][]spool.Batch{spool.Log: {testBatch("transient-capacity", time.Now())}}}
+	api := &fakeIngest{err: status.Error(codes.ResourceExhausted, "upstream temporarily saturated")}
+	client := NewClient(api, store, "agent-a")
+	client.initialBackoff = time.Millisecond
+	client.maxBackoff = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := client.SendPending(ctx)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Empty(t, store.acks)
+	assert.Empty(t, store.findings)
+	assert.GreaterOrEqual(t, len(api.sent), 2)
+}
+
+func TestSendPendingRetainsBatchForMalformedAcceptedAcknowledgement(t *testing.T) {
+	store := &fakeStore{pending: map[spool.DataClass][]spool.Batch{spool.Log: {testBatch("expected", time.Now())}}}
+	api := &fakeIngest{acks: map[string]*telemetryv1.BatchAck{"expected": {BatchId: "different", Accepted: true}}}
+
+	err := NewClient(api, store, "agent-a").SendPending(context.Background())
+
+	require.ErrorIs(t, err, ErrPermanentRejection)
+	assert.Empty(t, store.acks)
+	assert.Equal(t, []healthFinding{{"TELEMETRY_INVALID_ACK", "ack batch_id does not match sent batch"}}, store.findings)
 }
 
 func TestSendPendingStopsOnCancellationBeforeRead(t *testing.T) {
@@ -120,6 +166,14 @@ type fakeIngest struct {
 	acks map[string]*telemetryv1.BatchAck
 	sent []string
 	err  error
+}
+
+func gatewayOversizeError() error {
+	st, err := status.New(codes.ResourceExhausted, "batch payload exceeds maximum size").WithDetails(&errdetails.ErrorInfo{Reason: "BATCH_TOO_LARGE", Domain: "dbpilot.telemetry"})
+	if err != nil {
+		panic(err)
+	}
+	return st.Err()
 }
 
 func (f *fakeIngest) PushLogBatch(_ context.Context, batch *telemetryv1.LogBatch, _ ...grpc.CallOption) (*telemetryv1.BatchAck, error) {
