@@ -101,7 +101,7 @@ func TestCompileConfiguresConcreteCollectorComponents(t *testing.T) {
 	if !ok {
 		t.Fatalf("memory limiter config type = %T", cfg.processors["memory_limiter"].config)
 	}
-	if memoryConfig.MemoryLimitMiB != 8 || memoryConfig.MemorySpikeLimitMiB >= memoryConfig.MemoryLimitMiB {
+	if memoryConfig.MemoryLimitMiB != defaultMemoryLimitMiB || memoryConfig.MemorySpikeLimitMiB != defaultMemorySpikeLimitMiB {
 		t.Errorf("memory limiter config = limit=%d spike=%d", memoryConfig.MemoryLimitMiB, memoryConfig.MemorySpikeLimitMiB)
 	}
 	if err := memoryConfig.Validate(); err != nil {
@@ -112,7 +112,7 @@ func TestCompileConfiguresConcreteCollectorComponents(t *testing.T) {
 	if !ok {
 		t.Fatalf("batch config type = %T", cfg.processors["batch"].config)
 	}
-	if batchConfig.SendBatchMaxSize != 2<<20 || batchConfig.SendBatchSize == 0 {
+	if batchConfig.SendBatchMaxSize != 0 || batchConfig.SendBatchSize == 0 {
 		t.Errorf("batch config = max=%d size=%d", batchConfig.SendBatchMaxSize, batchConfig.SendBatchSize)
 	}
 	if err := batchConfig.Validate(); err != nil {
@@ -130,8 +130,67 @@ func TestCompileConfiguresConcreteCollectorComponents(t *testing.T) {
 		t.Errorf("file storage Validate() error = %v", err)
 	}
 
-	if got := cfg.exporters["dbpilot"].resourceAttributes["service.name"]; got != "billing" {
-		t.Errorf("exporter resource service.name = %q", got)
+	exporter, ok := cfg.Exporter("dbpilot")
+	if !ok {
+		t.Fatal("compiled DBPilot exporter is missing")
+	}
+	if exporter.MaxBatchBytes != p.Limits.MaxBatchBytes {
+		t.Errorf("DBPilot exporter byte batch limit = %d, want %d", exporter.MaxBatchBytes, p.Limits.MaxBatchBytes)
+	}
+	if err := exporter.ValidateBatchBytes(p.Limits.MaxBatchBytes); err != nil {
+		t.Errorf("ValidateBatchBytes(limit) error = %v", err)
+	}
+	if err := exporter.ValidateBatchBytes(p.Limits.MaxBatchBytes + 1); err == nil {
+		t.Error("ValidateBatchBytes(limit + 1) error = nil, want byte-limit rejection")
+	}
+	if got := exporter.SourceResourceAttributes["prometheus/prom"]["service.name"]; got != "billing" {
+		t.Errorf("prometheus resource service.name = %q", got)
+	}
+}
+
+func TestCompilePreservesResourceAttributesPerSource(t *testing.T) {
+	p := runtimeTestPolicy([]policy.Source{
+		{ID: "alpha", Kind: policy.SourceFileLog, Path: "/var/log/alpha.log", Interval: time.Second, Labels: map[string]string{"service.name": "alpha"}},
+		{ID: "beta", Kind: policy.SourceFileLog, Path: "/var/log/beta.log", Interval: time.Second, Labels: map[string]string{"service.name": "beta"}},
+	})
+
+	cfg, err := Compile(p, NewCatalog())
+	if err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+	exporter, ok := cfg.Exporter("dbpilot")
+	if !ok {
+		t.Fatal("compiled DBPilot exporter is missing")
+	}
+	for receiverID, want := range map[string]struct{ service, sourceID string }{
+		"file_log/alpha": {service: "alpha", sourceID: "alpha"},
+		"file_log/beta":  {service: "beta", sourceID: "beta"},
+	} {
+		attributes, exists := exporter.SourceResourceAttributes[receiverID]
+		if !exists {
+			t.Errorf("exporter source attributes missing for %q", receiverID)
+			continue
+		}
+		if attributes["service.name"] != want.service || attributes["dbpilot.source.id"] != want.sourceID {
+			t.Errorf("exporter source attributes for %q = %#v", receiverID, attributes)
+		}
+	}
+
+	pipeline, ok := cfg.Pipeline(logsPipelineID)
+	if !ok {
+		t.Fatal("logs pipeline is missing")
+	}
+	if got := pipeline.SourceResourceAttributes["file_log/alpha"]["service.name"]; got != "alpha" {
+		t.Errorf("logs pipeline alpha service.name = %q", got)
+	}
+	if got := pipeline.SourceResourceAttributes["file_log/beta"]["service.name"]; got != "beta" {
+		t.Errorf("logs pipeline beta service.name = %q", got)
+	}
+
+	exporter.SourceResourceAttributes["file_log/alpha"]["service.name"] = "mutated"
+	source, ok := cfg.Source("file_log/alpha")
+	if !ok || source.ResourceAttributes["service.name"] != "alpha" {
+		t.Errorf("source attributes leaked mutable exporter data: %#v", source.ResourceAttributes)
 	}
 }
 

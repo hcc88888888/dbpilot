@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"net/url"
 	"path/filepath"
 	"slices"
@@ -33,11 +32,17 @@ var (
 	ErrUnsupportedSource = errors.New("unsupported telemetry source")
 	// ErrNoPipelines prevents an inert policy from reaching the runtime.
 	ErrNoPipelines = errors.New("telemetry policy produces zero pipelines")
+	// ErrBatchExceedsLimit means a DBPilot exporter batch exceeded the signed
+	// byte limit. Collector batchprocessor limits item counts, so it cannot
+	// perform this check.
+	ErrBatchExceedsLimit = errors.New("telemetry batch exceeds byte limit")
 )
 
 const (
-	logsPipelineID    = "dbpilot/logs"
-	metricsPipelineID = "dbpilot/metrics"
+	logsPipelineID             = "dbpilot/logs"
+	metricsPipelineID          = "dbpilot/metrics"
+	defaultMemoryLimitMiB      = 256
+	defaultMemorySpikeLimitMiB = 64
 )
 
 // RuntimeConfig is an immutable inspection view over the typed Collector
@@ -66,8 +71,10 @@ type processorConfig struct {
 }
 
 type exporterConfig struct {
-	id                 string
-	resourceAttributes map[string]string
+	id                       string
+	maxBatchBytes            int64
+	resourceAttributes       map[string]string
+	sourceResourceAttributes map[string]map[string]string
 }
 
 type extensionConfig struct {
@@ -77,10 +84,11 @@ type extensionConfig struct {
 }
 
 type pipelineConfig struct {
-	id           string
-	receiverIDs  []string
-	processorIDs []string
-	exporterIDs  []string
+	id                       string
+	receiverIDs              []string
+	processorIDs             []string
+	exporterIDs              []string
+	sourceResourceAttributes map[string]map[string]string
 }
 
 type runtimeLimits struct {
@@ -121,6 +129,17 @@ type PrometheusConfig struct {
 type PipelineConfig struct {
 	ID, Signal                             string
 	ReceiverIDs, ProcessorIDs, ExporterIDs []string
+	SourceResourceAttributes               map[string]map[string]string
+}
+
+// ExporterConfig describes DBPilot's typed exporter contract. MaxBatchBytes
+// is enforced by the DBPilot spool/exporter boundary; it is deliberately not
+// mapped to Collector batchprocessor item-count fields.
+type ExporterConfig struct {
+	ID                       string
+	MaxBatchBytes            int64
+	ResourceAttributes       map[string]string
+	SourceResourceAttributes map[string]map[string]string
 }
 
 // Compile converts validated policy values into configurations for the closed
@@ -135,8 +154,10 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 		receivers:  make(map[string]receiverConfig, len(p.Sources)),
 		processors: make(map[string]processorConfig, 2),
 		exporters: map[string]exporterConfig{"dbpilot": {
-			id:                 "dbpilot",
-			resourceAttributes: map[string]string{"dbpilot.agent.id": p.AgentID},
+			id:                       "dbpilot",
+			maxBatchBytes:            p.Limits.MaxBatchBytes,
+			resourceAttributes:       map[string]string{"dbpilot.agent.id": p.AgentID},
+			sourceResourceAttributes: make(map[string]map[string]string, len(p.Sources)),
 		}},
 		extensions: make(map[string]extensionConfig, 1),
 		pipelines:  make(map[string]pipelineConfig, 2),
@@ -148,10 +169,10 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 		},
 	}
 
-	if err := cfg.addProcessor("memory_limiter", allowed, p.Limits); err != nil {
+	if err := cfg.addProcessor("memory_limiter", allowed); err != nil {
 		return RuntimeConfig{}, err
 	}
-	if err := cfg.addProcessor("batch", allowed, p.Limits); err != nil {
+	if err := cfg.addProcessor("batch", allowed); err != nil {
 		return RuntimeConfig{}, err
 	}
 	storageID, hasStorage := cfg.addFileStorage(p.AgentID, p.Limits.MaxSpoolBytes, allowed)
@@ -193,19 +214,17 @@ func (cfg *RuntimeConfig) addSource(agentID string, source policy.Source, storag
 	cfg.receivers[id] = receiverConfig{id: id, kind: componentKind, config: collectorConfig}
 	cfg.sources[id] = sourceInspection(agentID, source, pipelineID)
 	exporter := cfg.exporters["dbpilot"]
-	for key, value := range cfg.sources[id].ResourceAttributes {
-		exporter.resourceAttributes[key] = value
-	}
+	exporter.sourceResourceAttributes[id] = maps.Clone(cfg.sources[id].ResourceAttributes)
 	cfg.exporters["dbpilot"] = exporter
 	return nil
 }
 
-func (cfg *RuntimeConfig) addProcessor(name string, allowed Catalog, limits policy.Limits) error {
+func (cfg *RuntimeConfig) addProcessor(name string, allowed Catalog) error {
 	factory, ok := allowed.ProcessorFactory(name)
 	if !ok {
 		return fmt.Errorf("processor %q is not catalogued", name)
 	}
-	collectorConfig, err := configureProcessor(name, factory.CreateDefaultConfig(), limits)
+	collectorConfig, err := configureProcessor(name, factory.CreateDefaultConfig())
 	if err != nil {
 		return err
 	}
@@ -250,11 +269,19 @@ func (cfg *RuntimeConfig) addPipelines() {
 	sort.Strings(metrics)
 	processors, exporters := cfg.ProcessorIDs(), cfg.ExporterIDs()
 	if len(logs) > 0 {
-		cfg.pipelines[logsPipelineID] = pipelineConfig{id: logsPipelineID, receiverIDs: logs, processorIDs: processors, exporterIDs: exporters}
+		cfg.pipelines[logsPipelineID] = pipelineConfig{id: logsPipelineID, receiverIDs: logs, processorIDs: processors, exporterIDs: exporters, sourceResourceAttributes: cfg.sourceAttributes(logs)}
 	}
 	if len(metrics) > 0 {
-		cfg.pipelines[metricsPipelineID] = pipelineConfig{id: metricsPipelineID, receiverIDs: metrics, processorIDs: processors, exporterIDs: exporters}
+		cfg.pipelines[metricsPipelineID] = pipelineConfig{id: metricsPipelineID, receiverIDs: metrics, processorIDs: processors, exporterIDs: exporters, sourceResourceAttributes: cfg.sourceAttributes(metrics)}
 	}
+}
+
+func (cfg *RuntimeConfig) sourceAttributes(receiverIDs []string) map[string]map[string]string {
+	attributes := make(map[string]map[string]string, len(receiverIDs))
+	for _, receiverID := range receiverIDs {
+		attributes[receiverID] = maps.Clone(cfg.sources[receiverID].ResourceAttributes)
+	}
+	return attributes
 }
 
 func configureReceiver(source policy.Source, config component.Config, storageID component.ID, hasStorage bool) (component.Config, error) {
@@ -325,7 +352,7 @@ func configureReceiver(source policy.Source, config component.Config, storageID 
 	}
 }
 
-func configureProcessor(name string, config component.Config, limits policy.Limits) (component.Config, error) {
+func configureProcessor(name string, config component.Config) (component.Config, error) {
 	switch name {
 	case "memory_limiter":
 		memoryConfig, ok := config.(*memorylimiterprocessor.Config)
@@ -333,19 +360,18 @@ func configureProcessor(name string, config component.Config, limits policy.Limi
 			return nil, fmt.Errorf("memory_limiter factory returned %T", config)
 		}
 		memoryConfig.CheckInterval = time.Second
-		memoryConfig.MemoryLimitMiB = bytesToMiB(limits.MaxSpoolBytes)
-		memoryConfig.MemorySpikeLimitMiB = max(uint32(1), memoryConfig.MemoryLimitMiB/4)
-		if memoryConfig.MemorySpikeLimitMiB >= memoryConfig.MemoryLimitMiB {
-			memoryConfig.MemoryLimitMiB = memoryConfig.MemorySpikeLimitMiB + 1
-		}
+		// Collector memory pressure and on-disk spool capacity are independent
+		// budgets. The latter is configured only on file_storage below.
+		memoryConfig.MemoryLimitMiB = defaultMemoryLimitMiB
+		memoryConfig.MemorySpikeLimitMiB = defaultMemorySpikeLimitMiB
 		return memoryConfig, nil
 	case "batch":
 		batchConfig, ok := config.(*batchprocessor.Config)
 		if !ok {
 			return nil, fmt.Errorf("batch factory returned %T", config)
 		}
-		batchConfig.SendBatchSize = 1
-		batchConfig.SendBatchMaxSize = bytesToUint32(limits.MaxBatchBytes)
+		// batchprocessor sizes batches by telemetry item count, not bytes. Its
+		// defaults remain intact; DBPilot's exporter owns MaxBatchBytes.
 		return batchConfig, nil
 	default:
 		return nil, fmt.Errorf("processor %q is not configured", name)
@@ -437,27 +463,6 @@ func splitList(raw string) []string {
 	return result
 }
 
-func bytesToMiB(bytes int64) uint32 {
-	if bytes <= 0 {
-		return 2
-	}
-	value := (bytes + (1<<20 - 1)) >> 20
-	if value > math.MaxUint32 {
-		return math.MaxUint32
-	}
-	return max(uint32(2), uint32(value))
-}
-
-func bytesToUint32(bytes int64) uint32 {
-	if bytes <= 0 {
-		return 1
-	}
-	if bytes > math.MaxUint32 {
-		return math.MaxUint32
-	}
-	return uint32(bytes)
-}
-
 func storageDirectory(agentID string) string {
 	digest := sha256.Sum256([]byte(agentID))
 	return hex.EncodeToString(digest[:])
@@ -540,7 +545,33 @@ func (cfg RuntimeConfig) Pipeline(id string) (PipelineConfig, bool) {
 	if id == metricsPipelineID {
 		signal = "metrics"
 	}
-	return PipelineConfig{ID: pipeline.id, Signal: signal, ReceiverIDs: slices.Clone(pipeline.receiverIDs), ProcessorIDs: slices.Clone(pipeline.processorIDs), ExporterIDs: slices.Clone(pipeline.exporterIDs)}, true
+	return PipelineConfig{ID: pipeline.id, Signal: signal, ReceiverIDs: slices.Clone(pipeline.receiverIDs), ProcessorIDs: slices.Clone(pipeline.processorIDs), ExporterIDs: slices.Clone(pipeline.exporterIDs), SourceResourceAttributes: cloneSourceAttributes(pipeline.sourceResourceAttributes)}, true
+}
+
+// Exporter retrieves a copy of the DBPilot exporter contract for a stable ID.
+func (cfg RuntimeConfig) Exporter(id string) (ExporterConfig, bool) {
+	exporter, ok := cfg.exporters[id]
+	if !ok {
+		return ExporterConfig{}, false
+	}
+	return ExporterConfig{ID: exporter.id, MaxBatchBytes: exporter.maxBatchBytes, ResourceAttributes: maps.Clone(exporter.resourceAttributes), SourceResourceAttributes: cloneSourceAttributes(exporter.sourceResourceAttributes)}, true
+}
+
+// ValidateBatchBytes is the byte-boundary check used by DBPilot's spool and
+// exporter implementation before it emits a batch.
+func (cfg ExporterConfig) ValidateBatchBytes(bytes int64) error {
+	if bytes < 0 || bytes > cfg.MaxBatchBytes {
+		return fmt.Errorf("%w: %d > %d", ErrBatchExceedsLimit, bytes, cfg.MaxBatchBytes)
+	}
+	return nil
+}
+
+func cloneSourceAttributes(attributes map[string]map[string]string) map[string]map[string]string {
+	result := make(map[string]map[string]string, len(attributes))
+	for receiverID, resourceAttributes := range attributes {
+		result[receiverID] = maps.Clone(resourceAttributes)
+	}
+	return result
 }
 
 func (cfg RuntimeConfig) MaxSpoolBytes() int64 { return cfg.limits.maxSpoolBytes }
