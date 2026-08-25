@@ -139,6 +139,92 @@ func TestRegistryOpenAcceptsPairedTLSSecretReferences(t *testing.T) {
 	}
 }
 
+func TestRegistryOpenRejectsNonCanonicalSecretReferences(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(MySQLFamily, &fakeFactory{}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*InstanceConfig)
+	}{
+		{
+			name: "credential reference has no provider",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret:///db-primary"
+			},
+		},
+		{
+			name: "credential reference has no name",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://runtime/"
+			},
+		},
+		{
+			name: "credential reference has no path",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://runtime"
+			},
+		},
+		{
+			name: "credential reference has extra path segments",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://runtime/db-primary/secondary"
+			},
+		},
+		{
+			name: "credential reference has a query",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://runtime/db-primary?version=1"
+			},
+		},
+		{
+			name: "credential reference has a fragment",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://runtime/db-primary#current"
+			},
+		},
+		{
+			name: "credential reference has credentials",
+			mutate: func(config *InstanceConfig) {
+				config.SecretRef = "secret://user@runtime/db-primary"
+			},
+		},
+		{
+			name: "TLS CA reference has no name",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CASecretRef = "secret://runtime/"
+			},
+		},
+		{
+			name: "TLS certificate reference has extra path segments",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CertificateSecretRef = "secret://runtime/client/cert"
+				config.TLS.KeySecretRef = "secret://runtime/client-key"
+			},
+		},
+		{
+			name: "TLS key reference has extra path segments",
+			mutate: func(config *InstanceConfig) {
+				config.TLS.CertificateSecretRef = "secret://runtime/client-cert"
+				config.TLS.KeySecretRef = "secret://runtime/client/key"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config := validInstanceConfig()
+			test.mutate(&config)
+
+			if _, err := registry.Open(context.Background(), config); err == nil {
+				t.Fatal("Open() error = nil, want malformed secret reference rejection")
+			}
+		})
+	}
+}
+
 func TestRegistryRejectsTypedNilFactory(t *testing.T) {
 	registry := NewRegistry()
 	var factory nilFactoryFunc

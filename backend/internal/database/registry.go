@@ -169,8 +169,11 @@ func validateSecretRef(secretRef string) error {
 	if strings.TrimSpace(secretRef) != secretRef || secretRef == "" {
 		return fmt.Errorf("database secret reference is required")
 	}
+	if strings.ContainsAny(secretRef, "?#") {
+		return fmt.Errorf("database secret reference must use secret://provider/name format")
+	}
 	parsed, err := url.ParseRequestURI(secretRef)
-	if err != nil || parsed.Scheme != "secret" || parsed.Host == "" || parsed.Path == "" || parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || parsed.Scheme != "secret" || parsed.Host == "" || parsed.User != nil || parsed.Port() != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path == "/" || strings.Count(parsed.Path, "/") != 1 {
 		return fmt.Errorf("database secret reference must use secret://provider/name format")
 	}
 	return nil
