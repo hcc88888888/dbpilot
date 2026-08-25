@@ -59,7 +59,7 @@ func (s *Store) Append(ctx context.Context, class DataClass, batch Batch) error 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db == nil {
-		return errors.New("spool closed")
+		return ErrClosed
 	}
 	if s.find(class, batch.ID) != nil {
 		return nil
@@ -69,53 +69,55 @@ func (s *Store) Append(ctx context.Context, class DataClass, batch Batch) error 
 	if err != nil {
 		return err
 	}
+	if s.activeFile != "" && s.activeSize > 0 && s.activeSize+int64(len(encoded)) > s.limits.SegmentBytes {
+		if err := s.sealActive(); err != nil {
+			return s.auditIOFailure(class, err)
+		}
+	}
 	if err := s.makeCapacity(class, int64(len(encoded))); err != nil {
-		return err
+		return s.auditIOFailure(class, err)
 	}
-	fileName := fmt.Sprintf("%020d.seg", sequence)
-	path := filepath.Join(s.segments, fileName)
-	tmp, err := os.CreateTemp(s.segments, ".active-*")
+	if s.activeFile == "" {
+		s.activeFile = "active.open"
+		s.activeSize = 0
+	}
+	path := filepath.Join(s.segments, s.activeFile)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return s.auditIOFailure(class, err)
 	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return err
+	if _, err := file.Write(encoded); err != nil {
+		_ = file.Close()
+		return s.auditIOFailure(class, err)
 	}
-	if _, err := tmp.Write(encoded); err != nil {
-		_ = tmp.Close()
-		return err
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return s.auditIOFailure(class, err)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	if err := syncDirectory(s.segments); err != nil {
-		return err
+	if err := file.Close(); err != nil {
+		return s.auditIOFailure(class, err)
 	}
 	stored := batch
 	stored.Payload = append([]byte(nil), batch.Payload...)
 	stored.CreatedAt = stored.CreatedAt.UTC()
-	item := entry{batch: stored, class: class, sequence: sequence, file: fileName, bytes: int64(len(encoded))}
+	item := entry{batch: stored, class: class, sequence: sequence, file: s.activeFile, bytes: int64(len(encoded))}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
-		if err := tx.Bucket(bucketSegmentIndex).Put(sequenceKey(sequence), []byte(fileName)); err != nil {
+		if err := tx.Bucket(bucketSegmentIndex).Put(sequenceKey(sequence), []byte(s.activeFile)); err != nil {
 			return err
 		}
 		return tx.Bucket(bucketDedup).Put(dedupKey(class, batch.ID), sequenceKey(sequence))
 	}); err != nil {
-		_ = os.Remove(path)
-		return err
+		_ = os.Truncate(path, s.activeSize)
+		return s.auditIOFailure(class, err)
 	}
 	s.entries[class] = append(s.entries[class], item)
 	s.nextSeq = sequence
+	s.activeSize += int64(len(encoded))
+	if s.activeSize >= s.limits.SegmentBytes {
+		if err := s.sealActive(); err != nil {
+			return s.auditIOFailure(class, err)
+		}
+	}
 	return nil
 }
 
@@ -129,6 +131,9 @@ func (s *Store) Pending(ctx context.Context, class DataClass, limit int) ([]Batc
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil, ErrClosed
+	}
 	items := s.entries[class]
 	if limit == 0 || limit > len(items) {
 		limit = len(items)
@@ -142,8 +147,8 @@ func (s *Store) Pending(ctx context.Context, class DataClass, limit int) ([]Batc
 	return result, nil
 }
 
-// Ack is idempotent. Since segments are single-batch sealed files, a
-// successful acknowledgement removes the complete segment atomically.
+// Ack is idempotent. A sealed segment is removed only after all of its
+// records have been acknowledged; otherwise it is compacted durably.
 func (s *Store) Ack(ctx context.Context, class DataClass, batchID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -153,12 +158,16 @@ func (s *Store) Ack(ctx context.Context, class DataClass, batchID string) error 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.db == nil {
+		return ErrClosed
+	}
 	item := s.find(class, batchID)
 	if item == nil {
 		return nil
 	}
-	if err := os.Remove(filepath.Join(s.segments, item.file)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	size, err := s.rewriteWithout(*item)
+	if err != nil {
+		return s.auditIOFailure(class, err)
 	}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketSegmentIndex).Delete(sequenceKey(item.sequence)); err != nil {
@@ -166,9 +175,15 @@ func (s *Store) Ack(ctx context.Context, class DataClass, batchID string) error 
 		}
 		return tx.Bucket(bucketDedup).Delete(dedupKey(class, batchID))
 	}); err != nil {
-		return err
+		return s.auditIOFailure(class, err)
 	}
 	s.remove(class, batchID)
+	if item.file == s.activeFile {
+		s.activeSize = size
+		if size == 0 {
+			s.activeFile = ""
+		}
+	}
 	return nil
 }
 
@@ -180,6 +195,12 @@ func (s *Store) recover() error {
 		return err
 	}
 	sort.Strings(paths)
+	activePath := filepath.Join(s.segments, "active.open")
+	if _, err := os.Lstat(activePath); err == nil {
+		paths = append(paths, activePath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	loaded := make(map[DataClass][]entry)
 	var maxSeq uint64
 	for _, path := range paths {
@@ -206,6 +227,9 @@ func (s *Store) recover() error {
 		sort.Slice(loaded[class], func(i, j int) bool { return loaded[class][i].sequence < loaded[class][j].sequence })
 	}
 	s.entries, s.nextSeq = loaded, maxSeq
+	if info, err := os.Stat(activePath); err == nil {
+		s.activeFile, s.activeSize = filepath.Base(activePath), info.Size()
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, bucket := range [][]byte{bucketSegmentIndex, bucketDedup} {
 			b := tx.Bucket(bucket)
@@ -252,9 +276,6 @@ func (s *Store) evictionCandidate() *entry {
 		}
 		if len(choices) > 0 {
 			sort.Slice(choices, func(i, j int) bool {
-				if class == Metric {
-					return choices[i].sequence < choices[j].sequence
-				}
 				if choices[i].batch.Priority != choices[j].batch.Priority {
 					return choices[i].batch.Priority < choices[j].batch.Priority
 				}
@@ -271,7 +292,8 @@ func (s *Store) delete(class DataClass, id string) error {
 	if item == nil {
 		return nil
 	}
-	if err := os.Remove(filepath.Join(s.segments, item.file)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	size, err := s.rewriteWithout(*item)
+	if err != nil {
 		return err
 	}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
@@ -283,7 +305,140 @@ func (s *Store) delete(class DataClass, id string) error {
 		return err
 	}
 	s.remove(class, id)
+	if item.file == s.activeFile {
+		s.activeSize = size
+		if size == 0 {
+			s.activeFile = ""
+		}
+	}
 	return nil
+}
+
+func (s *Store) auditIOFailure(class DataClass, err error) error {
+	if class == AuditLog && err != nil && !errors.Is(err, ErrAuditCapacity) {
+		s.findings[FindingAuditSpoolIOFailure] = struct{}{}
+	}
+	return err
+}
+
+// sealActive promotes the fsynced active segment only when it contains
+// records. The metadata is updated after the rename; recovery can rebuild it
+// if the process stops between those operations.
+func (s *Store) sealActive() error {
+	if s.activeFile == "" {
+		return nil
+	}
+	var first uint64
+	for _, values := range s.entries {
+		for _, item := range values {
+			if item.file == s.activeFile && (first == 0 || item.sequence < first) {
+				first = item.sequence
+			}
+		}
+	}
+	if first == 0 {
+		if err := os.Remove(filepath.Join(s.segments, s.activeFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		s.activeFile, s.activeSize = "", 0
+		return nil
+	}
+	sealed := fmt.Sprintf("%020d.seg", first)
+	if err := os.Rename(filepath.Join(s.segments, s.activeFile), filepath.Join(s.segments, sealed)); err != nil {
+		return err
+	}
+	if err := syncDirectory(s.segments); err != nil {
+		return err
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		for _, values := range s.entries {
+			for _, item := range values {
+				if item.file == s.activeFile {
+					if err := tx.Bucket(bucketSegmentIndex).Put(sequenceKey(item.sequence), []byte(sealed)); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for class, values := range s.entries {
+		for index := range values {
+			if s.entries[class][index].file == s.activeFile {
+				s.entries[class][index].file = sealed
+			}
+		}
+	}
+	s.activeFile, s.activeSize = "", 0
+	return nil
+}
+
+// rewriteWithout removes one delivered or evicted record while preserving
+// every other record in the same segment. It returns the new physical size.
+func (s *Store) rewriteWithout(exclude entry) (int64, error) {
+	var remaining []entry
+	for _, values := range s.entries {
+		for _, item := range values {
+			if item.file == exclude.file && item.sequence != exclude.sequence {
+				remaining = append(remaining, item)
+			}
+		}
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i].sequence < remaining[j].sequence })
+	path := filepath.Join(s.segments, exclude.file)
+	if len(remaining) == 0 {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		return 0, nil
+	}
+	var contents []byte
+	for _, item := range remaining {
+		record, err := encodeRecord(recordHeader{ID: item.batch.ID, SourceID: item.batch.SourceID, CreatedAt: item.batch.CreatedAt.UTC(), Priority: item.batch.Priority, Checksum: item.batch.Checksum, Class: item.class, Sequence: item.sequence}, item.batch.Payload)
+		if err != nil {
+			return 0, err
+		}
+		contents = append(contents, record...)
+	}
+	if err := atomicReplace(path, contents); err != nil {
+		return 0, err
+	}
+	return int64(len(contents)), nil
+}
+
+func atomicReplace(path string, contents []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".rewrite-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(contents); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return syncDirectory(filepath.Dir(path))
 }
 
 func (s *Store) usedBytes() int64 {

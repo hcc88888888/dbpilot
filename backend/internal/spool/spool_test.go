@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -211,6 +212,112 @@ func TestOpenRejectsInvalidRoots(t *testing.T) {
 		if _, err := spool.Open(root, spool.Limits{MaxBytes: 1024, SegmentBytes: 512}); !errors.Is(err, spool.ErrInvalidRoot) {
 			t.Errorf("Open(%q) error = %v", root, err)
 		}
+	}
+}
+
+func TestOpenRejectsLinuxSymlinkAndInsecureRoots(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux root ownership and mode checks")
+	}
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.Open(link, spool.Limits{MaxBytes: 1024, SegmentBytes: 512}); !errors.Is(err, spool.ErrInvalidRoot) {
+		t.Fatalf("Open(symlink root) error = %v", err)
+	}
+	insecureRoot := filepath.Join(parent, "insecure")
+	if err := os.Mkdir(insecureRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.Open(insecureRoot, spool.Limits{MaxBytes: 1024, SegmentBytes: 512}); !errors.Is(err, spool.ErrInvalidRoot) {
+		t.Fatalf("Open(insecure root) error = %v", err)
+	}
+}
+
+func TestAuditIOFailureRaisesHealthFinding(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := spool.Open(root, spool.Limits{MaxBytes: 4096, SegmentBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	segments := filepath.Join(root, "segments")
+	if err := os.RemoveAll(segments); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segments, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.AuditLog, batch("audit-io", 10, 1)); err == nil {
+		t.Fatal("Append(audit) error = nil")
+	}
+	if !contains(store.HealthFindings(), spool.FindingAuditSpoolIOFailure) {
+		t.Fatalf("findings = %v", store.HealthFindings())
+	}
+}
+
+func TestMetricEvictionUsesPriorityThenAge(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, spool.Limits{MaxBytes: 800, SegmentBytes: 1024})
+	if err := store.Append(ctx, spool.Metric, batch("old-high", 200, 9)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.Metric, batch("new-low", 200, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.Metric, batch("incoming", 200, 5)); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.Pending(ctx, spool.Metric, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].ID != "old-high" || pending[1].ID != "incoming" {
+		t.Fatalf("pending after metric eviction = %#v", pending)
+	}
+}
+
+func TestSegmentBytesKeepsActiveSegmentUntilRotation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := spool.Open(root, spool.Limits{MaxBytes: 8192, SegmentBytes: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Append(ctx, spool.Log, batch("one", 20, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, spool.Log, batch("two", 20, 1)); err != nil {
+		t.Fatal(err)
+	}
+	sealed, _ := filepath.Glob(filepath.Join(root, "segments", "*.seg"))
+	if len(sealed) != 0 {
+		t.Fatalf("sealed segments before rotation = %v", sealed)
+	}
+	if err := store.Append(ctx, spool.Log, batch("three", 300, 1)); err != nil {
+		t.Fatal(err)
+	}
+	sealed, _ = filepath.Glob(filepath.Join(root, "segments", "*.seg"))
+	if len(sealed) != 1 {
+		t.Fatalf("sealed segments after rotation = %v", sealed)
+	}
+}
+
+func TestPendingRejectsClosedStore(t *testing.T) {
+	store := openStore(t, spool.Limits{MaxBytes: 1024, SegmentBytes: 512})
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pending(context.Background(), spool.Log, 1); !errors.Is(err, spool.ErrClosed) {
+		t.Fatalf("Pending after Close error = %v", err)
 	}
 }
 

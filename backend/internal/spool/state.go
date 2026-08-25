@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -23,11 +22,13 @@ var (
 	ErrAuditCapacity  = errors.New("audit spool capacity exhausted")
 	ErrNoActivePolicy = errors.New("no active policy")
 	ErrNoCheckpoint   = errors.New("no checkpoint")
+	ErrClosed         = errors.New("spool closed")
 )
 
 const (
-	FindingAuditSpoolFull = "AUDIT_SPOOL_FULL"
-	FindingCorruptSegment = "CORRUPT_SEGMENT"
+	FindingAuditSpoolFull      = "AUDIT_SPOOL_FULL"
+	FindingAuditSpoolIOFailure = "AUDIT_SPOOL_IO_FAILURE"
+	FindingCorruptSegment      = "CORRUPT_SEGMENT"
 )
 
 var (
@@ -75,6 +76,8 @@ type Store struct {
 	nextSeq    uint64
 	entries    map[DataClass][]entry
 	findings   map[string]struct{}
+	activeFile string
+	activeSize int64
 }
 
 // Close flushes bbolt state. It is safe to call more than once.
@@ -83,6 +86,9 @@ func (s *Store) Close() error {
 	defer s.mu.Unlock()
 	if s.db == nil {
 		return nil
+	}
+	if err := s.sealActive(); err != nil {
+		return err
 	}
 	err := s.db.Close()
 	s.db = nil
@@ -98,23 +104,23 @@ func Open(root string, limits Limits) (*Store, error) {
 	if limits.MaxBytes <= 0 || limits.SegmentBytes <= 0 {
 		return nil, fmt.Errorf("%w: non-positive limits", ErrInvalidRoot)
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return nil, fmt.Errorf("create spool root: %w", err)
-	}
-	if runtime.GOOS == "linux" {
-		_ = os.Chmod(root, 0o700)
+	if err := ensurePrivateDirectory(root); err != nil {
+		return nil, err
 	}
 	segments := filepath.Join(root, "segments")
 	quarantine := filepath.Join(root, "quarantine")
 	for _, directory := range []string{segments, quarantine} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return nil, fmt.Errorf("create spool directory: %w", err)
-		}
-		if runtime.GOOS == "linux" {
-			_ = os.Chmod(directory, 0o700)
+		if err := ensurePrivateDirectory(directory); err != nil {
+			return nil, err
 		}
 	}
-	db, err := bolt.Open(filepath.Join(root, "state.db"), 0o600, nil)
+	statePath := filepath.Join(root, "state.db")
+	if info, err := os.Lstat(statePath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return nil, ErrInvalidRoot
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	db, err := bolt.Open(statePath, 0o600, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open spool state: %w", err)
 	}
@@ -147,6 +153,33 @@ func validRoot(root string) error {
 		return ErrInvalidRoot
 	}
 	return nil
+}
+
+func ensurePrivateDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return ErrInvalidRoot
+		}
+		if err := validatePrivateDirectory(info); err != nil {
+			return err
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect spool root: %w", err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("create spool root: %w", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return fmt.Errorf("restrict spool root: %w", err)
+	}
+	info, err = os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	return validatePrivateDirectory(info)
 }
 
 // PutPolicy atomically replaces the persisted signed policy envelope.
@@ -211,7 +244,7 @@ func (s *Store) update(fn func(*bolt.Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db == nil {
-		return errors.New("spool closed")
+		return ErrClosed
 	}
 	return s.db.Update(fn)
 }
@@ -219,7 +252,7 @@ func (s *Store) view(fn func(*bolt.Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db == nil {
-		return errors.New("spool closed")
+		return ErrClosed
 	}
 	return s.db.View(fn)
 }
