@@ -59,6 +59,19 @@ func TestLoadConfigAcceptsAbsoluteRestrictedConfiguration(t *testing.T) {
 	require.Equal(t, "agent-a", config.AgentID)
 }
 
+func TestLoadConfigRejectsAllowedLogRootThatIsNotDirectory(t *testing.T) {
+	dir := t.TempDir()
+	file := writeSecret(t, dir, "not-a-directory")
+	ca := writeSecret(t, dir, "ca.pem")
+	cert := writeSecret(t, dir, "agent.pem")
+	key := writeSecret(t, dir, "key.pem")
+	policyKey := writeSecret(t, dir, "policy.pem")
+	policyFile := writeSecret(t, dir, "policy.json")
+	path := writeConfig(t, "agent_id: agent-a\nserver_address: ingest.example:9443\nca_file: "+filepath.ToSlash(ca)+"\ncert_file: "+filepath.ToSlash(cert)+"\nkey_file: "+filepath.ToSlash(key)+"\npolicy_public_key_file: "+filepath.ToSlash(policyKey)+"\npolicy_file: "+filepath.ToSlash(policyFile)+"\ndata_directory: "+filepath.ToSlash(dir)+"\nallowed_log_roots: ["+filepath.ToSlash(file)+"]\nfile_collection_enabled: true\n")
+	_, err := loadConfig(path)
+	require.Error(t, err)
+}
+
 func writeSecret(t *testing.T, directory, name string) string {
 	t.Helper()
 	path := filepath.Join(directory, name)

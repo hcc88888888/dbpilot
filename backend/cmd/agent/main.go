@@ -130,8 +130,8 @@ func loadConfig(path string) (agentConfig, error) {
 		if !filepath.IsAbs(root) {
 			return agentConfig{}, errors.New("allowed_log_roots entries must be absolute")
 		}
-		resolved, err := filepath.EvalSymlinks(root)
-		if err != nil || resolved == string(filepath.Separator) {
+		info, err := os.Lstat(root)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || filepath.Clean(root) == string(filepath.Separator) {
 			return agentConfig{}, errors.New("allowed_log_roots entries must exist and must not be a filesystem root")
 		}
 	}
