@@ -4,13 +4,16 @@ go 1.25.0
 
 require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.158.0
+	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver v0.158.0
+	github.com/prometheus/prometheus v0.313.2
 	go.opentelemetry.io/collector/component v1.64.0
+	go.opentelemetry.io/collector/confmap v1.64.0
 	go.opentelemetry.io/collector/extension v1.64.0
 	go.opentelemetry.io/collector/processor v1.64.0
 	go.opentelemetry.io/collector/processor/batchprocessor v0.158.0
@@ -200,7 +203,6 @@ require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/experimentalmetricmetadata v0.158.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/ottl v0.158.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatautil v0.158.0 // indirect
-	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza v0.158.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/prometheus v0.158.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/winperfcounters v0.158.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/deltatocumulativeprocessor v0.158.0 // indirect
@@ -225,7 +227,6 @@ require (
 	github.com/prometheus/exporter-toolkit v0.17.1 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
-	github.com/prometheus/prometheus v0.313.2 // indirect
 	github.com/prometheus/sigv4 v0.4.1 // indirect
 	github.com/puzpuzpuz/xsync/v4 v4.5.0 // indirect
 	github.com/rs/cors v1.11.1 // indirect
@@ -257,7 +258,6 @@ require (
 	go.opentelemetry.io/collector/config/configopaque v1.64.0 // indirect
 	go.opentelemetry.io/collector/config/configoptional v1.64.0 // indirect
 	go.opentelemetry.io/collector/config/configtls v1.64.0 // indirect
-	go.opentelemetry.io/collector/confmap v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer v1.64.0 // indirect
 	go.opentelemetry.io/collector/consumer/consumererror v0.158.0 // indirect
 	go.opentelemetry.io/collector/consumer/consumertest v0.158.0 // indirect

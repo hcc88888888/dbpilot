@@ -1,14 +1,30 @@
 package telemetry
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
+	"math"
+	"net/url"
+	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
+	"time"
 
 	"dbpilot.local/platform/internal/policy"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator/input/journald"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/filelogreceiver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/processor/batchprocessor"
+	"go.opentelemetry.io/collector/processor/memorylimiterprocessor"
 )
 
 var (
@@ -49,7 +65,10 @@ type processorConfig struct {
 	config component.Config
 }
 
-type exporterConfig struct{ id string }
+type exporterConfig struct {
+	id                 string
+	resourceAttributes map[string]string
+}
 
 type extensionConfig struct {
 	id     string
@@ -115,7 +134,10 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 	cfg := RuntimeConfig{
 		receivers:  make(map[string]receiverConfig, len(p.Sources)),
 		processors: make(map[string]processorConfig, 2),
-		exporters:  map[string]exporterConfig{"dbpilot": {id: "dbpilot"}},
+		exporters: map[string]exporterConfig{"dbpilot": {
+			id:                 "dbpilot",
+			resourceAttributes: map[string]string{"dbpilot.agent.id": p.AgentID},
+		}},
 		extensions: make(map[string]extensionConfig, 1),
 		pipelines:  make(map[string]pipelineConfig, 2),
 		sources:    make(map[string]SourceConfig, len(p.Sources)),
@@ -126,18 +148,18 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 		},
 	}
 
-	if err := cfg.addProcessor("memory_limiter", allowed); err != nil {
+	if err := cfg.addProcessor("memory_limiter", allowed, p.Limits); err != nil {
 		return RuntimeConfig{}, err
 	}
-	if err := cfg.addProcessor("batch", allowed); err != nil {
+	if err := cfg.addProcessor("batch", allowed, p.Limits); err != nil {
 		return RuntimeConfig{}, err
 	}
-	cfg.addFileStorage(allowed)
+	storageID, hasStorage := cfg.addFileStorage(p.AgentID, p.Limits.MaxSpoolBytes, allowed)
 
 	sources := slices.Clone(p.Sources)
 	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
 	for _, source := range sources {
-		if err := cfg.addSource(p.AgentID, source, allowed); err != nil {
+		if err := cfg.addSource(p.AgentID, source, storageID, hasStorage, allowed); err != nil {
 			return RuntimeConfig{}, err
 		}
 	}
@@ -151,7 +173,7 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 	return cfg, nil
 }
 
-func (cfg *RuntimeConfig) addSource(agentID string, source policy.Source, allowed Catalog) error {
+func (cfg *RuntimeConfig) addSource(agentID string, source policy.Source, storageID component.ID, hasStorage bool, allowed Catalog) error {
 	componentKind, pipelineID, ok := receiverFor(source.Kind)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnsupportedSource, source.Kind)
@@ -164,26 +186,54 @@ func (cfg *RuntimeConfig) addSource(agentID string, source policy.Source, allowe
 	if _, exists := cfg.receivers[id]; exists {
 		return fmt.Errorf("%w: duplicate component ID %q", ErrUnsupportedSource, id)
 	}
-	cfg.receivers[id] = receiverConfig{id: id, kind: componentKind, config: factory.CreateDefaultConfig()}
+	collectorConfig, err := configureReceiver(source, factory.CreateDefaultConfig(), storageID, hasStorage)
+	if err != nil {
+		return err
+	}
+	cfg.receivers[id] = receiverConfig{id: id, kind: componentKind, config: collectorConfig}
 	cfg.sources[id] = sourceInspection(agentID, source, pipelineID)
+	exporter := cfg.exporters["dbpilot"]
+	for key, value := range cfg.sources[id].ResourceAttributes {
+		exporter.resourceAttributes[key] = value
+	}
+	cfg.exporters["dbpilot"] = exporter
 	return nil
 }
 
-func (cfg *RuntimeConfig) addProcessor(name string, allowed Catalog) error {
+func (cfg *RuntimeConfig) addProcessor(name string, allowed Catalog, limits policy.Limits) error {
 	factory, ok := allowed.ProcessorFactory(name)
 	if !ok {
 		return fmt.Errorf("processor %q is not catalogued", name)
 	}
-	cfg.processors[name] = processorConfig{id: name, kind: name, config: factory.CreateDefaultConfig()}
+	collectorConfig, err := configureProcessor(name, factory.CreateDefaultConfig(), limits)
+	if err != nil {
+		return err
+	}
+	cfg.processors[name] = processorConfig{id: name, kind: name, config: collectorConfig}
 	return nil
 }
 
-func (cfg *RuntimeConfig) addFileStorage(allowed Catalog) {
+func (cfg *RuntimeConfig) addFileStorage(agentID string, maxSpoolBytes int64, allowed Catalog) (component.ID, bool) {
 	if c, ok := allowed.(*catalog); ok && c.fileStorageFactory() != nil {
-		cfg.extensions["file_storage"] = extensionConfig{
-			id: "file_storage", kind: "file_storage", config: c.fileStorageFactory().CreateDefaultConfig(),
+		storageType, err := component.NewType("file_storage")
+		if err != nil {
+			return component.ID{}, false
 		}
+		storageID := component.NewIDWithName(storageType, "")
+		storageConfig, ok := c.fileStorageFactory().CreateDefaultConfig().(*filestorage.Config)
+		if !ok {
+			return component.ID{}, false
+		}
+		storageConfig.Directory = filepath.Join("dbpilot-spool", storageDirectory(agentID))
+		storageConfig.MaxSize = maxSpoolBytes
+		storageConfig.CreateDirectory = true
+		storageConfig.FSync = true
+		cfg.extensions["file_storage"] = extensionConfig{
+			id: "file_storage", kind: "file_storage", config: storageConfig,
+		}
+		return storageID, true
 	}
+	return component.ID{}, false
 }
 
 func (cfg *RuntimeConfig) addPipelines() {
@@ -205,6 +255,212 @@ func (cfg *RuntimeConfig) addPipelines() {
 	if len(metrics) > 0 {
 		cfg.pipelines[metricsPipelineID] = pipelineConfig{id: metricsPipelineID, receiverIDs: metrics, processorIDs: processors, exporterIDs: exporters}
 	}
+}
+
+func configureReceiver(source policy.Source, config component.Config, storageID component.ID, hasStorage bool) (component.Config, error) {
+	switch source.Kind {
+	case policy.SourceFileLog:
+		fileConfig, ok := config.(*filelogreceiver.FileLogConfig)
+		if !ok {
+			return nil, fmt.Errorf("file_log factory returned %T", config)
+		}
+		fileConfig.InputConfig.Include = []string{source.Path}
+		fileConfig.InputConfig.Exclude = splitList(source.Params["exclude"])
+		if startAt := source.Params["start_at"]; startAt != "" {
+			fileConfig.InputConfig.StartAt = startAt
+		}
+		if encoding := source.Params["encoding"]; encoding != "" {
+			fileConfig.InputConfig.Encoding = encoding
+		}
+		fileConfig.InputConfig.SplitConfig.LineStartPattern = source.Params["multiline_line_start_pattern"]
+		fileConfig.InputConfig.SplitConfig.LineEndPattern = source.Params["multiline_line_end_pattern"]
+		if hasStorage {
+			fileConfig.StorageID = &storageID
+		}
+		return fileConfig, nil
+	case policy.SourceJournald:
+		journalConfig, ok := config.(*journaldreceiver.JournaldConfig)
+		if !ok {
+			return nil, fmt.Errorf("journald factory returned %T", config)
+		}
+		journalConfig.InputConfig.Units = splitList(source.Params["unit"])
+		matches, err := journaldMatches(source.Params["match"])
+		if err != nil {
+			return nil, err
+		}
+		journalConfig.InputConfig.Matches = matches
+		if hasStorage {
+			journalConfig.BaseConfig.StorageID = &storageID
+		}
+		return journalConfig, nil
+	case policy.SourceHostMetrics:
+		hostConfig, ok := config.(*hostmetricsreceiver.Config)
+		if !ok {
+			return nil, fmt.Errorf("host_metrics factory returned %T", config)
+		}
+		collectors, err := hostCollectors(source.Params["collectors"])
+		if err != nil {
+			return nil, err
+		}
+		raw := map[string]any{"collection_interval": source.Interval.String(), "scrapers": map[string]any{}}
+		scrapers := raw["scrapers"].(map[string]any)
+		for _, collector := range collectors {
+			scrapers[collector] = map[string]any{}
+		}
+		if err := hostConfig.Unmarshal(confmap.NewFromStringMap(raw)); err != nil {
+			return nil, fmt.Errorf("configure host_metrics: %w", err)
+		}
+		return hostConfig, nil
+	case policy.SourcePrometheus:
+		promConfig, ok := config.(*prometheusreceiver.Config)
+		if !ok {
+			return nil, fmt.Errorf("prometheus factory returned %T", config)
+		}
+		if err := configurePrometheus(promConfig, source); err != nil {
+			return nil, err
+		}
+		return promConfig, nil
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedSource, source.Kind)
+	}
+}
+
+func configureProcessor(name string, config component.Config, limits policy.Limits) (component.Config, error) {
+	switch name {
+	case "memory_limiter":
+		memoryConfig, ok := config.(*memorylimiterprocessor.Config)
+		if !ok {
+			return nil, fmt.Errorf("memory_limiter factory returned %T", config)
+		}
+		memoryConfig.CheckInterval = time.Second
+		memoryConfig.MemoryLimitMiB = bytesToMiB(limits.MaxSpoolBytes)
+		memoryConfig.MemorySpikeLimitMiB = max(uint32(1), memoryConfig.MemoryLimitMiB/4)
+		if memoryConfig.MemorySpikeLimitMiB >= memoryConfig.MemoryLimitMiB {
+			memoryConfig.MemoryLimitMiB = memoryConfig.MemorySpikeLimitMiB + 1
+		}
+		return memoryConfig, nil
+	case "batch":
+		batchConfig, ok := config.(*batchprocessor.Config)
+		if !ok {
+			return nil, fmt.Errorf("batch factory returned %T", config)
+		}
+		batchConfig.SendBatchSize = 1
+		batchConfig.SendBatchMaxSize = bytesToUint32(limits.MaxBatchBytes)
+		return batchConfig, nil
+	default:
+		return nil, fmt.Errorf("processor %q is not configured", name)
+	}
+}
+
+func configurePrometheus(config *prometheusreceiver.Config, source policy.Source) error {
+	target, err := url.Parse(source.Endpoint)
+	if err != nil || target.Host == "" {
+		return fmt.Errorf("configure prometheus endpoint: %w", policy.ErrInvalidEndpoint)
+	}
+	timeout := source.Interval / 2
+	if rawTimeout := source.Params["scrape_timeout"]; rawTimeout != "" {
+		timeout, err = time.ParseDuration(rawTimeout)
+		if err != nil || timeout <= 0 || timeout >= source.Interval {
+			return fmt.Errorf("configure prometheus scrape timeout")
+		}
+	}
+	scrape := map[string]any{
+		"job_name": source.ID, "scrape_interval": source.Interval.String(), "scrape_timeout": timeout.String(),
+		"metrics_path": target.EscapedPath(), "scheme": target.Scheme,
+		"static_configs": []any{map[string]any{"targets": []string{target.Host}}},
+	}
+	if scrape["metrics_path"] == "" {
+		scrape["metrics_path"] = "/metrics"
+	}
+	if tlsConfig := prometheusTLS(source.Params); len(tlsConfig) > 0 {
+		scrape["tls_config"] = tlsConfig
+	}
+	if username := source.Params["username"]; username != "" {
+		scrape["basic_auth"] = map[string]any{"username": username, "password": source.Params["password"]}
+	}
+	if err := config.PrometheusConfig.Unmarshal(confmap.NewFromStringMap(map[string]any{"scrape_configs": []any{scrape}})); err != nil {
+		return fmt.Errorf("configure prometheus: %w", err)
+	}
+	return nil
+}
+
+func prometheusTLS(params map[string]string) map[string]any {
+	result := make(map[string]any, 3)
+	for policyName, collectorName := range map[string]string{"tls_ca_file": "ca_file", "tls_cert_file": "cert_file", "tls_key_file": "key_file"} {
+		if value := params[policyName]; value != "" {
+			result[collectorName] = value
+		}
+	}
+	return result
+}
+
+func journaldMatches(raw string) ([]journald.MatchConfig, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	result := make([]journald.MatchConfig, 0)
+	for _, entry := range splitList(raw) {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("invalid journald match %q", entry)
+		}
+		result = append(result, journald.MatchConfig{key: value})
+	}
+	return result, nil
+}
+
+func hostCollectors(raw string) ([]string, error) {
+	collectors := splitList(raw)
+	if len(collectors) == 0 {
+		collectors = []string{"cpu", "memory", "disk", "filesystem", "network", "load"}
+	}
+	allowed := map[string]struct{}{"cpu": {}, "memory": {}, "disk": {}, "filesystem": {}, "network": {}, "load": {}, "processes": {}}
+	for _, collector := range collectors {
+		if _, ok := allowed[collector]; !ok {
+			return nil, fmt.Errorf("unsupported hostmetrics collector %q", collector)
+		}
+	}
+	return collectors, nil
+}
+
+func splitList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	items := strings.Split(raw, ",")
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func bytesToMiB(bytes int64) uint32 {
+	if bytes <= 0 {
+		return 2
+	}
+	value := (bytes + (1<<20 - 1)) >> 20
+	if value > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return max(uint32(2), uint32(value))
+}
+
+func bytesToUint32(bytes int64) uint32 {
+	if bytes <= 0 {
+		return 1
+	}
+	if bytes > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(bytes)
+}
+
+func storageDirectory(agentID string) string {
+	digest := sha256.Sum256([]byte(agentID))
+	return hex.EncodeToString(digest[:])
 }
 
 func receiverFor(kind policy.SourceKind) (componentKind, pipelineID string, ok bool) {
