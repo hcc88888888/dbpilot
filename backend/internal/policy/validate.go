@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -11,6 +12,17 @@ import (
 const minimumCollectionInterval = 5 * time.Second
 
 func Validate(p Policy, env ValidationEnvironment) error {
+	return validate(p, env, true)
+}
+
+// ValidateStructural validates fields that are self-contained in a signed
+// policy. Runtime validation must additionally use Validate with an agent
+// environment for filesystem, plugin-registry, and version checks.
+func ValidateStructural(p Policy) error {
+	return validate(p, ValidationEnvironment{}, false)
+}
+
+func validate(p Policy, env ValidationEnvironment, runtime bool) error {
 	if strings.TrimSpace(p.AgentID) == "" {
 		return ErrInvalidAgentID
 	}
@@ -48,19 +60,26 @@ func Validate(p Policy, env ValidationEnvironment) error {
 
 		switch source.Kind {
 		case SourceFileLog:
-			if err := validatePath(source.Path, env); err != nil {
+			if err := validatePathSyntax(source.Path); err != nil {
 				return err
+			}
+			if runtime {
+				if err := validatePath(source.Path, env); err != nil {
+					return err
+				}
 			}
 		case SourcePrometheus, SourceHTTPJSONMetrics:
 			if err := validateEndpoint(source.Endpoint); err != nil {
 				return err
 			}
 		case SourcePluginMetrics:
-			if _, ok := env.PluginIDs[source.PluginID]; !ok || strings.TrimSpace(source.PluginID) == "" {
-				return ErrPluginNotRegistered
-			}
-			if !validPluginParameters(source.Params) {
+			if strings.TrimSpace(source.PluginID) == "" || !validPluginParameters(source.Params) {
 				return ErrUnsafePluginParameter
+			}
+			if runtime {
+				if err := validatePluginSource(source, env); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -77,23 +96,19 @@ func allowedSourceKind(kind SourceKind) bool {
 }
 
 func validatePath(raw string, env ValidationEnvironment) error {
-	if raw == "" || !path.IsAbs(raw) {
-		return ErrPathTraversal
+	if err := validatePathSyntax(raw); err != nil {
+		return err
 	}
-	for _, part := range strings.Split(raw, "/") {
-		if part == ".." {
-			return ErrPathTraversal
-		}
+	if env.ResolvePath == nil {
+		return ErrPathResolution
 	}
 	resolved := path.Clean(raw)
-	if env.ResolvePath != nil {
-		var err error
-		resolved, err = env.ResolvePath(raw)
-		if err != nil {
-			return fmt.Errorf("resolve telemetry path: %w", err)
-		}
-		resolved = path.Clean(resolved)
+	var err error
+	resolved, err = env.ResolvePath(raw)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrPathResolution, err)
 	}
+	resolved = path.Clean(resolved)
 	for _, root := range env.ForbiddenRoots {
 		if isWithin(resolved, root) {
 			return ErrForbiddenPath
@@ -108,6 +123,18 @@ func validatePath(raw string, env ValidationEnvironment) error {
 		}
 	}
 	return ErrPathOutsideAllowRoots
+}
+
+func validatePathSyntax(raw string) error {
+	if raw == "" || !path.IsAbs(raw) {
+		return ErrPathTraversal
+	}
+	for _, part := range strings.Split(raw, "/") {
+		if part == ".." {
+			return ErrPathTraversal
+		}
+	}
+	return nil
 }
 
 func isWithin(candidate, root string) bool {
@@ -145,7 +172,25 @@ func validParameterKey(key string) bool {
 }
 
 func containsShellSyntax(value string) bool {
-	return strings.ContainsAny(value, "\x00\r\n;|&$`<>")
+	return strings.ContainsAny(value, "\x00\r\n;|&$`<>") || strings.Contains(strings.ToLower(value), "curl ") || strings.Contains(strings.ToLower(value), "wget ") || strings.Contains(strings.ToLower(value), "http://") || strings.Contains(strings.ToLower(value), "https://")
+}
+
+func validatePluginSource(source Source, env ValidationEnvironment) error {
+	definition, ok := env.PluginDefinitions[source.PluginID]
+	if !ok {
+		return ErrPluginNotRegistered
+	}
+	for key, value := range source.Params {
+		schema, ok := definition.Parameters[key]
+		if !ok || schema.MaxLength <= 0 || len(value) > schema.MaxLength || containsShellSyntax(value) {
+			return ErrUnsafePluginParameter
+		}
+		pattern, err := regexp.Compile(schema.ValuePattern)
+		if err != nil || !pattern.MatchString(value) {
+			return ErrUnsafePluginParameter
+		}
+	}
+	return nil
 }
 
 func validateEndpoint(raw string) error {

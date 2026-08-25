@@ -3,8 +3,6 @@ package policy
 import (
 	"crypto/ed25519"
 	"encoding/json"
-	"path"
-	"path/filepath"
 	"sort"
 	"time"
 )
@@ -21,7 +19,13 @@ func Sign(private ed25519.PrivateKey, p Policy) (SignatureEnvelope, error) {
 }
 
 func Verify(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time) (Policy, error) {
-	return VerifyAndValidate(public, envelope, now, defaultValidationEnvironment())
+	if err := verifySignatureAndExpiry(public, envelope, now); err != nil {
+		return Policy{}, err
+	}
+	if err := ValidateStructural(envelope.Policy); err != nil {
+		return Policy{}, err
+	}
+	return envelope.Policy, nil
 }
 
 // VerifyAndValidate verifies a signature and applies the runtime's policy
@@ -29,20 +33,32 @@ func Verify(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time)
 // last persisted policy version. Agents should persist the returned Version
 // only after all policy application steps succeed.
 func VerifyAndValidate(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time, env ValidationEnvironment) (Policy, error) {
-	if len(public) != ed25519.PublicKeySize {
-		return Policy{}, ErrInvalidSignature
-	}
-	bytes, err := canonicalBytes(envelope.Policy)
-	if err != nil || !ed25519.Verify(public, bytes, envelope.Signature) {
-		return Policy{}, ErrInvalidSignature
-	}
-	if !envelope.Policy.ExpiresAt.After(now) {
-		return Policy{}, ErrExpiredPolicy
+	if err := verifySignatureAndExpiry(public, envelope, now); err != nil {
+		return Policy{}, err
 	}
 	if err := Validate(envelope.Policy, env); err != nil {
 		return Policy{}, err
 	}
+	if env.VersionStore != nil {
+		if err := env.VersionStore.CheckAndRecord(envelope.Policy.AgentID, envelope.Policy.Version); err != nil {
+			return Policy{}, err
+		}
+	}
 	return envelope.Policy, nil
+}
+
+func verifySignatureAndExpiry(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time) error {
+	if len(public) != ed25519.PublicKeySize {
+		return ErrInvalidSignature
+	}
+	bytes, err := canonicalBytes(envelope.Policy)
+	if err != nil || !ed25519.Verify(public, bytes, envelope.Signature) {
+		return ErrInvalidSignature
+	}
+	if !envelope.Policy.ExpiresAt.After(now) {
+		return ErrExpiredPolicy
+	}
+	return nil
 }
 
 func canonicalBytes(p Policy) ([]byte, error) {
@@ -59,22 +75,4 @@ func canonicalBytes(p Policy) ([]byte, error) {
 	}
 	sort.Slice(canonical.Sources, func(i, j int) bool { return canonical.Sources[i].ID < canonical.Sources[j].ID })
 	return json.Marshal(canonical)
-}
-
-func defaultValidationEnvironment() ValidationEnvironment {
-	return ValidationEnvironment{
-		AllowedRoots:   []string{"/var/log", "/var/lib/dbpilot", "/opt/dbpilot"},
-		ForbiddenRoots: []string{"/proc", "/sys", "/dev"},
-		PluginIDs:      map[string]struct{}{},
-		ResolvePath: func(raw string) (string, error) {
-			resolved, err := filepath.EvalSymlinks(raw)
-			if err != nil {
-				// A non-existent path cannot currently be a symlink. The agent's
-				// collector will fail to open it, while lexical confinement remains
-				// enforced here. Existing paths are always evaluated above.
-				return path.Clean(raw), nil
-			}
-			return filepath.ToSlash(resolved), nil
-		},
-	}
 }

@@ -36,6 +36,8 @@ var (
 	ErrTooManyLabels         = errors.New("too many labels")
 	ErrPluginNotRegistered   = errors.New("plugin is not registered")
 	ErrUnsafePluginParameter = errors.New("unsafe plugin parameter")
+	ErrPathResolution        = errors.New("telemetry path resolution failed")
+	ErrVersionStore          = errors.New("policy version store error")
 )
 
 type Policy struct {
@@ -77,4 +79,17 @@ type ValidationEnvironment struct {
 	// PreviousVersion is the last accepted policy version persisted by the agent.
 	// A non-zero value requires the incoming policy to be strictly newer.
 	PreviousVersion uint64
+	// PluginDefinitions is the runtime registry and parameter schema for
+	// declarative plugin metric sources.
+	PluginDefinitions map[string]PluginDefinition
+	VersionStore      VersionStore
+}
+
+type PluginDefinition struct {
+	Parameters map[string]ParameterSchema
+}
+
+type ParameterSchema struct {
+	MaxLength    int
+	ValuePattern string
 }
