@@ -103,15 +103,17 @@ func validatePath(raw string, env ValidationEnvironment) error {
 	if env.ResolvePath == nil {
 		return ErrPathResolution
 	}
-	resolved := path.Clean(raw)
-	var err error
-	resolved, err = env.ResolvePath(raw)
+	resolved, err := env.ResolvePath(raw)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrPathResolution, err)
 	}
-	resolved = path.Clean(resolved)
+	if strings.HasPrefix(resolved, "/") {
+		resolved = path.Clean(resolved)
+	} else {
+		resolved = filepath.Clean(resolved)
+	}
 	for _, root := range env.ForbiddenRoots {
-		if isWithin(resolved, root) {
+		if isWithinFilesystem(resolved, root) {
 			return ErrForbiddenPath
 		}
 	}
@@ -119,7 +121,7 @@ func validatePath(raw string, env ValidationEnvironment) error {
 		return ErrPathOutsideAllowRoots
 	}
 	for _, root := range env.AllowedRoots {
-		if isWithin(resolved, root) {
+		if isWithinFilesystem(resolved, root) {
 			return nil
 		}
 	}
@@ -138,12 +140,29 @@ func validatePathSyntax(raw string) error {
 	return nil
 }
 
-func isWithin(candidate, root string) bool {
-	root = path.Clean(root)
-	if root == "/" {
-		return path.IsAbs(candidate)
+func isWithinFilesystem(candidate, root string) bool {
+	if root == "" {
+		return false
 	}
-	return candidate == root || strings.HasPrefix(candidate, root+"/")
+	// Policies can be prepared off-host, so retain POSIX-root semantics for
+	// existing signed policies while using native volume-aware logic for native
+	// Agent paths such as C:\\dbpilot\\logs.
+	if strings.HasPrefix(candidate, "/") || strings.HasPrefix(root, "/") {
+		candidate, root = path.Clean(candidate), path.Clean(root)
+		return root == "/" || candidate == root || strings.HasPrefix(candidate, root+"/")
+	}
+	candidate, root = filepath.Clean(candidate), filepath.Clean(root)
+	if !filepath.IsAbs(candidate) || !filepath.IsAbs(root) {
+		return false
+	}
+	if !strings.EqualFold(filepath.VolumeName(candidate), filepath.VolumeName(root)) {
+		return false
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func validPluginParameters(params map[string]string) bool {

@@ -70,6 +70,38 @@ func TestEmbeddedBuilderFileReceiverPersistsSpoolBatchWithSourceMetadata(t *test
 	require.Equal(t, "embedded-test-agent", agentID.Str())
 }
 
+// Resetting the in-memory exporter sequence on an Agent restart must not turn
+// a new record into a spool deduplication no-op.
+func TestEmbeddedBuilderRestartUsesDistinctSpoolBatchIDs(t *testing.T) {
+	directory := t.TempDir()
+	spoolRoot := filepath.Join(directory, "spool")
+	collect := func(name string, expected int) {
+		path := filepath.Join(directory, name+".log")
+		require.NoError(t, os.WriteFile(path, []byte(name+" "+time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o600))
+		store, err := spool.Open(spoolRoot, spool.Limits{MaxBytes: 4 << 20, SegmentBytes: 1 << 20})
+		require.NoError(t, err)
+		candidate, err := telemetry.NewEmbeddedBuilder(store).Build(context.Background(), compileEmbeddedFileConfig(t, path))
+		require.NoError(t, err)
+		require.NoError(t, candidate.Start(context.Background()))
+		require.Eventually(t, func() bool {
+			batches, pendingErr := store.Pending(context.Background(), spool.Log, 0)
+			return pendingErr == nil && len(batches) == expected
+		}, 5*time.Second, 20*time.Millisecond)
+		require.NoError(t, candidate.Stop(context.Background()))
+		require.NoError(t, store.Close())
+	}
+
+	collect("before-restart", 1)
+	collect("after-restart", 2)
+	store, err := spool.Open(spoolRoot, spool.Limits{MaxBytes: 4 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	defer store.Close()
+	batches, err := store.Pending(context.Background(), spool.Log, 0)
+	require.NoError(t, err)
+	require.Len(t, batches, 2)
+	require.NotEqual(t, batches[0].ID, batches[1].ID)
+}
+
 func openEmbeddedStore(t *testing.T) *spool.Store {
 	t.Helper()
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll("dbpilot-spool")) })

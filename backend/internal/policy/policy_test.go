@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -58,6 +59,28 @@ func TestValidateStructuralAcceptsNativeAbsoluteFilePath(t *testing.T) {
 	p := validPolicy(fileSource(filepath.Join(t.TempDir(), "application.log")))
 	if err := policy.ValidateStructural(p); err != nil {
 		t.Fatalf("ValidateStructural() error = %v", err)
+	}
+}
+
+func TestVerifyAndValidateAcceptsWindowsPathWithinWindowsRoot(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path semantics")
+	}
+	pub, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyValue := validPolicy(fileSource(`C:\dbpilot\logs\application.log`))
+	envelope, err := policy.Sign(private, policyValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = policy.VerifyAndValidate(pub, envelope, time.Now(), policy.ValidationEnvironment{
+		AllowedRoots: []string{`C:\dbpilot\logs`},
+		ResolvePath:  func(path string) (string, error) { return path, nil },
+	})
+	if err != nil {
+		t.Fatalf("VerifyAndValidate() error = %v", err)
 	}
 }
 

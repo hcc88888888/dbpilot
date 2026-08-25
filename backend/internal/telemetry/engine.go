@@ -2,17 +2,17 @@ package telemetry
 
 import (
 	"context"
-	"crypto/sha256"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"maps"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/extension"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -168,11 +168,11 @@ func (c *embeddedCandidate) buildExtensions(ctx context.Context, cfg RuntimeConf
 
 func (c *embeddedCandidate) buildPipelines(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, store SpoolAppender) error {
 	exporter, _ := cfg.Exporter("dbpilot")
-	logNext, err := newSpoolLogsConsumer(store, c.version, exporter)
+	logNext, err := newSpoolLogsConsumer(store, exporter)
 	if err != nil {
 		return err
 	}
-	metricNext, err := newSpoolMetricsConsumer(store, c.version, exporter)
+	metricNext, err := newSpoolMetricsConsumer(store, exporter)
 	if err != nil {
 		return err
 	}
@@ -319,6 +319,9 @@ func (c *embeddedCandidate) Healthy(ctx context.Context) error {
 	if !c.started || c.stopped || len(c.receivers) == 0 || len(c.processors) == 0 {
 		return errors.New("embedded collector components are not running")
 	}
+	if err := c.host.failure(); err != nil {
+		return fmt.Errorf("embedded collector component unhealthy: %w", err)
+	}
 	for _, componentReceiver := range c.receivers {
 		if componentReceiver == nil {
 			return errors.New("embedded collector receiver is unavailable")
@@ -358,11 +361,40 @@ func (c *embeddedCandidate) shutdownLocked(ctx context.Context) error {
 }
 
 type embeddedHost struct {
+	mu         sync.Mutex
 	extensions map[component.ID]component.Component
+	fatal      error
 }
 
 func (h *embeddedHost) GetExtensions() map[component.ID]component.Component {
 	return maps.Clone(h.extensions)
+}
+
+// Report receives OTel component status changes. Fatal, permanent, and
+// unexpected stopped states make the candidate unhealthy until it is retired.
+func (h *embeddedHost) Report(event *componentstatus.Event) {
+	if event == nil {
+		return
+	}
+	status := event.Status()
+	if status != componentstatus.StatusFatalError && status != componentstatus.StatusPermanentError && status != componentstatus.StatusStopped {
+		return
+	}
+	err := event.Err()
+	if err == nil {
+		err = fmt.Errorf("component status %s", status)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.fatal == nil {
+		h.fatal = err
+	}
+}
+
+func (h *embeddedHost) failure() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.fatal
 }
 
 func tagLogsConsumer(next consumer.Logs, attributes map[string]string) (consumer.Logs, error) {
@@ -391,13 +423,11 @@ func tagMetricsConsumer(next consumer.Metrics, attributes map[string]string) (co
 
 type spoolLogsConsumer struct {
 	store    SpoolAppender
-	version  uint64
 	exporter ExporterConfig
-	sequence atomic.Uint64
 }
 
-func newSpoolLogsConsumer(store SpoolAppender, version uint64, exporter ExporterConfig) (consumer.Logs, error) {
-	c := &spoolLogsConsumer{store: store, version: version, exporter: exporter}
+func newSpoolLogsConsumer(store SpoolAppender, exporter ExporterConfig) (consumer.Logs, error) {
+	c := &spoolLogsConsumer{store: store, exporter: exporter}
 	return consumer.NewLogs(c.ConsumeLogs)
 }
 
@@ -412,7 +442,11 @@ func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) err
 		if err := c.exporter.ValidateBatchBytes(int64(len(payload))); err != nil {
 			return err
 		}
-		if err := c.store.Append(ctx, spool.Log, spool.Batch{ID: c.batchID("log"), SourceID: sourceID(one.ResourceLogs().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
+		id, err := newSpoolBatchID()
+		if err != nil {
+			return err
+		}
+		if err := c.store.Append(ctx, spool.Log, spool.Batch{ID: id, SourceID: sourceID(one.ResourceLogs().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
 			return err
 		}
 	}
@@ -421,13 +455,11 @@ func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) err
 
 type spoolMetricsConsumer struct {
 	store    SpoolAppender
-	version  uint64
 	exporter ExporterConfig
-	sequence atomic.Uint64
 }
 
-func newSpoolMetricsConsumer(store SpoolAppender, version uint64, exporter ExporterConfig) (consumer.Metrics, error) {
-	c := &spoolMetricsConsumer{store: store, version: version, exporter: exporter}
+func newSpoolMetricsConsumer(store SpoolAppender, exporter ExporterConfig) (consumer.Metrics, error) {
+	c := &spoolMetricsConsumer{store: store, exporter: exporter}
 	return consumer.NewMetrics(c.ConsumeMetrics)
 }
 
@@ -442,24 +474,23 @@ func (c *spoolMetricsConsumer) ConsumeMetrics(ctx context.Context, metrics pmetr
 		if err := c.exporter.ValidateBatchBytes(int64(len(payload))); err != nil {
 			return err
 		}
-		if err := c.store.Append(ctx, spool.Metric, spool.Batch{ID: c.batchID("metric"), SourceID: sourceID(one.ResourceMetrics().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
+		id, err := newSpoolBatchID()
+		if err != nil {
+			return err
+		}
+		if err := c.store.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: sourceID(one.ResourceMetrics().At(0).Resource().Attributes()), CreatedAt: time.Now().UTC(), Priority: 1, Payload: payload}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *spoolLogsConsumer) batchID(kind string) string {
-	return batchID(c.version, kind, c.sequence.Add(1))
-}
-
-func (c *spoolMetricsConsumer) batchID(kind string) string {
-	return batchID(c.version, kind, c.sequence.Add(1))
-}
-
-func batchID(version uint64, kind string, sequence uint64) string {
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%d/%s/%d", version, kind, sequence)))
-	return fmt.Sprintf("%x", digest[:])
+func newSpoolBatchID() (string, error) {
+	var value [16]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate spool batch ID: %w", err)
+	}
+	return fmt.Sprintf("%x", value[:]), nil
 }
 
 func sourceID(attributes pcommon.Map) string {

@@ -15,10 +15,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/exporter"
 	"dbpilot.local/platform/internal/ingest"
 	"dbpilot.local/platform/internal/policy"
@@ -44,21 +46,21 @@ func TestTelemetryLifecycleRetainsFailedBatchesAcrossRestartAndDeliversViaMTLS(t
 	require.NoError(t, err)
 	envelope, err := policy.Sign(private, policy.Policy{AgentID: "agent-a", Version: 1, IssuedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Sources: []policy.Source{{ID: "file-log", Kind: policy.SourceFileLog, Path: logPath, Interval: 5 * time.Second, Params: map[string]string{"start_at": "beginning"}}}, Limits: policy.Limits{MaxSpoolBytes: 1 << 20, MaxBatchBytes: 1 << 16, MaxEventsPerSec: 100}})
 	require.NoError(t, err)
-	signedPolicy, err := policy.Verify(public, envelope, time.Now())
-	require.NoError(t, err)
-	engine := telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store))
-	result, err := engine.Apply(context.Background(), signedPolicy)
-	require.NoError(t, err)
-	require.Equal(t, telemetry.ApplyActive, result.State)
+	runCtx, cancel := context.WithCancel(context.Background())
+	reporter := &recordingHealthReporter{}
+	runtime := agent.NewRuntime(agent.Dependencies{
+		AgentID: "agent-a", PolicySource: staticPolicySource{envelope: envelope},
+		PolicyVerifier: agent.Verifier{PublicKey: public, Environment: policy.ValidationEnvironment{AllowedRoots: []string{directory}, ResolvePath: filepath.EvalSymlinks}},
+		Engine:         telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store,
+		Exporter: exporter.NewClient(unavailableIngest{}, store, "agent-a"), HealthReporter: reporter,
+		PollInterval: time.Hour, ExportInterval: time.Hour, ShutdownTimeout: 100 * time.Millisecond, OperationTimeout: 20 * time.Millisecond,
+	})
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(runCtx) }()
 	require.Eventually(t, func() bool { return len(pending(t, store, spool.Log)) == 1 }, 5*time.Second, 20*time.Millisecond)
-
-	failed := exporter.NewClient(unavailableIngest{}, store, "agent-a")
-	failedCtx, cancelFailed := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	err = failed.SendPending(failedCtx)
-	cancelFailed()
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-	require.NoError(t, engine.Stop(context.Background()))
-	require.NoError(t, store.Close())
+	require.Eventually(t, func() bool { return reporter.HasState(string(telemetry.ApplyActive)) }, time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, <-runDone)
 
 	store, err = spool.Open(filepath.Join(directory, "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 512})
 	require.NoError(t, err)
@@ -92,6 +94,38 @@ func assertClosedPolicySurface(t *testing.T) {
 }
 
 type unavailableIngest struct{}
+
+type staticPolicySource struct{ envelope policy.SignatureEnvelope }
+
+func (s staticPolicySource) Fetch(ctx context.Context) (policy.SignatureEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return policy.SignatureEnvelope{}, err
+	}
+	return s.envelope, nil
+}
+
+type recordingHealthReporter struct {
+	mu     sync.Mutex
+	states []string
+}
+
+func (r *recordingHealthReporter) Report(_ context.Context, status agent.PolicyStatus) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states = append(r.states, status.State)
+	return nil
+}
+
+func (r *recordingHealthReporter) HasState(want string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, state := range r.states {
+		if state == want {
+			return true
+		}
+	}
+	return false
+}
 
 func (unavailableIngest) PushLogBatch(context.Context, *telemetryv1.LogBatch, ...grpc.CallOption) (*telemetryv1.BatchAck, error) {
 	return nil, status.Error(codes.Unavailable, "temporary outage")
