@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -583,6 +584,9 @@ func validateRegisteredPlugin(plugin RegisteredPlugin) error {
 		// platform. A registry entry must reference a native executable.
 		return ErrUnknownPlugin
 	}
+	if !hasNativeExecutableHeader(plugin.Executable) {
+		return ErrUnknownPlugin
+	}
 	if _, err := hex.DecodeString(plugin.SHA256); err != nil || len(plugin.SHA256) != sha256.Size*2 {
 		return ErrPluginDigestMismatch
 	}
@@ -602,6 +606,38 @@ func validateRegisteredPlugin(plugin RegisteredPlugin) error {
 		}
 	}
 	return nil
+}
+
+// hasNativeExecutableHeader rejects scripts before command construction. A
+// fixed registry path is not sufficient: an extensionless Unix script can use
+// a shebang, while Windows may dispatch script extensions to an interpreter.
+// Accept only the native executable format for the current platform.
+func hasNativeExecutableHeader(executable string) bool {
+	file, err := os.Open(executable)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	header := make([]byte, 4)
+	read, err := io.ReadFull(file, header)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return false
+	}
+	header = header[:read]
+	if bytes.HasPrefix(header, []byte("#!")) {
+		return false
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return len(header) >= 2 && header[0] == 'M' && header[1] == 'Z'
+	case "darwin":
+		return len(header) == 4 && (bytes.Equal(header, []byte{0xce, 0xfa, 0xed, 0xfe}) ||
+			bytes.Equal(header, []byte{0xcf, 0xfa, 0xed, 0xfe}) ||
+			bytes.Equal(header, []byte{0xfe, 0xed, 0xfa, 0xce}) ||
+			bytes.Equal(header, []byte{0xfe, 0xed, 0xfa, 0xcf}))
+	default:
+		return len(header) == 4 && bytes.Equal(header, []byte{0x7f, 'E', 'L', 'F'})
+	}
 }
 
 func pluginArguments(plugin RegisteredPlugin, values map[string]string) ([]string, error) {

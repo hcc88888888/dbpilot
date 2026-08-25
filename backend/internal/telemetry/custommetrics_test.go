@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -162,6 +163,35 @@ func TestPluginCollectorRejectsCommandInterpreterLauncher(t *testing.T) {
 	_, err := NewPluginCollector().Collect(context.Background(), fakeRegistry{plugin: plugin}, policy.PluginMetricSpec{PluginID: "disk-check"})
 	if !errors.Is(err, ErrUnknownPlugin) {
 		t.Fatalf("Collect() error = %v, want ErrUnknownPlugin", err)
+	}
+}
+
+func TestPluginCollectorRejectsScriptLaunchersRegardlessOfExtension(t *testing.T) {
+	for name, fixture := range map[string]struct {
+		filename string
+		contents string
+	}{
+		"python":  {filename: "disk-check.py", contents: "print('unsafe')\n"},
+		"shebang": {filename: "disk-check", contents: "#!/bin/sh\necho unsafe\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			executable := filepath.Join(t.TempDir(), fixture.filename)
+			if err := os.WriteFile(executable, []byte(fixture.contents), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			binary, err := os.ReadFile(executable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(binary)
+			plugin := testPlugin(t, "json")
+			plugin.Executable = executable
+			plugin.SHA256 = hex.EncodeToString(digest[:])
+			_, err = NewPluginCollector().Collect(context.Background(), fakeRegistry{plugin: plugin}, policy.PluginMetricSpec{PluginID: "disk-check"})
+			if !errors.Is(err, ErrUnknownPlugin) {
+				t.Fatalf("Collect() error = %v, want ErrUnknownPlugin", err)
+			}
+		})
 	}
 }
 
