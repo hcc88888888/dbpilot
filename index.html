@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DataPilot · 数据库运维管理系统</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="features.css" />
+  <link rel="stylesheet" href="enterprise-theme.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">DP</span><span>DataPilot</span></div>
+    <div class="workspace"><span class="avatar small">CP</span><span>生产环境</span><span class="chevron">⌄</span></div>
+    <nav id="mainNav">
+      <p class="nav-title">运维中心</p>
+      <a class="nav-item active" href="#overview"><span>▦</span>概览</a>
+      <a class="nav-item" href="#instances"><span>◉</span>数据库实例 <em>24</em></a>
+      <a class="nav-item" href="#monitor"><span>⌁</span>性能监控</a>
+      <a class="nav-item" href="#alerts"><span>◇</span>告警中心 <em class="danger">3</em></a>
+      <p class="nav-title space">运维工具</p>
+      <a class="nav-item" href="#execution"><span>▸</span>批量执行</a>
+      <a class="nav-item" href="#backup"><span>◫</span>备份恢复</a>
+      <a class="nav-item" href="#audit"><span>≡</span>审计日志</a>
+      <p class="nav-title space">系统设置</p>
+      <a class="nav-item" href="#settings"><span>⚙</span>告警策略</a>
+      <a class="nav-item" href="#users"><span>♙</span>成员与权限</a>
+    </nav>
+    <div class="sidebar-footer"><span class="avatar">C</span><div><b>Chris Peng</b><small>管理员</small></div><span class="more">•••</span></div>
+  </aside>
+
+  <main>
+    <header>
+      <div><div class="crumb">运维中心 <span>/</span> 概览</div><h1>早上好，Chris <span>👋</span></h1></div>
+      <div class="header-actions"><button class="icon-button" title="帮助">?</button><button class="icon-button notification" title="通知">♧<i></i></button><button class="primary" id="newTask">＋ 新建运维任务</button></div>
+    </header>
+
+    <section class="health-banner">
+      <div class="pulse"><span></span></div><div><strong>系统运行正常</strong><p>所有核心服务可用，数据库集群状态稳定</p></div>
+      <button class="text-button" id="viewHealth">查看状态详情 <span>→</span></button>
+    </section>
+
+    <section class="stats-grid">
+      <article class="stat-card"><div class="stat-head"><span>受管实例</span><span class="stat-icon blue">▦</span></div><strong>24</strong><p><b class="up">↑ 2</b> 较上月</p><div class="spark spark-blue"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+      <article class="stat-card"><div class="stat-head"><span>活跃告警</span><span class="stat-icon red">◇</span></div><strong>3</strong><p><b class="down">↑ 1</b> 较昨日</p><div class="spark spark-red"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+      <article class="stat-card"><div class="stat-head"><span>今日执行任务</span><span class="stat-icon green">▸</span></div><strong>18</strong><p><b class="up">↑ 12%</b> 较昨日</p><div class="spark spark-green"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+      <article class="stat-card"><div class="stat-head"><span>备份成功率</span><span class="stat-icon purple">◫</span></div><strong>99.8<span class="unit">%</span></strong><p><b class="up">↑ 0.3%</b> 较上周</p><div class="spark spark-purple"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+    </section>
+
+    <section class="dashboard-grid" id="dashboard">
+      <article class="panel instances" id="instances"><div class="panel-head"><div><h2>实例运行状况</h2><p>24 个受管数据库实例</p></div><button class="link">查看全部 →</button></div><div class="tabs"><button class="selected">全部 <b>24</b></button><button>MySQL <b>12</b></button><button>PostgreSQL <b>8</b></button><button>Redis <b>4</b></button></div><div class="instance-list" id="instanceList"></div></article>
+      <article class="panel chart-panel" id="monitor"><div class="panel-head"><div><h2>资源使用趋势</h2><p>核心实例 · 最近 24 小时</p></div><select id="metricSelect"><option>CPU 使用率</option><option>内存使用率</option><option>连接数</option></select></div><div class="chart-label"><span>80%</span><span>60%</span><span>40%</span><span>20%</span><span>0%</span></div><div class="chart"><svg viewBox="0 0 620 205" preserveAspectRatio="none"><defs><linearGradient id="fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#4f6cf6" stop-opacity=".25"/><stop offset="1" stop-color="#4f6cf6" stop-opacity="0"/></linearGradient></defs><path class="area" d="M0,145 C28,126 45,137 70,118 S115,133 142,104 S182,126 208,111 S251,78 278,91 S324,115 347,95 S388,67 415,83 S456,92 482,65 S520,83 546,56 S588,76 620,39 L620,205 L0,205Z"/><path class="line" d="M0,145 C28,126 45,137 70,118 S115,133 142,104 S182,126 208,111 S251,78 278,91 S324,115 347,95 S388,67 415,83 S456,92 482,65 S520,83 546,56 S588,76 620,39"/><circle cx="415" cy="83" r="4"/></svg></div><div class="chart-times"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>现在</span></div><div class="chart-summary"><div><span class="dot blue-dot"></span><small>当前</small><b id="currentMetric">62.4%</b></div><div><span class="dot gray-dot"></span><small>平均</small><b>48.7%</b></div><div><span class="dot orange-dot"></span><small>峰值</small><b>78.2%</b></div></div></article>
+      <article class="panel alerts" id="alerts"><div class="panel-head"><div><h2>需要关注的告警</h2><p>3 条未处理告警</p></div><button class="link">告警中心 →</button></div><div id="alertList"></div></article>
+      <article class="panel activity"><div class="panel-head"><div><h2>最近任务</h2><p>运维任务执行记录</p></div><button class="link">全部记录 →</button></div><div class="task-list" id="taskList"></div></article>
+    </section>
+    <section class="feature-page" id="featurePage"></section>
+  </main>
+  <div class="modal-backdrop" id="modal"><div class="modal"><button class="close" id="closeModal">×</button><span class="eyebrow">批量执行</span><h2>创建运维任务</h2><p>选择目标实例并配置执行内容，系统将按审批策略安全执行。</p><label>任务名称<input value="例行健康检查" /></label><label>执行内容<textarea>SHOW PROCESSLIST;</textarea></label><div class="modal-actions"><button class="secondary" id="closeModal2">取消</button><button class="primary" id="submitTask">创建并提交</button></div></div></div>
+  <div class="toast" id="toast">任务已创建，等待审批后执行</div>
+  <script src="app.js"></script>
+</body>
+</html>
