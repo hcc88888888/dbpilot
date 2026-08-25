@@ -3,6 +3,7 @@ module dbpilot.local/platform
 go 1.25.0
 
 require (
+	go.etcd.io/bbolt v1.5.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.158.0
@@ -246,7 +247,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
-	go.etcd.io/bbolt v1.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/client v1.64.0 // indirect
 	go.opentelemetry.io/collector/component/componentstatus v0.158.0 // indirect
