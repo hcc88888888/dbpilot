@@ -12,6 +12,8 @@ import (
 
 const minimumCollectionInterval = 5 * time.Second
 
+var metricTemplateIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
+
 func Validate(p Policy, env ValidationEnvironment) error {
 	return validate(p, env, true)
 }
@@ -82,7 +84,21 @@ func validate(p Policy, env ValidationEnvironment, runtime bool) error {
 					return err
 				}
 			}
+		case SourceSQLMetrics:
+			if !metricTemplateIDPattern.MatchString(source.MetricID) {
+				return ErrInvalidMetricTemplateID
+			}
 		}
+	}
+	return nil
+}
+
+// ValidateSQLMetricSpec ensures policy can select only a well-formed template
+// name. Runtime secret references and statements are intentionally ignored:
+// neither has a JSON representation in signed policy.
+func ValidateSQLMetricSpec(spec SQLMetricSpec) error {
+	if !metricTemplateIDPattern.MatchString(spec.MetricID) {
+		return ErrInvalidMetricTemplateID
 	}
 	return nil
 }

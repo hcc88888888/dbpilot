@@ -20,24 +20,25 @@ const (
 )
 
 var (
-	ErrInvalidSignature      = errors.New("invalid policy signature")
-	ErrExpiredPolicy         = errors.New("expired policy")
-	ErrInvalidAgentID        = errors.New("invalid agent ID")
-	ErrPolicyVersionRollback = errors.New("policy version rollback")
-	ErrNoSources             = errors.New("policy has no sources")
-	ErrDuplicateSourceID     = errors.New("duplicate source ID")
-	ErrSourceKindNotAllowed  = errors.New("source kind is not allowed")
-	ErrInvalidLimits         = errors.New("invalid policy limits")
-	ErrPathTraversal         = errors.New("path traversal is not allowed")
-	ErrPathOutsideAllowRoots = errors.New("path is outside allowed roots")
-	ErrForbiddenPath         = errors.New("path is in a forbidden root")
-	ErrInvalidEndpoint       = errors.New("invalid metrics endpoint")
-	ErrIntervalTooShort      = errors.New("collection interval is below five seconds")
-	ErrTooManyLabels         = errors.New("too many labels")
-	ErrPluginNotRegistered   = errors.New("plugin is not registered")
-	ErrUnsafePluginParameter = errors.New("unsafe plugin parameter")
-	ErrPathResolution        = errors.New("telemetry path resolution failed")
-	ErrVersionStore          = errors.New("policy version store error")
+	ErrInvalidSignature        = errors.New("invalid policy signature")
+	ErrExpiredPolicy           = errors.New("expired policy")
+	ErrInvalidAgentID          = errors.New("invalid agent ID")
+	ErrPolicyVersionRollback   = errors.New("policy version rollback")
+	ErrNoSources               = errors.New("policy has no sources")
+	ErrDuplicateSourceID       = errors.New("duplicate source ID")
+	ErrSourceKindNotAllowed    = errors.New("source kind is not allowed")
+	ErrInvalidLimits           = errors.New("invalid policy limits")
+	ErrPathTraversal           = errors.New("path traversal is not allowed")
+	ErrPathOutsideAllowRoots   = errors.New("path is outside allowed roots")
+	ErrForbiddenPath           = errors.New("path is in a forbidden root")
+	ErrInvalidEndpoint         = errors.New("invalid metrics endpoint")
+	ErrIntervalTooShort        = errors.New("collection interval is below five seconds")
+	ErrTooManyLabels           = errors.New("too many labels")
+	ErrPluginNotRegistered     = errors.New("plugin is not registered")
+	ErrUnsafePluginParameter   = errors.New("unsafe plugin parameter")
+	ErrPathResolution          = errors.New("telemetry path resolution failed")
+	ErrVersionStore            = errors.New("policy version store error")
+	ErrInvalidMetricTemplateID = errors.New("invalid metric template ID")
 )
 
 type Policy struct {
@@ -57,6 +58,7 @@ type Source struct {
 	Interval time.Duration     `json:"interval"`
 	Labels   map[string]string `json:"labels,omitempty"`
 	PluginID string            `json:"plugin_id,omitempty"`
+	MetricID string            `json:"metric_id,omitempty"`
 	Params   map[string]string `json:"params,omitempty"`
 }
 
@@ -133,11 +135,13 @@ type HTTPJSONMetricSpec struct {
 	AllowInsecureHTTP bool `json:"allow_insecure_http,omitempty"`
 }
 
-// SQLMetricSpec describes one bounded query against a read-only connection.
-// The metric collector analyzes Statement defensively, while the database
-// account and driver timeout remain required defense-in-depth controls.
+// SQLMetricSpec selects a runtime-owned SQL metric template. Statement and
+// SecretRef remain runtime-only compatibility fields and are never signed or
+// serialized into a telemetry policy.
 type SQLMetricSpec struct {
-	Statement    string            `json:"statement"`
+	MetricID     string            `json:"metric_id"`
+	Statement    string            `json:"-"`
+	SecretRef    string            `json:"-"`
 	MetricName   string            `json:"metric_name"`
 	Type         MetricType        `json:"type,omitempty"`
 	ValueColumn  string            `json:"value_column,omitempty"`

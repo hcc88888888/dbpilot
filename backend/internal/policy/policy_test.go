@@ -3,14 +3,55 @@ package policy_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/internal/policy"
 )
+
+func TestTemplatePolicySerializesOnlyTypedMetricReference(t *testing.T) {
+	spec := policy.SQLMetricSpec{
+		MetricID:   "db.connections",
+		MetricName: "db_connections",
+		SecretRef:  "secret://runtime/db-primary",
+		Statement:  "SELECT password FROM users",
+	}
+	body, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if string(body) == "" || !containsJSONField(body, "metric_id") {
+		t.Fatalf("policy JSON = %s, want metric_id", body)
+	}
+	for _, forbidden := range []string{"secret://", "SELECT", "statement"} {
+		if stringContains(string(body), forbidden) {
+			t.Fatalf("policy JSON = %s, must not contain %q", body, forbidden)
+		}
+	}
+	if err := policy.ValidateSQLMetricSpec(spec); err != nil {
+		t.Fatalf("ValidateSQLMetricSpec() error = %v", err)
+	}
+	if err := policy.ValidateSQLMetricSpec(policy.SQLMetricSpec{MetricID: "../../unsafe"}); !errors.Is(err, policy.ErrInvalidMetricTemplateID) {
+		t.Fatalf("ValidateSQLMetricSpec() error = %v, want ErrInvalidMetricTemplateID", err)
+	}
+}
+
+func TestTemplatePolicyAcceptsSQLMetricSourceByTemplateID(t *testing.T) {
+	p := validPolicy(policy.Source{ID: "database-connections", Kind: policy.SourceSQLMetrics, MetricID: "db.connections", Interval: 5 * time.Second})
+	if err := policy.Validate(p, testEnvironment(nil)); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func containsJSONField(body []byte, field string) bool {
+	return stringContains(string(body), "\""+field+"\"")
+}
+func stringContains(body, fragment string) bool { return strings.Contains(body, fragment) }
 
 func validPolicy(source policy.Source) policy.Policy {
 	return policy.Policy{
