@@ -8,6 +8,9 @@ ca_file: /etc/dbpilot/tls/ca.pem
 cert_file: /etc/dbpilot/tls/agent.pem
 key_file: /etc/dbpilot/tls/agent-key.pem
 policy_public_key_file: /etc/dbpilot/policy-public-key.pem
+# Signed JSON policy envelope, atomically replaced by the enrolled control-plane
+# bootstrapper. This is never raw Collector/YAML configuration.
+policy_file: /var/lib/dbpilot-agent/policy-envelope.json
 data_directory: /var/lib/dbpilot-agent
 allowed_log_roots:
   - /var/log

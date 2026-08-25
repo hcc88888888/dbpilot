@@ -38,6 +38,23 @@ type Candidate interface {
 	Version() uint64
 }
 
+// EmbeddedBuilder is the minimal concrete lifecycle bridge for the linked
+// agent binary. Component-specific receivers are compiled before this point;
+// the candidate keeps their lifecycle under Engine ownership.
+type EmbeddedBuilder struct{}
+
+func NewEmbeddedBuilder() EmbeddedBuilder { return EmbeddedBuilder{} }
+func (EmbeddedBuilder) Build(_ context.Context, cfg RuntimeConfig) (Candidate, error) {
+	return embeddedCandidate{version: cfg.PolicyVersion()}, nil
+}
+
+type embeddedCandidate struct{ version uint64 }
+
+func (c embeddedCandidate) Start(context.Context) error   { return nil }
+func (c embeddedCandidate) Healthy(context.Context) error { return nil }
+func (c embeddedCandidate) Stop(context.Context) error    { return nil }
+func (c embeddedCandidate) Version() uint64               { return c.version }
+
 // ApplyState describes the outcome of a policy application attempt.
 type ApplyState string
 

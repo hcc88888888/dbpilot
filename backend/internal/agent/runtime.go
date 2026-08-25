@@ -5,11 +5,15 @@ package agent
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
+	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
 	"dbpilot.local/platform/internal/telemetry"
@@ -31,9 +35,10 @@ func (e *StartupError) Error() string { return fmt.Sprintf("agent startup: %v", 
 func (e *StartupError) Unwrap() error { return errors.Join(ErrNoUsablePolicy, e.Cause) }
 
 const (
-	defaultPollInterval    = 30 * time.Second
-	defaultExportInterval  = 5 * time.Second
-	defaultShutdownTimeout = 10 * time.Second
+	defaultPollInterval     = 30 * time.Second
+	defaultExportInterval   = 5 * time.Second
+	defaultShutdownTimeout  = 10 * time.Second
+	defaultOperationTimeout = 5 * time.Second
 )
 
 // PolicySource fetches only a signed DBPilot policy envelope. It has no raw
@@ -95,10 +100,11 @@ type Dependencies struct {
 	Exporter       Exporter
 	HealthReporter HealthReporter
 
-	PollInterval    time.Duration
-	ExportInterval  time.Duration
-	ShutdownTimeout time.Duration
-	Now             func() time.Time
+	PollInterval     time.Duration
+	ExportInterval   time.Duration
+	ShutdownTimeout  time.Duration
+	OperationTimeout time.Duration
+	Now              func() time.Time
 }
 
 // Runtime supervises one agent process. It never binds an administration
@@ -116,6 +122,9 @@ func NewRuntime(deps Dependencies) *Runtime {
 	}
 	if deps.ShutdownTimeout <= 0 {
 		deps.ShutdownTimeout = defaultShutdownTimeout
+	}
+	if deps.OperationTimeout <= 0 {
+		deps.OperationTimeout = defaultOperationTimeout
 	}
 	if deps.Now == nil {
 		deps.Now = time.Now
@@ -182,7 +191,9 @@ func (r *Runtime) activateStored(ctx context.Context) bool {
 }
 
 func (r *Runtime) activateRemote(ctx context.Context) bool {
-	envelope, err := r.deps.PolicySource.Fetch(ctx)
+	operationCtx, cancel := context.WithTimeout(ctx, r.deps.OperationTimeout)
+	defer cancel()
+	envelope, err := r.deps.PolicySource.Fetch(operationCtx)
 	if err != nil {
 		return false
 	}
@@ -238,7 +249,9 @@ func (r *Runtime) exportLoop(ctx context.Context) {
 		}
 		// exporter.Client retains batches and performs its own bounded retry
 		// backoff. Its errors are deliberately isolated from collector health.
-		_ = r.deps.Exporter.SendPending(ctx)
+		operationCtx, cancel := context.WithTimeout(ctx, r.deps.OperationTimeout)
+		_ = r.deps.Exporter.SendPending(operationCtx)
+		cancel()
 		select {
 		case <-ctx.Done():
 			return
@@ -277,6 +290,45 @@ func (r *Runtime) shutdown() error {
 		errs = append(errs, fmt.Errorf("close spool: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// FilePolicySource reads a signed JSON envelope from an absolute regular file.
+// It is a bootstrap source, not a raw Collector configuration channel.
+type FilePolicySource struct{ Path string }
+
+func (s FilePolicySource) Fetch(ctx context.Context) (policy.SignatureEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return policy.SignatureEnvelope{}, err
+	}
+	contents, err := os.ReadFile(s.Path)
+	if err != nil {
+		return policy.SignatureEnvelope{}, err
+	}
+	var envelope policy.SignatureEnvelope
+	if err := json.Unmarshal(contents, &envelope); err != nil {
+		return policy.SignatureEnvelope{}, err
+	}
+	return envelope, ctx.Err()
+}
+
+// Verifier adapts DBPilot's signed-policy verifier to Runtime's narrow port.
+type Verifier struct {
+	PublicKey   ed25519.PublicKey
+	Environment policy.ValidationEnvironment
+}
+
+func (v Verifier) Verify(_ context.Context, envelope policy.SignatureEnvelope) (policy.Policy, error) {
+	return policy.VerifyAndValidate(v.PublicKey, envelope, time.Now(), v.Environment)
+}
+
+// GRPCHealthReporter maps lifecycle status to the DBPilot-owned protobuf API.
+type GRPCHealthReporter struct {
+	Client telemetryv1.TelemetryIngestClient
+}
+
+func (r GRPCHealthReporter) Report(ctx context.Context, value PolicyStatus) error {
+	_, err := r.Client.ReportPolicyStatus(ctx, &telemetryv1.PolicyStatus{AgentId: value.AgentID, Version: int64(value.Version), State: value.State, ErrorCode: value.ErrorCode, ReportedAtUnix: value.Reported.Unix()})
+	return err
 }
 
 var (

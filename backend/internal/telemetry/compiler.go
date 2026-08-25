@@ -49,13 +49,14 @@ const (
 // configurations constructed from a policy. The actual component.Config
 // values stay private so callers cannot mutate a compiled policy.
 type RuntimeConfig struct {
-	receivers  map[string]receiverConfig
-	processors map[string]processorConfig
-	exporters  map[string]exporterConfig
-	extensions map[string]extensionConfig
-	pipelines  map[string]pipelineConfig
-	sources    map[string]SourceConfig
-	limits     runtimeLimits
+	policyVersion uint64
+	receivers     map[string]receiverConfig
+	processors    map[string]processorConfig
+	exporters     map[string]exporterConfig
+	extensions    map[string]extensionConfig
+	pipelines     map[string]pipelineConfig
+	sources       map[string]SourceConfig
+	limits        runtimeLimits
 }
 
 type receiverConfig struct {
@@ -151,8 +152,9 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 	}
 
 	cfg := RuntimeConfig{
-		receivers:  make(map[string]receiverConfig, len(p.Sources)),
-		processors: make(map[string]processorConfig, 2),
+		policyVersion: p.Version,
+		receivers:     make(map[string]receiverConfig, len(p.Sources)),
+		processors:    make(map[string]processorConfig, 2),
 		exporters: map[string]exporterConfig{"dbpilot": {
 			id:                       "dbpilot",
 			maxBatchBytes:            p.Limits.MaxBatchBytes,
@@ -193,6 +195,10 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 	}
 	return cfg, nil
 }
+
+// PolicyVersion identifies the signed policy that produced this immutable
+// configuration, allowing a concrete builder to return a matching Candidate.
+func (cfg RuntimeConfig) PolicyVersion() uint64 { return cfg.policyVersion }
 
 func (cfg *RuntimeConfig) addSource(agentID string, source policy.Source, storageID component.ID, hasStorage bool, allowed Catalog) error {
 	componentKind, pipelineID, ok := receiverFor(source.Kind)

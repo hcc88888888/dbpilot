@@ -51,7 +51,8 @@ func TestLoadConfigAcceptsAbsoluteRestrictedConfiguration(t *testing.T) {
 	cert := writeSecret(t, dir, "agent.pem")
 	key := writeSecret(t, dir, "key.pem")
 	policyKey := writeSecret(t, dir, "policy.pem")
-	path := writeConfig(t, "\nagent_id: agent-a\nserver_address: ingest.example:9443\nca_file: "+filepath.ToSlash(ca)+"\ncert_file: "+filepath.ToSlash(cert)+"\nkey_file: "+filepath.ToSlash(key)+"\npolicy_public_key_file: "+filepath.ToSlash(policyKey)+"\ndata_directory: "+filepath.ToSlash(dir)+"\nallowed_log_roots: ["+filepath.ToSlash(dir)+"]\nfile_collection_enabled: true\n")
+	policyFile := writeSecret(t, dir, "policy-envelope.json")
+	path := writeConfig(t, "\nagent_id: agent-a\nserver_address: ingest.example:9443\nca_file: "+filepath.ToSlash(ca)+"\ncert_file: "+filepath.ToSlash(cert)+"\nkey_file: "+filepath.ToSlash(key)+"\npolicy_public_key_file: "+filepath.ToSlash(policyKey)+"\npolicy_file: "+filepath.ToSlash(policyFile)+"\ndata_directory: "+filepath.ToSlash(dir)+"\nallowed_log_roots: ["+filepath.ToSlash(dir)+"]\nfile_collection_enabled: true\n")
 
 	config, err := loadConfig(path)
 	require.NoError(t, err)

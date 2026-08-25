@@ -26,6 +26,10 @@ if (-not [System.IO.Path]::IsPathRooted($GoBinary) -or -not (Test-Path -LiteralP
     throw 'GoBinary must be an absolute path to a Go executable.'
 }
 $go = [System.IO.Path]::GetFullPath($GoBinary)
+$goVersion = (& $go version).Trim()
+if ($goVersion -notmatch '^go version go1\.27\.0 ') {
+    throw "Go 1.27.0 is required; found: $goVersion"
+}
 
 $scriptRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $scriptRoot

@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +17,14 @@ import (
 	"strings"
 	"syscall"
 
+	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	"dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/exporter"
+	"dbpilot.local/platform/internal/policy"
+	"dbpilot.local/platform/internal/spool"
+	"dbpilot.local/platform/internal/telemetry"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,6 +40,7 @@ type agentConfig struct {
 	CertFile              string   `yaml:"cert_file"`
 	KeyFile               string   `yaml:"key_file"`
 	PolicyPublicKeyFile   string   `yaml:"policy_public_key_file"`
+	PolicyFile            string   `yaml:"policy_file"`
 	DataDirectory         string   `yaml:"data_directory"`
 	AllowedLogRoots       []string `yaml:"allowed_log_roots"`
 	FileCollectionEnabled bool     `yaml:"file_collection_enabled"`
@@ -36,9 +49,7 @@ type agentConfig struct {
 // startRuntime is deliberately a narrow seam: the signed-policy control-plane
 // source is supplied by the later enrollment/control-plane integration. The
 // Agent refuses to claim it is collecting when that source is unavailable.
-var startRuntime = func(context.Context, agentConfig) error {
-	return errors.New("signed DBPilot policy source is not configured")
-}
+var startRuntime = runRuntime
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -90,13 +101,16 @@ func loadConfig(path string) (agentConfig, error) {
 	if strings.TrimSpace(settings.AgentID) == "" || strings.TrimSpace(settings.ServerAddress) == "" {
 		return agentConfig{}, errors.New("agent_id and server_address are required")
 	}
-	for _, secret := range []string{settings.CAFile, settings.CertFile, settings.KeyFile, settings.PolicyPublicKeyFile} {
+	for _, secret := range []string{settings.CAFile, settings.CertFile, settings.KeyFile, settings.PolicyPublicKeyFile, settings.PolicyFile} {
 		if !filepath.IsAbs(secret) {
 			return agentConfig{}, errors.New("TLS and policy-key paths must be absolute")
 		}
-		info, err := os.Stat(secret)
-		if err != nil || info.IsDir() {
+		info, err := os.Lstat(secret)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return agentConfig{}, fmt.Errorf("required TLS or policy material is unavailable: %s", secret)
+		}
+		if runtime.GOOS == "linux" && secret == settings.KeyFile && info.Mode().Perm()&0o077 != 0 {
+			return agentConfig{}, errors.New("key_file must not be group/world accessible")
 		}
 	}
 	if !filepath.IsAbs(settings.DataDirectory) {
@@ -116,6 +130,70 @@ func loadConfig(path string) (agentConfig, error) {
 		if !filepath.IsAbs(root) {
 			return agentConfig{}, errors.New("allowed_log_roots entries must be absolute")
 		}
+		resolved, err := filepath.EvalSymlinks(root)
+		if err != nil || resolved == string(filepath.Separator) {
+			return agentConfig{}, errors.New("allowed_log_roots entries must exist and must not be a filesystem root")
+		}
 	}
 	return settings, nil
+}
+
+func runRuntime(ctx context.Context, settings agentConfig) error {
+	publicKey, err := loadPublicKey(settings.PolicyPublicKeyFile)
+	if err != nil {
+		return err
+	}
+	tlsConfig, err := clientTLSConfig(settings)
+	if err != nil {
+		return err
+	}
+	connection, err := grpc.DialContext(ctx, settings.ServerAddress, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	store, err := spool.Open(settings.DataDirectory, spool.Limits{MaxBytes: 1 << 30, SegmentBytes: 16 << 20})
+	if err != nil {
+		return err
+	}
+	client := telemetryv1.NewTelemetryIngestClient(connection)
+	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
+	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder()), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}})
+	return runtime.Run(ctx)
+}
+
+func loadPublicKey(path string) (ed25519.PublicKey, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(contents)
+	if block == nil {
+		return nil, errors.New("policy public key must be PEM")
+	}
+	parsed, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := parsed.(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("policy public key must be Ed25519")
+	}
+	return key, nil
+}
+
+func clientTLSConfig(settings agentConfig) (*tls.Config, error) {
+	ca, err := os.ReadFile(settings.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("CA file contains no certificates")
+	}
+	certificate, err := tls.LoadX509KeyPair(settings.CertFile, settings.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}, nil
 }
