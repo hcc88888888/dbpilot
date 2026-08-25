@@ -6,22 +6,36 @@ param(
     [string]$Binary,
     [ValidateSet('amd64', 'arm64')]
     [string]$Architecture = 'amd64',
+    [string]$DockerBinary,
     [switch]$Pull
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($DockerBinary)) {
+    $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
+    if ($dockerCommand) {
+        $DockerBinary = $dockerCommand.Source
+    } else {
+        $dockerCandidates = @(
+            (Join-Path ${env:ProgramFiles} 'Docker\Docker\resources\bin\docker.exe'),
+            (Join-Path ${env:LOCALAPPDATA} 'Programs\DockerDesktop\resources\bin\docker.exe')
+        )
+        $DockerBinary = $dockerCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    }
+}
+if ([string]::IsNullOrWhiteSpace($DockerBinary) -or -not (Test-Path -LiteralPath $DockerBinary -PathType Leaf)) {
+    throw 'Docker CLI is required. Install/start Docker Desktop or pass -DockerBinary with the absolute docker.exe path.'
+}
+
 function Invoke-Docker {
     param([string[]]$Arguments)
-    & docker @Arguments
+    & $DockerBinary @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
     }
 }
 
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker CLI is required. Windows validation can run this script through Docker Desktop or a remote Docker context.'
-}
 if (-not [System.IO.Path]::IsPathRooted($Binary) -or -not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
     throw 'Binary must be an existing absolute path.'
 }
@@ -29,13 +43,13 @@ if (-not [System.IO.Path]::IsPathRooted($Binary) -or -not (Test-Path -LiteralPat
 if ($Pull) {
     Invoke-Docker @('pull', $Image)
 }
-$imageId = (& docker image inspect --format '{{.Id}}' $Image 2>$null).Trim()
+$imageId = (& $DockerBinary image inspect --format '{{.Id}}' $Image 2>$null).Trim()
 if ([string]::IsNullOrWhiteSpace($imageId)) {
     throw "Kylin image '$Image' is not available locally. Pull it from the approved enterprise registry or configure a Docker context with access."
 }
 
 $platform = if ($Architecture -eq 'amd64') { 'linux/amd64' } else { 'linux/arm64' }
-$container = (& docker create --platform $platform $Image /bin/sh -c 'sleep 300').Trim()
+$container = (& $DockerBinary create --platform $platform $Image /bin/sh -c 'sleep 300').Trim()
 if ([string]::IsNullOrWhiteSpace($container)) { throw 'Unable to create Kylin validation container.' }
 try {
     Invoke-Docker @('cp', $Binary, "${container}:/opt/dbpilot-agent")
@@ -61,5 +75,5 @@ printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s\n' "${ID}" "${VERSION_
     Invoke-Docker @('exec', '-e', "DBPILOT_EXPECTED_ARCH=$Architecture", $container, '/bin/sh', '-c', "echo $encoded | base64 -d | /bin/sh")
 }
 finally {
-    & docker rm -f $container 2>$null | Out-Null
+    & $DockerBinary rm -f $container 2>$null | Out-Null
 }

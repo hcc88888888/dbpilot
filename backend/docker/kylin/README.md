@@ -21,6 +21,9 @@ powershell -File ..\scripts\verify-kylin-docker.ps1 `
   -Architecture amd64
 ```
 
+If Docker Desktop is not on `PATH`, add
+`-DockerBinary "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"`.
+
 For arm64, use a Kylin V10 arm64 image and set `-Architecture arm64`. Docker
 Desktop must have an engine capable of running the requested platform. If no
 Kylin image is available locally, the script fails explicitly; do not replace
