@@ -20,21 +20,22 @@ const (
 )
 
 var (
-	ErrInvalidSignature        = errors.New("invalid policy signature")
-	ErrExpiredPolicy           = errors.New("expired policy")
-	ErrInvalidAgentID          = errors.New("invalid agent ID")
-	ErrPolicyVersionRollback   = errors.New("policy version rollback")
-	ErrNoSources               = errors.New("policy has no sources")
-	ErrDuplicateSourceID       = errors.New("duplicate source ID")
-	ErrSourceKindNotAllowed    = errors.New("source kind is not allowed")
-	ErrInvalidLimits           = errors.New("invalid policy limits")
-	ErrPathTraversal           = errors.New("path traversal is not allowed")
-	ErrPathOutsideAllowRoots   = errors.New("path is outside allowed roots")
-	ErrForbiddenPath           = errors.New("path is in a forbidden root")
-	ErrInvalidEndpoint         = errors.New("invalid metrics endpoint")
-	ErrIntervalTooShort        = errors.New("collection interval is below five seconds")
-	ErrTooManyLabels           = errors.New("too many labels")
-	ErrPluginNotRegistered     = errors.New("plugin is not registered")
+	ErrInvalidSignature      = errors.New("invalid policy signature")
+	ErrExpiredPolicy         = errors.New("expired policy")
+	ErrInvalidAgentID        = errors.New("invalid agent ID")
+	ErrPolicyVersionRollback = errors.New("policy version rollback")
+	ErrNoSources             = errors.New("policy has no sources")
+	ErrDuplicateSourceID     = errors.New("duplicate source ID")
+	ErrSourceKindNotAllowed  = errors.New("source kind is not allowed")
+	ErrInvalidLimits         = errors.New("invalid policy limits")
+	ErrPathTraversal         = errors.New("path traversal is not allowed")
+	ErrPathOutsideAllowRoots = errors.New("path is outside allowed roots")
+	ErrForbiddenPath         = errors.New("path is in a forbidden root")
+	ErrInvalidEndpoint       = errors.New("invalid metrics endpoint")
+	ErrIntervalTooShort      = errors.New("collection interval is below five seconds")
+	ErrTooManyLabels         = errors.New("too many labels")
+	ErrPluginNotRegistered   = errors.New("plugin is not registered")
+	ErrUnsafePluginParameter = errors.New("unsafe plugin parameter")
 )
 
 type Policy struct {
@@ -73,4 +74,7 @@ type ValidationEnvironment struct {
 	ForbiddenRoots []string
 	PluginIDs      map[string]struct{}
 	ResolvePath    func(string) (string, error)
+	// PreviousVersion is the last accepted policy version persisted by the agent.
+	// A non-zero value requires the incoming policy to be strictly newer.
+	PreviousVersion uint64
 }

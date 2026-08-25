@@ -3,6 +3,8 @@ package policy
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"path"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -19,6 +21,14 @@ func Sign(private ed25519.PrivateKey, p Policy) (SignatureEnvelope, error) {
 }
 
 func Verify(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time) (Policy, error) {
+	return VerifyAndValidate(public, envelope, now, defaultValidationEnvironment())
+}
+
+// VerifyAndValidate verifies a signature and applies the runtime's policy
+// environment, including canonical path resolution, plugin registry, and the
+// last persisted policy version. Agents should persist the returned Version
+// only after all policy application steps succeed.
+func VerifyAndValidate(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time, env ValidationEnvironment) (Policy, error) {
 	if len(public) != ed25519.PublicKeySize {
 		return Policy{}, ErrInvalidSignature
 	}
@@ -29,7 +39,7 @@ func Verify(public ed25519.PublicKey, envelope SignatureEnvelope, now time.Time)
 	if !envelope.Policy.ExpiresAt.After(now) {
 		return Policy{}, ErrExpiredPolicy
 	}
-	if err := Validate(envelope.Policy, defaultValidationEnvironment()); err != nil {
+	if err := Validate(envelope.Policy, env); err != nil {
 		return Policy{}, err
 	}
 	return envelope.Policy, nil
@@ -56,5 +66,15 @@ func defaultValidationEnvironment() ValidationEnvironment {
 		AllowedRoots:   []string{"/var/log", "/var/lib/dbpilot", "/opt/dbpilot"},
 		ForbiddenRoots: []string{"/proc", "/sys", "/dev"},
 		PluginIDs:      map[string]struct{}{},
+		ResolvePath: func(raw string) (string, error) {
+			resolved, err := filepath.EvalSymlinks(raw)
+			if err != nil {
+				// A non-existent path cannot currently be a symlink. The agent's
+				// collector will fail to open it, while lexical confinement remains
+				// enforced here. Existing paths are always evaluated above.
+				return path.Clean(raw), nil
+			}
+			return filepath.ToSlash(resolved), nil
+		},
 	}
 }

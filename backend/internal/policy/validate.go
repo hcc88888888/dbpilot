@@ -14,7 +14,7 @@ func Validate(p Policy, env ValidationEnvironment) error {
 	if strings.TrimSpace(p.AgentID) == "" {
 		return ErrInvalidAgentID
 	}
-	if p.Version == 0 {
+	if p.Version == 0 || (env.PreviousVersion != 0 && p.Version <= env.PreviousVersion) {
 		return ErrPolicyVersionRollback
 	}
 	if p.ExpiresAt.IsZero() || !p.ExpiresAt.After(p.IssuedAt) {
@@ -58,6 +58,9 @@ func Validate(p Policy, env ValidationEnvironment) error {
 		case SourcePluginMetrics:
 			if _, ok := env.PluginIDs[source.PluginID]; !ok || strings.TrimSpace(source.PluginID) == "" {
 				return ErrPluginNotRegistered
+			}
+			if !validPluginParameters(source.Params) {
+				return ErrUnsafePluginParameter
 			}
 		}
 	}
@@ -109,7 +112,40 @@ func validatePath(raw string, env ValidationEnvironment) error {
 
 func isWithin(candidate, root string) bool {
 	root = path.Clean(root)
+	if root == "/" {
+		return path.IsAbs(candidate)
+	}
 	return candidate == root || strings.HasPrefix(candidate, root+"/")
+}
+
+func validPluginParameters(params map[string]string) bool {
+	for key, value := range params {
+		if !validParameterKey(key) || containsShellSyntax(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func validParameterKey(key string) bool {
+	if key == "" || len(key) > 64 {
+		return false
+	}
+	switch strings.ToLower(key) {
+	case "command", "command_line", "executable", "exec", "shell", "script", "args":
+		return false
+	}
+	for index, r := range key {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_' || r == '-' || r == '.' || (index > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func containsShellSyntax(value string) bool {
+	return strings.ContainsAny(value, "\x00\r\n;|&$`<>")
 }
 
 func validateEndpoint(raw string) error {

