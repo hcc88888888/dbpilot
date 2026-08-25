@@ -1,0 +1,25 @@
+[Unit]
+Description=DBPilot embedded telemetry agent
+Documentation=file:///usr/share/doc/dbpilot-agent/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dbpilot
+Group=dbpilot
+ExecStart=/usr/local/bin/dbpilot-agent --config /etc/dbpilot/agent.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/dbpilot-agent
+ConfigurationDirectory=dbpilot
+StateDirectory=dbpilot-agent
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

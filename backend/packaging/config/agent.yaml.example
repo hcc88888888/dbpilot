@@ -1,0 +1,14 @@
+# Install as /etc/dbpilot/agent.yaml (mode 0600, owner dbpilot:dbpilot).
+# This is Agent bootstrap configuration only. Telemetry policies are signed
+# DBPilot documents delivered by the control plane; do not place policy YAML,
+# Collector YAML, executables, or shell commands in this file.
+agent_id: replace-with-enrolled-agent-id
+server_address: ingest.dbpilot.example:9443
+ca_file: /etc/dbpilot/tls/ca.pem
+cert_file: /etc/dbpilot/tls/agent.pem
+key_file: /etc/dbpilot/tls/agent-key.pem
+policy_public_key_file: /etc/dbpilot/policy-public-key.pem
+data_directory: /var/lib/dbpilot-agent
+allowed_log_roots:
+  - /var/log
+file_collection_enabled: true

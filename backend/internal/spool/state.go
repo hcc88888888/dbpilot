@@ -106,6 +106,18 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// Seal promotes the current active segment without closing the metadata
+// database. Runtime calls it after receivers stop and before its final,
+// bounded exporter flush so an interrupted process can recover every batch.
+func (s *Store) Seal() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return ErrClosed
+	}
+	return s.sealActive()
+}
+
 // Open validates and creates a private root, opens bbolt metadata, and scans
 // the spool files to recover durable batches.
 func Open(root string, limits Limits) (*Store, error) {
@@ -252,6 +264,21 @@ func (s *Store) HealthFindings() []string {
 	}
 	sort.Strings(values)
 	return values
+}
+
+// RecordHealthFinding records a stable operational finding emitted by a
+// dependent component such as the acknowledged exporter. Detail is intentionally
+// not persisted with the code because the spool's health state is bounded and
+// may not retain server-provided text or credentials.
+func (s *Store) RecordHealthFinding(code string, _ string) {
+	if code == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		s.findings[code] = struct{}{}
+	}
 }
 
 func (s *Store) update(fn func(*bolt.Tx) error) error {

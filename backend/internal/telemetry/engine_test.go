@@ -124,6 +124,16 @@ func TestApplyRejectsLowerPolicyVersion(t *testing.T) {
 	require.Equal(t, 1, builder.BuildCalls())
 }
 
+func TestStopRetiresTheActivePipeline(t *testing.T) {
+	candidate := healthyCandidate(1)
+	engine := telemetry.NewEngine(newFakeBuilder(candidate))
+	requireApplyActive(t, engine, 1)
+
+	require.NoError(t, engine.Stop(context.Background()))
+	require.True(t, candidate.Stopped())
+	require.Zero(t, engine.ActiveVersion())
+}
+
 func TestApplySerializesConcurrentLifecycleTransitions(t *testing.T) {
 	firstCandidate := healthyCandidate(1)
 	secondCandidate := healthyCandidate(2)

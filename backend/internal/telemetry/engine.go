@@ -96,6 +96,19 @@ func (e *Engine) ActiveVersion() uint64 {
 	return e.active.Version()
 }
 
+// Stop retires the active pipeline during agent shutdown. Apply and Stop are
+// serialized so a candidate cannot be published after shutdown begins.
+func (e *Engine) Stop(ctx context.Context) error {
+	e.transitionMu.Lock()
+	defer e.transitionMu.Unlock()
+	if e.active == nil {
+		return nil
+	}
+	active := e.active
+	e.active = nil
+	return active.Stop(ctx)
+}
+
 // Apply compiles, starts, and health-checks a replacement before atomically
 // publishing it. A pre-swap failure stops only the new candidate and keeps the
 // old pipeline active. The active pipeline is stopped only after the swap.

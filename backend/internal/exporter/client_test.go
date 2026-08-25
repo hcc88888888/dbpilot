@@ -196,8 +196,7 @@ func (f *fakeIngest) ack(id string) (*telemetryv1.BatchAck, error) {
 	if ack == nil {
 		return nil, errors.New("unexpected batch")
 	}
-	copy := *ack
-	return &copy, nil
+	return &telemetryv1.BatchAck{BatchId: ack.BatchId, Accepted: ack.Accepted, Retryable: ack.Retryable, ErrorCode: ack.ErrorCode}, nil
 }
 
 func testBatch(id string, created time.Time) spool.Batch {

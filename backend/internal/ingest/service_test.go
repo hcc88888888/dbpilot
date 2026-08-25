@@ -153,13 +153,11 @@ func (d *memoryDedup) Lookup(agentID, batchID string) (*telemetryv1.BatchAck, bo
 	if !ok {
 		return nil, false
 	}
-	copy := *ack
-	return &copy, true
+	return &telemetryv1.BatchAck{BatchId: ack.BatchId, Accepted: ack.Accepted, Retryable: ack.Retryable, ErrorCode: ack.ErrorCode}, true
 }
 
 func (d *memoryDedup) Remember(agentID, batchID string, ack *telemetryv1.BatchAck) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	copy := *ack
-	d.acks[agentID+"/"+batchID] = &copy
+	d.acks[agentID+"/"+batchID] = &telemetryv1.BatchAck{BatchId: ack.BatchId, Accepted: ack.Accepted, Retryable: ack.Retryable, ErrorCode: ack.ErrorCode}
 }

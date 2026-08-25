@@ -12,6 +12,7 @@ import (
 
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
+	"github.com/stretchr/testify/require"
 )
 
 func openStore(t *testing.T, limits spool.Limits) *spool.Store {
@@ -339,6 +340,23 @@ func TestCloseAuditSealFailureRaisesHealthFinding(t *testing.T) {
 		t.Fatal("Close() error = nil")
 	}
 	if !contains(store.HealthFindings(), spool.FindingAuditSpoolIOFailure) {
+		t.Fatalf("findings = %v", store.HealthFindings())
+	}
+}
+
+func TestSealMakesActiveBatchesAvailableWithoutClosingState(t *testing.T) {
+	store := openStore(t, spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, store.Append(context.Background(), spool.Log, spool.Batch{ID: "seal-1", SourceID: "source", CreatedAt: time.Now(), Payload: []byte("payload")}))
+	require.NoError(t, store.Seal())
+	batches, err := store.Pending(context.Background(), spool.Log, 1)
+	require.NoError(t, err)
+	require.Len(t, batches, 1)
+}
+
+func TestRecordHealthFindingExposesExporterFailure(t *testing.T) {
+	store := openStore(t, spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	store.RecordHealthFinding("TELEMETRY_PERMANENT_REJECTION", "gateway rejected batch")
+	if !contains(store.HealthFindings(), "TELEMETRY_PERMANENT_REJECTION") {
 		t.Fatalf("findings = %v", store.HealthFindings())
 	}
 }

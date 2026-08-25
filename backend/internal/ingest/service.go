@@ -201,13 +201,18 @@ func (d *MemoryDeduplicator) Lookup(agentID, batchID string) (*telemetryv1.Batch
 	if !ok {
 		return nil, false
 	}
-	copy := *ack
-	return &copy, true
+	return cloneBatchAck(ack), true
 }
 
 func (d *MemoryDeduplicator) Remember(agentID, batchID string, ack *telemetryv1.BatchAck) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	copy := *ack
-	d.acks[agentID+"\x00"+batchID] = &copy
+	d.acks[agentID+"\x00"+batchID] = cloneBatchAck(ack)
+}
+
+func cloneBatchAck(ack *telemetryv1.BatchAck) *telemetryv1.BatchAck {
+	if ack == nil {
+		return nil
+	}
+	return &telemetryv1.BatchAck{BatchId: ack.BatchId, Accepted: ack.Accepted, Retryable: ack.Retryable, ErrorCode: ack.ErrorCode}
 }
