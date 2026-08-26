@@ -144,6 +144,9 @@ func (client *jmxClient) FetchZooKeeperMonitor(ctx context.Context, endpoint End
 	if err != nil {
 		return nil, err
 	}
+	if err := validateJMXTLSURL(target, client.config.TLS); err != nil {
+		return nil, err
+	}
 	if ctx == nil || isNilInterface(client.resolver) {
 		return nil, errors.New("ZooKeeper monitor runtime client is required")
 	}

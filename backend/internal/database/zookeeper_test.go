@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -85,6 +86,17 @@ func TestZooKeeperMonitorParsesJSONAndRedactsFailures(t *testing.T) {
 	_, err = adapter.Collect(context.Background(), MetricRequest{})
 	if !called || err == nil || containsString([]string{err.Error()}, "top-secret") {
 		t.Fatalf("Collect() error = %v, want redacted monitor failure", err)
+	}
+}
+
+func TestZooKeeperMonitorRejectsHTTPWhenTLSIsEnabledBeforeRequest(t *testing.T) {
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	defer server.Close()
+	client := NewJMXClient(StaticSecretResolver{"secret://runtime/zk": []byte("token"), "secret://runtime/zk-ca": []byte("not-used")}, JMXClientConfig{SecretRef: "secret://runtime/zk", TLS: TLSConfig{Enabled: true, CASecretRef: "secret://runtime/zk-ca"}})
+	_, err := client.(zooKeeperMonitorFetcher).FetchZooKeeperMonitor(context.Background(), Endpoint{URL: server.URL + zooKeeperCompatibilityPath})
+	if err == nil || called || !strings.Contains(err.Error(), "JMX TLS requires an HTTPS endpoint") {
+		t.Fatalf("Collect() error = %v, called = %v; want TLS rejection before request", err, called)
 	}
 }
 
