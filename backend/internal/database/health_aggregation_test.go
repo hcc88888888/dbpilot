@@ -57,6 +57,60 @@ func TestAggregateHealthMarksUnrelatedSamplesIncompleteAndRejectsUndeclaredRoles
 	}
 }
 
+func TestAggregateHealthRequiresExactMetricInputsAndCompleteCapacityPairs(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		samples []MetricSample
+		cluster string
+		kind    ComponentKind
+		role    string
+	}{
+		{
+			name: "unknown HBase request metric is incomplete",
+			samples: []MetricSample{
+				sample("hbase-prod", HBaseComponent, "master", "hbase.request.unknown", 1),
+				sample("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.missing_blocks", 0),
+				sample("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1),
+			},
+			cluster: "hbase-prod", kind: HBaseComponent, role: "master",
+		},
+		{
+			name: "unknown DataNode I/O metric is incomplete",
+			samples: []MetricSample{
+				sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1),
+				sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.unknown", 1),
+				sample("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1),
+			},
+			cluster: "hdfs-prod", kind: HDFSComponent, role: "datanode",
+		},
+		{
+			name: "partial NameNode capacity pair is incomplete",
+			samples: []MetricSample{
+				sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1),
+				sample("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.capacity_used", 90),
+				sample("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1),
+			},
+			cluster: "hdfs-prod", kind: HDFSComponent, role: "namenode",
+		},
+		{
+			name: "partial DataNode capacity pair is incomplete",
+			samples: []MetricSample{
+				sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1),
+				sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.capacity", 100),
+				sample("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1),
+			},
+			cluster: "hdfs-prod", kind: HDFSComponent, role: "datanode",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := findHealth(AggregateHealth(mustTopology(t, "master"), test.samples), test.cluster, test.kind, test.role)
+			if !ok || got.State != HealthDataIncomplete {
+				t.Fatalf("health = %#v, want data_incomplete", got)
+			}
+		})
+	}
+}
+
 func TestBuildDependencyEvidenceDeduplicatesAlertKeys(t *testing.T) {
 	topology := mustTopology(t, "master")
 	evidence := BuildDependencyEvidence(topology, []MetricSample{
@@ -89,6 +143,33 @@ func TestBuildDependencyEvidenceUsesDataNodeIOAndPreservesDimensions(t *testing.
 	}
 	if evidence[0].Host != "hbase-1" || evidence[0].SampleTime != stamp || evidence[0].DependencyHost != "datanode-1" || evidence[0].DependencySampleTime != stamp.Add(1) {
 		t.Fatalf("evidence dimensions = %#v, want component and dependency host/sample time", evidence[0])
+	}
+}
+
+func TestBuildDependencyEvidenceUsesTriggerDimensionsDeterministically(t *testing.T) {
+	topology := mustTopology(t, "master")
+	write := sample("hbase-prod", HBaseComponent, "master", "hbase.wal.sync_time", 2000)
+	write.Host, write.Timestamp = "trigger-hbase", testTimestamp()
+	unrelatedHBase := sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1)
+	unrelatedHBase.Host, unrelatedHBase.Timestamp = "later-hbase", testTimestamp().Add(time.Hour)
+	io := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.bytes_read", dataNodeIOPressureBytes+1)
+	io.Host, io.Timestamp = "trigger-datanode", testTimestamp()
+	unrelatedHDFS := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.xceiver_count", 1)
+	unrelatedHDFS.Host, unrelatedHDFS.Timestamp = "later-datanode", testTimestamp().Add(time.Hour)
+
+	evidence := BuildDependencyEvidence(topology, []MetricSample{unrelatedHDFS, unrelatedHBase, io, write})
+	if len(evidence) != 1 || evidence[0].Host != "trigger-hbase" || evidence[0].DependencyHost != "trigger-datanode" || evidence[0].SampleTime != testTimestamp() || evidence[0].DependencySampleTime != testTimestamp() {
+		t.Fatalf("BuildDependencyEvidence() = %#v, want deterministic triggering dimensions", evidence)
+	}
+}
+
+func TestBuildDependencyEvidenceRejectsUnknownDataNodeIO(t *testing.T) {
+	evidence := BuildDependencyEvidence(mustTopology(t, "master"), []MetricSample{
+		sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 2000),
+		sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.unknown", dataNodeIOPressureBytes+1),
+	})
+	if hasRule(evidence, EvidenceHBaseWriteLatencyHDFS) {
+		t.Fatalf("BuildDependencyEvidence() = %#v, must ignore unknown DataNode I/O metrics", evidence)
 	}
 }
 

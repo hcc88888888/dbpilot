@@ -72,7 +72,7 @@ func TestResolveTopologyCanonicalizesRoleAliasesAndReturnsDefensiveCopies(t *tes
 	nodes[0].Roles[0] = "mutated"
 	relations := topology.Relations()
 	relations[0].ComponentID = "mutated"
-	if topology.HasRelation("mutated", "hdfs-prod", HDFSComponent) || hasTopologyRole(topology.Nodes(), "mutated", "mutated") {
+	if topology.HasRelation("mutated", "hdfs-prod", HDFSComponent) || hasTopologyRole(topology.Nodes(), "mutated", "mutated") || !topology.HasRelation("hbase-prod", "hdfs-prod", HDFSComponent) || !hasTopologyRole(topology.Nodes(), "hbase-prod", "regionserver") {
 		t.Fatal("Topology accessor leaked mutable state")
 	}
 }

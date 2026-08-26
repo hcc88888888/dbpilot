@@ -139,8 +139,9 @@ func BuildDependencyEvidence(topology Topology, samples []MetricSample) []Depend
 
 		if hasHDFS && hdfsDataNodeDiskOrIOPressure(byCluster[hdfsID]) {
 			for _, role := range roles {
-				if hasElevatedWriteLatency(byCluster[node.ID][role]) {
-					addEvidence(evidence, node.ID, role, EvidenceHBaseWriteLatencyHDFS, hdfsID, byCluster[node.ID][role], flattenSamples(byCluster[hdfsID]))
+				writeSamples := elevatedWriteLatencySamples(byCluster[node.ID][role])
+				if len(writeSamples) != 0 {
+					addEvidence(evidence, node.ID, role, EvidenceHBaseWriteLatencyHDFS, hdfsID, writeSamples, hdfsDataNodePressureSamples(byCluster[hdfsID]))
 				}
 			}
 		}
@@ -251,12 +252,19 @@ func metricGreaterThan(samples []MetricSample, name string, threshold float64) b
 }
 
 func hasElevatedWriteLatency(samples []MetricSample) bool {
+	return len(elevatedWriteLatencySamples(samples)) != 0
+}
+
+func elevatedWriteLatencySamples(samples []MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
 	for _, name := range []string{"hbase.wal.append_time", "hbase.wal.sync_time", "hbase.request.total_time"} {
-		if metricGreaterThan(samples, name, writeLatencyThresholdMS) {
-			return true
+		for _, sample := range samples {
+			if sample.MetricName == name && sample.Value > writeLatencyThresholdMS {
+				result = append(result, sample)
+			}
 		}
 	}
-	return false
+	return result
 }
 
 func hasRequestBacklog(samples []MetricSample) bool {
@@ -264,12 +272,29 @@ func hasRequestBacklog(samples []MetricSample) bool {
 }
 
 func hdfsDataNodeDiskOrIOPressure(roles map[string][]MetricSample) bool {
+	return len(hdfsDataNodePressureSamples(roles)) != 0
+}
+
+func hdfsDataNodePressureSamples(roles map[string][]MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
 	for role, samples := range roles {
-		if role == hdfsRoleDataNode && (metricGreaterThan(samples, "hdfs.datanode.failed_volumes", 0) || capacityPressure(samples, "hdfs.datanode.used", "hdfs.datanode.capacity") || metricGreaterThan(samples, "hdfs.datanode.xceiver_count", requestBacklogThreshold) || metricGreaterThan(samples, "hdfs.datanode.io.bytes_read", dataNodeIOPressureBytes) || metricGreaterThan(samples, "hdfs.datanode.io.bytes_written", dataNodeIOPressureBytes)) {
-			return true
+		if role != hdfsRoleDataNode {
+			continue
+		}
+		for _, sample := range samples {
+			if (sample.MetricName == "hdfs.datanode.failed_volumes" && sample.Value > 0) || (sample.MetricName == "hdfs.datanode.xceiver_count" && sample.Value > requestBacklogThreshold) || ((sample.MetricName == "hdfs.datanode.io.bytes_read" || sample.MetricName == "hdfs.datanode.io.bytes_written") && sample.Value > dataNodeIOPressureBytes) {
+				result = append(result, sample)
+			}
+		}
+		if capacityPressure(samples, "hdfs.datanode.used", "hdfs.datanode.capacity") {
+			for _, sample := range samples {
+				if sample.MetricName == "hdfs.datanode.used" || sample.MetricName == "hdfs.datanode.capacity" {
+					result = append(result, sample)
+				}
+			}
 		}
 	}
-	return false
+	return result
 }
 
 func hdfsWALFlushRisk(roles map[string][]MetricSample) bool {
@@ -319,26 +344,58 @@ func zooKeeperComponentFailure(roles map[string][]MetricSample) bool {
 }
 
 func hasRequiredHealthInputs(kind ComponentKind, role string, samples []MetricSample) bool {
+	switch kind {
+	case HBaseComponent:
+		return hasAnyMetric(samples, hbaseHealthMetricNames)
+	case HDFSComponent:
+		if role == hdfsRoleNameNode {
+			return hasAnyMetric(samples, hdfsNameNodeHealthMetricNames) || hasMetricPair(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total")
+		}
+		if role == hdfsRoleDataNode {
+			return hasAnyMetric(samples, hdfsDataNodeHealthMetricNames) || hasMetricPair(samples, "hdfs.datanode.used", "hdfs.datanode.capacity")
+		}
+	case ZooKeeperComponent:
+		return hasAnyMetric(samples, zooKeeperHealthMetricNames)
+	}
+	return false
+}
+
+var hbaseHealthMetricNames = map[string]struct{}{
+	"hbase.master.dead_region_servers": {}, "hbase.request.queue_time": {}, "hbase.request.processing_time": {}, "hbase.request.total_time": {}, "hbase.request.open_connections": {}, "hbase.wal.append_time": {}, "hbase.wal.sync_time": {}, "hbase.wal.slow_appends": {}, "hbase.flush.queue_length": {}, "hbase.flush.time": {}, "hbase.flush.count": {}, "hbase.compaction.queue_length": {}, "hbase.compaction.time": {}, "hbase.compaction.count": {},
+}
+
+var hdfsNameNodeHealthMetricNames = map[string]struct{}{
+	"hdfs.namenode.under_replicated_blocks": {}, "hdfs.namenode.missing_blocks": {}, "hdfs.namenode.corrupt_files": {},
+}
+
+var hdfsDataNodeHealthMetricNames = map[string]struct{}{
+	"hdfs.datanode.failed_volumes": {}, "hdfs.datanode.xceiver_count": {}, "hdfs.datanode.io.bytes_read": {}, "hdfs.datanode.io.bytes_written": {},
+}
+
+var zooKeeperHealthMetricNames = map[string]struct{}{
+	"zookeeper.sessions": {}, "zookeeper.quorum.members": {}, "zookeeper.outstanding_requests": {}, "zookeeper.transaction_log.sync_time": {},
+}
+
+func hasAnyMetric(samples []MetricSample, allowed map[string]struct{}) bool {
 	for _, sample := range samples {
-		switch kind {
-		case HBaseComponent:
-			if strings.HasPrefix(sample.MetricName, "hbase.request.") || strings.HasPrefix(sample.MetricName, "hbase.wal.") || strings.HasPrefix(sample.MetricName, "hbase.flush.") || strings.HasPrefix(sample.MetricName, "hbase.compaction.") || sample.MetricName == "hbase.master.dead_region_servers" {
-				return true
-			}
-		case HDFSComponent:
-			if role == hdfsRoleNameNode && (sample.MetricName == "hdfs.namenode.under_replicated_blocks" || sample.MetricName == "hdfs.namenode.missing_blocks" || sample.MetricName == "hdfs.namenode.corrupt_files" || sample.MetricName == "hdfs.namenode.capacity_used" || sample.MetricName == "hdfs.namenode.capacity_total") {
-				return true
-			}
-			if role == hdfsRoleDataNode && (sample.MetricName == "hdfs.datanode.failed_volumes" || sample.MetricName == "hdfs.datanode.capacity" || sample.MetricName == "hdfs.datanode.used" || sample.MetricName == "hdfs.datanode.xceiver_count" || strings.HasPrefix(sample.MetricName, "hdfs.datanode.io.")) {
-				return true
-			}
-		case ZooKeeperComponent:
-			if sample.MetricName == "zookeeper.sessions" || sample.MetricName == "zookeeper.quorum.members" || sample.MetricName == "zookeeper.outstanding_requests" || sample.MetricName == "zookeeper.transaction_log.sync_time" {
-				return true
-			}
+		if _, exists := allowed[sample.MetricName]; exists {
+			return true
 		}
 	}
 	return false
+}
+
+func hasMetricPair(samples []MetricSample, first, second string) bool {
+	firstFound, secondFound := false, false
+	for _, sample := range samples {
+		if sample.MetricName == first {
+			firstFound = true
+		}
+		if sample.MetricName == second {
+			secondFound = true
+		}
+	}
+	return firstFound && secondFound
 }
 
 func nodeHasRole(node TopologyNode, role string) bool {
@@ -355,17 +412,34 @@ func flattenSamples(roles map[string][]MetricSample) []MetricSample {
 	for _, samples := range roles {
 		result = append(result, samples...)
 	}
+	sort.Slice(result, func(i, j int) bool { return metricSampleLess(result[i], result[j]) })
 	return result
 }
 
 func sampleDimensions(samples []MetricSample) (string, time.Time) {
 	var selected MetricSample
 	for _, sample := range samples {
-		if selected.Timestamp.IsZero() || sample.Timestamp.After(selected.Timestamp) {
+		if selected.Timestamp.IsZero() || sample.Timestamp.After(selected.Timestamp) || (sample.Timestamp.Equal(selected.Timestamp) && metricSampleLess(sample, selected)) {
 			selected = sample
 		}
 	}
 	return selected.Host, selected.Timestamp
+}
+
+func metricSampleLess(left, right MetricSample) bool {
+	if !left.Timestamp.Equal(right.Timestamp) {
+		return left.Timestamp.Before(right.Timestamp)
+	}
+	if left.Host != right.Host {
+		return left.Host < right.Host
+	}
+	if left.Instance != right.Instance {
+		return left.Instance < right.Instance
+	}
+	if left.MetricName != right.MetricName {
+		return left.MetricName < right.MetricName
+	}
+	return left.Value < right.Value
 }
 
 func capacityPressure(samples []MetricSample, usedName, totalName string) bool {
