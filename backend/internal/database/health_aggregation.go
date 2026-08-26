@@ -23,10 +23,9 @@ const (
 	diskPressureRatio             = 0.90
 	zooKeeperOutstandingThreshold = 100.0
 	zooKeeperLatencyThresholdMS   = 1000.0
-	dataNodeIOPressureBytes       = float64(1 << 30)
 )
 
-// ComponentHealth is a role-level, deterministic health result. State always
+// ComponentHealth is a role-and-host-level, deterministic health result. State always
 // describes the closest known cause: the component itself, an authorized
 // dependency, or incomplete collection data.
 type ComponentHealth struct {
@@ -67,18 +66,19 @@ type DependencyEvidence struct {
 // AggregateHealth computes component-local health before propagating
 // authorized dependency failures to HBase. Unknown, missing, or uncollected
 // samples become data_incomplete rather than a component failure.
-func AggregateHealth(topology Topology, samples []MetricSample) []ComponentHealth {
+func AggregateHealth(topology Topology, samples []MetricSample, statuses ...ComponentCollectionStatus) []ComponentHealth {
 	byCluster := samplesByAuthorizedComponent(topology, samples)
+	incomplete := incompleteHealthScopes(topology, statuses)
 	health := make([]ComponentHealth, 0)
 	for _, node := range topology.nodes {
-		roles := node.Roles
-		if len(roles) == 0 {
-			roles = []string{"unknown"}
-		}
-		for _, role := range roles {
-			local := byCluster[node.ID][role]
-			host, sampleTime := sampleDimensions(local)
-			health = append(health, ComponentHealth{Cluster: node.ID, Component: node.Kind, Role: role, State: localHealth(node.Kind, role, local), Host: host, SampleTime: sampleTime})
+		for _, scope := range componentHealthScopes(node, byCluster[node.ID], incomplete[node.ID]) {
+			local := samplesForHealthScope(byCluster[node.ID][scope.role], scope.host)
+			state, dimensions := localHealthDetails(node.Kind, scope.role, local)
+			if incomplete[node.ID][scope] && state != HealthComponentFailure {
+				state = HealthDataIncomplete
+			}
+			_, sampleTime := sampleDimensions(dimensions)
+			health = append(health, ComponentHealth{Cluster: node.ID, Component: node.Kind, Role: scope.role, State: state, Host: scope.host, SampleTime: sampleTime})
 		}
 	}
 
@@ -116,9 +116,97 @@ func AggregateHealth(topology Topology, samples []MetricSample) []ComponentHealt
 		if health[i].Component != health[j].Component {
 			return health[i].Component < health[j].Component
 		}
-		return health[i].Role < health[j].Role
+		if health[i].Role != health[j].Role {
+			return health[i].Role < health[j].Role
+		}
+		return health[i].Host < health[j].Host
 	})
 	return health
+}
+
+type healthScope struct {
+	role string
+	host string
+}
+
+func incompleteHealthScopes(topology Topology, statuses []ComponentCollectionStatus) map[string]map[healthScope]bool {
+	result := make(map[string]map[healthScope]bool, len(topology.nodes))
+	for _, node := range topology.nodes {
+		result[node.ID] = make(map[healthScope]bool)
+	}
+	for _, status := range statuses {
+		node, exists := topology.node(status.Cluster)
+		if !exists || status.Component != node.Kind {
+			continue
+		}
+		for _, endpoint := range status.IncompleteEndpoints {
+			role, err := canonicalHealthRole(node.Kind, endpoint.Role)
+			if err == nil {
+				result[node.ID][healthScope{role: role, host: endpoint.Host}] = true
+			}
+		}
+		if status.State == "failed" && len(status.IncompleteEndpoints) == 0 {
+			roles := node.Roles
+			if node.Kind == ZooKeeperComponent || len(roles) == 0 {
+				roles = []string{"unknown"}
+			}
+			for _, role := range roles {
+				result[node.ID][healthScope{role: role}] = true
+			}
+		}
+	}
+	return result
+}
+
+func componentHealthScopes(node TopologyNode, roles map[string][]MetricSample, incomplete map[healthScope]bool) []healthScope {
+	set := make(map[healthScope]struct{})
+	for role, samples := range roles {
+		for _, sample := range samples {
+			set[healthScope{role: role, host: sample.Host}] = struct{}{}
+		}
+	}
+	for scope := range incomplete {
+		set[scope] = struct{}{}
+	}
+	if node.Kind == ZooKeeperComponent {
+		if len(set) == 0 {
+			set[healthScope{role: "unknown"}] = struct{}{}
+		}
+	} else {
+		for _, role := range node.Roles {
+			found := false
+			for scope := range set {
+				if scope.role == role {
+					found = true
+					break
+				}
+			}
+			if !found {
+				set[healthScope{role: role}] = struct{}{}
+			}
+		}
+	}
+	result := make([]healthScope, 0, len(set))
+	for scope := range set {
+		result = append(result, scope)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].role != result[j].role {
+			return result[i].role < result[j].role
+		}
+		return result[i].host < result[j].host
+	})
+	return result
+}
+
+func samplesForHealthScope(samples []MetricSample, host string) []MetricSample {
+	result := make([]MetricSample, 0)
+	for _, sample := range samples {
+		if sample.Host == host {
+			result = append(result, sample)
+		}
+	}
+	return result
 }
 
 // BuildDependencyEvidence evaluates the four initial correlation rules using
@@ -198,13 +286,20 @@ func samplesByAuthorizedComponent(topology Topology, samples []MetricSample) map
 		if !exists || sample.Component != string(node.Kind) {
 			continue
 		}
-		role, err := canonicalComponentRole(node.Kind, sample.Role)
-		if err != nil || !nodeHasRole(node, role) {
+		role, err := canonicalHealthRole(node.Kind, sample.Role)
+		if err != nil || (node.Kind != ZooKeeperComponent && !nodeHasRole(node, role)) {
 			continue
 		}
 		result[node.ID][role] = append(result[node.ID][role], sample)
 	}
 	return result
+}
+
+func canonicalHealthRole(kind ComponentKind, role string) (string, error) {
+	if kind == ZooKeeperComponent && strings.EqualFold(strings.TrimSpace(role), "unknown") {
+		return "unknown", nil
+	}
+	return canonicalComponentRole(kind, role)
 }
 
 func aggregateComponentState(values []ComponentHealth, cluster string, kind ComponentKind) HealthState {
@@ -229,33 +324,49 @@ func aggregateComponentState(values []ComponentHealth, cluster string, kind Comp
 }
 
 func localHealth(kind ComponentKind, role string, samples []MetricSample) HealthState {
+	state, _ := localHealthDetails(kind, role, samples)
+	return state
+}
+
+func localHealthDetails(kind ComponentKind, role string, samples []MetricSample) (HealthState, []MetricSample) {
 	if !hasRequiredHealthInputs(kind, role, samples) {
-		return HealthDataIncomplete
+		return HealthDataIncomplete, samples
 	}
 	switch kind {
 	case HBaseComponent:
-		if metricGreaterThan(samples, "hbase.master.dead_region_servers", 0) {
-			return HealthComponentFailure
+		if triggers := metricSamplesGreaterThan(samples, "hbase.master.dead_region_servers", 0); len(triggers) != 0 {
+			return HealthComponentFailure, triggers
 		}
 	case HDFSComponent:
-		if metricGreaterThan(samples, "hdfs.namenode.missing_blocks", 0) || metricGreaterThan(samples, "hdfs.namenode.corrupt_files", 0) || metricGreaterThan(samples, "hdfs.datanode.failed_volumes", 0) || capacityPressure(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total") {
-			return HealthComponentFailure
+		triggers := make([]MetricSample, 0)
+		for _, name := range []string{"hdfs.namenode.missing_blocks", "hdfs.namenode.corrupt_files", "hdfs.datanode.failed_volumes"} {
+			triggers = append(triggers, metricSamplesGreaterThan(samples, name, 0)...)
+		}
+		triggers = append(triggers, capacityPressureSamples(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total")...)
+		if len(triggers) != 0 {
+			return HealthComponentFailure, triggers
 		}
 	case ZooKeeperComponent:
-		if zooKeeperComponentFailure(map[string][]MetricSample{"role": samples}) {
-			return HealthComponentFailure
+		triggers := append(zooKeeperBacklogSamples(map[string][]MetricSample{"role": samples}), zooKeeperFailoverSamples(map[string][]MetricSample{"role": samples})...)
+		if len(triggers) != 0 {
+			return HealthComponentFailure, triggers
 		}
 	}
-	return HealthHealthy
+	return HealthHealthy, samples
 }
 
 func metricGreaterThan(samples []MetricSample, name string, threshold float64) bool {
+	return len(metricSamplesGreaterThan(samples, name, threshold)) != 0
+}
+
+func metricSamplesGreaterThan(samples []MetricSample, name string, threshold float64) []MetricSample {
+	result := make([]MetricSample, 0)
 	for _, sample := range samples {
 		if sample.MetricName == name && sample.Value > threshold {
-			return true
+			result = append(result, sample)
 		}
 	}
-	return false
+	return result
 }
 
 func hasElevatedWriteLatency(samples []MetricSample) bool {
@@ -299,7 +410,7 @@ func hdfsDataNodePressureSamples(roles map[string][]MetricSample) []MetricSample
 			continue
 		}
 		for _, sample := range samples {
-			if (sample.MetricName == "hdfs.datanode.failed_volumes" && sample.Value > 0) || (sample.MetricName == "hdfs.datanode.xceiver_count" && sample.Value > requestBacklogThreshold) || ((sample.MetricName == "hdfs.datanode.io.bytes_read" || sample.MetricName == "hdfs.datanode.io.bytes_written") && sample.Value > dataNodeIOPressureBytes) {
+			if (sample.MetricName == "hdfs.datanode.failed_volumes" && sample.Value > 0) || (sample.MetricName == "hdfs.datanode.xceiver_count" && sample.Value > requestBacklogThreshold) {
 				result = append(result, sample)
 			}
 		}
@@ -391,7 +502,7 @@ func hasRequiredHealthInputs(kind ComponentKind, role string, samples []MetricSa
 			return hasAnyMetric(samples, hdfsDataNodeHealthMetricNames) || hasMetricPair(samples, "hdfs.datanode.used", "hdfs.datanode.capacity")
 		}
 	case ZooKeeperComponent:
-		return hasAnyMetric(samples, zooKeeperHealthMetricNames)
+		return role != "unknown" && hasAnyMetric(samples, zooKeeperHealthMetricNames)
 	}
 	return false
 }
@@ -405,7 +516,7 @@ var hdfsNameNodeHealthMetricNames = map[string]struct{}{
 }
 
 var hdfsDataNodeHealthMetricNames = map[string]struct{}{
-	"hdfs.datanode.failed_volumes": {}, "hdfs.datanode.xceiver_count": {}, "hdfs.datanode.io.bytes_read": {}, "hdfs.datanode.io.bytes_written": {},
+	"hdfs.datanode.failed_volumes": {}, "hdfs.datanode.xceiver_count": {},
 }
 
 var zooKeeperHealthMetricNames = map[string]struct{}{

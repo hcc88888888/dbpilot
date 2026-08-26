@@ -144,7 +144,7 @@ existing telemetry engine stops and before the spool is sealed.
 
 Each collection writes a deterministic JSON envelope to the existing metric
 spool. It includes normalized samples, per-component `ok`/`partial`/`failed`
-status events, role-level health, and correlation-only dependency evidence.
+status events, role-and-host-level health, and correlation-only dependency evidence.
 The batch ID includes a durable monotonic collection sequence. The Agent
 advances that sequence only after the batch append succeeds, so an interrupted
 append/checkpoint boundary replays the same ID safely after restart, while a

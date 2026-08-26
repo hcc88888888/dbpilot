@@ -15,7 +15,10 @@ const (
 	zooKeeperCompatibilityPath = "/commands/monitor"
 )
 
-type ZooKeeperEndpointFailure struct{ Endpoint Endpoint }
+type ZooKeeperEndpointFailure struct {
+	Endpoint Endpoint
+	Host     string
+}
 type ZooKeeperEndpointErrors struct{ Failures []ZooKeeperEndpointFailure }
 
 func (errors *ZooKeeperEndpointErrors) Error() string {
@@ -23,6 +26,14 @@ func (errors *ZooKeeperEndpointErrors) Error() string {
 		return fmt.Sprintf("ZooKeeper collection failed for %s endpoint", errors.Failures[0].Endpoint.Role)
 	}
 	return fmt.Sprintf("ZooKeeper collection failed for %d endpoints", len(errors.Failures))
+}
+
+func (errors *ZooKeeperEndpointErrors) FailedEndpoints() []ComponentEndpointStatus {
+	result := make([]ComponentEndpointStatus, 0, len(errors.Failures))
+	for _, failure := range errors.Failures {
+		result = append(result, ComponentEndpointStatus{Role: failure.Endpoint.Role, Host: failure.Host})
+	}
+	return result
 }
 
 type ZooKeeperParseIssues struct{ Issues []ParseIssue }
@@ -113,22 +124,24 @@ func (adapter *zooKeeperAdapter) Collect(ctx context.Context, request MetricRequ
 	failures := make([]ZooKeeperEndpointFailure, 0)
 	issues := make([]ParseIssue, 0)
 	for _, endpoint := range adapter.definition.Endpoints {
-		role, roleErr := normalizedZooKeeperRole(endpoint.Role)
+		_, roleErr := normalizedZooKeeperRole(endpoint.Role)
 		if roleErr != nil {
 			return samples, roleErr
 		}
+		host := componentEndpointHost(endpoint.URL)
 		if endpointPath(endpoint.URL) == zooKeeperCompatibilityPath {
 			monitor, ok := adapter.client.(zooKeeperMonitorFetcher)
 			if !ok {
-				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: "unknown"}, Host: host})
 				continue
 			}
 			values, fetchErr := monitor.FetchZooKeeperMonitor(ctx, endpoint)
 			if fetchErr != nil {
-				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: "unknown"}, Host: host})
 				continue
 			}
-			endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans([]JMXBean{{Name: "dbpilot:zookeeper=monitor", Attributes: values}}, zooKeeperMonitorAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: componentEndpointHost(endpoint.URL), Instance: adapter.definition.ID})
+			role := observedZooKeeperRole(values["zk_server_state"])
+			endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans([]JMXBean{{Name: "dbpilot:zookeeper=monitor", Attributes: values}}, zooKeeperMonitorAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: host, Instance: adapter.definition.ID})
 			if normalizeErr != nil {
 				return samples, errors.New("normalize ZooKeeper monitor metrics")
 			}
@@ -140,12 +153,13 @@ func (adapter *zooKeeperAdapter) Collect(ctx context.Context, request MetricRequ
 			}
 			continue
 		}
-		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, zooKeeperBeanAllowlist())
+		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, zooKeeperFetchAllowlist())
 		if fetchErr != nil {
-			failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+			failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: "unknown"}, Host: host})
 			continue
 		}
-		endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans(beans, zooKeeperBeanAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: componentEndpointHost(endpoint.URL), Instance: adapter.definition.ID})
+		role := observedZooKeeperJMXRole(beans)
+		endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans(beans, zooKeeperBeanAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: host, Instance: adapter.definition.ID})
 		if normalizeErr != nil {
 			return samples, errors.New("normalize ZooKeeper JMX metrics")
 		}
@@ -191,6 +205,38 @@ func zooKeeperBeanAllowlist() BeanAllowlist {
 		"org.apache.ZooKeeperService:name0=ReplicatedServer_*": zooKeeperMetricProperties(),
 	}
 }
+
+func zooKeeperFetchAllowlist() BeanAllowlist {
+	properties := zooKeeperMetricProperties()
+	properties["State"] = JMXMetricDefinition{MetricName: "zookeeper.internal.server_state"}
+	return BeanAllowlist{"org.apache.ZooKeeperService:name0=ReplicatedServer_*": properties}
+}
+
+func observedZooKeeperJMXRole(beans []JMXBean) string {
+	role := "unknown"
+	for _, bean := range beans {
+		observed := observedZooKeeperRole(bean.Attributes["State"])
+		if observed == "unknown" {
+			continue
+		}
+		if role != "unknown" && role != observed {
+			return "unknown"
+		}
+		role = observed
+	}
+	return role
+}
+
+func observedZooKeeperRole(raw JSONValue) string {
+	switch strings.ToLower(strings.TrimSpace(stringJSONValue(raw))) {
+	case zooKeeperRoleLeader:
+		return zooKeeperRoleLeader
+	case zooKeeperRoleFollower:
+		return zooKeeperRoleFollower
+	default:
+		return "unknown"
+	}
+}
 func zooKeeperMetricProperties() BeanProperties {
 	return BeanProperties{"AvgRequestLatency": {MetricName: "zookeeper.request.latency", Unit: "ms"}, "OutstandingRequests": {MetricName: "zookeeper.outstanding_requests", Unit: "count"}, "PacketsReceived": {MetricName: "zookeeper.requests.received", Unit: "count"}, "PacketsSent": {MetricName: "zookeeper.requests.sent", Unit: "count"}, "NumAliveConnections": {MetricName: "zookeeper.sessions", Unit: "count"}, "QuorumSize": {MetricName: "zookeeper.quorum.members", Unit: "count"}, "ZnodeCount": {MetricName: "zookeeper.znodes", Unit: "count"}, "WatchCount": {MetricName: "zookeeper.watches", Unit: "count"}, "TxnLogElapsedSyncTime": {MetricName: "zookeeper.transaction_log.sync_time", Unit: "ms"}, "SnapshotTime": {MetricName: "zookeeper.snapshot.time", Unit: "ms"}}
 }
@@ -200,13 +246,14 @@ func zooKeeperMonitorAllowlist() BeanAllowlist {
 }
 
 func parseZooKeeperMonitor(body []byte) (map[string]JSONValue, error) {
-	values := make(map[string]JSONValue)
-	if json.Unmarshal(body, &values) == nil {
-		return values, nil
+	rawValues := make(map[string]JSONValue)
+	if json.Unmarshal(body, &rawValues) == nil {
+		return allowedZooKeeperMonitorValues(rawValues), nil
 	}
+	values := make(map[string]JSONValue)
 	for _, line := range strings.Split(string(body), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 2 && strings.HasPrefix(fields[0], "zk_") {
+		if len(fields) == 2 && isAllowedZooKeeperMonitorField(fields[0]) {
 			encoded, _ := json.Marshal(fields[1])
 			values[fields[0]] = encoded
 		}
@@ -215,4 +262,22 @@ func parseZooKeeperMonitor(body []byte) (map[string]JSONValue, error) {
 		return nil, errors.New("decode ZooKeeper monitor response")
 	}
 	return values, nil
+}
+
+func allowedZooKeeperMonitorValues(values map[string]JSONValue) map[string]JSONValue {
+	result := make(map[string]JSONValue)
+	for field, value := range values {
+		if isAllowedZooKeeperMonitorField(field) {
+			result[field] = value
+		}
+	}
+	return result
+}
+
+func isAllowedZooKeeperMonitorField(field string) bool {
+	if field == "zk_server_state" {
+		return true
+	}
+	_, allowed := zooKeeperMonitorAllowlist()["dbpilot:zookeeper=monitor"][field]
+	return allowed
 }

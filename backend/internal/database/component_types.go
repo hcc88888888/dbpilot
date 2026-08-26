@@ -1,6 +1,9 @@
 package database
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // ComponentKind identifies a non-SQL observability component.
 type ComponentKind string
@@ -34,6 +37,39 @@ type ComponentDefinition struct {
 	SecretRef    string        `yaml:"secret_ref" json:"secret_ref"`
 	TLSRef       string        `yaml:"tls_ref,omitempty" json:"tls_ref,omitempty"`
 	Dependencies DependencyRef `yaml:"dependencies,omitempty" json:"dependencies,omitempty"`
+}
+
+// ComponentEndpointStatus identifies an endpoint collection scope without
+// retaining or exposing its URL.
+type ComponentEndpointStatus struct {
+	Role string `json:"role"`
+	Host string `json:"host"`
+}
+
+// ComponentCollectionStatus is the collection completeness input shared by
+// the Agent envelope and dependency health aggregation.
+type ComponentCollectionStatus struct {
+	Cluster             string                    `json:"cluster"`
+	Component           ComponentKind             `json:"component"`
+	State               string                    `json:"state"`
+	ErrorCode           string                    `json:"error_code,omitempty"`
+	Attempts            int                       `json:"attempts"`
+	SampleCount         int                       `json:"sample_count"`
+	IncompleteEndpoints []ComponentEndpointStatus `json:"incomplete_endpoints,omitempty"`
+}
+
+type componentEndpointFailureReporter interface {
+	FailedEndpoints() []ComponentEndpointStatus
+}
+
+// FailedComponentEndpoints extracts sanitized endpoint dimensions from a
+// possibly joined adapter status.
+func FailedComponentEndpoints(err error) []ComponentEndpointStatus {
+	var reporter componentEndpointFailureReporter
+	if !errors.As(err, &reporter) {
+		return nil
+	}
+	return reporter.FailedEndpoints()
 }
 
 // ComponentAdapter is the deliberately narrow boundary for non-SQL adapters.

@@ -14,8 +14,8 @@ import (
 func TestZooKeeperAdapterCollectsLeaderAndFollowerFixtures(t *testing.T) {
 	definition := zooKeeperTestDefinition()
 	client := &fixtureJMXClient{fixtures: map[string][]JMXBean{
-		definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","AvgRequestLatency":2,"OutstandingRequests":4,"NumAliveConnections":8,"QuorumSize":3,"ZnodeCount":21,"WatchCount":5,"TxnLogElapsedSyncTime":7,"SnapshotTime":9}]}`),
-		definition.Endpoints[1].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id3,name1=replica.3","AvgRequestLatency":3,"PacketsReceived":10,"PacketsSent":11,"NumAliveConnections":6}]}`),
+		definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","State":"leader","AvgRequestLatency":2,"OutstandingRequests":4,"NumAliveConnections":8,"QuorumSize":3,"ZnodeCount":21,"WatchCount":5,"TxnLogElapsedSyncTime":7,"SnapshotTime":9}]}`),
+		definition.Endpoints[1].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id3,name1=replica.3","State":"follower","AvgRequestLatency":3,"PacketsReceived":10,"PacketsSent":11,"NumAliveConnections":6}]}`),
 	}}
 	adapter, err := NewZooKeeperAdapter(definition, client)
 	if err != nil {
@@ -43,7 +43,7 @@ func TestZooKeeperMonitorCompatibilityUsesRuntimeTLSAndAuthorization(t *testing.
 		if got := r.Header.Get("Authorization"); got != "Bearer runtime-token" {
 			t.Fatalf("Authorization = %q", got)
 		}
-		_, _ = w.Write([]byte("zk_avg_latency\t2\nzk_num_alive_connections\t8\n"))
+		_, _ = w.Write([]byte("zk_server_state\tfollower\nzk_avg_latency\t2\nzk_num_alive_connections\t8\n"))
 	}))
 	defer server.Close()
 	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
@@ -62,14 +62,47 @@ func TestZooKeeperMonitorCompatibilityUsesRuntimeTLSAndAuthorization(t *testing.
 	if !called {
 		t.Fatal("monitor endpoint was not called")
 	}
-	assertComponentSample(t, samples, "zookeeper.request.latency", "zookeeper", "leader", 2)
-	assertComponentSample(t, samples, "zookeeper.sessions", "zookeeper", "leader", 8)
+	assertComponentSample(t, samples, "zookeeper.request.latency", "zookeeper", "follower", 2)
+	assertComponentSample(t, samples, "zookeeper.sessions", "zookeeper", "follower", 8)
+}
+
+func TestZooKeeperAdapterUsesUnknownRoleWhenObservedStateIsUnavailable(t *testing.T) {
+	definition := zooKeeperTestDefinition()
+	definition.Endpoints = definition.Endpoints[:1]
+	client := &fixtureJMXClient{fixtures: map[string][]JMXBean{
+		definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","AvgRequestLatency":2,"NumAliveConnections":8}]}`),
+	}}
+	adapter, err := NewZooKeeperAdapter(definition, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples, err := adapter.Collect(context.Background(), MetricRequest{})
+	allowZooKeeperParseIssues(t, err)
+	assertComponentSample(t, samples, "zookeeper.sessions", "zookeeper", "unknown", 8)
+}
+
+func TestZooKeeperAdapterUsesObservedJMXRoleInsteadOfConfiguredHint(t *testing.T) {
+	definition := zooKeeperTestDefinition()
+	definition.Endpoints = definition.Endpoints[:1]
+	client := &fixtureJMXClient{fixtures: map[string][]JMXBean{
+		definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","State":"follower","NumAliveConnections":8}]}`),
+	}}
+	adapter, err := NewZooKeeperAdapter(definition, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples, err := adapter.Collect(context.Background(), MetricRequest{})
+	allowZooKeeperParseIssues(t, err)
+	assertComponentSample(t, samples, "zookeeper.sessions", "zookeeper", "follower", 8)
 }
 
 func TestZooKeeperMonitorParsesJSONAndRedactsFailures(t *testing.T) {
 	values, err := parseZooKeeperMonitor([]byte(`{"zk_avg_latency":2,"zk_num_alive_connections":8,"unsafe":"x"}`))
 	if err != nil || string(values["zk_avg_latency"]) != "2" {
 		t.Fatalf("parseZooKeeperMonitor() = %#v, %v", values, err)
+	}
+	if _, exists := values["unsafe"]; exists {
+		t.Fatalf("parseZooKeeperMonitor() retained non-allowlisted field: %#v", values)
 	}
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +136,7 @@ func TestZooKeeperMonitorRejectsHTTPWhenTLSIsEnabledBeforeRequest(t *testing.T) 
 func TestZooKeeperAdapterReportsOptionalFieldsAndRedactsEndpointFailure(t *testing.T) {
 	definition := zooKeeperTestDefinition()
 	client := &fixtureJMXClient{
-		fixtures: map[string][]JMXBean{definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","AvgRequestLatency":2}]}`)},
+		fixtures: map[string][]JMXBean{definition.Endpoints[0].URL: decodeHBaseFixture(t, `{"beans":[{"name":"org.apache.ZooKeeperService:name0=ReplicatedServer_id1,name1=replica.1","State":"leader","AvgRequestLatency":2}]}`)},
 		errors:   map[string]error{definition.Endpoints[1].URL: errors.New("token=top-secret")},
 	}
 	adapter, err := NewZooKeeperAdapter(definition, client)

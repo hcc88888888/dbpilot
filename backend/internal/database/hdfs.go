@@ -15,7 +15,10 @@ const (
 )
 
 // HDFSEndpointFailure identifies an unavailable endpoint without exposing its address or runtime credentials.
-type HDFSEndpointFailure struct{ Endpoint Endpoint }
+type HDFSEndpointFailure struct {
+	Endpoint Endpoint
+	Host     string
+}
 type HDFSEndpointErrors struct{ Failures []HDFSEndpointFailure }
 
 func (errors *HDFSEndpointErrors) Error() string {
@@ -23,6 +26,14 @@ func (errors *HDFSEndpointErrors) Error() string {
 		return fmt.Sprintf("HDFS JMX collection failed for %s endpoint", errors.Failures[0].Endpoint.Role)
 	}
 	return fmt.Sprintf("HDFS JMX collection failed for %d endpoints", len(errors.Failures))
+}
+
+func (errors *HDFSEndpointErrors) FailedEndpoints() []ComponentEndpointStatus {
+	result := make([]ComponentEndpointStatus, 0, len(errors.Failures))
+	for _, failure := range errors.Failures {
+		result = append(result, ComponentEndpointStatus{Role: failure.Endpoint.Role, Host: failure.Host})
+	}
+	return result
 }
 
 // HDFSParseIssues records optional or malformed fixed JMX metrics.
@@ -117,7 +128,7 @@ func (adapter *hdfsAdapter) Collect(ctx context.Context, request MetricRequest) 
 		allowlist := hdfsBeanAllowlist(role)
 		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, allowlist)
 		if fetchErr != nil {
-			failures = append(failures, HDFSEndpointFailure{Endpoint: Endpoint{Role: role}})
+			failures = append(failures, HDFSEndpointFailure{Endpoint: Endpoint{Role: role}, Host: componentEndpointHost(endpoint.URL)})
 			continue
 		}
 		endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans(beans, allowlist, JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(HDFSComponent), Role: role, Host: componentEndpointHost(endpoint.URL), Instance: adapter.definition.ID})

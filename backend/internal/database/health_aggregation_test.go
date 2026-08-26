@@ -111,6 +111,62 @@ func TestAggregateHealthRequiresExactMetricInputsAndCompleteCapacityPairs(t *tes
 	}
 }
 
+func TestAggregateHealthSeparatesHostsAndUsesFailureTriggerTime(t *testing.T) {
+	stamp := testTimestamp()
+	topology := mustTopology(t, "master")
+	samples := healthyDependencySamples()
+	samples = append(samples,
+		metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.master.dead_region_servers", 1, "master-a", stamp),
+		metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1, "master-a", stamp.Add(time.Hour)),
+		metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.master.dead_region_servers", 0, "master-b", stamp.Add(2*time.Hour)),
+	)
+
+	health := AggregateHealth(topology, samples)
+	failed, ok := findHealthHost(health, "hbase-prod", HBaseComponent, "master", "master-a")
+	if !ok || failed.State != HealthComponentFailure || failed.SampleTime != stamp {
+		t.Fatalf("master-a health = %#v, want component_failure at triggering sample time", failed)
+	}
+	healthy, ok := findHealthHost(health, "hbase-prod", HBaseComponent, "master", "master-b")
+	if !ok || healthy.State != HealthHealthy {
+		t.Fatalf("master-b health = %#v, want independent healthy host", healthy)
+	}
+}
+
+func TestAggregateHealthPropagatesPartialEndpointStatus(t *testing.T) {
+	stamp := testTimestamp()
+	samples := append(healthyDependencySamples(), metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1, "master-a", stamp))
+	status := ComponentCollectionStatus{
+		Cluster: "hbase-prod", Component: HBaseComponent, State: "partial",
+		IncompleteEndpoints: []ComponentEndpointStatus{{Role: "master", Host: "master-b"}},
+	}
+
+	health := AggregateHealth(mustTopology(t, "master"), samples, status)
+	complete, ok := findHealthHost(health, "hbase-prod", HBaseComponent, "master", "master-a")
+	if !ok || complete.State != HealthHealthy {
+		t.Fatalf("master-a health = %#v, want healthy independent endpoint", complete)
+	}
+	incomplete, ok := findHealthHost(health, "hbase-prod", HBaseComponent, "master", "master-b")
+	if !ok || incomplete.State != HealthDataIncomplete {
+		t.Fatalf("master-b health = %#v, want data_incomplete from partial endpoint status", incomplete)
+	}
+}
+
+func TestAggregateHealthUsesObservedZooKeeperRoleAndTreatsUnknownAsIncomplete(t *testing.T) {
+	topology := mustTopology(t, "master")
+	observed := metricWithDimensions("zk-prod", ZooKeeperComponent, "follower", "zookeeper.sessions", 2, "zk-a", testTimestamp())
+	health, ok := findHealthHost(AggregateHealth(topology, []MetricSample{observed}), "zk-prod", ZooKeeperComponent, "follower", "zk-a")
+	if !ok || health.State != HealthHealthy {
+		t.Fatalf("observed follower health = %#v, want healthy follower despite configured leader hint", health)
+	}
+
+	unknown := observed
+	unknown.Role = "unknown"
+	health, ok = findHealthHost(AggregateHealth(topology, []MetricSample{unknown}), "zk-prod", ZooKeeperComponent, "unknown", "zk-a")
+	if !ok || health.State != HealthDataIncomplete {
+		t.Fatalf("unknown ZooKeeper health = %#v, want data_incomplete", health)
+	}
+}
+
 func TestBuildDependencyEvidenceDeduplicatesAlertKeys(t *testing.T) {
 	topology := mustTopology(t, "master")
 	evidence := BuildDependencyEvidence(topology, []MetricSample{
@@ -130,19 +186,16 @@ func TestBuildDependencyEvidenceDeduplicatesAlertKeys(t *testing.T) {
 	}
 }
 
-func TestBuildDependencyEvidenceUsesDataNodeIOAndPreservesDimensions(t *testing.T) {
+func TestBuildDependencyEvidenceRejectsCumulativeDataNodeIOCounters(t *testing.T) {
 	topology := mustTopology(t, "master")
 	stamp := testTimestamp()
 	write := sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 2000)
 	write.Host, write.Timestamp = "hbase-1", stamp
-	io := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.bytes_written", dataNodeIOPressureBytes+1)
+	io := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.bytes_written", float64(1<<50))
 	io.Host, io.Timestamp = "datanode-1", stamp.Add(1)
 	evidence := BuildDependencyEvidence(topology, []MetricSample{write, io})
-	if len(evidence) != 1 || evidence[0].Rule != EvidenceHBaseWriteLatencyHDFS {
-		t.Fatalf("BuildDependencyEvidence() = %#v, want DataNode I/O evidence", evidence)
-	}
-	if evidence[0].Host != "hbase-1" || evidence[0].SampleTime != stamp || evidence[0].DependencyHost != "datanode-1" || evidence[0].DependencySampleTime != stamp.Add(1) {
-		t.Fatalf("evidence dimensions = %#v, want component and dependency host/sample time", evidence[0])
+	if hasRule(evidence, EvidenceHBaseWriteLatencyHDFS) {
+		t.Fatalf("BuildDependencyEvidence() = %#v, cumulative byte counters must not imply I/O pressure", evidence)
 	}
 }
 
@@ -152,7 +205,7 @@ func TestBuildDependencyEvidenceUsesTriggerDimensionsDeterministically(t *testin
 	write.Host, write.Timestamp = "trigger-hbase", testTimestamp()
 	unrelatedHBase := sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1)
 	unrelatedHBase.Host, unrelatedHBase.Timestamp = "later-hbase", testTimestamp().Add(time.Hour)
-	io := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.bytes_read", dataNodeIOPressureBytes+1)
+	io := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.xceiver_count", requestBacklogThreshold+1)
 	io.Host, io.Timestamp = "trigger-datanode", testTimestamp()
 	unrelatedHDFS := sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.xceiver_count", 1)
 	unrelatedHDFS.Host, unrelatedHDFS.Timestamp = "later-datanode", testTimestamp().Add(time.Hour)
@@ -298,7 +351,7 @@ func TestCapacityPressureRequiresOneHostInstanceTimestampPair(t *testing.T) {
 func TestBuildDependencyEvidenceRejectsUnknownDataNodeIO(t *testing.T) {
 	evidence := BuildDependencyEvidence(mustTopology(t, "master"), []MetricSample{
 		sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 2000),
-		sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.unknown", dataNodeIOPressureBytes+1),
+		sample("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.io.unknown", float64(1<<50)),
 	})
 	if hasRule(evidence, EvidenceHBaseWriteLatencyHDFS) {
 		t.Fatalf("BuildDependencyEvidence() = %#v, must ignore unknown DataNode I/O metrics", evidence)
@@ -309,7 +362,7 @@ func TestBuildDependencyEvidenceRejectsUndeclaredDependencyRole(t *testing.T) {
 	topology := mustTopology(t, "master")
 	evidence := BuildDependencyEvidence(topology, []MetricSample{
 		sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 2000),
-		sample("hdfs-prod", HDFSComponent, "worker", "hdfs.datanode.io.bytes_written", dataNodeIOPressureBytes+1),
+		sample("hdfs-prod", HDFSComponent, "worker", "hdfs.datanode.io.bytes_written", float64(1<<50)),
 	})
 	if hasRule(evidence, EvidenceHBaseWriteLatencyHDFS) {
 		t.Fatalf("BuildDependencyEvidence() = %#v, must reject samples from undeclared roles", evidence)
@@ -450,6 +503,24 @@ func findHealth(values []ComponentHealth, cluster string, component ComponentKin
 		}
 	}
 	return ComponentHealth{}, false
+}
+
+func findHealthHost(values []ComponentHealth, cluster string, component ComponentKind, role, host string) (ComponentHealth, bool) {
+	for _, value := range values {
+		if value.Cluster == cluster && value.Component == component && value.Role == role && value.Host == host {
+			return value, true
+		}
+	}
+	return ComponentHealth{}, false
+}
+
+func healthyDependencySamples() []MetricSample {
+	stamp := testTimestamp()
+	return []MetricSample{
+		metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.missing_blocks", 0, "namenode-a", stamp),
+		metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.failed_volumes", 0, "datanode-a", stamp),
+		metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 2, "zk-a", stamp),
+	}
 }
 
 func hasRule(values []DependencyEvidence, rule EvidenceRule) bool {

@@ -167,9 +167,9 @@ func damengDSN(config InstanceConfig, password []byte) (string, error) {
 	}
 	parameters := url.Values{
 		"connectTimeout": []string{strconvDurationMilliseconds(config.ConnectTimeout)},
-		"logLevel":        []string{"off"},
-		"schema":          []string{config.Database},
-		"socketTimeout":   []string{strconvDurationSeconds(config.QueryTimeout)},
+		"logLevel":       []string{"off"},
+		"schema":         []string{config.Database},
+		"socketTimeout":  []string{strconvDurationSeconds(config.QueryTimeout)},
 	}
 	return fmt.Sprintf("dm://%s:%s@%s?%s", url.PathEscape(config.User), url.PathEscape(string(password)), address.Host, parameters.Encode()), nil
 }

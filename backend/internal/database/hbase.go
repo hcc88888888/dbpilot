@@ -18,6 +18,7 @@ const (
 // or runtime credentials in a returned error string.
 type HBaseEndpointFailure struct {
 	Endpoint Endpoint
+	Host     string
 }
 
 // HBaseEndpointErrors preserves partial collection: samples from healthy
@@ -31,6 +32,14 @@ func (errors *HBaseEndpointErrors) Error() string {
 		return fmt.Sprintf("HBase JMX collection failed for %s endpoint", errors.Failures[0].Endpoint.Role)
 	}
 	return fmt.Sprintf("HBase JMX collection failed for %d endpoints", len(errors.Failures))
+}
+
+func (errors *HBaseEndpointErrors) FailedEndpoints() []ComponentEndpointStatus {
+	result := make([]ComponentEndpointStatus, 0, len(errors.Failures))
+	for _, failure := range errors.Failures {
+		result = append(result, ComponentEndpointStatus{Role: failure.Endpoint.Role, Host: failure.Host})
+	}
+	return result
 }
 
 // HBaseParseIssues carries fixed-allowlist JMX parse statuses to callers.
@@ -161,7 +170,7 @@ func (adapter *hbaseAdapter) Collect(ctx context.Context, request MetricRequest)
 		}
 		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, hbaseBeanAllowlist(role))
 		if fetchErr != nil {
-			failures = append(failures, HBaseEndpointFailure{Endpoint: Endpoint{Role: role}})
+			failures = append(failures, HBaseEndpointFailure{Endpoint: Endpoint{Role: role}, Host: hbaseEndpointHost(endpoint.URL)})
 			continue
 		}
 		host := hbaseEndpointHost(endpoint.URL)

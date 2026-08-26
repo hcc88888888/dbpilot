@@ -75,8 +75,11 @@ func validComponentDefinition() ComponentDefinition {
 }
 
 type fakeComponentAdapter struct{ kind ComponentKind }
-func (a *fakeComponentAdapter) Component() ComponentKind { return a.kind }
+
+func (a *fakeComponentAdapter) Component() ComponentKind     { return a.kind }
 func (*fakeComponentAdapter) Capabilities() CapabilityMatrix { return CapabilityMatrix{} }
-func (*fakeComponentAdapter) Ping(context.Context) error { return nil }
-func (*fakeComponentAdapter) Collect(context.Context, MetricRequest) ([]MetricSample, error) { return nil, nil }
+func (*fakeComponentAdapter) Ping(context.Context) error     { return nil }
+func (*fakeComponentAdapter) Collect(context.Context, MetricRequest) ([]MetricSample, error) {
+	return nil, nil
+}
 func (*fakeComponentAdapter) Close() error { return nil }

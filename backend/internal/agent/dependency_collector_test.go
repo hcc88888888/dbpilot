@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -10,6 +11,51 @@ import (
 	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDependencyCollectorRetryMergesIndependentSamples(t *testing.T) {
+	collector := &DependencyCollector{config: DependencyCollectorConfig{MaxAttempts: 2, RequestTimeout: time.Second, InitialBackoff: time.Nanosecond, MaxBackoff: time.Nanosecond}}
+	definition := database.ComponentDefinition{ID: "hbase-prod", Kind: database.HBaseComponent}
+	adapter := &scriptedComponentAdapter{results: []scriptedCollection{
+		{
+			samples: []database.MetricSample{{Cluster: "hbase-prod", Component: "hbase", Role: "regionserver", Host: "rs-a", Instance: "hbase-prod", MetricName: "hbase.flush.queue_length", Value: 1, Unit: "count"}},
+			err:     &database.HBaseEndpointErrors{Failures: []database.HBaseEndpointFailure{{Endpoint: database.Endpoint{Role: "regionserver"}, Host: "rs-b"}}},
+		},
+		{
+			samples: []database.MetricSample{{Cluster: "hbase-prod", Component: "hbase", Role: "regionserver", Host: "rs-b", Instance: "hbase-prod", MetricName: "hbase.flush.queue_length", Value: 2, Unit: "count"}},
+			err:     &database.HBaseEndpointErrors{Failures: []database.HBaseEndpointFailure{{Endpoint: database.Endpoint{Role: "regionserver"}, Host: "rs-a"}}},
+		},
+	}}
+
+	samples, status := collector.collectWithRetry(context.Background(), definition, adapter)
+	if len(samples) != 2 || !slices.ContainsFunc(samples, func(sample database.MetricSample) bool { return sample.Host == "rs-a" }) || !slices.ContainsFunc(samples, func(sample database.MetricSample) bool { return sample.Host == "rs-b" }) {
+		t.Fatalf("collectWithRetry() samples = %#v, want valid samples retained from both attempts", samples)
+	}
+	if status.State != "partial" || status.SampleCount != 2 || len(status.IncompleteEndpoints) != 1 || status.IncompleteEndpoints[0].Host != "rs-a" {
+		t.Fatalf("collectWithRetry() status = %#v, want final partial endpoint scope", status)
+	}
+}
+
+type scriptedCollection struct {
+	samples []database.MetricSample
+	err     error
+}
+
+type scriptedComponentAdapter struct {
+	results []scriptedCollection
+	next    int
+}
+
+func (*scriptedComponentAdapter) Component() database.ComponentKind { return database.HBaseComponent }
+func (*scriptedComponentAdapter) Capabilities() database.CapabilityMatrix {
+	return database.CapabilityMatrix{Metrics: true}
+}
+func (*scriptedComponentAdapter) Ping(context.Context) error { return nil }
+func (adapter *scriptedComponentAdapter) Collect(context.Context, database.MetricRequest) ([]database.MetricSample, error) {
+	result := adapter.results[adapter.next]
+	adapter.next++
+	return result.samples, result.err
+}
+func (*scriptedComponentAdapter) Close() error { return nil }
 
 func TestNewDependencyCollectorRejectsInvalidRuntimeBoundaries(t *testing.T) {
 	valid := DependencyCollectorConfig{

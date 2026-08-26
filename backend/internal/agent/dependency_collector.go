@@ -45,14 +45,7 @@ type DependencyCollectorConfig struct {
 
 // ComponentCollectionStatus reports an adapter outcome without endpoint URLs,
 // response bodies, credentials, or arbitrary error text.
-type ComponentCollectionStatus struct {
-	Cluster     string                 `json:"cluster"`
-	Component   database.ComponentKind `json:"component"`
-	State       string                 `json:"state"`
-	ErrorCode   string                 `json:"error_code,omitempty"`
-	Attempts    int                    `json:"attempts"`
-	SampleCount int                    `json:"sample_count"`
-}
+type ComponentCollectionStatus = database.ComponentCollectionStatus
 
 // DependencyTelemetryEnvelope is the durable payload emitted to the existing
 // metric spool. Evidence is correlation-only and contains no remediation.
@@ -200,7 +193,7 @@ func (collector *DependencyCollector) CollectOnce(ctx context.Context) error {
 
 	envelope := DependencyTelemetryEnvelope{
 		AgentID: collector.config.AgentID, Sequence: sequence, CollectedAt: collectedAt, Samples: samples,
-		Statuses: statuses, Health: database.AggregateHealth(collector.topology, samples),
+		Statuses: statuses, Health: database.AggregateHealth(collector.topology, samples, statuses...),
 		Evidence: database.BuildDependencyEvidence(collector.topology, samples),
 	}
 	id, err := dependencyEnvelopeID(envelope)
@@ -242,14 +235,16 @@ func (collector *DependencyCollector) nextSequence() (uint64, error) {
 }
 
 func (collector *DependencyCollector) collectWithRetry(ctx context.Context, definition database.ComponentDefinition, adapter database.ComponentAdapter) ([]database.MetricSample, ComponentCollectionStatus) {
-	var samples []database.MetricSample
+	sampleSet := make(map[metricSampleIdentity]database.MetricSample)
 	var err error
 	attempts := 0
 	for attempts < collector.config.MaxAttempts {
 		attempts++
 		requestCtx, cancel := context.WithTimeout(ctx, collector.config.RequestTimeout)
-		samples, err = adapter.Collect(requestCtx, database.MetricRequest{})
+		attemptSamples, attemptErr := adapter.Collect(requestCtx, database.MetricRequest{})
 		cancel()
+		mergeMetricSamples(sampleSet, attemptSamples)
+		err = attemptErr
 		if err == nil || attempts == collector.config.MaxAttempts || ctx.Err() != nil {
 			break
 		}
@@ -258,13 +253,30 @@ func (collector *DependencyCollector) collectWithRetry(ctx context.Context, defi
 			break
 		}
 	}
+	samples := make([]database.MetricSample, 0, len(sampleSet))
+	for _, sample := range sampleSet {
+		samples = append(samples, sample)
+	}
+	sortMetricSamples(samples)
 	status := ComponentCollectionStatus{Cluster: definition.ID, Component: definition.Kind, State: "ok", Attempts: attempts, SampleCount: len(samples)}
 	if err != nil && len(samples) != 0 {
 		status.State, status.ErrorCode = "partial", "COMPONENT_COLLECTION_PARTIAL"
 	} else if err != nil {
 		status.State, status.ErrorCode = "failed", "COMPONENT_COLLECTION_FAILED"
 	}
+	status.IncompleteEndpoints = database.FailedComponentEndpoints(err)
 	return samples, status
+}
+
+type metricSampleIdentity struct {
+	cluster, component, role, host, instance, metric, unit string
+}
+
+func mergeMetricSamples(target map[metricSampleIdentity]database.MetricSample, samples []database.MetricSample) {
+	for _, sample := range samples {
+		key := metricSampleIdentity{cluster: sample.Cluster, component: sample.Component, role: sample.Role, host: sample.Host, instance: sample.Instance, metric: sample.MetricName, unit: sample.Unit}
+		target[key] = sample
+	}
 }
 
 func (collector *DependencyCollector) backoff(attempt int) time.Duration {
