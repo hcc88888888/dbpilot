@@ -30,5 +30,23 @@ type NotificationRepository interface {
 	ListActiveSilences(context.Context, Scope, time.Time) ([]Silence, error)
 	ReserveNotificationDelivery(context.Context, NotificationDelivery, *AuditRecord) (bool, error)
 	UpdateNotificationDelivery(context.Context, NotificationDelivery, AuditRecord) error
-	ListDueNotificationDeliveries(context.Context, time.Time) ([]NotificationDelivery, error)
+	ClaimDueNotificationDeliveries(context.Context, time.Time, string, time.Time, int) ([]NotificationDelivery, error)
+}
+
+type InAppNotificationRepository interface {
+	InAppNotificationWriter
+	ListInAppNotifications(context.Context, Scope, string, int) ([]InAppNotification, error)
+}
+
+type SilenceRepository interface {
+	CreateSilence(context.Context, Silence) (Silence, error)
+	UpdateSilence(context.Context, Silence) (Silence, error)
+	DeleteSilence(context.Context, Scope, string) error
+}
+
+type NotificationConfigurationRepository interface {
+	CreateNotificationTemplate(context.Context, NotificationTemplate) (NotificationTemplate, error)
+	UpdateNotificationTemplate(context.Context, NotificationTemplate) (NotificationTemplate, error)
+	CreateNotificationPolicy(context.Context, NotificationPolicy) (NotificationPolicy, error)
+	UpdateNotificationPolicy(context.Context, NotificationPolicy) (NotificationPolicy, error)
 }

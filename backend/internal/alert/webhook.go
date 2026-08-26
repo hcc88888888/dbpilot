@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"time"
@@ -77,8 +78,36 @@ func validateWebhookURL(ctx context.Context, rawURL string, allowlist WebhookAll
 }
 
 func publicWebhookIP(address net.IP) bool {
-	return address != nil && !address.IsUnspecified() && !address.IsLoopback() && !address.IsPrivate() && !address.IsLinkLocalUnicast() && !address.IsLinkLocalMulticast() && !address.IsMulticast()
+	if address == nil || !address.IsGlobalUnicast() {
+		return false
+	}
+	if ipv4 := address.To4(); ipv4 != nil {
+		address = ipv4
+	}
+	for _, blocked := range webhookSpecialUseNetworks {
+		if blocked.Contains(address) {
+			return false
+		}
+	}
+	return true
 }
+
+var webhookSpecialUseNetworks = func() []*net.IPNet {
+	ranges := []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		"::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32", "2002::/16", "fc00::/7", "fec0::/10", "fe80::/10", "ff00::/8",
+	}
+	result := make([]*net.IPNet, 0, len(ranges))
+	for _, raw := range ranges {
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			panic(err)
+		}
+		result = append(result, network)
+	}
+	return result
+}()
 
 type WebhookChannel struct {
 	allowlist WebhookAllowlist
@@ -86,21 +115,27 @@ type WebhookChannel struct {
 	secrets   SecretResolver
 	client    *http.Client
 	now       func() time.Time
+	timeout   time.Duration
 }
 
-func NewWebhookChannel(allowlist WebhookAllowlist, resolver WebhookIPResolver, secrets SecretResolver, transport http.RoundTripper) *WebhookChannel {
-	if transport == nil {
-		base := http.DefaultTransport.(*http.Transport).Clone()
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
-		base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			validated, err := validatedWebhookDialAddress(ctx, address, allowlist, resolver)
-			if err != nil {
-				return nil, err
-			}
-			return dialer.DialContext(ctx, network, validated)
+func NewWebhookChannel(allowlist WebhookAllowlist, resolver WebhookIPResolver, secrets SecretResolver) *WebhookChannel {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	base.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		validated, err := validatedWebhookDialAddress(ctx, address, allowlist, resolver)
+		if err != nil {
+			return nil, err
 		}
-		transport = base
+		return dialer.DialContext(ctx, network, validated)
 	}
+	return buildWebhookChannel(allowlist, resolver, secrets, base)
+}
+
+func newWebhookChannelForTest(allowlist WebhookAllowlist, resolver WebhookIPResolver, secrets SecretResolver, transport http.RoundTripper) *WebhookChannel {
+	return buildWebhookChannel(allowlist, resolver, secrets, transport)
+}
+
+func buildWebhookChannel(allowlist WebhookAllowlist, resolver WebhookIPResolver, secrets SecretResolver, transport http.RoundTripper) *WebhookChannel {
 	return &WebhookChannel{
 		allowlist: allowlist, resolver: resolver, secrets: secrets,
 		client: &http.Client{
@@ -110,7 +145,7 @@ func NewWebhookChannel(allowlist WebhookAllowlist, resolver WebhookIPResolver, s
 				return ErrWebhookRedirect
 			},
 		},
-		now: time.Now,
+		now: time.Now, timeout: 10 * time.Second,
 	}
 }
 
@@ -149,19 +184,21 @@ func (channel *WebhookChannel) Deliver(ctx context.Context, delivery DeliveryReq
 	if channel == nil || channel.client == nil {
 		return PermanentDeliveryError("webhook_configuration", nil)
 	}
-	if err := validateWebhookURL(ctx, delivery.Target, channel.allowlist, channel.resolver); err != nil {
+	deliveryCtx, cancel := context.WithTimeout(ctx, channel.timeout)
+	defer cancel()
+	if err := validateWebhookURL(deliveryCtx, delivery.Target, channel.allowlist, channel.resolver); err != nil {
 		return err
 	}
 	if channel.secrets == nil || strings.TrimSpace(delivery.SecretRef) == "" {
 		return PermanentDeliveryError("webhook_secret_reference", nil)
 	}
-	secret, err := channel.secrets.Resolve(ctx, delivery.SecretRef)
+	secret, err := channel.secrets.Resolve(deliveryCtx, delivery.SecretRef)
 	if err != nil || len(secret) == 0 {
 		return PermanentDeliveryError("webhook_secret_resolution", err)
 	}
 	defer clear(secret)
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, delivery.Target, bytes.NewBufferString(delivery.Body))
+	request, err := http.NewRequestWithContext(deliveryCtx, http.MethodPost, delivery.Target, bytes.NewBufferString(delivery.Body))
 	if err != nil {
 		return PermanentDeliveryError("webhook_request_validation", err)
 	}
@@ -235,13 +272,14 @@ type SMTPChannel struct {
 	config  SMTPConfig
 	secrets SecretResolver
 	sender  SMTPSender
+	timeout time.Duration
 }
 
 func NewSMTPChannel(config SMTPConfig, secrets SecretResolver, sender SMTPSender) *SMTPChannel {
 	if sender == nil {
 		sender = NetworkSMTPSender{}
 	}
-	return &SMTPChannel{config: config, secrets: secrets, sender: sender}
+	return &SMTPChannel{config: config, secrets: secrets, sender: sender, timeout: 10 * time.Second}
 }
 
 func (*SMTPChannel) Name() string { return "smtp" }
@@ -250,19 +288,60 @@ func (channel *SMTPChannel) Deliver(ctx context.Context, request DeliveryRequest
 	if channel == nil || channel.secrets == nil || channel.sender == nil || strings.TrimSpace(request.SecretRef) == "" {
 		return PermanentDeliveryError("smtp_configuration", nil)
 	}
-	if !validMailbox(request.Target) || !validMailbox(channel.config.From) || strings.ContainsAny(request.Subject, "\r\n") {
+	if err := validateSMTPConfig(channel.config); err != nil || !validMailbox(request.Target) || strings.ContainsAny(request.Subject, "\r\n") {
 		return PermanentDeliveryError("smtp_message_validation", nil)
 	}
-	password, err := channel.secrets.Resolve(ctx, request.SecretRef)
+	deliveryCtx, cancel := context.WithTimeout(ctx, channel.timeout)
+	defer cancel()
+	password, err := channel.secrets.Resolve(deliveryCtx, request.SecretRef)
 	if err != nil || len(password) == 0 {
-		return PermanentDeliveryError("smtp_secret_resolution", err)
+		if err != nil {
+			return RetryableDeliveryError("smtp_secret_resolution", err)
+		}
+		return PermanentDeliveryError("smtp_secret_resolution", nil)
 	}
 	defer clear(password)
 	message := SMTPMessage{SMTPConfig: channel.config, To: request.Target, Subject: request.Subject, Body: request.Body, Password: password, SecretRef: request.SecretRef, RequireTLS: true}
-	if err := channel.sender.Send(ctx, message); err != nil {
-		return RetryableDeliveryError("smtp_transport", err)
+	if err := channel.sender.Send(deliveryCtx, message); err != nil {
+		var classified *deliveryError
+		if errors.As(err, &classified) {
+			return err
+		}
+		return classifySMTPError("transport", err)
 	}
 	return nil
+}
+
+func validateSMTPConfig(config SMTPConfig) error {
+	if config.Address == "" || config.ServerName == "" || !validMailbox(config.From) {
+		return ErrInvalidNotification
+	}
+	host, port, err := net.SplitHostPort(config.Address)
+	if err != nil || strings.TrimSpace(host) == "" || strings.TrimSpace(port) == "" || strings.ContainsAny(config.ServerName, "\r\n") {
+		return ErrInvalidNotification
+	}
+	return nil
+}
+
+func classifySMTPError(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if stage == "config" || stage == "tls" || stage == "auth" {
+		return PermanentDeliveryError("smtp_"+stage, err)
+	}
+	var protocol *textproto.Error
+	if errors.As(err, &protocol) {
+		if protocol.Code >= 400 && protocol.Code < 500 {
+			return RetryableDeliveryError("smtp_4xx", err)
+		}
+		return PermanentDeliveryError("smtp_5xx", err)
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return RetryableDeliveryError("smtp_transport", err)
+	}
+	return RetryableDeliveryError("smtp_transport", err)
 }
 
 func validMailbox(raw string) bool {
@@ -274,52 +353,58 @@ type NetworkSMTPSender struct{}
 
 func (NetworkSMTPSender) Send(ctx context.Context, message SMTPMessage) error {
 	if !message.RequireTLS || message.Address == "" || message.ServerName == "" {
-		return errors.New("SMTP TLS configuration is required")
+		return PermanentDeliveryError("smtp_configuration", nil)
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	var connection net.Conn
-	var err error
-	if message.ImplicitTLS {
-		connection, err = tls.DialWithDialer(dialer, "tcp", message.Address, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: message.ServerName})
-	} else {
-		connection, err = dialer.DialContext(ctx, "tcp", message.Address)
-	}
+	connection, err := dialer.DialContext(ctx, "tcp", message.Address)
 	if err != nil {
-		return err
+		return classifySMTPError("transport", err)
 	}
 	defer connection.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			return classifySMTPError("transport", err)
+		}
+	}
+	if message.ImplicitTLS {
+		tlsConnection := tls.Client(connection, &tls.Config{MinVersion: tls.VersionTLS12, ServerName: message.ServerName})
+		if err := tlsConnection.HandshakeContext(ctx); err != nil {
+			return classifySMTPError("tls", err)
+		}
+		connection = tlsConnection
+	}
 	client, err := smtp.NewClient(connection, message.ServerName)
 	if err != nil {
-		return err
+		return classifySMTPError("protocol", err)
 	}
 	defer client.Close()
 	if !message.ImplicitTLS {
 		if err := client.StartTLS(&tls.Config{MinVersion: tls.VersionTLS12, ServerName: message.ServerName}); err != nil {
-			return err
+			return classifySMTPError("tls", err)
 		}
 	}
 	if message.Username != "" {
 		if err := client.Auth(smtp.PlainAuth("", message.Username, string(message.Password), message.ServerName)); err != nil {
-			return err
+			return classifySMTPError("auth", err)
 		}
 	}
 	if err := client.Mail(message.From); err != nil {
-		return err
+		return classifySMTPError("mail", err)
 	}
 	if err := client.Rcpt(message.To); err != nil {
-		return err
+		return classifySMTPError("rcpt", err)
 	}
 	writer, err := client.Data()
 	if err != nil {
-		return err
+		return classifySMTPError("data", err)
 	}
 	payload := "From: " + message.From + "\r\nTo: " + message.To + "\r\nSubject: " + message.Subject + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + message.Body
 	if _, err := io.WriteString(writer, payload); err != nil {
 		_ = writer.Close()
-		return err
+		return classifySMTPError("data", err)
 	}
 	if err := writer.Close(); err != nil {
-		return err
+		return classifySMTPError("data", err)
 	}
-	return client.Quit()
+	return classifySMTPError("quit", client.Quit())
 }

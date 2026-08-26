@@ -69,7 +69,7 @@ func (record AuditRecord) Validate() error {
 
 func allowedAuditAction(action string) bool {
 	switch action {
-	case "rule.created", "rule.updated", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "evaluation.failed":
+	case "rule.created", "rule.updated", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "evaluation.failed", "policy.created", "policy.updated", "template.created", "template.updated", "silence.created", "silence.updated", "silence.deleted", "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
 		return true
 	default:
 		return false
@@ -145,6 +145,48 @@ func allowedAuditDetail(action, key, value string) bool {
 		}
 	case "evaluation.failed":
 		return key == "failure_kind" && value == "rule_evaluation"
+	case "silence.created", "silence.updated", "silence.deleted":
+		switch key {
+		case "starts_at", "ends_at":
+			_, err := time.Parse(time.RFC3339Nano, value)
+			return err == nil
+		case "matcher_count":
+			parsed, err := strconv.Atoi(value)
+			return err == nil && parsed > 0
+		case "reason_present":
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		}
+	case "policy.created", "policy.updated":
+		switch key {
+		case "channel":
+			return value == "in_app" || value == "smtp" || value == "webhook"
+		case "template_id":
+			return validIdentifier(value)
+		case "enabled":
+			_, err := strconv.ParseBool(value)
+			return err == nil
+		}
+	case "template.created", "template.updated":
+		if key == "version" {
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			return err == nil && parsed > 0
+		}
+	case "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
+		switch key {
+		case "status":
+			switch DeliveryStatus(value) {
+			case DeliveryAttempting, DeliveryDelivered, DeliverySuppressed, DeliveryRetryScheduled, DeliveryAbandoned:
+				return true
+			}
+		case "channel":
+			return validIdentifier(value)
+		case "attempt":
+			parsed, err := strconv.Atoi(value)
+			return err == nil && parsed >= 0
+		case "failure_class":
+			return sanitizeFailureClass(value) == value
+		}
 	}
 	return false
 }
@@ -157,6 +199,14 @@ func knownAuditDetailKey(action, key string) bool {
 		return key == "state" || key == "window_start" || key == "window_end" || key == conditionSinceEvidenceKey || key == "samples" || key == "missing" || key == "aggregate" || key == "rate"
 	case "evaluation.failed":
 		return key == "failure_kind"
+	case "silence.created", "silence.updated", "silence.deleted":
+		return key == "starts_at" || key == "ends_at" || key == "matcher_count" || key == "reason_present"
+	case "policy.created", "policy.updated":
+		return key == "channel" || key == "template_id" || key == "enabled"
+	case "template.created", "template.updated":
+		return key == "version"
+	case "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
+		return key == "status" || key == "channel" || key == "attempt" || key == "failure_class"
 	default:
 		return false
 	}

@@ -44,6 +44,9 @@ type NotificationRoute struct {
 // Version is stable for the persisted template revision and deliberately does
 // not contain rendered content.
 func (template NotificationTemplate) Version() string {
+	if template.Revision > 0 {
+		return strconv.FormatInt(template.Revision, 10)
+	}
 	if !template.UpdatedAt.IsZero() {
 		return template.UpdatedAt.UTC().Format(time.RFC3339Nano)
 	}
@@ -64,6 +67,7 @@ func (policy NotificationPolicy) MarshalJSON() ([]byte, error) {
 }
 
 type DeliveryRequest struct {
+	DeliveryID      string            `json:"delivery_id"`
 	Scope           Scope             `json:"scope"`
 	EventID         string            `json:"event_id"`
 	State           EventState        `json:"state"`
@@ -91,6 +95,9 @@ type NotificationDelivery struct {
 	NextAttemptAt  time.Time       `json:"next_attempt_at,omitempty"`
 	DeliveredAt    time.Time       `json:"delivered_at,omitempty"`
 	FailureClass   string          `json:"failure_class,omitempty"`
+	LeaseOwner     string          `json:"-"`
+	LeaseExpiresAt time.Time       `json:"-"`
+	ClaimOwner     string          `json:"-"`
 	Request        DeliveryRequest `json:"-"`
 }
 
@@ -108,6 +115,9 @@ type Dispatcher struct {
 	channels   map[string]DeliveryChannel
 	now        func() time.Time
 	eventURL   func(AlertEvent) string
+	workerID   string
+	lease      time.Duration
+	batchSize  int
 }
 
 func NewDispatcher(repository NotificationRepository, channels []DeliveryChannel, now func() time.Time, eventURL func(AlertEvent) string) *Dispatcher {
@@ -123,7 +133,11 @@ func NewDispatcher(repository NotificationRepository, channels []DeliveryChannel
 	if eventURL == nil {
 		eventURL = func(AlertEvent) string { return "" }
 	}
-	return &Dispatcher{repository: repository, channels: byName, now: now, eventURL: eventURL}
+	workerID, err := newControlPlaneID("dispatcher", nil)
+	if err != nil {
+		workerID = "dispatcher-local"
+	}
+	return &Dispatcher{repository: repository, channels: byName, now: now, eventURL: eventURL, workerID: workerID, lease: 30 * time.Second, batchSize: 100}
 }
 
 func (dispatcher *Dispatcher) Dispatch(ctx context.Context, event AlertEvent, state EventState) error {
@@ -148,10 +162,32 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, event AlertEvent, st
 	}
 
 	for _, route := range routes {
-		if route.Policy.Scope != event.Scope || route.Template.Scope != event.Scope {
+		if route.Policy.Scope != event.Scope {
 			return ErrNotificationScopeMismatch
 		}
 		if !routeMatches(route, rule, event, now) {
+			continue
+		}
+		if matchingSilence(silences, event, now) {
+			request := suppressedDeliveryRequest(route, rule, event, state)
+			delivery := newNotificationDelivery(request, event, now)
+			delivery.Status = DeliverySuppressed
+			audit := notificationAudit(delivery, "delivery.suppressed", now)
+			if _, err := dispatcher.repository.ReserveNotificationDelivery(ctx, delivery, &audit); err != nil {
+				return err
+			}
+			continue
+		}
+		if route.Template.ID == "" {
+			if err := dispatcher.recordConfigurationFailure(ctx, route, event, state, now, "template_missing"); err != nil {
+				return err
+			}
+			continue
+		}
+		if route.Template.Scope != event.Scope || route.Template.ID != route.Policy.TemplateID {
+			if err := dispatcher.recordConfigurationFailure(ctx, route, event, state, now, "template_scope"); err != nil {
+				return err
+			}
 			continue
 		}
 		channel := dispatcher.channels[route.Policy.Channel]
@@ -169,14 +205,9 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, event AlertEvent, st
 			continue
 		}
 		delivery := newNotificationDelivery(request, event, now)
-		if matchingSilence(silences, event, now) {
-			delivery.Status = DeliverySuppressed
-			audit := notificationAudit(delivery, "delivery.suppressed", now)
-			if _, err := dispatcher.repository.ReserveNotificationDelivery(ctx, delivery, &audit); err != nil {
-				return err
-			}
-			continue
-		}
+		delivery.LeaseOwner = dispatcher.workerID
+		delivery.LeaseExpiresAt = now.Add(dispatcher.lease)
+		delivery.ClaimOwner = dispatcher.workerID
 		reserved, err := dispatcher.repository.ReserveNotificationDelivery(ctx, delivery, nil)
 		if err != nil {
 			return err
@@ -195,37 +226,38 @@ func (dispatcher *Dispatcher) RetryDue(ctx context.Context, at time.Time) error 
 	if dispatcher == nil || dispatcher.repository == nil || at.IsZero() {
 		return ErrInvalidNotification
 	}
-	due, err := dispatcher.repository.ListDueNotificationDeliveries(ctx, at.UTC())
+	due, err := dispatcher.repository.ClaimDueNotificationDeliveries(ctx, at.UTC(), dispatcher.workerID, at.UTC().Add(dispatcher.lease), dispatcher.batchSize)
 	if err != nil {
 		return err
 	}
+	var batchErrors []error
 	for index := range due {
 		delivery := due[index]
-		if delivery.Scope != delivery.Request.Scope || delivery.Status != DeliveryRetryScheduled || delivery.NextAttemptAt.After(at) {
-			return ErrInvalidNotification
+		if delivery.Scope != delivery.Request.Scope || delivery.Status != DeliveryAttempting || delivery.LeaseOwner != dispatcher.workerID {
+			batchErrors = append(batchErrors, ErrInvalidNotification)
+			continue
 		}
 		channel := dispatcher.channels[delivery.Request.Channel]
 		if channel == nil {
 			delivery.Status = DeliveryAbandoned
 			delivery.FailureClass = "channel_validation"
 			delivery.NextAttemptAt = time.Time{}
+			delivery.LeaseOwner = ""
+			delivery.LeaseExpiresAt = time.Time{}
 			if err := dispatcher.repository.UpdateNotificationDelivery(ctx, delivery, notificationAudit(delivery, "delivery.abandoned", at)); err != nil {
-				return err
+				batchErrors = append(batchErrors, err)
 			}
 			continue
 		}
-		delivery.Status = DeliveryAttempting
-		delivery.Attempts++
-		delivery.AttemptedAt = at.UTC()
-		delivery.NextAttemptAt = time.Time{}
 		if err := dispatcher.repository.UpdateNotificationDelivery(ctx, delivery, notificationAudit(delivery, "delivery.retrying", at)); err != nil {
-			return err
+			batchErrors = append(batchErrors, err)
+			continue
 		}
 		if err := dispatcher.finishAttempt(ctx, channel, &delivery, at.UTC()); err != nil {
-			return err
+			batchErrors = append(batchErrors, err)
 		}
 	}
-	return nil
+	return errors.Join(batchErrors...)
 }
 
 func (dispatcher *Dispatcher) finishAttempt(ctx context.Context, channel DeliveryChannel, delivery *NotificationDelivery, at time.Time) error {
@@ -235,6 +267,8 @@ func (dispatcher *Dispatcher) finishAttempt(ctx context.Context, channel Deliver
 		delivery.DeliveredAt = at
 		delivery.NextAttemptAt = time.Time{}
 		delivery.FailureClass = ""
+		delivery.LeaseOwner = ""
+		delivery.LeaseExpiresAt = time.Time{}
 		return dispatcher.repository.UpdateNotificationDelivery(ctx, *delivery, notificationAudit(*delivery, "delivery.delivered", at))
 	}
 
@@ -243,16 +277,23 @@ func (dispatcher *Dispatcher) finishAttempt(ctx context.Context, channel Deliver
 	if IsRetryableDeliveryError(deliveryErr) && delivery.Attempts <= len(retryDelays) {
 		delivery.Status = DeliveryRetryScheduled
 		delivery.NextAttemptAt = at.Add(retryDelays[delivery.Attempts-1])
+		delivery.LeaseOwner = ""
+		delivery.LeaseExpiresAt = time.Time{}
 		return dispatcher.repository.UpdateNotificationDelivery(ctx, *delivery, notificationAudit(*delivery, "delivery.retry_scheduled", at))
 	}
 	delivery.Status = DeliveryAbandoned
 	delivery.NextAttemptAt = time.Time{}
+	delivery.LeaseOwner = ""
+	delivery.LeaseExpiresAt = time.Time{}
 	return dispatcher.repository.UpdateNotificationDelivery(ctx, *delivery, notificationAudit(*delivery, "delivery.abandoned", at))
 }
 
 func (dispatcher *Dispatcher) recordConfigurationFailure(ctx context.Context, route NotificationRoute, event AlertEvent, state EventState, at time.Time, failureClass string) error {
-	request := DeliveryRequest{Scope: event.Scope, EventID: event.ID, State: state, Severity: "unknown", Channel: route.Policy.Channel, PolicyID: route.Policy.ID, TemplateID: route.Template.ID, TemplateVersion: route.Template.Version(), Target: route.Policy.Target}
+	request := suppressedDeliveryRequest(route, AlertRule{Severity: "unknown"}, event, state)
 	delivery := newNotificationDelivery(request, event, at)
+	delivery.LeaseOwner = dispatcher.workerID
+	delivery.LeaseExpiresAt = at.Add(dispatcher.lease)
+	delivery.ClaimOwner = dispatcher.workerID
 	reserved, err := dispatcher.repository.ReserveNotificationDelivery(ctx, delivery, nil)
 	if err != nil || !reserved {
 		return err
@@ -260,6 +301,22 @@ func (dispatcher *Dispatcher) recordConfigurationFailure(ctx context.Context, ro
 	delivery.Status = DeliveryAbandoned
 	delivery.FailureClass = failureClass
 	return dispatcher.repository.UpdateNotificationDelivery(ctx, delivery, notificationAudit(delivery, "delivery.abandoned", at))
+}
+
+func suppressedDeliveryRequest(route NotificationRoute, rule AlertRule, event AlertEvent, state EventState) DeliveryRequest {
+	templateID := route.Policy.TemplateID
+	if templateID == "" {
+		templateID = route.Template.ID
+	}
+	templateVersion := route.Template.Version()
+	if route.Template.ID == "" || templateVersion == "" {
+		templateVersion = "missing:" + templateID
+	}
+	return DeliveryRequest{
+		Scope: event.Scope, EventID: event.ID, State: state, Severity: rule.Severity,
+		Channel: route.Policy.Channel, PolicyID: route.Policy.ID, TemplateID: templateID,
+		TemplateVersion: templateVersion, Target: route.Policy.Target,
+	}
 }
 
 func (dispatcher *Dispatcher) deliveryRequest(route NotificationRoute, rule AlertRule, event AlertEvent, state EventState) (DeliveryRequest, error) {
@@ -283,6 +340,7 @@ func (dispatcher *Dispatcher) deliveryRequest(route NotificationRoute, rule Aler
 
 func newNotificationDelivery(request DeliveryRequest, event AlertEvent, at time.Time) NotificationDelivery {
 	key := deliveryIdempotencyKey(event.ID, request.State, request.Channel, request.TemplateVersion)
+	request.DeliveryID = key
 	return NotificationDelivery{ID: key, Scope: event.Scope, EventID: event.ID, PolicyID: request.PolicyID, IdempotencyKey: key, Status: DeliveryAttempting, Attempts: 1, AttemptedAt: at, Request: request}
 }
 
@@ -295,15 +353,27 @@ func routeMatches(route NotificationRoute, rule AlertRule, event AlertEvent, at 
 	if !route.Policy.Enabled || !containsString(rule.NotificationPolicyIDs, route.Policy.ID) {
 		return false
 	}
-	if len(route.Severities) > 0 && !containsString(route.Severities, rule.Severity) {
+	severities := route.Policy.Severities
+	if len(severities) == 0 {
+		severities = route.Severities
+	}
+	if len(severities) > 0 && !containsString(severities, rule.Severity) {
 		return false
 	}
-	for key, value := range route.MatchLabels {
+	labels := route.Policy.MatchLabels
+	if len(labels) == 0 {
+		labels = route.MatchLabels
+	}
+	for key, value := range labels {
 		if event.Labels[key] != value {
 			return false
 		}
 	}
-	return inUTCWindow(at, route.WindowStartUTC, route.WindowEndUTC)
+	start, end := route.Policy.WindowStartUTC, route.Policy.WindowEndUTC
+	if start == "" && end == "" {
+		start, end = route.WindowStartUTC, route.WindowEndUTC
+	}
+	return inUTCWindow(at, start, end)
 }
 
 func containsString(values []string, wanted string) bool {
@@ -334,6 +404,66 @@ func inUTCWindow(at time.Time, startRaw, endRaw string) bool {
 		return nowMinute >= startMinute && nowMinute < endMinute
 	}
 	return nowMinute >= startMinute || nowMinute < endMinute
+}
+
+func validateNotificationPolicy(policy NotificationPolicy) error {
+	if policy.Scope.Validate() != nil || !validIdentifier(policy.ID) || strings.TrimSpace(policy.Name) == "" || strings.TrimSpace(policy.Target) == "" || containsSecretMaterial(policy.Target) || !validIdentifier(policy.TemplateID) {
+		return ErrInvalidNotification
+	}
+	switch policy.Channel {
+	case "in_app":
+	case "smtp", "webhook":
+		if strings.TrimSpace(policy.SecretRef) == "" {
+			return ErrInvalidNotification
+		}
+	default:
+		return ErrInvalidNotification
+	}
+	for _, severity := range policy.Severities {
+		if !allowedSeverity(severity) {
+			return ErrInvalidNotification
+		}
+	}
+	if (policy.WindowStartUTC == "") != (policy.WindowEndUTC == "") {
+		return ErrInvalidNotification
+	}
+	if policy.WindowStartUTC != "" {
+		if _, err := time.Parse("15:04", policy.WindowStartUTC); err != nil {
+			return ErrInvalidNotification
+		}
+		if _, err := time.Parse("15:04", policy.WindowEndUTC); err != nil {
+			return ErrInvalidNotification
+		}
+	}
+	return nil
+}
+
+func validateNotificationTemplate(template NotificationTemplate) error {
+	if template.Scope.Validate() != nil || !validIdentifier(template.ID) || strings.TrimSpace(template.Name) == "" || template.Revision <= 0 {
+		return ErrInvalidTemplate
+	}
+	if !validTemplateText(template.Subject) || !validTemplateText(template.Body) {
+		return ErrInvalidTemplate
+	}
+	return nil
+}
+
+func validTemplateText(source string) bool {
+	invalid := false
+	rendered := placeholderPattern.ReplaceAllStringFunc(source, func(token string) string {
+		name := placeholderPattern.FindStringSubmatch(token)[1]
+		switch name {
+		case "event.id", "event.state", "event.severity", "evidence.aggregate", "event.url":
+			return ""
+		default:
+			if strings.HasPrefix(name, "resource.") && len(name) > len("resource.") {
+				return ""
+			}
+			invalid = true
+			return ""
+		}
+	})
+	return !invalid && !strings.Contains(rendered, "{{") && !strings.Contains(rendered, "}}")
 }
 
 func matchingSilence(silences []Silence, event AlertEvent, at time.Time) bool {
@@ -422,20 +552,12 @@ func notificationAuditID(delivery NotificationDelivery, action string) string {
 }
 
 func validateNotificationAudit(record AuditRecord) error {
-	if record.Scope.Validate() != nil || record.ID == "" || record.Actor == "" || record.TargetID == "" || record.OccurredAt.IsZero() {
-		return ErrInvalidAuditRecord
-	}
 	switch record.Action {
 	case "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
 	default:
 		return ErrInvalidAuditRecord
 	}
-	for key, value := range record.Details {
-		if sensitiveField(key) || containsSecretMaterial(value) {
-			return ErrInvalidAuditRecord
-		}
-	}
-	return nil
+	return record.Validate()
 }
 
 type deliveryError struct {

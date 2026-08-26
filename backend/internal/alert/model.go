@@ -302,15 +302,20 @@ func canonicalParts(parts ...string) string {
 // NotificationPolicy stores routing configuration but never a secret value.
 // SecretRef is intentionally excluded from JSON and audit record structures.
 type NotificationPolicy struct {
-	ID        string    `json:"id"`
-	Scope     Scope     `json:"scope"`
-	Name      string    `json:"name"`
-	Channel   string    `json:"channel"`
-	Target    string    `json:"target"`
-	SecretRef string    `json:"-"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             string            `json:"id"`
+	Scope          Scope             `json:"scope"`
+	Name           string            `json:"name"`
+	Channel        string            `json:"channel"`
+	Target         string            `json:"target"`
+	SecretRef      string            `json:"-"`
+	TemplateID     string            `json:"template_id"`
+	Severities     []string          `json:"severities,omitempty"`
+	MatchLabels    map[string]string `json:"match_labels,omitempty"`
+	WindowStartUTC string            `json:"window_start_utc,omitempty"`
+	WindowEndUTC   string            `json:"window_end_utc,omitempty"`
+	Enabled        bool              `json:"enabled"`
+	CreatedAt      time.Time         `json:"created_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
 }
 
 type NotificationTemplate struct {
@@ -319,6 +324,7 @@ type NotificationTemplate struct {
 	Name      string    `json:"name"`
 	Subject   string    `json:"subject"`
 	Body      string    `json:"body"`
+	Revision  int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -330,7 +336,22 @@ type Silence struct {
 	StartsAt  time.Time         `json:"starts_at"`
 	EndsAt    time.Time         `json:"ends_at"`
 	CreatedBy string            `json:"created_by"`
+	Reason    string            `json:"reason"`
 	CreatedAt time.Time         `json:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at"`
+}
+
+type InAppNotification struct {
+	ID         string     `json:"id"`
+	Scope      Scope      `json:"scope"`
+	DeliveryID string     `json:"delivery_id"`
+	EventID    string     `json:"event_id"`
+	EventState EventState `json:"event_state"`
+	Recipient  string     `json:"recipient"`
+	Subject    string     `json:"subject"`
+	Body       string     `json:"body"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ReadAt     time.Time  `json:"read_at,omitempty"`
 }
 
 type AuditRecord struct {

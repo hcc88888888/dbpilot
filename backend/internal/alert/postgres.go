@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,10 +26,14 @@ const eventUpsertSQL = "INSERT INTO alert_events (id, tenant_id, project_id, rul
 const eventAdvisoryLockSQL = "SELECT pg_advisory_xact_lock($1)"
 const eventLockSQL = "SELECT " + eventColumnsSQL + " FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND fingerprint = $3 FOR UPDATE"
 const auditInsertSQL = "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-const notificationRouteSQL = "SELECT p.id AS policy_id, p.tenant_id AS policy_tenant_id, p.project_id AS policy_project_id, p.name AS policy_name, p.channel, p.target, p.secret_ref, p.enabled, p.created_at AS policy_created_at, p.updated_at AS policy_updated_at, COALESCE(t.id, p.id) AS template_id, p.tenant_id AS template_tenant_id, p.project_id AS template_project_id, COALESCE(t.name, '') AS template_name, COALESCE(t.subject, '') AS subject, COALESCE(t.body, '') AS body, COALESCE(t.created_at, p.created_at) AS template_created_at, COALESCE(t.updated_at, p.updated_at) AS template_updated_at FROM alert_rules r JOIN notification_policies p ON p.tenant_id = r.tenant_id AND p.project_id = r.project_id AND p.id = ANY(r.notification_policy_ids) LEFT JOIN notification_templates t ON t.tenant_id = p.tenant_id AND t.project_id = p.project_id AND t.id = p.id WHERE r.tenant_id = $1 AND r.project_id = $2 AND r.id = $3 ORDER BY p.id ASC"
-const deliveryInsertSQL = "INSERT INTO notification_deliveries (id, tenant_id, project_id, event_id, policy_id, status, attempted_at, delivered_at, failure_reason) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, id) DO NOTHING"
-const deliveryUpdateSQL = "UPDATE notification_deliveries SET status = $1, attempted_at = $2, delivered_at = $3, failure_reason = $4 WHERE tenant_id = $5 AND project_id = $6 AND id = $7"
-const dueDeliveriesSQL = "SELECT id, tenant_id, project_id, event_id, policy_id, status, attempted_at, delivered_at, failure_reason FROM notification_deliveries WHERE status = 'retry_scheduled' AND failure_reason LIKE '{%' AND (failure_reason::jsonb ->> 'next_attempt_at')::timestamptz <= $1 ORDER BY attempted_at ASC"
+const notificationRouteSQL = "SELECT p.id AS policy_id, p.tenant_id AS policy_tenant_id, p.project_id AS policy_project_id, p.name AS policy_name, p.channel, p.target, p.secret_ref, p.template_id, p.severities, p.match_labels, COALESCE(to_char(p.window_start_utc, 'HH24:MI'), '') AS window_start_utc, COALESCE(to_char(p.window_end_utc, 'HH24:MI'), '') AS window_end_utc, p.enabled, p.created_at AS policy_created_at, p.updated_at AS policy_updated_at, t.id AS resolved_template_id, t.tenant_id AS template_tenant_id, t.project_id AS template_project_id, t.name AS template_name, t.subject, t.body, t.revision AS template_revision, t.created_at AS template_created_at, t.updated_at AS template_updated_at FROM alert_rules r JOIN notification_policies p ON p.tenant_id = r.tenant_id AND p.project_id = r.project_id AND p.id = ANY(r.notification_policy_ids) LEFT JOIN notification_templates t ON t.tenant_id = p.tenant_id AND t.project_id = p.project_id AND t.id = p.template_id WHERE r.tenant_id = $1 AND r.project_id = $2 AND r.id = $3 ORDER BY p.id ASC"
+const notificationPolicyColumnsSQL = "id, tenant_id, project_id, name, channel, target, secret_ref, template_id, severities, match_labels, COALESCE(to_char(window_start_utc, 'HH24:MI'), ''), COALESCE(to_char(window_end_utc, 'HH24:MI'), ''), enabled, created_at, updated_at"
+const notificationTemplateColumnsSQL = "id, tenant_id, project_id, name, subject, body, revision, created_at, updated_at"
+const notificationDeliveryColumnsSQL = "id, tenant_id, project_id, event_id, policy_id, idempotency_key, event_state, channel, template_id, template_version, status, attempts, attempted_at, next_attempt_at, delivered_at, lease_owner, lease_expires_at, failure_class, request_target, request_subject, request_body, request_labels, request_secret_ref"
+const qualifiedNotificationDeliveryColumnsSQL = "d.id, d.tenant_id, d.project_id, d.event_id, d.policy_id, d.idempotency_key, d.event_state, d.channel, d.template_id, d.template_version, d.status, d.attempts, d.attempted_at, d.next_attempt_at, d.delivered_at, d.lease_owner, d.lease_expires_at, d.failure_class, d.request_target, d.request_subject, d.request_body, d.request_labels, d.request_secret_ref"
+const deliveryInsertSQL = "INSERT INTO notification_deliveries (" + notificationDeliveryColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (tenant_id, project_id, idempotency_key) DO NOTHING"
+const deliveryUpdateSQL = "UPDATE notification_deliveries SET status = $1, attempted_at = $2, next_attempt_at = $3, delivered_at = $4, lease_owner = $5, lease_expires_at = $6, failure_class = $7 WHERE tenant_id = $8 AND project_id = $9 AND id = $10 AND status = 'attempting' AND lease_owner = $11"
+const claimDeliveriesSQL = "WITH candidates AS (SELECT tenant_id, project_id, id FROM notification_deliveries WHERE ((status = 'retry_scheduled' AND next_attempt_at <= $1) OR (status = 'attempting' AND lease_expires_at <= $1)) AND idempotency_key <> '' AND event_state IN ('pending', 'firing', 'acknowledged', 'resolved') AND channel <> '' AND template_id <> '' AND template_version <> '' AND attempts >= 0 ORDER BY COALESCE(next_attempt_at, lease_expires_at), attempted_at FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE notification_deliveries AS d SET status = 'attempting', attempts = d.attempts + 1, attempted_at = $1, next_attempt_at = NULL, lease_owner = $3, lease_expires_at = $4 FROM candidates AS c WHERE d.tenant_id = c.tenant_id AND d.project_id = c.project_id AND d.id = c.id RETURNING " + qualifiedNotificationDeliveryColumnsSQL + ") SELECT " + notificationDeliveryColumnsSQL + " FROM claimed ORDER BY attempted_at, id"
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -402,21 +408,179 @@ func (r *PostgresRepository) ListNotificationRoutes(ctx context.Context, scope S
 	routes := make([]NotificationRoute, 0)
 	for rows.Next() {
 		var route NotificationRoute
+		var severities pq.StringArray
+		var labels []byte
+		var templateID, templateTenantID, templateProjectID, templateName, subject, body sql.NullString
+		var templateRevision sql.NullInt64
+		var templateCreatedAt, templateUpdatedAt sql.NullTime
 		if err := rows.Scan(
 			&route.Policy.ID, &route.Policy.Scope.TenantID, &route.Policy.Scope.ProjectID, &route.Policy.Name,
-			&route.Policy.Channel, &route.Policy.Target, &route.Policy.SecretRef, &route.Policy.Enabled,
+			&route.Policy.Channel, &route.Policy.Target, &route.Policy.SecretRef, &route.Policy.TemplateID,
+			&severities, &labels, &route.Policy.WindowStartUTC, &route.Policy.WindowEndUTC, &route.Policy.Enabled,
 			&route.Policy.CreatedAt, &route.Policy.UpdatedAt,
-			&route.Template.ID, &route.Template.Scope.TenantID, &route.Template.Scope.ProjectID, &route.Template.Name,
-			&route.Template.Subject, &route.Template.Body, &route.Template.CreatedAt, &route.Template.UpdatedAt,
+			&templateID, &templateTenantID, &templateProjectID, &templateName,
+			&subject, &body, &templateRevision, &templateCreatedAt, &templateUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
-		if route.Policy.Scope != scope || route.Template.Scope != scope {
+		if route.Policy.Scope != scope {
 			return nil, ErrNotificationScopeMismatch
+		}
+		route.Policy.Severities = []string(severities)
+		if err := unmarshalMap(labels, &route.Policy.MatchLabels); err != nil {
+			return nil, err
+		}
+		if templateID.Valid {
+			route.Template = NotificationTemplate{
+				ID: templateID.String, Scope: Scope{TenantID: templateTenantID.String, ProjectID: templateProjectID.String},
+				Name: templateName.String, Subject: subject.String, Body: body.String, Revision: templateRevision.Int64,
+			}
+			if templateCreatedAt.Valid {
+				route.Template.CreatedAt = templateCreatedAt.Time
+			}
+			if templateUpdatedAt.Valid {
+				route.Template.UpdatedAt = templateUpdatedAt.Time
+			}
 		}
 		routes = append(routes, route)
 	}
 	return routes, rows.Err()
+}
+
+func (r *PostgresRepository) CreateNotificationTemplate(ctx context.Context, template NotificationTemplate) (NotificationTemplate, error) {
+	return r.mutateNotificationTemplate(ctx, template, false)
+}
+
+func (r *PostgresRepository) UpdateNotificationTemplate(ctx context.Context, template NotificationTemplate) (NotificationTemplate, error) {
+	return r.mutateNotificationTemplate(ctx, template, true)
+}
+
+func (r *PostgresRepository) mutateNotificationTemplate(ctx context.Context, template NotificationTemplate, update bool) (NotificationTemplate, error) {
+	if err := validateNotificationTemplate(template); err != nil {
+		return NotificationTemplate{}, err
+	}
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return NotificationTemplate{}, err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationTemplate{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "INSERT INTO notification_templates (id, tenant_id, project_id, name, subject, body, revision) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING " + notificationTemplateColumnsSQL
+	args := []any{template.ID, template.Scope.TenantID, template.Scope.ProjectID, template.Name, template.Subject, template.Body, template.Revision}
+	action := "template.created"
+	if update {
+		query = "UPDATE notification_templates SET name = $1, subject = $2, body = $3, revision = $4, updated_at = NOW() WHERE tenant_id = $5 AND project_id = $6 AND id = $7 AND revision < $4 RETURNING " + notificationTemplateColumnsSQL
+		args = []any{template.Name, template.Subject, template.Body, template.Revision, template.Scope.TenantID, template.Scope.ProjectID, template.ID}
+		action = "template.updated"
+	}
+	stored, err := scanNotificationTemplate(tx.QueryRowContext(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return NotificationTemplate{}, ErrNotFound
+	}
+	if err != nil {
+		return NotificationTemplate{}, err
+	}
+	at := stored.CreatedAt
+	if update {
+		at = stored.UpdatedAt
+	}
+	if err := appendAudit(ctx, tx, configurationAudit(stored.Scope, actor, action, stored.ID, at, map[string]string{"version": strconv.FormatInt(stored.Revision, 10)})); err != nil {
+		return NotificationTemplate{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return NotificationTemplate{}, err
+	}
+	return stored, nil
+}
+
+func (r *PostgresRepository) CreateNotificationPolicy(ctx context.Context, policy NotificationPolicy) (NotificationPolicy, error) {
+	return r.mutateNotificationPolicy(ctx, policy, false)
+}
+
+func (r *PostgresRepository) UpdateNotificationPolicy(ctx context.Context, policy NotificationPolicy) (NotificationPolicy, error) {
+	return r.mutateNotificationPolicy(ctx, policy, true)
+}
+
+func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, policy NotificationPolicy, update bool) (NotificationPolicy, error) {
+	if err := validateNotificationPolicy(policy); err != nil {
+		return NotificationPolicy{}, err
+	}
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return NotificationPolicy{}, err
+	}
+	labels, err := marshalMap(policy.MatchLabels)
+	if err != nil {
+		return NotificationPolicy{}, err
+	}
+	start, end := nullableTimeOfDay(policy.WindowStartUTC), nullableTimeOfDay(policy.WindowEndUTC)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return NotificationPolicy{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "INSERT INTO notification_policies (id, tenant_id, project_id, name, channel, target, secret_ref, template_id, severities, match_labels, window_start_utc, window_end_utc, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::time, $12::time, $13) RETURNING " + notificationPolicyColumnsSQL
+	args := []any{policy.ID, policy.Scope.TenantID, policy.Scope.ProjectID, policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(policy.Severities), labels, start, end, policy.Enabled}
+	action := "policy.created"
+	if update {
+		query = "UPDATE notification_policies SET name = $1, channel = $2, target = $3, secret_ref = $4, template_id = $5, severities = $6, match_labels = $7, window_start_utc = $8::time, window_end_utc = $9::time, enabled = $10, updated_at = NOW() WHERE tenant_id = $11 AND project_id = $12 AND id = $13 RETURNING " + notificationPolicyColumnsSQL
+		args = []any{policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(policy.Severities), labels, start, end, policy.Enabled, policy.Scope.TenantID, policy.Scope.ProjectID, policy.ID}
+		action = "policy.updated"
+	}
+	stored, err := scanNotificationPolicy(tx.QueryRowContext(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return NotificationPolicy{}, ErrNotFound
+	}
+	if err != nil {
+		return NotificationPolicy{}, err
+	}
+	at := stored.CreatedAt
+	if update {
+		at = stored.UpdatedAt
+	}
+	details := map[string]string{"channel": stored.Channel, "template_id": stored.TemplateID, "enabled": strconv.FormatBool(stored.Enabled)}
+	if err := appendAudit(ctx, tx, configurationAudit(stored.Scope, actor, action, stored.ID, at, details)); err != nil {
+		return NotificationPolicy{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return NotificationPolicy{}, err
+	}
+	return stored, nil
+}
+
+func scanNotificationTemplate(scanner rowScanner) (NotificationTemplate, error) {
+	var template NotificationTemplate
+	err := scanner.Scan(&template.ID, &template.Scope.TenantID, &template.Scope.ProjectID, &template.Name, &template.Subject, &template.Body, &template.Revision, &template.CreatedAt, &template.UpdatedAt)
+	return template, err
+}
+
+func scanNotificationPolicy(scanner rowScanner) (NotificationPolicy, error) {
+	var policy NotificationPolicy
+	var severities pq.StringArray
+	var labels []byte
+	if err := scanner.Scan(&policy.ID, &policy.Scope.TenantID, &policy.Scope.ProjectID, &policy.Name, &policy.Channel, &policy.Target, &policy.SecretRef, &policy.TemplateID, &severities, &labels, &policy.WindowStartUTC, &policy.WindowEndUTC, &policy.Enabled, &policy.CreatedAt, &policy.UpdatedAt); err != nil {
+		return NotificationPolicy{}, err
+	}
+	policy.Severities = []string(severities)
+	if err := unmarshalMap(labels, &policy.MatchLabels); err != nil {
+		return NotificationPolicy{}, err
+	}
+	return policy, nil
+}
+
+func nullableTimeOfDay(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func configurationAudit(scope Scope, actor, action, target string, at time.Time, details map[string]string) AuditRecord {
+	id := "audit-" + fingerprintParts(scope.TenantID, scope.ProjectID, target, action, at.UTC().Format(time.RFC3339Nano))[:24]
+	return AuditRecord{ID: id, Scope: scope, Actor: actor, Action: action, TargetID: target, OccurredAt: at.UTC(), Details: details}
 }
 
 func (r *PostgresRepository) ListActiveSilences(ctx context.Context, scope Scope, at time.Time) ([]Silence, error) {
@@ -426,7 +590,7 @@ func (r *PostgresRepository) ListActiveSilences(ctx context.Context, scope Scope
 	if at.IsZero() {
 		return nil, ErrInvalidNotification
 	}
-	query := "SELECT id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, created_at FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 AND starts_at <= $3 AND ends_at > $3 ORDER BY created_at ASC"
+	query := "SELECT id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 AND starts_at <= $3 AND ends_at > $3 ORDER BY created_at ASC"
 	rows, err := r.db.QueryContext(ctx, query, scope.TenantID, scope.ProjectID, at.UTC())
 	if err != nil {
 		return nil, err
@@ -436,7 +600,7 @@ func (r *PostgresRepository) ListActiveSilences(ctx context.Context, scope Scope
 	for rows.Next() {
 		var silence Silence
 		var matchers []byte
-		if err := rows.Scan(&silence.ID, &silence.Scope.TenantID, &silence.Scope.ProjectID, &matchers, &silence.StartsAt, &silence.EndsAt, &silence.CreatedBy, &silence.CreatedAt); err != nil {
+		if err := rows.Scan(&silence.ID, &silence.Scope.TenantID, &silence.Scope.ProjectID, &matchers, &silence.StartsAt, &silence.EndsAt, &silence.CreatedBy, &silence.Reason, &silence.CreatedAt, &silence.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if silence.Scope != scope {
@@ -448,6 +612,172 @@ func (r *PostgresRepository) ListActiveSilences(ctx context.Context, scope Scope
 		silences = append(silences, silence)
 	}
 	return silences, rows.Err()
+}
+
+func (r *PostgresRepository) PersistInAppNotification(ctx context.Context, request DeliveryRequest) error {
+	if request.Scope.Validate() != nil || request.DeliveryID == "" || request.EventID == "" || !allowedEventState(request.State) || strings.TrimSpace(request.Target) == "" {
+		return ErrInvalidNotification
+	}
+	digest := sha256.Sum256([]byte(canonicalParts(request.Scope.TenantID, request.Scope.ProjectID, request.DeliveryID, request.Target)))
+	id := "notice-" + hex.EncodeToString(digest[:12])
+	query := "INSERT INTO in_app_notifications (id, tenant_id, project_id, delivery_id, event_id, event_state, recipient, subject, body, created_at) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() WHERE EXISTS (SELECT 1 FROM notification_deliveries WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND event_id = $5 AND channel = 'in_app') ON CONFLICT (tenant_id, project_id, delivery_id, recipient) DO UPDATE SET id = in_app_notifications.id RETURNING id"
+	var storedID string
+	err := r.db.QueryRowContext(ctx, query, id, request.Scope.TenantID, request.Scope.ProjectID, request.DeliveryID, request.EventID, request.State, request.Target, request.Subject, request.Body).Scan(&storedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotificationScopeMismatch
+	}
+	return err
+}
+
+func (r *PostgresRepository) ListInAppNotifications(ctx context.Context, scope Scope, recipient string, limit int) ([]InAppNotification, error) {
+	if scope.Validate() != nil || strings.TrimSpace(recipient) == "" {
+		return nil, ErrInvalidNotification
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := "SELECT id, tenant_id, project_id, delivery_id, event_id, event_state, recipient, subject, body, created_at, read_at FROM in_app_notifications WHERE tenant_id = $1 AND project_id = $2 AND recipient = $3 ORDER BY created_at DESC LIMIT $4"
+	rows, err := r.db.QueryContext(ctx, query, scope.TenantID, scope.ProjectID, recipient, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]InAppNotification, 0)
+	for rows.Next() {
+		var notification InAppNotification
+		var readAt sql.NullTime
+		if err := rows.Scan(&notification.ID, &notification.Scope.TenantID, &notification.Scope.ProjectID, &notification.DeliveryID, &notification.EventID, &notification.EventState, &notification.Recipient, &notification.Subject, &notification.Body, &notification.CreatedAt, &readAt); err != nil {
+			return nil, err
+		}
+		if notification.Scope != scope {
+			return nil, ErrNotificationScopeMismatch
+		}
+		if readAt.Valid {
+			notification.ReadAt = readAt.Time
+		}
+		result = append(result, notification)
+	}
+	return result, rows.Err()
+}
+
+func (r *PostgresRepository) CreateSilence(ctx context.Context, silence Silence) (Silence, error) {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return Silence{}, err
+	}
+	if err := validateSilence(silence); err != nil || silence.CreatedBy != actor {
+		return Silence{}, ErrInvalidNotification
+	}
+	matchers, err := marshalMap(silence.Matchers)
+	if err != nil {
+		return Silence{}, err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Silence{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "INSERT INTO alert_silences (id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at"
+	stored, err := scanSilence(tx.QueryRowContext(ctx, query, silence.ID, silence.Scope.TenantID, silence.Scope.ProjectID, matchers, silence.StartsAt, silence.EndsAt, actor, silence.Reason))
+	if err != nil {
+		return Silence{}, err
+	}
+	audit := silenceAudit(stored, actor, "silence.created", stored.CreatedAt)
+	if err := appendAudit(ctx, tx, audit); err != nil {
+		return Silence{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Silence{}, err
+	}
+	return stored, nil
+}
+
+func (r *PostgresRepository) UpdateSilence(ctx context.Context, silence Silence) (Silence, error) {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return Silence{}, err
+	}
+	if err := validateSilence(silence); err != nil {
+		return Silence{}, err
+	}
+	matchers, err := marshalMap(silence.Matchers)
+	if err != nil {
+		return Silence{}, err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Silence{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "UPDATE alert_silences SET matchers = $1, starts_at = $2, ends_at = $3, reason = $4, updated_at = NOW() WHERE tenant_id = $5 AND project_id = $6 AND id = $7 RETURNING id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at"
+	stored, err := scanSilence(tx.QueryRowContext(ctx, query, matchers, silence.StartsAt, silence.EndsAt, silence.Reason, silence.Scope.TenantID, silence.Scope.ProjectID, silence.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Silence{}, ErrNotFound
+	}
+	if err != nil {
+		return Silence{}, err
+	}
+	if err := appendAudit(ctx, tx, silenceAudit(stored, actor, "silence.updated", stored.UpdatedAt)); err != nil {
+		return Silence{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Silence{}, err
+	}
+	return stored, nil
+}
+
+func (r *PostgresRepository) DeleteSilence(ctx context.Context, scope Scope, id string) error {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if scope.Validate() != nil || !validIdentifier(id) {
+		return ErrInvalidNotification
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "DELETE FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 AND id = $3 RETURNING id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at"
+	deleted, err := scanSilence(tx.QueryRowContext(ctx, query, scope.TenantID, scope.ProjectID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := appendAudit(ctx, tx, silenceAudit(deleted, actor, "silence.deleted", time.Now().UTC())); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateSilence(silence Silence) error {
+	if silence.Scope.Validate() != nil || !validIdentifier(silence.ID) || len(silence.Matchers) == 0 || strings.TrimSpace(silence.CreatedBy) == "" || strings.TrimSpace(silence.Reason) == "" || containsSecretMaterial(silence.Reason) || silence.StartsAt.IsZero() || !silence.EndsAt.After(silence.StartsAt) {
+		return ErrInvalidNotification
+	}
+	return nil
+}
+
+func scanSilence(scanner rowScanner) (Silence, error) {
+	var silence Silence
+	var matchers []byte
+	if err := scanner.Scan(&silence.ID, &silence.Scope.TenantID, &silence.Scope.ProjectID, &matchers, &silence.StartsAt, &silence.EndsAt, &silence.CreatedBy, &silence.Reason, &silence.CreatedAt, &silence.UpdatedAt); err != nil {
+		return Silence{}, err
+	}
+	if err := unmarshalMap(matchers, &silence.Matchers); err != nil {
+		return Silence{}, err
+	}
+	return silence, nil
+}
+
+func silenceAudit(silence Silence, actor, action string, at time.Time) AuditRecord {
+	id := "audit-" + fingerprintParts(silence.Scope.TenantID, silence.Scope.ProjectID, silence.ID, action, at.UTC().Format(time.RFC3339Nano))[:24]
+	return AuditRecord{ID: id, Scope: silence.Scope, Actor: actor, Action: action, TargetID: silence.ID, OccurredAt: at.UTC(), Details: map[string]string{
+		"starts_at": silence.StartsAt.UTC().Format(time.RFC3339Nano), "ends_at": silence.EndsAt.UTC().Format(time.RFC3339Nano),
+		"matcher_count": strconv.Itoa(len(silence.Matchers)), "reason_present": "true",
+	}}
 }
 
 func (r *PostgresRepository) ReserveNotificationDelivery(ctx context.Context, delivery NotificationDelivery, audit *AuditRecord) (bool, error) {
@@ -462,7 +792,7 @@ func (r *PostgresRepository) ReserveNotificationDelivery(ctx context.Context, de
 			return false, err
 		}
 	}
-	envelope, err := marshalDeliveryEnvelope(delivery)
+	labels, err := marshalMap(delivery.Request.Labels)
 	if err != nil {
 		return false, err
 	}
@@ -471,7 +801,13 @@ func (r *PostgresRepository) ReserveNotificationDelivery(ctx context.Context, de
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, deliveryInsertSQL, delivery.ID, delivery.Scope.TenantID, delivery.Scope.ProjectID, delivery.EventID, delivery.PolicyID, delivery.Status, delivery.AttemptedAt, nullableTimestamp(delivery.DeliveredAt), envelope)
+	result, err := tx.ExecContext(ctx, deliveryInsertSQL,
+		delivery.ID, delivery.Scope.TenantID, delivery.Scope.ProjectID, delivery.EventID, delivery.PolicyID,
+		delivery.IdempotencyKey, delivery.Request.State, delivery.Request.Channel, delivery.Request.TemplateID, delivery.Request.TemplateVersion,
+		delivery.Status, delivery.Attempts, delivery.AttemptedAt, nullableTimestamp(delivery.NextAttemptAt), nullableTimestamp(delivery.DeliveredAt),
+		delivery.LeaseOwner, nullableTimestamp(delivery.LeaseExpiresAt), delivery.FailureClass,
+		delivery.Request.Target, delivery.Request.Subject, delivery.Request.Body, labels, delivery.Request.SecretRef,
+	)
 	if err != nil {
 		return false, err
 	}
@@ -506,16 +842,16 @@ func (r *PostgresRepository) UpdateNotificationDelivery(ctx context.Context, del
 	if err := validateNotificationAudit(audit); err != nil {
 		return err
 	}
-	envelope, err := marshalDeliveryEnvelope(delivery)
-	if err != nil {
-		return err
-	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, deliveryUpdateSQL, delivery.Status, delivery.AttemptedAt, nullableTimestamp(delivery.DeliveredAt), envelope, delivery.Scope.TenantID, delivery.Scope.ProjectID, delivery.ID)
+	result, err := tx.ExecContext(ctx, deliveryUpdateSQL,
+		delivery.Status, delivery.AttemptedAt, nullableTimestamp(delivery.NextAttemptAt), nullableTimestamp(delivery.DeliveredAt),
+		delivery.LeaseOwner, nullableTimestamp(delivery.LeaseExpiresAt), delivery.FailureClass,
+		delivery.Scope.TenantID, delivery.Scope.ProjectID, delivery.ID, delivery.ClaimOwner,
+	)
 	if err != nil {
 		return err
 	}
@@ -532,11 +868,14 @@ func (r *PostgresRepository) UpdateNotificationDelivery(ctx context.Context, del
 	return tx.Commit()
 }
 
-func (r *PostgresRepository) ListDueNotificationDeliveries(ctx context.Context, at time.Time) ([]NotificationDelivery, error) {
-	if at.IsZero() {
+func (r *PostgresRepository) ClaimDueNotificationDeliveries(ctx context.Context, at time.Time, owner string, leaseUntil time.Time, limit int) ([]NotificationDelivery, error) {
+	if at.IsZero() || leaseUntil.IsZero() || !leaseUntil.After(at) || strings.TrimSpace(owner) == "" {
 		return nil, ErrInvalidNotification
 	}
-	rows, err := r.db.QueryContext(ctx, dueDeliveriesSQL, at.UTC())
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, claimDeliveriesSQL, at.UTC(), limit, owner, leaseUntil.UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +886,7 @@ func (r *PostgresRepository) ListDueNotificationDeliveries(ctx context.Context, 
 		if err != nil {
 			return nil, err
 		}
-		if delivery.Status != DeliveryRetryScheduled || delivery.NextAttemptAt.After(at) {
+		if delivery.Status != DeliveryAttempting || delivery.LeaseOwner != owner || !delivery.LeaseExpiresAt.Equal(leaseUntil) {
 			return nil, ErrInvalidNotification
 		}
 		deliveries = append(deliveries, delivery)
@@ -555,72 +894,35 @@ func (r *PostgresRepository) ListDueNotificationDeliveries(ctx context.Context, 
 	return deliveries, rows.Err()
 }
 
-type storedDeliveryRequest struct {
-	Scope           Scope             `json:"scope"`
-	EventID         string            `json:"event_id"`
-	State           EventState        `json:"state"`
-	Severity        string            `json:"severity"`
-	Channel         string            `json:"channel"`
-	PolicyID        string            `json:"policy_id"`
-	TemplateID      string            `json:"template_id"`
-	TemplateVersion string            `json:"template_version"`
-	Target          string            `json:"target"`
-	SecretRef       string            `json:"secret_ref"`
-	Subject         string            `json:"subject"`
-	Body            string            `json:"body"`
-	Labels          map[string]string `json:"labels,omitempty"`
-}
-
-type deliveryEnvelope struct {
-	Attempts      int                   `json:"attempts"`
-	NextAttemptAt time.Time             `json:"next_attempt_at,omitempty"`
-	FailureClass  string                `json:"failure_class,omitempty"`
-	Request       storedDeliveryRequest `json:"request"`
-}
-
-func marshalDeliveryEnvelope(delivery NotificationDelivery) (string, error) {
-	request := delivery.Request
-	envelope := deliveryEnvelope{
-		Attempts: delivery.Attempts, NextAttemptAt: delivery.NextAttemptAt, FailureClass: sanitizeFailureClass(delivery.FailureClass),
-		Request: storedDeliveryRequest{
-			Scope: request.Scope, EventID: request.EventID, State: request.State, Severity: request.Severity,
-			Channel: request.Channel, PolicyID: request.PolicyID, TemplateID: request.TemplateID, TemplateVersion: request.TemplateVersion,
-			Target: request.Target, SecretRef: request.SecretRef, Subject: request.Subject, Body: request.Body, Labels: request.Labels,
-		},
-	}
-	if delivery.FailureClass == "" {
-		envelope.FailureClass = ""
-	}
-	encoded, err := json.Marshal(envelope)
-	if err != nil {
-		return "", fmt.Errorf("encode notification delivery: %w", err)
-	}
-	return string(encoded), nil
-}
-
 func scanNotificationDelivery(scanner rowScanner) (NotificationDelivery, error) {
 	var delivery NotificationDelivery
-	var deliveredAt sql.NullTime
-	var encoded string
-	if err := scanner.Scan(&delivery.ID, &delivery.Scope.TenantID, &delivery.Scope.ProjectID, &delivery.EventID, &delivery.PolicyID, &delivery.Status, &delivery.AttemptedAt, &deliveredAt, &encoded); err != nil {
+	var nextAttemptAt, deliveredAt, leaseExpiresAt sql.NullTime
+	var labels []byte
+	if err := scanner.Scan(
+		&delivery.ID, &delivery.Scope.TenantID, &delivery.Scope.ProjectID, &delivery.EventID, &delivery.PolicyID,
+		&delivery.IdempotencyKey, &delivery.Request.State, &delivery.Request.Channel, &delivery.Request.TemplateID, &delivery.Request.TemplateVersion,
+		&delivery.Status, &delivery.Attempts, &delivery.AttemptedAt, &nextAttemptAt, &deliveredAt,
+		&delivery.LeaseOwner, &leaseExpiresAt, &delivery.FailureClass,
+		&delivery.Request.Target, &delivery.Request.Subject, &delivery.Request.Body, &labels, &delivery.Request.SecretRef,
+	); err != nil {
 		return NotificationDelivery{}, err
+	}
+	delivery.Request.DeliveryID = delivery.ID
+	delivery.Request.Scope = delivery.Scope
+	delivery.Request.EventID = delivery.EventID
+	delivery.Request.PolicyID = delivery.PolicyID
+	delivery.ClaimOwner = delivery.LeaseOwner
+	if nextAttemptAt.Valid {
+		delivery.NextAttemptAt = nextAttemptAt.Time
 	}
 	if deliveredAt.Valid {
 		delivery.DeliveredAt = deliveredAt.Time
 	}
-	var envelope deliveryEnvelope
-	if err := json.Unmarshal([]byte(encoded), &envelope); err != nil {
-		return NotificationDelivery{}, fmt.Errorf("decode notification delivery: %w", err)
+	if leaseExpiresAt.Valid {
+		delivery.LeaseExpiresAt = leaseExpiresAt.Time
 	}
-	delivery.IdempotencyKey = delivery.ID
-	delivery.Attempts = envelope.Attempts
-	delivery.NextAttemptAt = envelope.NextAttemptAt
-	delivery.FailureClass = envelope.FailureClass
-	request := envelope.Request
-	delivery.Request = DeliveryRequest{
-		Scope: request.Scope, EventID: request.EventID, State: request.State, Severity: request.Severity,
-		Channel: request.Channel, PolicyID: request.PolicyID, TemplateID: request.TemplateID, TemplateVersion: request.TemplateVersion,
-		Target: request.Target, SecretRef: request.SecretRef, Subject: request.Subject, Body: request.Body, Labels: request.Labels,
+	if err := unmarshalMap(labels, &delivery.Request.Labels); err != nil {
+		return NotificationDelivery{}, err
 	}
 	if err := validateNotificationDelivery(delivery); err != nil {
 		return NotificationDelivery{}, err
@@ -632,7 +934,7 @@ func validateNotificationDelivery(delivery NotificationDelivery) error {
 	if delivery.Scope.Validate() != nil || strings.TrimSpace(delivery.ID) == "" || delivery.ID != delivery.IdempotencyKey || strings.TrimSpace(delivery.EventID) == "" || strings.TrimSpace(delivery.PolicyID) == "" || delivery.Attempts < 1 || delivery.AttemptedAt.IsZero() {
 		return ErrInvalidNotification
 	}
-	if delivery.Request.Scope != delivery.Scope || delivery.Request.EventID != delivery.EventID || delivery.Request.PolicyID != delivery.PolicyID || delivery.Request.Channel == "" || delivery.Request.TemplateVersion == "" {
+	if delivery.Request.Scope != delivery.Scope || delivery.Request.EventID != delivery.EventID || delivery.Request.PolicyID != delivery.PolicyID || delivery.Request.Channel == "" || delivery.Request.TemplateID == "" || delivery.Request.TemplateVersion == "" {
 		return ErrInvalidNotification
 	}
 	switch delivery.Status {
@@ -641,6 +943,12 @@ func validateNotificationDelivery(delivery NotificationDelivery) error {
 		return ErrInvalidNotification
 	}
 	if delivery.Status == DeliveryRetryScheduled && delivery.NextAttemptAt.IsZero() {
+		return ErrInvalidNotification
+	}
+	if delivery.Status == DeliveryAttempting && (delivery.LeaseOwner == "" || delivery.LeaseExpiresAt.IsZero()) {
+		return ErrInvalidNotification
+	}
+	if delivery.FailureClass != "" && sanitizeFailureClass(delivery.FailureClass) != delivery.FailureClass {
 		return ErrInvalidNotification
 	}
 	return nil
@@ -760,3 +1068,6 @@ func nullableTimestamp(value time.Time) any {
 var _ Repository = (*PostgresRepository)(nil)
 var _ AuditWriter = (*PostgresRepository)(nil)
 var _ NotificationRepository = (*PostgresRepository)(nil)
+var _ InAppNotificationRepository = (*PostgresRepository)(nil)
+var _ SilenceRepository = (*PostgresRepository)(nil)
+var _ NotificationConfigurationRepository = (*PostgresRepository)(nil)
