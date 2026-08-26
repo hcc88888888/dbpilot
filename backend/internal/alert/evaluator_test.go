@@ -298,6 +298,84 @@ func TestEvaluatorRedactsSensitiveResourceLabels(t *testing.T) {
 	require.Equal(t, RedactedValue, event.Labels["api_token"])
 }
 
+func TestEvaluatorPaginatesEveryEventForRuleMissingData(t *testing.T) {
+	rule := ruleWith(MissingPolicy("resolve"))
+	fx := newEvaluatorFixture(t, rule)
+	for index := 0; index < 501; index++ {
+		labels := map[string]string{"agent_id": "agent-a", "host": "host-" + strconv.Itoa(index)}
+		fingerprint := EventFingerprint(fx.scope, rule.ID, labels)
+		fx.repo.eventsByFingerprint[fingerprint] = AlertEvent{ID: "event-" + strconv.Itoa(index), Scope: fx.scope, RuleID: rule.ID, Fingerprint: fingerprint, Labels: labels, Evidence: map[string]string{}, State: EventFiring, FirstSeen: fx.now.Add(-time.Hour), LastSeen: fx.now.Add(-time.Minute), FiringAt: fx.now.Add(-30 * time.Minute), LastActor: "system:evaluator"}
+	}
+
+	fx.evaluate()
+	resolved := 0
+	for _, event := range fx.events() {
+		if event.State == EventResolved {
+			resolved++
+		}
+	}
+	require.Equal(t, 501, resolved)
+	require.Equal(t, []int{0, 500}, fx.repo.listRuleEventOffsets)
+}
+
+func TestEvaluatorMatchesAgentSelectorAgainstTrustedIdentity(t *testing.T) {
+	rule := defaultRule()
+	rule.Labels = map[string]string{"agent_id": "agent-a"}
+	fx := newEvaluatorFixture(t, rule)
+	trusted := sampleAt(fx.now, 91)
+	spoofed := sampleAt(fx.now, 99)
+	spoofed.AgentID = "agent-b"
+	spoofed.Labels["agent_id"] = "agent-a"
+	fx.append(trusted, spoofed)
+
+	fx.evaluate()
+	events := fx.events()
+	require.Len(t, events, 1)
+	require.Equal(t, "agent-a", events[0].Labels["agent_id"])
+	require.Equal(t, map[string]string{}, fx.metrics.queries[0].Labels)
+}
+
+func TestEvaluatorSensitiveLabelRotationReusesFingerprint(t *testing.T) {
+	fx := newEvaluatorFixture(t, defaultRule())
+	fx.append(sample(fx.now, 91, map[string]string{"host": "a", "api_token": "old-secret"}))
+	fx.evaluate()
+	first := fx.event("cpu")
+
+	fx.now = fx.now.Add(time.Minute)
+	fx.append(sample(fx.now, 91, map[string]string{"host": "a", "api_token": "new-secret"}))
+	fx.evaluate()
+	rotated := fx.event("cpu")
+	require.Len(t, fx.events(), 1)
+	require.Equal(t, first.ID, rotated.ID)
+	require.Equal(t, first.Fingerprint, rotated.Fingerprint)
+	require.Equal(t, RedactedValue, rotated.Labels["api_token"])
+}
+
+func TestEvaluatorReturnsSanitizedErrorWhenFailureFindingCannotPersistAndContinues(t *testing.T) {
+	invalid := defaultRule()
+	invalid.ID = "invalid"
+	invalid.Name = "invalid"
+	invalid.Aggregation = "runtime-invalid"
+	valid := defaultRule()
+	valid.ID = "valid"
+	valid.Name = "valid"
+	fx := newEvaluatorFixture(t, invalid, valid)
+	fx.repo.failedRuleID = invalid.ID
+	fx.append(sampleAt(fx.now, 91))
+
+	summary, err := fx.evaluator.EvaluateScope(context.Background(), fx.scope, fx.now)
+	require.ErrorIs(t, err, ErrEvaluationAuditPersistence)
+	require.Equal(t, 1, summary.FailedRules)
+	require.Equal(t, EventPending, fx.event("valid").State)
+	require.Equal(t, "alert evaluation audit persistence failed", fx.evaluator.Health().LastError)
+	require.NotContains(t, err.Error(), "invalid")
+}
+
+func TestControlPlaneIDReturnsErrorWhenRandomSourceFails(t *testing.T) {
+	_, err := newControlPlaneID("event", failingReader{})
+	require.Error(t, err)
+}
+
 type evaluatorFixture struct {
 	t         *testing.T
 	now       time.Time
@@ -480,12 +558,13 @@ func (store *memoryMetricStore) Query(_ context.Context, query MetricQuery) ([]M
 }
 
 type memoryRepository struct {
-	mu                  sync.Mutex
-	rules               []AlertRule
-	eventsByFingerprint map[string]AlertEvent
-	audits              []AuditRecord
-	failedRuleID        string
-	putFailure          error
+	mu                   sync.Mutex
+	rules                []AlertRule
+	eventsByFingerprint  map[string]AlertEvent
+	audits               []AuditRecord
+	failedRuleID         string
+	putFailure           error
+	listRuleEventOffsets []int
 }
 
 func (repo *memoryRepository) CreateRule(_ context.Context, rule AlertRule) (AlertRule, error) {
@@ -579,6 +658,27 @@ func (repo *memoryRepository) ListEvents(_ context.Context, scope Scope, _ Event
 	return events, nil
 }
 
+func (repo *memoryRepository) ListRuleEvents(_ context.Context, scope Scope, ruleID string, filter EventFilter) ([]AlertEvent, error) {
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	repo.listRuleEventOffsets = append(repo.listRuleEventOffsets, filter.Offset)
+	var events []AlertEvent
+	for _, event := range repo.eventsByFingerprint {
+		if event.Scope == scope && event.RuleID == ruleID {
+			events = append(events, event)
+		}
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].ID < events[j].ID })
+	if filter.Offset >= len(events) {
+		return []AlertEvent{}, nil
+	}
+	end := filter.Offset + filter.Limit
+	if end > len(events) {
+		end = len(events)
+	}
+	return append([]AlertEvent(nil), events[filter.Offset:end]...), nil
+}
+
 func (repo *memoryRepository) AppendAudit(_ context.Context, record AuditRecord) error {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
@@ -588,3 +688,7 @@ func (repo *memoryRepository) AppendAudit(_ context.Context, record AuditRecord)
 	repo.audits = append(repo.audits, record)
 	return nil
 }
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errors.New("random unavailable") }

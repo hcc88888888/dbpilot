@@ -13,5 +13,6 @@ type Repository interface {
 	PutEventAndAudit(context.Context, AlertEvent, AuditRecord) (AlertEvent, error)
 	FindEventByFingerprint(context.Context, Scope, string) (AlertEvent, bool, error)
 	ListEvents(context.Context, Scope, EventFilter) ([]AlertEvent, error)
+	ListRuleEvents(context.Context, Scope, string, EventFilter) ([]AlertEvent, error)
 	AppendAudit(context.Context, AuditRecord) error
 }

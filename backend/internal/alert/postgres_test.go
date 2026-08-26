@@ -2,6 +2,7 @@ package alert_test
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"os"
 	"path/filepath"
@@ -33,6 +34,25 @@ func TestPostgresRepositoryScopesEventLookup(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresRepositoryPagesEventsWithinScopeAndRule(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		require.NoError(t, db.Close())
+	})
+	at := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND rule_id = $3 ORDER BY id ASC LIMIT $4 OFFSET $5")).
+		WithArgs("t1", "p1", "rule-1", 500, 500).
+		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow("event-501", "t1", "p1", "rule-1", "fp-501", []byte(`{"host":"a"}`), []byte(`{}`), "pending", at, at, nil, nil, nil, "system:evaluator"))
+
+	events, err := alert.NewPostgresRepository(db).ListRuleEvents(context.Background(), alert.Scope{TenantID: "t1", ProjectID: "p1"}, "rule-1", alert.EventFilter{Limit: 500, Offset: 500})
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	require.Equal(t, "event-501", events[0].ID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresRepositoryScopesEveryRuleOperation(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -45,15 +65,15 @@ func TestPostgresRepositoryScopesEveryRuleOperation(t *testing.T) {
 	rule := testRule()
 
 	mock.ExpectQuery("INSERT INTO alert_rules").WithArgs(
-		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true,
+		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator-a",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
-	_, err = repository.CreateRule(ctx, rule)
+	_, err = repository.CreateRule(alert.ContextWithAuditActor(ctx, "operator-a"), rule)
 	require.NoError(t, err)
 
 	mock.ExpectQuery("UPDATE alert_rules").WithArgs(
-		"cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "t1", "p1", "rule-1",
+		"cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "t1", "p1", "rule-1", "operator-b",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
-	_, err = repository.UpdateRule(ctx, rule)
+	_, err = repository.UpdateRule(alert.ContextWithAuditActor(ctx, "operator-b"), rule)
 	require.NoError(t, err)
 
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC")).
@@ -80,11 +100,15 @@ func TestPostgresRepositoryScopesEveryEventAndAuditWrite(t *testing.T) {
 	repository := alert.NewPostgresRepository(db)
 	ctx := context.Background()
 	firstSeen := time.Now()
-	event := alert.AlertEvent{ID: "event-1", Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, RuleID: "rule-1", Fingerprint: "fp", Labels: map[string]string{"host": "a"}, Evidence: map[string]string{"value": "80"}, State: alert.EventFiring, FirstSeen: firstSeen, LastSeen: firstSeen.Add(time.Minute), FiringAt: firstSeen.Add(30 * time.Second), LastActor: "system"}
+	event := alert.AlertEvent{ID: "event-1", Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, RuleID: "rule-1", Fingerprint: "fp", Labels: map[string]string{"host": "a"}, Evidence: map[string]string{"value": "80"}, State: alert.EventPending, FirstSeen: firstSeen, LastSeen: firstSeen, LastActor: "system"}
 
+	mock.ExpectBegin()
+	mock.ExpectQuery("FOR UPDATE").WithArgs("t1", "p1", "fp").WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery("INSERT INTO alert_events").WithArgs(
-		"event-1", "t1", "p1", "rule-1", "fp", sqlmock.AnyArg(), sqlmock.AnyArg(), "firing", event.FirstSeen, event.LastSeen, event.FiringAt, nil, nil, "system",
+		"event-1", "t1", "p1", "rule-1", "fp", sqlmock.AnyArg(), sqlmock.AnyArg(), "pending", event.FirstSeen, event.LastSeen, nil, nil, nil, "system",
 	).WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow(eventRowValues(event)...))
+	mock.ExpectExec("INSERT INTO alert_audit_log").WithArgs(sqlmock.AnyArg(), "t1", "p1", "system", "event.pending", "event-1", event.LastSeen, []byte(`{"state":"pending"}`)).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 	_, err = repository.PutEvent(ctx, event)
 	require.NoError(t, err)
 
@@ -95,9 +119,9 @@ func TestPostgresRepositoryScopesEveryEventAndAuditWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")).
-		WithArgs("audit-1", "t1", "p1", "operator", "acknowledge", "event-1", sqlmock.AnyArg(), []byte(`{"reason":"investigating"}`)).
+		WithArgs("audit-1", "t1", "p1", "operator", "event.acknowledged", "event-1", sqlmock.AnyArg(), []byte(`{"state":"acknowledged"}`)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	err = repository.AppendAudit(ctx, alert.AuditRecord{ID: "audit-1", Scope: event.Scope, Actor: "operator", Action: "acknowledge", TargetID: "event-1", OccurredAt: time.Now(), Details: map[string]string{"reason": "investigating"}})
+	err = repository.AppendAudit(ctx, alert.AuditRecord{ID: "audit-1", Scope: event.Scope, Actor: "operator", Action: "event.acknowledged", TargetID: "event-1", OccurredAt: time.Now(), Details: map[string]string{"state": "acknowledged"}})
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -151,10 +175,10 @@ func TestPostgresRepositoryPreservesNanosecondRuleDurations(t *testing.T) {
 	rule.EvaluationEvery = time.Nanosecond
 	rule.For = 999999 * time.Nanosecond
 	mock.ExpectQuery("INSERT INTO alert_rules").WithArgs(
-		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Nanosecond), int64(999999*time.Nanosecond), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true,
+		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Nanosecond), int64(999999*time.Nanosecond), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
 
-	stored, err := alert.NewPostgresRepository(db).CreateRule(context.Background(), rule)
+	stored, err := alert.NewPostgresRepository(db).CreateRule(alert.ContextWithAuditActor(context.Background(), "operator"), rule)
 	require.NoError(t, err)
 	require.Equal(t, time.Nanosecond, stored.EvaluationEvery)
 	require.Equal(t, 999999*time.Nanosecond, stored.For)

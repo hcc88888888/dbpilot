@@ -2,8 +2,10 @@ package alert
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"sync"
@@ -11,8 +13,9 @@ import (
 )
 
 var (
-	ErrUnsupportedAggregation = errors.New("unsupported alert aggregation")
-	ErrInvalidRateWindow      = errors.New("rate requires two samples at different timestamps")
+	ErrUnsupportedAggregation     = errors.New("unsupported alert aggregation")
+	ErrInvalidRateWindow          = errors.New("rate requires two samples at different timestamps")
+	ErrEvaluationAuditPersistence = errors.New("alert evaluation audit persistence failed")
 )
 
 const conditionSinceEvidenceKey = "condition_since"
@@ -47,13 +50,14 @@ type EvaluatorHealth struct {
 type Evaluator struct {
 	repository Repository
 	metrics    MetricStore
+	idSource   io.Reader
 
 	mu     sync.RWMutex
 	health EvaluatorHealth
 }
 
 func NewEvaluator(repository Repository, metrics MetricStore) *Evaluator {
-	return &Evaluator{repository: repository, metrics: metrics}
+	return &Evaluator{repository: repository, metrics: metrics, idSource: rand.Reader}
 }
 
 func (e *Evaluator) Health() EvaluatorHealth {
@@ -83,6 +87,7 @@ func (e *Evaluator) EvaluateScope(ctx context.Context, scope Scope, now time.Tim
 	summary.Rules = len(rules)
 	e.recordLateness(now, rules)
 
+	auditPersistenceFailed := false
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
@@ -90,7 +95,9 @@ func (e *Evaluator) EvaluateScope(ctx context.Context, scope Scope, now time.Tim
 		updated, err := e.evaluateRule(ctx, scope, rule, now)
 		if err != nil {
 			summary.FailedRules++
-			e.appendFailureFinding(ctx, scope, rule.ID, now)
+			if findingErr := e.appendFailureFinding(ctx, scope, rule.ID, now); findingErr != nil {
+				auditPersistenceFailed = true
+			}
 			continue
 		}
 		summary.EvaluatedRules++
@@ -103,6 +110,9 @@ func (e *Evaluator) EvaluateScope(ctx context.Context, scope Scope, now time.Tim
 		e.health.LastError = ""
 	}
 	e.mu.Unlock()
+	if auditPersistenceFailed {
+		return summary, ErrEvaluationAuditPersistence
+	}
 	return summary, nil
 }
 
@@ -111,11 +121,12 @@ func (e *Evaluator) evaluateRule(ctx context.Context, scope Scope, rule AlertRul
 		return 0, ErrInvalidRule
 	}
 	windowStart := now.Add(-rule.EvaluationEvery)
-	samples, err := e.metrics.Query(ctx, MetricQuery{Scope: scope, Name: rule.Metric, Labels: cloneMap(rule.Labels), From: windowStart, To: now})
+	selector := canonicalRuleSelector(rule.Labels)
+	samples, err := e.metrics.Query(ctx, MetricQuery{Scope: scope, Name: rule.Metric, Labels: storageMetricSelector(rule.Labels), From: windowStart, To: now})
 	if err != nil {
 		return 0, err
 	}
-	samples = filterEvaluationSamples(samples, scope, rule.Metric, rule.Labels, windowStart, now)
+	samples = filterEvaluationSamples(samples, scope, rule.Metric, selector, windowStart, now)
 
 	groups := make(map[string][]MetricSample)
 	groupLabels := make(map[string]map[string]string)
@@ -156,17 +167,14 @@ func (e *Evaluator) evaluateRule(ctx context.Context, scope Scope, rule AlertRul
 		}
 	}
 
-	existing, err := e.repository.ListEvents(ctx, scope, EventFilter{Limit: 500})
+	existing, err := e.listAllRuleEvents(ctx, scope, rule.ID)
 	if err != nil {
 		return updated, err
 	}
 	missingEvidence := EvaluationEvidence{WindowStart: windowStart, WindowEnd: now, Missing: true}
-	globalMissingFingerprint := EventFingerprint(scope, rule.ID, rule.Labels)
+	globalMissingFingerprint := EventFingerprint(scope, rule.ID, selector)
 	hadExisting := false
 	for _, event := range existing {
-		if event.RuleID != rule.ID {
-			continue
-		}
 		if _, seen := seenFingerprints[event.Fingerprint]; seen {
 			continue
 		}
@@ -191,7 +199,7 @@ func (e *Evaluator) evaluateRule(ctx context.Context, scope Scope, rule AlertRul
 		}
 	}
 	if len(groups) == 0 && !hadExisting && rule.MissingData != "ignore" {
-		changed, err := e.applyMissing(ctx, rule, globalMissingFingerprint, rule.Labels, missingEvidence, now)
+		changed, err := e.applyMissing(ctx, rule, globalMissingFingerprint, selector, missingEvidence, now)
 		if err != nil {
 			return updated, err
 		}
@@ -229,7 +237,11 @@ func (e *Evaluator) applyResult(ctx context.Context, rule AlertRule, fingerprint
 		}
 		state := EventPending
 		action := "event.pending"
-		event = AlertEvent{ID: newControlPlaneID("event", now), Scope: rule.Scope, RuleID: rule.ID, Fingerprint: fingerprint, Labels: sanitizedLabels, Evidence: evidenceMap, State: state, FirstSeen: now, LastSeen: now, LastActor: "system:evaluator"}
+		eventID, idErr := newControlPlaneID("event", e.idSource)
+		if idErr != nil {
+			return false, idErr
+		}
+		event = AlertEvent{ID: eventID, Scope: rule.Scope, RuleID: rule.ID, Fingerprint: fingerprint, Labels: sanitizedLabels, Evidence: evidenceMap, State: state, FirstSeen: now, LastSeen: now, LastActor: "system:evaluator"}
 		if createResolved {
 			event.State = EventResolved
 			event.ResolvedAt = now
@@ -299,13 +311,36 @@ func (e *Evaluator) applyResult(ctx context.Context, rule AlertRule, fingerprint
 func (e *Evaluator) writeTransition(ctx context.Context, event AlertEvent, action string, now time.Time) (bool, error) {
 	details := cloneMap(event.Evidence)
 	details["state"] = string(event.State)
-	record := AuditRecord{ID: newControlPlaneID("audit", now), Scope: event.Scope, Actor: "system:evaluator", Action: action, TargetID: event.ID, OccurredAt: now, Details: details}
-	_, err := e.repository.PutEventAndAudit(ctx, event, record)
+	auditID, err := newControlPlaneID("audit", e.idSource)
+	if err != nil {
+		return false, err
+	}
+	record := AuditRecord{ID: auditID, Scope: event.Scope, Actor: "system:evaluator", Action: action, TargetID: event.ID, OccurredAt: now, Details: details}
+	_, err = e.repository.PutEventAndAudit(ctx, event, record)
 	return err == nil, err
 }
 
-func (e *Evaluator) appendFailureFinding(ctx context.Context, scope Scope, ruleID string, now time.Time) {
-	_ = e.repository.AppendAudit(ctx, AuditRecord{ID: newControlPlaneID("audit", now), Scope: scope, Actor: "system:evaluator", Action: "evaluation.failed", TargetID: ruleID, OccurredAt: now, Details: map[string]string{"finding": "rule evaluation failed"}})
+func (e *Evaluator) appendFailureFinding(ctx context.Context, scope Scope, ruleID string, now time.Time) error {
+	auditID, err := newControlPlaneID("audit", e.idSource)
+	if err != nil {
+		return err
+	}
+	return e.repository.AppendAudit(ctx, AuditRecord{ID: auditID, Scope: scope, Actor: "system:evaluator", Action: "evaluation.failed", TargetID: ruleID, OccurredAt: now, Details: map[string]string{"failure_kind": "rule_evaluation"}})
+}
+
+func (e *Evaluator) listAllRuleEvents(ctx context.Context, scope Scope, ruleID string) ([]AlertEvent, error) {
+	const pageSize = 500
+	all := make([]AlertEvent, 0)
+	for offset := 0; ; offset += pageSize {
+		page, err := e.repository.ListRuleEvents(ctx, scope, ruleID, EventFilter{Limit: pageSize, Offset: offset})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			return all, nil
+		}
+	}
 }
 
 func (e *Evaluator) recordLateness(now time.Time, rules []AlertRule) {
@@ -328,7 +363,9 @@ func (e *Evaluator) finishRun(now time.Time, latency time.Duration, failedRules 
 	e.health.LastRunAt = now
 	e.health.LastRunLatency = latency
 	e.health.FailedRules = failedRules
-	if runErr != nil {
+	if errors.Is(runErr, ErrEvaluationAuditPersistence) {
+		e.health.LastError = ErrEvaluationAuditPersistence.Error()
+	} else if runErr != nil {
 		e.health.LastError = "alert evaluation failed"
 	}
 }
@@ -419,7 +456,7 @@ func cloneMap(source map[string]string) map[string]string {
 }
 
 func canonicalResourceLabels(sample MetricSample) map[string]string {
-	labels := cloneMap(sample.Labels)
+	labels := sanitizeDetails(sample.Labels)
 	labels["agent_id"] = sample.AgentID
 	return labels
 }
@@ -427,10 +464,24 @@ func canonicalResourceLabels(sample MetricSample) map[string]string {
 func filterEvaluationSamples(samples []MetricSample, scope Scope, metric string, selector map[string]string, from, to time.Time) []MetricSample {
 	filtered := make([]MetricSample, 0, len(samples))
 	for _, sample := range samples {
-		if validateMetricSample(sample) != nil || sample.Scope != scope || sample.Name != metric || sample.SampledAt.Before(from) || sample.SampledAt.After(to) || !labelsMatch(sample.Labels, selector) {
+		if validateMetricSample(sample) != nil || sample.Scope != scope || sample.Name != metric || sample.SampledAt.Before(from) || sample.SampledAt.After(to) || !labelsMatch(canonicalResourceLabels(sample), selector) {
 			continue
 		}
 		filtered = append(filtered, sample)
+	}
+	return filtered
+}
+
+func canonicalRuleSelector(selector map[string]string) map[string]string {
+	return sanitizeDetails(selector)
+}
+
+func storageMetricSelector(selector map[string]string) map[string]string {
+	filtered := make(map[string]string, len(selector))
+	for key, value := range selector {
+		if key != "agent_id" && !sensitiveField(key) {
+			filtered[key] = value
+		}
 	}
 	return filtered
 }
