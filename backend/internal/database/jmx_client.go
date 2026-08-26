@@ -1,0 +1,268 @@
+package database
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	defaultJMXTimeout = 30 * time.Second
+	maximumJMXBody    = 4 << 20
+)
+
+type jmxClient struct {
+	resolver SecretResolver
+	config   JMXClientConfig
+}
+
+// NewJMXClient creates a client that resolves credentials and TLS material at
+// request time. It never stores resolved values beyond the request lifetime.
+func NewJMXClient(resolver SecretResolver, config JMXClientConfig) JMXClient {
+	return &jmxClient{resolver: resolver, config: config}
+}
+
+func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist BeanAllowlist) ([]JMXBean, error) {
+	if ctx == nil {
+		return nil, errors.New("JMX fetch context is required")
+	}
+	if isNilInterface(client.resolver) {
+		return nil, errors.New("JMX runtime secret resolver is required")
+	}
+	target, err := validatedJMXURL(endpoint.URL)
+	if err != nil {
+		return nil, err
+	}
+	timeout := client.config.Timeout
+	if timeout == 0 {
+		timeout = defaultJMXTimeout
+	}
+	if timeout < 0 || timeout > maximumOperationTimeout {
+		return nil, errors.New("JMX timeout must be greater than zero and at most one minute")
+	}
+	requestContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	credential, err := resolveJMXCredential(requestContext, client.resolver, client.config.SecretRef)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, err := resolveJMXTLS(requestContext, client.resolver, client.config.TLS, target.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		TLSClientConfig:       tlsConfig,
+	}
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{Transport: transport}
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, errors.New("create JMX request")
+	}
+	request.Header.Set("Accept", "application/json")
+	if len(credential) != 0 {
+		request.Header.Set("Authorization", "Bearer "+string(credential))
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		if requestContext.Err() != nil {
+			return nil, requestContext.Err()
+		}
+		return nil, errors.New("JMX request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("JMX request returned HTTP status %d", response.StatusCode)
+	}
+
+	var payload struct {
+		Beans []map[string]JSONValue `json:"beans"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maximumJMXBody))
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, errors.New("decode JMX response")
+	}
+	return filterJMXBeans(payload.Beans, allowlist), nil
+}
+
+func validatedJMXURL(raw string) (*url.URL, error) {
+	if strings.TrimSpace(raw) != raw || raw == "" {
+		return nil, errors.New("JMX endpoint is required")
+	}
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "/jmx" {
+		return nil, errors.New("JMX endpoint must be an HTTP(S) URL with read-only /jmx path")
+	}
+	return parsed, nil
+}
+
+func resolveJMXCredential(ctx context.Context, resolver SecretResolver, reference string) ([]byte, error) {
+	if reference == "" {
+		return nil, nil
+	}
+	if err := validateSecretRef(reference); err != nil {
+		return nil, errors.New("JMX credential secret reference is invalid")
+	}
+	credential, err := resolver.ResolveSecret(ctx, reference)
+	if err != nil || len(credential) == 0 {
+		return nil, errors.New("resolve JMX credential secret")
+	}
+	return credential, nil
+}
+
+func resolveJMXTLS(ctx context.Context, resolver SecretResolver, config TLSConfig, endpointHost string) (*tls.Config, error) {
+	if err := validateTLSConfig(config); err != nil {
+		return nil, errors.New("JMX TLS configuration is invalid")
+	}
+	if !config.Enabled {
+		if config.ServerName != "" || config.CASecretRef != "" || config.CertificateSecretRef != "" || config.KeySecretRef != "" {
+			return nil, errors.New("JMX TLS settings require TLS to be enabled")
+		}
+		return nil, nil
+	}
+	serverName := config.ServerName
+	if serverName == "" {
+		serverName = endpointHost
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
+	if config.CASecretRef != "" {
+		certificateAuthority, err := resolveRuntimeSecret(ctx, resolver, config.CASecretRef, "CA")
+		if err != nil {
+			return nil, errors.New("resolve JMX TLS CA secret")
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(certificateAuthority) {
+			return nil, errors.New("JMX TLS CA certificate is invalid")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	if config.CertificateSecretRef != "" {
+		certificatePEM, err := resolveRuntimeSecret(ctx, resolver, config.CertificateSecretRef, "client certificate")
+		if err != nil {
+			return nil, errors.New("resolve JMX TLS client certificate secret")
+		}
+		keyPEM, err := resolveRuntimeSecret(ctx, resolver, config.KeySecretRef, "client key")
+		if err != nil {
+			return nil, errors.New("resolve JMX TLS client key secret")
+		}
+		certificate, err := tls.X509KeyPair(certificatePEM, keyPEM)
+		if err != nil {
+			return nil, errors.New("JMX TLS client certificate is invalid")
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
+	}
+	return tlsConfig, nil
+}
+
+func filterJMXBeans(rawBeans []map[string]JSONValue, allowlist BeanAllowlist) []JMXBean {
+	beans := make([]JMXBean, 0, len(rawBeans))
+	for _, rawBean := range rawBeans {
+		name := stringJSONValue(rawBean["name"])
+		properties, allowed := allowlist[name]
+		if !allowed {
+			continue
+		}
+		attributes := make(map[string]JSONValue, len(properties))
+		for property := range properties {
+			if value, found := rawBean[property]; found {
+				attributes[property] = append(JSONValue(nil), value...)
+			}
+		}
+		beans = append(beans, JMXBean{Name: name, Attributes: attributes})
+	}
+	return beans
+}
+
+func stringJSONValue(value JSONValue) string {
+	var text string
+	if json.Unmarshal(value, &text) != nil {
+		return ""
+	}
+	return text
+}
+
+// NormalizeJMXBeans converts only fixed allowlisted JMX values to DBPilot's
+// common metric representation. Unknown beans and malformed fields are
+// reported as statuses instead of being guessed or remapped.
+func NormalizeJMXBeans(beans []JMXBean, allowlist BeanAllowlist, labels JMXMetricLabels) ([]MetricSample, []ParseIssue, error) {
+	if err := validateJMXAllowlist(allowlist); err != nil {
+		return nil, nil, err
+	}
+	timestamp := labels.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now().UTC()
+	}
+	samples := make([]MetricSample, 0)
+	issues := make([]ParseIssue, 0)
+	for _, bean := range beans {
+		properties, allowed := allowlist[bean.Name]
+		if !allowed {
+			issues = append(issues, ParseIssue{Bean: bean.Name, Status: JMXParseUnknownBean})
+			continue
+		}
+		for property, definition := range properties {
+			raw, found := bean.Attributes[property]
+			if !found {
+				issues = append(issues, ParseIssue{Bean: bean.Name, Property: property, Status: JMXParseMissingAttribute})
+				continue
+			}
+			value, ok := numericJMXValue(raw)
+			if !ok {
+				issues = append(issues, ParseIssue{Bean: bean.Name, Property: property, Status: JMXParseInvalidAttribute})
+				continue
+			}
+			multiplier := definition.Multiplier
+			if multiplier == 0 {
+				multiplier = 1
+			}
+			samples = append(samples, MetricSample{Cluster: labels.Cluster, Component: labels.Component, Role: labels.Role, Host: labels.Host, Instance: labels.Instance, MetricName: definition.MetricName, Value: value * multiplier, Unit: definition.Unit, Timestamp: timestamp})
+		}
+	}
+	return samples, issues, nil
+}
+
+func validateJMXAllowlist(allowlist BeanAllowlist) error {
+	for bean, properties := range allowlist {
+		if strings.TrimSpace(bean) != bean || bean == "" {
+			return errors.New("JMX bean allowlist contains an invalid name")
+		}
+		for property, definition := range properties {
+			if strings.TrimSpace(property) != property || property == "" || strings.TrimSpace(definition.MetricName) != definition.MetricName || definition.MetricName == "" || math.IsNaN(definition.Multiplier) || math.IsInf(definition.Multiplier, 0) {
+				return errors.New("JMX property allowlist contains an invalid mapping")
+			}
+		}
+	}
+	return nil
+}
+
+func numericJMXValue(raw JSONValue) (float64, bool) {
+	var number float64
+	if err := json.Unmarshal(raw, &number); err == nil && !math.IsNaN(number) && !math.IsInf(number, 0) {
+		return number, true
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return 0, false
+	}
+	number, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, false
+	}
+	return number, true
+}
