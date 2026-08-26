@@ -29,14 +29,17 @@ func TestJMXClientFetchDecodesOnlyAllowlistedBeanProperties(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Fetch() error = %v", err)
 	}
-	if len(beans) != 1 || beans[0].Name != "Hadoop:service=HBase,name=Master" {
-		t.Fatalf("Fetch() beans = %#v, want one Master bean", beans)
+	if len(beans) != 2 || beans[0].Name != "Hadoop:service=HBase,name=Master" {
+		t.Fatalf("Fetch() beans = %#v, want Master bean and preserved unknown bean", beans)
 	}
 	if got := string(beans[0].Attributes["numRegions"]); got != "7" {
 		t.Fatalf("Fetch() numRegions = %s, want 7", got)
 	}
 	if _, found := beans[0].Attributes["unsafe"]; found {
 		t.Fatal("Fetch() retained a non-allowlisted property")
+	}
+	if beans[1].Name != "Hadoop:service=HBase,name=Other" || len(beans[1].Attributes) != 0 {
+		t.Fatalf("Fetch() unknown bean = %#v, want name only", beans[1])
 	}
 }
 
@@ -113,5 +116,87 @@ func TestJMXClientFetchRedactsCredentialsAndResponseBodies(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "top-secret") || strings.Contains(err.Error(), "password=") || strings.Contains(err.Error(), server.URL) {
 		t.Fatalf("Fetch() error = %q, leaked protected detail", err)
+	}
+}
+
+func TestJMXClientFetchRejectsRedirectBeforeFollowingIt(t *testing.T) {
+	redirectTargetCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/jmx" {
+			http.Redirect(writer, request, "/admin", http.StatusFound)
+			return
+		}
+		redirectTargetCalled = true
+		if request.Header.Get("Authorization") != "" {
+			t.Fatal("redirect target received credentials")
+		}
+	}))
+	defer server.Close()
+
+	client := NewJMXClient(StaticSecretResolver{"secret://runtime/jmx": []byte("top-secret")}, JMXClientConfig{SecretRef: "secret://runtime/jmx", Timeout: time.Second})
+	_, err := client.Fetch(context.Background(), Endpoint{URL: server.URL + "/jmx"}, BeanAllowlist{})
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("Fetch() error = %v, want redirect rejection", err)
+	}
+	if redirectTargetCalled {
+		t.Fatal("Fetch() followed a redirect")
+	}
+}
+
+func TestJMXClientFetchRetriesTransientHTTPFailures(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts++
+		if attempts < 3 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"beans":[{"name":"Hadoop:service=HBase,name=Master","numRegions":7}]}`))
+	}))
+	defer server.Close()
+
+	client := NewJMXClient(StaticSecretResolver{"secret://runtime/jmx": []byte("top-secret")}, JMXClientConfig{SecretRef: "secret://runtime/jmx", Timeout: time.Second})
+	beans, err := client.Fetch(context.Background(), Endpoint{URL: server.URL + "/jmx"}, BeanAllowlist{"Hadoop:service=HBase,name=Master": {"numRegions": {MetricName: "dbpilot.hbase.regions"}}})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if attempts != 3 || len(beans) != 1 {
+		t.Fatalf("Fetch() attempts, beans = %d, %#v, want 3 attempts and one bean", attempts, beans)
+	}
+}
+
+func TestJMXClientFetchRejectsHTTPEndpointWhenTLSIsEnabledBeforeResolvingCredentials(t *testing.T) {
+	resolver := failingJMXResolver{t: t}
+	client := NewJMXClient(resolver, JMXClientConfig{SecretRef: "secret://runtime/jmx", TLS: TLSConfig{Enabled: true}, Timeout: time.Second})
+	_, err := client.Fetch(context.Background(), Endpoint{URL: "http://jmx.example.test:16010/jmx"}, BeanAllowlist{})
+	if err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("Fetch() error = %v, want TLS HTTP endpoint rejection", err)
+	}
+}
+
+type failingJMXResolver struct{ t *testing.T }
+
+func (resolver failingJMXResolver) ResolveSecret(context.Context, string) ([]byte, error) {
+	resolver.t.Fatal("Fetch() resolved credentials for a TLS-enabled HTTP endpoint")
+	return nil, nil
+}
+
+func TestJMXClientFetchPreservesUnknownBeanForNormalizationStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte(`{"beans":[{"name":"Hadoop:service=HBase,name=Unknown","count":2}]}`))
+	}))
+	defer server.Close()
+
+	client := NewJMXClient(StaticSecretResolver{"secret://runtime/jmx": []byte("top-secret")}, JMXClientConfig{SecretRef: "secret://runtime/jmx", Timeout: time.Second})
+	beans, err := client.Fetch(context.Background(), Endpoint{URL: server.URL + "/jmx"}, BeanAllowlist{})
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	_, issues, err := NormalizeJMXBeans(beans, BeanAllowlist{}, JMXMetricLabels{})
+	if err != nil {
+		t.Fatalf("NormalizeJMXBeans() error = %v", err)
+	}
+	if len(issues) != 1 || issues[0].Bean != "Hadoop:service=HBase,name=Unknown" || issues[0].Status != JMXParseUnknownBean {
+		t.Fatalf("NormalizeJMXBeans() issues = %#v, want unknown bean status", issues)
 	}
 }

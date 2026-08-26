@@ -18,9 +18,13 @@ import (
 )
 
 const (
-	defaultJMXTimeout = 30 * time.Second
-	maximumJMXBody    = 4 << 20
+	defaultJMXTimeout  = 30 * time.Second
+	maximumJMXBody     = 4 << 20
+	maximumJMXAttempts = 3
+	jmxRetryBaseDelay  = 10 * time.Millisecond
 )
+
+var errJMXRedirect = errors.New("JMX redirects are not permitted")
 
 type jmxClient struct {
 	resolver SecretResolver
@@ -44,6 +48,9 @@ func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist
 	if err != nil {
 		return nil, err
 	}
+	if err := validateJMXTLSURL(target, client.config.TLS); err != nil {
+		return nil, err
+	}
 	timeout := client.config.Timeout
 	if timeout == 0 {
 		timeout = defaultJMXTimeout
@@ -54,11 +61,11 @@ func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist
 	requestContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	credential, err := resolveJMXCredential(requestContext, client.resolver, client.config.SecretRef)
+	tlsConfig, err := resolveJMXTLS(requestContext, client.resolver, client.config.TLS, target.Hostname())
 	if err != nil {
 		return nil, err
 	}
-	tlsConfig, err := resolveJMXTLS(requestContext, client.resolver, client.config.TLS, target.Hostname())
+	credential, err := resolveJMXCredential(requestContext, client.resolver, client.config.SecretRef)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +77,12 @@ func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist
 		TLSClientConfig:       tlsConfig,
 	}
 	defer transport.CloseIdleConnections()
-	httpClient := &http.Client{Transport: transport}
+	httpClient := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errJMXRedirect
+		},
+	}
 	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, errors.New("create JMX request")
@@ -79,26 +91,50 @@ func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist
 	if len(credential) != 0 {
 		request.Header.Set("Authorization", "Bearer "+string(credential))
 	}
-	response, err := httpClient.Do(request)
-	if err != nil {
-		if requestContext.Err() != nil {
-			return nil, requestContext.Err()
+	for attempt := 0; attempt < maximumJMXAttempts; attempt++ {
+		response, requestErr := httpClient.Do(request)
+		if requestErr != nil {
+			if response != nil {
+				response.Body.Close()
+			}
+			if errors.Is(requestErr, errJMXRedirect) {
+				return nil, errJMXRedirect
+			}
+			if requestContext.Err() != nil {
+				return nil, requestContext.Err()
+			}
+			if attempt+1 < maximumJMXAttempts && waitForJMXRetry(requestContext, attempt) == nil {
+				continue
+			}
+			if requestContext.Err() != nil {
+				return nil, requestContext.Err()
+			}
+			return nil, errors.New("JMX request failed")
 		}
-		return nil, errors.New("JMX request failed")
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("JMX request returned HTTP status %d", response.StatusCode)
-	}
+		if isTransientJMXStatus(response.StatusCode) && attempt+1 < maximumJMXAttempts {
+			response.Body.Close()
+			if err := waitForJMXRetry(requestContext, attempt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			response.Body.Close()
+			return nil, fmt.Errorf("JMX request returned HTTP status %d", response.StatusCode)
+		}
 
-	var payload struct {
-		Beans []map[string]JSONValue `json:"beans"`
+		var payload struct {
+			Beans []map[string]JSONValue `json:"beans"`
+		}
+		decoder := json.NewDecoder(io.LimitReader(response.Body, maximumJMXBody))
+		err := decoder.Decode(&payload)
+		response.Body.Close()
+		if err != nil {
+			return nil, errors.New("decode JMX response")
+		}
+		return filterJMXBeans(payload.Beans, allowlist), nil
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maximumJMXBody))
-	if err := decoder.Decode(&payload); err != nil {
-		return nil, errors.New("decode JMX response")
-	}
-	return filterJMXBeans(payload.Beans, allowlist), nil
+	return nil, errors.New("JMX request failed")
 }
 
 func validatedJMXURL(raw string) (*url.URL, error) {
@@ -110,6 +146,32 @@ func validatedJMXURL(raw string) (*url.URL, error) {
 		return nil, errors.New("JMX endpoint must be an HTTP(S) URL with read-only /jmx path")
 	}
 	return parsed, nil
+}
+
+func validateJMXTLSURL(target *url.URL, config TLSConfig) error {
+	if err := validateTLSConfig(config); err != nil {
+		return errors.New("JMX TLS configuration is invalid")
+	}
+	if config.Enabled && target.Scheme != "https" {
+		return errors.New("JMX TLS requires an HTTPS endpoint")
+	}
+	return nil
+}
+
+func isTransientJMXStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func waitForJMXRetry(ctx context.Context, attempt int) error {
+	delay := jmxRetryBaseDelay << attempt
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func resolveJMXCredential(ctx context.Context, resolver SecretResolver, reference string) ([]byte, error) {
@@ -176,6 +238,7 @@ func filterJMXBeans(rawBeans []map[string]JSONValue, allowlist BeanAllowlist) []
 		name := stringJSONValue(rawBean["name"])
 		properties, allowed := allowlist[name]
 		if !allowed {
+			beans = append(beans, JMXBean{Name: name, Attributes: map[string]JSONValue{}})
 			continue
 		}
 		attributes := make(map[string]JSONValue, len(properties))
