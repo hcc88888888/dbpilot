@@ -27,9 +27,7 @@ func TestRegisterHBaseAdapterCollectsMasterAndRegionServerFixtures(t *testing.T)
 		t.Fatal("registered HBase adapter was not found")
 	}
 	samples, err := adapter.Collect(context.Background(), MetricRequest{})
-	if err != nil {
-		t.Fatalf("Collect() error = %v", err)
-	}
+	allowHBaseParseIssues(t, err)
 	assertHBaseSample(t, samples, "hbase.master.live_region_servers", "master", 3)
 	assertHBaseSample(t, samples, "hbase.regionserver.regions", "regionserver", 12)
 	assertHBaseSample(t, samples, "hbase.block_cache.hits", "regionserver", 42)
@@ -50,9 +48,7 @@ func TestHBaseAdapterSupportsVersionAliasesAndMissingOptionalBeans(t *testing.T)
 		t.Fatalf("NewHBaseAdapter() error = %v", err)
 	}
 	samples, err := adapter.Collect(context.Background(), MetricRequest{})
-	if err != nil {
-		t.Fatalf("Collect() error = %v", err)
-	}
+	allowHBaseParseIssues(t, err)
 	assertHBaseSample(t, samples, "hbase.master.live_region_servers", "master", 4)
 	assertHBaseSample(t, samples, "hbase.regionserver.regions", "regionserver", 15)
 	assertHBaseSample(t, samples, "hbase.memstore.size", "regionserver", 11)
@@ -88,6 +84,70 @@ func TestHBaseAdapterRejectsUnknownMetricIDs(t *testing.T) {
 	}
 }
 
+func TestHBaseAdapterReturnsParseIssuesForMalformedMissingAndUnknownMetrics(t *testing.T) {
+	definition := hbaseTestDefinition()
+	client := &fixtureJMXClient{fixtures: map[string][]JMXBean{
+		definition.Endpoints[0].URL: {
+			{Name: "Hadoop:service=HBase,name=Master,sub=Server", Attributes: map[string]JSONValue{
+				"numRegionServers": JSONValue(`"not-a-number"`),
+			}},
+			{Name: "Hadoop:service=HBase,name=Unknown", Attributes: map[string]JSONValue{"count": JSONValue(`2`)}},
+		},
+	}}
+	adapter, err := NewHBaseAdapter(definition, client)
+	if err != nil {
+		t.Fatalf("NewHBaseAdapter() error = %v", err)
+	}
+	_, err = adapter.Collect(context.Background(), MetricRequest{})
+	var parseIssues *HBaseParseIssues
+	if !errors.As(err, &parseIssues) {
+		t.Fatalf("Collect() error = %v, want parse issue status", err)
+	}
+	if !hasParseIssue(parseIssues.Issues, "Hadoop:service=HBase,name=Master,sub=Server", "numRegionServers", JMXParseInvalidAttribute) {
+		t.Fatalf("parse issues = %#v, want malformed Master metric", parseIssues.Issues)
+	}
+	if !hasParseIssue(parseIssues.Issues, "Hadoop:service=HBase,name=Master,sub=Server", "numDeadRegionServers", JMXParseMissingAttribute) {
+		t.Fatalf("parse issues = %#v, want missing Master metric", parseIssues.Issues)
+	}
+	if !hasParseIssue(parseIssues.Issues, "Hadoop:service=HBase,name=Unknown", "", JMXParseUnknownBean) {
+		t.Fatalf("parse issues = %#v, want unknown bean", parseIssues.Issues)
+	}
+}
+
+func TestHBaseAdapterCopiesDefinitionEndpointsAtConstruction(t *testing.T) {
+	definition := hbaseTestDefinition()
+	originalEndpoint := definition.Endpoints[0]
+	client := &fixtureJMXClient{fixtures: map[string][]JMXBean{
+		originalEndpoint.URL: decodeHBaseFixture(t, `{"beans":[{"name":"Hadoop:service=HBase,name=Master,sub=Server","numRegionServers":3}]}`),
+	}}
+	adapter, err := NewHBaseAdapter(definition, client)
+	if err != nil {
+		t.Fatalf("NewHBaseAdapter() error = %v", err)
+	}
+	definition.Endpoints[0] = Endpoint{URL: "https://changed.example.test:16010/jmx", Role: "regionserver"}
+	samples, err := adapter.Collect(context.Background(), MetricRequest{})
+	allowHBaseParseIssues(t, err)
+	assertHBaseSample(t, samples, "hbase.master.live_region_servers", "master", 3)
+}
+
+func TestHBaseAdapterRejectsInvalidRoleAtConstructionAndCollection(t *testing.T) {
+	invalidDefinition := hbaseTestDefinition()
+	invalidDefinition.Endpoints[0].Role = "worker"
+	if _, err := NewHBaseAdapter(invalidDefinition, &fixtureJMXClient{}); err == nil {
+		t.Fatal("NewHBaseAdapter() error = nil, want invalid role rejected")
+	}
+
+	definition := hbaseTestDefinition()
+	adapter, err := NewHBaseAdapter(definition, &fixtureJMXClient{})
+	if err != nil {
+		t.Fatalf("NewHBaseAdapter() error = %v", err)
+	}
+	adapter.(*hbaseAdapter).definition.Endpoints[0].Role = "worker"
+	if _, err := adapter.Collect(context.Background(), MetricRequest{}); err == nil {
+		t.Fatal("Collect() error = nil, want defensive role revalidation")
+	}
+}
+
 func TestNewHBaseAdapterWithRuntimeResolvesCredentialAndTLSReferences(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if got, want := request.Header.Get("Authorization"), "Bearer runtime-token"; got != want {
@@ -112,9 +172,7 @@ func TestNewHBaseAdapterWithRuntimeResolvesCredentialAndTLSReferences(t *testing
 		t.Fatalf("NewHBaseAdapterWithRuntime() error = %v", err)
 	}
 	samples, err := adapter.Collect(context.Background(), MetricRequest{})
-	if err != nil {
-		t.Fatalf("Collect() error = %v", err)
-	}
+	allowHBaseParseIssues(t, err)
 	assertHBaseSample(t, samples, "hbase.master.live_region_servers", "master", 2)
 }
 
@@ -158,6 +216,26 @@ func assertHBaseSample(t *testing.T, samples []MetricSample, name, role string, 
 		}
 	}
 	t.Fatalf("samples = %#v, want %s/%s=%v", samples, name, role, value)
+}
+
+func hasParseIssue(issues []ParseIssue, bean, property string, status JMXParseStatus) bool {
+	for _, issue := range issues {
+		if issue.Bean == bean && issue.Property == property && issue.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func allowHBaseParseIssues(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		return
+	}
+	var parseIssues *HBaseParseIssues
+	if !errors.As(err, &parseIssues) {
+		t.Fatalf("Collect() error = %v, want only parse issue status", err)
+	}
 }
 
 type fixtureJMXClient struct {

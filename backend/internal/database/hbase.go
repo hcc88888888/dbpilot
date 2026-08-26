@@ -33,6 +33,16 @@ func (errors *HBaseEndpointErrors) Error() string {
 	return fmt.Sprintf("HBase JMX collection failed for %d endpoints", len(errors.Failures))
 }
 
+// HBaseParseIssues carries fixed-allowlist JMX parse statuses to callers.
+// It deliberately excludes raw JMX values, credentials, and endpoint URLs.
+type HBaseParseIssues struct {
+	Issues []ParseIssue
+}
+
+func (issues *HBaseParseIssues) Error() string {
+	return fmt.Sprintf("HBase JMX collection skipped %d malformed or unavailable metrics", len(issues.Issues))
+}
+
 type hbaseAdapter struct {
 	definition   ComponentDefinition
 	client       JMXClient
@@ -57,6 +67,7 @@ func NewHBaseAdapter(definition ComponentDefinition, client JMXClient) (Componen
 			return nil, err
 		}
 	}
+	definition.Endpoints = append([]Endpoint(nil), definition.Endpoints...)
 	return &hbaseAdapter{
 		definition: definition,
 		client:     client,
@@ -142,15 +153,19 @@ func (adapter *hbaseAdapter) Collect(ctx context.Context, request MetricRequest)
 	}
 	samples := make([]MetricSample, 0)
 	failures := make([]HBaseEndpointFailure, 0)
+	issues := make([]ParseIssue, 0)
 	for _, endpoint := range adapter.definition.Endpoints {
-		role, _ := normalizedHBaseRole(endpoint.Role)
+		role, roleErr := normalizedHBaseRole(endpoint.Role)
+		if roleErr != nil {
+			return samples, roleErr
+		}
 		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, hbaseBeanAllowlist(role))
 		if fetchErr != nil {
 			failures = append(failures, HBaseEndpointFailure{Endpoint: Endpoint{Role: role}})
 			continue
 		}
 		host := hbaseEndpointHost(endpoint.URL)
-		endpointSamples, _, normalizeErr := NormalizeJMXBeans(beans, hbaseBeanAllowlist(role), JMXMetricLabels{
+		endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans(beans, hbaseBeanAllowlist(role), JMXMetricLabels{
 			Cluster:   adapter.definition.ID,
 			Component: string(HBaseComponent),
 			Role:      role,
@@ -160,14 +175,22 @@ func (adapter *hbaseAdapter) Collect(ctx context.Context, request MetricRequest)
 		if normalizeErr != nil {
 			return samples, errors.New("normalize HBase JMX metrics")
 		}
+		issues = append(issues, endpointIssues...)
 		for _, sample := range endpointSamples {
 			if len(requested) == 0 || requested[sample.MetricName] {
 				samples = append(samples, sample)
 			}
 		}
 	}
+	statuses := make([]error, 0, 2)
 	if len(failures) != 0 {
-		return samples, &HBaseEndpointErrors{Failures: failures}
+		statuses = append(statuses, &HBaseEndpointErrors{Failures: failures})
+	}
+	if len(issues) != 0 {
+		statuses = append(statuses, &HBaseParseIssues{Issues: issues})
+	}
+	if len(statuses) != 0 {
+		return samples, errors.Join(statuses...)
 	}
 	return samples, nil
 }
