@@ -11,9 +11,11 @@ import (
 	"github.com/lib/pq"
 )
 
-var ErrNotFound = errors.New("alert record not found")
+var (
+	ErrNotFound = errors.New("alert record not found")
+)
 
-const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ms, for_duration_ms, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
+const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
 const eventColumnsSQL = "id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor"
 
 type PostgresRepository struct {
@@ -32,8 +34,8 @@ func (r *PostgresRepository) CreateRule(ctx context.Context, rule AlertRule) (Al
 	if err != nil {
 		return AlertRule{}, err
 	}
-	query := "INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ms, for_duration_ms, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING " + ruleColumnsSQL
-	return scanRule(r.db.QueryRowContext(ctx, query, rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Milliseconds(), rule.For.Milliseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled))
+	query := "INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING " + ruleColumnsSQL
+	return scanRule(r.db.QueryRowContext(ctx, query, rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled))
 }
 
 func (r *PostgresRepository) UpdateRule(ctx context.Context, rule AlertRule) (AlertRule, error) {
@@ -44,8 +46,8 @@ func (r *PostgresRepository) UpdateRule(ctx context.Context, rule AlertRule) (Al
 	if err != nil {
 		return AlertRule{}, err
 	}
-	query := "UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ms = $6, for_duration_ms = $7, missing_data = $8, severity = $9, notification_policy_ids = $10, labels = $11, enabled = $12, updated_at = NOW() WHERE tenant_id = $13 AND project_id = $14 AND id = $15 RETURNING " + ruleColumnsSQL
-	rule, err = scanRule(r.db.QueryRowContext(ctx, query, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Milliseconds(), rule.For.Milliseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled, rule.Scope.TenantID, rule.Scope.ProjectID, rule.ID))
+	query := "UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ns = $6, for_duration_ns = $7, missing_data = $8, severity = $9, notification_policy_ids = $10, labels = $11, enabled = $12, updated_at = NOW() WHERE tenant_id = $13 AND project_id = $14 AND id = $15 RETURNING " + ruleColumnsSQL
+	rule, err = scanRule(r.db.QueryRowContext(ctx, query, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled, rule.Scope.TenantID, rule.Scope.ProjectID, rule.ID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertRule{}, ErrNotFound
 	}
@@ -87,7 +89,7 @@ func (r *PostgresRepository) GetRule(ctx context.Context, scope Scope, id string
 }
 
 func (r *PostgresRepository) PutEvent(ctx context.Context, event AlertEvent) (AlertEvent, error) {
-	if err := event.Scope.Validate(); err != nil {
+	if err := event.Validate(); err != nil {
 		return AlertEvent{}, err
 	}
 	labels, err := marshalMap(event.Labels)
@@ -174,12 +176,12 @@ func scanRule(scanner rowScanner) (AlertRule, error) {
 	var rule AlertRule
 	var policyIDs pq.StringArray
 	var labels []byte
-	var evaluationEveryMS, forDurationMS int64
-	if err := scanner.Scan(&rule.ID, &rule.Scope.TenantID, &rule.Scope.ProjectID, &rule.Name, &rule.Metric, &rule.Aggregation, &rule.Operator, &rule.Threshold, &evaluationEveryMS, &forDurationMS, &rule.MissingData, &rule.Severity, &policyIDs, &labels, &rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+	var evaluationEveryNS, forDurationNS int64
+	if err := scanner.Scan(&rule.ID, &rule.Scope.TenantID, &rule.Scope.ProjectID, &rule.Name, &rule.Metric, &rule.Aggregation, &rule.Operator, &rule.Threshold, &evaluationEveryNS, &forDurationNS, &rule.MissingData, &rule.Severity, &policyIDs, &labels, &rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
 		return AlertRule{}, err
 	}
-	rule.EvaluationEvery = durationFromMilliseconds(evaluationEveryMS)
-	rule.For = durationFromMilliseconds(forDurationMS)
+	rule.EvaluationEvery = durationFromNanoseconds(evaluationEveryNS)
+	rule.For = durationFromNanoseconds(forDurationNS)
 	rule.NotificationPolicyIDs = []string(policyIDs)
 	if err := unmarshalMap(labels, &rule.Labels); err != nil {
 		return AlertRule{}, err
@@ -234,8 +236,8 @@ func unmarshalMap(encoded []byte, target *map[string]string) error {
 	return nil
 }
 
-func durationFromMilliseconds(value int64) time.Duration {
-	return time.Duration(value) * time.Millisecond
+func durationFromNanoseconds(value int64) time.Duration {
+	return time.Duration(value)
 }
 
 func nullableTimestamp(value time.Time) any {

@@ -9,8 +9,8 @@ CREATE TABLE alert_rules (
     aggregation TEXT NOT NULL,
     operator TEXT NOT NULL,
     threshold DOUBLE PRECISION NOT NULL,
-    evaluation_every_ms BIGINT NOT NULL,
-    for_duration_ms BIGINT NOT NULL,
+    evaluation_every_ns BIGINT NOT NULL CHECK (evaluation_every_ns > 0),
+    for_duration_ns BIGINT NOT NULL CHECK (for_duration_ns > 0),
     missing_data TEXT NOT NULL,
     severity TEXT NOT NULL,
     notification_policy_ids TEXT[] NOT NULL DEFAULT '{}',
@@ -30,7 +30,7 @@ CREATE TABLE alert_events (
     fingerprint TEXT NOT NULL,
     labels JSONB NOT NULL DEFAULT '{}'::jsonb,
     evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-    state TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'firing', 'acknowledged', 'resolved')),
     first_seen TIMESTAMPTZ NOT NULL,
     last_seen TIMESTAMPTZ NOT NULL,
     firing_at TIMESTAMPTZ,
@@ -113,10 +113,11 @@ CREATE TABLE metric_samples (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     metric TEXT NOT NULL,
+    series_fingerprint TEXT NOT NULL,
     labels JSONB NOT NULL DEFAULT '{}'::jsonb,
     value DOUBLE PRECISION NOT NULL,
     sampled_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (tenant_id, project_id, metric, sampled_at)
+    PRIMARY KEY (tenant_id, project_id, metric, series_fingerprint, sampled_at)
 ) PARTITION BY RANGE (sampled_at);
 
 DO $$

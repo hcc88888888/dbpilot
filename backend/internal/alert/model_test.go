@@ -53,8 +53,9 @@ func TestFingerprintIgnoresLabelOrder(t *testing.T) {
 
 func TestPrincipalAllowsOnlyAssignedProjectsUnlessPlatformAdmin(t *testing.T) {
 	projectScope := alert.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
-	require.True(t, (alert.Principal{Subject: "user", Projects: map[string]struct{}{"project-a": {}}}).Allows(projectScope))
-	require.False(t, (alert.Principal{Subject: "user", Projects: map[string]struct{}{"project-b": {}}}).Allows(projectScope))
+	require.True(t, (alert.Principal{Subject: "user", Projects: map[string]struct{}{projectScope.Key(): {}}}).Allows(projectScope))
+	require.False(t, (alert.Principal{Subject: "user", Projects: map[string]struct{}{alert.Scope{TenantID: "tenant-a", ProjectID: "project-b"}.Key(): {}}}).Allows(projectScope))
+	require.False(t, (alert.Principal{Subject: "user", Projects: map[string]struct{}{projectScope.Key(): {}}}).Allows(alert.Scope{TenantID: "tenant-b", ProjectID: "project-a"}))
 	require.True(t, (alert.Principal{Subject: "admin", PlatformAdmin: true}).Allows(projectScope))
 }
 
@@ -73,4 +74,33 @@ func TestEventTransitionPreservesFirstSeenAndRecordsStateTimes(t *testing.T) {
 
 	_, err = transitioned.Transition(alert.EventPending, firedAt.Add(time.Minute), "operator")
 	require.Error(t, err)
+}
+
+func TestEventTransitionRejectsTimeBeforeExistingLifecycleFacts(t *testing.T) {
+	firstSeen := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	event := alert.AlertEvent{State: alert.EventPending, FirstSeen: firstSeen, LastSeen: firstSeen.Add(time.Minute)}
+
+	_, err := event.Transition(alert.EventFiring, firstSeen.Add(-time.Nanosecond), "operator")
+	require.Error(t, err)
+	_, err = event.Transition(alert.EventFiring, firstSeen.Add(30*time.Second), "operator")
+	require.Error(t, err)
+}
+
+func TestEventValidateRejectsUnknownStateAndInconsistentTimestamps(t *testing.T) {
+	firstSeen := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	event := alert.AlertEvent{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, RuleID: "rule-1", Fingerprint: "fp", State: alert.EventState("unknown"), FirstSeen: firstSeen, LastSeen: firstSeen}
+	require.Error(t, event.Validate())
+
+	event.State = alert.EventFiring
+	require.Error(t, event.Validate())
+	event.FiringAt = firstSeen.Add(time.Minute)
+	event.LastSeen = firstSeen
+	require.Error(t, event.Validate())
+}
+
+func TestSeriesFingerprintDistinguishesLabelSeries(t *testing.T) {
+	require.NotEqual(t,
+		alert.SeriesFingerprint(map[string]string{"host": "db-a"}),
+		alert.SeriesFingerprint(map[string]string{"host": "db-b"}),
+	)
 }

@@ -15,6 +15,7 @@ import (
 var (
 	ErrInvalidScope               = errors.New("alert scope requires tenant and project")
 	ErrInvalidRule                = errors.New("invalid alert rule")
+	ErrInvalidEvent               = errors.New("invalid alert event")
 	ErrInvalidEventTransition     = errors.New("invalid alert event transition")
 	ErrInvalidEventTransitionTime = errors.New("event transition time is required")
 )
@@ -32,12 +33,20 @@ func (s Scope) Validate() error {
 	return nil
 }
 
+// Key is an unambiguous identity for project assignments. It deliberately
+// includes the tenant so a repeated project ID cannot cross an authorization
+// boundary.
+func (s Scope) Key() string {
+	return canonicalParts(s.TenantID, s.ProjectID)
+}
+
 // Principal is the authenticated caller's project assignment. Agent payloads
 // never populate this value; production inventory resolution owns assignment.
 type Principal struct {
 	Subject       string
 	PlatformAdmin bool
-	Projects      map[string]struct{}
+	// Projects contains Scope.Key values resolved by production inventory.
+	Projects map[string]struct{}
 }
 
 func (p Principal) Allows(scope Scope) bool {
@@ -47,7 +56,7 @@ func (p Principal) Allows(scope Scope) bool {
 	if p.PlatformAdmin {
 		return true
 	}
-	_, allowed := p.Projects[scope.ProjectID]
+	_, allowed := p.Projects[scope.Key()]
 	return allowed
 }
 
@@ -164,10 +173,57 @@ type AlertEvent struct {
 	LastActor      string            `json:"last_actor,omitempty"`
 }
 
+func (e AlertEvent) Validate() error {
+	if e.Scope.Validate() != nil || strings.TrimSpace(e.RuleID) == "" || strings.TrimSpace(e.Fingerprint) == "" || !allowedEventState(e.State) {
+		return ErrInvalidEvent
+	}
+	if e.FirstSeen.IsZero() || e.LastSeen.IsZero() || e.LastSeen.Before(e.FirstSeen) {
+		return ErrInvalidEvent
+	}
+	if !validEventTimestamp(e.FiringAt, e.FirstSeen, e.LastSeen) || !validEventTimestamp(e.AcknowledgedAt, e.FirstSeen, e.LastSeen) || !validEventTimestamp(e.ResolvedAt, e.FirstSeen, e.LastSeen) {
+		return ErrInvalidEvent
+	}
+	switch e.State {
+	case EventPending:
+		if !e.FiringAt.IsZero() || !e.AcknowledgedAt.IsZero() || !e.ResolvedAt.IsZero() {
+			return ErrInvalidEvent
+		}
+	case EventFiring:
+		if e.FiringAt.IsZero() || !e.AcknowledgedAt.IsZero() || !e.ResolvedAt.IsZero() {
+			return ErrInvalidEvent
+		}
+	case EventAcknowledged:
+		if e.FiringAt.IsZero() || e.AcknowledgedAt.IsZero() || e.AcknowledgedAt.Before(e.FiringAt) || !e.ResolvedAt.IsZero() {
+			return ErrInvalidEvent
+		}
+	case EventResolved:
+		if e.ResolvedAt.IsZero() || (!e.FiringAt.IsZero() && e.ResolvedAt.Before(e.FiringAt)) || (!e.AcknowledgedAt.IsZero() && (e.FiringAt.IsZero() || e.ResolvedAt.Before(e.AcknowledgedAt))) {
+			return ErrInvalidEvent
+		}
+	}
+	return nil
+}
+
+func allowedEventState(state EventState) bool {
+	switch state {
+	case EventPending, EventFiring, EventAcknowledged, EventResolved:
+		return true
+	default:
+		return false
+	}
+}
+
+func validEventTimestamp(value, firstSeen, lastSeen time.Time) bool {
+	return value.IsZero() || (!value.Before(firstSeen) && !value.After(lastSeen))
+}
+
 // Transition returns an event in the requested state without mutating the
 // source event. FirstSeen is immutable once recorded.
 func (e AlertEvent) Transition(next EventState, at time.Time, actor string) (AlertEvent, error) {
 	if at.IsZero() {
+		return AlertEvent{}, ErrInvalidEventTransitionTime
+	}
+	if (!e.FirstSeen.IsZero() && at.Before(e.FirstSeen)) || (!e.LastSeen.IsZero() && at.Before(e.LastSeen)) {
 		return AlertEvent{}, ErrInvalidEventTransitionTime
 	}
 	if !permittedTransition(e.State, next) {
@@ -206,27 +262,41 @@ func permittedTransition(current, next EventState) bool {
 // EventFingerprint is stable across equivalent label maps and includes the
 // tenant/project scope so identical source labels cannot cross tenant bounds.
 func EventFingerprint(scope Scope, ruleID string, labels map[string]string) string {
+	return fingerprintParts(scope.TenantID, scope.ProjectID, ruleID, canonicalLabels(labels))
+}
+
+// SeriesFingerprint identifies a normalized metric label series independently
+// of PostgreSQL storage and map iteration order.
+func SeriesFingerprint(labels map[string]string) string {
+	return fingerprintParts(canonicalLabels(labels))
+}
+
+func fingerprintParts(parts ...string) string {
+	digest := sha256.Sum256([]byte(canonicalParts(parts...)))
+	return hex.EncodeToString(digest[:])
+}
+
+func canonicalLabels(labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for key := range labels {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 
-	var canonical strings.Builder
-	appendCanonicalPart(&canonical, scope.TenantID)
-	appendCanonicalPart(&canonical, scope.ProjectID)
-	appendCanonicalPart(&canonical, ruleID)
+	parts := make([]string, 0, len(labels)*2)
 	for _, key := range keys {
-		appendCanonicalPart(&canonical, key)
-		appendCanonicalPart(&canonical, labels[key])
+		parts = append(parts, key, labels[key])
 	}
-	digest := sha256.Sum256([]byte(canonical.String()))
-	return hex.EncodeToString(digest[:])
+	return canonicalParts(parts...)
 }
 
-func appendCanonicalPart(builder *strings.Builder, value string) {
-	fmt.Fprintf(builder, "%d:", len(value))
-	builder.WriteString(value)
+func canonicalParts(parts ...string) string {
+	var canonical strings.Builder
+	for _, part := range parts {
+		fmt.Fprintf(&canonical, "%d:", len(part))
+		canonical.WriteString(part)
+	}
+	return canonical.String()
 }
 
 // NotificationPolicy stores routing configuration but never a secret value.
