@@ -1,6 +1,9 @@
 package alert
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Repository is the tenant-scoped persistence boundary for the alert control
 // plane. Implementations must never infer a scope from an Agent payload.
@@ -15,4 +18,17 @@ type Repository interface {
 	ListEvents(context.Context, Scope, EventFilter) ([]AlertEvent, error)
 	ListRuleEvents(context.Context, Scope, string, EventFilter) ([]AlertEvent, error)
 	AppendAudit(context.Context, AuditRecord) error
+}
+
+// NotificationRepository is the tenant-scoped persistence boundary for
+// routing, silence matching, idempotent delivery reservation, and retries. It
+// stays separate from Repository so event-only stores need not implement
+// notification delivery.
+type NotificationRepository interface {
+	GetRule(context.Context, Scope, string) (AlertRule, error)
+	ListNotificationRoutes(context.Context, Scope, string) ([]NotificationRoute, error)
+	ListActiveSilences(context.Context, Scope, time.Time) ([]Silence, error)
+	ReserveNotificationDelivery(context.Context, NotificationDelivery, *AuditRecord) (bool, error)
+	UpdateNotificationDelivery(context.Context, NotificationDelivery, AuditRecord) error
+	ListDueNotificationDeliveries(context.Context, time.Time) ([]NotificationDelivery, error)
 }
