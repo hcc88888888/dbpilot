@@ -8,7 +8,13 @@ ALTER TABLE notification_policies
     ADD COLUMN window_end_utc TIME;
 
 ALTER TABLE notification_templates
-    ADD COLUMN revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0);
+    ADD COLUMN revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+    ADD COLUMN legacy_version_from_updated_at BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Rows present before 0002 keep the exact UpdatedAt version used to derive
+-- their delivery idempotency keys. Templates created after 0002 use revision.
+ALTER TABLE notification_templates
+    ALTER COLUMN legacy_version_from_updated_at SET DEFAULT FALSE;
 
 -- The pre-0002 adapter resolved a template by the policy ID inside the same
 -- tenant/project. Preserve that relationship when it is unambiguous.

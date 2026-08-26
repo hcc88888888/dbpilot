@@ -41,9 +41,12 @@ type NotificationRoute struct {
 	WindowEndUTC   string
 }
 
-// Version is stable for the persisted template revision and deliberately does
-// not contain rendered content.
+// Version is stable for the persisted revision. Templates migrated from 0001
+// retain their UpdatedAt-derived identity until the first explicit update.
 func (template NotificationTemplate) Version() string {
+	if template.LegacyVersionFromUpdatedAt && !template.UpdatedAt.IsZero() {
+		return template.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
 	if template.Revision > 0 {
 		return strconv.FormatInt(template.Revision, 10)
 	}

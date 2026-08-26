@@ -180,7 +180,7 @@ func TestPostgresNotificationRepositoryLoadsOnlyAssignedScopedRoutes(t *testing.
 		WithArgs("tenant-a", "project-a", "rule-1").
 		WillReturnRows(sqlmock.NewRows(notificationRouteColumns()).AddRow(
 			"policy-1", "tenant-a", "project-a", "primary", "webhook", "https://allowed.example/hook", "vault://hook", "template-7", "{critical}", []byte(`{"database":"orders"}`), "09:00", "11:00", true, at, at,
-			"template-7", "tenant-a", "project-a", "default", "subject", "body", int64(7), at, at,
+			"template-7", "tenant-a", "project-a", "default", "subject", "body", int64(7), false, at, at,
 		))
 
 	routes, err := NewPostgresRepository(database).ListNotificationRoutes(context.Background(), Scope{TenantID: "tenant-a", ProjectID: "project-a"}, "rule-1")
@@ -257,7 +257,7 @@ func TestPostgresNotificationRepositoryAtomicallyClaimsDueAndExpiredAttempting(t
 }
 
 func notificationRouteColumns() []string {
-	return []string{"policy_id", "policy_tenant_id", "policy_project_id", "policy_name", "channel", "target", "secret_ref", "template_id", "severities", "match_labels", "window_start_utc", "window_end_utc", "enabled", "policy_created_at", "policy_updated_at", "resolved_template_id", "template_tenant_id", "template_project_id", "template_name", "subject", "body", "template_revision", "template_created_at", "template_updated_at"}
+	return []string{"policy_id", "policy_tenant_id", "policy_project_id", "policy_name", "channel", "target", "secret_ref", "template_id", "severities", "match_labels", "window_start_utc", "window_end_utc", "enabled", "policy_created_at", "policy_updated_at", "resolved_template_id", "template_tenant_id", "template_project_id", "template_name", "subject", "body", "template_revision", "template_legacy_version", "template_created_at", "template_updated_at"}
 }
 
 func notificationDeliveryColumns() []string {
@@ -368,7 +368,7 @@ func TestPostgresCreatesExplicitVersionedTemplateAndRoutedPolicy(t *testing.T) {
 	template := NotificationTemplate{ID: "template-7", Scope: scope, Name: "critical", Subject: "{{event.id}}", Body: "{{event.state}}", Revision: 7}
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO notification_templates").WithArgs("template-7", "tenant-a", "project-a", "critical", "{{event.id}}", "{{event.state}}", int64(7)).WillReturnRows(
-		sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "name", "subject", "body", "revision", "created_at", "updated_at"}).AddRow("template-7", "tenant-a", "project-a", "critical", "{{event.id}}", "{{event.state}}", int64(7), at, at),
+		sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "name", "subject", "body", "revision", "legacy_version_from_updated_at", "created_at", "updated_at"}).AddRow("template-7", "tenant-a", "project-a", "critical", "{{event.id}}", "{{event.state}}", int64(7), false, at, at),
 	)
 	mock.ExpectExec("INSERT INTO alert_audit_log").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()

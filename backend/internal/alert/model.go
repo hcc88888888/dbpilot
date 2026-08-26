@@ -319,14 +319,15 @@ type NotificationPolicy struct {
 }
 
 type NotificationTemplate struct {
-	ID        string    `json:"id"`
-	Scope     Scope     `json:"scope"`
-	Name      string    `json:"name"`
-	Subject   string    `json:"subject"`
-	Body      string    `json:"body"`
-	Revision  int64     `json:"version"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID                         string    `json:"id"`
+	Scope                      Scope     `json:"scope"`
+	Name                       string    `json:"name"`
+	Subject                    string    `json:"subject"`
+	Body                       string    `json:"body"`
+	Revision                   int64     `json:"version"`
+	LegacyVersionFromUpdatedAt bool      `json:"-"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
 }
 
 type Silence struct {

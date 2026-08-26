@@ -26,9 +26,9 @@ const eventUpsertSQL = "INSERT INTO alert_events (id, tenant_id, project_id, rul
 const eventAdvisoryLockSQL = "SELECT pg_advisory_xact_lock($1)"
 const eventLockSQL = "SELECT " + eventColumnsSQL + " FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND fingerprint = $3 FOR UPDATE"
 const auditInsertSQL = "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-const notificationRouteSQL = "SELECT p.id AS policy_id, p.tenant_id AS policy_tenant_id, p.project_id AS policy_project_id, p.name AS policy_name, p.channel, p.target, p.secret_ref, COALESCE(p.template_id, ''), p.severities, p.match_labels, COALESCE(to_char(p.window_start_utc, 'HH24:MI'), '') AS window_start_utc, COALESCE(to_char(p.window_end_utc, 'HH24:MI'), '') AS window_end_utc, p.enabled, p.created_at AS policy_created_at, p.updated_at AS policy_updated_at, t.id AS resolved_template_id, t.tenant_id AS template_tenant_id, t.project_id AS template_project_id, t.name AS template_name, t.subject, t.body, t.revision AS template_revision, t.created_at AS template_created_at, t.updated_at AS template_updated_at FROM alert_rules r JOIN notification_policies p ON p.tenant_id = r.tenant_id AND p.project_id = r.project_id AND p.id = ANY(r.notification_policy_ids) LEFT JOIN notification_templates t ON t.tenant_id = p.tenant_id AND t.project_id = p.project_id AND t.id = p.template_id WHERE r.tenant_id = $1 AND r.project_id = $2 AND r.id = $3 ORDER BY p.id ASC"
+const notificationRouteSQL = "SELECT p.id AS policy_id, p.tenant_id AS policy_tenant_id, p.project_id AS policy_project_id, p.name AS policy_name, p.channel, p.target, p.secret_ref, COALESCE(p.template_id, ''), p.severities, p.match_labels, COALESCE(to_char(p.window_start_utc, 'HH24:MI'), '') AS window_start_utc, COALESCE(to_char(p.window_end_utc, 'HH24:MI'), '') AS window_end_utc, p.enabled, p.created_at AS policy_created_at, p.updated_at AS policy_updated_at, t.id AS resolved_template_id, t.tenant_id AS template_tenant_id, t.project_id AS template_project_id, t.name AS template_name, t.subject, t.body, t.revision AS template_revision, t.legacy_version_from_updated_at, t.created_at AS template_created_at, t.updated_at AS template_updated_at FROM alert_rules r JOIN notification_policies p ON p.tenant_id = r.tenant_id AND p.project_id = r.project_id AND p.id = ANY(r.notification_policy_ids) LEFT JOIN notification_templates t ON t.tenant_id = p.tenant_id AND t.project_id = p.project_id AND t.id = p.template_id WHERE r.tenant_id = $1 AND r.project_id = $2 AND r.id = $3 ORDER BY p.id ASC"
 const notificationPolicyColumnsSQL = "id, tenant_id, project_id, name, channel, target, secret_ref, template_id, severities, match_labels, COALESCE(to_char(window_start_utc, 'HH24:MI'), ''), COALESCE(to_char(window_end_utc, 'HH24:MI'), ''), enabled, created_at, updated_at"
-const notificationTemplateColumnsSQL = "id, tenant_id, project_id, name, subject, body, revision, created_at, updated_at"
+const notificationTemplateColumnsSQL = "id, tenant_id, project_id, name, subject, body, revision, legacy_version_from_updated_at, created_at, updated_at"
 const notificationDeliveryColumnsSQL = "id, tenant_id, project_id, event_id, policy_id, idempotency_key, event_state, channel, template_id, template_version, status, attempts, attempted_at, next_attempt_at, delivered_at, lease_owner, lease_expires_at, failure_class, request_target, request_subject, request_body, request_labels, request_secret_ref"
 const qualifiedNotificationDeliveryColumnsSQL = "d.id, d.tenant_id, d.project_id, d.event_id, d.policy_id, d.idempotency_key, d.event_state, d.channel, d.template_id, d.template_version, d.status, d.attempts, d.attempted_at, d.next_attempt_at, d.delivered_at, d.lease_owner, d.lease_expires_at, d.failure_class, d.request_target, d.request_subject, d.request_body, d.request_labels, d.request_secret_ref"
 const deliveryInsertSQL = "INSERT INTO notification_deliveries (" + notificationDeliveryColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (tenant_id, project_id, idempotency_key) DO NOTHING"
@@ -412,6 +412,7 @@ func (r *PostgresRepository) ListNotificationRoutes(ctx context.Context, scope S
 		var labels []byte
 		var templateID, templateTenantID, templateProjectID, templateName, subject, body sql.NullString
 		var templateRevision sql.NullInt64
+		var templateLegacyVersion sql.NullBool
 		var templateCreatedAt, templateUpdatedAt sql.NullTime
 		if err := rows.Scan(
 			&route.Policy.ID, &route.Policy.Scope.TenantID, &route.Policy.Scope.ProjectID, &route.Policy.Name,
@@ -419,7 +420,7 @@ func (r *PostgresRepository) ListNotificationRoutes(ctx context.Context, scope S
 			&severities, &labels, &route.Policy.WindowStartUTC, &route.Policy.WindowEndUTC, &route.Policy.Enabled,
 			&route.Policy.CreatedAt, &route.Policy.UpdatedAt,
 			&templateID, &templateTenantID, &templateProjectID, &templateName,
-			&subject, &body, &templateRevision, &templateCreatedAt, &templateUpdatedAt,
+			&subject, &body, &templateRevision, &templateLegacyVersion, &templateCreatedAt, &templateUpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -434,6 +435,7 @@ func (r *PostgresRepository) ListNotificationRoutes(ctx context.Context, scope S
 			route.Template = NotificationTemplate{
 				ID: templateID.String, Scope: Scope{TenantID: templateTenantID.String, ProjectID: templateProjectID.String},
 				Name: templateName.String, Subject: subject.String, Body: body.String, Revision: templateRevision.Int64,
+				LegacyVersionFromUpdatedAt: templateLegacyVersion.Bool,
 			}
 			if templateCreatedAt.Valid {
 				route.Template.CreatedAt = templateCreatedAt.Time
@@ -472,7 +474,7 @@ func (r *PostgresRepository) mutateNotificationTemplate(ctx context.Context, tem
 	args := []any{template.ID, template.Scope.TenantID, template.Scope.ProjectID, template.Name, template.Subject, template.Body, template.Revision}
 	action := "template.created"
 	if update {
-		query = "UPDATE notification_templates SET name = $1, subject = $2, body = $3, revision = $4, updated_at = NOW() WHERE tenant_id = $5 AND project_id = $6 AND id = $7 AND revision < $4 RETURNING " + notificationTemplateColumnsSQL
+		query = "UPDATE notification_templates SET name = $1, subject = $2, body = $3, revision = $4, legacy_version_from_updated_at = FALSE, updated_at = NOW() WHERE tenant_id = $5 AND project_id = $6 AND id = $7 AND revision < $4 RETURNING " + notificationTemplateColumnsSQL
 		args = []any{template.Name, template.Subject, template.Body, template.Revision, template.Scope.TenantID, template.Scope.ProjectID, template.ID}
 		action = "template.updated"
 	}
@@ -553,7 +555,7 @@ func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, polic
 
 func scanNotificationTemplate(scanner rowScanner) (NotificationTemplate, error) {
 	var template NotificationTemplate
-	err := scanner.Scan(&template.ID, &template.Scope.TenantID, &template.Scope.ProjectID, &template.Name, &template.Subject, &template.Body, &template.Revision, &template.CreatedAt, &template.UpdatedAt)
+	err := scanner.Scan(&template.ID, &template.Scope.TenantID, &template.Scope.ProjectID, &template.Name, &template.Subject, &template.Body, &template.Revision, &template.LegacyVersionFromUpdatedAt, &template.CreatedAt, &template.UpdatedAt)
 	return template, err
 }
 

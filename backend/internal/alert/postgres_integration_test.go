@@ -137,6 +137,101 @@ func TestNotificationMigrationUpgradesPopulated0001WithoutLosingRoutesOrRetrySta
 	require.Zero(t, invalidConstraints)
 }
 
+func TestNotificationMigrationPreservesLegacyTemplateVersionIdempotencyOnReplay(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql")
+	scope := Scope{TenantID: "tenant-version", ProjectID: "project-version"}
+
+	var legacyUpdatedAt time.Time
+	_, err := database.ExecContext(ctx, "INSERT INTO notification_policies (id, tenant_id, project_id, name, channel, target, enabled) VALUES ('policy-version', $1, $2, 'legacy policy', 'in_app', 'user-7', true)", scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	require.NoError(t, database.QueryRowContext(ctx, "INSERT INTO notification_templates (id, tenant_id, project_id, name, subject, body) VALUES ('policy-version', $1, $2, 'legacy template', '{{event.id}}', '{{event.state}}') RETURNING updated_at", scope.TenantID, scope.ProjectID).Scan(&legacyUpdatedAt))
+	_, err = database.ExecContext(ctx, "INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids) VALUES ('rule-version', $1, $2, 'version replay', 'db.cpu', 'avg', '>', 80, 60000000000, 60000000000, 'ignore', 'critical', ARRAY['policy-version'])", scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+
+	event := AlertEvent{ID: "event-version", Scope: scope, RuleID: "rule-version", Fingerprint: "version-fingerprint", Labels: map[string]string{"database": "orders"}, Evidence: map[string]string{"aggregate": "91"}, State: EventFiring, FirstSeen: legacyUpdatedAt, LastSeen: legacyUpdatedAt, FiringAt: legacyUpdatedAt, LastActor: "evaluator"}
+	legacyVersion := legacyUpdatedAt.UTC().Format(time.RFC3339Nano)
+	legacyDeliveryID := deliveryIdempotencyKey(event.ID, EventFiring, "in_app", legacyVersion)
+	envelope, err := json.Marshal(map[string]any{
+		"attempts": 1,
+		"request": map[string]any{
+			"scope":    map[string]string{"tenant_id": scope.TenantID, "project_id": scope.ProjectID},
+			"event_id": event.ID, "state": "firing", "severity": "critical", "channel": "in_app",
+			"policy_id": "policy-version", "template_id": "policy-version", "template_version": legacyVersion,
+			"target": "user-7", "secret_ref": "", "subject": event.ID, "body": "firing", "labels": event.Labels,
+		},
+	})
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "INSERT INTO notification_deliveries (id, tenant_id, project_id, event_id, policy_id, status, attempted_at, delivered_at, failure_reason) VALUES ($1, $2, $3, $4, 'policy-version', 'delivered', $5, $5, $6)", legacyDeliveryID, scope.TenantID, scope.ProjectID, event.ID, legacyUpdatedAt, string(envelope))
+	require.NoError(t, err)
+
+	migration, err := os.ReadFile(filepath.Join("migrations", "0002_notification_delivery_control.sql"))
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, string(migration))
+	require.NoError(t, err)
+
+	repository := NewPostgresRepository(database)
+	routes, err := repository.ListNotificationRoutes(ctx, scope, "rule-version")
+	require.NoError(t, err)
+	require.Len(t, routes, 1)
+	require.Equal(t, legacyVersion, routes[0].Template.Version())
+	channel := &recordingChannel{name: "in_app"}
+	dispatcher := NewDispatcher(repository, []DeliveryChannel{channel}, func() time.Time { return legacyUpdatedAt.Add(time.Minute) }, nil)
+	require.NoError(t, dispatcher.Dispatch(ctx, event, EventFiring))
+	require.Empty(t, channel.requests)
+
+	var deliveryCount int
+	var storedID, storedKey, storedVersion string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*), min(id), min(idempotency_key), min(template_version) FROM notification_deliveries WHERE tenant_id = $1 AND project_id = $2 AND event_id = $3", scope.TenantID, scope.ProjectID, event.ID).Scan(&deliveryCount, &storedID, &storedKey, &storedVersion))
+	require.Equal(t, 1, deliveryCount)
+	require.Equal(t, legacyDeliveryID, storedID)
+	require.Equal(t, legacyDeliveryID, storedKey)
+	require.Equal(t, legacyVersion, storedVersion)
+}
+
+func TestPostgresUpdatingMigratedLegacyTemplateSwitchesToRevisionVersion(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql")
+	scope := Scope{TenantID: "tenant-version-update", ProjectID: "project-version-update"}
+	var legacyUpdatedAt time.Time
+	require.NoError(t, database.QueryRowContext(ctx, "INSERT INTO notification_templates (id, tenant_id, project_id, name, subject, body) VALUES ('template-version', $1, $2, 'legacy template', 'old subject', 'old body') RETURNING updated_at", scope.TenantID, scope.ProjectID).Scan(&legacyUpdatedAt))
+	migration, err := os.ReadFile(filepath.Join("migrations", "0002_notification_delivery_control.sql"))
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, string(migration))
+	require.NoError(t, err)
+
+	updated, err := NewPostgresRepository(database).UpdateNotificationTemplate(ContextWithAuditActor(ctx, "operator"), NotificationTemplate{ID: "template-version", Scope: scope, Name: "updated template", Subject: "new subject", Body: "new body", Revision: 2})
+	require.NoError(t, err)
+	require.Equal(t, "2", updated.Version())
+	require.NotEqual(t, legacyUpdatedAt.UTC().Format(time.RFC3339Nano), updated.Version())
+	encoded, err := json.Marshal(updated)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "legacy_version")
+
+	var legacyVersion bool
+	var auditCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT legacy_version_from_updated_at FROM notification_templates WHERE tenant_id = $1 AND project_id = $2 AND id = 'template-version'", scope.TenantID, scope.ProjectID).Scan(&legacyVersion))
+	require.False(t, legacyVersion)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM alert_audit_log WHERE tenant_id = $1 AND project_id = $2 AND action = 'template.updated' AND target_id = 'template-version'", scope.TenantID, scope.ProjectID).Scan(&auditCount))
+	require.Equal(t, 1, auditCount)
+}
+
 func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T) {
 	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
 		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
