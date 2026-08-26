@@ -98,3 +98,29 @@ startup failures. It never substitutes a generic Linux image for Kylin.
 This container check covers executable compatibility and bootstrap startup.
 Systemd, journald ACLs, kernel metrics, eBPF, and real Kylin service behavior
 must still be verified on Kylin V10 amd64/arm64 VM or bare-metal runners.
+
+## Database adapter integration verification
+
+The database adapter integration suite uses disposable MySQL 8 and PostgreSQL
+16 containers on a dedicated Docker network. The containers publish no host
+ports, use tmpfs-backed data directories, and create restricted non-production
+reader accounts. They are database test fixtures, not Kylin compatibility
+containers and do not make any claim about Kylin support.
+
+Run the Windows verifier from `backend` with Docker Desktop running:
+
+```powershell
+powershell -File .\scripts\verify-database-adapters.ps1
+```
+
+The verifier locates Docker Desktop, waits for service health, reports both
+server versions, runs the real integration test in the isolated Compose
+network, and removes the containers and temporary data on every exit path.
+For a manually managed environment, set `DBPILOT_DB_INTEGRATION=1`,
+`DBPILOT_MYSQL_ADDRESS`, `DBPILOT_MYSQL_DATABASE`, `DBPILOT_MYSQL_USER`,
+`DBPILOT_POSTGRES_ADDRESS`, `DBPILOT_POSTGRES_DATABASE`, `DBPILOT_POSTGRES_USER`,
+`DBPILOT_SECRET_INTEGRATION_MYSQL`, and
+`DBPILOT_SECRET_INTEGRATION_POSTGRES` before running `go test
+./internal/database`. The test only uses pre-registered metric templates and
+resolves credentials through the runtime `secret://integration/...` boundary;
+do not put credentials in telemetry policy documents or logs.

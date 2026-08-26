@@ -1,0 +1,95 @@
+name: dbpilot-database-adapters
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: dbpilot_integration
+      MYSQL_ROOT_PASSWORD: dbpilot-integration-root
+    command: ["--skip-log-bin"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pdbpilot-integration-root --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [database-adapters]
+    tmpfs:
+      - /var/lib/mysql:rw,noexec,nosuid,size=512m
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: dbpilot_integration
+      POSTGRES_PASSWORD: dbpilot-integration-root
+      POSTGRES_USER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dbpilot_integration"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [database-adapters]
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=512m
+
+  mysql-bootstrap:
+    image: mysql:8.4
+    depends_on:
+      mysql:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        mysql -h mysql -uroot -pdbpilot-integration-root -e
+        "CREATE USER IF NOT EXISTS 'dbpilot_reader'@'%' IDENTIFIED BY 'dbpilot-integration-mysql-password';
+        GRANT SELECT ON dbpilot_integration.* TO 'dbpilot_reader'@'%'; FLUSH PRIVILEGES;"
+    networks: [database-adapters]
+    restart: "no"
+
+  postgres-bootstrap:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: dbpilot-integration-root
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        psql -h postgres -U postgres -d dbpilot_integration -v ON_ERROR_STOP=1
+        -c 'CREATE ROLE dbpilot_reader LOGIN PASSWORD $$$$dbpilot-integration-postgres-password$$$$;'
+        -c 'GRANT CONNECT ON DATABASE dbpilot_integration TO dbpilot_reader;'
+        -c 'GRANT USAGE ON SCHEMA public TO dbpilot_reader;'
+        -c 'GRANT SELECT ON ALL TABLES IN SCHEMA public TO dbpilot_reader;'
+    networks: [database-adapters]
+    restart: "no"
+
+  adapter-tests:
+    image: golang:1.25-bookworm
+    depends_on:
+      mysql-bootstrap:
+        condition: service_completed_successfully
+      postgres-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      DBPILOT_DB_INTEGRATION: "1"
+      DBPILOT_MYSQL_ADDRESS: mysql://mysql:3306
+      DBPILOT_MYSQL_DATABASE: dbpilot_integration
+      DBPILOT_MYSQL_USER: dbpilot_reader
+      DBPILOT_POSTGRES_ADDRESS: postgres://postgres:5432
+      DBPILOT_POSTGRES_DATABASE: dbpilot_integration
+      DBPILOT_POSTGRES_USER: dbpilot_reader
+      DBPILOT_SECRET_INTEGRATION_MYSQL: dbpilot-integration-mysql-password
+      DBPILOT_SECRET_INTEGRATION_POSTGRES: dbpilot-integration-postgres-password
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - 'timeout "$${DBPILOT_DB_TEST_TIMEOUT_SECONDS:-75}s" go test ./internal/database -run ^TestDatabaseAdaptersIntegration$$ -count=1 -timeout 60s'
+    networks: [database-adapters]
+    working_dir: /workspace
+    volumes:
+      - ../..:/workspace:ro
+
+networks:
+  database-adapters:
+    driver: bridge
