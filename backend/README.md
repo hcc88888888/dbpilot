@@ -130,8 +130,11 @@ do not put credentials in telemetry policy documents or logs.
 
 ## HBase dependency observability runtime
 
-The Agent can register trusted `hbase`, `hdfs`, and `zookeeper` component
-definitions through `agent.DependencyCollectorConfig`. Definitions use only
+The Agent registers trusted `hbase`, `hdfs`, and `zookeeper` component
+definitions from `agent.yaml` and wires them into the production `Runtime`.
+`component_secrets.provider: environment` resolves a reference such as
+`secret://hbase/reader` from `DBPILOT_SECRET_HBASE_READER`; secret values are
+never stored in the configuration or spool. Definitions use only
 allowlisted read-only `/jmx` (or the ZooKeeper read-only monitor compatibility
 path) endpoints and canonical runtime Secret/TLS references. The collector
 resolves HBase dependency IDs before collection, registers HDFS and ZooKeeper
@@ -142,12 +145,15 @@ existing telemetry engine stops and before the spool is sealed.
 Each collection writes a deterministic JSON envelope to the existing metric
 spool. It includes normalized samples, per-component `ok`/`partial`/`failed`
 status events, role-level health, and correlation-only dependency evidence.
-The batch ID is derived from canonical envelope content and collection time,
-so replay of the same collection after reopening the spool is idempotent.
+The batch ID includes a durable monotonic collection sequence. The Agent
+advances that sequence only after the batch append succeeds, so an interrupted
+append/checkpoint boundary replays the same ID safely after restart, while a
+new same-clock collection receives a distinct ID.
 Endpoint URLs, response bodies, credentials, and TLS material are excluded
 from the envelope and status errors.
 
-The disposable Compose fixture uses three authenticated static JMX services on
+The disposable Compose fixture uses three authenticated static JMX services
+plus one deliberately unavailable HBase endpoint on
 one dedicated bridge network. It publishes no host ports, runs the fixtures
 read-only without Linux capabilities, and health-checks every service. Run the
 Windows verifier from `backend`:
@@ -158,8 +164,10 @@ powershell -File .\scripts\verify-hbase-dependencies.ps1 `
   -GoBinary 'C:\absolute\path\to\go.exe'
 ```
 
-By default the script also builds a static Linux integration-test binary and
-runs the real JMX→adapter→topology→Agent spool path inside the approved
+By default the script cross-builds and starts the actual `dbpilot-agent`
+binary, loads a generated restricted `agent.yaml`, collects the fixture JMX
+endpoints through the production `Runtime`, stops the Agent with SIGTERM, and
+decodes the resulting dependency batch from the spool inside the approved
 `cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` Kylin V10 image. Pass a
 different approved image with `-KylinImage`; use `-SkipKylin` only for a local
 Docker fixture check. Every exit path removes the Kylin container, Compose

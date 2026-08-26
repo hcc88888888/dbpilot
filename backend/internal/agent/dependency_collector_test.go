@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -48,11 +49,46 @@ func TestNewDependencyCollectorRejectsInvalidRuntimeBoundaries(t *testing.T) {
 type discardDependencyStore struct{}
 
 func (discardDependencyStore) Append(context.Context, spool.DataClass, spool.Batch) error { return nil }
+func (discardDependencyStore) Checkpoint(string) ([]byte, error)                          { return nil, spool.ErrNoCheckpoint }
+func (discardDependencyStore) PutCheckpoint(string, []byte) error                         { return nil }
 
 type nilDependencyStore struct{}
 
 func (*nilDependencyStore) Append(context.Context, spool.DataClass, spool.Batch) error { return nil }
+func (*nilDependencyStore) Checkpoint(string) ([]byte, error)                          { return nil, spool.ErrNoCheckpoint }
+func (*nilDependencyStore) PutCheckpoint(string, []byte) error                         { return nil }
 
 type nilDependencyResolver struct{}
 
 func (*nilDependencyResolver) ResolveSecret(context.Context, string) ([]byte, error) { return nil, nil }
+
+func TestDependencyCollectorReturnsAppendAndCheckpointFailures(t *testing.T) {
+	definition := []database.ComponentDefinition{{
+		ID: "hdfs-a", Kind: database.HDFSComponent,
+		Endpoints: []database.Endpoint{{URL: "http://127.0.0.1:1/jmx", Role: "namenode"}},
+		SecretRef: "secret://test/reader",
+	}}
+	store := &failureDependencyStore{appendErr: errors.New("spool unavailable")}
+	collector, err := NewDependencyCollector(DependencyCollectorConfig{
+		AgentID: "agent-a", Definitions: definition, Store: store,
+		SecretResolver: database.StaticSecretResolver{"secret://test/reader": []byte("token")},
+		RequestTimeout: time.Millisecond, MaxAttempts: 1,
+	})
+	require.NoError(t, err)
+	require.ErrorContains(t, collector.CollectOnce(context.Background()), "spool unavailable")
+
+	store.appendErr = nil
+	store.checkpointErr = errors.New("checkpoint unavailable")
+	require.ErrorContains(t, collector.CollectOnce(context.Background()), "checkpoint unavailable")
+}
+
+type failureDependencyStore struct {
+	appendErr     error
+	checkpointErr error
+}
+
+func (store *failureDependencyStore) Append(context.Context, spool.DataClass, spool.Batch) error {
+	return store.appendErr
+}
+func (*failureDependencyStore) Checkpoint(string) ([]byte, error)        { return nil, spool.ErrNoCheckpoint }
+func (store *failureDependencyStore) PutCheckpoint(string, []byte) error { return store.checkpointErr }

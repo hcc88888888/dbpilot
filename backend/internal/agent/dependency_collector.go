@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -22,6 +23,8 @@ const dependencyCollectorSourceID = "hbase-dependencies"
 // collector. spool.Store implements it directly.
 type DependencyCollectorStore interface {
 	Append(context.Context, spool.DataClass, spool.Batch) error
+	Checkpoint(string) ([]byte, error)
+	PutCheckpoint(string, []byte) error
 }
 
 // DependencyCollectorConfig is trusted Agent configuration. Definitions may
@@ -55,6 +58,7 @@ type ComponentCollectionStatus struct {
 // metric spool. Evidence is correlation-only and contains no remediation.
 type DependencyTelemetryEnvelope struct {
 	BatchID     string                        `json:"batch_id"`
+	Sequence    uint64                        `json:"sequence"`
 	AgentID     string                        `json:"agent_id"`
 	CollectedAt time.Time                     `json:"collected_at"`
 	Samples     []database.MetricSample       `json:"samples"`
@@ -69,6 +73,7 @@ type DependencyCollector struct {
 	topology  database.Topology
 	registry  database.ComponentRegistry
 	closeOnce sync.Once
+	collectMu sync.Mutex
 	closeErr  error
 }
 
@@ -167,6 +172,12 @@ func (collector *DependencyCollector) CollectOnce(ctx context.Context) error {
 	if collector == nil || ctx == nil {
 		return errors.New("dependency collector context is required")
 	}
+	collector.collectMu.Lock()
+	defer collector.collectMu.Unlock()
+	sequence, err := collector.nextSequence()
+	if err != nil {
+		return fmt.Errorf("read dependency collection sequence: %w", err)
+	}
 	collectedAt := collector.config.Now().UTC()
 	definitions := cloneComponentDefinitions(collector.config.Definitions)
 	sort.Slice(definitions, func(i, j int) bool { return definitions[i].ID < definitions[j].ID })
@@ -188,7 +199,7 @@ func (collector *DependencyCollector) CollectOnce(ctx context.Context) error {
 	sortMetricSamples(samples)
 
 	envelope := DependencyTelemetryEnvelope{
-		AgentID: collector.config.AgentID, CollectedAt: collectedAt, Samples: samples,
+		AgentID: collector.config.AgentID, Sequence: sequence, CollectedAt: collectedAt, Samples: samples,
 		Statuses: statuses, Health: database.AggregateHealth(collector.topology, samples),
 		Evidence: database.BuildDependencyEvidence(collector.topology, samples),
 	}
@@ -201,7 +212,33 @@ func (collector *DependencyCollector) CollectOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return collector.config.Store.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: dependencyCollectorSourceID, CreatedAt: collectedAt, Priority: 1, Payload: payload})
+	if err := collector.config.Store.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: dependencyCollectorSourceID, CreatedAt: collectedAt, Priority: 1, Payload: payload}); err != nil {
+		return fmt.Errorf("append dependency telemetry: %w", err)
+	}
+	checkpoint := make([]byte, 8)
+	binary.BigEndian.PutUint64(checkpoint, sequence)
+	if err := collector.config.Store.PutCheckpoint(dependencyCollectorSourceID, checkpoint); err != nil {
+		return fmt.Errorf("persist dependency collection sequence: %w", err)
+	}
+	return nil
+}
+
+func (collector *DependencyCollector) nextSequence() (uint64, error) {
+	checkpoint, err := collector.config.Store.Checkpoint(dependencyCollectorSourceID)
+	if errors.Is(err, spool.ErrNoCheckpoint) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(checkpoint) != 8 {
+		return 0, errors.New("invalid dependency collection checkpoint")
+	}
+	sequence := binary.BigEndian.Uint64(checkpoint)
+	if sequence == ^uint64(0) {
+		return 0, errors.New("dependency collection sequence exhausted")
+	}
+	return sequence + 1, nil
 }
 
 func (collector *DependencyCollector) collectWithRetry(ctx context.Context, definition database.ComponentDefinition, adapter database.ComponentAdapter) ([]database.MetricSample, ComponentCollectionStatus) {
@@ -253,8 +290,13 @@ func waitDependencyBackoff(ctx context.Context, delay time.Duration) error {
 }
 
 func dependencyEnvelopeID(envelope DependencyTelemetryEnvelope) (string, error) {
-	envelope.BatchID = ""
-	payload, err := json.Marshal(envelope)
+	// Identity deliberately excludes collection content and wall-clock time.
+	// If append succeeds but its following checkpoint fails, the same sequence
+	// is replayed after restart and the spool keeps the already-durable payload.
+	payload, err := json.Marshal(struct {
+		AgentID  string `json:"agent_id"`
+		Sequence uint64 `json:"sequence"`
+	}{AgentID: envelope.AgentID, Sequence: envelope.Sequence})
 	if err != nil {
 		return "", err
 	}
@@ -295,7 +337,9 @@ func (collector *DependencyCollector) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("dependency collector context is required")
 	}
-	_ = collector.CollectOnce(ctx)
+	if err := collector.CollectOnce(ctx); err != nil {
+		return err
+	}
 	ticker := time.NewTicker(collector.config.Interval)
 	defer ticker.Stop()
 	for {
@@ -303,7 +347,9 @@ func (collector *DependencyCollector) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			_ = collector.CollectOnce(ctx)
+			if err := collector.CollectOnce(ctx); err != nil {
+				return err
+			}
 		}
 	}
 }

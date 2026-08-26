@@ -16,9 +16,11 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
 	"dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/exporter"
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
@@ -34,16 +36,43 @@ var (
 )
 
 type agentConfig struct {
-	AgentID               string   `yaml:"agent_id"`
-	ServerAddress         string   `yaml:"server_address"`
-	CAFile                string   `yaml:"ca_file"`
-	CertFile              string   `yaml:"cert_file"`
-	KeyFile               string   `yaml:"key_file"`
-	PolicyPublicKeyFile   string   `yaml:"policy_public_key_file"`
-	PolicyFile            string   `yaml:"policy_file"`
-	DataDirectory         string   `yaml:"data_directory"`
-	AllowedLogRoots       []string `yaml:"allowed_log_roots"`
-	FileCollectionEnabled bool     `yaml:"file_collection_enabled"`
+	AgentID               string                         `yaml:"agent_id"`
+	ServerAddress         string                         `yaml:"server_address"`
+	CAFile                string                         `yaml:"ca_file"`
+	CertFile              string                         `yaml:"cert_file"`
+	KeyFile               string                         `yaml:"key_file"`
+	PolicyPublicKeyFile   string                         `yaml:"policy_public_key_file"`
+	PolicyFile            string                         `yaml:"policy_file"`
+	DataDirectory         string                         `yaml:"data_directory"`
+	AllowedLogRoots       []string                       `yaml:"allowed_log_roots"`
+	FileCollectionEnabled bool                           `yaml:"file_collection_enabled"`
+	Components            []database.ComponentDefinition `yaml:"components"`
+	ComponentSecrets      componentSecretConfig          `yaml:"component_secrets"`
+	ComponentCollection   componentCollectionConfig      `yaml:"component_collection"`
+}
+
+type componentSecretConfig struct {
+	Provider string `yaml:"provider"`
+}
+type componentCollectionConfig struct {
+	IntervalSeconds            int `yaml:"interval_seconds"`
+	RequestTimeoutSeconds      int `yaml:"request_timeout_seconds"`
+	MaxAttempts                int `yaml:"max_attempts"`
+	InitialBackoffMilliseconds int `yaml:"initial_backoff_milliseconds"`
+	MaxBackoffMilliseconds     int `yaml:"max_backoff_milliseconds"`
+}
+
+func (c componentCollectionConfig) interval() time.Duration {
+	return time.Duration(c.IntervalSeconds) * time.Second
+}
+func (c componentCollectionConfig) requestTimeout() time.Duration {
+	return time.Duration(c.RequestTimeoutSeconds) * time.Second
+}
+func (c componentCollectionConfig) initialBackoff() time.Duration {
+	return time.Duration(c.InitialBackoffMilliseconds) * time.Millisecond
+}
+func (c componentCollectionConfig) maxBackoff() time.Duration {
+	return time.Duration(c.MaxBackoffMilliseconds) * time.Millisecond
 }
 
 // startRuntime is deliberately a narrow seam: the signed-policy control-plane
@@ -135,6 +164,12 @@ func loadConfig(path string) (agentConfig, error) {
 			return agentConfig{}, errors.New("allowed_log_roots entries must exist and must not be a filesystem root")
 		}
 	}
+	if len(settings.Components) > 0 && settings.ComponentSecrets.Provider != "environment" {
+		return agentConfig{}, errors.New("component_secrets.provider must be environment when components are configured")
+	}
+	if settings.ComponentCollection.IntervalSeconds < 0 || settings.ComponentCollection.RequestTimeoutSeconds < 0 || settings.ComponentCollection.MaxAttempts < 0 || settings.ComponentCollection.InitialBackoffMilliseconds < 0 || settings.ComponentCollection.MaxBackoffMilliseconds < 0 {
+		return agentConfig{}, errors.New("component_collection values must not be negative")
+	}
 	return settings, nil
 }
 
@@ -158,7 +193,19 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	client := telemetryv1.NewTelemetryIngestClient(connection)
 	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
-	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}})
+	var componentCollector agent.ComponentCollector
+	if len(settings.Components) > 0 {
+		componentCollector, err = agent.NewDependencyCollector(agent.DependencyCollectorConfig{
+			AgentID: settings.AgentID, Definitions: settings.Components, SecretResolver: database.EnvironmentSecretResolver{}, Store: store,
+			Interval: settings.ComponentCollection.interval(), RequestTimeout: settings.ComponentCollection.requestTimeout(), MaxAttempts: settings.ComponentCollection.MaxAttempts,
+			InitialBackoff: settings.ComponentCollection.initialBackoff(), MaxBackoff: settings.ComponentCollection.maxBackoff(),
+		})
+		if err != nil {
+			_ = store.Close()
+			return fmt.Errorf("configure component collector: %w", err)
+		}
+	}
+	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
 	return runtime.Run(ctx)
 }
 

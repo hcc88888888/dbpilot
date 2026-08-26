@@ -6,34 +6,34 @@ import "context"
 type ComponentKind string
 
 const (
-	HBaseComponent      ComponentKind = "hbase"
-	HDFSComponent       ComponentKind = "hdfs"
-	ZooKeeperComponent  ComponentKind = "zookeeper"
-	ComponentHBase      = HBaseComponent
-	ComponentHDFS       = HDFSComponent
-	ComponentZooKeeper  = ZooKeeperComponent
+	HBaseComponent     ComponentKind = "hbase"
+	HDFSComponent      ComponentKind = "hdfs"
+	ZooKeeperComponent ComponentKind = "zookeeper"
+	ComponentHBase                   = HBaseComponent
+	ComponentHDFS                    = HDFSComponent
+	ComponentZooKeeper               = ZooKeeperComponent
 )
 
 // Endpoint is a read-only component collection endpoint.
 type Endpoint struct {
-	URL  string
-	Role string
+	URL  string `yaml:"url" json:"url"`
+	Role string `yaml:"role" json:"role"`
 }
 
 // DependencyRef links an HBase component to authorized dependency clusters.
 type DependencyRef struct {
-	HDFSClusterID      string
-	ZooKeeperClusterID string
+	HDFSClusterID      string `yaml:"hdfs_cluster_id" json:"hdfs_cluster_id"`
+	ZooKeeperClusterID string `yaml:"zookeeper_cluster_id" json:"zookeeper_cluster_id"`
 }
 
 // ComponentDefinition describes a component without embedding credentials.
 type ComponentDefinition struct {
-	ID           string
-	Kind         ComponentKind
-	Endpoints    []Endpoint
-	SecretRef    string
-	TLSRef       string
-	Dependencies DependencyRef
+	ID           string        `yaml:"id" json:"id"`
+	Kind         ComponentKind `yaml:"kind" json:"kind"`
+	Endpoints    []Endpoint    `yaml:"endpoints" json:"endpoints"`
+	SecretRef    string        `yaml:"secret_ref" json:"secret_ref"`
+	TLSRef       string        `yaml:"tls_ref,omitempty" json:"tls_ref,omitempty"`
+	Dependencies DependencyRef `yaml:"dependencies,omitempty" json:"dependencies,omitempty"`
 }
 
 // ComponentAdapter is the deliberately narrow boundary for non-SQL adapters.

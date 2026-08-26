@@ -79,14 +79,15 @@ $composeFile = (Resolve-Path -LiteralPath $composeFile).Path
 $projectName = "dbpilot-hbase-dependencies-$PID"
 $networkName = "${projectName}_hbase-dependencies"
 $kylinContainer = $null
-$testBinary = $null
+$agentBinary = $null
+$fixtureBinary = $null
 $primaryFailure = $null
 
 try {
     Invoke-Docker @('version', '--format', '{{.Server.Version}}')
     Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'config', '--quiet')
-    Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'up', '--detach', 'hbase-jmx', 'hdfs-jmx', 'zookeeper-jmx')
-    foreach ($service in @('hbase-jmx', 'hdfs-jmx', 'zookeeper-jmx')) { Wait-Healthy $service }
+    Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'up', '--detach', 'hbase-jmx', 'hbase-failing-jmx', 'hdfs-jmx', 'zookeeper-jmx')
+    foreach ($service in @('hbase-jmx', 'hbase-failing-jmx', 'hdfs-jmx', 'zookeeper-jmx')) { Wait-Healthy $service }
     Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'run', '--rm', '--no-deps', '--env', "DBPILOT_TEST_TIMEOUT_SECONDS=$TestTimeoutSeconds", 'collector-tests')
     Write-Host 'Docker fixture runtime-path validation passed (fixture JMX, not full distribution E2E).'
 
@@ -98,12 +99,15 @@ try {
         $imageID = (& $DockerBinary image inspect --format '{{.Id}}' $KylinImage 2>$null).Trim()
         if ([string]::IsNullOrWhiteSpace($imageID)) { throw "Approved Kylin image '$KylinImage' is not available locally." }
 
-        $testBinary = Join-Path ([IO.Path]::GetTempPath()) "dbpilot-hbase-dependencies-$PID.test"
+        $agentBinary = Join-Path ([IO.Path]::GetTempPath()) "dbpilot-agent-$PID"
+        $fixtureBinary = Join-Path ([IO.Path]::GetTempPath()) "dbpilot-hbase-agent-fixture-$PID"
         $priorGOOS, $priorGOARCH, $priorCGO = ${env:GOOS}, ${env:GOARCH}, ${env:CGO_ENABLED}
         try {
             ${env:GOOS} = 'linux'; ${env:GOARCH} = $Architecture; ${env:CGO_ENABLED} = '0'
-            & $resolvedGoBinary test -c -o $testBinary ./internal/database
-            if ($LASTEXITCODE -ne 0) { throw "Build Kylin integration test failed with exit code $LASTEXITCODE." }
+            & $resolvedGoBinary build -o $agentBinary ./cmd/agent
+            if ($LASTEXITCODE -ne 0) { throw "Build Kylin Agent failed with exit code $LASTEXITCODE." }
+            & $resolvedGoBinary build -o $fixtureBinary ./test/fixtures/hbase-agent
+            if ($LASTEXITCODE -ne 0) { throw "Build Kylin fixture inspector failed with exit code $LASTEXITCODE." }
         } finally {
             ${env:GOOS}, ${env:GOARCH}, ${env:CGO_ENABLED} = $priorGOOS, $priorGOARCH, $priorCGO
         }
@@ -111,7 +115,8 @@ try {
         $platform = if ($Architecture -eq 'amd64') { 'linux/amd64' } else { 'linux/arm64' }
         $kylinContainer = (& $DockerBinary create --platform $platform --network $networkName --tmpfs '/tmp:rw,nosuid,size=256m' $KylinImage /bin/sh -c 'sleep 300').Trim()
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($kylinContainer)) { throw 'Unable to create Kylin validation container.' }
-        Invoke-Docker @('cp', $testBinary, "${kylinContainer}:/opt/dependency.test")
+        Invoke-Docker @('cp', $agentBinary, "${kylinContainer}:/opt/dbpilot-agent")
+        Invoke-Docker @('cp', $fixtureBinary, "${kylinContainer}:/opt/hbase-agent-fixture")
         Invoke-Docker @('start', $kylinContainer)
         $kylinScript = @'
 set -eu
@@ -119,17 +124,24 @@ set -eu
 case "${ID:-}" in kylin|kylin-server|neokylin|kylinsec) ;; *) exit 41 ;; esac
 case "${VERSION_ID:-}" in V10|v10|10*) ;; *) exit 42 ;; esac
 case "${DBPILOT_EXPECTED_ARCH}" in amd64) test "$(uname -m)" = x86_64 ;; arm64) test "$(uname -m)" = aarch64 ;; esac
-chmod 0755 /opt/dependency.test
-/opt/dependency.test -test.run '^TestDependencyCollectorPersistsRealJMXSamplesEvidenceAndRestartSafeID$' -test.count=1 -test.timeout=90s
+chmod 0755 /opt/dbpilot-agent /opt/hbase-agent-fixture
+mkdir -m 0700 /opt/agent-fixture
+/opt/hbase-agent-fixture -mode prepare -dir /opt/agent-fixture -hbase http://hbase-jmx:8000/jmx -hbase-failing http://hbase-failing-jmx:8000/jmx -hdfs http://hdfs-jmx:8000/jmx -zookeeper http://zookeeper-jmx:8000/jmx
+DBPILOT_SECRET_FIXTURE_READER=dbpilot-fixture-read-only /opt/dbpilot-agent --config /opt/agent-fixture/agent.yaml >/tmp/dbpilot-agent.log 2>&1 &
+agent_pid=$!
+iterations=0
+while [ "$iterations" -lt 8 ]; do
+  kill -0 "$agent_pid" || { cat /tmp/dbpilot-agent.log; exit 43; }
+  sleep 1
+  iterations=$((iterations + 1))
+done
+kill -TERM "$agent_pid"
+wait "$agent_pid" || { cat /tmp/dbpilot-agent.log; exit 44; }
+/opt/hbase-agent-fixture -mode inspect -dir /opt/agent-fixture
 printf 'Kylin HBase dependency validation passed: ID=%s VERSION=%s ARCH=%s\n' "$ID" "${VERSION_ID:-unknown}" "$(uname -m)"
 '@
         $encodedScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($kylinScript))
         Invoke-Docker @('exec',
-            '-e', 'DBPILOT_HBASE_DEPENDENCY_INTEGRATION=1',
-            '-e', 'DBPILOT_HBASE_JMX_URL=http://hbase-jmx:8000/jmx',
-            '-e', 'DBPILOT_HDFS_JMX_URL=http://hdfs-jmx:8000/jmx',
-            '-e', 'DBPILOT_ZOOKEEPER_JMX_URL=http://zookeeper-jmx:8000/jmx',
-            '-e', 'DBPILOT_HBASE_DEPENDENCY_TOKEN=dbpilot-fixture-read-only',
             '-e', "DBPILOT_EXPECTED_ARCH=$Architecture",
             $kylinContainer, '/bin/sh', '-c', "echo $encodedScript | base64 -d | /bin/sh")
     }
@@ -144,9 +156,11 @@ finally {
         & $DockerBinary rm -f $kylinContainer 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) { $cleanupFailures += 'Kylin container cleanup failed.' }
     }
-    if (-not [string]::IsNullOrWhiteSpace($testBinary) -and (Test-Path -LiteralPath $testBinary)) {
-        Remove-Item -LiteralPath $testBinary -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $testBinary) { $cleanupFailures += "Temporary test binary cleanup failed: $testBinary" }
+    foreach ($temporaryBinary in @($agentBinary, $fixtureBinary)) {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryBinary) -and (Test-Path -LiteralPath $temporaryBinary)) {
+            Remove-Item -LiteralPath $temporaryBinary -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $temporaryBinary) { $cleanupFailures += "Temporary binary cleanup failed: $temporaryBinary" }
+        }
     }
     $cleanupPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'

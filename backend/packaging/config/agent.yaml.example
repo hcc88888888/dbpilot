@@ -15,3 +15,36 @@ data_directory: /var/lib/dbpilot-agent
 allowed_log_roots:
   - /var/log
 file_collection_enabled: true
+
+# Component credentials are resolved only at runtime. For the environment
+# provider, secret://hbase/reader maps to DBPILOT_SECRET_HBASE_READER.
+component_secrets:
+  provider: environment
+component_collection:
+  interval_seconds: 60
+  request_timeout_seconds: 10
+  max_attempts: 3
+  initial_backoff_milliseconds: 100
+  max_backoff_milliseconds: 2000
+components:
+  - id: hdfs-prod
+    kind: hdfs
+    endpoints:
+      - url: https://namenode.example:9871/jmx
+        role: namenode
+    secret_ref: secret://hdfs/reader
+  - id: zk-prod
+    kind: zookeeper
+    endpoints:
+      - url: https://zookeeper.example:8080/jmx
+        role: leader
+    secret_ref: secret://zookeeper/reader
+  - id: hbase-prod
+    kind: hbase
+    endpoints:
+      - url: https://regionserver.example:16030/jmx
+        role: regionserver
+    secret_ref: secret://hbase/reader
+    dependencies:
+      hdfs_cluster_id: hdfs-prod
+      zookeeper_cluster_id: zk-prod

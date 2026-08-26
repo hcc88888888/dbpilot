@@ -169,6 +169,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 
 	var workers sync.WaitGroup
+	componentErrors := make(chan error, 1)
 	workerCount := 2
 	if r.deps.ComponentCollector != nil {
 		workerCount++
@@ -185,12 +186,28 @@ func (r *Runtime) Run(ctx context.Context) error {
 	if r.deps.ComponentCollector != nil {
 		go func() {
 			defer workers.Done()
-			_ = r.deps.ComponentCollector.Run(runCtx)
+			componentErrors <- r.deps.ComponentCollector.Run(runCtx)
 		}()
 	}
-	<-runCtx.Done()
+	var runErr error
+	if r.deps.ComponentCollector == nil {
+		<-runCtx.Done()
+	} else {
+		select {
+		case <-runCtx.Done():
+		case err := <-componentErrors:
+			if runCtx.Err() == nil {
+				if err == nil {
+					err = errors.New("component collector stopped unexpectedly")
+				}
+				runErr = fmt.Errorf("component collector failed: %w", err)
+				r.reportStatus(r.deps.AgentID, r.deps.Engine.ActiveVersion(), "DEGRADED", "COMPONENT_COLLECTOR_FAILED")
+				cancel()
+			}
+		}
+	}
 	workers.Wait()
-	return r.shutdown()
+	return errors.Join(runErr, r.shutdown())
 }
 
 func (r *Runtime) valid() error {
@@ -279,13 +296,17 @@ func (r *Runtime) exportLoop(ctx context.Context) {
 }
 
 func (r *Runtime) report(agentID string, version uint64, state telemetry.ApplyState, code string) {
+	r.reportStatus(agentID, version, string(state), code)
+}
+
+func (r *Runtime) reportStatus(agentID string, version uint64, state, code string) {
 	if agentID == "" {
 		agentID = r.deps.AgentID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.deps.ShutdownTimeout)
 	defer cancel()
 	_ = r.deps.HealthReporter.Report(ctx, PolicyStatus{
-		AgentID: agentID, Version: version, State: string(state), ErrorCode: code, Reported: r.deps.Now().UTC(),
+		AgentID: agentID, Version: version, State: state, ErrorCode: code, Reported: r.deps.Now().UTC(),
 	})
 }
 

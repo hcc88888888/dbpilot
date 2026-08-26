@@ -17,6 +17,9 @@ class ReadOnlyJMXHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/health":
             body = b'{"status":"ok"}'
         elif self.path == "/jmx":
+            if os.environ.get("DBPILOT_FIXTURE_FAIL_JMX") == "1":
+                self.send_error(503)
+                return
             body = PAYLOAD
         else:
             self.send_error(404)

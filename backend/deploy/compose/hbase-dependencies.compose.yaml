@@ -36,6 +36,15 @@ services:
     volumes:
       - ./fixtures:/fixture:ro
 
+  hbase-failing-jmx:
+    <<: *jmx-fixture
+    environment:
+      DBPILOT_FIXTURE_TOKEN: dbpilot-fixture-read-only
+      DBPILOT_FIXTURE_FILE: /fixture/hbase-jmx.json
+      DBPILOT_FIXTURE_FAIL_JMX: "1"
+    volumes:
+      - ./fixtures:/fixture:ro
+
   zookeeper-jmx:
     <<: *jmx-fixture
     environment:
@@ -49,10 +58,12 @@ services:
     depends_on:
       hbase-jmx: {condition: service_healthy}
       hdfs-jmx: {condition: service_healthy}
+      hbase-failing-jmx: {condition: service_healthy}
       zookeeper-jmx: {condition: service_healthy}
     environment:
       DBPILOT_HBASE_DEPENDENCY_INTEGRATION: "1"
       DBPILOT_HBASE_JMX_URL: http://hbase-jmx:8000/jmx
+      DBPILOT_HBASE_FAILING_JMX_URL: http://hbase-failing-jmx:8000/jmx
       DBPILOT_HDFS_JMX_URL: http://hdfs-jmx:8000/jmx
       DBPILOT_ZOOKEEPER_JMX_URL: http://zookeeper-jmx:8000/jmx
       DBPILOT_HBASE_DEPENDENCY_TOKEN: dbpilot-fixture-read-only

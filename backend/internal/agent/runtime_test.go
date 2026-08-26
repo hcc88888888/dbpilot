@@ -157,6 +157,23 @@ func TestRuntimeRunsAndClosesComponentCollectorBeforeSpoolSeal(t *testing.T) {
 	require.Less(t, eventIndex(values, "component-close"), eventIndex(values, "seal"))
 }
 
+func TestRuntimeReturnsAndReportsComponentCollectorFailure(t *testing.T) {
+	stored := signedEnvelope(1)
+	reporter := &fakeReporter{}
+	collectorErr := errors.New("append dependency telemetry: spool unavailable")
+	componentCollector := &fakeComponentCollector{runErr: collectorErr}
+	runtime := NewRuntime(Dependencies{
+		AgentID: "agent-a", PolicySource: &fakePolicySource{err: errors.New("offline")}, PolicyVerifier: fakeVerifier{},
+		Engine: &fakeEngine{}, Store: &fakeStore{stored: &stored}, Exporter: &fakeExporter{},
+		HealthReporter: reporter, ComponentCollector: componentCollector,
+	})
+
+	err := runtime.Run(context.Background())
+	require.ErrorIs(t, err, collectorErr)
+	require.Contains(t, reporter.States(), "DEGRADED")
+	require.Contains(t, reporter.ErrorCodes(), "COMPONENT_COLLECTOR_FAILED")
+}
+
 func signedEnvelope(version uint64) policy.SignatureEnvelope {
 	return policy.SignatureEnvelope{Policy: policy.Policy{
 		AgentID: "agent-a", Version: version, IssuedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(time.Hour),
@@ -323,22 +340,30 @@ type fakeComponentCollector struct {
 	events *eventLog
 	onRun  func()
 	ran    bool
+	runErr error
 }
 
 func (collector *fakeComponentCollector) Run(ctx context.Context) error {
 	collector.mu.Lock()
 	collector.ran = true
 	collector.mu.Unlock()
-	collector.events.Add("component-run")
+	if collector.events != nil {
+		collector.events.Add("component-run")
+	}
 	if collector.onRun != nil {
 		collector.onRun()
+	}
+	if collector.runErr != nil {
+		return collector.runErr
 	}
 	<-ctx.Done()
 	return nil
 }
 
 func (collector *fakeComponentCollector) Close() error {
-	collector.events.Add("component-close")
+	if collector.events != nil {
+		collector.events.Add("component-close")
+	}
 	return nil
 }
 
@@ -371,6 +396,15 @@ func (r *fakeReporter) States() []string {
 		states = append(states, status.State)
 	}
 	return states
+}
+func (r *fakeReporter) ErrorCodes() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	codes := make([]string, 0, len(r.statuses))
+	for _, status := range r.statuses {
+		codes = append(codes, status.ErrorCode)
+	}
+	return codes
 }
 
 type eventLog struct {
