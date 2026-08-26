@@ -94,10 +94,10 @@ func TestPostgresRepositoryScopesEveryEventAndAuditWrite(t *testing.T) {
 	_, err = repository.ListEvents(ctx, event.Scope, alert.EventFilter{Limit: 25})
 	require.NoError(t, err)
 
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7)")).
-		WithArgs("audit-1", "t1", "p1", "operator", "acknowledge", "event-1", sqlmock.AnyArg()).
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")).
+		WithArgs("audit-1", "t1", "p1", "operator", "acknowledge", "event-1", sqlmock.AnyArg(), []byte(`{"reason":"investigating"}`)).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	err = repository.AppendAudit(ctx, alert.AuditRecord{ID: "audit-1", Scope: event.Scope, Actor: "operator", Action: "acknowledge", TargetID: "event-1", OccurredAt: time.Now()})
+	err = repository.AppendAudit(ctx, alert.AuditRecord{ID: "audit-1", Scope: event.Scope, Actor: "operator", Action: "acknowledge", TargetID: "event-1", OccurredAt: time.Now(), Details: map[string]string{"reason": "investigating"}})
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

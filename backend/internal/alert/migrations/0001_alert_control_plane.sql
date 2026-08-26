@@ -105,6 +105,7 @@ CREATE TABLE alert_audit_log (
     action TEXT NOT NULL,
     target_id TEXT NOT NULL,
     occurred_at TIMESTAMPTZ NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
     PRIMARY KEY (tenant_id, project_id, id)
 );
 CREATE INDEX alert_audit_log_scope_occurred_idx ON alert_audit_log (tenant_id, project_id, occurred_at DESC);

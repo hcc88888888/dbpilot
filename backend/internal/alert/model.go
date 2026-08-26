@@ -334,12 +334,13 @@ type Silence struct {
 }
 
 type AuditRecord struct {
-	ID         string    `json:"id"`
-	Scope      Scope     `json:"scope"`
-	Actor      string    `json:"actor"`
-	Action     string    `json:"action"`
-	TargetID   string    `json:"target_id"`
-	OccurredAt time.Time `json:"occurred_at"`
+	ID         string            `json:"id"`
+	Scope      Scope             `json:"scope"`
+	Actor      string            `json:"actor"`
+	Action     string            `json:"action"`
+	TargetID   string            `json:"target_id"`
+	OccurredAt time.Time         `json:"occurred_at"`
+	Details    map[string]string `json:"details,omitempty"`
 }
 
 type EventFilter struct {

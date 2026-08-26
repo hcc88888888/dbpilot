@@ -17,6 +17,9 @@ var (
 
 const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
 const eventColumnsSQL = "id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor"
+const eventUpsertSQL = "INSERT INTO alert_events (id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, fingerprint) DO UPDATE SET labels = EXCLUDED.labels, evidence = EXCLUDED.evidence, state = EXCLUDED.state, last_seen = EXCLUDED.last_seen, firing_at = EXCLUDED.firing_at, acknowledged_at = EXCLUDED.acknowledged_at, resolved_at = EXCLUDED.resolved_at, last_actor = EXCLUDED.last_actor RETURNING " + eventColumnsSQL
+const auditedEventUpsertSQL = "WITH previous AS (SELECT state FROM alert_events WHERE tenant_id = $2 AND project_id = $3 AND fingerprint = $5 FOR UPDATE), changed AS (" + eventUpsertSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':' || state || ':' || last_seen::text), tenant_id, project_id, CASE WHEN last_actor = '' THEN 'system:repository' ELSE last_actor END, 'event.' || state, id, last_seen, jsonb_build_object('state', state) FROM changed WHERE NOT EXISTS (SELECT 1 FROM previous WHERE previous.state = changed.state)) SELECT " + eventColumnsSQL + " FROM changed"
+const auditInsertSQL = "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -34,7 +37,7 @@ func (r *PostgresRepository) CreateRule(ctx context.Context, rule AlertRule) (Al
 	if err != nil {
 		return AlertRule{}, err
 	}
-	query := "INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING " + ruleColumnsSQL
+	query := "WITH changed AS (INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':created:' || created_at::text), tenant_id, project_id, 'system:repository', 'rule.created', id, created_at, jsonb_build_object('name', name, 'metric', metric, 'severity', severity) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
 	return scanRule(r.db.QueryRowContext(ctx, query, rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled))
 }
 
@@ -46,7 +49,7 @@ func (r *PostgresRepository) UpdateRule(ctx context.Context, rule AlertRule) (Al
 	if err != nil {
 		return AlertRule{}, err
 	}
-	query := "UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ns = $6, for_duration_ns = $7, missing_data = $8, severity = $9, notification_policy_ids = $10, labels = $11, enabled = $12, updated_at = NOW() WHERE tenant_id = $13 AND project_id = $14 AND id = $15 RETURNING " + ruleColumnsSQL
+	query := "WITH changed AS (UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ns = $6, for_duration_ns = $7, missing_data = $8, severity = $9, notification_policy_ids = $10, labels = $11, enabled = $12, updated_at = NOW() WHERE tenant_id = $13 AND project_id = $14 AND id = $15 RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':updated:' || updated_at::text), tenant_id, project_id, 'system:repository', 'rule.updated', id, updated_at, jsonb_build_object('name', name, 'metric', metric, 'severity', severity) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
 	rule, err = scanRule(r.db.QueryRowContext(ctx, query, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled, rule.Scope.TenantID, rule.Scope.ProjectID, rule.ID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertRule{}, ErrNotFound
@@ -89,9 +92,54 @@ func (r *PostgresRepository) GetRule(ctx context.Context, scope Scope, id string
 }
 
 func (r *PostgresRepository) PutEvent(ctx context.Context, event AlertEvent) (AlertEvent, error) {
+	return putEventWithQuery(ctx, r.db, event, auditedEventUpsertSQL)
+}
+
+func (r *PostgresRepository) PutEventAndAudit(ctx context.Context, event AlertEvent, record AuditRecord) (AlertEvent, error) {
 	if err := event.Validate(); err != nil {
 		return AlertEvent{}, err
 	}
+	record = sanitizeAuditRecord(record)
+	if err := record.Validate(); err != nil {
+		return AlertEvent{}, err
+	}
+	if record.Scope != event.Scope || record.TargetID != event.ID {
+		return AlertEvent{}, ErrInvalidAuditRecord
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AlertEvent{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stored, err := putEvent(ctx, tx, event)
+	if err != nil {
+		return AlertEvent{}, err
+	}
+	record.TargetID = stored.ID
+	if err := appendAudit(ctx, tx, record); err != nil {
+		return AlertEvent{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AlertEvent{}, err
+	}
+	return stored, nil
+}
+
+type queryRower interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func putEvent(ctx context.Context, database queryRower, event AlertEvent) (AlertEvent, error) {
+	return putEventWithQuery(ctx, database, event, eventUpsertSQL)
+}
+
+func putEventWithQuery(ctx context.Context, database queryRower, event AlertEvent, query string) (AlertEvent, error) {
+	if err := event.Validate(); err != nil {
+		return AlertEvent{}, err
+	}
+	event.Labels = sanitizeDetails(event.Labels)
+	event.Evidence = sanitizeDetails(event.Evidence)
 	labels, err := marshalMap(event.Labels)
 	if err != nil {
 		return AlertEvent{}, err
@@ -100,8 +148,7 @@ func (r *PostgresRepository) PutEvent(ctx context.Context, event AlertEvent) (Al
 	if err != nil {
 		return AlertEvent{}, err
 	}
-	query := "INSERT INTO alert_events (id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, fingerprint) DO UPDATE SET labels = EXCLUDED.labels, evidence = EXCLUDED.evidence, state = EXCLUDED.state, last_seen = EXCLUDED.last_seen, firing_at = EXCLUDED.firing_at, acknowledged_at = EXCLUDED.acknowledged_at, resolved_at = EXCLUDED.resolved_at, last_actor = EXCLUDED.last_actor RETURNING " + eventColumnsSQL
-	return scanEvent(r.db.QueryRowContext(ctx, query, event.ID, event.Scope.TenantID, event.Scope.ProjectID, event.RuleID, event.Fingerprint, labels, evidence, event.State, event.FirstSeen, event.LastSeen, nullableTimestamp(event.FiringAt), nullableTimestamp(event.AcknowledgedAt), nullableTimestamp(event.ResolvedAt), event.LastActor))
+	return scanEvent(database.QueryRowContext(ctx, query, event.ID, event.Scope.TenantID, event.Scope.ProjectID, event.RuleID, event.Fingerprint, labels, evidence, event.State, event.FirstSeen, event.LastSeen, nullableTimestamp(event.FiringAt), nullableTimestamp(event.AcknowledgedAt), nullableTimestamp(event.ResolvedAt), event.LastActor))
 }
 
 func (r *PostgresRepository) FindEventByFingerprint(ctx context.Context, scope Scope, fingerprint string) (AlertEvent, bool, error) {
@@ -160,11 +207,23 @@ func (r *PostgresRepository) ListEvents(ctx context.Context, scope Scope, filter
 }
 
 func (r *PostgresRepository) AppendAudit(ctx context.Context, record AuditRecord) error {
-	if err := record.Scope.Validate(); err != nil {
+	return appendAudit(ctx, r.db, record)
+}
+
+type contextExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func appendAudit(ctx context.Context, database contextExecer, record AuditRecord) error {
+	record = sanitizeAuditRecord(record)
+	if err := record.Validate(); err != nil {
 		return err
 	}
-	query := "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"
-	_, err := r.db.ExecContext(ctx, query, record.ID, record.Scope.TenantID, record.Scope.ProjectID, record.Actor, record.Action, record.TargetID, record.OccurredAt)
+	details, err := marshalMap(record.Details)
+	if err != nil {
+		return err
+	}
+	_, err = database.ExecContext(ctx, auditInsertSQL, record.ID, record.Scope.TenantID, record.Scope.ProjectID, record.Actor, record.Action, record.TargetID, record.OccurredAt, details)
 	return err
 }
 
@@ -246,3 +305,6 @@ func nullableTimestamp(value time.Time) any {
 	}
 	return value
 }
+
+var _ Repository = (*PostgresRepository)(nil)
+var _ AuditWriter = (*PostgresRepository)(nil)
