@@ -24,11 +24,12 @@ func TestMetricStoreQueryFiltersScopeMetricLabelsAndWindow(t *testing.T) {
 
 	from := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
 	to := from.Add(time.Hour)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT tenant_id, project_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT tenant_id, project_id, agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC")).
 		WithArgs("t1", "p1", "db.connections", from, to).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "metric", "labels", "value", "sampled_at"}).
-			AddRow("t1", "p1", "db.connections", []byte(`{"instance":"db-1","role":"primary"}`), 12.0, from.Add(time.Minute)).
-			AddRow("t1", "p1", "db.connections", []byte(`{"instance":"db-2"}`), 20.0, from.Add(2*time.Minute)))
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "agent_id", "metric", "labels", "value", "sampled_at"}).
+			AddRow("t1", "p1", "agent-a", "db.connections", []byte(`{"instance":"db-1","role":"primary"}`), 12.0, from.Add(time.Minute)).
+			AddRow("t1", "p1", "agent-b", "db.connections", []byte(`{"instance":"db-1","role":"primary"}`), 13.0, from.Add(time.Minute)).
+			AddRow("t1", "p1", "agent-a", "db.connections", []byte(`{"instance":"db-2"}`), 20.0, from.Add(2*time.Minute)))
 
 	samples, err := alert.NewPostgresRepository(db).Query(context.Background(), alert.MetricQuery{
 		Scope:  alert.Scope{TenantID: "t1", ProjectID: "p1"},
@@ -38,8 +39,9 @@ func TestMetricStoreQueryFiltersScopeMetricLabelsAndWindow(t *testing.T) {
 		Labels: map[string]string{"instance": "db-1"},
 	})
 	require.NoError(t, err)
-	require.Len(t, samples, 1)
+	require.Len(t, samples, 2)
 	require.Equal(t, "db-1", samples[0].InstanceID)
+	require.Equal(t, []string{"agent-a", "agent-b"}, []string{samples[0].AgentID, samples[1].AgentID})
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -56,20 +58,52 @@ func TestMetricStoreAppendUsesScopedSeriesIdentityAndCanonicalLabels(t *testing.
 	sampledAt := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
 	sample := alert.MetricSample{
 		Scope:     alert.Scope{TenantID: "t1", ProjectID: "p1"},
+		AgentID:   "agent-a",
 		Name:      "db.connections",
 		Labels:    map[string]string{"role": "primary", "instance": "db-1"},
 		Value:     12,
 		SampledAt: sampledAt,
 	}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING")).
-		WithArgs("t1", "p1", "db.connections", alert.SeriesFingerprint(sample.Labels), canonicalJSON(`{"instance":"db-1","role":"primary"}`), 12.0, sampledAt).
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+		WithArgs("t1", "p1", "agent-a", "db.connections", agentSeriesFingerprint("agent-a", sample.Labels), canonicalJSON(`{"instance":"db-1","role":"primary"}`), 12.0, sampledAt).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+		WithArgs("t1", "p1", "agent-b", "db.connections", agentSeriesFingerprint("agent-b", sample.Labels), canonicalJSON(`{"instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
-	err = alert.NewPostgresRepository(db).Append(context.Background(), []alert.MetricSample{sample})
+	otherAgent := sample
+	otherAgent.AgentID = "agent-b"
+	err = alert.NewPostgresRepository(db).Append(context.Background(), []alert.MetricSample{sample, otherAgent})
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func canonicalJSON(value string) driver.Value { return []byte(value) }
+
+func agentSeriesFingerprint(agentID string, labels map[string]string) string {
+	return alert.SeriesFingerprint(map[string]string{"agent_id": agentID, "instance": labels["instance"], "role": labels["role"]})
+}
+
+func TestMetricStoreQueryDoesNotTreatMissingLabelAsEmptyValue(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		require.NoError(t, db.Close())
+	})
+	from := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	to := from.Add(time.Hour)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT tenant_id, project_id, agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC")).
+		WithArgs("t1", "p1", "db.connections", from, to).
+		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "agent_id", "metric", "labels", "value", "sampled_at"}).
+			AddRow("t1", "p1", "agent-a", "db.connections", []byte(`{"instance":""}`), 12.0, from.Add(time.Minute)).
+			AddRow("t1", "p1", "agent-b", "db.connections", []byte(`{"role":"primary"}`), 13.0, from.Add(time.Minute)))
+
+	samples, err := alert.NewPostgresRepository(db).Query(context.Background(), alert.MetricQuery{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, Name: "db.connections", Labels: map[string]string{"instance": ""}, From: from, To: to})
+	require.NoError(t, err)
+	require.Len(t, samples, 1)
+	require.Equal(t, "agent-a", samples[0].AgentID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}

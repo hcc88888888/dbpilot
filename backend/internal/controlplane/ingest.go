@@ -18,10 +18,18 @@ import (
 )
 
 var (
-	ErrMetricScopeClaim   = errors.New("metric payload scope claim is prohibited")
-	ErrInvalidMetricBatch = errors.New("invalid metric batch")
+	ErrMetricScopeClaim   = metricValidationError("metric payload scope claim is prohibited")
+	ErrInvalidMetricBatch = metricValidationError("invalid metric batch")
 	metricLabelKey        = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 )
+
+type metricValidationError string
+
+func (e metricValidationError) Error() string { return string(e) }
+
+// IsMetricBatchValidation marks malformed and identity-claim payload errors
+// without exposing control-plane implementation details to ingest.
+func (metricValidationError) IsMetricBatchValidation() bool { return true }
 
 // AgentScopeResolver derives the only permissible tenant/project assignment
 // from authenticated Agent inventory.
@@ -78,6 +86,9 @@ func (c *MetricConsumer) ConsumeMetricBatch(ctx context.Context, agentID string,
 			return fmt.Errorf("%w: labels", ErrInvalidMetricBatch)
 		}
 		for key := range input.Labels {
+			if isIdentityClaim(key) {
+				return ErrMetricScopeClaim
+			}
 			if !metricLabelKey.MatchString(key) {
 				return fmt.Errorf("%w: invalid label key", ErrInvalidMetricBatch)
 			}

@@ -3,6 +3,7 @@ package controlplane_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,6 +16,20 @@ func TestMetricConsumerRejectsPayloadScopeClaim(t *testing.T) {
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
 	err := consumer.ConsumeMetricBatch(context.Background(), "agent-a", []byte(`{"tenant_id":"other","samples":[]}`), time.Now().UTC())
 	require.ErrorContains(t, err, "scope claim")
+}
+
+func TestMetricConsumerRejectsReservedIdentityClaimsAtEveryPayloadLevel(t *testing.T) {
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	now := time.Now().UTC()
+	for _, name := range []string{"tenant_id", "project_id", "agent_id", "tenant", "project", "agent", "scope"} {
+		for _, level := range []string{"envelope", "sample", "labels"} {
+			t.Run(level+"/"+name, func(t *testing.T) {
+				payload := identityClaimPayload(level, name)
+				err := consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+				require.ErrorContains(t, err, "scope claim")
+			})
+		}
+	}
 }
 
 func TestMetricConsumerResolvesScopeAndNormalizesMetricSample(t *testing.T) {
@@ -84,4 +99,15 @@ func (r agentResolver) ScopeForAgent(_ context.Context, agentID string) (alert.S
 		return alert.Scope{}, errors.New("agent scope not found")
 	}
 	return scope, nil
+}
+
+func identityClaimPayload(level, name string) []byte {
+	switch level {
+	case "envelope":
+		return []byte(fmt.Sprintf(`{"%s":"spoofed","samples":[]}`, name))
+	case "sample":
+		return []byte(fmt.Sprintf(`{"samples":[{"%s":"spoofed","name":"db.connections","value":1,"sampled_at":"2026-08-26T09:59:00Z","labels":{}}]}`, name))
+	default:
+		return []byte(fmt.Sprintf(`{"samples":[{"name":"db.connections","value":1,"sampled_at":"2026-08-26T09:59:00Z","labels":{"%s":"spoofed"}}]}`, name))
+	}
 }

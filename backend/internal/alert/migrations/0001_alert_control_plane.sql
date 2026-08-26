@@ -112,12 +112,13 @@ CREATE INDEX alert_audit_log_scope_occurred_idx ON alert_audit_log (tenant_id, p
 CREATE TABLE metric_samples (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
     metric TEXT NOT NULL,
     series_fingerprint TEXT NOT NULL,
     labels JSONB NOT NULL DEFAULT '{}'::jsonb,
     value DOUBLE PRECISION NOT NULL,
     sampled_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (tenant_id, project_id, metric, series_fingerprint, sampled_at)
+    PRIMARY KEY (tenant_id, project_id, agent_id, metric, series_fingerprint, sampled_at)
 ) PARTITION BY RANGE (sampled_at);
 
 DO $$

@@ -92,6 +92,24 @@ func TestSendPendingRetriesUntypedResourceExhaustion(t *testing.T) {
 	assert.GreaterOrEqual(t, len(api.sent), 2)
 }
 
+func TestSendPendingRetriesUnavailableMetricIngestFailure(t *testing.T) {
+	store := &fakeStore{pending: map[spool.DataClass][]spool.Batch{spool.Metric: {testBatch("metric-unavailable", time.Now())}}}
+	api := &fakeIngest{err: status.Error(codes.Unavailable, "metric batch processing is temporarily unavailable")}
+	client := NewClient(api, store, "agent-a")
+	client.initialBackoff = time.Millisecond
+	client.maxBackoff = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := client.SendPending(ctx)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NotErrorIs(t, err, ErrPermanentRejection)
+	assert.Empty(t, store.acks)
+	assert.Empty(t, store.findings)
+	assert.GreaterOrEqual(t, len(api.sent), 2)
+}
+
 func TestSendPendingRetainsBatchForMalformedAcceptedAcknowledgement(t *testing.T) {
 	store := &fakeStore{pending: map[spool.DataClass][]spool.Batch{spool.Log: {testBatch("expected", time.Now())}}}
 	api := &fakeIngest{acks: map[string]*telemetryv1.BatchAck{"expected": {BatchId: "different", Accepted: true}}}

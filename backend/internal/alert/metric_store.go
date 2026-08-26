@@ -43,8 +43,8 @@ type MetricStore interface {
 	Query(context.Context, MetricQuery) ([]MetricSample, error)
 }
 
-const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING"
-const metricQuerySQL = "SELECT tenant_id, project_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC"
+const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING"
+const metricQuerySQL = "SELECT tenant_id, project_id, agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC"
 
 // Append writes an entire batch transactionally. Replayed samples are safe:
 // the table's scoped series/timestamp key makes the insert idempotent.
@@ -68,7 +68,7 @@ func (r *PostgresRepository) Append(ctx context.Context, samples []MetricSample)
 		if err != nil {
 			return fmt.Errorf("encode metric labels: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, metricInsertSQL, sample.Scope.TenantID, sample.Scope.ProjectID, sample.Name, SeriesFingerprint(sample.Labels), labels, sample.Value, sample.SampledAt); err != nil {
+		if _, err := tx.ExecContext(ctx, metricInsertSQL, sample.Scope.TenantID, sample.Scope.ProjectID, sample.AgentID, sample.Name, metricSeriesFingerprint(sample.AgentID, sample.Labels), labels, sample.Value, sample.SampledAt); err != nil {
 			return err
 		}
 	}
@@ -91,7 +91,7 @@ func (r *PostgresRepository) Query(ctx context.Context, query MetricQuery) ([]Me
 	for rows.Next() {
 		var sample MetricSample
 		var labels []byte
-		if err := rows.Scan(&sample.Scope.TenantID, &sample.Scope.ProjectID, &sample.Name, &labels, &sample.Value, &sample.SampledAt); err != nil {
+		if err := rows.Scan(&sample.Scope.TenantID, &sample.Scope.ProjectID, &sample.AgentID, &sample.Name, &labels, &sample.Value, &sample.SampledAt); err != nil {
 			return nil, err
 		}
 		if err := unmarshalMap(labels, &sample.Labels); err != nil {
@@ -109,7 +109,7 @@ func (r *PostgresRepository) Query(ctx context.Context, query MetricQuery) ([]Me
 }
 
 func validateMetricSample(sample MetricSample) error {
-	if sample.Scope.Validate() != nil || strings.TrimSpace(sample.Name) == "" || sample.SampledAt.IsZero() || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
+	if sample.Scope.Validate() != nil || strings.TrimSpace(sample.AgentID) == "" || strings.TrimSpace(sample.Name) == "" || sample.SampledAt.IsZero() || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
 		return ErrInvalidMetricSample
 	}
 	return nil
@@ -124,11 +124,21 @@ func validateMetricQuery(query MetricQuery) error {
 
 func labelsMatch(actual, expected map[string]string) bool {
 	for key, value := range expected {
-		if actual[key] != value {
+		actualValue, ok := actual[key]
+		if !ok || actualValue != value {
 			return false
 		}
 	}
 	return true
+}
+
+func metricSeriesFingerprint(agentID string, labels map[string]string) string {
+	seriesLabels := make(map[string]string, len(labels)+1)
+	for key, value := range labels {
+		seriesLabels[key] = value
+	}
+	seriesLabels["agent_id"] = agentID
+	return SeriesFingerprint(seriesLabels)
 }
 
 func populateMetricIdentity(sample *MetricSample) {

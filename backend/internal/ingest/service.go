@@ -116,7 +116,7 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 		return nil, status.Error(codes.InvalidArgument, "batch checksum is invalid")
 	}
 	if s.dedup == nil {
-		return nil, status.Error(codes.Internal, "batch deduplicator is unavailable")
+		return nil, status.Error(codes.Unavailable, "batch deduplicator is temporarily unavailable")
 	}
 	s.dedupMu.Lock()
 	defer s.dedupMu.Unlock()
@@ -125,7 +125,7 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	}
 	if metricConsumer != nil {
 		if err := metricConsumer.ConsumeMetricBatch(ctx, authenticatedAgentID, payload, time.Now().UTC()); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "metric batch rejected: %v", err)
+			return nil, metricConsumerFailure(err)
 		}
 	}
 	ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
@@ -135,6 +135,40 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	s.receivedMu.Unlock()
 	return ack, nil
 }
+
+type metricBatchValidationFailure interface {
+	error
+	IsMetricBatchValidation() bool
+}
+
+func metricConsumerFailure(err error) error {
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return sanitizedMetricConsumerError(codes.Canceled, "metric batch processing canceled", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return sanitizedMetricConsumerError(codes.DeadlineExceeded, "metric batch processing deadline exceeded", err)
+	}
+	var validation metricBatchValidationFailure
+	if errors.As(err, &validation) && validation.IsMetricBatchValidation() {
+		return sanitizedMetricConsumerError(codes.InvalidArgument, "metric batch is invalid", err)
+	}
+	return sanitizedMetricConsumerError(codes.Unavailable, "metric batch processing is temporarily unavailable", err)
+}
+
+// metricConsumerStatusError keeps the original cause available to local
+// observability while GRPCStatus exposes only a stable, non-sensitive message.
+type metricConsumerStatusError struct {
+	status *status.Status
+	cause  error
+}
+
+func sanitizedMetricConsumerError(code codes.Code, message string, cause error) error {
+	return &metricConsumerStatusError{status: status.New(code, message), cause: cause}
+}
+
+func (e *metricConsumerStatusError) Error() string              { return e.status.Err().Error() }
+func (e *metricConsumerStatusError) Unwrap() error              { return e.cause }
+func (e *metricConsumerStatusError) GRPCStatus() *status.Status { return e.status }
 
 func (s *Service) authorize(ctx context.Context, claimedAgentID string) (string, error) {
 	authenticatedAgentID, err := verifiedSPIFFEAgent(ctx)

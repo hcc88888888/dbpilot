@@ -99,8 +99,72 @@ func TestIngestDoesNotAcceptMetricBatchWhenConsumerFails(t *testing.T) {
 	batch := validMetricBatch("metric-failure", "agent-a", []byte(`{"samples":[]}`))
 
 	_, err := service.PushMetricBatch(ctx, batch)
-	require.ErrorContains(t, err, "metric store unavailable")
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, "metric batch processing is temporarily unavailable", status.Convert(err).Message())
 	require.Empty(t, service.ReceivedBatches())
+}
+
+func TestIngestMapsMetricValidationToSanitizedInvalidArgument(t *testing.T) {
+	consumer := &metricConsumerSpy{err: metricValidationFailure{}}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	_, err := service.PushMetricBatch(contextWithSPIFFEAgent(t, "agent-a"), validMetricBatch("metric-invalid", "agent-a", []byte(`{"samples":[]}`)))
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, "metric batch is invalid", status.Convert(err).Message())
+}
+
+func TestIngestMapsOperationalMetricFailureToSanitizedUnavailable(t *testing.T) {
+	rawCause := errors.New("postgres://operator:secret@database.internal:5432/alerts unavailable")
+	consumer := &metricConsumerSpy{err: rawCause}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	_, err := service.PushMetricBatch(contextWithSPIFFEAgent(t, "agent-a"), validMetricBatch("metric-unavailable", "agent-a", []byte(`{"samples":[]}`)))
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, "metric batch processing is temporarily unavailable", status.Convert(err).Message())
+	require.NotContains(t, status.Convert(err).Message(), "database.internal")
+	require.ErrorIs(t, err, rawCause)
+	require.Empty(t, service.ReceivedBatches())
+}
+
+func TestIngestPreservesMetricConsumerCancellationAndDeadline(t *testing.T) {
+	for _, want := range []codes.Code{codes.Canceled, codes.DeadlineExceeded} {
+		t.Run(want.String(), func(t *testing.T) {
+			consumerErr := context.Canceled
+			if want == codes.DeadlineExceeded {
+				consumerErr = context.DeadlineExceeded
+			}
+			service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), &metricConsumerSpy{err: consumerErr})
+			_, err := service.PushMetricBatch(contextWithSPIFFEAgent(t, "agent-a"), validMetricBatch("metric-"+want.String(), "agent-a", []byte(`{"samples":[]}`)))
+			require.Equal(t, want, status.Code(err))
+		})
+	}
+}
+
+func TestIngestNeverCallsMetricConsumerBeforeTLSAndChecksumValidation(t *testing.T) {
+	consumer := &metricConsumerSpy{}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	valid := validMetricBatch("metric-validate", "agent-a", []byte(`{"samples":[]}`))
+	_, err := service.PushMetricBatch(contextWithUnverifiedSPIFFEAgent(t, "agent-a"), valid)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	invalidChecksum := validMetricBatch("metric-checksum", "agent-a", []byte(`{"samples":[]}`))
+	invalidChecksum.Checksum = []byte("bad")
+	_, err = service.PushMetricBatch(contextWithSPIFFEAgent(t, "agent-a"), invalidChecksum)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, 0, consumer.calls)
+}
+
+func TestIngestRetriesMetricConsumerAfterFirstFailure(t *testing.T) {
+	consumer := &scriptedMetricConsumer{errors: []error{errors.New("temporary store failure"), nil}}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	ctx := contextWithSPIFFEAgent(t, "agent-a")
+	batch := validMetricBatch("metric-retry", "agent-a", []byte(`{"samples":[]}`))
+	_, err := service.PushMetricBatch(ctx, batch)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	ack, err := service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	require.True(t, ack.Accepted)
+	require.Equal(t, 2, consumer.calls)
+	require.Len(t, service.ReceivedBatches(), 1)
 }
 
 func TestIngestDeduplicatesConcurrentRequestsAtomically(t *testing.T) {
@@ -184,6 +248,22 @@ type metricConsumerSpy struct {
 func (c *metricConsumerSpy) ConsumeMetricBatch(context.Context, string, []byte, time.Time) error {
 	c.calls++
 	return c.err
+}
+
+type metricValidationFailure struct{}
+
+func (metricValidationFailure) Error() string                 { return "untrusted raw validation detail" }
+func (metricValidationFailure) IsMetricBatchValidation() bool { return true }
+
+type scriptedMetricConsumer struct {
+	errors []error
+	calls  int
+}
+
+func (c *scriptedMetricConsumer) ConsumeMetricBatch(context.Context, string, []byte, time.Time) error {
+	err := c.errors[c.calls]
+	c.calls++
+	return err
 }
 
 func newMemoryDedup() *memoryDedup { return &memoryDedup{acks: make(map[string]*telemetryv1.BatchAck)} }
