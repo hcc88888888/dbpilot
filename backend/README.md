@@ -127,3 +127,47 @@ For a manually managed environment, set `DBPILOT_DB_INTEGRATION=1`,
 ./internal/database`. The test only uses pre-registered metric templates and
 resolves credentials through the runtime `secret://integration/...` boundary;
 do not put credentials in telemetry policy documents or logs.
+
+## HBase dependency observability runtime
+
+The Agent can register trusted `hbase`, `hdfs`, and `zookeeper` component
+definitions through `agent.DependencyCollectorConfig`. Definitions use only
+allowlisted read-only `/jmx` (or the ZooKeeper read-only monitor compatibility
+path) endpoints and canonical runtime Secret/TLS references. The collector
+resolves HBase dependency IDs before collection, registers HDFS and ZooKeeper
+before HBase, applies bounded request deadlines and exponential retry, and
+runs under the Agent lifecycle. Shutdown closes these adapters before the
+existing telemetry engine stops and before the spool is sealed.
+
+Each collection writes a deterministic JSON envelope to the existing metric
+spool. It includes normalized samples, per-component `ok`/`partial`/`failed`
+status events, role-level health, and correlation-only dependency evidence.
+The batch ID is derived from canonical envelope content and collection time,
+so replay of the same collection after reopening the spool is idempotent.
+Endpoint URLs, response bodies, credentials, and TLS material are excluded
+from the envelope and status errors.
+
+The disposable Compose fixture uses three authenticated static JMX services on
+one dedicated bridge network. It publishes no host ports, runs the fixtures
+read-only without Linux capabilities, and health-checks every service. Run the
+Windows verifier from `backend`:
+
+```powershell
+powershell -File .\scripts\verify-hbase-dependencies.ps1 `
+  -DockerBinary "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe" `
+  -GoBinary 'C:\absolute\path\to\go.exe'
+```
+
+By default the script also builds a static Linux integration-test binary and
+runs the real JMX→adapter→topology→Agent spool path inside the approved
+`cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` Kylin V10 image. Pass a
+different approved image with `-KylinImage`; use `-SkipKylin` only for a local
+Docker fixture check. Every exit path removes the Kylin container, Compose
+containers, networks, and disposable Go cache volumes, and reports cleanup
+failures.
+
+This fixture proves parser/contract and Agent runtime-path behavior; its static
+JMX services are not full HBase, HDFS, or ZooKeeper distributions. A production
+endpoint-to-endpoint support claim still requires matching-version clusters and
+Kylin V10 VM or bare-metal evidence with real service health, networking, and
+credentials.

@@ -139,6 +139,24 @@ func TestRuntimeShutsDownInReceiverSealFlushCloseOrder(t *testing.T) {
 	require.Equal(t, []string{"stop", "seal", "flush", "close"}, events.Values())
 }
 
+func TestRuntimeRunsAndClosesComponentCollectorBeforeSpoolSeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	stored := signedEnvelope(1)
+	events := &eventLog{}
+	componentCollector := &fakeComponentCollector{events: events, onRun: cancel}
+	runtime := NewRuntime(Dependencies{
+		AgentID: "agent-a", PolicySource: &fakePolicySource{err: errors.New("offline")}, PolicyVerifier: fakeVerifier{},
+		Engine: &fakeEngine{events: events}, Store: &fakeStore{stored: &stored, events: events},
+		Exporter: &fakeExporter{}, HealthReporter: &fakeReporter{}, ComponentCollector: componentCollector,
+	})
+
+	require.NoError(t, runtime.Run(ctx))
+	require.True(t, componentCollector.Ran())
+	values := events.Values()
+	require.Less(t, eventIndex(values, "component-close"), eventIndex(values, "seal"))
+}
+
 func signedEnvelope(version uint64) policy.SignatureEnvelope {
 	return policy.SignatureEnvelope{Policy: policy.Policy{
 		AgentID: "agent-a", Version: version, IssuedAt: time.Now().Add(-time.Minute), ExpiresAt: time.Now().Add(time.Hour),
@@ -298,6 +316,45 @@ func (e *fakeExporter) Calls() int { e.mu.Lock(); defer e.mu.Unlock(); return e.
 type fakeReporter struct {
 	mu       sync.Mutex
 	statuses []PolicyStatus
+}
+
+type fakeComponentCollector struct {
+	mu     sync.Mutex
+	events *eventLog
+	onRun  func()
+	ran    bool
+}
+
+func (collector *fakeComponentCollector) Run(ctx context.Context) error {
+	collector.mu.Lock()
+	collector.ran = true
+	collector.mu.Unlock()
+	collector.events.Add("component-run")
+	if collector.onRun != nil {
+		collector.onRun()
+	}
+	<-ctx.Done()
+	return nil
+}
+
+func (collector *fakeComponentCollector) Close() error {
+	collector.events.Add("component-close")
+	return nil
+}
+
+func (collector *fakeComponentCollector) Ran() bool {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return collector.ran
+}
+
+func eventIndex(values []string, expected string) int {
+	for index, value := range values {
+		if value == expected {
+			return index
+		}
+	}
+	return len(values)
 }
 
 func (r *fakeReporter) Report(_ context.Context, status PolicyStatus) error {

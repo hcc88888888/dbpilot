@@ -1,0 +1,83 @@
+name: dbpilot-hbase-dependencies
+
+x-jmx-fixture: &jmx-fixture
+  image: python:3.13-alpine
+  command: ["python", "/fixture/jmx_fixture.py"]
+  environment:
+    DBPILOT_FIXTURE_TOKEN: dbpilot-fixture-read-only
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  user: "65532:65532"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  networks: [hbase-dependencies]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os,urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/health',headers={'Authorization':'Bearer '+os.environ['DBPILOT_FIXTURE_TOKEN']}); assert urllib.request.urlopen(request,timeout=2).status == 200"]
+    interval: 2s
+    timeout: 3s
+    retries: 20
+    start_period: 2s
+
+services:
+  hbase-jmx:
+    <<: *jmx-fixture
+    environment:
+      DBPILOT_FIXTURE_TOKEN: dbpilot-fixture-read-only
+      DBPILOT_FIXTURE_FILE: /fixture/hbase-jmx.json
+    volumes:
+      - ./fixtures:/fixture:ro
+
+  hdfs-jmx:
+    <<: *jmx-fixture
+    environment:
+      DBPILOT_FIXTURE_TOKEN: dbpilot-fixture-read-only
+      DBPILOT_FIXTURE_FILE: /fixture/hdfs-jmx.json
+    volumes:
+      - ./fixtures:/fixture:ro
+
+  zookeeper-jmx:
+    <<: *jmx-fixture
+    environment:
+      DBPILOT_FIXTURE_TOKEN: dbpilot-fixture-read-only
+      DBPILOT_FIXTURE_FILE: /fixture/zookeeper-jmx.json
+    volumes:
+      - ./fixtures:/fixture:ro
+
+  collector-tests:
+    image: golang:1.25-bookworm
+    depends_on:
+      hbase-jmx: {condition: service_healthy}
+      hdfs-jmx: {condition: service_healthy}
+      zookeeper-jmx: {condition: service_healthy}
+    environment:
+      DBPILOT_HBASE_DEPENDENCY_INTEGRATION: "1"
+      DBPILOT_HBASE_JMX_URL: http://hbase-jmx:8000/jmx
+      DBPILOT_HDFS_JMX_URL: http://hdfs-jmx:8000/jmx
+      DBPILOT_ZOOKEEPER_JMX_URL: http://zookeeper-jmx:8000/jmx
+      DBPILOT_HBASE_DEPENDENCY_TOKEN: dbpilot-fixture-read-only
+      GOCACHE: /gocache
+      GOMODCACHE: /gomodcache
+      GOTMPDIR: /gotmp
+    command: ["/bin/sh", "-ec", "timeout $${DBPILOT_TEST_TIMEOUT_SECONDS:-120}s go test ./internal/database -run '^TestDependencyCollectorPersistsRealJMXSamplesEvidenceAndRestartSafeID$$' -count=1 -timeout 90s"]
+    working_dir: /workspace
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [hbase-dependencies]
+    volumes:
+      - ../..:/workspace:ro
+      - go-build-cache:/gocache
+      - go-module-cache:/gomodcache
+      - go-temp:/gotmp
+
+networks:
+  hbase-dependencies:
+    driver: bridge
+
+volumes:
+  go-build-cache:
+  go-module-cache:
+  go-temp:

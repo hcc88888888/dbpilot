@@ -73,6 +73,13 @@ type Exporter interface {
 	SendPending(context.Context) error
 }
 
+// ComponentCollector owns non-SQL component collection while Runtime owns its
+// process lifecycle. Collection results are written directly to the spool.
+type ComponentCollector interface {
+	Run(context.Context) error
+	Close() error
+}
+
 // PolicyStatus is a local, typed representation of the status reported to
 // DBPilot. A transport adapter can map it to the protobuf contract.
 type PolicyStatus struct {
@@ -92,13 +99,14 @@ type HealthReporter interface {
 // Dependencies makes runtime ownership explicit and keeps the supervisor
 // independently testable from gRPC and collector component implementations.
 type Dependencies struct {
-	AgentID        string
-	PolicySource   PolicySource
-	PolicyVerifier PolicyVerifier
-	Engine         Engine
-	Store          Store
-	Exporter       Exporter
-	HealthReporter HealthReporter
+	AgentID            string
+	PolicySource       PolicySource
+	PolicyVerifier     PolicyVerifier
+	Engine             Engine
+	Store              Store
+	Exporter           Exporter
+	HealthReporter     HealthReporter
+	ComponentCollector ComponentCollector
 
 	PollInterval     time.Duration
 	ExportInterval   time.Duration
@@ -161,7 +169,11 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workerCount := 2
+	if r.deps.ComponentCollector != nil {
+		workerCount++
+	}
+	workers.Add(workerCount)
 	go func() {
 		defer workers.Done()
 		r.policyLoop(runCtx)
@@ -170,6 +182,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 		defer workers.Done()
 		r.exportLoop(runCtx)
 	}()
+	if r.deps.ComponentCollector != nil {
+		go func() {
+			defer workers.Done()
+			_ = r.deps.ComponentCollector.Run(runCtx)
+		}()
+	}
 	<-runCtx.Done()
 	workers.Wait()
 	return r.shutdown()
@@ -278,6 +296,11 @@ func (r *Runtime) shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), r.deps.ShutdownTimeout)
 	defer cancel()
 	var errs []error
+	if r.deps.ComponentCollector != nil {
+		if err := r.deps.ComponentCollector.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close component collectors: %w", err))
+		}
+	}
 	if err := r.deps.Engine.Stop(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("stop receivers: %w", err))
 	}

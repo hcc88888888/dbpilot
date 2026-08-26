@@ -1,0 +1,1 @@
+{"beans":[{"name":"Hadoop:service=DataNode,name=FSDatasetState","Capacity":1000,"DfsUsed":950,"Remaining":50,"NumFailedVolumes":0,"NumBlocks":80},{"name":"Hadoop:service=DataNode,name=DataNodeInfo","xceiverCount":4},{"name":"Hadoop:service=DataNode,name=DataNodeActivity-port50010","BytesRead":100,"BytesWritten":200}]}
