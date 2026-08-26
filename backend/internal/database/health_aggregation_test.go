@@ -163,6 +163,56 @@ func TestBuildDependencyEvidenceUsesTriggerDimensionsDeterministically(t *testin
 	}
 }
 
+func TestBuildDependencyEvidenceUsesTriggerDimensionsForRemainingRules(t *testing.T) {
+	stamp := testTimestamp()
+	for _, test := range []struct {
+		name        string
+		role        string
+		samples     []MetricSample
+		rule        EvidenceRule
+		wantHost    string
+		wantDepHost string
+	}{
+		{
+			name: "ZooKeeper backlog", role: "regionserver", rule: EvidenceRegionServerBacklogZooKeeper, wantHost: "rs-trigger", wantDepHost: "zk-trigger",
+			samples: []MetricSample{metricWithDimensions("hbase-prod", HBaseComponent, "regionserver", "hbase.flush.queue_length", 101, "rs-trigger", stamp), metricWithDimensions("hbase-prod", HBaseComponent, "regionserver", "hbase.request.total_time", 1, "rs-later", stamp.Add(time.Hour)), metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.quorum.members", 1, "zk-trigger", stamp), metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1, "zk-later", stamp.Add(time.Hour))},
+		},
+		{
+			name: "HDFS WAL flush", role: "master", rule: EvidenceHDFSWALFlushRisk, wantHost: "", wantDepHost: "nn-trigger",
+			samples: []MetricSample{metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.under_replicated_blocks", 1, "nn-trigger", stamp), metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.missing_blocks", 0, "nn-later", stamp.Add(time.Hour))},
+		},
+		{
+			name: "ZooKeeper failover", role: "regionserver", rule: EvidenceZooKeeperFailoverRisk, wantHost: "", wantDepHost: "zk-trigger",
+			samples: []MetricSample{metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.outstanding_requests", 101, "zk-trigger", stamp), metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.sessions", 1, "zk-later", stamp.Add(time.Hour))},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, evidence := range BuildDependencyEvidence(mustTopology(t, test.role), test.samples) {
+				if evidence.Rule == test.rule {
+					if evidence.Host != test.wantHost || evidence.DependencyHost != test.wantDepHost || (test.wantHost != "" && evidence.SampleTime != stamp) || evidence.DependencySampleTime != stamp {
+						t.Fatalf("evidence = %#v, want triggering dimensions", evidence)
+					}
+					return
+				}
+			}
+			t.Fatalf("BuildDependencyEvidence() missing %q", test.rule)
+		})
+	}
+}
+
+func TestCapacityPressureRequiresOneHostInstanceTimestampPair(t *testing.T) {
+	stamp := testTimestamp()
+	used := metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.used", 95, "a", stamp)
+	totalDifferentHost := metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.capacity", 100, "b", stamp)
+	if capacityPressure([]MetricSample{used, totalDifferentHost}, "hdfs.datanode.used", "hdfs.datanode.capacity") {
+		t.Fatal("capacityPressure() matched capacity samples from different hosts")
+	}
+	total := metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.capacity", 100, "a", stamp)
+	if !capacityPressure([]MetricSample{used, total}, "hdfs.datanode.used", "hdfs.datanode.capacity") {
+		t.Fatal("capacityPressure() did not match one host/instance/timestamp pair")
+	}
+}
+
 func TestBuildDependencyEvidenceRejectsUnknownDataNodeIO(t *testing.T) {
 	evidence := BuildDependencyEvidence(mustTopology(t, "master"), []MetricSample{
 		sample("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 2000),
@@ -303,6 +353,12 @@ func testTimestamp() time.Time { return time.Unix(1_700_000_000, 0).UTC() }
 
 func sample(cluster string, component ComponentKind, role, metric string, value float64) MetricSample {
 	return MetricSample{Cluster: cluster, Component: string(component), Role: role, MetricName: metric, Value: value}
+}
+
+func metricWithDimensions(cluster string, component ComponentKind, role, metric string, value float64, host string, timestamp time.Time) MetricSample {
+	valueSample := sample(cluster, component, role, metric, value)
+	valueSample.Host, valueSample.Timestamp = host, timestamp
+	return valueSample
 }
 
 func findHealth(values []ComponentHealth, cluster string, component ComponentKind, role string) (ComponentHealth, bool) {

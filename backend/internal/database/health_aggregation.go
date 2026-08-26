@@ -147,20 +147,21 @@ func BuildDependencyEvidence(topology Topology, samples []MetricSample) []Depend
 		}
 		if hasZooKeeper && zooKeeperBacklogRisk(byCluster[zooKeeperID]) {
 			for _, role := range roles {
-				if role == hbaseRoleRegionServer && hasRequestBacklog(byCluster[node.ID][role]) {
-					addEvidence(evidence, node.ID, role, EvidenceRegionServerBacklogZooKeeper, zooKeeperID, byCluster[node.ID][role], flattenSamples(byCluster[zooKeeperID]))
+				backlog := requestBacklogSamples(byCluster[node.ID][role])
+				if role == hbaseRoleRegionServer && len(backlog) != 0 {
+					addEvidence(evidence, node.ID, role, EvidenceRegionServerBacklogZooKeeper, zooKeeperID, backlog, zooKeeperBacklogSamples(byCluster[zooKeeperID]))
 				}
 			}
 		}
 		if hasHDFS && hdfsWALFlushRisk(byCluster[hdfsID]) {
 			for _, role := range roles {
-				addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID, byCluster[node.ID][role], flattenSamples(byCluster[hdfsID]))
+				addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID, byCluster[node.ID][role], hdfsWALFlushRiskSamples(byCluster[hdfsID]))
 			}
 		}
 		if hasZooKeeper && zooKeeperFailoverRisk(byCluster[zooKeeperID]) {
 			for _, role := range roles {
 				if role == hbaseRoleRegionServer {
-					addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID, byCluster[node.ID][role], flattenSamples(byCluster[zooKeeperID]))
+					addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID, byCluster[node.ID][role], zooKeeperFailoverSamples(byCluster[zooKeeperID]))
 				}
 			}
 		}
@@ -268,7 +269,17 @@ func elevatedWriteLatencySamples(samples []MetricSample) []MetricSample {
 }
 
 func hasRequestBacklog(samples []MetricSample) bool {
-	return metricGreaterThan(samples, "hbase.flush.queue_length", requestBacklogThreshold) || metricGreaterThan(samples, "hbase.compaction.queue_length", requestBacklogThreshold) || metricGreaterThan(samples, "hbase.request.queue_time", writeLatencyThresholdMS)
+	return len(requestBacklogSamples(samples)) != 0
+}
+
+func requestBacklogSamples(samples []MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
+	for _, sample := range samples {
+		if (sample.MetricName == "hbase.flush.queue_length" || sample.MetricName == "hbase.compaction.queue_length") && sample.Value > requestBacklogThreshold || sample.MetricName == "hbase.request.queue_time" && sample.Value > writeLatencyThresholdMS {
+			result = append(result, sample)
+		}
+	}
+	return result
 }
 
 func hdfsDataNodeDiskOrIOPressure(roles map[string][]MetricSample) bool {
@@ -298,45 +309,72 @@ func hdfsDataNodePressureSamples(roles map[string][]MetricSample) []MetricSample
 }
 
 func hdfsWALFlushRisk(roles map[string][]MetricSample) bool {
-	for role, samples := range roles {
-		if role == hdfsRoleNameNode && (metricGreaterThan(samples, "hdfs.namenode.under_replicated_blocks", 0) || metricGreaterThan(samples, "hdfs.namenode.missing_blocks", 0) || metricGreaterThan(samples, "hdfs.namenode.corrupt_files", 0) || capacityPressure(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total")) {
-			return true
-		}
-	}
-	return false
+	return len(hdfsWALFlushRiskSamples(roles)) != 0
 }
 
-func zooKeeperBacklogRisk(roles map[string][]MetricSample) bool {
-	for _, samples := range roles {
+func hdfsWALFlushRiskSamples(roles map[string][]MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
+	for role, samples := range roles {
+		if role != hdfsRoleNameNode {
+			continue
+		}
 		for _, sample := range samples {
-			if (sample.MetricName == "zookeeper.sessions" && sample.Value <= 0) || (sample.MetricName == "zookeeper.quorum.members" && sample.Value <= 1) {
-				return true
+			if (sample.MetricName == "hdfs.namenode.under_replicated_blocks" || sample.MetricName == "hdfs.namenode.missing_blocks" || sample.MetricName == "hdfs.namenode.corrupt_files") && sample.Value > 0 {
+				result = append(result, sample)
+			}
+		}
+		if capacityPressure(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total") {
+			for _, sample := range samples {
+				if sample.MetricName == "hdfs.namenode.capacity_used" || sample.MetricName == "hdfs.namenode.capacity_total" {
+					result = append(result, sample)
+				}
 			}
 		}
 	}
-	return false
+	return result
+}
+
+func zooKeeperBacklogRisk(roles map[string][]MetricSample) bool {
+	return len(zooKeeperBacklogSamples(roles)) != 0
+}
+
+func zooKeeperBacklogSamples(roles map[string][]MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
+	for _, samples := range roles {
+		for _, sample := range samples {
+			if (sample.MetricName == "zookeeper.sessions" && sample.Value <= 0) || (sample.MetricName == "zookeeper.quorum.members" && sample.Value <= 1) {
+				result = append(result, sample)
+			}
+		}
+	}
+	return result
 }
 
 func zooKeeperFailoverRisk(roles map[string][]MetricSample) bool {
+	return len(zooKeeperFailoverSamples(roles)) != 0
+}
+
+func zooKeeperFailoverSamples(roles map[string][]MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
 	for _, samples := range roles {
 		for _, sample := range samples {
 			switch sample.MetricName {
 			case "zookeeper.sessions":
 				if sample.Value <= 0 {
-					return true
+					result = append(result, sample)
 				}
 			case "zookeeper.outstanding_requests":
 				if sample.Value > zooKeeperOutstandingThreshold {
-					return true
+					result = append(result, sample)
 				}
 			case "zookeeper.transaction_log.sync_time":
 				if sample.Value > zooKeeperLatencyThresholdMS {
-					return true
+					result = append(result, sample)
 				}
 			}
 		}
 	}
-	return false
+	return result
 }
 
 func zooKeeperComponentFailure(roles map[string][]MetricSample) bool {
@@ -443,18 +481,26 @@ func metricSampleLess(left, right MetricSample) bool {
 }
 
 func capacityPressure(samples []MetricSample, usedName, totalName string) bool {
-	used, total := 0.0, 0.0
+	type capacityPair struct {
+		used, total       float64
+		hasUsed, hasTotal bool
+	}
+	pairs := make(map[string]capacityPair)
 	for _, sample := range samples {
+		key := sample.Host + "\x00" + sample.Instance + "\x00" + sample.Timestamp.UTC().Format(time.RFC3339Nano)
+		pair := pairs[key]
 		switch sample.MetricName {
 		case usedName:
-			if sample.Value > used {
-				used = sample.Value
-			}
+			pair.used, pair.hasUsed = sample.Value, true
 		case totalName:
-			if sample.Value > total {
-				total = sample.Value
-			}
+			pair.total, pair.hasTotal = sample.Value, true
+		}
+		pairs[key] = pair
+	}
+	for _, pair := range pairs {
+		if pair.hasUsed && pair.hasTotal && pair.total > 0 && pair.used/pair.total >= diskPressureRatio {
+			return true
 		}
 	}
-	return total > 0 && used/total >= diskPressureRatio
+	return false
 }
