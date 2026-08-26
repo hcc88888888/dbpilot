@@ -200,6 +200,88 @@ func TestBuildDependencyEvidenceUsesTriggerDimensionsForRemainingRules(t *testin
 	}
 }
 
+func TestBuildDependencyEvidenceDependencyOnlyRulesExcludeUnrelatedHBaseSamples(t *testing.T) {
+	stamp := testTimestamp()
+	for _, test := range []struct {
+		name    string
+		role    string
+		rule    EvidenceRule
+		samples []MetricSample
+	}{
+		{
+			name: "HDFS WAL flush", role: "master", rule: EvidenceHDFSWALFlushRisk,
+			samples: []MetricSample{
+				metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.under_replicated_blocks", 1, "nn-trigger", stamp),
+				metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.request.total_time", 1, "hbase-later", stamp.Add(time.Hour)),
+			},
+		},
+		{
+			name: "ZooKeeper failover", role: "regionserver", rule: EvidenceZooKeeperFailoverRisk,
+			samples: []MetricSample{
+				metricWithDimensions("zk-prod", ZooKeeperComponent, "leader", "zookeeper.outstanding_requests", 101, "zk-trigger", stamp),
+				metricWithDimensions("hbase-prod", HBaseComponent, "regionserver", "hbase.request.total_time", 1, "hbase-later", stamp.Add(time.Hour)),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, evidence := range BuildDependencyEvidence(mustTopology(t, test.role), test.samples) {
+				if evidence.Rule != test.rule {
+					continue
+				}
+				if evidence.Host != "" || !evidence.SampleTime.IsZero() || evidence.DependencySampleTime != stamp {
+					t.Fatalf("evidence = %#v, want only dependency triggering dimensions", evidence)
+				}
+				return
+			}
+			t.Fatalf("BuildDependencyEvidence() missing %q", test.rule)
+		})
+	}
+}
+
+func TestBuildDependencyEvidenceCapacityEvidenceUsesTriggerPairDimensions(t *testing.T) {
+	stamp := testTimestamp()
+	for _, test := range []struct {
+		name     string
+		role     string
+		rule     EvidenceRule
+		samples  []MetricSample
+		wantHost string
+	}{
+		{
+			name: "DataNode pressure", role: "master", rule: EvidenceHBaseWriteLatencyHDFS, wantHost: "datanode-trigger",
+			samples: []MetricSample{
+				metricWithDimensions("hbase-prod", HBaseComponent, "master", "hbase.wal.sync_time", 2000, "hbase-trigger", stamp),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.used", 95, "datanode-trigger", stamp),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.capacity", 100, "datanode-trigger", stamp),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.used", 89, "datanode-later", stamp.Add(time.Hour)),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.capacity", 100, "datanode-later", stamp.Add(time.Hour)),
+			},
+		},
+		{
+			name: "NameNode WAL flush risk", role: "master", rule: EvidenceHDFSWALFlushRisk, wantHost: "namenode-trigger",
+			samples: []MetricSample{
+				metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.capacity_used", 95, "namenode-trigger", stamp),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.capacity_total", 100, "namenode-trigger", stamp),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.capacity_used", 89, "namenode-later", stamp.Add(time.Hour)),
+				metricWithDimensions("hdfs-prod", HDFSComponent, "namenode", "hdfs.namenode.capacity_total", 100, "namenode-later", stamp.Add(time.Hour)),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, evidence := range BuildDependencyEvidence(mustTopology(t, test.role), test.samples) {
+				if evidence.Rule != test.rule {
+					continue
+				}
+				if evidence.DependencyHost != test.wantHost || evidence.DependencySampleTime != stamp {
+					t.Fatalf("evidence = %#v, want triggering capacity pair dimensions", evidence)
+				}
+				return
+			}
+			t.Fatalf("BuildDependencyEvidence() missing %q", test.rule)
+		})
+	}
+}
+
 func TestCapacityPressureRequiresOneHostInstanceTimestampPair(t *testing.T) {
 	stamp := testTimestamp()
 	used := metricWithDimensions("hdfs-prod", HDFSComponent, "datanode", "hdfs.datanode.used", 95, "a", stamp)

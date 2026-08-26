@@ -153,15 +153,21 @@ func BuildDependencyEvidence(topology Topology, samples []MetricSample) []Depend
 				}
 			}
 		}
-		if hasHDFS && hdfsWALFlushRisk(byCluster[hdfsID]) {
-			for _, role := range roles {
-				addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID, byCluster[node.ID][role], hdfsWALFlushRiskSamples(byCluster[hdfsID]))
+		if hasHDFS {
+			walFlushRisk := hdfsWALFlushRiskSamples(byCluster[hdfsID])
+			if len(walFlushRisk) != 0 {
+				for _, role := range roles {
+					addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID, nil, walFlushRisk)
+				}
 			}
 		}
-		if hasZooKeeper && zooKeeperFailoverRisk(byCluster[zooKeeperID]) {
-			for _, role := range roles {
-				if role == hbaseRoleRegionServer {
-					addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID, byCluster[node.ID][role], zooKeeperFailoverSamples(byCluster[zooKeeperID]))
+		if hasZooKeeper {
+			failoverRisk := zooKeeperFailoverSamples(byCluster[zooKeeperID])
+			if len(failoverRisk) != 0 {
+				for _, role := range roles {
+					if role == hbaseRoleRegionServer {
+						addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID, nil, failoverRisk)
+					}
 				}
 			}
 		}
@@ -298,11 +304,7 @@ func hdfsDataNodePressureSamples(roles map[string][]MetricSample) []MetricSample
 			}
 		}
 		if capacityPressure(samples, "hdfs.datanode.used", "hdfs.datanode.capacity") {
-			for _, sample := range samples {
-				if sample.MetricName == "hdfs.datanode.used" || sample.MetricName == "hdfs.datanode.capacity" {
-					result = append(result, sample)
-				}
-			}
+			result = append(result, capacityPressureSamples(samples, "hdfs.datanode.used", "hdfs.datanode.capacity")...)
 		}
 	}
 	return result
@@ -324,11 +326,7 @@ func hdfsWALFlushRiskSamples(roles map[string][]MetricSample) []MetricSample {
 			}
 		}
 		if capacityPressure(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total") {
-			for _, sample := range samples {
-				if sample.MetricName == "hdfs.namenode.capacity_used" || sample.MetricName == "hdfs.namenode.capacity_total" {
-					result = append(result, sample)
-				}
-			}
+			result = append(result, capacityPressureSamples(samples, "hdfs.namenode.capacity_used", "hdfs.namenode.capacity_total")...)
 		}
 	}
 	return result
@@ -481,8 +479,12 @@ func metricSampleLess(left, right MetricSample) bool {
 }
 
 func capacityPressure(samples []MetricSample, usedName, totalName string) bool {
+	return len(capacityPressureSamples(samples, usedName, totalName)) != 0
+}
+
+func capacityPressureSamples(samples []MetricSample, usedName, totalName string) []MetricSample {
 	type capacityPair struct {
-		used, total       float64
+		used, total       MetricSample
 		hasUsed, hasTotal bool
 	}
 	pairs := make(map[string]capacityPair)
@@ -491,16 +493,18 @@ func capacityPressure(samples []MetricSample, usedName, totalName string) bool {
 		pair := pairs[key]
 		switch sample.MetricName {
 		case usedName:
-			pair.used, pair.hasUsed = sample.Value, true
+			pair.used, pair.hasUsed = sample, true
 		case totalName:
-			pair.total, pair.hasTotal = sample.Value, true
+			pair.total, pair.hasTotal = sample, true
 		}
 		pairs[key] = pair
 	}
+	result := make([]MetricSample, 0)
 	for _, pair := range pairs {
-		if pair.hasUsed && pair.hasTotal && pair.total > 0 && pair.used/pair.total >= diskPressureRatio {
-			return true
+		if pair.hasUsed && pair.hasTotal && pair.total.Value > 0 && pair.used.Value/pair.total.Value >= diskPressureRatio {
+			result = append(result, pair.used, pair.total)
 		}
 	}
-	return false
+	sort.Slice(result, func(i, j int) bool { return metricSampleLess(result[i], result[j]) })
+	return result
 }
