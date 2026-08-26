@@ -43,6 +43,10 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 	return &PostgresRepository{db: db}
 }
 
+func (r *PostgresRepository) NewID(prefix string) (string, error) {
+	return newControlPlaneID(prefix, nil)
+}
+
 func (r *PostgresRepository) CreateRule(ctx context.Context, rule AlertRule) (AlertRule, error) {
 	if err := rule.Validate(); err != nil {
 		return AlertRule{}, err
@@ -111,6 +115,10 @@ func (r *PostgresRepository) GetRule(ctx context.Context, scope Scope, id string
 		return AlertRule{}, ErrNotFound
 	}
 	return rule, err
+}
+
+func (r *PostgresRepository) DeleteRule(ctx context.Context, scope Scope, id string) error {
+	return r.deleteConfiguration(ctx, scope, id, "alert_rules", "rule.deleted")
 }
 
 func (r *PostgresRepository) PutEvent(ctx context.Context, event AlertEvent) (AlertEvent, error) {
@@ -302,6 +310,20 @@ func (r *PostgresRepository) FindEventByFingerprint(ctx context.Context, scope S
 	return event, err == nil, err
 }
 
+func (r *PostgresRepository) GetEvent(ctx context.Context, scope Scope, id string) (AlertEvent, error) {
+	if err := scope.Validate(); err != nil {
+		return AlertEvent{}, err
+	}
+	event, err := scanEvent(r.db.QueryRowContext(ctx, "SELECT "+eventColumnsSQL+" FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return AlertEvent{}, ErrNotFound
+	}
+	if err == nil && event.Scope != scope {
+		return AlertEvent{}, ErrInvalidScope
+	}
+	return event, err
+}
+
 func (r *PostgresRepository) ListEvents(ctx context.Context, scope Scope, filter EventFilter) ([]AlertEvent, error) {
 	if err := scope.Validate(); err != nil {
 		return nil, err
@@ -384,6 +406,9 @@ func (r *PostgresRepository) ListRuleEvents(ctx context.Context, scope Scope, ru
 		if scanErr != nil {
 			return nil, scanErr
 		}
+		if event.Scope != scope {
+			return nil, ErrInvalidScope
+		}
 		events = append(events, event)
 	}
 	return events, rows.Err()
@@ -457,6 +482,47 @@ func (r *PostgresRepository) UpdateNotificationTemplate(ctx context.Context, tem
 	return r.mutateNotificationTemplate(ctx, template, true)
 }
 
+func (r *PostgresRepository) ListNotificationTemplates(ctx context.Context, scope Scope) ([]NotificationTemplate, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT "+notificationTemplateColumnsSQL+" FROM notification_templates WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC", scope.TenantID, scope.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]NotificationTemplate, 0)
+	for rows.Next() {
+		value, scanErr := scanNotificationTemplate(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if value.Scope != scope {
+			return nil, ErrNotificationScopeMismatch
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (r *PostgresRepository) GetNotificationTemplate(ctx context.Context, scope Scope, id string) (NotificationTemplate, error) {
+	if err := scope.Validate(); err != nil {
+		return NotificationTemplate{}, err
+	}
+	value, err := scanNotificationTemplate(r.db.QueryRowContext(ctx, "SELECT "+notificationTemplateColumnsSQL+" FROM notification_templates WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return NotificationTemplate{}, ErrNotFound
+	}
+	if err == nil && value.Scope != scope {
+		return NotificationTemplate{}, ErrNotificationScopeMismatch
+	}
+	return value, err
+}
+
+func (r *PostgresRepository) DeleteNotificationTemplate(ctx context.Context, scope Scope, id string) error {
+	return r.deleteConfiguration(ctx, scope, id, "notification_templates", "template.deleted")
+}
+
 func (r *PostgresRepository) mutateNotificationTemplate(ctx context.Context, template NotificationTemplate, update bool) (NotificationTemplate, error) {
 	if err := validateNotificationTemplate(template); err != nil {
 		return NotificationTemplate{}, err
@@ -504,6 +570,47 @@ func (r *PostgresRepository) CreateNotificationPolicy(ctx context.Context, polic
 
 func (r *PostgresRepository) UpdateNotificationPolicy(ctx context.Context, policy NotificationPolicy) (NotificationPolicy, error) {
 	return r.mutateNotificationPolicy(ctx, policy, true)
+}
+
+func (r *PostgresRepository) ListNotificationPolicies(ctx context.Context, scope Scope) ([]NotificationPolicy, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT "+notificationPolicyColumnsSQL+" FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC", scope.TenantID, scope.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]NotificationPolicy, 0)
+	for rows.Next() {
+		value, scanErr := scanNotificationPolicy(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if value.Scope != scope {
+			return nil, ErrNotificationScopeMismatch
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (r *PostgresRepository) GetNotificationPolicy(ctx context.Context, scope Scope, id string) (NotificationPolicy, error) {
+	if err := scope.Validate(); err != nil {
+		return NotificationPolicy{}, err
+	}
+	value, err := scanNotificationPolicy(r.db.QueryRowContext(ctx, "SELECT "+notificationPolicyColumnsSQL+" FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return NotificationPolicy{}, ErrNotFound
+	}
+	if err == nil && value.Scope != scope {
+		return NotificationPolicy{}, ErrNotificationScopeMismatch
+	}
+	return value, err
+}
+
+func (r *PostgresRepository) DeleteNotificationPolicy(ctx context.Context, scope Scope, id string) error {
+	return r.deleteConfiguration(ctx, scope, id, "notification_policies", "policy.deleted")
 }
 
 func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, policy NotificationPolicy, update bool) (NotificationPolicy, error) {
@@ -614,6 +721,43 @@ func (r *PostgresRepository) ListActiveSilences(ctx context.Context, scope Scope
 		silences = append(silences, silence)
 	}
 	return silences, rows.Err()
+}
+
+func (r *PostgresRepository) ListSilences(ctx context.Context, scope Scope) ([]Silence, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC", scope.TenantID, scope.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]Silence, 0)
+	for rows.Next() {
+		value, scanErr := scanSilence(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if value.Scope != scope {
+			return nil, ErrNotificationScopeMismatch
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (r *PostgresRepository) GetSilence(ctx context.Context, scope Scope, id string) (Silence, error) {
+	if err := scope.Validate(); err != nil {
+		return Silence{}, err
+	}
+	value, err := scanSilence(r.db.QueryRowContext(ctx, "SELECT id, tenant_id, project_id, matchers, starts_at, ends_at, created_by, reason, created_at, updated_at FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Silence{}, ErrNotFound
+	}
+	if err == nil && value.Scope != scope {
+		return Silence{}, ErrNotificationScopeMismatch
+	}
+	return value, err
 }
 
 func (r *PostgresRepository) PersistInAppNotification(ctx context.Context, request DeliveryRequest) error {
@@ -895,6 +1039,66 @@ func (r *PostgresRepository) ClaimDueNotificationDeliveries(ctx context.Context,
 		deliveries = append(deliveries, delivery)
 	}
 	return deliveries, rows.Err()
+}
+
+func (r *PostgresRepository) ListNotificationDeliveries(ctx context.Context, scope Scope, eventID string) ([]NotificationDelivery, error) {
+	if scope.Validate() != nil || strings.TrimSpace(eventID) == "" {
+		return nil, ErrInvalidNotification
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT "+notificationDeliveryColumnsSQL+" FROM notification_deliveries WHERE tenant_id = $1 AND project_id = $2 AND event_id = $3 ORDER BY attempted_at DESC, id ASC", scope.TenantID, scope.ProjectID, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]NotificationDelivery, 0)
+	for rows.Next() {
+		value, scanErr := scanNotificationDelivery(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if value.Scope != scope || value.EventID != eventID {
+			return nil, ErrNotificationScopeMismatch
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (r *PostgresRepository) deleteConfiguration(ctx context.Context, scope Scope, id, table, action string) error {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if scope.Validate() != nil || !validIdentifier(id) {
+		return ErrInvalidNotification
+	}
+	switch table {
+	case "alert_rules", "notification_policies", "notification_templates":
+	default:
+		return errors.New("unsupported configuration table")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	query := "DELETE FROM " + table + " WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
+	result, err := tx.ExecContext(ctx, query, scope.TenantID, scope.ProjectID, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	at := time.Now().UTC()
+	if err := appendAudit(ctx, tx, configurationAudit(scope, actor, action, id, at, nil)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func scanNotificationDelivery(scanner rowScanner) (NotificationDelivery, error) {

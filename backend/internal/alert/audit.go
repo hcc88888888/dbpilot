@@ -69,7 +69,7 @@ func (record AuditRecord) Validate() error {
 
 func allowedAuditAction(action string) bool {
 	switch action {
-	case "rule.created", "rule.updated", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "evaluation.failed", "policy.created", "policy.updated", "template.created", "template.updated", "silence.created", "silence.updated", "silence.deleted", "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
+	case "rule.created", "rule.updated", "rule.deleted", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "evaluation.failed", "policy.created", "policy.updated", "policy.deleted", "template.created", "template.updated", "template.deleted", "silence.created", "silence.updated", "silence.deleted", "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
 		return true
 	default:
 		return false
