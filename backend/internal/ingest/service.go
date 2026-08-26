@@ -40,11 +40,19 @@ type BatchDeduplicator interface {
 	Remember(agentID, batchID string, ack *telemetryv1.BatchAck)
 }
 
+// MetricBatchConsumer receives a verified, checksum-valid, newly accepted
+// metric batch. It is optional so the local telemetry test gateway remains a
+// payload-opaque contract server.
+type MetricBatchConsumer interface {
+	ConsumeMetricBatch(context.Context, string, []byte, time.Time) error
+}
+
 // Service validates and acknowledges DBPilot telemetry batches.
 type Service struct {
 	telemetryv1.UnimplementedTelemetryIngestServer
 	identities AgentIdentityResolver
 	dedup      BatchDeduplicator
+	metrics    MetricBatchConsumer
 	dedupMu    sync.Mutex
 	receivedMu sync.Mutex
 	received   []BatchMetadata
@@ -60,22 +68,26 @@ type BatchMetadata struct {
 	ReceivedAt   time.Time
 }
 
-func NewService(identities AgentIdentityResolver, dedup BatchDeduplicator) *Service {
-	return &Service{identities: identities, dedup: dedup}
+func NewService(identities AgentIdentityResolver, dedup BatchDeduplicator, metrics ...MetricBatchConsumer) *Service {
+	service := &Service{identities: identities, dedup: dedup}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
 }
 
 func (s *Service) PushLogBatch(ctx context.Context, batch *telemetryv1.LogBatch) (*telemetryv1.BatchAck, error) {
 	if batch == nil {
 		return nil, status.Error(codes.InvalidArgument, "log batch is required")
 	}
-	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum)
+	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum, nil)
 }
 
 func (s *Service) PushMetricBatch(ctx context.Context, batch *telemetryv1.MetricBatch) (*telemetryv1.BatchAck, error) {
 	if batch == nil {
 		return nil, status.Error(codes.InvalidArgument, "metric batch is required")
 	}
-	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum)
+	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum, s.metrics)
 }
 
 func (s *Service) ReportPolicyStatus(ctx context.Context, report *telemetryv1.PolicyStatus) (*telemetryv1.PolicyStatusAck, error) {
@@ -88,7 +100,7 @@ func (s *Service) ReportPolicyStatus(ctx context.Context, report *telemetryv1.Po
 	return &telemetryv1.PolicyStatusAck{Accepted: true}, nil
 }
 
-func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID string, payload, checksum []byte) (*telemetryv1.BatchAck, error) {
+func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID string, payload, checksum []byte, metricConsumer MetricBatchConsumer) (*telemetryv1.BatchAck, error) {
 	authenticatedAgentID, err := s.authorize(ctx, claimedAgentID)
 	if err != nil {
 		return nil, err
@@ -110,6 +122,11 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	defer s.dedupMu.Unlock()
 	if ack, ok := s.dedup.Lookup(authenticatedAgentID, batchID); ok {
 		return ack, nil
+	}
+	if metricConsumer != nil {
+		if err := metricConsumer.ConsumeMetricBatch(ctx, authenticatedAgentID, payload, time.Now().UTC()); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "metric batch rejected: %v", err)
+		}
 	}
 	ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
 	s.dedup.Remember(authenticatedAgentID, batchID, ack)

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
 	"github.com/stretchr/testify/assert"
@@ -76,6 +78,31 @@ func TestIngestReturnsSameAcceptedAckForDuplicateBatch(t *testing.T) {
 	assert.Len(t, service.ReceivedBatches(), 1)
 }
 
+func TestIngestDeliversNewMetricBatchToConsumerOnlyOnce(t *testing.T) {
+	consumer := &metricConsumerSpy{}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	ctx := contextWithSPIFFEAgent(t, "agent-a")
+	payload := []byte(`{"samples":[]}`)
+	batch := validMetricBatch("metric-duplicate", "agent-a", payload)
+
+	_, err := service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	_, err = service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	require.Equal(t, 1, consumer.calls)
+}
+
+func TestIngestDoesNotAcceptMetricBatchWhenConsumerFails(t *testing.T) {
+	consumer := &metricConsumerSpy{err: errors.New("metric store unavailable")}
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup(), consumer)
+	ctx := contextWithSPIFFEAgent(t, "agent-a")
+	batch := validMetricBatch("metric-failure", "agent-a", []byte(`{"samples":[]}`))
+
+	_, err := service.PushMetricBatch(ctx, batch)
+	require.ErrorContains(t, err, "metric store unavailable")
+	require.Empty(t, service.ReceivedBatches())
+}
+
 func TestIngestDeduplicatesConcurrentRequestsAtomically(t *testing.T) {
 	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
 	batch := validLogBatch("concurrent", "agent-a", []byte("payload"))
@@ -118,6 +145,11 @@ func validLogBatch(id, agentID string, payload []byte) *telemetryv1.LogBatch {
 	return &telemetryv1.LogBatch{BatchId: id, AgentId: agentID, SourceId: "source", Payload: payload, Checksum: checksum[:]}
 }
 
+func validMetricBatch(id, agentID string, payload []byte) *telemetryv1.MetricBatch {
+	checksum := sha256.Sum256(payload)
+	return &telemetryv1.MetricBatch{BatchId: id, AgentId: agentID, SourceId: "source", Payload: payload, Checksum: checksum[:]}
+}
+
 func contextWithSPIFFEAgent(t *testing.T, agentID string) context.Context {
 	t.Helper()
 	uri, err := url.Parse("spiffe://dbpilot/agent/" + agentID)
@@ -142,6 +174,16 @@ func (agents knownAgents) KnownAgent(_ context.Context, agentID string) bool { r
 type memoryDedup struct {
 	mu   sync.Mutex
 	acks map[string]*telemetryv1.BatchAck
+}
+
+type metricConsumerSpy struct {
+	calls int
+	err   error
+}
+
+func (c *metricConsumerSpy) ConsumeMetricBatch(context.Context, string, []byte, time.Time) error {
+	c.calls++
+	return c.err
 }
 
 func newMemoryDedup() *memoryDedup { return &memoryDedup{acks: make(map[string]*telemetryv1.BatchAck)} }
