@@ -1,0 +1,174 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+)
+
+const (
+	zooKeeperRoleLeader        = "leader"
+	zooKeeperRoleFollower      = "follower"
+	zooKeeperCompatibilityPath = "/commands/monitor"
+)
+
+type ZooKeeperEndpointFailure struct{ Endpoint Endpoint }
+type ZooKeeperEndpointErrors struct{ Failures []ZooKeeperEndpointFailure }
+
+func (errors *ZooKeeperEndpointErrors) Error() string {
+	if len(errors.Failures) == 1 {
+		return fmt.Sprintf("ZooKeeper collection failed for %s endpoint", errors.Failures[0].Endpoint.Role)
+	}
+	return fmt.Sprintf("ZooKeeper collection failed for %d endpoints", len(errors.Failures))
+}
+
+type ZooKeeperParseIssues struct{ Issues []ParseIssue }
+
+func (issues *ZooKeeperParseIssues) Error() string {
+	return fmt.Sprintf("ZooKeeper collection skipped %d malformed or unavailable metrics", len(issues.Issues))
+}
+
+type zooKeeperAdapter struct {
+	definition   ComponentDefinition
+	client       JMXClient
+	capabilities CapabilityMatrix
+}
+
+func NewZooKeeperAdapter(definition ComponentDefinition, client JMXClient) (ComponentAdapter, error) {
+	if err := validateComponentDefinition(definition); err != nil {
+		return nil, err
+	}
+	if definition.Kind != ZooKeeperComponent {
+		return nil, fmt.Errorf("component %q is not a ZooKeeper component", definition.ID)
+	}
+	if isNilInterface(client) {
+		return nil, errors.New("ZooKeeper JMX client is required")
+	}
+	for _, endpoint := range definition.Endpoints {
+		if _, err := normalizedZooKeeperRole(endpoint.Role); err != nil {
+			return nil, err
+		}
+	}
+	definition.Endpoints = append([]Endpoint(nil), definition.Endpoints...)
+	return &zooKeeperAdapter{definition: definition, client: client, capabilities: CapabilityMatrix{Metrics: true, MetricIDs: ZooKeeperMetricIDs()}}, nil
+}
+
+func NewZooKeeperAdapterWithRuntime(definition ComponentDefinition, resolver SecretResolver) (ComponentAdapter, error) {
+	if isNilInterface(resolver) {
+		return nil, errors.New("ZooKeeper runtime secret resolver is required")
+	}
+	config := JMXClientConfig{SecretRef: definition.SecretRef}
+	if definition.TLSRef != "" {
+		config.TLS = TLSConfig{Enabled: true, CASecretRef: definition.TLSRef}
+	}
+	return NewZooKeeperAdapter(definition, NewJMXClient(resolver, config))
+}
+func RegisterZooKeeperAdapter(registry ComponentRegistry, definition ComponentDefinition, client JMXClient) error {
+	if isNilInterface(registry) {
+		return errors.New("component registry is required")
+	}
+	adapter, err := NewZooKeeperAdapter(definition, client)
+	if err != nil {
+		return err
+	}
+	return registry.Register(definition, adapter)
+}
+func RegisterZooKeeperAdapterWithRuntime(registry ComponentRegistry, definition ComponentDefinition, resolver SecretResolver) error {
+	if isNilInterface(registry) {
+		return errors.New("component registry is required")
+	}
+	adapter, err := NewZooKeeperAdapterWithRuntime(definition, resolver)
+	if err != nil {
+		return err
+	}
+	return registry.Register(definition, adapter)
+}
+func ZooKeeperMetricIDs() []string                 { return metricIDs(zooKeeperBeanAllowlist()) }
+func (*zooKeeperAdapter) Component() ComponentKind { return ZooKeeperComponent }
+func (adapter *zooKeeperAdapter) Capabilities() CapabilityMatrix {
+	return cloneCapabilities(adapter.capabilities)
+}
+func (adapter *zooKeeperAdapter) Ping(ctx context.Context) error {
+	_, err := adapter.Collect(ctx, MetricRequest{})
+	return err
+}
+func (*zooKeeperAdapter) Close() error { return nil }
+
+func (adapter *zooKeeperAdapter) Collect(ctx context.Context, request MetricRequest) ([]MetricSample, error) {
+	if ctx == nil {
+		return nil, errors.New("ZooKeeper collect context is required")
+	}
+	requested, err := validateComponentMetricRequest(request, ZooKeeperMetricIDs(), "ZooKeeper")
+	if err != nil {
+		return nil, err
+	}
+	samples := make([]MetricSample, 0)
+	failures := make([]ZooKeeperEndpointFailure, 0)
+	issues := make([]ParseIssue, 0)
+	for _, endpoint := range adapter.definition.Endpoints {
+		role, roleErr := normalizedZooKeeperRole(endpoint.Role)
+		if roleErr != nil {
+			return samples, roleErr
+		}
+		// Compatibility monitor endpoints are explicitly allowlisted but never
+		// sent through the JMX client, which only permits /jmx JSON requests.
+		if endpointPath(endpoint.URL) == zooKeeperCompatibilityPath {
+			failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+			continue
+		}
+		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, zooKeeperBeanAllowlist())
+		if fetchErr != nil {
+			failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+			continue
+		}
+		endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans(beans, zooKeeperBeanAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: componentEndpointHost(endpoint.URL), Instance: adapter.definition.ID})
+		if normalizeErr != nil {
+			return samples, errors.New("normalize ZooKeeper JMX metrics")
+		}
+		issues = append(issues, endpointIssues...)
+		for _, sample := range endpointSamples {
+			if len(requested) == 0 || requested[sample.MetricName] {
+				samples = append(samples, sample)
+			}
+		}
+	}
+	statuses := make([]error, 0, 2)
+	if len(failures) != 0 {
+		statuses = append(statuses, &ZooKeeperEndpointErrors{Failures: failures})
+	}
+	if len(issues) != 0 {
+		statuses = append(statuses, &ZooKeeperParseIssues{Issues: issues})
+	}
+	if len(statuses) != 0 {
+		return samples, errors.Join(statuses...)
+	}
+	return samples, nil
+}
+
+func normalizedZooKeeperRole(role string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case zooKeeperRoleLeader:
+		return zooKeeperRoleLeader, nil
+	case zooKeeperRoleFollower:
+		return zooKeeperRoleFollower, nil
+	default:
+		return "", errors.New("ZooKeeper endpoint role must be leader or follower")
+	}
+}
+func endpointPath(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Path
+}
+func zooKeeperBeanAllowlist() BeanAllowlist {
+	return BeanAllowlist{
+		"org.apache.ZooKeeperService:name0=ReplicatedServer_*": zooKeeperMetricProperties(),
+	}
+}
+func zooKeeperMetricProperties() BeanProperties {
+	return BeanProperties{"AvgRequestLatency": {MetricName: "zookeeper.request.latency", Unit: "ms"}, "OutstandingRequests": {MetricName: "zookeeper.outstanding_requests", Unit: "count"}, "PacketsReceived": {MetricName: "zookeeper.requests.received", Unit: "count"}, "PacketsSent": {MetricName: "zookeeper.requests.sent", Unit: "count"}, "NumAliveConnections": {MetricName: "zookeeper.connections", Unit: "count"}, "QuorumSize": {MetricName: "zookeeper.quorum.members", Unit: "count"}, "ZnodeCount": {MetricName: "zookeeper.znodes", Unit: "count"}, "WatchCount": {MetricName: "zookeeper.watches", Unit: "count"}, "TxnLogElapsedSyncTime": {MetricName: "zookeeper.transaction_log.sync_time", Unit: "ms"}, "SnapshotTime": {MetricName: "zookeeper.snapshot.time", Unit: "ms"}}
+}

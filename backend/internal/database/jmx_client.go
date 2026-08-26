@@ -236,7 +236,7 @@ func filterJMXBeans(rawBeans []map[string]JSONValue, allowlist BeanAllowlist) []
 	beans := make([]JMXBean, 0, len(rawBeans))
 	for _, rawBean := range rawBeans {
 		name := stringJSONValue(rawBean["name"])
-		properties, allowed := allowlist[name]
+		properties, allowed := allowlistedJMXProperties(allowlist, name)
 		if !allowed {
 			beans = append(beans, JMXBean{Name: name, Attributes: map[string]JSONValue{}})
 			continue
@@ -274,7 +274,7 @@ func NormalizeJMXBeans(beans []JMXBean, allowlist BeanAllowlist, labels JMXMetri
 	samples := make([]MetricSample, 0)
 	issues := make([]ParseIssue, 0)
 	for _, bean := range beans {
-		properties, allowed := allowlist[bean.Name]
+		properties, allowed := allowlistedJMXProperties(allowlist, bean.Name)
 		if !allowed {
 			issues = append(issues, ParseIssue{Bean: bean.Name, Status: JMXParseUnknownBean})
 			continue
@@ -302,7 +302,7 @@ func NormalizeJMXBeans(beans []JMXBean, allowlist BeanAllowlist, labels JMXMetri
 
 func validateJMXAllowlist(allowlist BeanAllowlist) error {
 	for bean, properties := range allowlist {
-		if strings.TrimSpace(bean) != bean || bean == "" {
+		if strings.TrimSpace(bean) != bean || bean == "" || (strings.Contains(bean, "*") && (!strings.HasSuffix(bean, "*") || strings.Count(bean, "*") != 1 || len(strings.TrimSuffix(bean, "*")) == 0)) {
 			return errors.New("JMX bean allowlist contains an invalid name")
 		}
 		for property, definition := range properties {
@@ -312,6 +312,21 @@ func validateJMXAllowlist(allowlist BeanAllowlist) error {
 		}
 	}
 	return nil
+}
+
+// allowlistedJMXProperties admits exact bean names and a single terminal
+// wildcard. Wildcards are fixed adapter-owned bean prefixes, not caller input;
+// Hadoop and ZooKeeper include a runtime port or server id in some bean names.
+func allowlistedJMXProperties(allowlist BeanAllowlist, bean string) (BeanProperties, bool) {
+	if properties, ok := allowlist[bean]; ok {
+		return properties, true
+	}
+	for template, properties := range allowlist {
+		if strings.HasSuffix(template, "*") && strings.HasPrefix(bean, strings.TrimSuffix(template, "*")) {
+			return properties, true
+		}
+	}
+	return nil, false
 }
 
 func numericJMXValue(raw JSONValue) (float64, bool) {
