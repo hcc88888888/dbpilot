@@ -48,7 +48,7 @@ func TestOracleFactoryBuildsFixedDriverDSNFromServiceName(t *testing.T) {
 	if got, want := opener.driverName, oracleDriverName; got != want {
 		t.Fatalf("driver name = %q, want fixed %q", got, want)
 	}
-	if got, want := opener.dsn, "oracle://readonly:runtime-password@db.example.test:1521/finance_pdb?CONNECTION+TIMEOUT=5&TIMEOUT=15"; got != want {
+	if got, want := opener.dsn, "oracle://readonly:runtime-password@db.example.test:1521/finance_pdb?CONNECTION+TIMEOUT=5&SSL=TRUE&SSL+VERIFY=TRUE&TIMEOUT=15"; got != want {
 		t.Fatalf("DSN = %q, want %q", got, want)
 	}
 	if opener.tlsConfig == nil || opener.tlsConfig.ServerName != "db.internal.test" {

@@ -170,6 +170,13 @@ func oracleDSN(config InstanceConfig, password []byte) (string, error) {
 		"CONNECTION TIMEOUT": []string{strconvDurationSeconds(config.ConnectTimeout)},
 		"TIMEOUT":            []string{strconvDurationSeconds(config.QueryTimeout)},
 	}
+	if config.TLS.Enabled {
+		// go-ora uses URL options to select TCPS. The TLS-capable opener receives
+		// the ephemeral tls.Config separately, so certificate material never
+		// enters this data source name.
+		parameters.Set("SSL", "TRUE")
+		parameters.Set("SSL VERIFY", "TRUE")
+	}
 	path := target
 	if targetKind == "sid" {
 		path = ""
