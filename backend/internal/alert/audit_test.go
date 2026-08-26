@@ -43,6 +43,7 @@ func TestPostgresPutEventAndAuditCommitsTogether(t *testing.T) {
 	event, record := transactionalEventAndAudit()
 
 	mock.ExpectBegin()
+	expectEventAdvisoryLock(mock)
 	expectNoLockedEvent(mock, event)
 	expectEventWrite(mock, event)
 	mock.ExpectExec(regexp.QuoteMeta(auditInsertSQL)).
@@ -66,6 +67,7 @@ func TestPostgresPutEventIncludesAtomicStateAudit(t *testing.T) {
 	event, _ := transactionalEventAndAudit()
 
 	mock.ExpectBegin()
+	expectEventAdvisoryLock(mock)
 	expectNoLockedEvent(mock, event)
 	expectEventWrite(mock, event)
 	mock.ExpectExec(regexp.QuoteMeta(auditInsertSQL)).
@@ -89,6 +91,7 @@ func TestPostgresPutEventAndAuditRollsBackBothWritesWhenAuditFails(t *testing.T)
 	event, record := transactionalEventAndAudit()
 
 	mock.ExpectBegin()
+	expectEventAdvisoryLock(mock)
 	expectNoLockedEvent(mock, event)
 	expectEventWrite(mock, event)
 	mock.ExpectExec(regexp.QuoteMeta(auditInsertSQL)).
@@ -170,6 +173,7 @@ func TestPostgresRejectsIllegalStoredEventTransition(t *testing.T) {
 	record := AuditRecord{ID: "audit-ack", Scope: acknowledged.Scope, Actor: acknowledged.LastActor, Action: "event.acknowledged", TargetID: acknowledged.ID, OccurredAt: acknowledged.LastSeen, Details: map[string]string{"state": "acknowledged"}}
 
 	mock.ExpectBegin()
+	expectEventAdvisoryLock(mock)
 	expectLockedEvent(mock, previous)
 	mock.ExpectRollback()
 	_, err = NewPostgresRepository(db).PutEventAndAudit(context.Background(), acknowledged, record)
@@ -196,6 +200,7 @@ func TestPostgresCommitsLegalStoredEventTransitionWithMatchingAudit(t *testing.T
 	record := AuditRecord{ID: "audit-fire", Scope: firing.Scope, Actor: firing.LastActor, Action: "event.firing", TargetID: firing.ID, OccurredAt: firing.LastSeen, Details: map[string]string{"state": "firing", "aggregate": "91"}}
 
 	mock.ExpectBegin()
+	expectEventAdvisoryLock(mock)
 	expectLockedEvent(mock, previous)
 	expectEventWrite(mock, firing)
 	mock.ExpectExec(regexp.QuoteMeta(auditInsertSQL)).
@@ -318,6 +323,19 @@ func expectEventWrite(mock sqlmock.Sqlmock, event AlertEvent) {
 	mock.ExpectQuery("INSERT INTO alert_events").
 		WithArgs(event.ID, "t1", "p1", event.RuleID, event.Fingerprint, sqlmock.AnyArg(), sqlmock.AnyArg(), event.State, event.FirstSeen, event.LastSeen, nullableTimestamp(event.FiringAt), nullableTimestamp(event.AcknowledgedAt), nullableTimestamp(event.ResolvedAt), event.LastActor).
 		WillReturnRows(sqlmock.NewRows(eventColumnNames()).AddRow(event.ID, "t1", "p1", event.RuleID, event.Fingerprint, []byte(`{"host":"a"}`), []byte(`{"aggregate":"91"}`), string(event.State), event.FirstSeen, event.LastSeen, nullableTimestamp(event.FiringAt), nullableTimestamp(event.AcknowledgedAt), nullableTimestamp(event.ResolvedAt), event.LastActor))
+}
+
+type int64SQLArgument struct{}
+
+func (int64SQLArgument) Match(value driver.Value) bool {
+	_, ok := value.(int64)
+	return ok
+}
+
+func expectEventAdvisoryLock(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).
+		WithArgs(int64SQLArgument{}).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func expectLockedEvent(mock sqlmock.Sqlmock, event AlertEvent) {

@@ -2,7 +2,9 @@ package alert
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ var (
 const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
 const eventColumnsSQL = "id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor"
 const eventUpsertSQL = "INSERT INTO alert_events (id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, fingerprint) DO UPDATE SET labels = EXCLUDED.labels, evidence = EXCLUDED.evidence, state = EXCLUDED.state, last_seen = EXCLUDED.last_seen, firing_at = EXCLUDED.firing_at, acknowledged_at = EXCLUDED.acknowledged_at, resolved_at = EXCLUDED.resolved_at, last_actor = EXCLUDED.last_actor RETURNING " + eventColumnsSQL
+const eventAdvisoryLockSQL = "SELECT pg_advisory_xact_lock($1)"
 const eventLockSQL = "SELECT " + eventColumnsSQL + " FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND fingerprint = $3 FOR UPDATE"
 const auditInsertSQL = "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
 
@@ -131,6 +134,9 @@ func (r *PostgresRepository) mutateEvent(ctx context.Context, event AlertEvent, 
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := lockEventMutation(ctx, tx, event.Scope, event.Fingerprint); err != nil {
+		return AlertEvent{}, err
+	}
 	previous, found, err := findEventForUpdate(ctx, tx, event.Scope, event.Fingerprint)
 	if err != nil {
 		return AlertEvent{}, err
@@ -159,6 +165,31 @@ func (r *PostgresRepository) mutateEvent(ctx context.Context, event AlertEvent, 
 		return AlertEvent{}, err
 	}
 	return stored, nil
+}
+
+func lockEventMutation(ctx context.Context, tx *sql.Tx, scope Scope, fingerprint string) error {
+	_, err := tx.ExecContext(ctx, eventAdvisoryLockSQL, eventAdvisoryLockKey(scope, fingerprint))
+	return err
+}
+
+func eventAdvisoryLockKey(scope Scope, fingerprint string) int64 {
+	// Length-prefixing prevents ambiguous tuples and no raw identity reaches SQL.
+	// A 64-bit digest collision only over-serializes unrelated events; it cannot
+	// let concurrent mutations of the same tuple acquire different locks.
+	hash := sha256.New()
+	writeLockKeyPart(hash, "dbpilot.alert.event.v1")
+	writeLockKeyPart(hash, scope.TenantID)
+	writeLockKeyPart(hash, scope.ProjectID)
+	writeLockKeyPart(hash, fingerprint)
+	digest := hash.Sum(nil)
+	return int64(binary.BigEndian.Uint64(digest[:8]))
+}
+
+func writeLockKeyPart(hash interface{ Write([]byte) (int, error) }, value string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = hash.Write(length[:])
+	_, _ = hash.Write([]byte(value))
 }
 
 func findEventForUpdate(ctx context.Context, tx *sql.Tx, scope Scope, fingerprint string) (AlertEvent, bool, error) {

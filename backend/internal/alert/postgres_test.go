@@ -103,6 +103,7 @@ func TestPostgresRepositoryScopesEveryEventAndAuditWrite(t *testing.T) {
 	event := alert.AlertEvent{ID: "event-1", Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, RuleID: "rule-1", Fingerprint: "fp", Labels: map[string]string{"host": "a"}, Evidence: map[string]string{"value": "80"}, State: alert.EventPending, FirstSeen: firstSeen, LastSeen: firstSeen, LastActor: "system"}
 
 	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta("SELECT pg_advisory_xact_lock($1)")).WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("FOR UPDATE").WithArgs("t1", "p1", "fp").WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery("INSERT INTO alert_events").WithArgs(
 		"event-1", "t1", "p1", "rule-1", "fp", sqlmock.AnyArg(), sqlmock.AnyArg(), "pending", event.FirstSeen, event.LastSeen, nil, nil, nil, "system",
