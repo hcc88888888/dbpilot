@@ -6,7 +6,7 @@ const postgresDriverName = "postgres"
 // protocol families, including openGauss. The fixed driver name is selected by
 // this factory, never by instance configuration.
 func NewPostgresFactory(opener SQLOpener, catalog TemplateCatalog) Factory {
-	return NewPostgresFactoryWithRuntime(opener, catalog, nil)
+	return NewPostgresFactoryWithRuntime(opener, catalog, EnvironmentSecretResolver{})
 }
 
 // NewPostgresFactoryWithRuntime creates a PostgreSQL-protocol factory with a

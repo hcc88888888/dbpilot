@@ -237,6 +237,63 @@ func TestFactoryRejectsTLSWhenOpenerCannotApplyIt(t *testing.T) {
 	}
 }
 
+func TestPublicFactoryUsesEnvironmentRuntimeSecretResolver(t *testing.T) {
+	t.Setenv("DBPILOT_SECRET_RUNTIME_DB_PRIMARY", "environment-password")
+	opener := &fakeSQLOpener{db: newTestSQLDB(t, &sqlDriverState{})}
+
+	adapter, err := NewMySQLFactory(opener, staticCatalog{}).Open(context.Background(), adapterTestConfig(MySQLFamily))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer adapter.Close()
+	if !strings.Contains(opener.dsn, "environment-password") {
+		t.Fatalf("DSN does not use the environment-resolved password: %q", opener.dsn)
+	}
+}
+
+func TestFactorySanitizesOpenerErrors(t *testing.T) {
+	const secret = "never-return-this-password"
+	opener := failingSQLOpener{err: errors.New("driver rejected DSN containing " + secret)}
+	_, err := NewMySQLFactoryWithRuntime(opener, staticCatalog{}, StaticSecretResolver{
+		"secret://runtime/db-primary": []byte(secret),
+	}).Open(context.Background(), adapterTestConfig(MySQLFamily))
+	if err == nil {
+		t.Fatal("Open() error = nil, want opener failure")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "DSN") {
+		t.Fatalf("Open() leaked driver details: %v", err)
+	}
+}
+
+func TestFactoryBoundsOpenAndTLSOpenWithConnectionDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		tls  bool
+	}{
+		{name: "open without TLS"},
+		{name: "open with TLS", tls: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opener := &blockingSQLOpener{}
+			config := adapterTestConfig(MySQLFamily)
+			config.ConnectTimeout = 20 * time.Millisecond
+			config.TLS.Enabled = test.tls
+			_, err := NewMySQLFactoryWithRuntime(opener, staticCatalog{}, StaticSecretResolver{
+				config.SecretRef: []byte("runtime-password"),
+			}).Open(context.Background(), config)
+			if err == nil {
+				t.Fatal("Open() error = nil, want bounded opener timeout")
+			}
+			if !opener.contextCancelled {
+				t.Fatal("opener context was not cancelled at the connection deadline")
+			}
+			if test.tls != opener.usedTLS {
+				t.Fatalf("OpenWithTLS used = %t, want %t", opener.usedTLS, test.tls)
+			}
+		})
+	}
+}
+
 func adapterTestConfig(family EngineFamily) InstanceConfig {
 	return InstanceConfig{
 		ID:             "db-primary",
@@ -313,7 +370,7 @@ type fakeSQLOpener struct {
 	tlsConfig  *tls.Config
 }
 
-func (opener *fakeSQLOpener) OpenWithTLS(driverName, dsn string, config *tls.Config) (*sql.DB, error) {
+func (opener *fakeSQLOpener) OpenWithTLS(_ context.Context, driverName, dsn string, config *tls.Config) (*sql.DB, error) {
 	opener.driverName = driverName
 	opener.dsn = dsn
 	opener.tlsConfig = config.Clone()
@@ -322,11 +379,37 @@ func (opener *fakeSQLOpener) OpenWithTLS(driverName, dsn string, config *tls.Con
 
 type basicSQLOpener struct{ delegate *fakeSQLOpener }
 
-func (opener basicSQLOpener) Open(driverName, dsn string) (*sql.DB, error) {
-	return opener.delegate.Open(driverName, dsn)
+func (opener basicSQLOpener) Open(ctx context.Context, driverName, dsn string) (*sql.DB, error) {
+	return opener.delegate.Open(ctx, driverName, dsn)
 }
 
-func (opener *fakeSQLOpener) Open(driverName, dsn string) (*sql.DB, error) {
+type failingSQLOpener struct{ err error }
+
+func (opener failingSQLOpener) Open(context.Context, string, string) (*sql.DB, error) {
+	return nil, opener.err
+}
+
+type blockingSQLOpener struct {
+	contextCancelled bool
+	usedTLS          bool
+}
+
+func (opener *blockingSQLOpener) Open(ctx context.Context, _ string, _ string) (*sql.DB, error) {
+	return opener.wait(ctx, false)
+}
+
+func (opener *blockingSQLOpener) OpenWithTLS(ctx context.Context, _ string, _ string, _ *tls.Config) (*sql.DB, error) {
+	return opener.wait(ctx, true)
+}
+
+func (opener *blockingSQLOpener) wait(ctx context.Context, usedTLS bool) (*sql.DB, error) {
+	<-ctx.Done()
+	opener.contextCancelled = true
+	opener.usedTLS = usedTLS
+	return nil, ctx.Err()
+}
+
+func (opener *fakeSQLOpener) Open(_ context.Context, driverName, dsn string) (*sql.DB, error) {
 	opener.driverName = driverName
 	opener.dsn = dsn
 	return opener.db, opener.err

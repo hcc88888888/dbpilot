@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,7 @@ const mysqlDriverName = "mysql"
 // Production wiring can delegate to sql.Open, while tests can supply a local
 // database/sql implementation without network access.
 type SQLOpener interface {
-	Open(driverName, dataSourceName string) (*sql.DB, error)
+	Open(context.Context, string, string) (*sql.DB, error)
 }
 
 // TLSOpeningSQLOpener opens a database after securely applying an ephemeral
@@ -27,7 +28,7 @@ type SQLOpener interface {
 // certificate material.
 type TLSOpeningSQLOpener interface {
 	SQLOpener
-	OpenWithTLS(driverName, dataSourceName string, config *tls.Config) (*sql.DB, error)
+	OpenWithTLS(context.Context, string, string, *tls.Config) (*sql.DB, error)
 }
 
 // SecretResolver resolves runtime-only secret references. Returned values are
@@ -36,11 +37,65 @@ type SecretResolver interface {
 	ResolveSecret(context.Context, string) ([]byte, error)
 }
 
-// SQLOpenerFunc adapts an Open function to SQLOpener.
-type SQLOpenerFunc func(driverName, dataSourceName string) (*sql.DB, error)
+// StaticSecretResolver is a runtime configuration boundary suitable for
+// injected secret stores in a process. It copies values before returning them.
+type StaticSecretResolver map[string][]byte
 
-func (function SQLOpenerFunc) Open(driverName, dataSourceName string) (*sql.DB, error) {
-	return function(driverName, dataSourceName)
+func (resolver StaticSecretResolver) ResolveSecret(ctx context.Context, reference string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	value, found := resolver[reference]
+	if !found {
+		return nil, errors.New("secret not found")
+	}
+	return append([]byte(nil), value...), nil
+}
+
+// EnvironmentSecretResolver resolves secret://provider/name as
+// DBPILOT_SECRET_PROVIDER_NAME. It is the default runtime resolver; callers
+// can inject a dedicated secret manager with the WithRuntime constructors.
+type EnvironmentSecretResolver struct{}
+
+func (EnvironmentSecretResolver) ResolveSecret(ctx context.Context, reference string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(reference)
+	if err != nil || parsed.Scheme != "secret" || parsed.Host == "" || parsed.Path == "" {
+		return nil, errors.New("secret not found")
+	}
+	name := strings.ToUpper(parsed.Host + "_" + strings.TrimPrefix(parsed.Path, "/"))
+	name = strings.Map(func(character rune) rune {
+		if (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') {
+			return character
+		}
+		return '_'
+	}, name)
+	value, found := os.LookupEnv("DBPILOT_SECRET_" + name)
+	if !found {
+		return nil, errors.New("secret not found")
+	}
+	return []byte(value), nil
+}
+
+// SQLDriverOpener is the concrete database/sql opener for runtime wiring.
+// The selected driver must be registered by the program. It intentionally
+// declines TLS because driver-specific TLS registration must be explicit.
+type SQLDriverOpener struct{}
+
+func (SQLDriverOpener) Open(ctx context.Context, driverName, dataSourceName string) (*sql.DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return sql.Open(driverName, dataSourceName)
+}
+
+// SQLOpenerFunc adapts an Open function to SQLOpener.
+type SQLOpenerFunc func(context.Context, string, string) (*sql.DB, error)
+
+func (function SQLOpenerFunc) Open(ctx context.Context, driverName, dataSourceName string) (*sql.DB, error) {
+	return function(ctx, driverName, dataSourceName)
 }
 
 type sqlProtocolFactory struct {
@@ -54,7 +109,7 @@ type sqlProtocolFactory struct {
 // NewMySQLFactory creates adapters for explicitly selected MySQL-protocol
 // families. It never derives a protocol or driver from user-controlled input.
 func NewMySQLFactory(opener SQLOpener, catalog TemplateCatalog) Factory {
-	return NewMySQLFactoryWithRuntime(opener, catalog, nil)
+	return NewMySQLFactoryWithRuntime(opener, catalog, EnvironmentSecretResolver{})
 }
 
 // NewMySQLFactoryWithRuntime creates a MySQL-protocol factory with the
@@ -96,7 +151,9 @@ func (factory *sqlProtocolFactory) Open(ctx context.Context, config InstanceConf
 		return nil, fmt.Errorf("database family %q does not use %s protocol", config.Family, factory.protocol)
 	}
 
-	password, tlsConfig, err := resolveRuntimeConnection(ctx, config, factory.resolver)
+	openContext, cancel := context.WithTimeout(ctx, config.ConnectTimeout)
+	defer cancel()
+	password, tlsConfig, err := resolveRuntimeConnection(openContext, config, factory.resolver)
 	if err != nil {
 		return nil, err
 	}
@@ -104,9 +161,9 @@ func (factory *sqlProtocolFactory) Open(ctx context.Context, config InstanceConf
 	if err != nil {
 		return nil, err
 	}
-	database, err := factory.openDatabase(dsn, tlsConfig)
+	database, err := factory.openDatabase(openContext, dsn, tlsConfig)
 	if err != nil {
-		return nil, fmt.Errorf("open %s database: %w", factory.protocol, err)
+		return nil, fmt.Errorf("open %s database", factory.protocol)
 	}
 	if database == nil {
 		return nil, fmt.Errorf("open %s database: opener returned nil database", factory.protocol)
@@ -121,20 +178,20 @@ func (factory *sqlProtocolFactory) Open(ctx context.Context, config InstanceConf
 	}
 	if err := adapter.Ping(ctx); err != nil {
 		_ = adapter.Close()
-		return nil, fmt.Errorf("connect %s database: %w", factory.protocol, err)
+		return nil, fmt.Errorf("connect %s database", factory.protocol)
 	}
 	return adapter, nil
 }
 
-func (factory *sqlProtocolFactory) openDatabase(dsn string, tlsConfig *tls.Config) (*sql.DB, error) {
+func (factory *sqlProtocolFactory) openDatabase(ctx context.Context, dsn string, tlsConfig *tls.Config) (*sql.DB, error) {
 	if tlsConfig == nil {
-		return factory.opener.Open(string(factory.protocol), dsn)
+		return factory.opener.Open(ctx, string(factory.protocol), dsn)
 	}
 	tlsOpener, ok := factory.opener.(TLSOpeningSQLOpener)
 	if !ok {
 		return nil, errors.New("database SQL opener cannot apply TLS settings")
 	}
-	return tlsOpener.OpenWithTLS(string(factory.protocol), dsn, tlsConfig)
+	return tlsOpener.OpenWithTLS(ctx, string(factory.protocol), dsn, tlsConfig)
 }
 
 func (factory *sqlProtocolFactory) accepts(family EngineFamily) bool {
@@ -260,7 +317,10 @@ func (adapter *sqlAdapter) Ping(ctx context.Context) error {
 	}
 	pingContext, cancel := context.WithTimeout(ctx, adapter.connectTimeout)
 	defer cancel()
-	return adapter.database.PingContext(pingContext)
+	if err := adapter.database.PingContext(pingContext); err != nil {
+		return errors.New("database ping failed")
+	}
+	return nil
 }
 
 func (adapter *sqlAdapter) QueryMetric(ctx context.Context, metricID string, arguments map[string]any) ([]MetricRow, error) {
@@ -285,7 +345,10 @@ func (adapter *sqlAdapter) Close() error {
 	defer timer.Stop()
 	select {
 	case <-adapter.closeDone:
-		return adapter.closeErr
+		if adapter.closeErr != nil {
+			return errors.New("close database adapter")
+		}
+		return nil
 	case <-timer.C:
 		return fmt.Errorf("close database adapter: %w", context.DeadlineExceeded)
 	}
@@ -294,7 +357,11 @@ func (adapter *sqlAdapter) Close() error {
 type sqlQueryer struct{ database *sql.DB }
 
 func (queryer sqlQueryer) QueryContext(ctx context.Context, statement string, arguments ...any) (Rows, error) {
-	return queryer.database.QueryContext(ctx, statement, arguments...)
+	rows, err := queryer.database.QueryContext(ctx, statement, arguments...)
+	if err != nil {
+		return nil, errors.New("database metric query failed")
+	}
+	return rows, nil
 }
 
 func postgresDSN(config InstanceConfig, password []byte) (string, error) {
