@@ -77,11 +77,19 @@ services:
       DBPILOT_MYSQL_ADDRESS: mysql://mysql:3306
       DBPILOT_MYSQL_DATABASE: dbpilot_integration
       DBPILOT_MYSQL_USER: dbpilot_reader
+
+      DBPILOT_MYSQL_ADMIN_USER: root
       DBPILOT_POSTGRES_ADDRESS: postgres://postgres:5432
       DBPILOT_POSTGRES_DATABASE: dbpilot_integration
       DBPILOT_POSTGRES_USER: dbpilot_reader
+
+      DBPILOT_POSTGRES_ADMIN_USER: postgres
       DBPILOT_SECRET_INTEGRATION_MYSQL: dbpilot-integration-mysql-password
+
+      DBPILOT_SECRET_INTEGRATION_MYSQL_ADMIN: dbpilot-integration-root
       DBPILOT_SECRET_INTEGRATION_POSTGRES: dbpilot-integration-postgres-password
+
+      DBPILOT_SECRET_INTEGRATION_POSTGRES_ADMIN: dbpilot-integration-root
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - 'timeout "$${DBPILOT_DB_TEST_TIMEOUT_SECONDS:-75}s" go test ./internal/database -run ^TestDatabaseAdaptersIntegration$$ -count=1 -timeout 60s'

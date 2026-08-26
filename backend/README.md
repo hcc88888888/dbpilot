@@ -118,9 +118,12 @@ server versions, runs the real integration test in the isolated Compose
 network, and removes the containers and temporary data on every exit path.
 For a manually managed environment, set `DBPILOT_DB_INTEGRATION=1`,
 `DBPILOT_MYSQL_ADDRESS`, `DBPILOT_MYSQL_DATABASE`, `DBPILOT_MYSQL_USER`,
-`DBPILOT_POSTGRES_ADDRESS`, `DBPILOT_POSTGRES_DATABASE`, `DBPILOT_POSTGRES_USER`,
-`DBPILOT_SECRET_INTEGRATION_MYSQL`, and
-`DBPILOT_SECRET_INTEGRATION_POSTGRES` before running `go test
+`DBPILOT_MYSQL_ADMIN_USER`, `DBPILOT_POSTGRES_ADDRESS`,
+`DBPILOT_POSTGRES_DATABASE`, `DBPILOT_POSTGRES_USER`,
+`DBPILOT_POSTGRES_ADMIN_USER`, `DBPILOT_SECRET_INTEGRATION_MYSQL`,
+`DBPILOT_SECRET_INTEGRATION_MYSQL_ADMIN`,
+`DBPILOT_SECRET_INTEGRATION_POSTGRES`, and
+`DBPILOT_SECRET_INTEGRATION_POSTGRES_ADMIN` before running `go test
 ./internal/database`. The test only uses pre-registered metric templates and
 resolves credentials through the runtime `secret://integration/...` boundary;
 do not put credentials in telemetry policy documents or logs.

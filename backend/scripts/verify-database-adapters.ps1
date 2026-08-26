@@ -41,6 +41,16 @@ function Invoke-Docker {
     }
 }
 
+function Invoke-DockerCapture {
+    param([string[]]$Arguments)
+    $output = & $DockerBinary @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "docker $($Arguments -join ' ') failed with exit code $exitCode"
+    }
+    return ($output | Out-String).Trim()
+}
+
 function Get-ComposeContainer {
     param([string]$Service)
     $container = (& $DockerBinary compose --project-name $projectName --file $composeFile ps -aq $Service).Trim()
@@ -100,8 +110,10 @@ try {
     Wait-ForCompletedService 'mysql-bootstrap'
     Wait-ForCompletedService 'postgres-bootstrap'
 
-    Write-Host "MySQL version: $((& $DockerBinary compose --project-name $projectName --file $composeFile exec -T -e MYSQL_PWD=dbpilot-integration-root mysql mysql -uroot -Nse 'SELECT VERSION()').Trim())"
-    Write-Host "PostgreSQL version: $((& $DockerBinary compose --project-name $projectName --file $composeFile exec -T -e PGPASSWORD=dbpilot-integration-root postgres psql -U postgres -d dbpilot_integration -Atc 'SHOW server_version').Trim())"
+    $mysqlVersion = Invoke-DockerCapture @('compose', '--project-name', $projectName, '--file', $composeFile, 'exec', '-T', '-e', 'MYSQL_PWD=dbpilot-integration-root', 'mysql', 'mysql', '-uroot', '-Nse', 'SELECT VERSION()')
+    $postgresVersion = Invoke-DockerCapture @('compose', '--project-name', $projectName, '--file', $composeFile, 'exec', '-T', '-e', 'PGPASSWORD=dbpilot-integration-root', 'postgres', 'psql', '-U', 'postgres', '-d', 'dbpilot_integration', '-Atc', 'SHOW server_version')
+    Write-Host "MySQL version: $mysqlVersion"
+    Write-Host "PostgreSQL version: $postgresVersion"
     Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'run', '--rm', '--no-deps', '--env', "DBPILOT_DB_TEST_TIMEOUT_SECONDS=$TestTimeoutSeconds", 'adapter-tests')
 }
 finally {
