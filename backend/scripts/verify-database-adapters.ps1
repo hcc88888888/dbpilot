@@ -101,6 +101,7 @@ $composeFile = Join-Path $backendRoot 'docker\database-adapters\docker-compose.y
 if (-not (Test-Path -LiteralPath $composeFile -PathType Leaf)) { throw "Compose file not found: $composeFile" }
 $composeFile = (Resolve-Path -LiteralPath $composeFile).Path
 $projectName = "dbpilot-adapters-$PID"
+$primaryFailure = $null
 
 try {
     Invoke-Docker @('version', '--format', '{{.Server.Version}}')
@@ -116,11 +117,28 @@ try {
     Write-Host "PostgreSQL version: $postgresVersion"
     Invoke-Docker @('compose', '--project-name', $projectName, '--file', $composeFile, 'run', '--rm', '--no-deps', '--env', "DBPILOT_DB_TEST_TIMEOUT_SECONDS=$TestTimeoutSeconds", 'adapter-tests')
 }
+catch {
+    $primaryFailure = $_
+    throw
+}
 finally {
     if (-not [string]::IsNullOrWhiteSpace($DockerBinary) -and (Test-Path -LiteralPath $DockerBinary -PathType Leaf)) {
         $cleanupErrorPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
-        & $DockerBinary compose --project-name $projectName --file $composeFile down --volumes --remove-orphans 2>$null | Out-Null
+        $cleanupOutput = & $DockerBinary compose --project-name $projectName --file $composeFile down --volumes --remove-orphans 2>&1
+        $cleanupExitCode = $LASTEXITCODE
         $ErrorActionPreference = $cleanupErrorPreference
+        if ($cleanupExitCode -ne 0) {
+            $cleanupDetail = ($cleanupOutput | Out-String).Trim()
+            $cleanupMessage = "Docker Compose cleanup failed with exit code $cleanupExitCode."
+            if (-not [string]::IsNullOrWhiteSpace($cleanupDetail)) {
+                $cleanupMessage += " Output: $cleanupDetail"
+            }
+            if ($null -ne $primaryFailure) {
+                Write-Error $cleanupMessage -ErrorAction Continue
+            } else {
+                throw $cleanupMessage
+            }
+        }
     }
 }
