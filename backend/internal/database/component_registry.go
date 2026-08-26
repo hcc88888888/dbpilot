@@ -53,7 +53,7 @@ func validateComponentDefinition(def ComponentDefinition) error {
 	for _, endpoint := range def.Endpoints {
 		if strings.TrimSpace(endpoint.URL) != endpoint.URL || endpoint.URL == "" { return fmt.Errorf("component %q endpoint is required", def.ID) }
 		parsed, err := url.ParseRequestURI(endpoint.URL)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" { return fmt.Errorf("component %q endpoint must be an absolute URL without credentials, query, or fragment", def.ID) }
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "/jmx" { return fmt.Errorf("component %q endpoint must be an HTTP(S) URL with read-only /jmx path", def.ID) }
 	}
 	if err := validateSecretRef(def.SecretRef); err != nil { return err }
 	if def.TLSRef != "" { if err := validateSecretRef(def.TLSRef); err != nil { return fmt.Errorf("component TLS secret reference: %w", err) } }
