@@ -3,6 +3,7 @@ package database
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // HealthState separates a local component failure from a failure in an
@@ -22,16 +23,19 @@ const (
 	diskPressureRatio             = 0.90
 	zooKeeperOutstandingThreshold = 100.0
 	zooKeeperLatencyThresholdMS   = 1000.0
+	dataNodeIOPressureBytes       = float64(1 << 30)
 )
 
 // ComponentHealth is a role-level, deterministic health result. State always
 // describes the closest known cause: the component itself, an authorized
 // dependency, or incomplete collection data.
 type ComponentHealth struct {
-	Cluster   string
-	Component ComponentKind
-	Role      string
-	State     HealthState
+	Cluster    string
+	Component  ComponentKind
+	Role       string
+	State      HealthState
+	Host       string
+	SampleTime time.Time
 }
 
 // EvidenceRule identifies one read-only, correlation-only dependency rule.
@@ -47,13 +51,17 @@ const (
 // DependencyEvidence records correlation only. It contains no command,
 // credentials, or remediation action.
 type DependencyEvidence struct {
-	Rule              EvidenceRule
-	State             HealthState
-	DedupKey          string
-	Cluster           string
-	Component         ComponentKind
-	Role              string
-	DependencyCluster string
+	Rule                 EvidenceRule
+	State                HealthState
+	DedupKey             string
+	Cluster              string
+	Component            ComponentKind
+	Role                 string
+	DependencyCluster    string
+	Host                 string
+	SampleTime           time.Time
+	DependencyHost       string
+	DependencySampleTime time.Time
 }
 
 // AggregateHealth computes component-local health before propagating
@@ -62,14 +70,15 @@ type DependencyEvidence struct {
 func AggregateHealth(topology Topology, samples []MetricSample) []ComponentHealth {
 	byCluster := samplesByAuthorizedComponent(topology, samples)
 	health := make([]ComponentHealth, 0)
-	for _, node := range topology.Nodes {
+	for _, node := range topology.nodes {
 		roles := node.Roles
 		if len(roles) == 0 {
 			roles = []string{"unknown"}
 		}
 		for _, role := range roles {
 			local := byCluster[node.ID][role]
-			health = append(health, ComponentHealth{Cluster: node.ID, Component: node.Kind, Role: role, State: localHealth(node.Kind, local)})
+			host, sampleTime := sampleDimensions(local)
+			health = append(health, ComponentHealth{Cluster: node.ID, Component: node.Kind, Role: role, State: localHealth(node.Kind, role, local), Host: host, SampleTime: sampleTime})
 		}
 	}
 
@@ -117,7 +126,7 @@ func AggregateHealth(topology Topology, samples []MetricSample) []ComponentHealt
 func BuildDependencyEvidence(topology Topology, samples []MetricSample) []DependencyEvidence {
 	byCluster := samplesByAuthorizedComponent(topology, samples)
 	evidence := make(map[string]DependencyEvidence)
-	for _, node := range topology.Nodes {
+	for _, node := range topology.nodes {
 		if node.Kind != HBaseComponent {
 			continue
 		}
@@ -128,29 +137,29 @@ func BuildDependencyEvidence(topology Topology, samples []MetricSample) []Depend
 			continue
 		}
 
-		if hasHDFS && hdfsDataNodeDiskPressure(byCluster[hdfsID]) {
+		if hasHDFS && hdfsDataNodeDiskOrIOPressure(byCluster[hdfsID]) {
 			for _, role := range roles {
 				if hasElevatedWriteLatency(byCluster[node.ID][role]) {
-					addEvidence(evidence, node.ID, role, EvidenceHBaseWriteLatencyHDFS, hdfsID)
+					addEvidence(evidence, node.ID, role, EvidenceHBaseWriteLatencyHDFS, hdfsID, byCluster[node.ID][role], flattenSamples(byCluster[hdfsID]))
 				}
 			}
 		}
-		if hasZooKeeper && zooKeeperPressure(byCluster[zooKeeperID]) {
+		if hasZooKeeper && zooKeeperBacklogRisk(byCluster[zooKeeperID]) {
 			for _, role := range roles {
 				if role == hbaseRoleRegionServer && hasRequestBacklog(byCluster[node.ID][role]) {
-					addEvidence(evidence, node.ID, role, EvidenceRegionServerBacklogZooKeeper, zooKeeperID)
+					addEvidence(evidence, node.ID, role, EvidenceRegionServerBacklogZooKeeper, zooKeeperID, byCluster[node.ID][role], flattenSamples(byCluster[zooKeeperID]))
 				}
 			}
 		}
 		if hasHDFS && hdfsWALFlushRisk(byCluster[hdfsID]) {
 			for _, role := range roles {
-				addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID)
+				addEvidence(evidence, node.ID, role, EvidenceHDFSWALFlushRisk, hdfsID, byCluster[node.ID][role], flattenSamples(byCluster[hdfsID]))
 			}
 		}
 		if hasZooKeeper && zooKeeperFailoverRisk(byCluster[zooKeeperID]) {
 			for _, role := range roles {
 				if role == hbaseRoleRegionServer {
-					addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID)
+					addEvidence(evidence, node.ID, role, EvidenceZooKeeperFailoverRisk, zooKeeperID, byCluster[node.ID][role], flattenSamples(byCluster[zooKeeperID]))
 				}
 			}
 		}
@@ -164,14 +173,16 @@ func BuildDependencyEvidence(topology Topology, samples []MetricSample) []Depend
 	return result
 }
 
-func addEvidence(records map[string]DependencyEvidence, cluster, role string, rule EvidenceRule, dependency string) {
+func addEvidence(records map[string]DependencyEvidence, cluster, role string, rule EvidenceRule, dependency string, componentSamples, dependencySamples []MetricSample) {
 	key := strings.Join([]string{cluster, string(HBaseComponent), role, string(rule)}, "/")
-	records[key] = DependencyEvidence{Rule: rule, State: HealthDependencyFailure, DedupKey: key, Cluster: cluster, Component: HBaseComponent, Role: role, DependencyCluster: dependency}
+	host, sampleTime := sampleDimensions(componentSamples)
+	dependencyHost, dependencySampleTime := sampleDimensions(dependencySamples)
+	records[key] = DependencyEvidence{Rule: rule, State: HealthDependencyFailure, DedupKey: key, Cluster: cluster, Component: HBaseComponent, Role: role, DependencyCluster: dependency, Host: host, SampleTime: sampleTime, DependencyHost: dependencyHost, DependencySampleTime: dependencySampleTime}
 }
 
 func samplesByAuthorizedComponent(topology Topology, samples []MetricSample) map[string]map[string][]MetricSample {
-	result := make(map[string]map[string][]MetricSample, len(topology.Nodes))
-	for _, node := range topology.Nodes {
+	result := make(map[string]map[string][]MetricSample, len(topology.nodes))
+	for _, node := range topology.nodes {
 		result[node.ID] = make(map[string][]MetricSample)
 	}
 	for _, sample := range samples {
@@ -179,8 +190,8 @@ func samplesByAuthorizedComponent(topology Topology, samples []MetricSample) map
 		if !exists || sample.Component != string(node.Kind) {
 			continue
 		}
-		role := strings.ToLower(strings.TrimSpace(sample.Role))
-		if role == "" {
+		role, err := canonicalComponentRole(node.Kind, sample.Role)
+		if err != nil || !nodeHasRole(node, role) {
 			continue
 		}
 		result[node.ID][role] = append(result[node.ID][role], sample)
@@ -209,8 +220,8 @@ func aggregateComponentState(values []ComponentHealth, cluster string, kind Comp
 	return state
 }
 
-func localHealth(kind ComponentKind, samples []MetricSample) HealthState {
-	if len(samples) == 0 {
+func localHealth(kind ComponentKind, role string, samples []MetricSample) HealthState {
+	if !hasRequiredHealthInputs(kind, role, samples) {
 		return HealthDataIncomplete
 	}
 	switch kind {
@@ -223,7 +234,7 @@ func localHealth(kind ComponentKind, samples []MetricSample) HealthState {
 			return HealthComponentFailure
 		}
 	case ZooKeeperComponent:
-		if zooKeeperFailoverRisk(map[string][]MetricSample{"role": samples}) {
+		if zooKeeperComponentFailure(map[string][]MetricSample{"role": samples}) {
 			return HealthComponentFailure
 		}
 	}
@@ -252,9 +263,9 @@ func hasRequestBacklog(samples []MetricSample) bool {
 	return metricGreaterThan(samples, "hbase.flush.queue_length", requestBacklogThreshold) || metricGreaterThan(samples, "hbase.compaction.queue_length", requestBacklogThreshold) || metricGreaterThan(samples, "hbase.request.queue_time", writeLatencyThresholdMS)
 }
 
-func hdfsDataNodeDiskPressure(roles map[string][]MetricSample) bool {
+func hdfsDataNodeDiskOrIOPressure(roles map[string][]MetricSample) bool {
 	for role, samples := range roles {
-		if role == hdfsRoleDataNode && (metricGreaterThan(samples, "hdfs.datanode.failed_volumes", 0) || capacityPressure(samples, "hdfs.datanode.used", "hdfs.datanode.capacity")) {
+		if role == hdfsRoleDataNode && (metricGreaterThan(samples, "hdfs.datanode.failed_volumes", 0) || capacityPressure(samples, "hdfs.datanode.used", "hdfs.datanode.capacity") || metricGreaterThan(samples, "hdfs.datanode.xceiver_count", requestBacklogThreshold) || metricGreaterThan(samples, "hdfs.datanode.io.bytes_read", dataNodeIOPressureBytes) || metricGreaterThan(samples, "hdfs.datanode.io.bytes_written", dataNodeIOPressureBytes)) {
 			return true
 		}
 	}
@@ -270,8 +281,15 @@ func hdfsWALFlushRisk(roles map[string][]MetricSample) bool {
 	return false
 }
 
-func zooKeeperPressure(roles map[string][]MetricSample) bool {
-	return zooKeeperFailoverRisk(roles)
+func zooKeeperBacklogRisk(roles map[string][]MetricSample) bool {
+	for _, samples := range roles {
+		for _, sample := range samples {
+			if (sample.MetricName == "zookeeper.sessions" && sample.Value <= 0) || (sample.MetricName == "zookeeper.quorum.members" && sample.Value <= 1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func zooKeeperFailoverRisk(roles map[string][]MetricSample) bool {
@@ -286,18 +304,68 @@ func zooKeeperFailoverRisk(roles map[string][]MetricSample) bool {
 				if sample.Value > zooKeeperOutstandingThreshold {
 					return true
 				}
-			case "zookeeper.request.latency", "zookeeper.transaction_log.sync_time":
+			case "zookeeper.transaction_log.sync_time":
 				if sample.Value > zooKeeperLatencyThresholdMS {
-					return true
-				}
-			case "zookeeper.quorum.members":
-				if sample.Value <= 1 {
 					return true
 				}
 			}
 		}
 	}
 	return false
+}
+
+func zooKeeperComponentFailure(roles map[string][]MetricSample) bool {
+	return zooKeeperBacklogRisk(roles) || zooKeeperFailoverRisk(roles)
+}
+
+func hasRequiredHealthInputs(kind ComponentKind, role string, samples []MetricSample) bool {
+	for _, sample := range samples {
+		switch kind {
+		case HBaseComponent:
+			if strings.HasPrefix(sample.MetricName, "hbase.request.") || strings.HasPrefix(sample.MetricName, "hbase.wal.") || strings.HasPrefix(sample.MetricName, "hbase.flush.") || strings.HasPrefix(sample.MetricName, "hbase.compaction.") || sample.MetricName == "hbase.master.dead_region_servers" {
+				return true
+			}
+		case HDFSComponent:
+			if role == hdfsRoleNameNode && (sample.MetricName == "hdfs.namenode.under_replicated_blocks" || sample.MetricName == "hdfs.namenode.missing_blocks" || sample.MetricName == "hdfs.namenode.corrupt_files" || sample.MetricName == "hdfs.namenode.capacity_used" || sample.MetricName == "hdfs.namenode.capacity_total") {
+				return true
+			}
+			if role == hdfsRoleDataNode && (sample.MetricName == "hdfs.datanode.failed_volumes" || sample.MetricName == "hdfs.datanode.capacity" || sample.MetricName == "hdfs.datanode.used" || sample.MetricName == "hdfs.datanode.xceiver_count" || strings.HasPrefix(sample.MetricName, "hdfs.datanode.io.")) {
+				return true
+			}
+		case ZooKeeperComponent:
+			if sample.MetricName == "zookeeper.sessions" || sample.MetricName == "zookeeper.quorum.members" || sample.MetricName == "zookeeper.outstanding_requests" || sample.MetricName == "zookeeper.transaction_log.sync_time" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func nodeHasRole(node TopologyNode, role string) bool {
+	for _, declared := range node.Roles {
+		if declared == role {
+			return true
+		}
+	}
+	return false
+}
+
+func flattenSamples(roles map[string][]MetricSample) []MetricSample {
+	result := make([]MetricSample, 0)
+	for _, samples := range roles {
+		result = append(result, samples...)
+	}
+	return result
+}
+
+func sampleDimensions(samples []MetricSample) (string, time.Time) {
+	var selected MetricSample
+	for _, sample := range samples {
+		if selected.Timestamp.IsZero() || sample.Timestamp.After(selected.Timestamp) {
+			selected = sample
+		}
+	}
+	return selected.Host, selected.Timestamp
 }
 
 func capacityPressure(samples []MetricSample, usedName, totalName string) bool {

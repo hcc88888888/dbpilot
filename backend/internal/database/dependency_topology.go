@@ -31,8 +31,8 @@ type DependencyRelation struct {
 // Topology contains a stable snapshot of the definitions needed to correlate
 // HBase health with its explicitly authorized HDFS and ZooKeeper dependencies.
 type Topology struct {
-	Nodes     []TopologyNode
-	Relations []DependencyRelation
+	nodes     []TopologyNode
+	relations []DependencyRelation
 }
 
 // ResolveTopology resolves only HBase dependency IDs to definitions supplied
@@ -55,17 +55,21 @@ func ResolveTopology(definitions []ComponentDefinition) (Topology, error) {
 		if definition.Kind != HBaseComponent && (definition.Dependencies.HDFSClusterID != "" || definition.Dependencies.ZooKeeperClusterID != "") {
 			return Topology{}, fmt.Errorf("%w: only HBase may declare dependencies", ErrUnauthorizedDependency)
 		}
-		nodes[definition.ID] = TopologyNode{ID: definition.ID, Kind: definition.Kind, Roles: topologyRoles(definition.Endpoints)}
+		roles, err := topologyRoles(definition.Kind, definition.Endpoints)
+		if err != nil {
+			return Topology{}, fmt.Errorf("component %q: %w", definition.ID, err)
+		}
+		nodes[definition.ID] = TopologyNode{ID: definition.ID, Kind: definition.Kind, Roles: roles}
 		dependencies[definition.ID] = definition.Dependencies
 	}
 
-	topology := Topology{Nodes: make([]TopologyNode, 0, len(nodes))}
+	topology := Topology{nodes: make([]TopologyNode, 0, len(nodes))}
 	for _, node := range nodes {
-		topology.Nodes = append(topology.Nodes, node)
+		topology.nodes = append(topology.nodes, node)
 	}
-	sort.Slice(topology.Nodes, func(i, j int) bool { return topology.Nodes[i].ID < topology.Nodes[j].ID })
+	sort.Slice(topology.nodes, func(i, j int) bool { return topology.nodes[i].ID < topology.nodes[j].ID })
 
-	for _, node := range topology.Nodes {
+	for _, node := range topology.nodes {
 		if node.Kind != HBaseComponent {
 			continue
 		}
@@ -84,11 +88,11 @@ func ResolveTopology(definitions []ComponentDefinition) (Topology, error) {
 			if !exists || resolved.Kind != reference.kind {
 				return Topology{}, fmt.Errorf("%w: HBase component %q references %s %q", ErrUnauthorizedDependency, node.ID, reference.kind, reference.id)
 			}
-			topology.Relations = append(topology.Relations, DependencyRelation{ComponentID: node.ID, DependencyID: reference.id, DependencyKind: reference.kind})
+			topology.relations = append(topology.relations, DependencyRelation{ComponentID: node.ID, DependencyID: reference.id, DependencyKind: reference.kind})
 		}
 	}
-	sort.Slice(topology.Relations, func(i, j int) bool {
-		left, right := topology.Relations[i], topology.Relations[j]
+	sort.Slice(topology.relations, func(i, j int) bool {
+		left, right := topology.relations[i], topology.relations[j]
 		if left.ComponentID != right.ComponentID {
 			return left.ComponentID < right.ComponentID
 		}
@@ -97,9 +101,23 @@ func ResolveTopology(definitions []ComponentDefinition) (Topology, error) {
 	return topology, nil
 }
 
+// Nodes returns a defensive copy of the credential-free topology nodes.
+func (topology Topology) Nodes() []TopologyNode {
+	result := make([]TopologyNode, len(topology.nodes))
+	for index, node := range topology.nodes {
+		result[index] = TopologyNode{ID: node.ID, Kind: node.Kind, Roles: append([]string(nil), node.Roles...)}
+	}
+	return result
+}
+
+// Relations returns a defensive copy of the authorized dependency edges.
+func (topology Topology) Relations() []DependencyRelation {
+	return append([]DependencyRelation(nil), topology.relations...)
+}
+
 // HasRelation reports whether a particular typed dependency edge is present.
 func (topology Topology) HasRelation(componentID, dependencyID string, kind ComponentKind) bool {
-	for _, relation := range topology.Relations {
+	for _, relation := range topology.relations {
 		if relation.ComponentID == componentID && relation.DependencyID == dependencyID && relation.DependencyKind == kind {
 			return true
 		}
@@ -108,7 +126,7 @@ func (topology Topology) HasRelation(componentID, dependencyID string, kind Comp
 }
 
 func (topology Topology) node(id string) (TopologyNode, bool) {
-	for _, node := range topology.Nodes {
+	for _, node := range topology.nodes {
 		if node.ID == id {
 			node.Roles = append([]string(nil), node.Roles...)
 			return node, true
@@ -118,7 +136,7 @@ func (topology Topology) node(id string) (TopologyNode, bool) {
 }
 
 func (topology Topology) dependencyID(componentID string, kind ComponentKind) (string, bool) {
-	for _, relation := range topology.Relations {
+	for _, relation := range topology.relations {
 		if relation.ComponentID == componentID && relation.DependencyKind == kind {
 			return relation.DependencyID, true
 		}
@@ -126,10 +144,13 @@ func (topology Topology) dependencyID(componentID string, kind ComponentKind) (s
 	return "", false
 }
 
-func topologyRoles(endpoints []Endpoint) []string {
+func topologyRoles(kind ComponentKind, endpoints []Endpoint) ([]string, error) {
 	roles := make(map[string]struct{}, len(endpoints))
 	for _, endpoint := range endpoints {
-		role := strings.ToLower(strings.TrimSpace(endpoint.Role))
+		role, err := canonicalComponentRole(kind, endpoint.Role)
+		if err != nil {
+			return nil, err
+		}
 		if role != "" {
 			roles[role] = struct{}{}
 		}
@@ -139,5 +160,18 @@ func topologyRoles(endpoints []Endpoint) []string {
 		result = append(result, role)
 	}
 	sort.Strings(result)
-	return result
+	return result, nil
+}
+
+func canonicalComponentRole(kind ComponentKind, role string) (string, error) {
+	switch kind {
+	case HBaseComponent:
+		return normalizedHBaseRole(role)
+	case HDFSComponent:
+		return normalizedHDFSRole(role)
+	case ZooKeeperComponent:
+		return normalizedZooKeeperRole(role)
+	default:
+		return "", fmt.Errorf("unsupported component kind %q", kind)
+	}
 }
