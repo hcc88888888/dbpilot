@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,6 +101,33 @@ func TestReadOnlyUsesCatalogStatementAndCallerDeadline(t *testing.T) {
 	}
 }
 
+func TestReadOnlySanitizesDriverRowErrors(t *testing.T) {
+	const secret = "mysql://readonly:do-not-leak@db.example.test:3306/app"
+	template := MetricTemplate{ID: "db.connections", Statement: "SELECT value FROM metrics", MaxRows: 2, ValueColumns: []string{"value"}}
+	catalog := staticCatalog{templates: map[EngineFamily]map[string]MetricTemplate{MySQLFamily: {template.ID: template}}}
+	tests := []struct {
+		name string
+		rows *fakeRows
+	}{
+		{name: "columns", rows: &fakeRows{columnsErr: errors.New(secret)}},
+		{name: "scan", rows: &fakeRows{columns: []string{"value"}, values: [][]any{{int64(1)}}, scanErr: errors.New(secret)}},
+		{name: "iteration", rows: &fakeRows{columns: []string{"value"}, err: errors.New(secret)}},
+		{name: "close", rows: &fakeRows{columns: []string{"value"}, closeErr: errors.New(secret)}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := ExecuteReadOnly(context.Background(), &recordingQueryer{rows: test.rows}, MySQLFamily, catalog, template.ID, nil, 1)
+			if err == nil {
+				t.Fatal("ExecuteReadOnly() error = nil, want sanitized driver failure")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("ExecuteReadOnly() leaked driver detail: %v", err)
+			}
+		})
+	}
+}
+
 type staticCatalog struct {
 	templates map[EngineFamily]map[string]MetricTemplate
 }
@@ -128,16 +156,27 @@ func (queryer *recordingQueryer) QueryContext(ctx context.Context, statement str
 }
 
 type fakeRows struct {
-	columns []string
-	values  [][]any
-	index   int
-	closed  bool
-	err     error
+	columns    []string
+	columnsErr error
+	values     [][]any
+	index      int
+	closed     bool
+	err        error
+	scanErr    error
+	closeErr   error
 }
 
-func (rows *fakeRows) Columns() ([]string, error) { return append([]string(nil), rows.columns...), nil }
-func (rows *fakeRows) Next() bool                 { return rows.index < len(rows.values) }
+func (rows *fakeRows) Columns() ([]string, error) {
+	if rows.columnsErr != nil {
+		return nil, rows.columnsErr
+	}
+	return append([]string(nil), rows.columns...), nil
+}
+func (rows *fakeRows) Next() bool { return rows.index < len(rows.values) }
 func (rows *fakeRows) Scan(dest ...any) error {
+	if rows.scanErr != nil {
+		return rows.scanErr
+	}
 	if rows.index >= len(rows.values) {
 		return fmt.Errorf("Scan called after rows exhausted")
 	}
@@ -154,5 +193,8 @@ func (rows *fakeRows) Scan(dest ...any) error {
 	rows.index++
 	return nil
 }
-func (rows *fakeRows) Err() error   { return rows.err }
-func (rows *fakeRows) Close() error { rows.closed = true; return nil }
+func (rows *fakeRows) Err() error { return rows.err }
+func (rows *fakeRows) Close() error {
+	rows.closed = true
+	return rows.closeErr
+}

@@ -96,13 +96,13 @@ func ExecuteReadOnly(ctx context.Context, db Queryer, family EngineFamily, catal
 	}
 	defer func() {
 		if err := rows.Close(); resultErr == nil && err != nil {
-			resultErr = err
+			resultErr = errors.New("database metric result close failed")
 		}
 	}()
 
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, errors.New("database metric result columns unavailable")
 	}
 	if len(columns) == 0 || len(columns) > maximumMetricColumns || len(columns) != len(template.ValueColumns) {
 		return nil, fmt.Errorf("%w: columns", ErrQueryResultBounds)
@@ -124,7 +124,7 @@ func ExecuteReadOnly(ctx context.Context, db Queryer, family EngineFamily, catal
 			destinations[index] = &values[index]
 		}
 		if err := rows.Scan(destinations...); err != nil {
-			return nil, err
+			return nil, errors.New("database metric result scan failed")
 		}
 		metricRow := make(MetricRow, len(columns))
 		for index, value := range values {
@@ -137,7 +137,7 @@ func ExecuteReadOnly(ctx context.Context, db Queryer, family EngineFamily, catal
 		metricRows = append(metricRows, metricRow)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, errors.New("database metric result iteration failed")
 	}
 	return metricRows, nil
 }
