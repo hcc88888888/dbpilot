@@ -3,17 +3,139 @@ package alert
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNotificationMigrationUpgradesPopulated0001WithoutLosingRoutesOrRetryState(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql")
+	scope := Scope{TenantID: "tenant-upgrade", ProjectID: "project-upgrade"}
+	attemptedAt := time.Date(2026, 8, 27, 8, 0, 0, 0, time.UTC)
+	nextAttemptAt := attemptedAt.Add(5 * time.Minute)
+
+	_, err := database.ExecContext(ctx, "INSERT INTO notification_templates (id, tenant_id, project_id, name, subject, body) VALUES ('policy-routable', $1, $2, 'legacy same-id', 'subject', 'body')", scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "INSERT INTO notification_policies (id, tenant_id, project_id, name, channel, target, enabled) VALUES ('policy-routable', $1, $2, 'routable', 'in_app', 'user-7', true), ('policy-no-template', $1, $2, 'missing', 'in_app', 'user-7', true)", scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids) VALUES ('rule-upgrade', $1, $2, 'upgrade', 'db.cpu', 'avg', '>', 80, 60000000000, 60000000000, 'ignore', 'critical', ARRAY['policy-routable', 'policy-no-template'])", scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "INSERT INTO alert_silences (id, tenant_id, project_id, matchers, starts_at, ends_at, created_by) VALUES ('silence-legacy', $1, $2, '{\"database\":\"orders\"}', $3, $4, 'operator')", scope.TenantID, scope.ProjectID, attemptedAt, attemptedAt.Add(time.Hour))
+	require.NoError(t, err)
+
+	legacyEnvelope := func(status DeliveryStatus, attempts int, next time.Time, failure string) string {
+		request := map[string]any{
+			"scope":    map[string]string{"tenant_id": scope.TenantID, "project_id": scope.ProjectID},
+			"event_id": "event-legacy", "state": "firing", "severity": "critical", "channel": "in_app",
+			"policy_id": "policy-routable", "template_id": "policy-routable", "template_version": attemptedAt.Format(time.RFC3339Nano),
+			"target": "user-7", "secret_ref": "vault://legacy-reference", "subject": "subject", "body": "body",
+			"labels": map[string]string{"database": "orders"},
+		}
+		envelope := map[string]any{"attempts": attempts, "failure_class": failure, "request": request}
+		if !next.IsZero() {
+			envelope["next_attempt_at"] = next.Format(time.RFC3339Nano)
+		}
+		encoded, marshalErr := json.Marshal(envelope)
+		require.NoError(t, marshalErr)
+		return string(encoded)
+	}
+	for _, fixture := range []struct {
+		id, status, envelope string
+		delivered            any
+	}{
+		{"delivery-delivered", "delivered", legacyEnvelope(DeliveryDelivered, 1, time.Time{}, ""), attemptedAt},
+		{"delivery-suppressed", "suppressed", legacyEnvelope(DeliverySuppressed, 1, time.Time{}, ""), nil},
+		{"delivery-retry", "retry_scheduled", legacyEnvelope(DeliveryRetryScheduled, 2, nextAttemptAt, "remote_5xx"), nil},
+		{"delivery-attempting", "attempting", legacyEnvelope(DeliveryAttempting, 1, time.Time{}, ""), nil},
+		{"delivery-malformed", "retry_scheduled", "not-json", nil},
+	} {
+		_, err = database.ExecContext(ctx, "INSERT INTO notification_deliveries (id, tenant_id, project_id, event_id, policy_id, status, attempted_at, delivered_at, failure_reason) VALUES ($1, $2, $3, 'event-legacy', 'policy-routable', $4, $5, $6, $7)", fixture.id, scope.TenantID, scope.ProjectID, fixture.status, attemptedAt, fixture.delivered, fixture.envelope)
+		require.NoError(t, err)
+	}
+
+	migration, err := os.ReadFile(filepath.Join("migrations", "0002_notification_delivery_control.sql"))
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, string(migration))
+	require.NoError(t, err)
+
+	var templateID sql.NullString
+	var enabled bool
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT template_id, enabled FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = 'policy-routable'", scope.TenantID, scope.ProjectID).Scan(&templateID, &enabled))
+	require.Equal(t, "policy-routable", templateID.String)
+	require.True(t, enabled)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT template_id, enabled FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = 'policy-no-template'", scope.TenantID, scope.ProjectID).Scan(&templateID, &enabled))
+	require.False(t, templateID.Valid)
+	require.False(t, enabled)
+	routes, err := NewPostgresRepository(database).ListNotificationRoutes(ctx, scope, "rule-upgrade")
+	require.NoError(t, err)
+	require.Len(t, routes, 2)
+	require.Equal(t, "policy-no-template", routes[0].Policy.ID)
+	require.False(t, routes[0].Policy.Enabled)
+	require.Empty(t, routes[0].Policy.TemplateID)
+
+	var reason string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT reason FROM alert_silences WHERE tenant_id = $1 AND project_id = $2 AND id = 'silence-legacy'", scope.TenantID, scope.ProjectID).Scan(&reason))
+	require.Equal(t, "migrated legacy silence; original reason was not recorded", reason)
+
+	type migratedDelivery struct {
+		status, eventState, channel, templateID, templateVersion, failureClass, target, secretRef string
+		attempts                                                                                  int
+		nextAttempt, leaseExpiry                                                                  sql.NullTime
+	}
+	readDelivery := func(id string) migratedDelivery {
+		var got migratedDelivery
+		require.NoError(t, database.QueryRowContext(ctx, "SELECT status, event_state, channel, template_id, template_version, failure_class, request_target, request_secret_ref, attempts, next_attempt_at, lease_expires_at FROM notification_deliveries WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id).Scan(&got.status, &got.eventState, &got.channel, &got.templateID, &got.templateVersion, &got.failureClass, &got.target, &got.secretRef, &got.attempts, &got.nextAttempt, &got.leaseExpiry))
+		return got
+	}
+	for _, id := range []string{"delivery-delivered", "delivery-suppressed"} {
+		got := readDelivery(id)
+		require.Empty(t, got.failureClass, id)
+		require.Equal(t, "firing", got.eventState, id)
+		require.Equal(t, "policy-routable", got.templateID, id)
+	}
+	retry := readDelivery("delivery-retry")
+	require.Equal(t, "retry_scheduled", retry.status)
+	require.Equal(t, 2, retry.attempts)
+	require.True(t, retry.nextAttempt.Valid)
+	require.True(t, retry.nextAttempt.Time.Equal(nextAttemptAt))
+	require.Equal(t, "remote_5xx", retry.failureClass)
+	require.Equal(t, "vault://legacy-reference", retry.secretRef)
+	attempting := readDelivery("delivery-attempting")
+	require.Equal(t, "attempting", attempting.status)
+	require.True(t, attempting.leaseExpiry.Valid)
+	require.False(t, attempting.leaseExpiry.Time.After(time.Now().UTC()))
+	malformed := readDelivery("delivery-malformed")
+	require.Equal(t, "abandoned", malformed.status)
+	require.Equal(t, "legacy_delivery_unrecoverable", malformed.failureClass)
+
+	var policyAudit, abandonedAudit int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM alert_audit_log WHERE tenant_id = $1 AND project_id = $2 AND action = 'policy.updated' AND target_id = 'policy-no-template' AND actor = 'dbpilot-schema-migration'", scope.TenantID, scope.ProjectID).Scan(&policyAudit))
+	require.Equal(t, 1, policyAudit)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM alert_audit_log WHERE tenant_id = $1 AND project_id = $2 AND action = 'delivery.abandoned' AND target_id = 'delivery-malformed' AND actor = 'dbpilot-schema-migration'", scope.TenantID, scope.ProjectID).Scan(&abandonedAudit))
+	require.Equal(t, 1, abandonedAudit)
+
+	var invalidConstraints int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM pg_constraint WHERE conrelid IN ('notification_policies'::regclass, 'alert_silences'::regclass, 'notification_deliveries'::regclass) AND NOT convalidated").Scan(&invalidConstraints))
+	require.Zero(t, invalidConstraints)
+}
 
 func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T) {
 	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
@@ -143,7 +265,95 @@ func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T)
 	require.Equal(t, 3, recovered[0].Attempts)
 }
 
+func TestPostgresRetryClaimsEachSlowDeliveryJustInTime(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, schema := setupNotificationIntegrationSchema(t, ctx, dsn)
+	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "notification-jit-worker-two"), "")
+	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
+
+	scope := Scope{TenantID: "tenant-jit", ProjectID: "project-jit"}
+	dueAt := time.Now().UTC().Add(-time.Second)
+	repositoryOne := NewPostgresRepository(database)
+	for index := 1; index <= 3; index++ {
+		eventID := fmt.Sprintf("event-jit-%d", index)
+		request := DeliveryRequest{Scope: scope, EventID: eventID, State: EventFiring, Channel: "slow", PolicyID: "policy-jit", TemplateID: "template-jit", TemplateVersion: "1", Target: "recipient", Subject: "subject", Body: "body"}
+		delivery := newNotificationDelivery(request, AlertEvent{ID: eventID, Scope: scope}, dueAt)
+		delivery.LeaseOwner = "seed-owner"
+		delivery.LeaseExpiresAt = dueAt
+		delivery.ClaimOwner = "seed-owner"
+		reserved, err := repositoryOne.ReserveNotificationDelivery(ctx, delivery, nil)
+		require.NoError(t, err)
+		require.True(t, reserved)
+		_, err = database.ExecContext(ctx, "UPDATE notification_deliveries SET status = 'retry_scheduled', next_attempt_at = $1, lease_owner = '', lease_expires_at = NULL, failure_class = 'remote_5xx' WHERE tenant_id = $2 AND project_id = $3 AND id = $4", dueAt, scope.TenantID, scope.ProjectID, delivery.ID)
+		require.NoError(t, err)
+	}
+
+	channel := &slowCountingChannel{name: "slow", delay: 40 * time.Millisecond, started: make(chan string, 8), counts: make(map[string]int)}
+	workerOne := NewDispatcher(repositoryOne, []DeliveryChannel{channel}, time.Now, nil)
+	workerTwo := NewDispatcher(NewPostgresRepository(databaseTwo), []DeliveryChannel{channel}, time.Now, nil)
+	workerOne.lease, workerTwo.lease = 50*time.Millisecond, 50*time.Millisecond
+	workerOne.batchSize, workerTwo.batchSize = 3, 3
+
+	workerOneResult := make(chan error, 1)
+	go func() { workerOneResult <- workerOne.RetryDue(ctx, time.Now().UTC()) }()
+	for index := 0; index < 3; index++ {
+		select {
+		case <-channel.started:
+		case err := <-workerOneResult:
+			t.Fatalf("worker one stopped after %d deliveries: %v", index, err)
+		case <-ctx.Done():
+			t.Fatal("worker one did not start all slow deliveries")
+		}
+	}
+	require.NoError(t, workerTwo.RetryDue(ctx, time.Now().UTC()))
+	require.NoError(t, <-workerOneResult)
+
+	channel.mu.Lock()
+	defer channel.mu.Unlock()
+	require.Len(t, channel.counts, 3)
+	for deliveryID, count := range channel.counts {
+		require.Equal(t, 1, count, deliveryID)
+	}
+}
+
+type slowCountingChannel struct {
+	name    string
+	delay   time.Duration
+	started chan string
+	mu      sync.Mutex
+	counts  map[string]int
+}
+
+func (channel *slowCountingChannel) Name() string { return channel.name }
+
+func (channel *slowCountingChannel) Deliver(ctx context.Context, request DeliveryRequest) error {
+	channel.mu.Lock()
+	channel.counts[request.DeliveryID]++
+	channel.mu.Unlock()
+	channel.started <- request.DeliveryID
+	timer := time.NewTimer(channel.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func setupNotificationIntegrationSchema(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {
+	return setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0002_notification_delivery_control.sql")
+}
+
+func setupNotificationIntegrationSchemaThrough(t *testing.T, ctx context.Context, dsn string, migrations ...string) (*sql.DB, string) {
 	t.Helper()
 	admin := openAlertIntegrationDB(t, dsn, "notification-admin")
 	schema := fmt.Sprintf("alert_notification_%d", time.Now().UnixNano())
@@ -159,7 +369,7 @@ func setupNotificationIntegrationSchema(t *testing.T, ctx context.Context, dsn s
 	})
 	database := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "notification-primary"), "")
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
-	for _, name := range []string{"0001_alert_control_plane.sql", "0002_notification_delivery_control.sql"} {
+	for _, name := range migrations {
 		migration, readErr := os.ReadFile(filepath.Join("migrations", name))
 		require.NoError(t, readErr)
 		_, execErr := database.ExecContext(ctx, string(migration))

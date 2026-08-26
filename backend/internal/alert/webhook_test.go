@@ -37,13 +37,15 @@ func TestWebhookDialRevalidatesAndPinsPublicAddress(t *testing.T) {
 func TestWebhookRejectsEverySpecialUseAddressAndMixedDNSAnswer(t *testing.T) {
 	for _, raw := range []string{
 		"0.1.2.3", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "192.0.0.1", "192.0.2.1", "192.168.0.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "240.0.0.1",
-		"::", "::1", "::ffff:127.0.0.1", "64:ff9b::1", "100::1", "2001:db8::1", "fc00::1", "fec0::1", "fe80::1", "ff00::1",
+		"::", "::1", "::ffff:127.0.0.1", "64:ff9b::1", "100::1", "100:0:0:1::1", "2001:db8::1", "3fff::1", "5f00::1", "4000::1", "6000::1", "fc00::1", "fec0::1", "fe80::1", "ff00::1",
 	} {
 		t.Run(raw, func(t *testing.T) { require.False(t, publicWebhookIP(net.ParseIP(raw))) })
 	}
 	require.True(t, publicWebhookIP(net.ParseIP("93.184.216.34")))
 	require.True(t, publicWebhookIP(net.ParseIP("2606:4700:4700::1111")))
 	resolver := staticIPResolver{"allowed.example": {net.ParseIP("93.184.216.34"), net.ParseIP("10.0.0.1")}}
+	require.Error(t, ValidateWebhookURL("https://allowed.example/hook", exactAllowlist{"allowed.example": true}, resolver))
+	resolver = staticIPResolver{"allowed.example": {net.ParseIP("2606:4700:4700::1111"), net.ParseIP("3fff::1")}}
 	require.Error(t, ValidateWebhookURL("https://allowed.example/hook", exactAllowlist{"allowed.example": true}, resolver))
 }
 

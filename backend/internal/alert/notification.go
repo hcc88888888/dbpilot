@@ -226,13 +226,25 @@ func (dispatcher *Dispatcher) RetryDue(ctx context.Context, at time.Time) error 
 	if dispatcher == nil || dispatcher.repository == nil || at.IsZero() {
 		return ErrInvalidNotification
 	}
-	due, err := dispatcher.repository.ClaimDueNotificationDeliveries(ctx, at.UTC(), dispatcher.workerID, at.UTC().Add(dispatcher.lease), dispatcher.batchSize)
-	if err != nil {
-		return err
-	}
 	var batchErrors []error
-	for index := range due {
-		delivery := due[index]
+	for processed := 0; processed < dispatcher.batchSize; processed++ {
+		claimAt := dispatcher.now().UTC()
+		if claimAt.Before(at.UTC()) {
+			claimAt = at.UTC()
+		}
+		due, err := dispatcher.repository.ClaimDueNotificationDeliveries(ctx, claimAt, dispatcher.workerID, claimAt.Add(dispatcher.lease), 1)
+		if err != nil {
+			batchErrors = append(batchErrors, err)
+			break
+		}
+		if len(due) == 0 {
+			break
+		}
+		if len(due) != 1 {
+			batchErrors = append(batchErrors, ErrInvalidNotification)
+			break
+		}
+		delivery := due[0]
 		if delivery.Scope != delivery.Request.Scope || delivery.Status != DeliveryAttempting || delivery.LeaseOwner != dispatcher.workerID {
 			batchErrors = append(batchErrors, ErrInvalidNotification)
 			continue
@@ -249,11 +261,11 @@ func (dispatcher *Dispatcher) RetryDue(ctx context.Context, at time.Time) error 
 			}
 			continue
 		}
-		if err := dispatcher.repository.UpdateNotificationDelivery(ctx, delivery, notificationAudit(delivery, "delivery.retrying", at)); err != nil {
+		if err := dispatcher.repository.UpdateNotificationDelivery(ctx, delivery, notificationAudit(delivery, "delivery.retrying", claimAt)); err != nil {
 			batchErrors = append(batchErrors, err)
 			continue
 		}
-		if err := dispatcher.finishAttempt(ctx, channel, &delivery, at.UTC()); err != nil {
+		if err := dispatcher.finishAttempt(ctx, channel, &delivery, claimAt); err != nil {
 			batchErrors = append(batchErrors, err)
 		}
 	}
