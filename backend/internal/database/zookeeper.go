@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,6 +35,10 @@ type zooKeeperAdapter struct {
 	definition   ComponentDefinition
 	client       JMXClient
 	capabilities CapabilityMatrix
+}
+
+type zooKeeperMonitorFetcher interface {
+	FetchZooKeeperMonitor(context.Context, Endpoint) (map[string]JSONValue, error)
 }
 
 func NewZooKeeperAdapter(definition ComponentDefinition, client JMXClient) (ComponentAdapter, error) {
@@ -112,10 +117,27 @@ func (adapter *zooKeeperAdapter) Collect(ctx context.Context, request MetricRequ
 		if roleErr != nil {
 			return samples, roleErr
 		}
-		// Compatibility monitor endpoints are explicitly allowlisted but never
-		// sent through the JMX client, which only permits /jmx JSON requests.
 		if endpointPath(endpoint.URL) == zooKeeperCompatibilityPath {
-			failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+			monitor, ok := adapter.client.(zooKeeperMonitorFetcher)
+			if !ok {
+				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+				continue
+			}
+			values, fetchErr := monitor.FetchZooKeeperMonitor(ctx, endpoint)
+			if fetchErr != nil {
+				failures = append(failures, ZooKeeperEndpointFailure{Endpoint: Endpoint{Role: role}})
+				continue
+			}
+			endpointSamples, endpointIssues, normalizeErr := NormalizeJMXBeans([]JMXBean{{Name: "dbpilot:zookeeper=monitor", Attributes: values}}, zooKeeperMonitorAllowlist(), JMXMetricLabels{Cluster: adapter.definition.ID, Component: string(ZooKeeperComponent), Role: role, Host: componentEndpointHost(endpoint.URL), Instance: adapter.definition.ID})
+			if normalizeErr != nil {
+				return samples, errors.New("normalize ZooKeeper monitor metrics")
+			}
+			issues = append(issues, endpointIssues...)
+			for _, sample := range endpointSamples {
+				if len(requested) == 0 || requested[sample.MetricName] {
+					samples = append(samples, sample)
+				}
+			}
 			continue
 		}
 		beans, fetchErr := adapter.client.Fetch(ctx, endpoint, zooKeeperBeanAllowlist())
@@ -170,5 +192,27 @@ func zooKeeperBeanAllowlist() BeanAllowlist {
 	}
 }
 func zooKeeperMetricProperties() BeanProperties {
-	return BeanProperties{"AvgRequestLatency": {MetricName: "zookeeper.request.latency", Unit: "ms"}, "OutstandingRequests": {MetricName: "zookeeper.outstanding_requests", Unit: "count"}, "PacketsReceived": {MetricName: "zookeeper.requests.received", Unit: "count"}, "PacketsSent": {MetricName: "zookeeper.requests.sent", Unit: "count"}, "NumAliveConnections": {MetricName: "zookeeper.connections", Unit: "count"}, "QuorumSize": {MetricName: "zookeeper.quorum.members", Unit: "count"}, "ZnodeCount": {MetricName: "zookeeper.znodes", Unit: "count"}, "WatchCount": {MetricName: "zookeeper.watches", Unit: "count"}, "TxnLogElapsedSyncTime": {MetricName: "zookeeper.transaction_log.sync_time", Unit: "ms"}, "SnapshotTime": {MetricName: "zookeeper.snapshot.time", Unit: "ms"}}
+	return BeanProperties{"AvgRequestLatency": {MetricName: "zookeeper.request.latency", Unit: "ms"}, "OutstandingRequests": {MetricName: "zookeeper.outstanding_requests", Unit: "count"}, "PacketsReceived": {MetricName: "zookeeper.requests.received", Unit: "count"}, "PacketsSent": {MetricName: "zookeeper.requests.sent", Unit: "count"}, "NumAliveConnections": {MetricName: "zookeeper.sessions", Unit: "count"}, "QuorumSize": {MetricName: "zookeeper.quorum.members", Unit: "count"}, "ZnodeCount": {MetricName: "zookeeper.znodes", Unit: "count"}, "WatchCount": {MetricName: "zookeeper.watches", Unit: "count"}, "TxnLogElapsedSyncTime": {MetricName: "zookeeper.transaction_log.sync_time", Unit: "ms"}, "SnapshotTime": {MetricName: "zookeeper.snapshot.time", Unit: "ms"}}
+}
+
+func zooKeeperMonitorAllowlist() BeanAllowlist {
+	return BeanAllowlist{"dbpilot:zookeeper=monitor": {"zk_avg_latency": {MetricName: "zookeeper.request.latency", Unit: "ms"}, "zk_num_alive_connections": {MetricName: "zookeeper.sessions", Unit: "count"}, "zk_outstanding_requests": {MetricName: "zookeeper.outstanding_requests", Unit: "count"}, "zk_packets_received": {MetricName: "zookeeper.requests.received", Unit: "count"}, "zk_packets_sent": {MetricName: "zookeeper.requests.sent", Unit: "count"}, "zk_znode_count": {MetricName: "zookeeper.znodes", Unit: "count"}, "zk_watch_count": {MetricName: "zookeeper.watches", Unit: "count"}}}
+}
+
+func parseZooKeeperMonitor(body []byte) (map[string]JSONValue, error) {
+	values := make(map[string]JSONValue)
+	if json.Unmarshal(body, &values) == nil {
+		return values, nil
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && strings.HasPrefix(fields[0], "zk_") {
+			encoded, _ := json.Marshal(fields[1])
+			values[fields[0]] = encoded
+		}
+	}
+	if len(values) == 0 {
+		return nil, errors.New("decode ZooKeeper monitor response")
+	}
+	return values, nil
 }

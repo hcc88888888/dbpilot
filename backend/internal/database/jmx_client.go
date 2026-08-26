@@ -137,6 +137,70 @@ func (client *jmxClient) Fetch(ctx context.Context, endpoint Endpoint, allowlist
 	return nil, errors.New("JMX request failed")
 }
 
+// FetchZooKeeperMonitor performs the sole non-JMX compatibility read. Its URL
+// and parsed fields remain fixed in the ZooKeeper adapter.
+func (client *jmxClient) FetchZooKeeperMonitor(ctx context.Context, endpoint Endpoint) (map[string]JSONValue, error) {
+	target, err := validatedZooKeeperMonitorURL(endpoint.URL)
+	if err != nil {
+		return nil, err
+	}
+	if ctx == nil || isNilInterface(client.resolver) {
+		return nil, errors.New("ZooKeeper monitor runtime client is required")
+	}
+	timeout := client.config.Timeout
+	if timeout == 0 {
+		timeout = defaultJMXTimeout
+	}
+	if timeout < 0 || timeout > maximumOperationTimeout {
+		return nil, errors.New("ZooKeeper monitor timeout must be greater than zero and at most one minute")
+	}
+	requestContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	tlsConfig, err := resolveJMXTLS(requestContext, client.resolver, client.config.TLS, target.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	credential, err := resolveJMXCredential(requestContext, client.resolver, client.config.SecretRef)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: (&net.Dialer{Timeout: timeout}).DialContext, TLSHandshakeTimeout: timeout, ResponseHeaderTimeout: timeout, TLSClientConfig: tlsConfig}
+	defer transport.CloseIdleConnections()
+	httpClient := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errJMXRedirect }}
+	request, err := http.NewRequestWithContext(requestContext, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, errors.New("create ZooKeeper monitor request")
+	}
+	request.Header.Set("Accept", "application/json, text/plain")
+	if len(credential) != 0 {
+		request.Header.Set("Authorization", "Bearer "+string(credential))
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		if requestContext.Err() != nil {
+			return nil, requestContext.Err()
+		}
+		return nil, errors.New("ZooKeeper monitor request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("ZooKeeper monitor returned HTTP status %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maximumJMXBody))
+	if err != nil {
+		return nil, errors.New("read ZooKeeper monitor response")
+	}
+	return parseZooKeeperMonitor(body)
+}
+
+func validatedZooKeeperMonitorURL(raw string) (*url.URL, error) {
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != zooKeeperCompatibilityPath {
+		return nil, errors.New("ZooKeeper monitor endpoint must use the read-only monitor path")
+	}
+	return parsed, nil
+}
+
 func validatedJMXURL(raw string) (*url.URL, error) {
 	if strings.TrimSpace(raw) != raw || raw == "" {
 		return nil, errors.New("JMX endpoint is required")

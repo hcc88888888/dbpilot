@@ -2,7 +2,11 @@ package database
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -25,6 +29,62 @@ func TestZooKeeperAdapterCollectsLeaderAndFollowerFixtures(t *testing.T) {
 	assertComponentSample(t, samples, "zookeeper.requests.received", "zookeeper", "follower", 10)
 	if !containsString(client.allowlistedProperties(), "AvgRequestLatency") || containsString(client.allowlistedProperties(), "unsafe") {
 		t.Fatalf("JMX allowlist properties = %v, want fixed ZooKeeper properties only", client.allowlistedProperties())
+	}
+}
+
+func TestZooKeeperMonitorCompatibilityUsesRuntimeTLSAndAuthorization(t *testing.T) {
+	called := false
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if r.URL.Path != zooKeeperCompatibilityPath {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer runtime-token" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		_, _ = w.Write([]byte("zk_avg_latency\t2\nzk_num_alive_connections\t8\n"))
+	}))
+	defer server.Close()
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if _, err := x509.ParseCertificate(server.Certificate().Raw); err != nil {
+		t.Fatal(err)
+	}
+	definition := zooKeeperTestDefinition()
+	definition.Endpoints = []Endpoint{{URL: server.URL + zooKeeperCompatibilityPath, Role: "leader"}}
+	definition.TLSRef = "secret://runtime/zk-ca"
+	adapter, err := NewZooKeeperAdapterWithRuntime(definition, StaticSecretResolver{definition.SecretRef: []byte("runtime-token"), definition.TLSRef: ca})
+	if err != nil {
+		t.Fatal(err)
+	}
+	samples, err := adapter.Collect(context.Background(), MetricRequest{})
+	allowZooKeeperParseIssues(t, err)
+	if !called {
+		t.Fatal("monitor endpoint was not called")
+	}
+	assertComponentSample(t, samples, "zookeeper.request.latency", "zookeeper", "leader", 2)
+	assertComponentSample(t, samples, "zookeeper.sessions", "zookeeper", "leader", 8)
+}
+
+func TestZooKeeperMonitorParsesJSONAndRedactsFailures(t *testing.T) {
+	values, err := parseZooKeeperMonitor([]byte(`{"zk_avg_latency":2,"zk_num_alive_connections":8,"unsafe":"x"}`))
+	if err != nil || string(values["zk_avg_latency"]) != "2" {
+		t.Fatalf("parseZooKeeperMonitor() = %#v, %v", values, err)
+	}
+	called := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		http.Error(w, "token=top-secret", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	definition := zooKeeperTestDefinition()
+	definition.Endpoints = []Endpoint{{URL: server.URL + zooKeeperCompatibilityPath, Role: "leader"}}
+	adapter, err := NewZooKeeperAdapterWithRuntime(definition, StaticSecretResolver{definition.SecretRef: []byte("top-secret")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = adapter.Collect(context.Background(), MetricRequest{})
+	if !called || err == nil || containsString([]string{err.Error()}, "top-secret") {
+		t.Fatalf("Collect() error = %v, want redacted monitor failure", err)
 	}
 }
 
