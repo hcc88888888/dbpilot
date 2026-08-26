@@ -66,9 +66,36 @@ func TestMetricConsumerDoesNotAppendWhenStoreIsUnavailable(t *testing.T) {
 	require.Empty(t, store.samples)
 }
 
+func TestMetricConsumerAtomicallyStoresBatchIdentityWithSamples(t *testing.T) {
+	store := &atomicRecordingStore{first: true}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+
+	first, err := consumer.ConsumeMetricBatchOnce(context.Background(), "agent-a", "batch-a", []byte(`{"samples":[{"name":"db.connections","value":12,"sampled_at":"2026-08-26T09:59:00Z","labels":{}}]}`), now)
+	require.NoError(t, err)
+	require.True(t, first)
+	require.Equal(t, "agent-a", store.agentID)
+	require.Equal(t, "batch-a", store.batchID)
+	require.Len(t, store.samples, 1)
+}
+
 type recordingStore struct {
 	samples []alert.MetricSample
 	err     error
+}
+
+type atomicRecordingStore struct {
+	recordingStore
+	agentID string
+	batchID string
+	first   bool
+}
+
+func (s *atomicRecordingStore) AppendBatch(_ context.Context, agentID, batchID string, samples []alert.MetricSample) (bool, error) {
+	s.agentID = agentID
+	s.batchID = batchID
+	s.samples = append(s.samples, samples...)
+	return s.first, s.err
 }
 
 func (s *recordingStore) Append(_ context.Context, samples []alert.MetricSample) error {

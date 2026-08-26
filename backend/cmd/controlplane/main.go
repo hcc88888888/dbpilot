@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -48,12 +49,28 @@ type AgentAssignment struct {
 	ProjectID string `yaml:"project_id"`
 }
 
+type EvaluationScopeSettings struct {
+	TenantID  string `yaml:"tenant_id"`
+	ProjectID string `yaml:"project_id"`
+}
+
 type SMTPSettings struct {
 	Address     string `yaml:"address"`
 	ServerName  string `yaml:"server_name"`
 	Username    string `yaml:"username"`
 	From        string `yaml:"from"`
 	ImplicitTLS bool   `yaml:"implicit_tls"`
+}
+
+type IdentitySettings struct {
+	Mode       string                       `yaml:"mode"`
+	Principals map[string]PrincipalSettings `yaml:"principals,omitempty"`
+}
+
+type PrincipalSettings struct {
+	Subject       string            `yaml:"subject"`
+	PlatformAdmin bool              `yaml:"platform_admin"`
+	Projects      []AgentAssignment `yaml:"projects,omitempty"`
 }
 
 type Config struct {
@@ -63,8 +80,9 @@ type Config struct {
 	GRPC             ListenerConfig             `yaml:"grpc"`
 	Agents           map[string]AgentAssignment `yaml:"agents"`
 	SMTP             SMTPSettings               `yaml:"smtp"`
+	Identity         IdentitySettings           `yaml:"identity"`
 	EventURLBase     string                     `yaml:"event_url_base"`
-	EvaluationScopes []alert.Scope              `yaml:"evaluation_scopes,omitempty"`
+	EvaluationScopes []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
 	EvaluationEvery  time.Duration              `yaml:"evaluation_every,omitempty"`
 	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
 
@@ -80,21 +98,26 @@ type Config struct {
 }
 
 type Server struct {
-	config       Config
-	database     *sql.DB
-	ownsDatabase bool
-	repository   *alert.PostgresRepository
-	evaluator    *alert.Evaluator
-	dispatcher   *alert.Dispatcher
-	httpServer   *http.Server
-	grpcServer   *grpc.Server
-	httpTLS      *tls.Config
-	grpcTLS      *tls.Config
-	ping         func(context.Context) error
-	migrate      func(context.Context) error
-	listen       func(string, string) (net.Listener, error)
-	scopes       []alert.Scope
-	ready        *atomic.Bool
+	config        Config
+	database      *sql.DB
+	ownsDatabase  bool
+	repository    *alert.PostgresRepository
+	evaluator     *alert.Evaluator
+	dispatcher    *alert.Dispatcher
+	httpServer    *http.Server
+	grpcServer    *grpc.Server
+	httpTLS       *tls.Config
+	grpcTLS       *tls.Config
+	ping          func(context.Context) error
+	migrate       func(context.Context) error
+	listen        func(string, string) (net.Listener, error)
+	scopes        []alert.Scope
+	ready         *atomic.Bool
+	evaluateScope func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents    func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch      func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue      func(context.Context, time.Time) error
+	workers       sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -155,7 +178,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 	httpTLS := config.HTTPServerTLS
 	if httpTLS == nil {
-		loaded, err := loadServerTLS(config.HTTP.TLS, false)
+		loaded, err := loadServerTLS(config.HTTP.TLS, config.PrincipalResolver == nil && config.Identity.Mode == "mtls")
 		if err != nil {
 			return nil, fmt.Errorf("load HTTP TLS: %w", err)
 		}
@@ -164,6 +187,9 @@ func NewServer(config Config) (*Server, error) {
 	httpTLS = httpTLS.Clone()
 	if httpTLS.MinVersion < tls.VersionTLS12 {
 		httpTLS.MinVersion = tls.VersionTLS12
+	}
+	if config.PrincipalResolver == nil && config.Identity.Mode == "mtls" {
+		httpTLS.ClientAuth = tls.RequireAndVerifyClientCert
 	}
 	grpcTLS := config.GRPCServerTLS
 	if grpcTLS == nil {
@@ -191,8 +217,7 @@ func NewServer(config Config) (*Server, error) {
 	repository := alert.NewPostgresRepository(database)
 	resolver := buildConfiguredAgentResolver(config.Agents)
 	metricConsumer := controlplane.NewMetricConsumer(resolver, repository)
-	deduplicator := postgresBatchDeduplicator{database: database}
-	ingestService := ingest.NewService(resolver, deduplicator, metricConsumer)
+	ingestService := ingest.NewDurableService(resolver, postgresLogBatchDeduplicator{database: database}, metricConsumer)
 	evaluator := alert.NewEvaluator(repository, repository)
 	secrets := config.SecretResolver
 	if secrets == nil {
@@ -209,9 +234,12 @@ func NewServer(config Config) (*Server, error) {
 	dispatcher := alert.NewDispatcher(repository, channels, time.Now, func(event alert.AlertEvent) string {
 		return strings.TrimRight(config.EventURLBase, "/") + "/api/v1/tenants/" + url.PathEscape(event.Scope.TenantID) + "/projects/" + url.PathEscape(event.Scope.ProjectID) + "/alerts/" + url.PathEscape(event.ID)
 	})
-	principalResolver := config.PrincipalResolver
-	if principalResolver == nil {
-		principalResolver = controlplane.HeaderPrincipalResolver{}
+	principalResolver, err := principalResolverForConfig(config)
+	if err != nil {
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, err
 	}
 	ping := config.Ping
 	if ping == nil {
@@ -228,14 +256,14 @@ func NewServer(config Config) (*Server, error) {
 	ready := &atomic.Bool{}
 	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Ready: func(ctx context.Context) error {
 		if !ready.Load() {
-			return errors.New("migrations are not complete")
+			return errors.New("a successful all-scope evaluation pass has not completed")
 		}
 		return ping(ctx)
 	}}
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready}, nil
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue}, nil
 }
 
 func validateConfig(config Config) error {
@@ -260,12 +288,108 @@ func validateConfig(config Config) error {
 	if config.GRPCServerTLS == nil && (config.GRPC.TLS.CertFile == "" || config.GRPC.TLS.KeyFile == "" || config.GRPC.TLS.ClientCAFile == "") {
 		return errors.New("gRPC mTLS certificate, key, and client CA references are required")
 	}
+	if config.PrincipalResolver == nil {
+		switch config.Identity.Mode {
+		case "local_headers":
+			if !loopbackAddress(config.HTTP.Address) {
+				return errors.New("local header identity requires a loopback HTTP listener")
+			}
+		case "mtls":
+			if len(config.Identity.Principals) == 0 {
+				return errors.New("mTLS identity requires configured principals")
+			}
+			if config.HTTPServerTLS == nil && config.HTTP.TLS.ClientCAFile == "" {
+				return errors.New("mTLS identity requires an HTTP client CA reference")
+			}
+			if config.HTTPServerTLS != nil && config.HTTPServerTLS.ClientCAs == nil {
+				return errors.New("mTLS identity requires HTTP client CAs")
+			}
+			if _, err := configuredCertificatePrincipals(config.Identity.Principals); err != nil {
+				return err
+			}
+		default:
+			return errors.New("trusted HTTP identity adapter is required")
+		}
+	}
 	for id, assignment := range config.Agents {
 		if strings.TrimSpace(id) == "" || (alert.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}).Validate() != nil {
 			return errors.New("agents contains an invalid assignment")
 		}
 	}
+	seenScopes := make(map[string]struct{}, len(config.EvaluationScopes))
+	for _, configured := range config.EvaluationScopes {
+		scope := alert.Scope{TenantID: configured.TenantID, ProjectID: configured.ProjectID}
+		if scope.Validate() != nil {
+			return errors.New("evaluation scope is invalid")
+		}
+		if _, duplicate := seenScopes[scope.Key()]; duplicate {
+			return errors.New("evaluation scope is duplicated")
+		}
+		seenScopes[scope.Key()] = struct{}{}
+	}
+	if len(configuredScopes(config)) == 0 {
+		return errors.New("at least one evaluation scope is required")
+	}
 	return nil
+}
+
+func principalResolverForConfig(config Config) (controlplane.PrincipalResolver, error) {
+	if config.PrincipalResolver != nil {
+		return config.PrincipalResolver, nil
+	}
+	switch config.Identity.Mode {
+	case "local_headers":
+		return controlplane.HeaderPrincipalResolver{}, nil
+	case "mtls":
+		principals, err := configuredCertificatePrincipals(config.Identity.Principals)
+		if err != nil {
+			return nil, err
+		}
+		return controlplane.CertificatePrincipalResolver{Principals: principals}, nil
+	default:
+		return nil, errors.New("trusted HTTP identity adapter is required")
+	}
+}
+
+func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map[string]alert.Principal, error) {
+	principals := make(map[string]alert.Principal, len(settings))
+	for rawURI, configured := range settings {
+		identityURI, err := url.Parse(rawURI)
+		if err != nil || !identityURI.IsAbs() || identityURI.Host == "" || identityURI.User != nil || identityURI.RawQuery != "" || identityURI.Fragment != "" {
+			return nil, errors.New("identity principals contains an invalid certificate URI")
+		}
+		if configured.Subject == "" || configured.Subject != strings.TrimSpace(configured.Subject) {
+			return nil, errors.New("identity principals contains an invalid subject")
+		}
+		projects := make(map[string]struct{}, len(configured.Projects))
+		for _, assignment := range configured.Projects {
+			scope := alert.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}
+			if scope.Validate() != nil {
+				return nil, errors.New("identity principals contains an invalid project scope")
+			}
+			if _, duplicate := projects[scope.Key()]; duplicate {
+				return nil, errors.New("identity principals contains a duplicate project scope")
+			}
+			projects[scope.Key()] = struct{}{}
+		}
+		if !configured.PlatformAdmin && len(projects) == 0 {
+			return nil, errors.New("identity principal requires a project scope")
+		}
+		principals[identityURI.String()] = alert.Principal{Subject: configured.Subject, PlatformAdmin: configured.PlatformAdmin, Projects: projects}
+	}
+	return principals, nil
+}
+
+func loopbackAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	parsed := net.ParseIP(host)
+	return parsed != nil && parsed.IsLoopback()
 }
 
 func loadServerTLS(material TLSMaterial, requireClient bool) (*tls.Config, error) {
@@ -304,7 +428,6 @@ func (server *Server) Run(ctx context.Context) error {
 		server.closeDatabase()
 		return fmt.Errorf("run migrations: %w", err)
 	}
-	server.ready.Store(true)
 	httpListener, err := server.listen("tcp", server.config.HTTP.Address)
 	if err != nil {
 		server.closeDatabase()
@@ -326,12 +449,22 @@ func (server *Server) Run(ctx context.Context) error {
 	go func() { errorsChannel <- server.grpcServer.Serve(grpcListener) }()
 	select {
 	case <-ctx.Done():
+		cancel()
 		server.stop(httpTLSListener, grpcListener)
+		workerErr := server.waitWorkers()
 		server.closeDatabase()
+		if workerErr != nil {
+			return workerErr
+		}
 		return ctx.Err()
 	case serveErr := <-errorsChannel:
+		cancel()
 		server.stop(httpTLSListener, grpcListener)
+		workerErr := server.waitWorkers()
 		server.closeDatabase()
+		if workerErr != nil {
+			return workerErr
+		}
 		if errors.Is(serveErr, http.ErrServerClosed) || errors.Is(serveErr, net.ErrClosed) {
 			return nil
 		}
@@ -365,8 +498,29 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	go periodic(ctx, evaluationEvery, func(at time.Time) { server.evaluateAndDispatch(ctx, at) })
-	go periodic(ctx, retryEvery, func(at time.Time) { _ = server.dispatcher.RetryDue(ctx, at) })
+	server.workers.Add(2)
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, retryEvery, func(at time.Time) { _ = server.retryDue(ctx, at) })
+	}()
+}
+
+func (server *Server) waitWorkers() error {
+	done := make(chan struct{})
+	go func() {
+		server.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(5 * time.Second):
+		return errors.New("control-plane workers did not stop before shutdown deadline")
+	}
 }
 
 func periodic(ctx context.Context, every time.Duration, action func(time.Time)) {
@@ -383,20 +537,31 @@ func periodic(ctx context.Context, every time.Duration, action func(time.Time)) 
 	}
 }
 
-func (server *Server) evaluateAndDispatch(ctx context.Context, at time.Time) {
+func (server *Server) evaluateAndDispatch(ctx context.Context, at time.Time) error {
+	var scopeErrors []error
 	for _, scope := range server.scopes {
 		if ctx.Err() != nil {
-			return
+			server.ready.Store(false)
+			return ctx.Err()
 		}
-		_, _ = server.evaluator.EvaluateScope(ctx, scope, at)
-		events, err := server.repository.ListEvents(ctx, scope, alert.EventFilter{Limit: 500})
+		if _, err := server.evaluateScope(ctx, scope, at); err != nil {
+			scopeErrors = append(scopeErrors, fmt.Errorf("%s evaluation: %w", scope.Key(), err))
+			continue
+		}
+		events, err := server.listEvents(ctx, scope, alert.EventFilter{Limit: 500})
 		if err != nil {
+			scopeErrors = append(scopeErrors, fmt.Errorf("%s event listing: %w", scope.Key(), err))
 			continue
 		}
 		for _, event := range events {
-			_ = server.dispatcher.Dispatch(ctx, event, event.State)
+			if err := server.dispatch(ctx, event, event.State); err != nil {
+				scopeErrors = append(scopeErrors, fmt.Errorf("%s event %s dispatch: %w", scope.Key(), event.ID, err))
+			}
 		}
 	}
+	err := errors.Join(scopeErrors...)
+	server.ready.Store(err == nil)
+	return err
 }
 
 type configuredAgentResolver map[string]alert.Scope
@@ -422,10 +587,9 @@ func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configu
 
 func configuredScopes(config Config) []alert.Scope {
 	byKey := make(map[string]alert.Scope)
-	for _, scope := range config.EvaluationScopes {
-		if scope.Validate() == nil {
-			byKey[scope.Key()] = scope
-		}
+	for _, configured := range config.EvaluationScopes {
+		scope := alert.Scope{TenantID: configured.TenantID, ProjectID: configured.ProjectID}
+		byKey[scope.Key()] = scope
 	}
 	for _, a := range config.Agents {
 		scope := alert.Scope{TenantID: a.TenantID, ProjectID: a.ProjectID}
@@ -477,32 +641,26 @@ func (environmentSecretResolver) Resolve(_ context.Context, ref string) ([]byte,
 	return []byte(value), nil
 }
 
-type postgresBatchDeduplicator struct{ database *sql.DB }
+type postgresLogBatchDeduplicator struct{ database *sql.DB }
 
-func (dedup postgresBatchDeduplicator) Lookup(agentID, batchID string) (*telemetryv1.BatchAck, bool) {
-	if dedup.database == nil {
-		return nil, false
-	}
-	ack := &telemetryv1.BatchAck{BatchId: batchID}
-	err := dedup.database.QueryRow("SELECT accepted, retryable, error_code FROM ingest_batch_dedup WHERE agent_id = $1 AND batch_id = $2", agentID, batchID).Scan(&ack.Accepted, &ack.Retryable, &ack.ErrorCode)
+func (dedup postgresLogBatchDeduplicator) AcceptBatchOnce(ctx context.Context, agentID, batchID string) (bool, error) {
+	var state string
+	err := dedup.database.QueryRowContext(ctx, "INSERT INTO ingest_batch_dedup (agent_id, batch_id, state, accepted_at) VALUES ($1, $2, 'accepted', NOW()) ON CONFLICT DO NOTHING RETURNING state", agentID, batchID).Scan(&state)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false
+		return false, nil
 	}
 	if err != nil {
-		return &telemetryv1.BatchAck{BatchId: batchID, Retryable: true, ErrorCode: "DEDUP_UNAVAILABLE"}, true
+		return false, err
 	}
-	return ack, true
-}
-func (dedup postgresBatchDeduplicator) Remember(agentID, batchID string, ack *telemetryv1.BatchAck) {
-	if dedup.database == nil || ack == nil {
-		return
+	if state != "accepted" {
+		return false, errors.New("unexpected log batch reservation state")
 	}
-	_, _ = dedup.database.Exec("INSERT INTO ingest_batch_dedup (agent_id, batch_id, accepted, retryable, error_code) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (agent_id, batch_id) DO NOTHING", agentID, batchID, ack.Accepted, ack.Retryable, ack.ErrorCode)
+	return true, nil
 }
 
 var _ ingest.AgentIdentityResolver = configuredAgentResolver{}
 var _ controlplane.AgentScopeResolver = configuredAgentResolver{}
-var _ ingest.BatchDeduplicator = postgresBatchDeduplicator{}
+var _ ingest.DurableBatchDeduplicator = postgresLogBatchDeduplicator{}
 
 // Small constructor aliases keep the configuration-to-runtime mapping explicit.
 func buildConfiguredAgentResolver(assignments map[string]AgentAssignment) configuredAgentResolver {

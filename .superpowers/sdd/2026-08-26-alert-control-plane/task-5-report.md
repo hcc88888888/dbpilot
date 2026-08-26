@@ -69,3 +69,44 @@ From `backend`:
 The Task 5 file list named only `repository.go` as an alert-package modification, but the reviewed Tasks 1–4 adapter did not expose the list/get/delete methods required by the mandated CRUD routes, and no durable production ingest deduplicator existed. The implementation therefore made the minimal directly related additions to `postgres.go`, the audit action allowlist, and a forward `0003` migration. Omitting these changes would require bypassing the scoped repository/audit boundary or using the explicitly test-only in-memory deduplicator, both prohibited by the task.
 
 No unresolved implementation concern remains. Live PostgreSQL migration execution was not environment-enabled in this task run; migration ordering/rollback behavior is unit-covered at the server boundary, while the full Go suite and existing environment-gated PostgreSQL tests remain available for the Task 6 end-to-end environment.
+
+## Review remediation (2026-08-27)
+
+This section supersedes the original report's descriptions of default header authentication, best-effort PostgreSQL deduplication, migration-only readiness, and the absence of live PostgreSQL verification. All C1/C2/I1/I2/I3/M1/M2 findings in `task-5-review.md` were addressed.
+
+### Security and durability
+
+- Production startup is now fail-closed unless code injects a trusted resolver or YAML explicitly selects a supported identity mode. The example uses HTTP mTLS with a verified certificate-URI-to-principal inventory. `local_headers` is accepted only on a loopback listener, and caller headers can no longer grant platform-admin privileges.
+- Added a verified-client-certificate resolver that requires a TLS verified chain, exactly one certificate URI, and an exact provisioned principal mapping. HTTP mTLS always uses `RequireAndVerifyClientCert` and configured client CAs.
+- Production metric ingestion no longer uses `Lookup -> Consume -> Remember`. `AppendBatch` reserves `(agent_id,batch_id)`, writes every metric sample, marks the reservation accepted, and commits in one PostgreSQL transaction. Unique-key contention serializes independent instances; any payload, state-update, or commit failure rolls back and produces no accepted acknowledgement.
+- Production opaque log batches use a context-aware, single-statement durable accept operation whose database errors also prevent acknowledgement. The legacy `BatchDeduplicator`/`MemoryDeduplicator` path remains solely for the unchanged local contract-test gateway.
+- Kept the already-committed `0003_ingest_dedup.sql` immutable and added forward migration `0004_atomic_ingest_batch.sql`. It removes legacy rejected rows, converts accepted acknowledgements to the new state model, and drops the obsolete best-effort acknowledgement columns.
+
+### Readiness, API boundary, and lifecycle
+
+- `evaluation_scopes` now uses an explicit `tenant_id`/`project_id` snake-case YAML DTO. Startup rejects invalid or duplicate entries and rejects an empty effective evaluation scope set.
+- Readiness remains false until one complete all-scope evaluation/list/dispatch pass succeeds. Per-scope errors are joined without allowing a later successful scope to erase an earlier failure; a later fully successful pass restores readiness.
+- API router-generated wrong-method, unknown-path, and automatic-redirect responses are normalized to the JSON error envelope with stable `405 method_not_allowed` or `404 not_found` codes.
+- Every JSON write endpoint requires `application/json` (parameters such as UTF-8 are accepted), returning `415 unsupported_media_type` otherwise. Bodies over 1 MiB return `413 payload_too_large`; malformed, unknown-field, and trailing-document inputs remain `400 invalid_request`.
+- Server shutdown and listener-error paths cancel the run context first, stop listeners, wait up to five seconds for evaluator/retry workers, and close the owned database only after workers exit. A blocking-worker lifecycle test proves `Run` does not return early.
+
+### Added regression evidence
+
+- Trusted HTTP identity: missing adapter fails startup; local headers require explicit loopback mode and cannot self-assert admin; mTLS uses only a verified, assigned certificate URI.
+- Durable ingest: atomic metric consumer delegation, no acknowledgement on atomic commit error, retry after failure, transaction rollback on metric failure or lost reservation update, committed-duplicate behavior, and no acknowledgement on durable log dedup failure.
+- Real PostgreSQL: two independent connection pools concurrently submit the same metric batch and produce exactly one accepted reservation and one metric row. An injected database trigger then forces a metric write failure, proves the reservation rolled back, and proves a second instance can retry successfully.
+- Readiness/config: startup-before-first-pass, partial multi-scope failure, later recovery, snake-case strict decoding, and empty/invalid/duplicate scope rejection.
+- HTTP/lifecycle: JSON 404/405/abnormal-slash handling, 415/413 classification, and worker-exit-before-`Run`-return.
+
+### Final verification
+
+From `backend` after remediation:
+
+- `go test ./cmd/controlplane ./internal/controlplane ./internal/ingest ./internal/alert -count=1` — PASS.
+- `go test ./... -count=1` — PASS for every package; generated/fixture packages report no test files.
+- `go vet ./...` — PASS with no diagnostics.
+- With a disposable PostgreSQL 16 container and two independent pools: `DBPILOT_ALERT_POSTGRES_INTEGRATION=1 go test ./internal/alert -run TestPostgresMetricBatchDedupIsAtomicAcrossInstances -count=1 -v` — PASS, including forced rollback and cross-instance retry. The explicitly named temporary container was stopped and removed after the test.
+- `git diff --check` — PASS apart from Git's informational Windows LF/CRLF conversion warnings.
+- `go test -race ...` could not run in this Windows environment because the bundled toolchain has CGO disabled; the ordinary focused/full suites and real PostgreSQL concurrency test passed.
+
+The pre-existing untracked `backend/internal/telemetry/dbpilot-spool/` directory was not read, modified, staged, or committed during remediation. No unresolved remediation concern remains.

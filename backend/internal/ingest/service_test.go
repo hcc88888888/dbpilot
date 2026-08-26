@@ -167,6 +167,47 @@ func TestIngestRetriesMetricConsumerAfterFirstFailure(t *testing.T) {
 	require.Len(t, service.ReceivedBatches(), 1)
 }
 
+func TestIngestDelegatesMetricDeduplicationToAtomicConsumer(t *testing.T) {
+	consumer := &atomicMetricConsumer{results: []bool{true, false}}
+	service := NewService(knownAgents{"agent-a": true}, nil, consumer)
+	ctx := contextWithSPIFFEAgent(t, "agent-a")
+	batch := validMetricBatch("metric-atomic", "agent-a", []byte(`{"samples":[]}`))
+
+	first, err := service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	second, err := service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	require.True(t, first.Accepted)
+	require.Equal(t, first, second)
+	require.Equal(t, 2, consumer.calls)
+	require.Len(t, service.ReceivedBatches(), 1)
+}
+
+func TestIngestDoesNotAcknowledgeFailedAtomicMetricCommit(t *testing.T) {
+	consumer := &atomicMetricConsumer{errors: []error{errors.New("commit failed"), nil}, results: []bool{false, true}}
+	service := NewService(knownAgents{"agent-a": true}, nil, consumer)
+	ctx := contextWithSPIFFEAgent(t, "agent-a")
+	batch := validMetricBatch("metric-atomic-retry", "agent-a", []byte(`{"samples":[]}`))
+
+	ack, err := service.PushMetricBatch(ctx, batch)
+	require.Nil(t, ack)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	ack, err = service.PushMetricBatch(ctx, batch)
+	require.NoError(t, err)
+	require.True(t, ack.Accepted)
+	require.Equal(t, 2, consumer.calls)
+}
+
+func TestIngestDoesNotAcknowledgeDurableLogDedupFailure(t *testing.T) {
+	dedup := &durableDedupSpy{err: errors.New("postgres unavailable")}
+	service := NewDurableService(knownAgents{"agent-a": true}, dedup)
+
+	ack, err := service.PushLogBatch(contextWithSPIFFEAgent(t, "agent-a"), validLogBatch("log-a", "agent-a", []byte("payload")))
+	require.Nil(t, ack)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Empty(t, service.ReceivedBatches())
+}
+
 func TestIngestDeduplicatesConcurrentRequestsAtomically(t *testing.T) {
 	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
 	batch := validLogBatch("concurrent", "agent-a", []byte("payload"))
@@ -258,6 +299,36 @@ func (metricValidationFailure) IsMetricBatchValidation() bool { return true }
 type scriptedMetricConsumer struct {
 	errors []error
 	calls  int
+}
+
+type atomicMetricConsumer struct {
+	results []bool
+	errors  []error
+	calls   int
+}
+
+type durableDedupSpy struct{ err error }
+
+func (d *durableDedupSpy) AcceptBatchOnce(context.Context, string, string) (bool, error) {
+	return d.err == nil, d.err
+}
+
+func (c *atomicMetricConsumer) ConsumeMetricBatch(context.Context, string, []byte, time.Time) error {
+	panic("atomic consumer must not use the non-atomic path")
+}
+
+func (c *atomicMetricConsumer) ConsumeMetricBatchOnce(_ context.Context, _, _ string, _ []byte, _ time.Time) (bool, error) {
+	index := c.calls
+	c.calls++
+	var err error
+	if index < len(c.errors) {
+		err = c.errors[index]
+	}
+	var first bool
+	if index < len(c.results) {
+		first = c.results[index]
+	}
+	return first, err
 }
 
 func (c *scriptedMetricConsumer) ConsumeMetricBatch(context.Context, string, []byte, time.Time) error {

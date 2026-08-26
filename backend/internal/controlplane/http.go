@@ -1,10 +1,12 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -134,10 +136,54 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.getSilence)
 	register("PUT /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.updateSilence)
 	register("DELETE /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.deleteSilence)
-	mux.HandleFunc("/api/v1/", func(writer http.ResponseWriter, _ *http.Request) {
-		writeAPIError(writer, http.StatusNotFound, "not_found", "resource was not found")
+	return normalizeAPIErrors(mux)
+}
+
+type bufferedResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (response *bufferedResponse) Header() http.Header { return response.header }
+func (response *bufferedResponse) WriteHeader(status int) {
+	if response.status == 0 {
+		response.status = status
+	}
+}
+func (response *bufferedResponse) Write(value []byte) (int, error) {
+	if response.status == 0 {
+		response.status = http.StatusOK
+	}
+	return response.body.Write(value)
+}
+
+func normalizeAPIErrors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasPrefix(request.URL.Path, "/api/v1") {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		buffered := &bufferedResponse{header: make(http.Header)}
+		next.ServeHTTP(buffered, request)
+		switch {
+		case buffered.status == http.StatusMethodNotAllowed:
+			writeAPIError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
+			return
+		case buffered.status == http.StatusNotFound || buffered.status >= 300 && buffered.status < 400:
+			writeAPIError(writer, http.StatusNotFound, "not_found", "resource was not found")
+			return
+		}
+		for key, values := range buffered.header {
+			writer.Header()[key] = append([]string(nil), values...)
+		}
+		status := buffered.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		writer.WriteHeader(status)
+		_, _ = writer.Write(buffered.body.Bytes())
 	})
-	return mux
 }
 
 type httpAPI struct{ services Services }
@@ -506,19 +552,33 @@ func eventFilter(request *http.Request) (alert.EventFilter, error) {
 }
 
 func decodeJSON(writer http.ResponseWriter, request *http.Request, target any) bool {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeAPIError(writer, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
+		return false
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, maxJSONBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "request body is invalid")
+		writeJSONDecodeError(writer, err)
 		return false
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "request body is invalid")
+		writeJSONDecodeError(writer, err)
 		return false
 	}
 	return true
+}
+
+func writeJSONDecodeError(writer http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeAPIError(writer, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds maximum size")
+		return
+	}
+	writeAPIError(writer, http.StatusBadRequest, "invalid_request", "request body is invalid")
 }
 
 func respondScoped(writer http.ResponseWriter, scope alert.Scope, value any, err error, status int) {

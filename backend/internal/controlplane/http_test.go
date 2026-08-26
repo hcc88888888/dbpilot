@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,12 +102,66 @@ func TestHTTPHandlerRejectsAuthenticationScopeAndMalformedJSONConsistently(t *te
 		t.Run(test.name, func(t *testing.T) {
 			handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: healthyEvaluator{}}, test.resolver)
 			request := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(test.body))
+			if test.body != nil {
+				request.Header.Set("Content-Type", "application/json")
+			}
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
 			require.Equal(t, test.wantCode, response.Code)
 			require.Contains(t, response.Body.String(), `"code":"`+test.wantError+`"`)
 		})
 	}
+}
+
+func TestHTTPHandlerNormalizesRouterErrorsAsJSON(t *testing.T) {
+	fixture := newHTTPFixture()
+	for name, test := range rangeRouterErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			response := fixture.request(test.method, test.path, memberFor("t1", "p1"), nil)
+			require.Equal(t, test.wantStatus, response.Code)
+			require.Equal(t, "application/json", response.Header().Get("Content-Type"))
+			require.Contains(t, response.Body.String(), `"code":"`+test.wantCode+`"`)
+		})
+	}
+}
+
+func rangeRouterErrorCases() map[string]struct {
+	method, path string
+	wantStatus   int
+	wantCode     string
+} {
+	return map[string]struct {
+		method, path string
+		wantStatus   int
+		wantCode     string
+	}{
+		"wrong method":   {http.MethodPatch, "/api/v1/tenants/t1/projects/p1/rules", http.StatusMethodNotAllowed, "method_not_allowed"},
+		"unknown path":   {http.MethodGet, "/api/v1/does-not-exist", http.StatusNotFound, "not_found"},
+		"abnormal slash": {http.MethodGet, "/api/v1/tenants/t1/projects//rules", http.StatusNotFound, "not_found"},
+	}
+}
+
+func TestJSONEndpointsRequireMediaTypeAndClassifyOversize(t *testing.T) {
+	fixture := newHTTPFixture()
+	path := "/api/v1/tenants/t1/projects/p1/rules"
+	handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: healthyEvaluator{}}, memberFor("t1", "p1"))
+
+	for _, mediaType := range []string{"", "text/plain"} {
+		request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(validRuleBody()))
+		request.Header.Set("Content-Type", mediaType)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		require.Equal(t, http.StatusUnsupportedMediaType, response.Code)
+		require.Contains(t, response.Body.String(), `"code":"unsupported_media_type"`)
+	}
+
+	oversize := []byte(`{"name":"` + strings.Repeat("a", int(maxJSONBodyBytes)) + `"}`)
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(oversize))
+	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	require.Contains(t, response.Body.String(), `"code":"payload_too_large"`)
 }
 
 func TestHTTPHandlerReturnsScopedNotFoundAndRedactsSecrets(t *testing.T) {
@@ -170,6 +225,9 @@ func newHTTPFixture() *httpFixture {
 func (fixture *httpFixture) request(method, path string, resolver PrincipalResolver, body []byte) *httptest.ResponseRecorder {
 	handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: healthyEvaluator{}, Now: func() time.Time { return fixture.repository.now }}, resolver)
 	request := httptest.NewRequest(method, path, bytes.NewReader(body))
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

@@ -2,7 +2,9 @@ package alert_test
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"regexp"
 	"testing"
 	"time"
@@ -77,6 +79,75 @@ func TestMetricStoreAppendUsesScopedSeriesIdentityAndCanonicalLabels(t *testing.
 	otherAgent.AgentID = "agent-b"
 	err = alert.NewPostgresRepository(db).Append(context.Background(), []alert.MetricSample{sample, otherAgent})
 	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMetricStoreAppendBatchCommitsReservationAndSamplesAtomically(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
+	sampledAt := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: sampledAt}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
+	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", []alert.MetricSample{sample})
+	require.NoError(t, err)
+	require.True(t, first)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMetricStoreAppendBatchRollsBackFailureWithoutAcknowledging(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: time.Now().UTC()}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
+	mock.ExpectExec("INSERT INTO metric_samples").WillReturnError(errors.New("write failed"))
+	mock.ExpectRollback()
+
+	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", []alert.MetricSample{sample})
+	require.Error(t, err)
+	require.False(t, first)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMetricStoreAppendBatchFailsClosedWhenReservationCommitIsLost(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: time.Now().UTC()}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
+	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectRollback()
+
+	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", []alert.MetricSample{sample})
+	require.Error(t, err)
+	require.False(t, first)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMetricStoreAppendBatchTreatsCommittedReservationAsDuplicate(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnError(sql.ErrNoRows)
+	mock.ExpectCommit()
+
+	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", nil)
+	require.NoError(t, err)
+	require.False(t, first)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

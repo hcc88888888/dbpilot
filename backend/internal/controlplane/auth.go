@@ -43,8 +43,6 @@ func (HeaderPrincipalResolver) ResolvePrincipal(request *http.Request) (alert.Pr
 	admin := false
 	if adminValue != "" {
 		switch adminValue {
-		case "true":
-			admin = true
 		case "false":
 		default:
 			return alert.Principal{}, ErrUnauthenticated
@@ -72,6 +70,27 @@ func (HeaderPrincipalResolver) ResolvePrincipal(request *http.Request) (alert.Pr
 		return alert.Principal{}, ErrUnauthenticated
 	}
 	return alert.Principal{Subject: subject, PlatformAdmin: admin, Projects: projects}, nil
+}
+
+// CertificatePrincipalResolver maps a verified client-certificate URI to a
+// principal provisioned by the enterprise identity inventory.
+type CertificatePrincipalResolver struct {
+	Principals map[string]alert.Principal
+}
+
+func (resolver CertificatePrincipalResolver) ResolvePrincipal(request *http.Request) (alert.Principal, error) {
+	if request == nil || request.TLS == nil || len(request.TLS.VerifiedChains) == 0 || len(request.TLS.VerifiedChains[0]) == 0 {
+		return alert.Principal{}, ErrUnauthenticated
+	}
+	leaf := request.TLS.VerifiedChains[0][0]
+	if len(leaf.URIs) != 1 || leaf.URIs[0] == nil {
+		return alert.Principal{}, ErrUnauthenticated
+	}
+	principal, ok := resolver.Principals[leaf.URIs[0].String()]
+	if !ok || strings.TrimSpace(principal.Subject) == "" {
+		return alert.Principal{}, ErrUnauthenticated
+	}
+	return principal, nil
 }
 
 func singleHeader(header http.Header, name string, required bool) (string, bool) {

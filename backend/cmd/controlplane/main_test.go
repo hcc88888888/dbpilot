@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
+	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/DATA-DOG/go-sqlmock"
+	"dbpilot.local/platform/internal/alert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,19 +23,6 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, 15*time.Second, config.EvaluationEvery)
 	require.Equal(t, time.Minute, config.RetryEvery)
 	require.Contains(t, config.Agents, "spiffe-agent-id")
-}
-
-func TestPostgresDeduplicatorFailsClosedWhenSharedStateIsUnavailable(t *testing.T) {
-	database, mock, err := sqlmock.New()
-	require.NoError(t, err)
-	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, database.Close()) })
-	mock.ExpectQuery("SELECT accepted").WithArgs("agent-1", "batch-1").WillReturnError(errors.New("database unavailable"))
-
-	ack, found := (postgresBatchDeduplicator{database: database}).Lookup("agent-1", "batch-1")
-	require.True(t, found)
-	require.False(t, ack.Accepted)
-	require.True(t, ack.Retryable)
-	require.Equal(t, "DEDUP_UNAVAILABLE", ack.ErrorCode)
 }
 
 func TestNewServerRejectsInvalidProductionConfiguration(t *testing.T) {
@@ -53,6 +43,95 @@ func TestNewServerRejectsInvalidProductionConfiguration(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestNewServerRejectsMissingTrustedHTTPIdentityAdapter(t *testing.T) {
+	config := validServerConfig()
+	config.PrincipalResolver = nil
+	config.Identity = IdentitySettings{}
+
+	server, err := NewServer(config)
+	require.Nil(t, server)
+	require.ErrorContains(t, err, "identity")
+}
+
+func TestLocalHeaderIdentityRequiresExplicitModeAndLoopbackListener(t *testing.T) {
+	config := validServerConfig()
+	config.PrincipalResolver = nil
+	config.Identity.Mode = "local_headers"
+	config.HTTP.Address = "0.0.0.0:8443"
+	server, err := NewServer(config)
+	require.Nil(t, server)
+	require.ErrorContains(t, err, "loopback")
+
+	config.HTTP.Address = "127.0.0.1:8443"
+	server, err = NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server)
+}
+
+func TestMTLSIdentityModeBuildsConfiguredPrincipalAdapter(t *testing.T) {
+	config := validServerConfig()
+	config.PrincipalResolver = nil
+	config.Identity = IdentitySettings{Mode: "mtls", Principals: map[string]PrincipalSettings{
+		"spiffe://dbpilot.example/operators/alice": {Subject: "alice", PlatformAdmin: true},
+	}}
+	config.HTTPServerTLS = &tls.Config{MinVersion: tls.VersionTLS12, ClientCAs: x509.NewCertPool()}
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server)
+	require.Equal(t, tls.RequireAndVerifyClientCert, server.httpTLS.ClientAuth)
+}
+
+func TestConfigStrictlyDecodesSnakeCaseEvaluationScopes(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "controlplane.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("evaluation_scopes:\n  - tenant_id: tenant-a\n    project_id: project-a\n"), 0o600))
+
+	config, err := loadConfig(path)
+	require.NoError(t, err)
+	require.Equal(t, []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}}, config.EvaluationScopes)
+}
+
+func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {
+	for name, scopes := range map[string][]EvaluationScopeSettings{
+		"missing":   nil,
+		"invalid":   {{TenantID: "", ProjectID: "project-a"}},
+		"duplicate": {{TenantID: "tenant-a", ProjectID: "project-a"}, {TenantID: "tenant-a", ProjectID: "project-a"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := validServerConfig()
+			config.EvaluationScopes = scopes
+			server, err := NewServer(config)
+			require.Nil(t, server)
+			require.ErrorContains(t, err, "evaluation scope")
+		})
+	}
+}
+
+func TestReadinessWaitsForSuccessfulAllScopePassAndRecovers(t *testing.T) {
+	config := validServerConfig()
+	config.EvaluationScopes = []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}, {TenantID: "tenant-b", ProjectID: "project-b"}}
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.False(t, server.ready.Load())
+
+	failing := true
+	server.evaluateScope = func(_ context.Context, scope alert.Scope, _ time.Time) (alert.EvaluationSummary, error) {
+		if failing && scope.TenantID == "tenant-a" {
+			return alert.EvaluationSummary{}, errors.New("tenant-a unavailable")
+		}
+		return alert.EvaluationSummary{}, nil
+	}
+	server.listEvents = func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error) { return nil, nil }
+	err = server.evaluateAndDispatch(context.Background(), time.Now().UTC())
+	require.ErrorContains(t, err, "tenant-a")
+	require.False(t, server.ready.Load(), "a later successful scope must not hide an earlier failure")
+
+	failing = false
+	require.NoError(t, server.evaluateAndDispatch(context.Background(), time.Now().UTC()))
+	require.True(t, server.ready.Load())
 }
 
 func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {
@@ -128,15 +207,55 @@ func TestRunCancellationStopsBothListeners(t *testing.T) {
 	require.True(t, listeners[1].isClosed())
 }
 
+func TestRunCancellationWaitsForWorkersToExit(t *testing.T) {
+	config := validServerConfig()
+	listeners := []*blockingListener{newBlockingListener(), newBlockingListener()}
+	next := 0
+	config.Ping = func(context.Context) error { return nil }
+	config.Migrate = func(context.Context) error { return nil }
+	config.Listen = func(string, string) (net.Listener, error) { listener := listeners[next]; next++; return listener, nil }
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	started := make(chan struct{})
+	exited := make(chan struct{})
+	server.evaluateScope = func(ctx context.Context, _ alert.Scope, _ time.Time) (alert.EvaluationSummary, error) {
+		close(started)
+		<-ctx.Done()
+		close(exited)
+		return alert.EvaluationSummary{}, ctx.Err()
+	}
+	server.retryDue = func(context.Context, time.Time) error { return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	<-started
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	select {
+	case <-exited:
+	default:
+		t.Fatal("Run returned before evaluator worker exited")
+	}
+}
+
 func validServerConfig() Config {
 	return Config{
-		DatabaseURL:      "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",
-		WebhookAllowlist: []string{"hooks.example.com"},
-		HTTP:             ListenerConfig{Address: "127.0.0.1:8443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused"}},
-		GRPC:             ListenerConfig{Address: "127.0.0.1:9443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused", ClientCAFile: "unused"}},
-		HTTPServerTLS:    &tls.Config{MinVersion: tls.VersionTLS12},
-		GRPCServerTLS:    &tls.Config{MinVersion: tls.VersionTLS12},
+		DatabaseURL:       "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",
+		WebhookAllowlist:  []string{"hooks.example.com"},
+		HTTP:              ListenerConfig{Address: "127.0.0.1:8443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused"}},
+		GRPC:              ListenerConfig{Address: "127.0.0.1:9443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused", ClientCAFile: "unused"}},
+		HTTPServerTLS:     &tls.Config{MinVersion: tls.VersionTLS12},
+		GRPCServerTLS:     &tls.Config{MinVersion: tls.VersionTLS12},
+		PrincipalResolver: trustedTestPrincipalResolver{},
+		EvaluationScopes:  []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
 	}
+}
+
+type trustedTestPrincipalResolver struct{}
+
+func (trustedTestPrincipalResolver) ResolvePrincipal(*http.Request) (alert.Principal, error) {
+	return alert.Principal{Subject: "trusted-test", PlatformAdmin: true}, nil
 }
 
 type blockingListener struct {

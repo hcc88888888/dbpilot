@@ -1,13 +1,36 @@
 package controlplane
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"dbpilot.local/platform/internal/alert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCertificatePrincipalResolverUsesOnlyVerifiedAssignedURI(t *testing.T) {
+	identityURI, err := url.Parse("spiffe://dbpilot.example/operators/alice")
+	require.NoError(t, err)
+	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+	resolver := CertificatePrincipalResolver{Principals: map[string]alert.Principal{
+		identityURI.String(): {Subject: "alice", PlatformAdmin: true, Projects: map[string]struct{}{scope.Key(): {}}},
+	}}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.TLS = &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{{URIs: []*url.URL{identityURI}}}}}
+
+	principal, err := resolver.ResolvePrincipal(request)
+	require.NoError(t, err)
+	require.True(t, principal.PlatformAdmin)
+	require.Equal(t, "alice", principal.Subject)
+
+	request.TLS.VerifiedChains = nil
+	_, err = resolver.ResolvePrincipal(request)
+	require.ErrorIs(t, err, ErrUnauthenticated)
+}
 
 func TestHeaderPrincipalResolverAcceptsExplicitScopedProjects(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -66,13 +89,11 @@ func TestHeaderPrincipalResolverRejectsMissingMalformedAndMultiValueIdentity(t *
 	}
 }
 
-func TestHeaderPrincipalResolverAllowsAdminWithoutProjectHeader(t *testing.T) {
+func TestHeaderPrincipalResolverRejectsCallerSuppliedPlatformAdmin(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.Header.Set(HeaderSubject, "platform-operator")
 	request.Header.Set(HeaderPlatformAdmin, "true")
 
-	principal, err := (HeaderPrincipalResolver{}).ResolvePrincipal(request)
-	require.NoError(t, err)
-	require.True(t, principal.PlatformAdmin)
-	require.True(t, principal.Allows(alert.Scope{TenantID: "any", ProjectID: "project"}))
+	_, err := (HeaderPrincipalResolver{}).ResolvePrincipal(request)
+	require.ErrorIs(t, err, ErrUnauthenticated)
 }

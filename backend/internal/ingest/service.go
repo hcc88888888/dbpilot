@@ -40,6 +40,14 @@ type BatchDeduplicator interface {
 	Remember(agentID, batchID string, ack *telemetryv1.BatchAck)
 }
 
+// DurableBatchDeduplicator atomically accepts an opaque batch identity in
+// shared storage. It is used by production log ingestion; failures prevent an
+// acknowledgement. Metric ingestion uses AtomicMetricBatchConsumer instead so
+// its payload write shares the reservation transaction.
+type DurableBatchDeduplicator interface {
+	AcceptBatchOnce(context.Context, string, string) (bool, error)
+}
+
 // MetricBatchConsumer receives a verified, checksum-valid, newly accepted
 // metric batch. It is optional so the local telemetry test gateway remains a
 // payload-opaque contract server.
@@ -47,11 +55,19 @@ type MetricBatchConsumer interface {
 	ConsumeMetricBatch(context.Context, string, []byte, time.Time) error
 }
 
+// AtomicMetricBatchConsumer durably reserves a batch identity and commits its
+// metric samples in one storage transaction. The boolean reports whether this
+// call committed the batch; false means a prior call already committed it.
+type AtomicMetricBatchConsumer interface {
+	ConsumeMetricBatchOnce(context.Context, string, string, []byte, time.Time) (bool, error)
+}
+
 // Service validates and acknowledges DBPilot telemetry batches.
 type Service struct {
 	telemetryv1.UnimplementedTelemetryIngestServer
 	identities AgentIdentityResolver
 	dedup      BatchDeduplicator
+	durable    DurableBatchDeduplicator
 	metrics    MetricBatchConsumer
 	dedupMu    sync.Mutex
 	receivedMu sync.Mutex
@@ -70,6 +86,14 @@ type BatchMetadata struct {
 
 func NewService(identities AgentIdentityResolver, dedup BatchDeduplicator, metrics ...MetricBatchConsumer) *Service {
 	service := &Service{identities: identities, dedup: dedup}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
+}
+
+func NewDurableService(identities AgentIdentityResolver, dedup DurableBatchDeduplicator, metrics ...MetricBatchConsumer) *Service {
+	service := &Service{identities: identities, durable: dedup}
 	if len(metrics) > 0 {
 		service.metrics = metrics[0]
 	}
@@ -115,6 +139,28 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	if len(checksum) != len(expected) || subtle.ConstantTimeCompare(expected[:], checksum) != 1 {
 		return nil, status.Error(codes.InvalidArgument, "batch checksum is invalid")
 	}
+	if atomicConsumer, ok := metricConsumer.(AtomicMetricBatchConsumer); ok {
+		first, err := atomicConsumer.ConsumeMetricBatchOnce(ctx, authenticatedAgentID, batchID, payload, time.Now().UTC())
+		if err != nil {
+			return nil, metricConsumerFailure(err)
+		}
+		ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
+		if first {
+			s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
+		}
+		return ack, nil
+	}
+	if s.durable != nil && metricConsumer == nil {
+		first, err := s.durable.AcceptBatchOnce(ctx, authenticatedAgentID, batchID)
+		if err != nil {
+			return nil, sanitizedMetricConsumerError(codes.Unavailable, "batch processing is temporarily unavailable", err)
+		}
+		ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
+		if first {
+			s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
+		}
+		return ack, nil
+	}
 	if s.dedup == nil {
 		return nil, status.Error(codes.Unavailable, "batch deduplicator is temporarily unavailable")
 	}
@@ -130,10 +176,14 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	}
 	ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
 	s.dedup.Remember(authenticatedAgentID, batchID, ack)
-	s.receivedMu.Lock()
-	s.received = append(s.received, BatchMetadata{BatchID: batchID, AgentID: authenticatedAgentID, SourceID: sourceID, PayloadBytes: len(payload), ReceivedAt: time.Now().UTC()})
-	s.receivedMu.Unlock()
+	s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
 	return ack, nil
+}
+
+func (s *Service) recordReceipt(batchID, agentID, sourceID string, payloadBytes int) {
+	s.receivedMu.Lock()
+	defer s.receivedMu.Unlock()
+	s.received = append(s.received, BatchMetadata{BatchID: batchID, AgentID: agentID, SourceID: sourceID, PayloadBytes: payloadBytes, ReceivedAt: time.Now().UTC()})
 }
 
 type metricBatchValidationFailure interface {

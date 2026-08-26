@@ -52,45 +52,70 @@ func NewMetricConsumer(resolver AgentScopeResolver, store alert.MetricStore) *Me
 // {"samples":[{"name":"...","value":1.5,"sampled_at":"RFC3339","labels":{...}}]}.
 // Tenant, project, and Agent identity fields are deliberately not accepted.
 func (c *MetricConsumer) ConsumeMetricBatch(ctx context.Context, agentID string, payload []byte, receivedAt time.Time) error {
+	samples, err := c.metricSamples(ctx, agentID, payload, receivedAt)
+	if err != nil {
+		return err
+	}
+	if err := c.store.Append(ctx, samples); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ConsumeMetricBatchOnce uses the repository's atomic batch primitive so the
+// accepted acknowledgement cannot race or get ahead of durable metric state.
+func (c *MetricConsumer) ConsumeMetricBatchOnce(ctx context.Context, agentID, batchID string, payload []byte, receivedAt time.Time) (bool, error) {
+	samples, err := c.metricSamples(ctx, agentID, payload, receivedAt)
+	if err != nil {
+		return false, err
+	}
+	store, ok := c.store.(alert.AtomicMetricBatchStore)
+	if !ok {
+		return false, errors.New("atomic metric batch store is unavailable")
+	}
+	return store.AppendBatch(ctx, agentID, batchID, samples)
+}
+
+func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payload []byte, receivedAt time.Time) ([]alert.MetricSample, error) {
 	if c == nil || c.resolver == nil {
-		return errors.New("metric scope resolver is unavailable")
+		return nil, errors.New("metric scope resolver is unavailable")
 	}
 	if c.store == nil {
-		return errors.New("metric store is unavailable")
+		return nil, errors.New("metric store is unavailable")
 	}
 	scope, err := c.resolver.ScopeForAgent(ctx, agentID)
 	if err != nil {
-		return fmt.Errorf("resolve agent scope: %w", err)
+		return nil, fmt.Errorf("resolve agent scope: %w", err)
 	}
 	if err := scope.Validate(); err != nil {
-		return fmt.Errorf("resolve agent scope: %w", err)
+		return nil, fmt.Errorf("resolve agent scope: %w", err)
 	}
 	envelope, err := decodeMetricEnvelope(payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	samples := make([]alert.MetricSample, 0, len(envelope.Samples))
 	for _, input := range envelope.Samples {
 		sampledAt, err := time.Parse(time.RFC3339, input.SampledAt)
 		if err != nil || sampledAt.IsZero() {
-			return fmt.Errorf("%w: sampled_at must be RFC3339", ErrInvalidMetricBatch)
+			return nil, fmt.Errorf("%w: sampled_at must be RFC3339", ErrInvalidMetricBatch)
 		}
 		if sampledAt.After(receivedAt.Add(5 * time.Minute)) {
-			return fmt.Errorf("%w: sampled_at is too far in the future", ErrInvalidMetricBatch)
+			return nil, fmt.Errorf("%w: sampled_at is too far in the future", ErrInvalidMetricBatch)
 		}
 		if strings.TrimSpace(input.Name) == "" || math.IsNaN(input.Value) || math.IsInf(input.Value, 0) {
-			return ErrInvalidMetricBatch
+			return nil, ErrInvalidMetricBatch
 		}
 		if input.Labels == nil || len(input.Labels) > 64 {
-			return fmt.Errorf("%w: labels", ErrInvalidMetricBatch)
+			return nil, fmt.Errorf("%w: labels", ErrInvalidMetricBatch)
 		}
 		for key := range input.Labels {
 			if isIdentityClaim(key) {
-				return ErrMetricScopeClaim
+				return nil, ErrMetricScopeClaim
 			}
 			if !metricLabelKey.MatchString(key) {
-				return fmt.Errorf("%w: invalid label key", ErrInvalidMetricBatch)
+				return nil, fmt.Errorf("%w: invalid label key", ErrInvalidMetricBatch)
 			}
 		}
 		labels := make(map[string]string, len(input.Labels))
@@ -101,10 +126,7 @@ func (c *MetricConsumer) ConsumeMetricBatch(ctx context.Context, agentID string,
 		populateIdentity(&sample)
 		samples = append(samples, sample)
 	}
-	if err := c.store.Append(ctx, samples); err != nil {
-		return err
-	}
-	return nil
+	return samples, nil
 }
 
 type metricEnvelope struct {

@@ -559,6 +559,67 @@ func TestPostgresConcurrentFirstEventWritesAreSerialized(t *testing.T) {
 	require.Equal(t, 1, auditCount)
 }
 
+// TestPostgresMetricBatchDedupIsAtomicAcrossInstances exercises two genuinely
+// independent pools against the same unique reservation. Exactly one instance
+// may commit the authenticated batch and its metric samples.
+func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run the PostgreSQL concurrency integration test")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql")
+	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "metric-batch-writer-2"), "")
+	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
+
+	sample := MetricSample{Scope: Scope{TenantID: "tenant-a", ProjectID: "project-a"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{"instance": "db-a"}, Value: 12, SampledAt: time.Now().UTC()}
+	type result struct {
+		first bool
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, repository := range []*PostgresRepository{NewPostgresRepository(databaseOne), NewPostgresRepository(databaseTwo)} {
+		go func(repository *PostgresRepository) {
+			<-start
+			first, err := repository.AppendBatch(ctx, "agent-a", "batch-a", []MetricSample{sample})
+			results <- result{first: first, err: err}
+		}(repository)
+	}
+	close(start)
+	one, two := <-results, <-results
+	require.NoError(t, one.err)
+	require.NoError(t, two.err)
+	require.NotEqual(t, one.first, two.first)
+
+	var dedupCount, metricCount int
+	require.NoError(t, databaseOne.QueryRowContext(ctx, "SELECT count(*) FROM ingest_batch_dedup WHERE agent_id = $1 AND batch_id = $2 AND state = 'accepted'", "agent-a", "batch-a").Scan(&dedupCount))
+	require.NoError(t, databaseOne.QueryRowContext(ctx, "SELECT count(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3", "tenant-a", "project-a", "agent-a").Scan(&metricCount))
+	require.Equal(t, 1, dedupCount)
+	require.Equal(t, 1, metricCount)
+
+	_, err := databaseOne.ExecContext(ctx, "CREATE FUNCTION fail_metric_batch_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected metric failure'; END $$")
+	require.NoError(t, err)
+	_, err = databaseOne.ExecContext(ctx, "CREATE TRIGGER fail_metric_batch BEFORE INSERT ON metric_samples FOR EACH ROW EXECUTE FUNCTION fail_metric_batch_insert()")
+	require.NoError(t, err)
+	failedSample := sample
+	failedSample.SampledAt = failedSample.SampledAt.Add(time.Second)
+	first, err := NewPostgresRepository(databaseOne).AppendBatch(ctx, "agent-a", "batch-retry", []MetricSample{failedSample})
+	require.Error(t, err)
+	require.False(t, first)
+	require.NoError(t, databaseOne.QueryRowContext(ctx, "SELECT count(*) FROM ingest_batch_dedup WHERE agent_id = $1 AND batch_id = $2", "agent-a", "batch-retry").Scan(&dedupCount))
+	require.Zero(t, dedupCount, "failed payload transaction must roll back its reservation")
+	_, err = databaseOne.ExecContext(ctx, "DROP TRIGGER fail_metric_batch ON metric_samples")
+	require.NoError(t, err)
+	first, err = NewPostgresRepository(databaseTwo).AppendBatch(ctx, "agent-a", "batch-retry", []MetricSample{failedSample})
+	require.NoError(t, err)
+	require.True(t, first, "another instance must be able to retry after rollback")
+}
+
 func setupAlertConcurrencySchema(t *testing.T, ctx context.Context, db *sql.DB, schema string) {
 	t.Helper()
 	statements := []string{
