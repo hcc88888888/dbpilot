@@ -62,6 +62,25 @@ type CapabilityMatrix struct {
 	MetricIDs    []string
 }
 
+// MetricRequest selects an allowlisted metric collection operation.
+type MetricRequest struct {
+	MetricIDs []string
+}
+
+// MetricSample is the common normalized metric representation shared by SQL
+// and non-SQL collectors.
+type MetricSample struct {
+	Cluster    string
+	Component  string
+	Role       string
+	Host       string
+	Instance   string
+	MetricName string
+	Value      float64
+	Unit       string
+	Timestamp  time.Time
+}
+
 // MetricRow is one numeric result row returned by a registered metric query.
 // Keys are declared by the metric template, not supplied by policy SQL.
 type MetricRow map[string]float64
