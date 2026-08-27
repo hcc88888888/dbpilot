@@ -22,8 +22,7 @@ AuditEvent:
     id:
       $ref: ./identifiers.yaml#/AuditEventId
     occurred_at:
-      type: string
-      format: date-time
+      $ref: ./identifiers.yaml#/UtcTimestamp
     action:
       type: string
       minLength: 1

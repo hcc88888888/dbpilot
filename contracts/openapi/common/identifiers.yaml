@@ -34,3 +34,8 @@ ResourceId:
   type: string
   minLength: 1
   description: Opaque business resource identifier.
+UtcTimestamp:
+  type: string
+  format: date-time
+  description: RFC 3339 timestamp in UTC, represented with a Z suffix.
+  pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$'

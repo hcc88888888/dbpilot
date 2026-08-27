@@ -87,20 +87,23 @@ Job:
       items:
         $ref: ./artifacts.yaml#/ArtifactReference
     created_at:
-      type: string
-      format: date-time
+      $ref: ./identifiers.yaml#/UtcTimestamp
     dispatched_at:
-      type: [string, 'null']
-      format: date-time
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
     started_at:
-      type: [string, 'null']
-      format: date-time
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
     finished_at:
-      type: [string, 'null']
-      format: date-time
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
     timeout_at:
-      type: [string, 'null']
-      format: date-time
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
     request_id:
       $ref: ./identifiers.yaml#/RequestId
     trace_id:

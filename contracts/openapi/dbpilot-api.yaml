@@ -35,6 +35,8 @@ components:
       $ref: ./common/identifiers.yaml#/AuditEventId
     RequestId:
       $ref: ./common/identifiers.yaml#/RequestId
+    UtcTimestamp:
+      $ref: ./common/identifiers.yaml#/UtcTimestamp
     Page:
       $ref: ./common/pagination.yaml#/Page
     Problem:
