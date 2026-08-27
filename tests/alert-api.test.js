@@ -35,6 +35,31 @@ test('demo adapter marks data as demo and removes unsafe delivery fields', async
   assert.equal('body' in detail.deliveries[0], false);
 });
 
+test('HTTP DTO normalization recursively removes secrets and raw delivery request bodies', async () => {
+  const api = createAlertApi({
+    baseUrl: 'https://control.example',
+    fetchImpl: async () => new Response(JSON.stringify([{
+      id: 'alert-1',
+      token: 'top-level-token',
+      private_key: 'private-key-material',
+      connection_string: 'postgres://operator:password@db.example/alerts',
+      nested: { api_token: 'nested-token', safe: 'kept' },
+      deliveries: [{
+        id: 'delivery-1', status: 'delivered', token: 'delivery-token',
+        request_body: 'raw request body', requestBody: 'raw camel request body', body: 'raw body',
+        response_body: 'raw response body', safe: 'kept',
+      }],
+    }])),
+  });
+
+  const result = await api.listAlerts(scope, {}, null);
+
+  assert.deepEqual(result.items, [{
+    id: 'alert-1', nested: { safe: 'kept' },
+    deliveries: [{ id: 'delivery-1', status: 'delivered', safe: 'kept' }],
+  }]);
+});
+
 test('HTTP failure never falls back to demo data', async () => {
   const api = createAlertApi({
     baseUrl: 'https://control.example',
@@ -137,5 +162,40 @@ test('remaining configuration methods use only documented scoped routes', async 
     ['https://control.example/api/v1/tenants/t1/projects/p1/templates/template-1', 'PUT'],
     ['https://control.example/api/v1/tenants/t1/projects/p1/silences', 'GET'],
     ['https://control.example/api/v1/tenants/t1/projects/p1/silences', 'POST'],
+  ]);
+});
+
+test('saving listed configuration projects each resource to its accepted write DTO', async () => {
+  const bodies = [];
+  const listed = {
+    '/rules': [{ id: 'rule-1', scope: { tenant_id: 'other', project_id: 'other' }, name: 'CPU', metric: 'host.cpu', aggregation: 'avg', operator: '>', threshold: 80, evaluation_every: '1m', lookback_window: '1m', for: '1m', missing_data: 'ignore', severity: 'critical', notification_policy_ids: ['policy-1'], labels: { database: 'orders' }, enabled: true, created_at: '2026-01-01T00:00:00Z' }],
+    '/notification-policies': [{ id: 'policy-1', name: 'Inbox', channel: 'in_app', target: 'operator-1', template_id: 'template-1', severities: ['critical'], match_labels: { database: 'orders' }, window_start_utc: '09:00', window_end_utc: '17:00', enabled: true, has_secret: false, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' }],
+    '/templates': [{ id: 'template-1', name: 'Default', subject: 'Alert', body: '{{event.id}}', version: 4, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' }],
+    '/silences': [{ id: 'silence-1', matchers: { 'label.database': 'orders' }, starts_at: '2026-01-01T00:00:00Z', ends_at: '2026-01-01T01:00:00Z', created_by: 'operator-1', reason: 'maintenance', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z' }],
+  };
+  const api = createAlertApi({
+    baseUrl: 'https://control.example',
+    fetchImpl: async (url, init = {}) => {
+      const path = new URL(url).pathname.replace('/api/v1/tenants/t1/projects/p1', '');
+      if ((init.method ?? 'GET') === 'GET') return new Response(JSON.stringify(listed[path]));
+      bodies.push([path, init.body]);
+      return new Response(JSON.stringify({ id: path.split('/').at(-1) }));
+    },
+  });
+
+  const [rule] = (await api.listRules(scope)).items;
+  const [policy] = (await api.listNotificationPolicies(scope)).items;
+  const [template] = (await api.listTemplates(scope)).items;
+  const [silence] = (await api.listSilences(scope)).items;
+  await api.saveRule(scope, rule);
+  await api.saveNotificationPolicy(scope, policy);
+  await api.saveTemplate(scope, template);
+  await api.saveSilence(scope, silence);
+
+  assert.deepEqual(bodies, [
+    ['/rules/rule-1', '{"name":"CPU","metric":"host.cpu","aggregation":"avg","operator":">","threshold":80,"evaluation_every":"1m","lookback_window":"1m","for":"1m","missing_data":"ignore","severity":"critical","notification_policy_ids":["policy-1"],"labels":{"database":"orders"},"enabled":true}'],
+    ['/notification-policies/policy-1', '{"name":"Inbox","channel":"in_app","target":"operator-1","template_id":"template-1","severities":["critical"],"match_labels":{"database":"orders"},"window_start_utc":"09:00","window_end_utc":"17:00","enabled":true}'],
+    ['/templates/template-1', '{"name":"Default","subject":"Alert","body":"{{event.id}}"}'],
+    ['/silences/silence-1', '{"matchers":{"label.database":"orders"},"starts_at":"2026-01-01T00:00:00Z","ends_at":"2026-01-01T01:00:00Z","reason":"maintenance"}'],
   ]);
 });

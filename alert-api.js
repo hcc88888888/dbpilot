@@ -44,7 +44,7 @@ export function createAlertApi({ baseUrl = '', fetchImpl = globalThis.fetch } = 
 function createHttpAdapter(request) {
   const getList = (path) => async (scope, signal) => normalizeList(await request(scope, path, {}, signal), scope, null);
   const save = (collection) => async (scope, value, signal) => {
-    const payload = requestPayload(value);
+    const payload = writePayload(collection, value);
     const id = value?.id;
     const path = id ? `/${collection}/${encodeURIComponent(id)}` : `/${collection}`;
     const method = id ? 'PUT' : 'POST';
@@ -105,8 +105,8 @@ function createDemoAdapter() {
   };
 
   const list = (key) => async (scope) => normalizeList(store[key], scope, null);
-  const save = (key, prefix) => async (scope, value) => {
-    const payload = requestPayload(value);
+  const save = (key, collection, prefix) => async (scope, value) => {
+    const payload = writePayload(collection, value);
     const id = value?.id || `${prefix}-${store[key].length + 1}`;
     const index = store[key].findIndex((item) => item.id === id);
     const next = { ...payload, id };
@@ -144,7 +144,7 @@ function createDemoAdapter() {
     },
 
     listRules: list('rules'),
-    saveRule: save('rules', 'rule'),
+    saveRule: save('rules', 'rules', 'rule'),
     async setRuleEnabled(scope, id, enabled) {
       const rule = store.rules.find((item) => item.id === id);
       if (!rule) throw apiFailure('not-found');
@@ -152,11 +152,11 @@ function createDemoAdapter() {
       return normalizeEntity(rule, scope, 'demo');
     },
     listNotificationPolicies: list('notificationPolicies'),
-    saveNotificationPolicy: save('notificationPolicies', 'policy'),
+    saveNotificationPolicy: save('notificationPolicies', 'notification-policies', 'policy'),
     listTemplates: list('templates'),
-    saveTemplate: save('templates', 'template'),
+    saveTemplate: save('templates', 'templates', 'template'),
     listSilences: list('silences'),
-    saveSilence: save('silences', 'silence'),
+    saveSilence: save('silences', 'silences', 'silence'),
     async endSilence(scope, id) {
       const index = store.silences.findIndex((item) => item.id === id);
       if (index === -1) throw apiFailure('not-found');
@@ -207,16 +207,30 @@ function normalizeEntity(response, scope, source = 'http') {
   return { ...resource, source, scope: cleanScope(scope) };
 }
 
-function safeResource(value, scope) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  const { scope: ignoredScope, secret_ref: ignoredSecretRef, secretRef: ignoredSecretRefCamel, audit: ignoredAudit, audit_details: ignoredAuditDetails, auditDetails: ignoredAuditDetailsCamel, ...safe } = value;
-  if (Array.isArray(safe.deliveries)) safe.deliveries = safe.deliveries.map(safeDelivery);
-  return safe;
+function safeResource(value) {
+  return redactDTO(value);
 }
 
 function safeDelivery(value) {
-  const { secret_ref, secretRef, body, request, response, scope, ...safe } = value || {};
-  return safe;
+  return redactDTO(value, true);
+}
+
+function redactDTO(value, inDelivery = false) {
+  if (Array.isArray(value)) return value.map((item) => redactDTO(item, inDelivery));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
+    if (isUnsafeDTOKey(key, inDelivery)) return [];
+    if (key === 'deliveries') return [[key, Array.isArray(item) ? item.map(safeDelivery) : []]];
+    return [[key, redactDTO(item, inDelivery)]];
+  }));
+}
+
+function isUnsafeDTOKey(key, inDelivery) {
+  const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (normalized === 'scope' || normalized === 'audit' || normalized === 'auditdetails') return true;
+  if (/(secret|token|password|credential|authorization|apikey|privatekey|connectionstring)/.test(normalized)) return true;
+  if (!inDelivery) return false;
+  return normalized === 'body' || normalized === 'request' || normalized === 'response' || normalized.includes('requestbody') || normalized.includes('responsebody') || normalized.includes('requestpayload');
 }
 
 function filterAlertItems(items, filters = {}) {
@@ -239,10 +253,24 @@ function filterValues(value) {
   return (Array.isArray(value) ? value : [value]).map(String);
 }
 
-function requestPayload(value) {
+function writePayload(collection, value) {
+  switch (collection) {
+    case 'rules':
+      return pickDTO(value, ['name', 'metric', 'aggregation', 'operator', 'threshold', 'evaluation_every', 'lookback_window', 'for', 'missing_data', 'severity', 'notification_policy_ids', 'labels', 'enabled']);
+    case 'notification-policies':
+      return pickDTO(value, ['name', 'channel', 'target', 'secret_ref', 'template_id', 'severities', 'match_labels', 'window_start_utc', 'window_end_utc', 'enabled']);
+    case 'templates':
+      return pickDTO(value, ['name', 'subject', 'body']);
+    case 'silences':
+      return pickDTO(value, ['matchers', 'starts_at', 'ends_at', 'reason']);
+    default:
+      return {};
+  }
+}
+
+function pickDTO(value, fields) {
   if (!value || typeof value !== 'object') return {};
-  const { id, scope, source, deliveries, secretRef, created_at, createdAt, updated_at, updatedAt, ...payload } = value;
-  return payload;
+  return Object.fromEntries(fields.filter((field) => value[field] !== undefined).map((field) => [field, value[field]]));
 }
 
 function dispositionPayload(value) {
