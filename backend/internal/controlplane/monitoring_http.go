@@ -65,7 +65,7 @@ func (api httpAPI) monitoringOverview(writer http.ResponseWriter, request *http.
 		return
 	}
 	instances := redactMonitoringInstances(value.Instances)
-	writeJSON(writer, http.StatusOK, monitoringOverviewResponse{Source: monitoringSource, Scope: scope, From: value.From, To: value.To, TotalInstances: value.TotalInstances, Healthy: value.Healthy, Stale: value.Stale, Offline: value.Offline, Instances: instances, Trend: value.Trend})
+	api.writeMonitoringJSON(writer, monitoringOverviewResponse{Source: monitoringSource, Scope: scope, From: value.From, To: value.To, TotalInstances: value.TotalInstances, Healthy: value.Healthy, Stale: value.Stale, Offline: value.Offline, Instances: instances, Trend: value.Trend})
 }
 
 func (api httpAPI) monitoringInstances(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -79,7 +79,7 @@ func (api httpAPI) monitoringInstances(writer http.ResponseWriter, request *http
 		monitoringAPIError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, monitoringInstancesResponse{Source: monitoringSource, Scope: scope, Items: redactMonitoringInstances(page.Items), NextOffset: page.NextOffset})
+	api.writeMonitoringJSON(writer, monitoringInstancesResponse{Source: monitoringSource, Scope: scope, Items: redactMonitoringInstances(page.Items), NextOffset: page.NextOffset})
 }
 
 func (api httpAPI) monitoringInstance(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -93,7 +93,7 @@ func (api httpAPI) monitoringInstance(writer http.ResponseWriter, request *http.
 		monitoringAPIError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, monitoringInstanceResponse{Source: monitoringSource, Scope: scope, Instance: redactMonitoringInstance(value.Instance), Metrics: value.Metrics})
+	api.writeMonitoringJSON(writer, monitoringInstanceResponse{Source: monitoringSource, Scope: scope, Instance: redactMonitoringInstance(value.Instance), Metrics: value.Metrics})
 }
 
 func (api httpAPI) monitoringSeries(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -112,7 +112,7 @@ func (api httpAPI) monitoringSeries(writer http.ResponseWriter, request *http.Re
 		monitoringAPIError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, monitoringSeriesResponse{Source: monitoringSource, Scope: scope, Series: value})
+	api.writeMonitoringJSON(writer, monitoringSeriesResponse{Source: monitoringSource, Scope: scope, Series: value})
 }
 
 func (api httpAPI) monitoringCapabilities(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -121,7 +121,19 @@ func (api httpAPI) monitoringCapabilities(writer http.ResponseWriter, request *h
 		monitoringAPIError(writer, err)
 		return
 	}
-	writeJSON(writer, http.StatusOK, monitoringCapabilitiesResponse{Source: monitoringSource, Scope: scope, Items: values})
+	api.writeMonitoringJSON(writer, monitoringCapabilitiesResponse{Source: monitoringSource, Scope: scope, Items: values})
+}
+
+type monitoringResponseSizer interface{ ValidateResponse(any) error }
+
+func (api httpAPI) writeMonitoringJSON(writer http.ResponseWriter, value any) {
+	if sizer, ok := api.services.Monitoring.(monitoringResponseSizer); ok {
+		if err := sizer.ValidateResponse(value); err != nil {
+			monitoringAPIError(writer, err)
+			return
+		}
+	}
+	writeJSON(writer, http.StatusOK, value)
 }
 
 func monitoringRange(request *http.Request, now time.Time) (monitoring.RangeQuery, error) {

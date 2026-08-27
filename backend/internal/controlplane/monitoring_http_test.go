@@ -84,12 +84,25 @@ func TestMonitoringQueryLimitErrorIsStableAndRedacted(t *testing.T) {
 	require.JSONEq(t, `{"error":{"code":"query_limit_exceeded","message":"monitoring query exceeds configured limit"}}`, response.Body.String())
 }
 
+func TestMonitoringHTTPChecksFinalResponseEnvelopeSize(t *testing.T) {
+	fixture := monitoringFixture(t)
+	handler := NewHTTPHandler(Services{Repository: newHTTPFixture().repository, Evaluator: healthyEvaluator{}, Monitoring: envelopeLimitedStore{QueryStore: fixture.store}, Now: func() time.Time { return fixture.now }}, memberFor("t1", "p1"))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/tenants/t1/projects/p1/monitoring/capabilities", nil))
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	require.Contains(t, response.Body.String(), `"code":"query_limit_exceeded"`)
+}
+
 type monitoringHTTPFixture struct {
 	scope   alert.Scope
 	now     time.Time
 	store   monitoring.QueryStore
 	handler http.Handler
 }
+
+type envelopeLimitedStore struct{ monitoring.QueryStore }
+
+func (envelopeLimitedStore) ValidateResponse(any) error { return monitoring.ErrQueryLimit }
 
 func monitoringFixture(t *testing.T) *monitoringHTTPFixture {
 	t.Helper()

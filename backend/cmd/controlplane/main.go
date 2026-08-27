@@ -292,10 +292,8 @@ func validateConfig(config Config) error {
 	if len(config.WebhookAllowlist) == 0 {
 		return errors.New("webhook_allowlist must contain at least one hostname")
 	}
-	for _, value := range []int{config.Monitoring.MaximumInstances, config.Monitoring.MaximumMetrics, config.Monitoring.MaximumLabels, config.Monitoring.MaximumSamples, config.Monitoring.MaximumResponseBytes} {
-		if value < 0 {
-			return errors.New("monitoring limits must not be negative")
-		}
+	if err := monitoring.ValidateQueryLimits(config.Monitoring.limits()); err != nil {
+		return errors.New("monitoring limits are invalid")
 	}
 	for _, host := range config.WebhookAllowlist {
 		if host == "" || host != strings.ToLower(strings.TrimSpace(host)) || strings.ContainsAny(host, "/:@") {

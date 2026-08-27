@@ -160,6 +160,8 @@ func TestMonitoringInstanceStateMigrationPersistsScopedLiveness(t *testing.T) {
 	require.Contains(t, content, "PRIMARY KEY (tenant_id, project_id, instance_id)")
 	require.Contains(t, content, "last_heartbeat_at TIMESTAMPTZ NOT NULL")
 	require.Contains(t, content, "monitoring_instances_scope_heartbeat_idx")
+	require.Contains(t, content, "FROM metric_samples")
+	require.Contains(t, content, "ON CONFLICT (tenant_id, project_id, instance_id) DO NOTHING")
 }
 
 func TestPostgresRepositoryRejectsInvalidEventsBeforeWriting(t *testing.T) {

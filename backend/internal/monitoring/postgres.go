@@ -19,6 +19,11 @@ const (
 	DefaultMaximumLabels        = 32
 	DefaultMaximumSamples       = 10000
 	DefaultMaximumResponseBytes = 1 << 20
+	HardMaximumInstances        = 1000
+	HardMaximumMetrics          = 200
+	HardMaximumLabels           = 64
+	HardMaximumSamples          = 50000
+	HardMaximumResponseBytes    = 4 << 20
 	stateFields                 = "instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at"
 )
 
@@ -28,6 +33,7 @@ const instancesSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE
 const instanceSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3"
 const instanceSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC, metric ASC LIMIT $6"
 const seriesSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND metric = $4 AND sampled_at >= $5 AND sampled_at <= $6 ORDER BY sampled_at ASC, agent_id ASC LIMIT $7"
+const scopeSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND sampled_at >= $3 AND sampled_at <= $4 ORDER BY sampled_at ASC, agent_id ASC, metric ASC LIMIT $5"
 
 // QueryLimits bounds storage reads before values enter memory or a response.
 // Zero-valued fields use conservative defaults.
@@ -56,7 +62,21 @@ func (limits QueryLimits) normalized() QueryLimits {
 	if limits.MaximumResponseBytes <= 0 {
 		limits.MaximumResponseBytes = defaults.MaximumResponseBytes
 	}
+	limits.MaximumInstances = min(limits.MaximumInstances, HardMaximumInstances)
+	limits.MaximumMetrics = min(limits.MaximumMetrics, HardMaximumMetrics)
+	limits.MaximumLabels = min(limits.MaximumLabels, HardMaximumLabels)
+	limits.MaximumSamples = min(limits.MaximumSamples, HardMaximumSamples)
+	limits.MaximumResponseBytes = min(limits.MaximumResponseBytes, HardMaximumResponseBytes)
 	return limits
+}
+
+func ValidateQueryLimits(limits QueryLimits) error {
+	for _, value := range []struct{ value, maximum int }{{limits.MaximumInstances, HardMaximumInstances}, {limits.MaximumMetrics, HardMaximumMetrics}, {limits.MaximumLabels, HardMaximumLabels}, {limits.MaximumSamples, HardMaximumSamples}, {limits.MaximumResponseBytes, HardMaximumResponseBytes}} {
+		if value.value < 0 || value.value > value.maximum {
+			return ErrQueryLimit
+		}
+	}
+	return nil
 }
 
 // DefaultCapabilities exposes the built-in SQL adapter catalog without opening
@@ -109,10 +129,16 @@ func (s *PostgresStore) Overview(ctx context.Context, scope alert.Scope, query R
 	if err != nil {
 		return Overview{}, err
 	}
-	value, err := s.memory(instances, nil, now).Overview(ctx, scope, query)
+	samples, err := s.scopeSamples(ctx, scope, query.From, query.To)
 	if err != nil {
 		return Overview{}, err
 	}
+	instances = instancesWithLatest(instances, samples)
+	value, err := s.memory(instances, samples, now).Overview(ctx, scope, query)
+	if err != nil {
+		return Overview{}, err
+	}
+	value.Trend = trendFromSamples(query, samples)
 	return value, s.ensureResponse(value)
 }
 
@@ -127,7 +153,13 @@ func (s *PostgresStore) ListInstances(ctx context.Context, scope alert.Scope, qu
 	if err != nil {
 		return InstancePage{}, err
 	}
-	value, err := s.memory(instances, nil, s.currentTime()).ListInstances(ctx, scope, query)
+	now := s.currentTime()
+	samples, err := s.scopeSamples(ctx, scope, now.Add(-MaximumRange), now)
+	if err != nil {
+		return InstancePage{}, err
+	}
+	instances = instancesWithLatest(instances, samples)
+	value, err := s.memory(instances, samples, now).ListInstances(ctx, scope, query)
 	if err != nil {
 		return InstancePage{}, err
 	}
@@ -273,6 +305,10 @@ func (s *PostgresStore) samples(ctx context.Context, statement string, arguments
 	return result, rows.Err()
 }
 
+func (s *PostgresStore) scopeSamples(ctx context.Context, scope alert.Scope, from, to time.Time) ([]alert.MetricSample, error) {
+	return s.samples(ctx, scopeSamplesSQL, []any{scope.TenantID, scope.ProjectID, from.UTC(), to.UTC(), s.queryLimits().MaximumSamples + 1}, scope)
+}
+
 func scanInstance(scanner interface{ Scan(...any) error }, scope alert.Scope, limits QueryLimits) (Instance, error) {
 	var value Instance
 	var labels []byte
@@ -303,11 +339,51 @@ func (s *PostgresStore) memory(instances []Instance, samples []alert.MetricSampl
 	return store
 }
 func (s *PostgresStore) ensureResponse(value any) error {
+	return s.ValidateResponse(value)
+}
+
+// ValidateResponse uses the exact JSON encoding size, including Encoder's
+// trailing newline. HTTP handlers pass their complete response envelope here.
+func (s *PostgresStore) ValidateResponse(value any) error {
 	encoded, err := json.Marshal(value)
-	if err != nil || len(encoded) > s.queryLimits().MaximumResponseBytes {
+	if err != nil || len(encoded)+1 > s.queryLimits().MaximumResponseBytes {
 		return ErrQueryLimit
 	}
 	return nil
+}
+
+func instancesWithLatest(instances []Instance, samples []alert.MetricSample) []Instance {
+	result := copyInstances(instances)
+	byID := make(map[string]int, len(result))
+	for index := range result {
+		byID[result[index].ID] = index
+		result[index].Latest = make(map[string]*float64)
+	}
+	latestAt := make(map[string]map[string]time.Time, len(result))
+	for _, sample := range samples {
+		index, found := byID[sampleInstanceID(sample)]
+		if !found {
+			continue
+		}
+		if latestAt[sampleInstanceID(sample)] == nil {
+			latestAt[sampleInstanceID(sample)] = make(map[string]time.Time)
+		}
+		if at := latestAt[sampleInstanceID(sample)][sample.Name]; at.After(sample.SampledAt) {
+			continue
+		}
+		value := sample.Value
+		result[index].Latest[sample.Name] = &value
+		latestAt[sampleInstanceID(sample)][sample.Name] = sample.SampledAt
+	}
+	return result
+}
+
+func trendFromSamples(query RangeQuery, samples []alert.MetricSample) Series {
+	points := make([]SamplePoint, 0, len(samples))
+	for _, sample := range samples {
+		points = append(points, SamplePoint{At: sample.SampledAt, Value: sample.Value})
+	}
+	return BuildSeries("monitoring.sample_value", query.From, query.To, query.Step, points)
 }
 func (s *PostgresStore) currentTime() time.Time {
 	s.mu.RLock()
