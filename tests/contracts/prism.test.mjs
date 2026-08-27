@@ -7,17 +7,22 @@ import { fileURLToPath } from 'node:url';
 const execFileAsync = promisify(execFile);
 const composeFile = fileURLToPath(new URL('../../deploy/contracts/prism.compose.yaml', import.meta.url));
 const mockBaseUrl = process.env.DBPILOT_CONTRACT_MOCK_URL ?? 'http://localhost:4010';
+const integrationEnabled = process.env.DBPILOT_PRISM_INTEGRATION === '1';
 
-test.after(async () => {
-  try {
-    await execFileAsync('docker', ['compose', '-p', 'dbpilot-contracts', '-f', composeFile, 'down', '--volumes', '--remove-orphans']);
-  }
-  catch {
-    // Cleanup must not mask the contract assertion that caused the test to fail.
-  }
-});
+if (integrationEnabled) {
+  test.after(async () => {
+    try {
+      await execFileAsync('docker', ['compose', '-p', 'dbpilot-contracts', '-f', composeFile, 'down', '--volumes', '--remove-orphans']);
+    }
+    catch {
+      // Cleanup must not mask the contract assertion that caused the test to fail.
+    }
+  });
+}
 
-test('Prism serves the documented capabilities example', async () => {
+test('Prism serves the documented capabilities example', {
+  skip: integrationEnabled ? false : 'set DBPILOT_PRISM_INTEGRATION=1 to run Prism integration',
+}, async () => {
   const response = await fetch(`${mockBaseUrl}/api/v1/tenants/demo/projects/demo/capabilities`, {
     headers: { Authorization: 'Bearer prism-test-token' },
   });
