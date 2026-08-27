@@ -8,6 +8,9 @@ import {
   validatePolicy,
   validateReason,
   validateRule,
+  validateSilence,
+  validateTemplate,
+  isActiveSilence,
   sanitizePolicyForDisplay,
 } from '../alert-center.js';
 
@@ -103,4 +106,39 @@ test('disposition validation requires category and rejects a token-like reason',
   assert.deepEqual(validateDisposition({ category: '', reason: 'token=abc.def.ghi' }), {
     category: '请选择处置分类', reason: '原因中不能包含凭据或连接串',
   });
+});
+
+test('template validation requires name, subject, and body', () => {
+  assert.deepEqual(validateTemplate({ name: '', subject: '', body: '' }), {
+    name: '请填写模板名称', subject: '请填写通知标题', body: '请填写通知正文',
+  });
+});
+
+test('template validation rejects variables the notification renderer does not support', () => {
+  assert.deepEqual(validateTemplate({ name: '告警', subject: '{{unknown.value}}', body: '告警正文' }), {
+    subject: '包含不支持的模板变量',
+  });
+});
+
+test('silence must have matcher, future end time, and an ordinary-text reason', () => {
+  assert.deepEqual(validateSilence({ matchers: {}, startsAt: '2026-08-27T10:00', endsAt: '2026-08-27T09:00', reason: 'secret=abc' }), {
+    matchers: '至少添加一个匹配条件', endsAt: '结束时间必须晚于开始时间', reason: '原因中不能包含凭据或连接串',
+  });
+});
+
+test('silence validation requires an ordinary-text reason', () => {
+  assert.deepEqual(validateSilence({ matchers: { 'label.instance': 'mysql-01' }, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '   ' }), {
+    reason: '请填写静默原因',
+  });
+});
+
+test('silence validation rejects a matcher row with only a key or value', () => {
+  assert.deepEqual(validateSilence({ matchers: { 'label.instance': 'mysql-01' }, hasIncompleteMatchers: true, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '例行维护' }), {
+    matchers: '请完整填写每个匹配条件',
+  });
+});
+
+test('active silence ends strictly before its end timestamp', () => {
+  assert.equal(isActiveSilence({ startsAt: '2026-08-27T09:00:00Z', endsAt: '2026-08-27T10:00:00Z' }, new Date('2026-08-27T09:30:00Z')), true);
+  assert.equal(isActiveSilence({ startsAt: '2026-08-27T09:00:00Z', endsAt: '2026-08-27T10:00:00Z' }, new Date('2026-08-27T10:00:00Z')), false);
 });

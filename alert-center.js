@@ -25,6 +25,16 @@ const SEVERITY_LABELS = {
   none: '无',
 };
 
+const TEMPLATE_VARIABLES = [
+  ['{{event.id}}', 'alert-20260827-01'],
+  ['{{event.state}}', 'firing'],
+  ['{{event.severity}}', 'critical'],
+  ['{{event.url}}', 'https://dbpilot.example/alerts/alert-20260827-01'],
+  ['{{evidence.aggregate}}', '92.4'],
+  ['{{resource.name}}', 'mysql-prod-01'],
+  ['{{resource.<标签名>}}', 'orders'],
+];
+
 const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
 
 export function safeText(value) {
@@ -80,6 +90,47 @@ export function validatePolicy(input = {}) {
   if (!String(input.target ?? '').trim()) errors.target = '请填写渠道目标';
   if (!templateId) errors.templateId = '请选择通知模板';
   return errors;
+}
+
+export function validateTemplate(input = {}) {
+  const errors = {};
+  if (!String(input.name ?? '').trim()) errors.name = '请填写模板名称';
+  if (!String(input.subject ?? '').trim()) errors.subject = '请填写通知标题';
+  if (!String(input.body ?? '').trim()) errors.body = '请填写通知正文';
+  for (const field of ['subject', 'body']) {
+    if (errors[field]) continue;
+    const unsupported = [...String(input[field] ?? '').matchAll(/{{([^{}]+)}}/g)]
+      .some(([, variable]) => !['event.id', 'event.state', 'event.severity', 'event.url', 'evidence.aggregate'].includes(variable) && !/^resource\.[^\s.{}]+$/.test(variable));
+    if (unsupported) errors[field] = '包含不支持的模板变量';
+  }
+  return errors;
+}
+
+export function validateSilence(input = {}) {
+  const errors = {};
+  const matchers = input.matchers ?? {};
+  const startsAt = String(input.startsAt ?? input.starts_at ?? '').trim();
+  const endsAt = String(input.endsAt ?? input.ends_at ?? '').trim();
+  const startsAtTime = Date.parse(startsAt);
+  const endsAtTime = Date.parse(endsAt);
+  if (input.hasIncompleteMatchers) errors.matchers = '请完整填写每个匹配条件';
+  else if (labelEntries(matchers).length === 0) errors.matchers = '至少添加一个匹配条件';
+  if (!startsAt) errors.startsAt = '请填写开始时间';
+  if (!endsAt) errors.endsAt = '请填写结束时间';
+  else if (Number.isNaN(endsAtTime) || (!Number.isNaN(startsAtTime) && endsAtTime <= startsAtTime) || endsAtTime <= Date.now()) errors.endsAt = '结束时间必须晚于开始时间';
+  if (!String(input.reason ?? '').trim()) errors.reason = '请填写静默原因';
+  else {
+    const reasonError = validateReason(input.reason);
+    if (reasonError) errors.reason = reasonError;
+  }
+  return errors;
+}
+
+export function isActiveSilence(silence = {}, now = new Date()) {
+  const startsAt = Date.parse(valueOf(silence, 'startsAt', 'starts_at'));
+  const endsAt = Date.parse(valueOf(silence, 'endsAt', 'ends_at'));
+  const timestamp = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  return Number.isFinite(startsAt) && Number.isFinite(endsAt) && Number.isFinite(timestamp) && startsAt <= timestamp && timestamp < endsAt;
 }
 
 export function sanitizePolicyForDisplay(policy = {}) {
@@ -347,6 +398,85 @@ function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
     </form>`;
 }
 
+function renderTemplatePreview(template = {}) {
+  let preview = safeText(`${String(valueOf(template, 'subject') ?? '')}\n\n${String(valueOf(template, 'body') ?? '')}`.trim());
+  TEMPLATE_VARIABLES.forEach(([variable, example]) => { preview = preview.replaceAll(variable, example); });
+  preview = preview.replace(/{{resource\.[^{}]+}}/g, 'orders');
+  return preview;
+}
+
+function templateVariableMarkup() {
+  return `<span class="alert-template-variables">${TEMPLATE_VARIABLES.map(([variable]) => `<b>${safeText(variable)}</b>`).join('')}</span>`;
+}
+
+function templateEditorMarkup(template = {}, errors = {}) {
+  return `
+    <div class="alert-drawer-head"><div><span class="eyebrow">通知模板编辑</span><h3>${template.id ? '编辑通知模板' : '新建通知模板'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
+    <form class="alert-config-form" data-template-form>
+      <label>模板名称<input name="name" required value="${safeText(valueOf(template, 'name') ?? '')}" placeholder="例如：数据库告警" /></label>
+      <label>通知标题<input name="subject" required value="${safeText(valueOf(template, 'subject') ?? '')}" placeholder="[{{event.severity}}] {{event.id}}" /></label>
+      <label>通知正文<textarea name="body" required rows="9" placeholder="告警 {{event.id}} 发生在 {{resource.name}}">${safeText(valueOf(template, 'body') ?? '')}</textarea></label>
+      <div class="alert-template-preview"><strong>允许变量</strong>${templateVariableMarkup()}<strong>文本预览</strong><pre data-template-preview>${renderTemplatePreview(template)}</pre></div>
+      <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
+      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit">保存模板</button></div>
+    </form>`;
+}
+
+function matcherRowsMarkup(matchers) {
+  const entries = labelEntries(matchers);
+  const rows = entries.length ? entries : [['', '']];
+  return rows.map(([key, value]) => `<div class="alert-matcher-row"><input name="matcherKey" value="${safeText(key)}" placeholder="标签键，例如 instance" /><input name="matcherValue" value="${safeText(value)}" placeholder="匹配值，例如 mysql-01" /><button type="button" data-silence-matcher-remove aria-label="删除匹配条件">删除</button></div>`).join('');
+}
+
+function dateTimeInputValue(value) {
+  const text = String(value ?? '').trim();
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(text) ? text.slice(0, 16) : '';
+  const pad = (number) => String(number).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function silenceEditorMarkup(silence = {}, errors = {}) {
+  return `
+    <div class="alert-drawer-head"><div><span class="eyebrow">静默编辑</span><h3>${silence.id ? '编辑静默' : '新建静默'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
+    <form class="alert-config-form" data-silence-form>
+      <fieldset class="alert-matcher-fieldset"><legend>匹配条件</legend><p class="alert-form-hint">每项使用独立的键和值，仅匹配当前项目内符合条件的告警。</p><div data-silence-matchers>${matcherRowsMarkup(valueOf(silence, 'matchers'))}</div><button type="button" data-silence-matcher-add>添加匹配条件</button></fieldset>
+      <div class="alert-form-grid"><label>开始时间<input name="startsAt" type="datetime-local" required value="${safeText(dateTimeInputValue(valueOf(silence, 'startsAt', 'starts_at')))}" /></label><label>结束时间<input name="endsAt" type="datetime-local" required value="${safeText(dateTimeInputValue(valueOf(silence, 'endsAt', 'ends_at')))}" /></label></div>
+      <label>静默原因<textarea name="reason" required maxlength="500" rows="4" placeholder="例如：例行数据库维护；不要填写凭据或连接串">${safeText(valueOf(silence, 'reason') ?? '')}</textarea></label>
+      <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
+      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit">保存静默</button></div>
+    </form>`;
+}
+
+function silenceCardMarkup(silence, active, canManage, lifecycle = active ? '生效中' : '已结束') {
+  const startsAt = valueOf(silence, 'startsAt', 'starts_at');
+  const endsAt = valueOf(silence, 'endsAt', 'ends_at');
+  const createdAt = valueOf(silence, 'createdAt', 'created_at');
+  const endedAt = valueOf(silence, 'endedAt', 'ended_at') ?? valueOf(silence, 'updatedAt', 'updated_at');
+  const creator = valueOf(silence, 'creator') ?? valueOf(silence, 'createdBy', 'created_by') ?? valueOf(silence, 'actor');
+  const stateClass = active ? 'is-active' : lifecycle === '待生效' ? 'is-scheduled' : 'is-history';
+  return `<article class="alert-config-card alert-silence-card ${stateClass}"><div class="alert-config-card-head"><div><h4>${active ? '生效中的静默' : lifecycle === '待生效' ? '待生效静默' : '历史静默'}</h4><p>${displayValue(valueOf(silence, 'reason'))}</p></div><span class="alert-status-tag ${active ? 'status-warning' : 'status-info'}">${lifecycle}</span></div><dl class="alert-config-details"><div><dt>匹配条件</dt><dd>${selectorChips(valueOf(silence, 'matchers'))}</dd></div><div><dt>创建人</dt><dd>${displayValue(creator)}</dd></div><div><dt>开始 / 结束</dt><dd>${displayTime(startsAt)} / ${displayTime(endsAt)}</dd></div><div><dt>创建时间</dt><dd>${displayTime(createdAt)}</dd></div><div><dt>生命周期记录</dt><dd>${displayTime(endedAt)}</dd></div></dl><div class="alert-config-card-actions"><button type="button" data-silence-edit="${safeText(silence.id)}" ${canManage ? '' : 'disabled'}>编辑</button>${active ? `<button type="button" data-silence-end="${safeText(silence.id)}" ${canManage ? '' : 'disabled'}>结束静默</button>` : ''}${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`;
+}
+
+function renderTemplatesMarkup({ templates, canManage }) {
+  return `
+    <div class="alert-config-toolbar"><div><strong>通知模板</strong><p>预览仅替换允许变量并按纯文本展示，绝不执行模板内容。</p></div><div><button type="button" data-template-create ${canManage ? '' : 'disabled'}>新建模板</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
+    <div class="alert-template-allowed"><strong>允许变量</strong>${templateVariableMarkup()}</div>
+    <div class="alert-config-list">${templates.length ? templates.map((template) => `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(template, 'name') ?? template.id)}</h4><p>标题：${displayValue(valueOf(template, 'subject'))}</p></div><span class="alert-status-tag status-info">修订 ${displayValue(valueOf(template, 'revision') ?? valueOf(template, 'version') ?? '—')}</span></div><dl class="alert-config-details"><div><dt>更新时间</dt><dd>${displayTime(valueOf(template, 'updatedAt', 'updated_at'))}</dd></div><div><dt>文本预览</dt><dd><pre class="alert-template-card-preview">${renderTemplatePreview(template)}</pre></dd></div></dl><div class="alert-config-card-actions"><button type="button" data-template-edit="${safeText(template.id)}" ${canManage ? '' : 'disabled'}>编辑</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`).join('') : '<div class="alert-empty"><strong>暂无通知模板</strong><p>创建模板后可在通知策略中引用。</p></div>'}</div>`;
+}
+
+function renderSilencesMarkup({ silences, canManage }) {
+  const now = new Date();
+  const active = silences.filter((silence) => !valueOf(silence, 'endedAt', 'ended_at') && isActiveSilence(silence, now));
+  const scheduled = silences.filter((silence) => !valueOf(silence, 'endedAt', 'ended_at') && Date.parse(valueOf(silence, 'startsAt', 'starts_at')) > now.getTime());
+  const history = silences.filter((silence) => !active.includes(silence) && !scheduled.includes(silence));
+  return `
+    <div class="alert-config-toolbar"><div><strong>维护静默</strong><p>结束静默会恢复匹配告警的通知，并写入审计记录。</p></div><div><button type="button" data-silence-create ${canManage ? '' : 'disabled'}>新建静默</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
+    <section class="alert-silence-section"><div class="alert-panel-head"><h4>生效中</h4><span>${active.length} 条</span></div><div class="alert-config-list">${active.length ? active.map((silence) => silenceCardMarkup(silence, true, canManage)).join('') : '<div class="alert-empty"><strong>当前没有生效中的静默</strong><p>维护窗口开始后会在此处显示。</p></div>'}</div></section>
+    <section class="alert-silence-section"><div class="alert-panel-head"><h4>待生效</h4><span>${scheduled.length} 条</span></div><div class="alert-config-list">${scheduled.length ? scheduled.map((silence) => silenceCardMarkup(silence, false, canManage, '待生效')).join('') : '<div class="alert-empty"><strong>暂无待生效静默</strong><p>未来维护窗口将在此处显示。</p></div>'}</div></section>
+    <section class="alert-silence-section"><div class="alert-panel-head"><h4>历史记录</h4><span>${history.length} 条</span></div><p class="alert-form-hint">本会话中手动结束的静默仅保留安全的生命周期摘要；不会展示服务端原始审计内容。</p><div class="alert-config-list">${history.length ? history.map((silence) => silenceCardMarkup(silence, false, canManage)).join('') : '<div class="alert-empty"><strong>暂无历史静默</strong><p>已过期的静默将在此处显示。</p></div>'}</div></section>`;
+}
+
 function renderRulesMarkup({ rules, policies, canManage }) {
   return `
     <div class="alert-config-toolbar"><div><strong>规则评估</strong><p>每条规则均在当前项目范围内评估。</p></div><div><button type="button" data-rule-create ${canManage ? '' : 'disabled'}>新建规则</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
@@ -387,6 +517,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
   let alertFilters = {};
   let alertCursor = null;
   let alertCursorHistory = [];
+  let endedSilenceHistory = [];
 
   function isView(value) {
     return ALERT_VIEWS.some(([view]) => view === value);
@@ -452,6 +583,8 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     if (currentView === 'alert-detail') return renderAlertDetail(signal);
     if (currentView === 'rules') return renderRules(signal);
     if (currentView === 'policies') return renderPolicies(signal);
+    if (currentView === 'templates') return renderTemplates(signal);
+    if (currentView === 'silences') return renderSilences(signal);
     root.innerHTML = shellMarkup(`<div class="alert-shell-message"><span class="alert-status-tag status-info">准备就绪</span><p>此专用页面已替代通用功能卡片。配置工作流将在相应模块加载时显示。</p></div>`);
     bindShell();
     return Promise.resolve();
@@ -469,6 +602,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     selectedEventId = null;
     alertCursor = null;
     alertCursorHistory = [];
+    endedSilenceHistory = [];
     if (currentView === 'alert-detail') currentView = 'alerts';
     return renderCurrent();
   }
@@ -584,6 +718,36 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       bindPolicies(policies, templates);
     } catch (error) {
       if (!signal.aborted && !destroyed) renderFailure('通知策略');
+    }
+  }
+
+  async function renderTemplates(signal) {
+    renderLoading('通知模板');
+    try {
+      const result = await api.listTemplates(currentScope, signal);
+      if (signal.aborted || destroyed) return;
+      const templates = listItems(result);
+      root.innerHTML = shellMarkup(renderTemplatesMarkup({ templates, canManage: permissions.manage }));
+      bindShell();
+      bindTemplates(templates);
+    } catch (error) {
+      if (!signal.aborted && !destroyed) renderFailure('通知模板');
+    }
+  }
+
+  async function renderSilences(signal) {
+    renderLoading('静默');
+    try {
+      const result = await api.listSilences(currentScope, signal);
+      if (signal.aborted || destroyed) return;
+      const listedSilences = listItems(result);
+      const listedIDs = new Set(listedSilences.map((silence) => String(silence.id)));
+      const silences = [...listedSilences, ...endedSilenceHistory.filter((silence) => !listedIDs.has(String(silence.id)))];
+      root.innerHTML = shellMarkup(renderSilencesMarkup({ silences, canManage: permissions.manage }));
+      bindShell();
+      bindSilences(silences);
+    } catch (error) {
+      if (!signal.aborted && !destroyed) renderFailure('静默');
     }
   }
 
@@ -751,6 +915,151 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         await api.saveNotificationPolicy(currentScope, payload, aborter?.signal);
         closeDrawer();
         onToast('通知策略已保存');
+        await renderCurrent();
+      } catch (error) {
+        if (output) output.textContent = error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试';
+        setBusy(form, false);
+      }
+    });
+  }
+
+  function bindTemplates(templates) {
+    root.querySelector('[data-template-create]')?.addEventListener('click', () => openTemplateDrawer({}));
+    root.querySelectorAll('[data-template-edit]').forEach((button) => button.addEventListener('click', () => {
+      const template = templates.find((item) => String(item.id) === button.dataset.templateEdit);
+      if (template) openTemplateDrawer(template);
+    }));
+  }
+
+  function openTemplateDrawer(template, errors = {}) {
+    if (!permissions.manage) return;
+    const drawer = showDrawer(templateEditorMarkup(template, errors));
+    const form = drawer?.querySelector('[data-template-form]');
+    if (!form) return;
+    const updatePreview = () => {
+      const preview = form.querySelector('[data-template-preview]');
+      if (!preview) return;
+      let text = `${String(form.elements.subject.value ?? '').trim()}\n\n${String(form.elements.body.value ?? '').trim()}`.trim();
+      TEMPLATE_VARIABLES.forEach(([variable, example]) => { text = text.replaceAll(variable, example); });
+      text = text.replace(/{{resource\.[^{}]+}}/g, 'orders');
+      preview.textContent = text;
+    };
+    form.addEventListener('input', updatePreview);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      const input = {
+        name: String(formData.get('name') ?? '').trim(),
+        subject: String(formData.get('subject') ?? '').trim(),
+        body: String(formData.get('body') ?? '').trim(),
+      };
+      const validation = validateTemplate(input);
+      const output = form.querySelector('.alert-form-errors');
+      if (Object.keys(validation).length) {
+        if (output) output.textContent = Object.values(validation).join(' ');
+        return;
+      }
+      setBusy(form, true);
+      try {
+        await api.saveTemplate(currentScope, { ...(template.id ? { id: template.id } : {}), ...input }, aborter?.signal);
+        closeDrawer();
+        onToast('通知模板已保存');
+        await renderCurrent();
+      } catch (error) {
+        if (output) output.textContent = error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试';
+        setBusy(form, false);
+      }
+    });
+  }
+
+  function bindSilences(silences) {
+    root.querySelector('[data-silence-create]')?.addEventListener('click', () => openSilenceDrawer({}));
+    root.querySelectorAll('[data-silence-edit]').forEach((button) => button.addEventListener('click', () => {
+      const silence = silences.find((item) => String(item.id) === button.dataset.silenceEdit);
+      if (silence) openSilenceDrawer(silence);
+    }));
+    root.querySelectorAll('[data-silence-end]').forEach((button) => button.addEventListener('click', () => {
+      const silence = silences.find((item) => String(item.id) === button.dataset.silenceEnd);
+      confirmEndSilence(button.dataset.silenceEnd, button, silence);
+    }));
+  }
+
+  async function confirmEndSilence(id, button, silence) {
+    if (!permissions.manage) return;
+    if (!window.confirm('结束静默后，匹配的告警将恢复通知。是否继续？')) return;
+    if (button) button.disabled = true;
+    try {
+      await api.endSilence(currentScope, id, aborter?.signal);
+      if (silence) {
+        const endedAt = new Date().toISOString();
+        endedSilenceHistory = [{ ...silence, endedAt, lifecycleSource: 'client-ended' }, ...endedSilenceHistory.filter((item) => String(item.id) !== String(id))];
+      }
+      onToast('静默已结束并写入审计记录');
+      await open('silences');
+    } catch (error) {
+      onToast(error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试');
+      if (button) button.disabled = false;
+    }
+  }
+
+  function openSilenceDrawer(silence, errors = {}) {
+    if (!permissions.manage) return;
+    const drawer = showDrawer(silenceEditorMarkup(silence, errors));
+    const form = drawer?.querySelector('[data-silence-form]');
+    if (!form) return;
+    const matcherList = form.querySelector('[data-silence-matchers]');
+    form.querySelector('[data-silence-matcher-add]')?.addEventListener('click', () => {
+      matcherList?.insertAdjacentHTML('beforeend', matcherRowsMarkup({}));
+    });
+    matcherList?.addEventListener('click', (event) => {
+      const remove = event.target.closest('[data-silence-matcher-remove]');
+      if (!remove) return;
+      const rows = matcherList.querySelectorAll('.alert-matcher-row');
+      if (rows.length === 1) {
+        rows[0].querySelectorAll('input').forEach((input) => { input.value = ''; });
+        return;
+      }
+      remove.closest('.alert-matcher-row')?.remove();
+    });
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const matcherRows = [...form.querySelectorAll('.alert-matcher-row')];
+      const hasIncompleteMatchers = matcherRows.some((row) => {
+        const key = String(row.querySelector('[name="matcherKey"]')?.value ?? '').trim();
+        const value = String(row.querySelector('[name="matcherValue"]')?.value ?? '').trim();
+        return Boolean(key) !== Boolean(value);
+      });
+      const matchers = matcherRows.reduce((result, row) => {
+        const key = String(row.querySelector('[name="matcherKey"]')?.value ?? '').trim();
+        const value = String(row.querySelector('[name="matcherValue"]')?.value ?? '').trim();
+        if (key && value) result[key] = value;
+        return result;
+      }, {});
+      const formData = new FormData(form);
+      const input = {
+        matchers,
+        hasIncompleteMatchers,
+        startsAt: String(formData.get('startsAt') ?? '').trim(),
+        endsAt: String(formData.get('endsAt') ?? '').trim(),
+        reason: String(formData.get('reason') ?? '').trim(),
+      };
+      const validation = validateSilence(input);
+      const output = form.querySelector('.alert-form-errors');
+      if (Object.keys(validation).length) {
+        if (output) output.textContent = Object.values(validation).join(' ');
+        return;
+      }
+      setBusy(form, true);
+      try {
+        await api.saveSilence(currentScope, {
+          ...(silence.id ? { id: silence.id } : {}),
+          matchers: input.matchers,
+          starts_at: new Date(input.startsAt).toISOString(),
+          ends_at: new Date(input.endsAt).toISOString(),
+          reason: input.reason,
+        }, aborter?.signal);
+        closeDrawer();
+        onToast('静默已保存');
         await renderCurrent();
       } catch (error) {
         if (output) output.textContent = error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试';
