@@ -2,14 +2,19 @@ package controlplane_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
 func TestMetricConsumerRejectsPayloadScopeClaim(t *testing.T) {
@@ -43,6 +48,61 @@ func TestMetricConsumerResolvesScopeAndNormalizesMetricSample(t *testing.T) {
 	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
 	require.Equal(t, "agent-a", store.samples[0].AgentID)
 	require.Equal(t, "db-1", store.samples[0].InstanceID)
+}
+
+func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	resourceAttributes := resourceMetrics.Resource().Attributes()
+	resourceAttributes.PutStr("instance", "postgres-1")
+	resourceAttributes.PutStr("component", "postgres")
+	resourceAttributes.PutStr("role", "primary")
+	resourceAttributes.PutStr("host.name", "postgres-1.internal")
+	resourceAttributes.PutStr("tenant_id", "payload-must-not-control-scope")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("host.cpu.utilization")
+	point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	point.SetDoubleValue(42.5)
+	point.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Minute)))
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.NoError(t, err)
+	require.Len(t, store.samples, 1)
+	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
+	require.Equal(t, "agent-a", store.samples[0].AgentID)
+	require.Equal(t, "postgres-1.internal", store.samples[0].Host)
+	require.NotContains(t, store.samples[0].Labels, "tenant_id")
+}
+
+func TestMetricConsumerAcceptsDependencyCollectorEnvelopeWithoutTrustingAgentID(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	payload, err := json.Marshal(agent.DependencyTelemetryEnvelope{
+		BatchID: "dependency-batch-1", Sequence: 7, AgentID: "untrusted-payload-agent", CollectedAt: now.Add(-time.Minute),
+		Samples: []database.MetricSample{{
+			Cluster: "hbase-a", Component: "hbase", Role: "regionserver", Host: "rs-1.internal", Instance: "hbase-a-rs-1",
+			MetricName: "hbase.flush.queue_length", Value: 3, Timestamp: now.Add(-time.Minute),
+		}},
+	})
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.NoError(t, err)
+	require.Len(t, store.samples, 1)
+	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
+	require.Equal(t, "agent-a", store.samples[0].AgentID)
+	require.Equal(t, "hbase-a-rs-1", store.samples[0].InstanceID)
+	require.Equal(t, "regionserver", store.samples[0].Role)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", []byte(`{"batch_id":"dependency-batch-2","agent_id":"untrusted-payload-agent","tenant_id":"payload-scope","samples":[]}`), now)
+	require.ErrorContains(t, err, "scope claim")
 }
 
 func TestMetricConsumerRejectsEachMissingCanonicalResourceDimension(t *testing.T) {

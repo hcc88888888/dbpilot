@@ -15,6 +15,9 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/database"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
 var (
@@ -90,7 +93,7 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 	if err := scope.Validate(); err != nil {
 		return nil, fmt.Errorf("resolve agent scope: %w", err)
 	}
-	envelope, err := decodeMetricEnvelope(payload)
+	envelope, err := decodeMetricEnvelopeForAgent(payload, agentID, receivedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +146,24 @@ type metricPayload struct {
 	Labels    map[string]string `json:"labels"`
 }
 
+// decodeMetricEnvelope preserves the decoder's package-local legacy surface
+// for callers that only need custom JSON decoding.
 func decodeMetricEnvelope(payload []byte) (metricEnvelope, error) {
+	return decodeMetricEnvelopeForAgent(payload, "", time.Time{})
+}
+
+// decodeMetricEnvelopeForAgent accepts the legacy documented JSON payload as well as
+// the two wire formats emitted by production Agents. Identity is intentionally
+// not part of the return value: MetricConsumer always assigns it from the
+// authenticated ingest caller.
+func decodeMetricEnvelopeForAgent(payload []byte, agentID string, receivedAt time.Time) (metricEnvelope, error) {
+	if bytes.HasPrefix(bytes.TrimSpace(payload), []byte("{")) {
+		return decodeJSONMetricEnvelope(payload)
+	}
+	return decodeOTLPMetricEnvelope(payload, agentID, receivedAt)
+}
+
+func decodeJSONMetricEnvelope(payload []byte) (metricEnvelope, error) {
 	var fields map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	if err := decoder.Decode(&fields); err != nil {
@@ -154,6 +174,9 @@ func decodeMetricEnvelope(payload []byte) (metricEnvelope, error) {
 	}
 	if _, ok := fields["samples"]; !ok {
 		return metricEnvelope{}, fmt.Errorf("%w: samples is required", ErrInvalidMetricBatch)
+	}
+	if isDependencyMetricEnvelope(fields) {
+		return decodeDependencyMetricEnvelope(fields)
 	}
 	for key := range fields {
 		if isIdentityClaim(key) {
@@ -208,6 +231,191 @@ func decodeMetricEnvelope(payload []byte) (metricEnvelope, error) {
 	return envelope, nil
 }
 
+// DependencyTelemetryEnvelope is deliberately decoded here rather than by
+// importing agent: control-plane owns the untrusted wire boundary and the
+// agent package must not become a production dependency of its receiver.
+type dependencyMetricEnvelope struct {
+	BatchID     string                  `json:"batch_id"`
+	Sequence    uint64                  `json:"sequence"`
+	AgentID     string                  `json:"agent_id"`
+	CollectedAt time.Time               `json:"collected_at"`
+	Samples     []database.MetricSample `json:"samples"`
+}
+
+func isDependencyMetricEnvelope(fields map[string]json.RawMessage) bool {
+	if _, ok := fields["batch_id"]; ok {
+		return true
+	}
+	if _, ok := fields["sequence"]; ok {
+		return true
+	}
+	_, ok := fields["collected_at"]
+	return ok
+}
+
+func decodeDependencyMetricEnvelope(fields map[string]json.RawMessage) (metricEnvelope, error) {
+	for key := range fields {
+		// The Agent records agent_id in its durable envelope for diagnostics.
+		// It is untrusted metadata and is intentionally ignored; the caller's
+		// authenticated Agent ID is the only identity used for persistence.
+		if isScopeClaim(key) {
+			return metricEnvelope{}, ErrMetricScopeClaim
+		}
+		switch key {
+		case "batch_id", "sequence", "agent_id", "collected_at", "samples", "statuses", "health", "evidence":
+		default:
+			return metricEnvelope{}, fmt.Errorf("%w: unknown dependency envelope field %q", ErrInvalidMetricBatch, key)
+		}
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return metricEnvelope{}, fmt.Errorf("%w: dependency envelope", ErrInvalidMetricBatch)
+	}
+	var envelope dependencyMetricEnvelope
+	if err := json.Unmarshal(encoded, &envelope); err != nil || envelope.Samples == nil {
+		return metricEnvelope{}, fmt.Errorf("%w: dependency samples", ErrInvalidMetricBatch)
+	}
+
+	result := metricEnvelope{Samples: make([]metricPayload, 0, len(envelope.Samples))}
+	for _, sample := range envelope.Samples {
+		sampledAt := sample.Timestamp
+		if sampledAt.IsZero() {
+			sampledAt = envelope.CollectedAt
+		}
+		labels := map[string]string{
+			"instance":  sample.Instance,
+			"component": sample.Component,
+			"role":      sample.Role,
+			"host":      sample.Host,
+			"engine":    sample.Component,
+		}
+		if sample.Cluster != "" {
+			labels["cluster"] = sample.Cluster
+		}
+		if sample.Unit != "" {
+			labels["unit"] = sample.Unit
+		}
+		result.Samples = append(result.Samples, metricPayload{
+			Name: sample.MetricName, Value: sample.Value, SampledAt: sampledAt.UTC().Format(time.RFC3339Nano), Labels: labels,
+		})
+	}
+	return result, nil
+}
+
+func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Time) (metricEnvelope, error) {
+	metrics, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(payload)
+	if err != nil {
+		return metricEnvelope{}, fmt.Errorf("%w: unsupported metric payload", ErrInvalidMetricBatch)
+	}
+	result := metricEnvelope{}
+	resources := metrics.ResourceMetrics()
+	for resourceIndex := 0; resourceIndex < resources.Len(); resourceIndex++ {
+		resource := resources.At(resourceIndex)
+		resourceAttributes := otelAttributes(resource.Resource().Attributes())
+		scopes := resource.ScopeMetrics()
+		for scopeIndex := 0; scopeIndex < scopes.Len(); scopeIndex++ {
+			metricList := scopes.At(scopeIndex).Metrics()
+			for metricIndex := 0; metricIndex < metricList.Len(); metricIndex++ {
+				metric := metricList.At(metricIndex)
+				switch metric.Type() {
+				case pmetric.MetricTypeGauge:
+					appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Gauge().DataPoints(), agentID, receivedAt)
+				case pmetric.MetricTypeSum:
+					appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Sum().DataPoints(), agentID, receivedAt)
+				}
+			}
+		}
+	}
+	if len(result.Samples) == 0 {
+		return metricEnvelope{}, fmt.Errorf("%w: OTLP contains no numeric datapoints", ErrInvalidMetricBatch)
+	}
+	return result, nil
+}
+
+func appendOTLPNumberPoints(result *metricEnvelope, name string, resourceAttributes map[string]string, points pmetric.NumberDataPointSlice, agentID string, receivedAt time.Time) {
+	for pointIndex := 0; pointIndex < points.Len(); pointIndex++ {
+		point := points.At(pointIndex)
+		attributes := mapsClone(resourceAttributes)
+		for key, value := range otelAttributes(point.Attributes()) {
+			attributes[key] = value
+		}
+		timestamp := point.Timestamp().AsTime()
+		if timestamp.IsZero() {
+			timestamp = point.StartTimestamp().AsTime()
+		}
+		if timestamp.IsZero() {
+			timestamp = receivedAt
+		}
+		value := point.DoubleValue()
+		if point.ValueType() == pmetric.NumberDataPointValueTypeInt {
+			value = float64(point.IntValue())
+		}
+		result.Samples = append(result.Samples, metricPayload{
+			Name: name, Value: value, SampledAt: timestamp.UTC().Format(time.RFC3339Nano), Labels: canonicalOTLPLabels(attributes, agentID),
+		})
+	}
+}
+
+func otelAttributes(attributes pcommon.Map) map[string]string {
+	result := make(map[string]string)
+	attributes.Range(func(key string, value pcommon.Value) bool {
+		switch value.Type() {
+		case pcommon.ValueTypeStr:
+			result[key] = value.Str()
+		case pcommon.ValueTypeBool:
+			result[key] = fmt.Sprintf("%t", value.Bool())
+		case pcommon.ValueTypeInt:
+			result[key] = fmt.Sprintf("%d", value.Int())
+		case pcommon.ValueTypeDouble:
+			result[key] = fmt.Sprintf("%g", value.Double())
+		}
+		return true
+	})
+	return result
+}
+
+func canonicalOTLPLabels(attributes map[string]string, agentID string) map[string]string {
+	component := firstMetricAttribute(attributes, "component", "service.name", "db.system", "dbpilot.source.id")
+	if component == "" {
+		component = "telemetry"
+	}
+	engine := firstMetricAttribute(attributes, "engine", "db.system", "db_system")
+	if engine == "" {
+		engine = component
+	}
+	return map[string]string{
+		"instance":  firstNonEmpty(firstMetricAttribute(attributes, "instance", "service.instance.id", "db.instance.id", "dbpilot.source.id", "service.name"), agentID),
+		"component": component,
+		"role":      firstNonEmpty(firstMetricAttribute(attributes, "role", "db.role", "service.role"), "collector"),
+		"host":      firstNonEmpty(firstMetricAttribute(attributes, "host", "host.name", "server.address", "net.host.name"), agentID),
+		"engine":    engine,
+	}
+}
+
+func firstMetricAttribute(attributes map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(attributes[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
+}
+
+func mapsClone(input map[string]string) map[string]string {
+	result := make(map[string]string, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
+}
+
 func ensureJSONEnd(decoder *json.Decoder) error {
 	if decoder.More() {
 		return fmt.Errorf("%w: trailing JSON", ErrInvalidMetricBatch)
@@ -220,8 +428,12 @@ func ensureJSONEnd(decoder *json.Decoder) error {
 }
 
 func isIdentityClaim(key string) bool {
+	return isScopeClaim(key) || key == "agent_id" || key == "agent"
+}
+
+func isScopeClaim(key string) bool {
 	switch key {
-	case "tenant_id", "project_id", "agent_id", "tenant", "project", "agent", "scope":
+	case "tenant_id", "project_id", "tenant", "project", "scope":
 		return true
 	default:
 		return false
