@@ -1,0 +1,153 @@
+name: ${DBPILOT_ALERT_COMPOSE_PROJECT:-dbpilot-alert-e2e}
+
+services:
+  state-init:
+    image: ${DBPILOT_KYLIN_IMAGE:?DBPILOT_KYLIN_IMAGE is required}
+    user: "0:0"
+    command: ["/bin/sh", "-c", "chown 65532:65532 /state && chmod 0700 /state"]
+    network_mode: none
+    read_only: true
+    volumes:
+      - sink_state:/state
+    restart: "no"
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "FOWNER"]
+    security_opt:
+      - no-new-privileges:true
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dbpilot
+      POSTGRES_USER: dbpilot
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      alert_internal:
+        ipv4_address: 203.0.114.10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbpilot -d dbpilot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+
+  smtp-sink:
+    image: ${DBPILOT_KYLIN_IMAGE:?DBPILOT_KYLIN_IMAGE is required}
+    user: "65532:65532"
+    command:
+      - /runtime/smtp-sink
+      - -listen=:2465
+      - -cert=/runtime/server.pem
+      - -key=/runtime/server-key.pem
+      - -state=/state
+    environment:
+      ALERT_SMTP_PASSWORD: ${DBPILOT_ALERT_SMTP_PASSWORD:?DBPILOT_ALERT_SMTP_PASSWORD is required}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - ${DBPILOT_ALERT_RUNTIME_DIR:?DBPILOT_ALERT_RUNTIME_DIR is required}:/runtime:ro
+      - sink_state:/state
+    networks:
+      alert_internal:
+        ipv4_address: 203.0.114.20
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/runtime/smtp-sink", "-check", "127.0.0.1:2465", "-ca", "/runtime/ca.pem", "-server-name", "smtp-sink"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+
+  webhook-sink:
+    image: ${DBPILOT_KYLIN_IMAGE:?DBPILOT_KYLIN_IMAGE is required}
+    user: "65532:65532"
+    command:
+      - /runtime/webhook-sink
+      - -listen=:8443
+      - -cert=/runtime/server.pem
+      - -key=/runtime/server-key.pem
+      - -state=/state
+    environment:
+      ALERT_WEBHOOK_SECRET: ${DBPILOT_ALERT_WEBHOOK_SECRET:?DBPILOT_ALERT_WEBHOOK_SECRET is required}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - ${DBPILOT_ALERT_RUNTIME_DIR:?DBPILOT_ALERT_RUNTIME_DIR is required}:/runtime:ro
+      - sink_state:/state
+    networks:
+      alert_internal:
+        ipv4_address: 203.0.114.30
+    depends_on:
+      state-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/runtime/webhook-sink", "-check-url", "https://webhook-sink:8443/health", "-ca", "/runtime/ca.pem"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+
+  controlplane:
+    image: ${DBPILOT_KYLIN_IMAGE:?DBPILOT_KYLIN_IMAGE is required}
+    user: "65532:65532"
+    command: ["/runtime/dbpilot-controlplane", "--config", "/runtime/controlplane.yaml"]
+    environment:
+      ALERT_SMTP_PASSWORD: ${DBPILOT_ALERT_SMTP_PASSWORD:?DBPILOT_ALERT_SMTP_PASSWORD is required}
+      ALERT_WEBHOOK_SECRET: ${DBPILOT_ALERT_WEBHOOK_SECRET:?DBPILOT_ALERT_WEBHOOK_SECRET is required}
+      SSL_CERT_FILE: /runtime/ca.pem
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - ${DBPILOT_ALERT_RUNTIME_DIR:?DBPILOT_ALERT_RUNTIME_DIR is required}:/runtime:ro
+    networks:
+      alert_internal:
+        ipv4_address: 203.0.114.40
+    depends_on:
+      postgres:
+        condition: service_healthy
+      smtp-sink:
+        condition: service_healthy
+      webhook-sink:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/runtime/webhook-sink", "-check-url", "https://controlplane:8443/readyz", "-ca", "/runtime/ca.pem", "-client-cert", "/runtime/admin.pem", "-client-key", "/runtime/admin-key.pem"]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  alert_internal:
+    internal: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 203.0.114.0/24
+
+volumes:
+  postgres_data:
+  sink_state:
+
+secrets:
+  postgres_password:
+    file: ${DBPILOT_ALERT_POSTGRES_PASSWORD_FILE:?DBPILOT_ALERT_POSTGRES_PASSWORD_FILE is required}

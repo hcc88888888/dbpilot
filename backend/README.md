@@ -1,5 +1,10 @@
 # DBPilot Agent telemetry foundation
 
+For production alert-control-plane deployment, PostgreSQL retention,
+identity/inventory integration, notification security, backup/restore, and the
+Docker/Kylin evidence boundary, see
+[`docs/alert-control-plane-operations.md`](docs/alert-control-plane-operations.md).
+
 `dbpilot-agent` is a single embedded telemetry process for Linux. It does not
 install, start, expose, or depend on Vector or a standalone OpenTelemetry
 Collector process.
