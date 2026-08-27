@@ -1,0 +1,61 @@
+package audit
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"dbpilot.local/platform/internal/platformscope"
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPostgresStoreAppendPersistsAppendOnlyEvent(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	value := validEvent()
+	value.ID = "audit-1"
+	value.OccurredAt = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	value.CreatedAt = value.OccurredAt
+	value.Detail = map[string]any{"count": float64(2)}
+	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
+		value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.OccurredAt, value.Action,
+		value.Actor.Type, value.Actor.ID, value.Resource.Type, value.Resource.ID, value.Result,
+		value.RequestID, value.TraceID, value.JobID, value.CommandID, []byte(`{"count":2}`), value.CreatedAt,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	require.NoError(t, NewPostgresStore(database).Append(context.Background(), value))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStoreListUsesScopeAndTupleCursor(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	after := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	mock.ExpectQuery("SELECT .* FROM audit_events WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, id\\) > \\(\\$3, \\$4\\) ORDER BY created_at ASC, id ASC LIMIT \\$5").
+		WithArgs(scope.TenantID, scope.ProjectID, after, "audit-1", 11).
+		WillReturnRows(sqlmock.NewRows(auditColumnNames()).AddRow("audit-2", scope.TenantID, scope.ProjectID, after.Add(time.Second), "inspection.finished", "user", "operator-1", "inspection", "inspection-1", "succeeded", "request-1", "trace-1", "job-1", "command-1", []byte(`{"rows":3}`), after.Add(time.Second)))
+
+	items, err := NewPostgresStore(database).List(context.Background(), scope, StoreListQuery{After: after, AfterID: "audit-1", Limit: 11})
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Equal(t, scope, items[0].Scope)
+	require.Equal(t, time.UTC, items[0].OccurredAt.Location())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStoreListWithoutCursorStillRequiresExactScope(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	mock.ExpectQuery("SELECT .* FROM audit_events WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at ASC, id ASC LIMIT \\$3").WithArgs(scope.TenantID, scope.ProjectID, 10).WillReturnRows(sqlmock.NewRows(auditColumnNames()))
+
+	items, err := NewPostgresStore(database).List(context.Background(), scope, StoreListQuery{Limit: 10})
+	require.NoError(t, err)
+	require.Empty(t, items)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
