@@ -82,18 +82,51 @@ function Assert-RunningContainersHaveNoPublishedPorts {
     }
 }
 
-function Get-ServiceLogs {
+function Get-RequiredServiceLogs {
     $savedPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $output = & $DockerBinary compose --project-name $projectName --file $composeFile logs --no-color --timestamps 2>&1
+    $composeOutput = & $DockerBinary compose --project-name $projectName --file $composeFile logs --no-color --timestamps 2>&1
     $composeExit = $LASTEXITCODE
+    $agentOutput = & $DockerBinary logs --timestamps $agentContainer 2>&1
+    $agentExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedPreference
+    if ($composeExit -ne 0) { throw 'Compose logs are required for the secret-echo gate.' }
+    if ($agentExit -ne 0) { throw 'Production Agent logs are required for the secret-echo gate.' }
+    return (($composeOutput + $agentOutput) | Out-String)
+}
+
+function Get-DiagnosticServiceLogs {
+    $savedPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = @(& $DockerBinary compose --project-name $projectName --file $composeFile logs --no-color --timestamps 2>&1)
+    if ($LASTEXITCODE -ne 0) { $output += 'Compose diagnostic logs were unavailable.' }
     $existingAgent = (& $DockerBinary ps -aq --filter "name=^/${agentContainer}$" 2>$null).Trim()
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($existingAgent)) {
+    if ($LASTEXITCODE -ne 0) {
+        $output += 'Agent diagnostic lookup was unavailable.'
+    } elseif (-not [string]::IsNullOrWhiteSpace($existingAgent)) {
         $output += & $DockerBinary logs --timestamps $agentContainer 2>&1
+        if ($LASTEXITCODE -ne 0) { $output += 'Agent diagnostic logs were unavailable.' }
     }
     $ErrorActionPreference = $savedPreference
-    if ($composeExit -ne 0) { return 'Sanitized service logs were unavailable.' }
     return ($output | Out-String)
+}
+
+function Wait-AgentAuthenticatedStatus {
+    $marker = 'dbpilot authenticated policy status accepted agent_id="agent-t1-p1" version=1'
+    $deadline = [DateTime]::UtcNow.AddSeconds([Math]::Min($HealthTimeoutSeconds, 30))
+    do {
+        $savedPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $logs = & $DockerBinary compose --project-name $projectName --file $composeFile logs --no-color controlplane 2>&1
+        $logsExit = $LASTEXITCODE
+        $ErrorActionPreference = $savedPreference
+        if ($logsExit -ne 0) { throw 'Control-plane logs are required to observe the authenticated Agent status RPC.' }
+        if (($logs | Out-String).Contains($marker)) { return }
+        $agentState = (& $DockerBinary inspect --format '{{.State.Status}}' $agentContainer).Trim()
+        if ($LASTEXITCODE -ne 0 -or $agentState -ne 'running') { throw 'The production Agent stopped before an authenticated status RPC was observed.' }
+        Start-Sleep -Seconds 1
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'The production Agent did not complete an observable authenticated status RPC.'
 }
 
 function Assert-NoSecretEcho {
@@ -104,7 +137,7 @@ function Assert-NoSecretEcho {
 }
 
 function Write-SanitizedFailureLogs {
-    $logs = Get-ServiceLogs
+    $logs = Get-DiagnosticServiceLogs
     Assert-NoSecretEcho $logs
     $sanitized = $logs.Replace($runtimeDirectory, '<temporary-runtime>')
     if ($sanitized.Length -gt 16000) { $sanitized = $sanitized.Substring($sanitized.Length - 16000) }
@@ -185,10 +218,10 @@ try {
     Invoke-Docker @('run', '--rm', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=16m,mode=1777', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--network', $networkName, '--user', '65532:65532', '--workdir', '/runtime', '--mount', $agentRunMount, '-e', 'DBPILOT_ALERT_KYLIN_POLICY_CHECK=1', $KylinImage, '/runtime/alert-e2e.test', '-test.v', '-test.run', '^TestKylinAgentPolicyApply$', '-test.timeout', '45s')
     $agentID = (& $DockerBinary run --detach --read-only --tmpfs '/tmp:rw,noexec,nosuid,size=16m,mode=1777' --cap-drop ALL --security-opt no-new-privileges --name $agentContainer --network $networkName --user 65532:65532 --workdir /runtime --mount $agentRunMount $KylinImage /runtime/dbpilot-agent --config /runtime/agent.yaml).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($agentID)) { throw 'Unable to start the production Agent in Kylin.' }
-    Start-Sleep -Seconds 3
+    Wait-AgentAuthenticatedStatus
     $agentState = (& $DockerBinary inspect --format '{{.State.Status}}' $agentContainer).Trim()
     if ($LASTEXITCODE -ne 0 -or $agentState -ne 'running') { throw 'The production Agent did not remain running in Kylin.' }
-    Write-Host 'EVIDENCE agent runtime=kylin-v10 identity=agent-t1-p1 mtls=enabled'
+    Write-Host 'EVIDENCE agent runtime=kylin-v10 identity=agent-t1-p1 mtls=authenticated status_rpc=accepted'
 
     $testArguments = @(
         'run', '--rm', '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,size=16m,mode=1777', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--network', $networkName, '--user', '65532:65532', '--workdir', '/runtime', '--mount', $agentRunMount,
@@ -204,7 +237,7 @@ try {
     )
     Invoke-Docker $testArguments
 
-    $logs = Get-ServiceLogs
+    $logs = Get-RequiredServiceLogs
     Assert-NoSecretEcho $logs
     $completed = $true
 }

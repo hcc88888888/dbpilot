@@ -62,22 +62,26 @@ func TestAlertControlPlaneLifecycle(t *testing.T) {
 	event := api.EventEventually(scopeT1P1, rule.ID, alert.EventFiring, 30*time.Second)
 	t.Logf("EVIDENCE firing event=%s fingerprint=%s", event.ID, event.Fingerprint)
 
-	retryScheduled := api.DeliveryEventually(scopeT1P1, event.ID, policies[2].ID, alert.DeliveryRetryScheduled, 1, 10*time.Second)
+	retryScheduled := api.DeliveryEventually(scopeT1P1, event.ID, policies[2].ID, alert.DeliveryRetryScheduled, alert.EventPending, 1, 10*time.Second)
 	require.NotEmpty(t, retryScheduled.FailureClass)
-	deliveries := api.DeliveriesEventually(scopeT1P1, event.ID, policies, 90*time.Second)
-	deliveryForPolicy(t, deliveries, policies[2].ID, alert.DeliveryDelivered)
-	retriedWebhook := api.DeliveryEventually(scopeT1P1, event.ID, policies[2].ID, alert.DeliveryDelivered, 2, 90*time.Second)
+	deliveries := api.DeliveriesEventually(scopeT1P1, event.ID, alert.EventFiring, policies, 90*time.Second)
+	deliveryForPolicy(t, deliveries, policies[2].ID, alert.DeliveryDelivered, alert.EventFiring)
+	retriedWebhook := api.DeliveryEventually(scopeT1P1, event.ID, policies[2].ID, alert.DeliveryDelivered, alert.EventPending, 2, 90*time.Second)
 	fixtureAfterRetry := api.FixtureStatus()
 	require.GreaterOrEqual(t, fixtureAfterRetry.WebhookAttempts, 3, "one failed pending delivery, one firing delivery, and the scheduled retry must reach the sink")
 	t.Logf("EVIDENCE notifications in_app=delivered smtp=delivered webhook=delivered failure=%s retry_attempts=%d sink_attempts=%d", retryScheduled.FailureClass, retriedWebhook.Attempts, fixtureAfterRetry.WebhookAttempts)
 
-	api.CreateSilence(scopeT1P1, fingerprintSilence(event.Fingerprint))
-	agent.PushMetric(metricEnvelope("db.connections", 1))
-	resolved := api.EventEventually(scopeT1P1, rule.ID, alert.EventResolved, 30*time.Second)
-	require.Eventually(t, func() bool {
-		return api.HasSuppressedDelivery(scopeT1P1, resolved.ID)
-	}, 30*time.Second, time.Second)
-	t.Logf("EVIDENCE silence fingerprint=%s suppressed=true", event.Fingerprint)
+	silencedRule := api.CreateRule(scopeT1P1, thresholdRule("db.silenced.connections", 80, policyIDs))
+	silencedFingerprint := alert.EventFingerprint(scopeT1P1, silencedRule.ID, map[string]string{"agent_id": "agent-t1-p1", "resource": "fixture-db", "role": "primary"})
+	api.CreateSilence(scopeT1P1, fingerprintSilence(silencedFingerprint))
+	agent.PushMetric(metricEnvelope("db.silenced.connections", 92))
+	silencedEvent := api.EventEventually(scopeT1P1, silencedRule.ID, alert.EventFiring, 30*time.Second)
+	require.Equal(t, silencedFingerprint, silencedEvent.Fingerprint)
+	api.DeliveryEventually(scopeT1P1, silencedEvent.ID, policies[0].ID, alert.DeliverySuppressed, alert.EventFiring, 1, 30*time.Second)
+	t.Logf("EVIDENCE silence fingerprint=%s firing_delivery=suppressed", silencedFingerprint)
+
+	agent.PushMetric(metricEnvelope("db.silenced.connections", 1))
+	resolved := api.EventEventually(scopeT1P1, silencedRule.ID, alert.EventResolved, 30*time.Second)
 	t.Logf("EVIDENCE recovery event=%s state=%s", resolved.ID, resolved.State)
 
 	status := api.GetAs(memberClient(t), eventPath("t1", "p1", event.ID))
@@ -278,7 +282,7 @@ func (api *e2eClient) EventEventually(scope alert.Scope, ruleID string, state al
 	return found
 }
 
-func (api *e2eClient) DeliveriesEventually(scope alert.Scope, eventID string, policies []alert.NotificationPolicy, timeout time.Duration) []alert.NotificationDelivery {
+func (api *e2eClient) DeliveriesEventually(scope alert.Scope, eventID string, eventState alert.EventState, policies []alert.NotificationPolicy, timeout time.Duration) []alert.NotificationDelivery {
 	api.t.Helper()
 	var found []alert.NotificationDelivery
 	require.Eventually(api.t, func() bool {
@@ -289,7 +293,7 @@ func (api *e2eClient) DeliveriesEventually(scope alert.Scope, eventID string, po
 		for _, configured := range policies {
 			matched := false
 			for _, delivery := range deliveries {
-				if delivery.PolicyID == configured.ID && delivery.Status == alert.DeliveryDelivered {
+				if delivery.PolicyID == configured.ID && delivery.Status == alert.DeliveryDelivered && delivery.EventState == eventState {
 					matched = true
 					break
 				}
@@ -304,7 +308,7 @@ func (api *e2eClient) DeliveriesEventually(scope alert.Scope, eventID string, po
 	return found
 }
 
-func (api *e2eClient) DeliveryEventually(scope alert.Scope, eventID, policyID string, status alert.DeliveryStatus, minimumAttempts int, timeout time.Duration) alert.NotificationDelivery {
+func (api *e2eClient) DeliveryEventually(scope alert.Scope, eventID, policyID string, status alert.DeliveryStatus, eventState alert.EventState, minimumAttempts int, timeout time.Duration) alert.NotificationDelivery {
 	api.t.Helper()
 	var found alert.NotificationDelivery
 	require.Eventually(api.t, func() bool {
@@ -313,7 +317,7 @@ func (api *e2eClient) DeliveryEventually(scope alert.Scope, eventID, policyID st
 			return false
 		}
 		for _, delivery := range deliveries {
-			if delivery.PolicyID == policyID && delivery.Status == status && delivery.Attempts >= minimumAttempts {
+			if delivery.PolicyID == policyID && delivery.Status == status && delivery.EventState == eventState && delivery.Attempts >= minimumAttempts {
 				found = delivery
 				return true
 			}
@@ -321,19 +325,6 @@ func (api *e2eClient) DeliveryEventually(scope alert.Scope, eventID, policyID st
 		return false
 	}, timeout, time.Second)
 	return found
-}
-
-func (api *e2eClient) HasSuppressedDelivery(scope alert.Scope, eventID string) bool {
-	var deliveries []alert.NotificationDelivery
-	if !api.TryJSON(http.MethodGet, eventPath(scope.TenantID, scope.ProjectID, eventID)+"/deliveries", nil, http.StatusOK, &deliveries) {
-		return false
-	}
-	for _, delivery := range deliveries {
-		if delivery.Status == alert.DeliverySuppressed {
-			return true
-		}
-	}
-	return false
 }
 
 type fixtureStatus struct {
@@ -467,14 +458,14 @@ func fingerprintSilence(fingerprint string) map[string]any {
 	return map[string]any{"matchers": map[string]string{"fingerprint": fingerprint}, "starts_at": now.Add(-time.Minute), "ends_at": now.Add(5 * time.Minute), "reason": "e2e maintenance"}
 }
 
-func deliveryForPolicy(t *testing.T, deliveries []alert.NotificationDelivery, policyID string, state alert.DeliveryStatus) alert.NotificationDelivery {
+func deliveryForPolicy(t *testing.T, deliveries []alert.NotificationDelivery, policyID string, state alert.DeliveryStatus, eventState alert.EventState) alert.NotificationDelivery {
 	t.Helper()
 	for _, delivery := range deliveries {
-		if delivery.PolicyID == policyID && delivery.Status == state {
+		if delivery.PolicyID == policyID && delivery.Status == state && delivery.EventState == eventState {
 			return delivery
 		}
 	}
-	require.FailNow(t, "delivery not found", "policy=%s status=%s", policyID, state)
+	require.FailNow(t, "delivery not found", "policy=%s status=%s event_state=%s", policyID, state, eventState)
 	return alert.NotificationDelivery{}
 }
 

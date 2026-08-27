@@ -245,6 +245,23 @@ func TestReportPolicyStatusUsesVerifiedSPIFFEIdentity(t *testing.T) {
 	assert.Equal(t, codes.PermissionDenied, status.Code(err))
 }
 
+func TestReportPolicyStatusObservesOnlyAuthenticatedAcceptedReports(t *testing.T) {
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
+	var observed []PolicyStatusMetadata
+	service.SetPolicyStatusObserver(PolicyStatusObserverFunc(func(value PolicyStatusMetadata) {
+		observed = append(observed, value)
+	}))
+
+	ack, err := service.ReportPolicyStatus(contextWithSPIFFEAgent(t, "agent-a"), &telemetryv1.PolicyStatus{AgentId: "agent-a", Version: 7, State: "ACTIVE", ErrorCode: "", ReportedAtUnix: 1_725_000_000})
+	require.NoError(t, err)
+	require.True(t, ack.Accepted)
+	require.Equal(t, []PolicyStatusMetadata{{AgentID: "agent-a", Version: 7, State: "ACTIVE", ErrorCode: "", ReportedAt: time.Unix(1_725_000_000, 0).UTC()}}, observed)
+
+	_, err = service.ReportPolicyStatus(contextWithSPIFFEAgent(t, "agent-a"), &telemetryv1.PolicyStatus{AgentId: "agent-b", Version: 8, State: "ACTIVE"})
+	require.Error(t, err)
+	require.Len(t, observed, 1, "a rejected claimed identity must not become server-observable")
+}
+
 func validLogBatch(id, agentID string, payload []byte) *telemetryv1.LogBatch {
 	checksum := sha256.Sum256(payload)
 	return &telemetryv1.LogBatch{BatchId: id, AgentId: agentID, SourceId: "source", Payload: payload, Checksum: checksum[:]}

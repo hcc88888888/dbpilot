@@ -62,6 +62,29 @@ type AtomicMetricBatchConsumer interface {
 	ConsumeMetricBatchOnce(context.Context, string, string, []byte, time.Time) (bool, error)
 }
 
+// PolicyStatusMetadata is the authenticated, body-free status receipt exposed
+// to server observability after a policy-status RPC has passed authorization.
+type PolicyStatusMetadata struct {
+	AgentID    string
+	Version    int64
+	State      string
+	ErrorCode  string
+	ReportedAt time.Time
+}
+
+// PolicyStatusObserver observes only authenticated policy-status reports.
+// Implementations must not retain TLS material or request bodies.
+type PolicyStatusObserver interface {
+	ObservePolicyStatus(PolicyStatusMetadata)
+}
+
+// PolicyStatusObserverFunc adapts a function to PolicyStatusObserver.
+type PolicyStatusObserverFunc func(PolicyStatusMetadata)
+
+func (observer PolicyStatusObserverFunc) ObservePolicyStatus(value PolicyStatusMetadata) {
+	observer(value)
+}
+
 // Service validates and acknowledges DBPilot telemetry batches.
 type Service struct {
 	telemetryv1.UnimplementedTelemetryIngestServer
@@ -69,6 +92,7 @@ type Service struct {
 	dedup      BatchDeduplicator
 	durable    DurableBatchDeduplicator
 	metrics    MetricBatchConsumer
+	statuses   PolicyStatusObserver
 	dedupMu    sync.Mutex
 	receivedMu sync.Mutex
 	received   []BatchMetadata
@@ -100,6 +124,12 @@ func NewDurableService(identities AgentIdentityResolver, dedup DurableBatchDedup
 	return service
 }
 
+// SetPolicyStatusObserver configures a synchronous server-side observation
+// boundary. Configure it before registering the service with a gRPC server.
+func (s *Service) SetPolicyStatusObserver(observer PolicyStatusObserver) {
+	s.statuses = observer
+}
+
 func (s *Service) PushLogBatch(ctx context.Context, batch *telemetryv1.LogBatch) (*telemetryv1.BatchAck, error) {
 	if batch == nil {
 		return nil, status.Error(codes.InvalidArgument, "log batch is required")
@@ -118,8 +148,12 @@ func (s *Service) ReportPolicyStatus(ctx context.Context, report *telemetryv1.Po
 	if report == nil {
 		return nil, status.Error(codes.InvalidArgument, "policy status is required")
 	}
-	if _, err := s.authorize(ctx, report.AgentId); err != nil {
+	authenticatedAgentID, err := s.authorize(ctx, report.AgentId)
+	if err != nil {
 		return nil, err
+	}
+	if s.statuses != nil {
+		s.statuses.ObservePolicyStatus(PolicyStatusMetadata{AgentID: authenticatedAgentID, Version: report.Version, State: report.State, ErrorCode: report.ErrorCode, ReportedAt: time.Unix(report.ReportedAtUnix, 0).UTC()})
 	}
 	return &telemetryv1.PolicyStatusAck{Accepted: true}, nil
 }

@@ -91,6 +91,7 @@ type NotificationDelivery struct {
 	Scope          Scope           `json:"scope"`
 	EventID        string          `json:"event_id"`
 	PolicyID       string          `json:"policy_id"`
+	EventState     EventState      `json:"event_state"`
 	IdempotencyKey string          `json:"idempotency_key"`
 	Status         DeliveryStatus  `json:"status"`
 	Attempts       int             `json:"attempts"`
@@ -356,7 +357,7 @@ func (dispatcher *Dispatcher) deliveryRequest(route NotificationRoute, rule Aler
 func newNotificationDelivery(request DeliveryRequest, event AlertEvent, at time.Time) NotificationDelivery {
 	key := deliveryIdempotencyKey(event.ID, request.State, request.Channel, request.TemplateVersion)
 	request.DeliveryID = key
-	return NotificationDelivery{ID: key, Scope: event.Scope, EventID: event.ID, PolicyID: request.PolicyID, IdempotencyKey: key, Status: DeliveryAttempting, Attempts: 1, AttemptedAt: at, Request: request}
+	return NotificationDelivery{ID: key, Scope: event.Scope, EventID: event.ID, PolicyID: request.PolicyID, EventState: request.State, IdempotencyKey: key, Status: DeliveryAttempting, Attempts: 1, AttemptedAt: at, Request: request}
 }
 
 func deliveryIdempotencyKey(eventID string, state EventState, channel, templateVersion string) string {

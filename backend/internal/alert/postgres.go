@@ -1118,6 +1118,7 @@ func scanNotificationDelivery(scanner rowScanner) (NotificationDelivery, error) 
 	delivery.Request.Scope = delivery.Scope
 	delivery.Request.EventID = delivery.EventID
 	delivery.Request.PolicyID = delivery.PolicyID
+	delivery.EventState = delivery.Request.State
 	delivery.ClaimOwner = delivery.LeaseOwner
 	if nextAttemptAt.Valid {
 		delivery.NextAttemptAt = nextAttemptAt.Time

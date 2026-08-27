@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -218,6 +219,9 @@ func NewServer(config Config) (*Server, error) {
 	resolver := buildConfiguredAgentResolver(config.Agents)
 	metricConsumer := controlplane.NewMetricConsumer(resolver, repository)
 	ingestService := ingest.NewDurableService(resolver, postgresLogBatchDeduplicator{database: database}, metricConsumer)
+	ingestService.SetPolicyStatusObserver(ingest.PolicyStatusObserverFunc(func(status ingest.PolicyStatusMetadata) {
+		log.Printf("dbpilot authenticated policy status accepted agent_id=%q version=%d", status.AgentID, status.Version)
+	}))
 	evaluator := alert.NewEvaluator(repository, repository)
 	secrets := config.SecretResolver
 	if secrets == nil {

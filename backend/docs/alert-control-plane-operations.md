@@ -13,14 +13,17 @@ verified SPIFFE client certificate. In `identity.mode: mtls`, the HTTPS API
 also requires a verified client certificate whose URI is present in the
 configured principal inventory.
 
-`GET /healthz` proves only that the HTTP process can answer. `GET /readyz`
-returns ready only after PostgreSQL is reachable, migrations have completed,
-and one complete evaluation/list/dispatch pass has succeeded for every
-configured scope. A failed rule, queue backlog, failed all-scope pass, or
-database outage makes readiness fail closed. The scoped `overview` response
-also reports evaluator health; alert on sustained unready state and inspect
-database reachability, evaluator failures, late runs, and notification retry
-backlog before restarting.
+`GET /healthz` proves only that the HTTP process can answer. The listeners bind
+only after migrations succeed. Once bound, `GET /readyz` requires a successful
+PostgreSQL ping, one complete evaluation/list/dispatch pass for every configured
+scope, no current evaluator error, and zero failed rules. An evaluation, event
+listing, dispatch, or database failure makes readiness fail closed. Although
+the readiness predicate also compares the evaluator's `queue_depth` field with
+zero, the production evaluator does not currently populate that field, and the
+notification retry backlog is not a readiness input. Monitor retry-scheduled
+deliveries separately. The scoped `overview` response reports evaluator health;
+alert on sustained unready state and inspect database reachability, evaluator
+failures, late runs, dispatcher errors, and retry backlog before restarting.
 
 Use a rollout that waits for `/readyz` before adding an instance to service.
 During planned database maintenance, remove instances from service first and
@@ -170,16 +173,20 @@ powershell -File .\scripts\verify-alert-control-plane.ps1 `
 
 The verifier rejects a missing/non-Kylin image, any Compose host-port
 publication, a non-internal fixture network, or a generated secret found in
-service logs. It runs PostgreSQL 16, the real control plane, hash-only SMTP and
-Webhook sinks, and a real `dbpilot-agent` process in Kylin; the lifecycle test
-uses the production HTTPS and mTLS gRPC listeners. The real Agent proves
-signed-policy application and its authenticated status path. A deterministic
-metric envelope is sent by the fixture's Agent identity over that same mTLS
-gRPC listener because the current host-metrics spool record is OTLP protobuf
-while the control-plane metric envelope is strict JSON. This is a documented
-compatibility gap, not evidence that host-metrics replay is end-to-end. Every
-path removes the Agent, containers, network, named volumes, and temporary
-certificates.
+service logs. A successful run requires both Compose and production-Agent logs
+to be collected; log acquisition failure fails the secret-echo gate closed.
+Failure diagnostics remain best-effort and sanitized. The verifier runs
+PostgreSQL 16, the real control plane, hash-only SMTP and Webhook sinks, and a
+real `dbpilot-agent` process in Kylin; the lifecycle test uses the production
+HTTPS and mTLS gRPC listeners. The control plane emits a body-free acceptance
+record only after authenticating the Agent's policy-status RPC, and the verifier
+waits for the real Agent's version-1 record before reporting mTLS evidence. A
+deterministic metric envelope is sent by the fixture's Agent identity over that
+same mTLS gRPC listener because the current host-metrics spool record is OTLP
+protobuf while the control-plane metric envelope is strict JSON. This is a
+documented compatibility gap, not evidence that host-metrics replay is
+end-to-end. Every path removes the Agent, containers, network, named volumes,
+and temporary certificates.
 
 This is Docker compatibility and protocol evidence only. It does not approve
 systemd units, journald ACLs, SELinux policy, kernel/cgroup metrics, DNS and

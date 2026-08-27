@@ -176,6 +176,7 @@ func TestHTTPHandlerReturnsScopedNotFoundAndRedactsSecrets(t *testing.T) {
 
 	deliveries := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/alerts/event-1/deliveries", memberFor("t1", "p1"), nil)
 	require.Equal(t, http.StatusOK, deliveries.Code)
+	require.Contains(t, deliveries.Body.String(), `"event_state":"firing"`)
 	require.NotContains(t, deliveries.Body.String(), "secret://delivery/key")
 	require.NotContains(t, deliveries.Body.String(), "request_body")
 }
@@ -216,7 +217,7 @@ func newHTTPFixture() *httpFixture {
 	policy := alert.NotificationPolicy{ID: "policy-1", Scope: scope, Name: "Webhook", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "secret://webhook/key", TemplateID: "template-1", Enabled: true, CreatedAt: now, UpdatedAt: now}
 	template := alert.NotificationTemplate{ID: "template-1", Scope: scope, Name: "Default", Subject: "Alert", Body: "{{event.id}}", Revision: 1, CreatedAt: now, UpdatedAt: now}
 	silence := alert.Silence{ID: "silence-1", Scope: scope, Matchers: map[string]string{"host": "db-1"}, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour), CreatedBy: "actor-1", Reason: "maintenance", CreatedAt: now, UpdatedAt: now}
-	delivery := alert.NotificationDelivery{ID: "delivery-1", Scope: scope, EventID: event.ID, PolicyID: policy.ID, IdempotencyKey: "delivery-1", Status: alert.DeliveryDelivered, Attempts: 1, AttemptedAt: now, DeliveredAt: now, Request: alert.DeliveryRequest{DeliveryID: "delivery-1", Scope: scope, EventID: event.ID, State: event.State, Channel: "webhook", PolicyID: policy.ID, TemplateID: template.ID, TemplateVersion: "1", SecretRef: "secret://delivery/key", Body: "sensitive request body"}}
+	delivery := alert.NotificationDelivery{ID: "delivery-1", Scope: scope, EventID: event.ID, PolicyID: policy.ID, EventState: event.State, IdempotencyKey: "delivery-1", Status: alert.DeliveryDelivered, Attempts: 1, AttemptedAt: now, DeliveredAt: now, Request: alert.DeliveryRequest{DeliveryID: "delivery-1", Scope: scope, EventID: event.ID, State: event.State, Channel: "webhook", PolicyID: policy.ID, TemplateID: template.ID, TemplateVersion: "1", SecretRef: "secret://delivery/key", Body: "sensitive request body"}}
 	repository := &memoryControlPlaneRepository{now: now, rules: map[string]alert.AlertRule{rule.ID: rule}, events: map[string]alert.AlertEvent{event.ID: event}, policies: map[string]alert.NotificationPolicy{policy.ID: policy}, templates: map[string]alert.NotificationTemplate{template.ID: template}, silences: map[string]alert.Silence{silence.ID: silence}, deliveries: []alert.NotificationDelivery{delivery}}
 	services := Services{Repository: repository, Evaluator: healthyEvaluator{}, Now: func() time.Time { return now }}
 	return &httpFixture{scope: scope, repository: repository, handler: NewHTTPHandler(services, memberFor("t1", "p1"))}
