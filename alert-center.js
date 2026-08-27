@@ -25,6 +25,8 @@ const SEVERITY_LABELS = {
   none: '无',
 };
 
+const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
+
 export function safeText(value) {
   return String(value ?? '').replace(/[&<>'"]/g, (character) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
@@ -36,7 +38,7 @@ export function formatSeverity(value) {
 }
 
 export function validateReason(value) {
-  return /(?:password|token|secret|postgres(?:ql)?:\/\/[^\s]+)/i.test(String(value ?? ''))
+  return SENSITIVE_VALUE_PATTERN.test(String(value ?? ''))
     ? '原因中不能包含凭据或连接串'
     : '';
 }
@@ -70,7 +72,7 @@ export function validateRule(input = {}) {
 }
 
 function isSensitiveText(value) {
-  return /(?:password|token|secret|authorization|api[_-]?key|postgres(?:ql)?:\/\/)/i.test(String(value ?? ''));
+  return SENSITIVE_VALUE_PATTERN.test(String(value ?? ''));
 }
 
 function displayValue(value, fallback = '—') {

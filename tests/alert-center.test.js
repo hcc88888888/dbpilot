@@ -27,6 +27,18 @@ test('validateReason rejects obvious credentials and connection strings', () => 
   assert.equal(validateReason('请使用 postgres://operator:password@example.com/db 连接'), '原因中不能包含凭据或连接串');
 });
 
+test('validateReason rejects non-Postgres DSNs with credentials', () => {
+  for (const reason of ['mysql://alice:pw@db.example/app', 'mongodb://user:pw@host.example/database']) {
+    assert.equal(validateReason(reason), '原因中不能包含凭据或连接串');
+  }
+});
+
+test('validateReason rejects bearer and API credential-bearing values', () => {
+  for (const reason of ['Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature', 'api_key: sk_live_abc123']) {
+    assert.equal(validateReason(reason), '原因中不能包含凭据或连接串');
+  }
+});
+
 test('buildAlertFilters removes empty fields and keeps the selected time range', () => {
   assert.deepEqual(buildAlertFilters(new Map([['state', 'firing'], ['severity', ''], ['from', '2026-08-27T00:00']])), {
     state: 'firing', from: '2026-08-27T00:00',
