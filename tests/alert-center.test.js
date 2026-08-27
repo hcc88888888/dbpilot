@@ -129,6 +129,13 @@ test('template preview resolves server-valid whitespace event and resource varia
   assert.equal(renderTemplatePreview({ subject: '{{ event.id }}', body: '{{ resource.database }}' }), 'alert-20260827-01\n\norders');
 });
 
+test('template validation rejects Unicode whitespace that the server placeholder grammar does not accept', () => {
+  assert.deepEqual(validateTemplate({ name: '告警', subject: '{{\u00a0event.id\u00a0}}', body: '{{\ufeffresource.database\ufeff}}' }), {
+    subject: '包含不支持的模板变量', body: '包含不支持的模板变量',
+  });
+  assert.equal(renderTemplatePreview({ subject: '{{ event.id }}', body: '{{ resource.database }}' }), 'alert-20260827-01\n\norders');
+});
+
 test('template validation rejects malformed and non-ASCII resource placeholders', () => {
   assert.deepEqual(validateTemplate({ name: '告警', subject: '告警 {{event.id', body: '{{resource.数据库}}' }), {
     subject: '包含不支持的模板变量', body: '包含不支持的模板变量',

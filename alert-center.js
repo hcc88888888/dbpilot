@@ -35,7 +35,7 @@ const TEMPLATE_VARIABLES = [
   ['{{resource.<标签名>}}', 'orders'],
 ];
 
-const TEMPLATE_PLACEHOLDER_PATTERN = /{{\s*([A-Za-z0-9_.-]+)\s*}}/g;
+const TEMPLATE_PLACEHOLDER_PATTERN = /{{[ \t\r\n\f]*([A-Za-z0-9_.-]+)[ \t\r\n\f]*}}/g;
 const TEMPLATE_VALUE_NAMES = new Set(['event.id', 'event.state', 'event.severity', 'event.url', 'evidence.aggregate']);
 const TEMPLATE_PREVIEW_VALUES = new Map([
   ['event.id', 'alert-20260827-01'],
