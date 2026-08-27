@@ -34,12 +34,62 @@
 .alert-toast-progress { width: 12px; height: 12px; border: 2px solid rgb(255 255 255 / .35); border-top-color: #fff; border-radius: 50%; animation: alert-spin .7s linear infinite; }
 .alert-center button:focus-visible { outline: 3px solid rgb(65 127 226 / .45); outline-offset: 2px; }
 .alert-detail-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(260px, .85fr); gap: 16px; }
+.alert-overview-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-top: 20px; }
+.alert-health-card, .alert-count-card, .alert-panel { border: 1px solid #e8edf4; border-radius: 12px; background: #fff; }
+.alert-health-card, .alert-count-card { display: grid; gap: 7px; min-height: 112px; padding: 17px; }
+.alert-health-card strong, .alert-count-card strong { font-size: 24px; letter-spacing: -.03em; }
+.alert-health-card p, .alert-count-card p, .alert-panel p { margin: 0; color: #68758a; font-size: 13px; }
+.alert-count-card > span { color: #68758a; font-size: 13px; font-weight: 700; }
+.alert-overview-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.alert-panel { padding: 16px; }
+.alert-panel h4 { margin: 0; color: #2b3950; font-size: 14px; }
+.alert-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; color: #748197; font-size: 12px; }
+.alert-trend { display: flex; align-items: end; gap: 5px; height: 112px; padding: 8px 0; border-bottom: 1px solid #edf0f5; }
+.alert-trend i { display: block; flex: 1; min-width: 8px; height: var(--alert-height); border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #6d8ee8, #dce7ff); }
+.alert-trend p { margin: auto; }
+.alert-kv { display: grid; gap: 10px; margin: 0; }
+.alert-kv div { display: flex; justify-content: space-between; gap: 10px; }
+.alert-kv dt { color: #748197; font-size: 13px; }
+.alert-kv dd { margin: 0; color: #344257; font-size: 13px; font-weight: 700; text-align: right; overflow-wrap: anywhere; }
+.alert-simple-list, .alert-evidence, .alert-timeline { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }
+.alert-simple-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; padding-bottom: 9px; border-bottom: 1px solid #f0f2f6; color: #344257; font-size: 13px; }
+.alert-simple-list li:last-child { padding-bottom: 0; border-bottom: 0; }
+.alert-simple-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-simple-list b { flex: 0 0 auto; font-size: 12px; }
+.alert-filter-bar { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)) auto; align-items: end; gap: 10px; margin-top: 20px; }
+.alert-filter-bar label { display: grid; gap: 5px; color: #68758a; font-size: 12px; font-weight: 700; }
+.alert-filter-bar input, .alert-filter-bar select, .alert-disposition-form select, .alert-disposition-form textarea { width: 100%; box-sizing: border-box; border: 1px solid #dbe2ec; border-radius: 7px; padding: 8px; color: #2b3950; background: #fff; font: inherit; }
+.alert-filter-bar button, .alert-pager button, .alert-detail-actions button { min-height: 34px; border: 0; border-radius: 7px; padding: 0 12px; color: #fff; background: #3564a5; font: inherit; font-weight: 700; cursor: pointer; }
+.alert-filter-bar button:hover, .alert-pager button:hover, .alert-detail-actions button:hover { background: #294f85; }
+.alert-filter-note { margin: 10px 0; color: #7a8799; font-size: 12px; }
+.alert-table-wrap { overflow-x: auto; border: 1px solid #e8edf4; border-radius: 10px; }
+.alert-table { width: 100%; min-width: 720px; border-collapse: collapse; text-align: left; }
+.alert-table th, .alert-table td { padding: 12px; border-bottom: 1px solid #edf0f5; color: #4d5b70; font-size: 13px; vertical-align: middle; }
+.alert-table th { color: #7a8799; background: #fafbfd; font-size: 12px; }
+.alert-table tr:last-child td { border-bottom: 0; }
+.alert-event-link, .alert-link-button { border: 0; padding: 0; color: #285da9; background: transparent; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
+.alert-event-link:hover, .alert-link-button:hover { color: #193f75; text-decoration: underline; }
+.alert-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; color: #7a8799; font-size: 12px; }
+.alert-pager div { display: flex; gap: 8px; }
+.alert-pager button[disabled] { color: #aab4c2; background: #eef1f5; cursor: not-allowed; }
+.alert-detail-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+.alert-detail-top > div:not(.alert-detail-actions) { display: flex; gap: 6px; }
+.alert-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.alert-disposition-form { display: flex; align-items: center; gap: 6px; }
+.alert-disposition-form textarea { min-width: 180px; min-height: 34px; resize: vertical; }
+.alert-form-errors { margin: 0; color: #a33549; font-size: 12px; }
+.alert-detail-main, .alert-detail-side { display: grid; align-content: start; gap: 14px; }
+.alert-evidence li, .alert-timeline li { display: grid; gap: 4px; padding-left: 12px; border-left: 2px solid #b9cef7; color: #56647a; font-size: 13px; overflow-wrap: anywhere; }
+.alert-evidence b, .alert-timeline b { color: #344257; }
+.alert-evidence time, .alert-timeline small { color: #8793a4; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @keyframes alert-shimmer { to { background-position: -200% 0; } }
 @keyframes alert-spin { to { transform: rotate(360deg); } }
 @media (max-width: 860px) {
   .alert-center-header, .alert-content-head { align-items: flex-start; flex-direction: column; }
   .alert-context { justify-content: flex-start; }
-  .alert-workbench, .alert-detail-grid { grid-template-columns: 1fr; }
+  .alert-workbench, .alert-detail-grid, .alert-overview-grid, .alert-overview-panels { grid-template-columns: 1fr; }
   .alert-subnav { display: flex; overflow-x: auto; white-space: nowrap; }
   .alert-subnav button { width: auto; flex: 0 0 auto; }
+  .alert-filter-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
