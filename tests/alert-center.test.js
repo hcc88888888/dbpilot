@@ -4,6 +4,7 @@ import {
   buildAlertFilters,
   alertFailureMessage,
   alertSourceLabel,
+  createAlertCenter,
   formatSeverity,
   safeText,
   validateDisposition,
@@ -200,3 +201,108 @@ test('active silence ends strictly before its end timestamp', () => {
   assert.equal(isActiveSilence({ startsAt: '2026-08-27T09:00:00Z', endsAt: '2026-08-27T10:00:00Z' }, new Date('2026-08-27T09:30:00Z')), true);
   assert.equal(isActiveSilence({ startsAt: '2026-08-27T09:00:00Z', endsAt: '2026-08-27T10:00:00Z' }, new Date('2026-08-27T10:00:00Z')), false);
 });
+
+test('confirmed silence-end click calls the scoped adapter, toasts, and reloads the silence DOM', async () => {
+  const root = createAlertCenterRoot();
+  const calls = [];
+  const toasts = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { confirm: () => true };
+  try {
+    const api = {
+      async listSilences() {
+        calls.push('list');
+        return calls.filter((call) => call === 'list').length === 1
+          ? { source: 'demo', items: [{ id: 'silence-1', matchers: { 'label.instance': 'mysql-01' }, starts_at: '2026-01-01T00:00:00Z', ends_at: '2099-01-01T00:00:00Z', reason: '维护' }] }
+          : { source: 'demo', items: [] };
+      },
+      async endSilence(scope, id) {
+        calls.push({ scope, id });
+      },
+    };
+    const controller = createAlertCenter({ root, api, scope: { tenantId: 'tenant-a', projectId: 'project-a' }, permissions: { manage: true }, onToast: (message) => toasts.push(message) });
+    await controller.open('silences');
+    root.endSilenceButton.click();
+    await flushEvents();
+
+    assert.deepEqual(calls.find((call) => typeof call === 'object'), { scope: { tenantId: 'tenant-a', projectId: 'project-a' }, id: 'silence-1' });
+    assert.deepEqual(toasts, ['静默已结束并写入审计记录']);
+    assert.equal(calls.filter((call) => call === 'list').length, 2);
+    assert.match(root.innerHTML, /历史静默/);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test('scope switch clears a prior demo source when the next response has no source', async () => {
+  const root = createAlertCenterRoot();
+  const api = {
+    async getOverview(scope) {
+      return scope.tenantId === 'demo'
+        ? { source: 'demo', events: { firing: 1 } }
+        : { events: { firing: 0 } };
+    },
+  };
+  const controller = createAlertCenter({ root, api, scope: { tenantId: 'demo', projectId: 'production' } });
+  await controller.open('overview');
+  assert.match(root.innerHTML, /演示数据/);
+  await controller.setScope({ tenantId: 'tenant-b', projectId: 'project-b' });
+  assert.match(root.innerHTML, /当前项目/);
+  assert.doesNotMatch(root.innerHTML, /演示数据/);
+});
+
+test('failed refresh clears a prior response source badge', async () => {
+  const root = createAlertCenterRoot();
+  let attempts = 0;
+  const api = {
+    async getOverview() {
+      attempts += 1;
+      if (attempts === 1) return { source: 'demo', events: { firing: 1 } };
+      throw { kind: 'unavailable' };
+    },
+  };
+  const controller = createAlertCenter({ root, api, scope: { tenantId: 'demo', projectId: 'production' } });
+  await controller.open('overview');
+  await controller.open('overview');
+  assert.match(root.innerHTML, /暂时无法加载监控概览/);
+  assert.match(root.innerHTML, /当前项目/);
+  assert.doesNotMatch(root.innerHTML, /演示数据/);
+});
+
+function createAlertCenterRoot() {
+  const endSilenceButton = createEventButton();
+  let markup = '';
+  return {
+    endSilenceButton,
+    get innerHTML() { return markup; },
+    set innerHTML(value) {
+      markup = value;
+      const id = String(value).match(/data-silence-end="([^"]+)"/)?.[1];
+      endSilenceButton.dataset.silenceEnd = id ?? '';
+    },
+    querySelector(selector) {
+      if (selector === '[data-alert-retry]') return null;
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector === '[data-silence-end]' && endSilenceButton.dataset.silenceEnd) return [endSilenceButton];
+      return [];
+    },
+    replaceChildren() { markup = ''; },
+  };
+}
+
+function createEventButton() {
+  const listeners = new Map();
+  return {
+    dataset: {},
+    disabled: false,
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    click() { listeners.get('click')?.({ currentTarget: this }); },
+  };
+}
+
+async function flushEvents() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}

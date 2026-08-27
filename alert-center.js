@@ -598,7 +598,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
   }
 
   function renderFailure(label, error) {
-    if (error?.kind === 'forbidden') currentSource = null;
+    currentSource = null;
     root.innerHTML = shellMarkup(`<div class="alert-error" role="alert"><strong>${safeText(alertFailureMessage(error, label))}</strong><button type="button" data-alert-retry>重试</button></div>`);
     bindShell();
   }
@@ -633,6 +633,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
   function setScope(nextScope) {
     aborter?.abort();
     currentScope = { ...nextScope };
+    currentSource = null;
     selectedEventId = null;
     alertCursor = null;
     alertCursorHistory = [];
