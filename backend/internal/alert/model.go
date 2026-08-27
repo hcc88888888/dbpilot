@@ -18,7 +18,46 @@ var (
 	ErrInvalidEvent               = errors.New("invalid alert event")
 	ErrInvalidEventTransition     = errors.New("invalid alert event transition")
 	ErrInvalidEventTransitionTime = errors.New("event transition time is required")
+	ErrInvalidDisposition         = errors.New("invalid alert event disposition")
 )
+
+type EventDispositionKind string
+
+const (
+	DispositionAcknowledgement EventDispositionKind = "acknowledgement"
+	DispositionResolution      EventDispositionKind = "resolution"
+	DispositionRootCause       EventDispositionKind = "root_cause"
+)
+
+// EventDisposition is an append-only operator record. Root-cause clues use
+// the same model as acknowledgement and resolution so actor, reason, category,
+// and time are never overwritten by the next event transition.
+type EventDisposition struct {
+	ID         string               `json:"id"`
+	Scope      Scope                `json:"scope"`
+	EventID    string               `json:"event_id"`
+	Kind       EventDispositionKind `json:"kind"`
+	Category   string               `json:"category"`
+	Reason     string               `json:"reason"`
+	Actor      string               `json:"actor"`
+	OccurredAt time.Time            `json:"occurred_at"`
+}
+
+func (d EventDisposition) Validate() error {
+	if d.Scope.Validate() != nil || !validIdentifier(d.ID) || !validIdentifier(d.EventID) || !validIdentifier(d.Category) || strings.TrimSpace(d.Actor) == "" || d.Actor != strings.TrimSpace(d.Actor) || d.OccurredAt.IsZero() {
+		return ErrInvalidDisposition
+	}
+	switch d.Kind {
+	case DispositionAcknowledgement, DispositionResolution, DispositionRootCause:
+	default:
+		return ErrInvalidDisposition
+	}
+	reason := strings.TrimSpace(d.Reason)
+	if reason == "" || reason != d.Reason || len(reason) > 1024 || containsSecretMaterial(reason) {
+		return ErrInvalidDisposition
+	}
+	return nil
+}
 
 // Scope identifies the only tenancy boundary accepted by alert storage.
 type Scope struct {
@@ -80,6 +119,7 @@ type AlertRule struct {
 	Operator              string            `json:"operator"`
 	Threshold             float64           `json:"threshold"`
 	EvaluationEvery       time.Duration     `json:"evaluation_every"`
+	LookbackWindow        time.Duration     `json:"lookback_window"`
 	For                   time.Duration     `json:"for"`
 	MissingData           string            `json:"missing_data"`
 	Severity              string            `json:"severity"`
@@ -97,7 +137,7 @@ func (r AlertRule) Validate() error {
 	if !allowedAggregation(r.Aggregation) || !allowedOperator(r.Operator) || !allowedSeverity(r.Severity) || !allowedMissingData(r.MissingData) {
 		return ErrInvalidRule
 	}
-	if math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0) || r.EvaluationEvery <= 0 || r.For <= 0 {
+	if math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0) || r.EvaluationEvery <= 0 || r.LookbackWindow < 0 || r.For <= 0 {
 		return ErrInvalidRule
 	}
 	for _, policyID := range r.NotificationPolicyIDs {
@@ -105,7 +145,19 @@ func (r AlertRule) Validate() error {
 			return ErrInvalidRule
 		}
 	}
+	if !validLabelMatchers(r.Labels) {
+		return ErrInvalidRule
+	}
 	return nil
+}
+
+// EffectiveLookbackWindow keeps pre-lookback rules backward compatible while
+// making query cadence and aggregation window independent for new rules.
+func (r AlertRule) EffectiveLookbackWindow() time.Duration {
+	if r.LookbackWindow > 0 {
+		return r.LookbackWindow
+	}
+	return r.EvaluationEvery
 }
 
 func allowedAggregation(value string) bool {
@@ -153,6 +205,28 @@ func validIdentifier(value string) bool {
 			continue
 		}
 		return false
+	}
+	return true
+}
+
+func validLabelName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '_' || (index > 0 && character >= '0' && character <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validLabelMatchers(matchers map[string]string) bool {
+	for key, value := range matchers {
+		if !validLabelName(key) || strings.TrimSpace(value) == "" || sensitiveField(key) || containsSecretMaterial(value) {
+			return false
+		}
 	}
 	return true
 }
@@ -366,7 +440,9 @@ type AuditRecord struct {
 }
 
 type EventFilter struct {
-	States []EventState
-	Limit  int
-	Offset int
+	States    []EventState
+	Limit     int
+	Offset    int
+	AfterID   string
+	OrderByID bool
 }

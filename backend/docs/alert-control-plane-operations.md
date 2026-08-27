@@ -19,11 +19,22 @@ PostgreSQL ping, one complete evaluation/list/dispatch pass for every configured
 scope, no current evaluator error, and zero failed rules. An evaluation, event
 listing, dispatch, or database failure makes readiness fail closed. Although
 the readiness predicate also compares the evaluator's `queue_depth` field with
-zero, the production evaluator does not currently populate that field, and the
-notification retry backlog is not a readiness input. Monitor retry-scheduled
-deliveries separately. The scoped `overview` response reports evaluator health;
+zero, the production PostgreSQL scheduler now populates it from due rules that
+could not be leased in the current pass. Notification retry backlog remains a
+separate signal. The scoped `overview` response reports only that project's
+evaluator health while readiness aggregates every configured scope;
 alert on sustained unready state and inspect database reachability, evaluator
 failures, late runs, dispatcher errors, and retry backlog before restarting.
+
+Each rule's `evaluation_every` is its durable cadence. `lookback_window` is the
+independent metric query window and defaults to the cadence for migrated and
+older API clients. PostgreSQL leases due rules with `SKIP LOCKED`, so replicas
+share work without duplicate evaluation; an expired lease is recoverable after
+a crash. A late process skips missed intervals and schedules the next run from
+the completed evaluation time instead of issuing an unbounded catch-up burst.
+Evaluator failure, no-data, delay, and backlog findings are ordinary scoped,
+routable system events attached to the affected rule and recover when the
+condition clears.
 
 Use a rollout that waits for `/readyz` before adding an instance to service.
 During planned database maintenance, remove instances from service first and
@@ -85,6 +96,12 @@ Changes to rules, policies, templates, silences, and manual event transitions
 carry the authenticated subject into the audit transaction. Do not bypass the
 scoped HTTP API with direct application-table writes.
 
+Acknowledgement and resolution requests require a secret-safe `category` and
+`reason`. Root-cause clues are added at `POST .../alerts/{id}/root-cause` and
+read through the paginated `GET .../alerts/{id}/dispositions` endpoint. These
+records are scoped, append-only, and committed in the same transaction as the
+event transition and audit record; corrections must be appended as new facts.
+
 The packaged non-root Agent service layout must create its data directory and
 the private embedded-collector file-storage directory before dropping
 privileges. The latter is `dbpilot-spool/<sha256(agent-id)>`, owned by the
@@ -96,8 +113,11 @@ as a packaging failure; do not run the Agent as root to work around it.
 ## Secret references and rotation
 
 Notification policies store references, never resolved values. The production
-resolver accepts `env://NAME`; `NAME` must identify a process environment
-entry provisioned by the platform secret manager. The API exposes only
+resolver accepts only `env://NAME`, where `NAME` matches
+`[A-Za-z_][A-Za-z0-9_]*` and identifies a process environment entry provisioned
+by the platform secret manager. Policy and delivery persistence reject every
+other syntax; the forward migration disables and scrubs unsupported legacy
+policy references. The API exposes only
 `has_secret`, and delivery responses omit the retry envelope, request body, and
 secret reference. TLS certificates, private keys, and CA bundles are absolute
 file paths in the server and Agent bootstrap configuration. Compose secrets in
@@ -187,6 +207,24 @@ protobuf while the control-plane metric envelope is strict JSON. This is a
 documented compatibility gap, not evidence that host-metrics replay is
 end-to-end. Every path removes the Agent, containers, network, named volumes,
 and temporary certificates.
+
+The ordinary Go test command deliberately leaves PostgreSQL integration tests
+gated. Before release, run them explicitly against a disposable PostgreSQL 16
+database; a plain `go test ./...` is not equivalent evidence:
+
+```powershell
+$env:DBPILOT_ALERT_POSTGRES_INTEGRATION = '1'
+$env:DBPILOT_ALERT_POSTGRES_DSN = 'postgres://dbpilot:<fixture-password>@127.0.0.1:<published-port>/dbpilot?sslmode=disable'
+& '<absolute go.exe>' test ./internal/alert -count=1
+Remove-Item Env:DBPILOT_ALERT_POSTGRES_INTEGRATION
+Remove-Item Env:DBPILOT_ALERT_POSTGRES_DSN
+```
+
+The suite creates a unique schema per test and covers populated forward
+migration, legacy delivery replay, multi-policy route identity, scheduler and
+delivery leases, transactional dispositions, 501-row cursor/count behavior,
+concurrent event writes, secret non-persistence, and atomic Agent batch dedup.
+Use only a disposable database and remove its container/volume after the run.
 
 This is Docker compatibility and protocol evidence only. It does not approve
 systemd units, journald ACLs, SELinux policy, kernel/cgroup metrics, DNS and

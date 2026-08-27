@@ -3,6 +3,7 @@ package alert
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"sync"
@@ -42,6 +43,20 @@ func TestEvaluatorMissingDataPolicies(t *testing.T) {
 			require.Equal(t, "0", event.Evidence["samples"])
 		})
 	}
+}
+
+func TestEvaluatorTreatsIncompleteStoredResourceIdentityAsMissingData(t *testing.T) {
+	fx := newEvaluatorFixture(t, ruleWith(MissingPolicy("alert")))
+	fx.metrics.samples = []MetricSample{{
+		Scope: fx.scope, AgentID: "agent-a", Name: "cpu", Value: 1, SampledAt: fx.now,
+		Labels: map[string]string{"instance": "db-1", "component": "postgres", "role": "primary"},
+	}}
+
+	fx.evaluate()
+	event := fx.event("cpu")
+	require.Equal(t, EventPending, event.State)
+	require.Equal(t, "true", event.Evidence["missing"])
+	require.Equal(t, "host", event.Evidence["missing_dimensions"])
 }
 
 func TestEvaluatorResolvesGlobalMissingEventWhenDataReturns(t *testing.T) {
@@ -186,7 +201,7 @@ func TestEvaluatorIgnoresMissingDataWhenConfigured(t *testing.T) {
 	fx := newEvaluatorFixture(t, ruleWith(MissingPolicy("ignore")))
 	fx.evaluate()
 	require.Empty(t, fx.events())
-	require.Empty(t, fx.auditActions())
+	require.Equal(t, EventFiring, fx.systemFinding("no_data").State)
 }
 
 func TestEvaluatorHealthReportsLateAndFailedRunsWithoutStoppingOtherRules(t *testing.T) {
@@ -231,6 +246,99 @@ func TestEvaluatorHealthDoesNotExposeDependencyErrorDetails(t *testing.T) {
 	require.NotContains(t, health.LastError, "password")
 }
 
+func TestEvaluatorHonorsEachRuleEvaluationCadence(t *testing.T) {
+	fast := defaultRule()
+	fast.ID, fast.Name, fast.Metric = "fast-rule", "fast", "fast.metric"
+	slow := defaultRule()
+	slow.ID, slow.Name, slow.Metric, slow.EvaluationEvery = "slow-rule", "slow", "slow.metric", 5*time.Minute
+	fx := newEvaluatorFixture(t, fast, slow)
+
+	fx.evaluate()
+	fx.now = fx.now.Add(time.Minute)
+	fx.evaluate()
+
+	queries := map[string]int{}
+	for _, query := range fx.metrics.queries {
+		queries[query.Name]++
+	}
+	require.Equal(t, 2, queries["fast.metric"])
+	require.Equal(t, 1, queries["slow.metric"])
+}
+
+func TestEvaluatorUsesLookbackWindowIndependentOfCadence(t *testing.T) {
+	rule := defaultRule()
+	rule.EvaluationEvery = time.Minute
+	rule.LookbackWindow = 5 * time.Minute
+	fx := newEvaluatorFixture(t, rule)
+	fx.append(sampleAt(fx.now.Add(-4*time.Minute), 91))
+
+	fx.evaluate()
+	require.Len(t, fx.metrics.queries, 1)
+	require.Equal(t, fx.now.Add(-5*time.Minute), fx.metrics.queries[0].From)
+	require.Equal(t, EventPending, fx.event("cpu").State)
+}
+
+func TestEvaluatorHealthAggregatesScopesWithoutLastScopeOverwrite(t *testing.T) {
+	scopeA := Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	scopeB := Scope{TenantID: "tenant-b", ProjectID: "project-b"}
+	invalid := defaultRule()
+	invalid.ID, invalid.Name, invalid.Aggregation, invalid.Scope = "invalid-a", "invalid-a", "runtime-invalid", scopeA
+	valid := defaultRule()
+	valid.ID, valid.Name, valid.Scope = "valid-b", "valid-b", scopeB
+	repository := &memoryRepository{rules: []AlertRule{invalid, valid}, eventsByFingerprint: map[string]AlertEvent{}}
+	evaluator := NewEvaluator(repository, &memoryMetricStore{})
+	now := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+
+	summaryA, err := evaluator.EvaluateScope(context.Background(), scopeA, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, summaryA.FailedRules)
+	_, err = evaluator.EvaluateScope(context.Background(), scopeB, now)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, evaluator.Health().FailedRules)
+	require.Equal(t, 1, evaluator.HealthForScope(scopeA).FailedRules)
+	require.Zero(t, evaluator.HealthForScope(scopeB).FailedRules)
+}
+
+func TestEvaluatorCreatesAndRecoversRoutableSystemFailureEvent(t *testing.T) {
+	rule := defaultRule()
+	rule.Aggregation = "runtime-invalid"
+	fx := newEvaluatorFixture(t, rule)
+	fx.append(sampleAt(fx.now, 91))
+
+	fx.evaluate()
+	finding := fx.systemFinding("failure")
+	require.Equal(t, EventFiring, finding.State)
+	require.Equal(t, rule.ID, finding.RuleID, "the affected rule keeps the notification route")
+	require.Equal(t, "rule_evaluation", finding.Evidence["failure_kind"])
+
+	fx.repo.rules[0].Aggregation = "avg"
+	fx.now = fx.now.Add(time.Minute)
+	fx.append(sampleAt(fx.now, 91))
+	fx.evaluate()
+	require.Equal(t, EventResolved, fx.systemFinding("failure").State)
+}
+
+func TestEvaluatorRecoversBacklogFindingEvenWhenNoRuleIsDueNextPass(t *testing.T) {
+	scope := Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	rule := defaultRule()
+	rule.Scope = scope
+	base := &memoryRepository{rules: []AlertRule{rule}, eventsByFingerprint: map[string]AlertEvent{}}
+	repository := &scheduledMemoryRepository{memoryRepository: base, due: []DueAlertRule{{Rule: rule, DueAt: time.Now().Add(-time.Minute)}}, queueDepth: 1}
+	evaluator := NewEvaluator(repository, &memoryMetricStore{})
+	now := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+
+	_, err := evaluator.EvaluateScope(context.Background(), scope, now)
+	require.NoError(t, err)
+	require.Equal(t, EventFiring, systemFindingFromRepository(t, base, "backlog").State)
+
+	repository.due = nil
+	repository.queueDepth = 0
+	_, err = evaluator.EvaluateScope(context.Background(), scope, now.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, EventResolved, systemFindingFromRepository(t, base, "backlog").State)
+}
+
 func TestEvaluatorFiltersQueryAndGroupsIndependentSeries(t *testing.T) {
 	rule := defaultRule()
 	rule.Labels = map[string]string{"role": "db"}
@@ -273,7 +381,7 @@ func TestEvaluatorDefensivelyFiltersMetricStoreResults(t *testing.T) {
 	fx := newEvaluatorFixture(t, rule)
 	fx.metrics.ignoreQueryFilters = true
 	fx.metrics.samples = []MetricSample{
-		{Scope: fx.scope, AgentID: "agent-a", Name: "cpu", Labels: map[string]string{"host": "a", "role": "db"}, Value: 91, SampledAt: fx.now},
+		{Scope: fx.scope, AgentID: "agent-a", Name: "cpu", Labels: map[string]string{"instance": "db-1", "component": "postgres", "host": "a", "role": "db"}, Value: 91, SampledAt: fx.now},
 		{Scope: Scope{TenantID: "other", ProjectID: fx.scope.ProjectID}, AgentID: "agent-b", Name: "cpu", Labels: map[string]string{"host": "b", "role": "db"}, Value: 99, SampledAt: fx.now},
 		{Scope: fx.scope, AgentID: "agent-c", Name: "memory", Labels: map[string]string{"host": "c", "role": "db"}, Value: 99, SampledAt: fx.now},
 		{Scope: fx.scope, AgentID: "agent-d", Name: "cpu", Labels: map[string]string{"host": "d", "role": "web"}, Value: 99, SampledAt: fx.now},
@@ -287,15 +395,14 @@ func TestEvaluatorDefensivelyFiltersMetricStoreResults(t *testing.T) {
 	require.Equal(t, "1", events[0].Evidence["samples"])
 }
 
-func TestEvaluatorRedactsSensitiveResourceLabels(t *testing.T) {
+func TestEvaluatorRejectsSensitiveResourceLabelsBeforeEventPersistence(t *testing.T) {
 	fx := newEvaluatorFixture(t, defaultRule())
 	fx.append(sample(fx.now, 91, map[string]string{"host": "a", "password": "do-not-store", "api_token": "secret"}))
 	fx.evaluate()
 
-	event := fx.event("cpu")
-	require.Equal(t, "a", event.Labels["host"])
-	require.Equal(t, RedactedValue, event.Labels["password"])
-	require.Equal(t, RedactedValue, event.Labels["api_token"])
+	require.Empty(t, fx.events())
+	require.NotContains(t, fmt.Sprint(fx.allEvents()), "do-not-store")
+	require.NotContains(t, fmt.Sprint(fx.allEvents()), "api_token")
 }
 
 func TestEvaluatorPaginatesEveryEventForRuleMissingData(t *testing.T) {
@@ -335,20 +442,17 @@ func TestEvaluatorMatchesAgentSelectorAgainstTrustedIdentity(t *testing.T) {
 	require.Equal(t, map[string]string{}, fx.metrics.queries[0].Labels)
 }
 
-func TestEvaluatorSensitiveLabelRotationReusesFingerprint(t *testing.T) {
+func TestEvaluatorSensitiveLabelRotationNeverCreatesResourceEvents(t *testing.T) {
 	fx := newEvaluatorFixture(t, defaultRule())
 	fx.append(sample(fx.now, 91, map[string]string{"host": "a", "api_token": "old-secret"}))
 	fx.evaluate()
-	first := fx.event("cpu")
 
 	fx.now = fx.now.Add(time.Minute)
 	fx.append(sample(fx.now, 91, map[string]string{"host": "a", "api_token": "new-secret"}))
 	fx.evaluate()
-	rotated := fx.event("cpu")
-	require.Len(t, fx.events(), 1)
-	require.Equal(t, first.ID, rotated.ID)
-	require.Equal(t, first.Fingerprint, rotated.Fingerprint)
-	require.Equal(t, RedactedValue, rotated.Labels["api_token"])
+	require.Empty(t, fx.events())
+	require.NotContains(t, fmt.Sprint(fx.allEvents()), "old-secret")
+	require.NotContains(t, fmt.Sprint(fx.allEvents()), "new-secret")
 }
 
 func TestEvaluatorReturnsSanitizedErrorWhenFailureFindingCannotPersistAndContinues(t *testing.T) {
@@ -433,6 +537,17 @@ func (fx *evaluatorFixture) evaluate() {
 }
 
 func (fx *evaluatorFixture) events() []AlertEvent {
+	all := fx.allEvents()
+	events := make([]AlertEvent, 0, len(all))
+	for _, event := range all {
+		if event.Labels[systemFindingLabelKey] == "" {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+func (fx *evaluatorFixture) allEvents() []AlertEvent {
 	fx.repo.mu.Lock()
 	defer fx.repo.mu.Unlock()
 	events := make([]AlertEvent, 0, len(fx.repo.eventsByFingerprint))
@@ -452,11 +567,22 @@ func (fx *evaluatorFixture) event(ruleName string) AlertEvent {
 		}
 	}
 	for _, event := range fx.events() {
-		if event.RuleID == ruleID {
+		if event.RuleID == ruleID && event.Labels[systemFindingLabelKey] == "" {
 			return event
 		}
 	}
 	fx.t.Fatalf("event for rule %q not found", ruleName)
+	return AlertEvent{}
+}
+
+func (fx *evaluatorFixture) systemFinding(kind string) AlertEvent {
+	fx.t.Helper()
+	for _, event := range fx.allEvents() {
+		if event.Labels[systemFindingLabelKey] == kind {
+			return event
+		}
+	}
+	fx.t.Fatalf("system finding %q not found", kind)
 	return AlertEvent{}
 }
 
@@ -518,7 +644,11 @@ func sampleAt(at time.Time, value float64) MetricSample {
 }
 
 func sample(at time.Time, value float64, labels map[string]string) MetricSample {
-	return MetricSample{AgentID: "agent-a", Name: "cpu", Labels: labels, Value: value, SampledAt: at}
+	normalized := map[string]string{"instance": "db-1", "component": "postgres", "role": "db", "host": "a"}
+	for key, labelValue := range labels {
+		normalized[key] = labelValue
+	}
+	return MetricSample{AgentID: "agent-a", Name: "cpu", Labels: normalized, Value: value, SampledAt: at}
 }
 
 type memoryMetricStore struct {
@@ -565,6 +695,33 @@ type memoryRepository struct {
 	failedRuleID         string
 	putFailure           error
 	listRuleEventOffsets []int
+}
+
+type scheduledMemoryRepository struct {
+	*memoryRepository
+	due        []DueAlertRule
+	queueDepth int
+}
+
+func (repository *scheduledMemoryRepository) ClaimDueRules(context.Context, Scope, time.Time, string, time.Time, int) ([]DueAlertRule, int, error) {
+	return append([]DueAlertRule(nil), repository.due...), repository.queueDepth, nil
+}
+
+func (*scheduledMemoryRepository) CompleteRuleEvaluation(context.Context, Scope, string, string, time.Time, time.Time) error {
+	return nil
+}
+
+func systemFindingFromRepository(t *testing.T, repository *memoryRepository, kind string) AlertEvent {
+	t.Helper()
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	for _, event := range repository.eventsByFingerprint {
+		if event.Labels[systemFindingLabelKey] == kind {
+			return event
+		}
+	}
+	t.Fatalf("system finding %q not found", kind)
+	return AlertEvent{}
 }
 
 func (repo *memoryRepository) CreateRule(_ context.Context, rule AlertRule) (AlertRule, error) {
@@ -646,16 +803,26 @@ func (repo *memoryRepository) FindEventByFingerprint(_ context.Context, scope Sc
 	return event, found, nil
 }
 
-func (repo *memoryRepository) ListEvents(_ context.Context, scope Scope, _ EventFilter) ([]AlertEvent, error) {
+func (repo *memoryRepository) ListEvents(_ context.Context, scope Scope, filter EventFilter) ([]AlertEvent, error) {
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
 	var events []AlertEvent
 	for _, event := range repo.eventsByFingerprint {
-		if event.Scope == scope {
+		if event.Scope == scope && (filter.AfterID == "" || event.ID > filter.AfterID) {
 			events = append(events, event)
 		}
 	}
-	return events, nil
+	if filter.OrderByID {
+		sort.Slice(events, func(i, j int) bool { return events[i].ID < events[j].ID })
+	}
+	if filter.Offset >= len(events) {
+		return []AlertEvent{}, nil
+	}
+	events = events[filter.Offset:]
+	if filter.Limit > 0 && len(events) > filter.Limit {
+		events = events[:filter.Limit]
+	}
+	return append([]AlertEvent(nil), events...), nil
 }
 
 func (repo *memoryRepository) ListRuleEvents(_ context.Context, scope Scope, ruleID string, filter EventFilter) ([]AlertEvent, error) {

@@ -21,6 +21,10 @@ type EvaluatorHealthReader interface {
 	Health() alert.EvaluatorHealth
 }
 
+type scopedEvaluatorHealthReader interface {
+	HealthForScope(alert.Scope) alert.EvaluatorHealth
+}
+
 type Services struct {
 	Repository alert.ControlPlaneRepository
 	Evaluator  EvaluatorHealthReader
@@ -101,6 +105,8 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 	register("POST /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/resolve", api.resolveAlert)
 	register("POST /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/recover", api.resolveAlert)
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/deliveries", api.listDeliveries)
+	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/dispositions", api.listEventDispositions)
+	register("POST /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/root-cause", api.appendRootCause)
 
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/rules", api.listRules)
 	register("POST /api/v1/tenants/{tenantID}/projects/{projectID}/rules", api.createRule)
@@ -189,20 +195,23 @@ func normalizeAPIErrors(next http.Handler) http.Handler {
 type httpAPI struct{ services Services }
 
 func (api httpAPI) overview(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
-	events, err := api.services.Repository.ListEvents(request.Context(), scope, alert.EventFilter{Limit: 500})
+	countsByState, err := api.services.Repository.CountEventsByState(request.Context(), scope)
 	if err != nil {
 		apiError(writer, err)
 		return
 	}
 	counts := make(map[string]int)
-	for _, event := range events {
-		if event.Scope != scope {
-			writeAPIError(writer, http.StatusInternalServerError, "internal", "internal server error")
-			return
-		}
-		counts[string(event.State)]++
+	for state, count := range countsByState {
+		counts[string(state)] = count
 	}
-	healthy := api.services.Evaluator != nil && evaluatorHealthy(api.services.Evaluator.Health())
+	healthy := false
+	if api.services.Evaluator != nil {
+		health := api.services.Evaluator.Health()
+		if scoped, ok := api.services.Evaluator.(scopedEvaluatorHealthReader); ok {
+			health = scoped.HealthForScope(scope)
+		}
+		healthy = evaluatorHealthy(health)
+	}
 	writeJSON(writer, http.StatusOK, map[string]any{"events": counts, "evaluator": map[string]bool{"healthy": healthy}})
 }
 
@@ -234,6 +243,10 @@ func (api httpAPI) resolveAlert(writer http.ResponseWriter, request *http.Reques
 }
 
 func (api httpAPI) transitionAlert(writer http.ResponseWriter, request *http.Request, scope alert.Scope, principal alert.Principal, state alert.EventState) {
+	var input eventDispositionInput
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
 	event, err := api.services.Repository.GetEvent(request.Context(), scope, request.PathValue("id"))
 	if err != nil {
 		apiError(writer, err)
@@ -254,9 +267,81 @@ func (api httpAPI) transitionAlert(writer http.ResponseWriter, request *http.Req
 		apiError(writer, err)
 		return
 	}
-	audit := alert.AuditRecord{ID: auditID, Scope: scope, Actor: principal.Subject, Action: "event." + string(state), TargetID: event.ID, OccurredAt: at, Details: map[string]string{"state": string(state)}}
-	event, err = api.services.Repository.PutEventAndAudit(request.Context(), event, audit)
+	dispositionID, err := api.services.Repository.NewID("disposition")
+	if err != nil {
+		apiError(writer, err)
+		return
+	}
+	kind := alert.DispositionAcknowledgement
+	if state == alert.EventResolved {
+		kind = alert.DispositionResolution
+	}
+	disposition := alert.EventDisposition{ID: dispositionID, Scope: scope, EventID: event.ID, Kind: kind, Category: input.Category, Reason: input.Reason, Actor: principal.Subject, OccurredAt: at}
+	if err := disposition.Validate(); err != nil {
+		apiError(writer, err)
+		return
+	}
+	audit := alert.AuditRecord{ID: auditID, Scope: scope, Actor: principal.Subject, Action: "event." + string(state), TargetID: event.ID, OccurredAt: at, Details: map[string]string{"state": string(state), "category": input.Category, "reason_present": "true"}}
+	event, err = api.services.Repository.PutEventAndDisposition(request.Context(), event, audit, disposition)
 	respondScoped(writer, scope, event, err, http.StatusOK)
+}
+
+type eventDispositionInput struct {
+	Category string `json:"category"`
+	Reason   string `json:"reason"`
+}
+
+func (api httpAPI) appendRootCause(writer http.ResponseWriter, request *http.Request, scope alert.Scope, principal alert.Principal) {
+	var input eventDispositionInput
+	if !decodeJSON(writer, request, &input) {
+		return
+	}
+	event, err := api.services.Repository.GetEvent(request.Context(), scope, request.PathValue("id"))
+	if err != nil {
+		apiError(writer, err)
+		return
+	}
+	if event.Scope != scope {
+		writeAPIError(writer, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	at := api.services.Now().UTC()
+	dispositionID, err := api.services.Repository.NewID("disposition")
+	if err != nil {
+		apiError(writer, err)
+		return
+	}
+	auditID, err := api.services.Repository.NewID("audit")
+	if err != nil {
+		apiError(writer, err)
+		return
+	}
+	disposition := alert.EventDisposition{ID: dispositionID, Scope: scope, EventID: event.ID, Kind: alert.DispositionRootCause, Category: input.Category, Reason: input.Reason, Actor: principal.Subject, OccurredAt: at}
+	audit := alert.AuditRecord{ID: auditID, Scope: scope, Actor: principal.Subject, Action: "event.root_cause", TargetID: event.ID, OccurredAt: at, Details: map[string]string{"category": input.Category, "reason_present": "true"}}
+	if err := api.services.Repository.AppendEventDisposition(request.Context(), disposition, audit); err != nil {
+		apiError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, disposition)
+}
+
+func (api httpAPI) listEventDispositions(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
+	event, err := api.services.Repository.GetEvent(request.Context(), scope, request.PathValue("id"))
+	if err != nil {
+		apiError(writer, err)
+		return
+	}
+	if event.Scope != scope {
+		writeAPIError(writer, http.StatusInternalServerError, "internal", "internal server error")
+		return
+	}
+	limit, offset, err := paginationValues(request)
+	if err != nil {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "query is invalid")
+		return
+	}
+	values, err := api.services.Repository.ListEventDispositions(request.Context(), scope, event.ID, limit, offset)
+	respondScoped(writer, scope, values, err, http.StatusOK)
 }
 
 func (api httpAPI) listDeliveries(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -300,6 +385,7 @@ type ruleInput struct {
 	Operator              string            `json:"operator"`
 	Threshold             float64           `json:"threshold"`
 	EvaluationEvery       durationValue     `json:"evaluation_every"`
+	LookbackWindow        durationValue     `json:"lookback_window,omitempty"`
 	For                   durationValue     `json:"for"`
 	MissingData           string            `json:"missing_data"`
 	Severity              string            `json:"severity"`
@@ -309,7 +395,11 @@ type ruleInput struct {
 }
 
 func (input ruleInput) value(scope alert.Scope, id string) alert.AlertRule {
-	return alert.AlertRule{ID: id, Scope: scope, Name: input.Name, Metric: input.Metric, Aggregation: input.Aggregation, Operator: input.Operator, Threshold: input.Threshold, EvaluationEvery: time.Duration(input.EvaluationEvery), For: time.Duration(input.For), MissingData: input.MissingData, Severity: input.Severity, NotificationPolicyIDs: input.NotificationPolicyIDs, Labels: input.Labels, Enabled: input.Enabled}
+	lookback := time.Duration(input.LookbackWindow)
+	if lookback == 0 {
+		lookback = time.Duration(input.EvaluationEvery)
+	}
+	return alert.AlertRule{ID: id, Scope: scope, Name: input.Name, Metric: input.Metric, Aggregation: input.Aggregation, Operator: input.Operator, Threshold: input.Threshold, EvaluationEvery: time.Duration(input.EvaluationEvery), LookbackWindow: lookback, For: time.Duration(input.For), MissingData: input.MissingData, Severity: input.Severity, NotificationPolicyIDs: input.NotificationPolicyIDs, Labels: input.Labels, Enabled: input.Enabled}
 }
 
 func (api httpAPI) listRules(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {
@@ -551,6 +641,14 @@ func eventFilter(request *http.Request) (alert.EventFilter, error) {
 	return filter, nil
 }
 
+func paginationValues(request *http.Request) (int, int, error) {
+	filter, err := eventFilter(request)
+	if err != nil || request.URL.Query().Get("state") != "" {
+		return 0, 0, errors.New("invalid pagination")
+	}
+	return filter.Limit, filter.Offset, nil
+}
+
 func decodeJSON(writer http.ResponseWriter, request *http.Request, target any) bool {
 	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
@@ -603,6 +701,14 @@ func valueWithinScope(value any, scope alert.Scope) bool {
 				return false
 			}
 		}
+	case alert.EventDisposition:
+		return typed.Scope == scope
+	case []alert.EventDisposition:
+		for _, item := range typed {
+			if item.Scope != scope {
+				return false
+			}
+		}
 	case alert.AlertRule:
 		return typed.Scope == scope
 	case []alert.AlertRule:
@@ -650,7 +756,9 @@ func apiError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, alert.ErrNotFound):
 		writeAPIError(writer, http.StatusNotFound, "not_found", "resource was not found")
-	case errors.Is(err, alert.ErrInvalidRule), errors.Is(err, alert.ErrInvalidEvent), errors.Is(err, alert.ErrInvalidEventTransition), errors.Is(err, alert.ErrInvalidEventTransitionTime), errors.Is(err, alert.ErrInvalidNotification), errors.Is(err, alert.ErrInvalidTemplate), errors.Is(err, alert.ErrInvalidScope):
+	case errors.Is(err, alert.ErrConfigurationInUse):
+		writeAPIError(writer, http.StatusConflict, "configuration_in_use", "configuration is in use")
+	case errors.Is(err, alert.ErrInvalidRule), errors.Is(err, alert.ErrInvalidEvent), errors.Is(err, alert.ErrInvalidEventTransition), errors.Is(err, alert.ErrInvalidEventTransitionTime), errors.Is(err, alert.ErrInvalidNotification), errors.Is(err, alert.ErrInvalidTemplate), errors.Is(err, alert.ErrInvalidScope), errors.Is(err, alert.ErrInvalidDisposition), errors.Is(err, alert.ErrInvalidPolicyReference):
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "request is invalid")
 	default:
 		writeAPIError(writer, http.StatusInternalServerError, "internal", "internal server error")

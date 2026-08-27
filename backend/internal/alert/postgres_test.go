@@ -64,25 +64,31 @@ func TestPostgresRepositoryScopesEveryRuleOperation(t *testing.T) {
 	ctx := context.Background()
 	rule := testRule()
 
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM notification_policies").WithArgs("t1", "p1", sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("policy-1"))
 	mock.ExpectQuery("INSERT INTO alert_rules").WithArgs(
-		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator-a",
+		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator-a",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
+	mock.ExpectCommit()
 	_, err = repository.CreateRule(alert.ContextWithAuditActor(ctx, "operator-a"), rule)
 	require.NoError(t, err)
 
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM notification_policies").WithArgs("t1", "p1", sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("policy-1"))
 	mock.ExpectQuery("UPDATE alert_rules").WithArgs(
-		"cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "t1", "p1", "rule-1", "operator-b",
+		"cpu", "host.cpu", "avg", ">", 80.0, int64(time.Minute), int64(time.Minute), int64(time.Minute), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "t1", "p1", "rule-1", "operator-b",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
+	mock.ExpectCommit()
 	_, err = repository.UpdateRule(alert.ContextWithAuditActor(ctx, "operator-b"), rule)
 	require.NoError(t, err)
 
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, lookback_window_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC")).
 		WithArgs("t1", "p1").
 		WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
 	_, err = repository.ListRules(ctx, rule.Scope)
 	require.NoError(t, err)
 
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 AND id = $3")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, lookback_window_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 AND id = $3")).
 		WithArgs("t1", "p1", "rule-1").
 		WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
 	_, err = repository.GetRule(ctx, rule.Scope, "rule-1")
@@ -113,7 +119,7 @@ func TestPostgresRepositoryScopesEveryEventAndAuditWrite(t *testing.T) {
 	_, err = repository.PutEvent(ctx, event)
 	require.NoError(t, err)
 
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor FROM alert_events WHERE tenant_id = $1 AND project_id = $2 ORDER BY last_seen DESC LIMIT $3 OFFSET $4")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor FROM alert_events WHERE tenant_id = $1 AND project_id = $2 ORDER BY last_seen DESC, id ASC LIMIT $3 OFFSET $4")).
 		WithArgs("t1", "p1", 25, 0).
 		WillReturnRows(sqlmock.NewRows(eventColumns()).AddRow(eventRowValues(event)...))
 	_, err = repository.ListEvents(ctx, event.Scope, alert.EventFilter{Limit: 25})
@@ -175,9 +181,12 @@ func TestPostgresRepositoryPreservesNanosecondRuleDurations(t *testing.T) {
 	rule := testRule()
 	rule.EvaluationEvery = time.Nanosecond
 	rule.For = 999999 * time.Nanosecond
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id FROM notification_policies").WithArgs("t1", "p1", sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("policy-1"))
 	mock.ExpectQuery("INSERT INTO alert_rules").WithArgs(
-		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Nanosecond), int64(999999*time.Nanosecond), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator",
+		"rule-1", "t1", "p1", "cpu", "host.cpu", "avg", ">", 80.0, int64(time.Nanosecond), int64(time.Nanosecond), int64(999999*time.Nanosecond), "ignore", "critical", sqlmock.AnyArg(), sqlmock.AnyArg(), true, "operator",
 	).WillReturnRows(sqlmock.NewRows(ruleColumns()).AddRow(ruleRowValues(rule)...))
+	mock.ExpectCommit()
 
 	stored, err := alert.NewPostgresRepository(db).CreateRule(alert.ContextWithAuditActor(context.Background(), "operator"), rule)
 	require.NoError(t, err)
@@ -191,11 +200,11 @@ func testRule() alert.AlertRule {
 }
 
 func ruleColumns() []string {
-	return []string{"id", "tenant_id", "project_id", "name", "metric", "aggregation", "operator", "threshold", "evaluation_every_ns", "for_duration_ns", "missing_data", "severity", "notification_policy_ids", "labels", "enabled", "created_at", "updated_at"}
+	return []string{"id", "tenant_id", "project_id", "name", "metric", "aggregation", "operator", "threshold", "evaluation_every_ns", "lookback_window_ns", "for_duration_ns", "missing_data", "severity", "notification_policy_ids", "labels", "enabled", "created_at", "updated_at"}
 }
 
 func ruleRowValues(rule alert.AlertRule) []driver.Value {
-	return []driver.Value{rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.For), rule.MissingData, rule.Severity, "{policy-1}", []byte(`{"host":"a"}`), rule.Enabled, rule.CreatedAt, rule.UpdatedAt}
+	return []driver.Value{rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.EffectiveLookbackWindow()), int64(rule.For), rule.MissingData, rule.Severity, "{policy-1}", []byte(`{"host":"a"}`), rule.Enabled, rule.CreatedAt, rule.UpdatedAt}
 }
 
 func eventColumns() []string {

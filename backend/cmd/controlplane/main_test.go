@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -132,6 +133,59 @@ func TestReadinessWaitsForSuccessfulAllScopePassAndRecovers(t *testing.T) {
 	failing = false
 	require.NoError(t, server.evaluateAndDispatch(context.Background(), time.Now().UTC()))
 	require.True(t, server.ready.Load())
+}
+
+func TestReadinessFailsClosedWhenRuleFailureReturnsNoTopLevelError(t *testing.T) {
+	config := validServerConfig()
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	server.evaluateScope = func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error) {
+		return alert.EvaluationSummary{FailedRules: 1}, nil
+	}
+	server.listEvents = func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error) { return nil, nil }
+
+	err = server.evaluateAndDispatch(context.Background(), time.Now().UTC())
+	require.ErrorContains(t, err, "failed rules")
+	require.False(t, server.ready.Load())
+}
+
+func TestEvaluateAndDispatchUsesStableCursorForEveryEvent(t *testing.T) {
+	config := validServerConfig()
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	server.evaluateScope = func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error) {
+		return alert.EvaluationSummary{}, nil
+	}
+	events := make([]alert.AlertEvent, 501)
+	for index := range events {
+		events[index] = alert.AlertEvent{ID: fmt.Sprintf("event-%04d", index)}
+	}
+	var filters []alert.EventFilter
+	server.listEvents = func(_ context.Context, _ alert.Scope, filter alert.EventFilter) ([]alert.AlertEvent, error) {
+		filters = append(filters, filter)
+		start := 0
+		if filter.AfterID != "" {
+			for start < len(events) && events[start].ID <= filter.AfterID {
+				start++
+			}
+		}
+		end := start + filter.Limit
+		if end > len(events) {
+			end = len(events)
+		}
+		return events[start:end], nil
+	}
+	dispatched := 0
+	server.dispatch = func(context.Context, alert.AlertEvent, alert.EventState) error {
+		dispatched++
+		return nil
+	}
+
+	require.NoError(t, server.evaluateAndDispatch(context.Background(), time.Now().UTC()))
+	require.Equal(t, 501, dispatched)
+	require.Len(t, filters, 2)
+	require.True(t, filters[0].OrderByID)
+	require.Equal(t, "event-0499", filters[1].AfterID)
 }
 
 func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {

@@ -122,6 +122,9 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 		for key, value := range input.Labels {
 			labels[key] = value
 		}
+		if err := alert.ValidateMetricLabels(labels); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidMetricBatch, err)
+		}
 		sample := alert.MetricSample{Scope: scope, AgentID: agentID, Name: strings.TrimSpace(input.Name), Labels: labels, Value: input.Value, SampledAt: sampledAt}
 		populateIdentity(&sample)
 		samples = append(samples, sample)

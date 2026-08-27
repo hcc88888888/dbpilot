@@ -71,8 +71,21 @@ func TestAlertControlPlaneLifecycle(t *testing.T) {
 	require.GreaterOrEqual(t, fixtureAfterRetry.WebhookAttempts, 3, "one failed pending delivery, one firing delivery, and the scheduled retry must reach the sink")
 	t.Logf("EVIDENCE notifications in_app=delivered smtp=delivered webhook=delivered failure=%s retry_attempts=%d sink_attempts=%d", retryScheduled.FailureClass, retriedWebhook.Attempts, fixtureAfterRetry.WebhookAttempts)
 
+	var acknowledged alert.AlertEvent
+	api.JSON(http.MethodPost, eventPath("t1", "p1", event.ID)+"/acknowledge", map[string]any{"category": "investigating", "reason": "e2e operator accepted incident"}, http.StatusOK, &acknowledged)
+	require.Equal(t, alert.EventAcknowledged, acknowledged.State)
+	require.Equal(t, "fixture-admin", acknowledged.LastActor)
+	var dispositions []alert.EventDisposition
+	api.JSON(http.MethodGet, eventPath("t1", "p1", event.ID)+"/dispositions?limit=10", nil, http.StatusOK, &dispositions)
+	require.NotEmpty(t, dispositions)
+	require.Equal(t, alert.DispositionAcknowledgement, dispositions[0].Kind)
+	require.Equal(t, "fixture-admin", dispositions[0].Actor)
+	t.Logf("EVIDENCE acknowledgement event=%s actor=%s disposition=%s", acknowledged.ID, dispositions[0].Actor, dispositions[0].ID)
+
 	silencedRule := api.CreateRule(scopeT1P1, thresholdRule("db.silenced.connections", 80, policyIDs))
-	silencedFingerprint := alert.EventFingerprint(scopeT1P1, silencedRule.ID, map[string]string{"agent_id": "agent-t1-p1", "resource": "fixture-db", "role": "primary"})
+	silencedLabels := metricResourceLabels()
+	silencedLabels["agent_id"] = "agent-t1-p1"
+	silencedFingerprint := alert.EventFingerprint(scopeT1P1, silencedRule.ID, silencedLabels)
 	api.CreateSilence(scopeT1P1, fingerprintSilence(silencedFingerprint))
 	agent.PushMetric(metricEnvelope("db.silenced.connections", 92))
 	silencedEvent := api.EventEventually(scopeT1P1, silencedRule.ID, alert.EventFiring, 30*time.Second)
@@ -272,7 +285,7 @@ func (api *e2eClient) EventEventually(scope alert.Scope, ruleID string, state al
 			return false
 		}
 		for _, event := range events {
-			if event.RuleID == ruleID && event.State == state {
+			if event.RuleID == ruleID && event.State == state && event.Labels["dbpilot_system_finding"] == "" {
 				found = event
 				return true
 			}
@@ -427,7 +440,11 @@ type metricInput struct {
 }
 
 func metricEnvelope(name string, value float64) metricInput {
-	return metricInput{Name: name, Value: value, Labels: map[string]string{"resource": "fixture-db", "role": "primary"}}
+	return metricInput{Name: name, Value: value, Labels: metricResourceLabels()}
+}
+
+func metricResourceLabels() map[string]string {
+	return map[string]string{"resource": "fixture-db", "instance": "fixture-db", "component": "postgres", "role": "primary", "host": "fixture-db"}
 }
 
 func (agent *mtlsAgent) PushMetric(metric metricInput) {
@@ -446,7 +463,7 @@ func (agent *mtlsAgent) PushMetric(metric metricInput) {
 }
 
 func thresholdRule(metric string, threshold float64, policies []string) map[string]any {
-	return map[string]any{"name": "e2e " + metric, "metric": metric, "aggregation": "avg", "operator": ">", "threshold": threshold, "evaluation_every": "2m", "for": "1s", "missing_data": "resolve", "severity": "critical", "notification_policy_ids": policies, "labels": map[string]string{}, "enabled": true}
+	return map[string]any{"name": "e2e " + metric, "metric": metric, "aggregation": "avg", "operator": ">", "threshold": threshold, "evaluation_every": "1s", "lookback_window": "2m", "for": "1s", "missing_data": "resolve", "severity": "critical", "notification_policy_ids": policies, "labels": map[string]string{}, "enabled": true}
 }
 
 func policyBody(name, channel, target, secretRef, templateID string) map[string]any {

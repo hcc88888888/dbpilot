@@ -26,6 +26,8 @@ func TestDispatcherSilenceSuppressesDeliveryButWritesAudit(t *testing.T) {
 	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
 	require.Empty(t, fx.channel.requests)
 	require.Equal(t, DeliverySuppressed, fx.repository.deliveries[0].Status)
+	require.Equal(t, "env://DBPILOT_WEBHOOK_TOKEN", fx.repository.deliveries[0].Request.SecretRef)
+	require.NoError(t, validateNotificationDelivery(fx.repository.deliveries[0]))
 	require.Equal(t, "delivery.suppressed", fx.repository.audits[0].Action)
 }
 
@@ -37,7 +39,83 @@ func TestDispatcherUsesEventStateChannelAndTemplateVersionIdempotencyKey(t *test
 
 	require.Len(t, fx.channel.requests, 1)
 	require.Len(t, fx.repository.deliveries, 1)
-	require.Equal(t, deliveryIdempotencyKey(fx.event.ID, EventFiring, "test", fx.repository.routes[0].Template.Version()), fx.repository.deliveries[0].IdempotencyKey)
+	require.Equal(t, deliveryIdempotencyKey(fx.event.ID, EventFiring, "webhook", fx.repository.routes[0].Policy.ID, fx.repository.routes[0].Policy.Version(), fx.repository.routes[0].Template.Version()), fx.repository.deliveries[0].IdempotencyKey)
+}
+
+func TestDispatcherKeepsTwoSameChannelPoliciesAsDistinctRoutes(t *testing.T) {
+	fx := newDispatchFixture(t)
+	second := fx.repository.routes[0]
+	second.Policy.ID = "policy-2"
+	second.Policy.Target = "recipient-2"
+	fx.repository.rule.NotificationPolicyIDs = append(fx.repository.rule.NotificationPolicyIDs, second.Policy.ID)
+	fx.repository.routes = append(fx.repository.routes, second)
+
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	require.Len(t, fx.channel.requests, 2)
+	require.Len(t, fx.repository.deliveries, 2)
+	require.NotEqual(t, fx.repository.deliveries[0].IdempotencyKey, fx.repository.deliveries[1].IdempotencyKey)
+}
+
+func TestDispatcherPolicyRevisionCreatesNewRouteIdentity(t *testing.T) {
+	fx := newDispatchFixture(t)
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	fx.repository.routes[0].Policy.UpdatedAt = fx.now.Add(time.Minute)
+
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	require.Len(t, fx.channel.requests, 2)
+	require.Len(t, fx.repository.deliveries, 2)
+	require.NotEqual(t, fx.repository.deliveries[0].IdempotencyKey, fx.repository.deliveries[1].IdempotencyKey)
+}
+
+func TestDispatcherHonorsLegacyKeyForSameRouteWithoutSuppressingSecondPolicy(t *testing.T) {
+	fx := newDispatchFixture(t)
+	firstRoute := fx.repository.routes[0]
+	firstRequest, err := fx.dispatcher.deliveryRequest(firstRoute, fx.repository.rule, fx.event, EventFiring)
+	require.NoError(t, err)
+	legacyKey := legacyDeliveryIdempotencyKey(fx.event.ID, EventFiring, firstRequest.Channel, firstRequest.TemplateVersion)
+	legacy := newNotificationDelivery(firstRequest, fx.event, fx.now)
+	legacy.ID, legacy.IdempotencyKey, legacy.Status = legacyKey, legacyKey, DeliveryDelivered
+	legacy.Request.DeliveryID = legacyKey
+	legacy.DeliveredAt = fx.now
+	legacy.LeaseOwner, legacy.LeaseExpiresAt, legacy.ClaimOwner = "", time.Time{}, ""
+	fx.repository.deliveries = []NotificationDelivery{legacy}
+
+	second := firstRoute
+	second.Policy.ID = "policy-2"
+	second.Policy.Target = "recipient-2"
+	fx.repository.rule.NotificationPolicyIDs = append(fx.repository.rule.NotificationPolicyIDs, second.Policy.ID)
+	fx.repository.routes = append(fx.repository.routes, second)
+
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	require.Len(t, fx.channel.requests, 1)
+	require.Equal(t, "policy-2", fx.channel.requests[0].PolicyID)
+	require.Len(t, fx.repository.deliveries, 2)
+}
+
+func TestDispatcherTreatsLegacyOrphanEventAsAuditedTerminalOutcome(t *testing.T) {
+	fx := newDispatchFixture(t)
+	fx.repository.rule = AlertRule{}
+
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	require.Empty(t, fx.channel.requests)
+	require.Len(t, fx.repository.audits, 1)
+	require.Equal(t, "delivery.abandoned", fx.repository.audits[0].Action)
+	require.Equal(t, "orphan_rule", fx.repository.audits[0].Details["failure_class"])
+}
+
+func TestRouteMatcherRequiresPresentLabelEvenForEmptyConfiguredValue(t *testing.T) {
+	fx := newDispatchFixture(t)
+	fx.repository.routes[0].Policy.MatchLabels = map[string]string{"typo": ""}
+
+	require.NoError(t, fx.dispatcher.Dispatch(context.Background(), fx.event, EventFiring))
+	require.Empty(t, fx.channel.requests)
+}
+
+func TestSilenceMatcherRequiresPresentLabelEvenForEmptyConfiguredValue(t *testing.T) {
+	fx := newDispatchFixture(t)
+	silence := Silence{Scope: fx.event.Scope, Matchers: map[string]string{"label.typo": ""}, StartsAt: fx.now.Add(-time.Minute), EndsAt: fx.now.Add(time.Minute)}
+
+	require.False(t, matchingSilence([]Silence{silence}, fx.event, fx.now))
 }
 
 func TestDispatcherMatchesSeverityLabelsAndUTCWindowAndRendersAllowedFields(t *testing.T) {
@@ -129,7 +207,7 @@ func TestDispatcherRetryDueDoesNotLetBadDeliveryBlockOtherTenants(t *testing.T) 
 	secondRequest := firstRequest
 	secondRequest.Scope = secondEvent.Scope
 	secondRequest.EventID = secondEvent.ID
-	secondRequest.Channel = "test"
+	secondRequest.Channel = "webhook"
 	second := newNotificationDelivery(secondRequest, secondEvent, fx.now)
 	second.Status = DeliveryRetryScheduled
 	second.NextAttemptAt = fx.now
@@ -166,6 +244,37 @@ func TestNotificationPolicyJSONOnlyExposesSecretPresence(t *testing.T) {
 	require.NotContains(t, string(encoded), "vault://")
 	require.NotContains(t, string(encoded), "secret_ref")
 	require.Contains(t, string(encoded), `"has_secret":true`)
+}
+
+func TestNotificationPolicyAcceptsOnlyProductionSecretReferences(t *testing.T) {
+	scope := Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	base := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "webhook", Channel: "webhook", Target: "https://allowed.example/hook", TemplateID: "template-1", Enabled: true}
+	for _, ref := range []string{"hunter2", "vault://hook", "env://", "env://HOOK=secret"} {
+		policy := base
+		policy.SecretRef = ref
+		require.Error(t, validateNotificationPolicy(policy), ref)
+	}
+	base.SecretRef = "env://DBPILOT_WEBHOOK_SECRET"
+	require.NoError(t, validateNotificationPolicy(base))
+}
+
+func TestPolicyAndSilenceRejectUnsafeOrAmbiguousMatchers(t *testing.T) {
+	scope := Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	policy := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "route", Channel: "in_app", Target: "operator", TemplateID: "template-1", Enabled: true}
+	for _, matcher := range []map[string]string{{"typo": ""}, {"password": "hunter2"}, {"database": "token=abcdef"}} {
+		policy.MatchLabels = matcher
+		require.Error(t, validateNotificationPolicy(policy), matcher)
+	}
+	policy.MatchLabels = map[string]string{"database": "orders"}
+	require.NoError(t, validateNotificationPolicy(policy))
+
+	now := time.Now().UTC()
+	for _, matcher := range []map[string]string{{"database": "orders"}, {"label.typo": ""}, {"label.password": "hunter2"}, {"unknown.namespace": "orders"}} {
+		silence := Silence{ID: "silence-1", Scope: scope, Matchers: matcher, StartsAt: now, EndsAt: now.Add(time.Hour), CreatedBy: "operator", Reason: "maintenance"}
+		require.Error(t, validateSilence(silence), matcher)
+	}
+	valid := Silence{ID: "silence-1", Scope: scope, Matchers: map[string]string{"label.database": "orders"}, StartsAt: now, EndsAt: now.Add(time.Hour), CreatedBy: "operator", Reason: "maintenance"}
+	require.NoError(t, validateSilence(valid))
 }
 
 func TestPostgresNotificationRepositoryLoadsOnlyAssignedScopedRoutes(t *testing.T) {
@@ -211,8 +320,9 @@ func TestPostgresNotificationRepositoryReservesDeliveryAndAuditAtomically(t *tes
 
 	mock.ExpectBegin()
 	mock.ExpectExec("INSERT INTO notification_deliveries").WithArgs(
-		delivery.ID, "tenant-a", "project-a", "event-1", "policy-1", delivery.IdempotencyKey, "firing", "test", "template-1", "3",
-		"suppressed", 1, fx.now, nil, nil, "", nil, "", "recipient", "Alert event-1", "firing", sqlmock.AnyArg(), "secret-ref",
+		delivery.ID, "tenant-a", "project-a", "event-1", "policy-1", delivery.IdempotencyKey, "firing", "webhook", "template-1", "3",
+		"suppressed", 1, fx.now, nil, nil, "", nil, "", "recipient", "Alert event-1", "firing", sqlmock.AnyArg(), "env://DBPILOT_WEBHOOK_TOKEN",
+		legacyDeliveryIdempotencyKey(delivery.EventID, delivery.EventState, delivery.Request.Channel, delivery.Request.TemplateVersion),
 	).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT INTO alert_audit_log").WithArgs(
 		audit.ID, "tenant-a", "project-a", audit.Actor, audit.Action, delivery.ID, fx.now, sqlmock.AnyArg(),
@@ -222,6 +332,33 @@ func TestPostgresNotificationRepositoryReservesDeliveryAndAuditAtomically(t *tes
 	reserved, err := NewPostgresRepository(database).ReserveNotificationDelivery(context.Background(), delivery, &audit)
 	require.NoError(t, err)
 	require.True(t, reserved)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresDeliveryPersistenceRejectsRawSecretMaterialBeforeSQL(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		require.NoError(t, database.Close())
+	})
+	fx := newDispatchFixture(t)
+	request, err := fx.dispatcher.deliveryRequest(fx.repository.routes[0], fx.repository.rule, fx.event, EventFiring)
+	require.NoError(t, err)
+
+	for name, mutate := range map[string]func(*NotificationDelivery){
+		"raw secret reference": func(delivery *NotificationDelivery) { delivery.Request.SecretRef = "hunter2" },
+		"sensitive label":      func(delivery *NotificationDelivery) { delivery.Request.Labels["api_token"] = "unsafe" },
+		"secret value":         func(delivery *NotificationDelivery) { delivery.Request.Body = "password=hunter2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			delivery := newNotificationDelivery(request, fx.event, fx.now)
+			mutate(&delivery)
+			reserved, persistErr := NewPostgresRepository(database).ReserveNotificationDelivery(context.Background(), delivery, nil)
+			require.False(t, reserved)
+			require.ErrorIs(t, persistErr, ErrInvalidNotification)
+		})
+	}
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -242,15 +379,15 @@ func TestPostgresNotificationRepositoryAtomicallyClaimsDueAndExpiredAttempting(t
 	leaseUntil := fx.now.Add(2 * time.Minute)
 	mock.ExpectQuery(regexp.QuoteMeta(claimDeliveriesSQL)).WithArgs(fx.now.Add(time.Minute), 10, "worker-b", leaseUntil).WillReturnRows(
 		sqlmock.NewRows(notificationDeliveryColumns()).AddRow(
-			delivery.ID, "tenant-a", "project-a", "event-1", "policy-1", delivery.ID, "firing", "test", "template-1", "3",
-			"attempting", 2, fx.now.Add(time.Minute), nil, nil, "worker-b", leaseUntil, "remote_5xx", "recipient", "Alert event-1", "firing", []byte(`{"database":"orders"}`), "secret-ref",
+			delivery.ID, "tenant-a", "project-a", "event-1", "policy-1", delivery.ID, "firing", "webhook", "template-1", "3",
+			"attempting", 2, fx.now.Add(time.Minute), nil, nil, "worker-b", leaseUntil, "remote_5xx", "recipient", "Alert event-1", "firing", []byte(`{"database":"orders"}`), "env://DBPILOT_WEBHOOK_TOKEN",
 		),
 	)
 
 	due, err := NewPostgresRepository(database).ClaimDueNotificationDeliveries(context.Background(), fx.now.Add(time.Minute), "worker-b", leaseUntil, 10)
 	require.NoError(t, err)
 	require.Len(t, due, 1)
-	require.Equal(t, "secret-ref", due[0].Request.SecretRef)
+	require.Equal(t, "env://DBPILOT_WEBHOOK_TOKEN", due[0].Request.SecretRef)
 	require.Equal(t, "worker-b", due[0].LeaseOwner)
 	require.Equal(t, 2, due[0].Attempts)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -279,12 +416,12 @@ func newDispatchFixture(t *testing.T) *dispatchFixture {
 	scope := Scope{TenantID: "tenant-a", ProjectID: "project-a"}
 	event := AlertEvent{ID: "event-1", Scope: scope, RuleID: "rule-1", Fingerprint: "fingerprint-1", Labels: map[string]string{"database": "orders"}, Evidence: map[string]string{"aggregate": "93.5"}, State: EventFiring, FirstSeen: now.Add(-time.Hour), LastSeen: now, FiringAt: now, LastActor: "evaluator"}
 	template := NotificationTemplate{ID: "template-1", Scope: scope, Name: "default", Subject: "Alert {{event.id}}", Body: "{{event.state}}", Revision: 3, UpdatedAt: now.Add(-time.Hour)}
-	policy := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "test", Channel: "test", Target: "recipient", SecretRef: "secret-ref", TemplateID: "template-1", Enabled: true}
+	policy := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "test", Channel: "webhook", Target: "recipient", SecretRef: "env://DBPILOT_WEBHOOK_TOKEN", TemplateID: "template-1", Enabled: true}
 	repository := &memoryNotificationRepository{
 		rule:   AlertRule{ID: "rule-1", Scope: scope, Name: "CPU", Metric: "cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", NotificationPolicyIDs: []string{"policy-1"}, Enabled: true},
 		routes: []NotificationRoute{{Policy: policy, Template: template}},
 	}
-	channel := &recordingChannel{name: "test"}
+	channel := &recordingChannel{name: "webhook"}
 	fx := &dispatchFixture{now: now, clock: now, event: event, repository: repository, channel: channel}
 	fx.dispatcher = NewDispatcher(repository, []DeliveryChannel{channel}, func() time.Time { return fx.clock }, func(event AlertEvent) string { return "https://dbpilot.example/alerts/" + event.ID })
 	return fx
@@ -302,6 +439,22 @@ func TestNotificationForwardMigrationAddsTypedRoutingDeliveryLeaseAndInAppFields
 		require.Contains(t, content, required)
 	}
 	require.NotContains(t, content, "failure_reason::jsonb")
+}
+
+func TestIntegrityForwardMigrationAddsSchedulingReferencesAndDispositionHistory(t *testing.T) {
+	migration, err := os.ReadFile(filepath.Join("migrations", "0005_alert_control_plane_integrity.sql"))
+	require.NoError(t, err)
+	content := string(migration)
+	for _, required := range []string{
+		"lookback_window_ns", "next_evaluation_at", "evaluation_lease_owner", "alert_rules_due_evaluation_idx",
+		"alert_events_scoped_rule_fk", "notification_policies_secret_reference_check",
+		"notification_deliveries_legacy_route_identity_idx", "CREATE TABLE alert_event_dispositions",
+		"alert_event_dispositions_append_only",
+	} {
+		require.Contains(t, content, required)
+	}
+	require.Contains(t, content, "DBPILOT_MIGRATED_UNAVAILABLE_SECRET")
+	require.NotContains(t, content, "DROP TABLE alert_events")
 }
 
 func TestPostgresInAppNotificationIsScopedIdempotentAndReadable(t *testing.T) {
@@ -340,10 +493,10 @@ func TestPostgresCreateSilencePersistsReasonAndLifecycleAudit(t *testing.T) {
 		require.NoError(t, database.Close())
 	})
 	at := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
-	silence := Silence{ID: "silence-1", Scope: Scope{TenantID: "tenant-a", ProjectID: "project-a"}, Matchers: map[string]string{"database": "orders"}, StartsAt: at, EndsAt: at.Add(time.Hour), CreatedBy: "operator", Reason: "planned maintenance", CreatedAt: at, UpdatedAt: at}
+	silence := Silence{ID: "silence-1", Scope: Scope{TenantID: "tenant-a", ProjectID: "project-a"}, Matchers: map[string]string{"label.database": "orders"}, StartsAt: at, EndsAt: at.Add(time.Hour), CreatedBy: "operator", Reason: "planned maintenance", CreatedAt: at, UpdatedAt: at}
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO alert_silences").WithArgs("silence-1", "tenant-a", "project-a", sqlmock.AnyArg(), at, at.Add(time.Hour), "operator", "planned maintenance").WillReturnRows(
-		sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "matchers", "starts_at", "ends_at", "created_by", "reason", "created_at", "updated_at"}).AddRow("silence-1", "tenant-a", "project-a", []byte(`{"database":"orders"}`), at, at.Add(time.Hour), "operator", "planned maintenance", at, at),
+		sqlmock.NewRows([]string{"id", "tenant_id", "project_id", "matchers", "starts_at", "ends_at", "created_by", "reason", "created_at", "updated_at"}).AddRow("silence-1", "tenant-a", "project-a", []byte(`{"label.database":"orders"}`), at, at.Add(time.Hour), "operator", "planned maintenance", at, at),
 	)
 	mock.ExpectExec("INSERT INTO alert_audit_log").WithArgs(sqlmock.AnyArg(), "tenant-a", "project-a", "operator", "silence.created", "silence-1", at, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
@@ -375,10 +528,10 @@ func TestPostgresCreatesExplicitVersionedTemplateAndRoutedPolicy(t *testing.T) {
 	_, err = repository.CreateNotificationTemplate(ctx, template)
 	require.NoError(t, err)
 
-	policy := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "route", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "vault://hook", TemplateID: "template-7", Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, WindowStartUTC: "09:00", WindowEndUTC: "11:00", Enabled: true}
+	policy := NotificationPolicy{ID: "policy-1", Scope: scope, Name: "route", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "env://DBPILOT_WEBHOOK_TOKEN", TemplateID: "template-7", Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, WindowStartUTC: "09:00", WindowEndUTC: "11:00", Enabled: true}
 	mock.ExpectBegin()
-	mock.ExpectQuery("INSERT INTO notification_policies").WithArgs("policy-1", "tenant-a", "project-a", "route", "webhook", "https://allowed.example/hook", "vault://hook", "template-7", sqlmock.AnyArg(), sqlmock.AnyArg(), "09:00", "11:00", true).WillReturnRows(
-		sqlmock.NewRows(notificationPolicyColumns()).AddRow("policy-1", "tenant-a", "project-a", "route", "webhook", "https://allowed.example/hook", "vault://hook", "template-7", "{critical}", []byte(`{"database":"orders"}`), "09:00", "11:00", true, at, at),
+	mock.ExpectQuery("INSERT INTO notification_policies").WithArgs("policy-1", "tenant-a", "project-a", "route", "webhook", "https://allowed.example/hook", "env://DBPILOT_WEBHOOK_TOKEN", "template-7", sqlmock.AnyArg(), sqlmock.AnyArg(), "09:00", "11:00", true).WillReturnRows(
+		sqlmock.NewRows(notificationPolicyColumns()).AddRow("policy-1", "tenant-a", "project-a", "route", "webhook", "https://allowed.example/hook", "env://DBPILOT_WEBHOOK_TOKEN", "template-7", "{critical}", []byte(`{"database":"orders"}`), "09:00", "11:00", true, at, at),
 	)
 	mock.ExpectExec("INSERT INTO alert_audit_log").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
@@ -420,6 +573,12 @@ func (repository *memoryNotificationRepository) GetRule(_ context.Context, scope
 	return repository.rule, nil
 }
 
+func (repository *memoryNotificationRepository) RecordOrphanedEvent(_ context.Context, event AlertEvent, at time.Time) error {
+	delivery := NotificationDelivery{ID: "orphan-" + event.ID, Scope: event.Scope, EventID: event.ID, PolicyID: "orphan-rule", EventState: event.State, Status: DeliveryAbandoned, AttemptedAt: at, FailureClass: "orphan_rule", Request: DeliveryRequest{Channel: "orphan"}}
+	repository.audits = append(repository.audits, notificationAudit(delivery, "delivery.abandoned", at))
+	return nil
+}
+
 func (repository *memoryNotificationRepository) ListNotificationRoutes(_ context.Context, scope Scope, ruleID string) ([]NotificationRoute, error) {
 	if repository.rule.Scope != scope || repository.rule.ID != ruleID {
 		return nil, ErrNotFound
@@ -438,8 +597,9 @@ func (repository *memoryNotificationRepository) ListActiveSilences(_ context.Con
 }
 
 func (repository *memoryNotificationRepository) ReserveNotificationDelivery(_ context.Context, delivery NotificationDelivery, audit *AuditRecord) (bool, error) {
+	legacyKey := legacyDeliveryIdempotencyKey(delivery.EventID, delivery.EventState, delivery.Request.Channel, delivery.Request.TemplateVersion)
 	for _, existing := range repository.deliveries {
-		if existing.Scope == delivery.Scope && existing.IdempotencyKey == delivery.IdempotencyKey {
+		if existing.Scope == delivery.Scope && (existing.IdempotencyKey == delivery.IdempotencyKey || existing.IdempotencyKey == legacyKey && sameDeliveryRoute(existing, delivery)) {
 			return false, nil
 		}
 	}
@@ -448,6 +608,13 @@ func (repository *memoryNotificationRepository) ReserveNotificationDelivery(_ co
 		repository.audits = append(repository.audits, *audit)
 	}
 	return true, nil
+}
+
+func sameDeliveryRoute(existing, candidate NotificationDelivery) bool {
+	return existing.EventID == candidate.EventID && existing.PolicyID == candidate.PolicyID &&
+		existing.EventState == candidate.EventState && existing.Request.Channel == candidate.Request.Channel &&
+		existing.Request.TemplateID == candidate.Request.TemplateID && existing.Request.TemplateVersion == candidate.Request.TemplateVersion &&
+		existing.Request.Target == candidate.Request.Target && existing.Request.SecretRef == candidate.Request.SecretRef
 }
 
 func (repository *memoryNotificationRepository) UpdateNotificationDelivery(_ context.Context, delivery NotificationDelivery, audit AuditRecord) error {

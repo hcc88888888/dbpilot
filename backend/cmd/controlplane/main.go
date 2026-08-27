@@ -548,19 +548,30 @@ func (server *Server) evaluateAndDispatch(ctx context.Context, at time.Time) err
 			server.ready.Store(false)
 			return ctx.Err()
 		}
-		if _, err := server.evaluateScope(ctx, scope, at); err != nil {
+		summary, err := server.evaluateScope(ctx, scope, at)
+		if err != nil {
 			scopeErrors = append(scopeErrors, fmt.Errorf("%s evaluation: %w", scope.Key(), err))
 			continue
 		}
-		events, err := server.listEvents(ctx, scope, alert.EventFilter{Limit: 500})
-		if err != nil {
-			scopeErrors = append(scopeErrors, fmt.Errorf("%s event listing: %w", scope.Key(), err))
-			continue
+		if summary.FailedRules > 0 {
+			scopeErrors = append(scopeErrors, fmt.Errorf("%s evaluation: %d failed rules", scope.Key(), summary.FailedRules))
 		}
-		for _, event := range events {
-			if err := server.dispatch(ctx, event, event.State); err != nil {
-				scopeErrors = append(scopeErrors, fmt.Errorf("%s event %s dispatch: %w", scope.Key(), event.ID, err))
+		cursor := ""
+		for {
+			events, listErr := server.listEvents(ctx, scope, alert.EventFilter{Limit: 500, AfterID: cursor, OrderByID: true})
+			if listErr != nil {
+				scopeErrors = append(scopeErrors, fmt.Errorf("%s event listing: %w", scope.Key(), listErr))
+				break
 			}
+			for _, event := range events {
+				if dispatchErr := server.dispatch(ctx, event, event.State); dispatchErr != nil {
+					scopeErrors = append(scopeErrors, fmt.Errorf("%s event %s dispatch: %w", scope.Key(), event.ID, dispatchErr))
+				}
+			}
+			if len(events) < 500 {
+				break
+			}
+			cursor = events[len(events)-1].ID
 		}
 	}
 	err := errors.Join(scopeErrors...)
@@ -630,14 +641,10 @@ func exactWebhookAllowlistFrom(values []string) exactWebhookAllowlist {
 type environmentSecretResolver struct{}
 
 func (environmentSecretResolver) Resolve(_ context.Context, ref string) ([]byte, error) {
-	const prefix = "env://"
-	if !strings.HasPrefix(ref, prefix) {
-		return nil, errors.New("unsupported secret reference")
-	}
-	name := strings.TrimPrefix(ref, prefix)
-	if name == "" || strings.ContainsAny(name, "=\x00") {
+	if err := alert.ValidateSecretReference(ref); err != nil {
 		return nil, errors.New("invalid secret reference")
 	}
+	name := strings.TrimPrefix(ref, "env://")
 	value, ok := os.LookupEnv(name)
 	if !ok {
 		return nil, errors.New("secret is unavailable")

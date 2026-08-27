@@ -75,6 +75,10 @@ func TestNotificationMigrationUpgradesPopulated0001WithoutLosingRoutesOrRetrySta
 	require.NoError(t, err)
 	_, err = database.ExecContext(ctx, string(migration))
 	require.NoError(t, err)
+	integrityMigration, err := os.ReadFile(filepath.Join("migrations", "0005_alert_control_plane_integrity.sql"))
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, string(integrityMigration))
+	require.NoError(t, err)
 
 	var templateID sql.NullString
 	var enabled bool
@@ -117,7 +121,7 @@ func TestNotificationMigrationUpgradesPopulated0001WithoutLosingRoutesOrRetrySta
 	require.True(t, retry.nextAttempt.Valid)
 	require.True(t, retry.nextAttempt.Time.Equal(nextAttemptAt))
 	require.Equal(t, "remote_5xx", retry.failureClass)
-	require.Equal(t, "vault://legacy-reference", retry.secretRef)
+	require.Empty(t, retry.secretRef, "unsupported legacy secret material is scrubbed at rest")
 	attempting := readDelivery("delivery-attempting")
 	require.Equal(t, "attempting", attempting.status)
 	require.True(t, attempting.leaseExpiry.Valid)
@@ -134,7 +138,7 @@ func TestNotificationMigrationUpgradesPopulated0001WithoutLosingRoutesOrRetrySta
 
 	var invalidConstraints int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM pg_constraint WHERE conrelid IN ('notification_policies'::regclass, 'alert_silences'::regclass, 'notification_deliveries'::regclass) AND NOT convalidated").Scan(&invalidConstraints))
-	require.Zero(t, invalidConstraints)
+	require.Equal(t, 4, invalidConstraints, "forward-only channel and secret checks remain NOT VALID for unknown legacy rows")
 }
 
 func TestNotificationMigrationPreservesLegacyTemplateVersionIdempotencyOnReplay(t *testing.T) {
@@ -159,7 +163,7 @@ func TestNotificationMigrationPreservesLegacyTemplateVersionIdempotencyOnReplay(
 
 	event := AlertEvent{ID: "event-version", Scope: scope, RuleID: "rule-version", Fingerprint: "version-fingerprint", Labels: map[string]string{"database": "orders"}, Evidence: map[string]string{"aggregate": "91"}, State: EventFiring, FirstSeen: legacyUpdatedAt, LastSeen: legacyUpdatedAt, FiringAt: legacyUpdatedAt, LastActor: "evaluator"}
 	legacyVersion := legacyUpdatedAt.UTC().Format(time.RFC3339Nano)
-	legacyDeliveryID := deliveryIdempotencyKey(event.ID, EventFiring, "in_app", legacyVersion)
+	legacyDeliveryID := legacyDeliveryIdempotencyKey(event.ID, EventFiring, "in_app", legacyVersion)
 	envelope, err := json.Marshal(map[string]any{
 		"attempts": 1,
 		"request": map[string]any{
@@ -176,6 +180,10 @@ func TestNotificationMigrationPreservesLegacyTemplateVersionIdempotencyOnReplay(
 	migration, err := os.ReadFile(filepath.Join("migrations", "0002_notification_delivery_control.sql"))
 	require.NoError(t, err)
 	_, err = database.ExecContext(ctx, string(migration))
+	require.NoError(t, err)
+	integrityMigration, err := os.ReadFile(filepath.Join("migrations", "0005_alert_control_plane_integrity.sql"))
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, string(integrityMigration))
 	require.NoError(t, err)
 
 	repository := NewPostgresRepository(database)
@@ -247,7 +255,7 @@ func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T)
 	actorCtx := ContextWithAuditActor(ctx, "operator")
 	scope := Scope{TenantID: "tenant-route", ProjectID: "project-route"}
 	otherScope := Scope{TenantID: "tenant-route", ProjectID: "project-other"}
-	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(time.Second)
 
 	template, err := repository.CreateNotificationTemplate(actorCtx, NotificationTemplate{ID: "template-explicit", Scope: scope, Name: "critical", Subject: "{{event.severity}} {{resource.database}}", Body: "{{event.id}} {{event.state}}", Revision: 9})
 	require.NoError(t, err)
@@ -257,38 +265,64 @@ func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T)
 	require.NoError(t, err)
 	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-wrong-label", Scope: scope, Name: "wrong label", Channel: "in_app", Target: "user-7", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "inventory"}, Enabled: true})
 	require.NoError(t, err)
-	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-wrong-window", Scope: scope, Name: "wrong window", Channel: "in_app", Target: "user-7", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, WindowStartUTC: "11:00", WindowEndUTC: "12:00", Enabled: true})
+	wrongWindowStart := now.Add(time.Hour).Format("15:04")
+	wrongWindowEnd := now.Add(2 * time.Hour).Format("15:04")
+	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-wrong-window", Scope: scope, Name: "wrong window", Channel: "in_app", Target: "user-7", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, WindowStartUTC: wrongWindowStart, WindowEndUTC: wrongWindowEnd, Enabled: true})
 	require.NoError(t, err)
-	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-match", Scope: scope, Name: "match", Channel: "in_app", Target: "user-7", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, WindowStartUTC: "09:00", WindowEndUTC: "11:00", Enabled: true})
+	matchPolicy, err := repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-match", Scope: scope, Name: "match", Channel: "in_app", Target: "user-7", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, Enabled: true})
+	require.NoError(t, err)
+	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-match-two", Scope: scope, Name: "match two", Channel: "in_app", Target: "user-8", TemplateID: template.ID, Severities: []string{"critical"}, MatchLabels: map[string]string{"database": "orders"}, Enabled: true})
 	require.NoError(t, err)
 	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-cross-scope", Scope: scope, Name: "cross", Channel: "in_app", Target: "user-7", TemplateID: "template-other", Enabled: true})
 	require.Error(t, err)
 	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-missing", Scope: scope, Name: "missing", Channel: "in_app", Target: "user-7", TemplateID: "does-not-exist", Enabled: true})
 	require.Error(t, err)
 
-	rule := AlertRule{ID: "rule-route", Scope: scope, Name: "route", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", NotificationPolicyIDs: []string{"policy-wrong-severity", "policy-wrong-label", "policy-wrong-window", "policy-match"}, Enabled: true}
+	rule := AlertRule{ID: "rule-route", Scope: scope, Name: "route", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", NotificationPolicyIDs: []string{"policy-wrong-severity", "policy-wrong-label", "policy-wrong-window", "policy-match", "policy-match-two"}, Enabled: true}
 	_, err = repository.CreateRule(actorCtx, rule)
 	require.NoError(t, err)
 	event := AlertEvent{ID: "event-route", Scope: scope, RuleID: rule.ID, Fingerprint: "route-fingerprint", Labels: map[string]string{"database": "orders"}, Evidence: map[string]string{"aggregate": "91"}, State: EventFiring, FirstSeen: now.Add(-time.Minute), LastSeen: now, FiringAt: now, LastActor: "evaluator"}
 	channel := &recordingChannel{name: "in_app"}
 	dispatcher := NewDispatcher(repository, []DeliveryChannel{channel}, func() time.Time { return now }, nil)
 	require.NoError(t, dispatcher.Dispatch(ctx, event, EventFiring))
-	require.Len(t, channel.requests, 1)
+	require.Len(t, channel.requests, 2)
+	require.NotEqual(t, channel.requests[0].DeliveryID, channel.requests[1].DeliveryID)
 	require.Equal(t, "9", channel.requests[0].TemplateVersion)
 	require.Equal(t, "critical orders", channel.requests[0].Subject)
 
 	request := channel.requests[0]
-	require.NoError(t, repository.PersistInAppNotification(ctx, request))
-	require.NoError(t, repository.PersistInAppNotification(ctx, request))
+	for _, routed := range channel.requests {
+		require.NoError(t, repository.PersistInAppNotification(ctx, routed))
+		require.NoError(t, repository.PersistInAppNotification(ctx, routed))
+	}
 	crossScopeRequest := request
 	crossScopeRequest.Scope = otherScope
 	require.ErrorIs(t, repository.PersistInAppNotification(ctx, crossScopeRequest), ErrNotificationScopeMismatch)
 	notifications, err := repository.ListInAppNotifications(ctx, scope, "user-7", 100)
 	require.NoError(t, err)
 	require.Len(t, notifications, 1)
+	secondNotifications, err := repository.ListInAppNotifications(ctx, scope, "user-8", 100)
+	require.NoError(t, err)
+	require.Len(t, secondNotifications, 1)
 	otherNotifications, err := repository.ListInAppNotifications(ctx, otherScope, "user-7", 100)
 	require.NoError(t, err)
 	require.Empty(t, otherNotifications)
+
+	previousPolicyDeliveryID := ""
+	for _, routed := range channel.requests {
+		if routed.PolicyID == matchPolicy.ID {
+			previousPolicyDeliveryID = routed.DeliveryID
+		}
+	}
+	require.NotEmpty(t, previousPolicyDeliveryID)
+	matchPolicy.Name = "match revised"
+	matchPolicy, err = repository.UpdateNotificationPolicy(actorCtx, matchPolicy)
+	require.NoError(t, err)
+	require.NoError(t, dispatcher.Dispatch(ctx, event, EventFiring))
+	require.Len(t, channel.requests, 3, "only the revised policy route should receive a new delivery identity")
+	revisedRequest := channel.requests[len(channel.requests)-1]
+	require.Equal(t, matchPolicy.ID, revisedRequest.PolicyID)
+	require.NotEqual(t, previousPolicyDeliveryID, revisedRequest.DeliveryID)
 
 	// Seed a legacy invalid reference with FK triggers disabled to prove the
 	// dispatcher records a permanent configuration failure instead of forging
@@ -360,6 +394,320 @@ func TestPostgresNotificationRoutingDeliveryLeaseAndInAppRoundTrip(t *testing.T)
 	require.Equal(t, 3, recovered[0].Attempts)
 }
 
+func TestPostgresRulePolicyReferencesAndDeletionRemainRecoverable(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL referential-integrity tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchema(t, ctx, dsn)
+	repository := NewPostgresRepository(database)
+	actorCtx := ContextWithAuditActor(ctx, "operator")
+	scope := Scope{TenantID: "tenant-ref", ProjectID: "project-ref"}
+	otherScope := Scope{TenantID: "tenant-ref", ProjectID: "project-other"}
+
+	template, err := repository.CreateNotificationTemplate(actorCtx, NotificationTemplate{ID: "template-ref", Scope: scope, Name: "ref", Subject: "subject", Body: "body", Revision: 1})
+	require.NoError(t, err)
+	policy, err := repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-ref", Scope: scope, Name: "ref", Channel: "in_app", Target: "operator", TemplateID: template.ID, Severities: []string{}, Enabled: true})
+	require.NoError(t, err)
+	otherTemplate, err := repository.CreateNotificationTemplate(actorCtx, NotificationTemplate{ID: "template-other", Scope: otherScope, Name: "other", Subject: "subject", Body: "body", Revision: 1})
+	require.NoError(t, err)
+	_, err = repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-other", Scope: otherScope, Name: "other", Channel: "in_app", Target: "operator", TemplateID: otherTemplate.ID, Severities: []string{}, Enabled: true})
+	require.NoError(t, err)
+
+	base := AlertRule{ID: "rule-ref", Scope: scope, Name: "ref", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: true}
+	missing := base
+	missing.ID = "rule-missing"
+	missing.NotificationPolicyIDs = []string{"policy-missing"}
+	_, err = repository.CreateRule(actorCtx, missing)
+	require.Error(t, err)
+	crossScope := base
+	crossScope.ID = "rule-cross-scope"
+	crossScope.NotificationPolicyIDs = []string{"policy-other"}
+	_, err = repository.CreateRule(actorCtx, crossScope)
+	require.Error(t, err)
+
+	base.NotificationPolicyIDs = []string{policy.ID}
+	storedRule, err := repository.CreateRule(actorCtx, base)
+	require.NoError(t, err)
+	require.Error(t, repository.DeleteNotificationPolicy(actorCtx, scope, policy.ID))
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	event := AlertEvent{ID: "event-ref", Scope: scope, RuleID: storedRule.ID, Fingerprint: "fingerprint-ref", Labels: map[string]string{"host": "db-a"}, Evidence: map[string]string{}, State: EventPending, FirstSeen: now, LastSeen: now, LastActor: "system:evaluator"}
+	_, err = repository.PutEvent(ctx, event)
+	require.NoError(t, err)
+	require.Error(t, repository.DeleteRule(actorCtx, scope, storedRule.ID))
+	remaining, err := repository.GetRule(ctx, scope, storedRule.ID)
+	require.NoError(t, err)
+	require.NoError(t, remaining.Validate())
+
+	evaluationAt := time.Now().UTC().Add(time.Second)
+	evaluator := NewEvaluator(repository, repository)
+	summary, err := evaluator.EvaluateScope(ctx, scope, evaluationAt)
+	require.NoError(t, err)
+	require.Zero(t, summary.FailedRules)
+	channel := &recordingChannel{name: "in_app"}
+	dispatcher := NewDispatcher(repository, []DeliveryChannel{channel}, func() time.Time { return evaluationAt }, nil)
+	require.NoError(t, dispatcher.Dispatch(ctx, event, event.State))
+	require.Len(t, channel.requests, 1, "rejected deletion preserves the event's notification route")
+	history, err := repository.ListEvents(ctx, scope, EventFilter{Limit: 500, OrderByID: true})
+	require.NoError(t, err)
+	foundHistoricalEvent := false
+	for _, stored := range history {
+		if stored.ID == event.ID {
+			foundHistoricalEvent = true
+		}
+	}
+	require.True(t, foundHistoricalEvent)
+	require.Empty(t, evaluator.HealthForScope(scope).LastError)
+}
+
+func TestPostgresRuleSchedulingLeasesCadenceAndLookbackAcrossReplicas(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL scheduling integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchema(t, ctx, dsn)
+	repository := NewPostgresRepository(database)
+	scope := Scope{TenantID: "tenant-schedule", ProjectID: "project-schedule"}
+	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
+	rule := AlertRule{ID: "rule-schedule", Scope: scope, Name: "schedule", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: 5 * time.Minute, LookbackWindow: 15 * time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: true}
+
+	stored, err := repository.CreateRule(ContextWithAuditActor(ctx, "operator"), rule)
+	require.NoError(t, err)
+	require.Equal(t, 15*time.Minute, stored.LookbackWindow)
+
+	first, depth, err := repository.ClaimDueRules(ctx, scope, now, "replica-a", now.Add(time.Minute), 10)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.Zero(t, depth)
+	require.Equal(t, 15*time.Minute, first[0].Rule.LookbackWindow)
+
+	second, _, err := repository.ClaimDueRules(ctx, scope, now, "replica-b", now.Add(time.Minute), 10)
+	require.NoError(t, err)
+	require.Empty(t, second, "an unexpired lease prevents duplicate multi-replica evaluation")
+
+	require.NoError(t, repository.CompleteRuleEvaluation(ctx, scope, rule.ID, "replica-a", now, now.Add(rule.EvaluationEvery)))
+	second, _, err = repository.ClaimDueRules(ctx, scope, now.Add(4*time.Minute), "replica-b", now.Add(6*time.Minute), 10)
+	require.NoError(t, err)
+	require.Empty(t, second)
+	second, _, err = repository.ClaimDueRules(ctx, scope, now.Add(5*time.Minute), "replica-b", now.Add(6*time.Minute), 10)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+}
+
+func TestPostgresConcurrentPolicyDeletionCannotRaceRuleEnable(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL policy concurrency integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	databaseOne, schema := setupNotificationIntegrationSchema(t, ctx, dsn)
+	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "policy-enable-racer"), "")
+	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
+	repositoryOne := NewPostgresRepository(databaseOne)
+	repositoryTwo := NewPostgresRepository(databaseTwo)
+	scope := Scope{TenantID: "tenant-policy-race", ProjectID: "project-policy-race"}
+	actorCtx := ContextWithAuditActor(ctx, "operator")
+	template, err := repositoryOne.CreateNotificationTemplate(actorCtx, NotificationTemplate{ID: "template-race", Scope: scope, Name: "race", Subject: "subject", Body: "body", Revision: 1})
+	require.NoError(t, err)
+	policy, err := repositoryOne.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-race", Scope: scope, Name: "race", Channel: "in_app", Target: "operator", TemplateID: template.ID, Enabled: true})
+	require.NoError(t, err)
+	rule := AlertRule{ID: "rule-race", Scope: scope, Name: "race", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: false}
+	rule, err = repositoryOne.CreateRule(actorCtx, rule)
+	require.NoError(t, err)
+
+	deletion, err := databaseOne.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	var locked string
+	require.NoError(t, deletion.QueryRowContext(ctx, "SELECT id FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE", scope.TenantID, scope.ProjectID, policy.ID).Scan(&locked))
+	rule.Enabled = true
+	rule.NotificationPolicyIDs = []string{policy.ID}
+	result := make(chan error, 1)
+	go func() {
+		_, updateErr := repositoryTwo.UpdateRule(ContextWithAuditActor(ctx, "operator-two"), rule)
+		result <- updateErr
+	}()
+	select {
+	case early := <-result:
+		t.Fatalf("rule enable did not wait for the policy deletion lock: %v", early)
+	case <-time.After(100 * time.Millisecond):
+	}
+	_, err = deletion.ExecContext(ctx, "DELETE FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, policy.ID)
+	require.NoError(t, err)
+	require.NoError(t, deletion.Commit())
+	require.ErrorIs(t, <-result, ErrInvalidPolicyReference)
+	stored, err := repositoryOne.GetRule(ctx, scope, rule.ID)
+	require.NoError(t, err)
+	require.False(t, stored.Enabled)
+	require.Empty(t, stored.NotificationPolicyIDs)
+}
+
+func TestPostgresEventDispositionIsAtomicScopedAndAppendOnly(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL disposition integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchema(t, ctx, dsn)
+	repository := NewPostgresRepository(database)
+	scope := Scope{TenantID: "tenant-disposition", ProjectID: "project-disposition"}
+	now := time.Now().UTC().Add(-time.Hour)
+	rule := AlertRule{ID: "rule-disposition", Scope: scope, Name: "disposition", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, LookbackWindow: 5 * time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: true}
+	_, err := repository.CreateRule(ContextWithAuditActor(ctx, "operator"), rule)
+	require.NoError(t, err)
+	event := AlertEvent{ID: "event-disposition", Scope: scope, RuleID: rule.ID, Fingerprint: "fingerprint-disposition", State: EventPending, FirstSeen: now, LastSeen: now, LastActor: "system:evaluator"}
+	event, err = repository.PutEventAndAudit(ctx, event, AuditRecord{ID: "audit-pending", Scope: scope, Actor: "system:evaluator", Action: "event.pending", TargetID: event.ID, OccurredAt: now, Details: map[string]string{"state": "pending"}})
+	require.NoError(t, err)
+	event, err = event.Transition(EventFiring, now.Add(time.Minute), "system:evaluator")
+	require.NoError(t, err)
+	event, err = repository.PutEventAndAudit(ctx, event, AuditRecord{ID: "audit-firing", Scope: scope, Actor: "system:evaluator", Action: "event.firing", TargetID: event.ID, OccurredAt: event.LastSeen, Details: map[string]string{"state": "firing"}})
+	require.NoError(t, err)
+
+	_, err = database.ExecContext(ctx, "CREATE FUNCTION fail_forced_disposition() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN IF NEW.category = 'force_failure' THEN RAISE EXCEPTION 'forced disposition failure'; END IF; RETURN NEW; END $$")
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "CREATE TRIGGER fail_forced_disposition BEFORE INSERT ON alert_event_dispositions FOR EACH ROW EXECUTE FUNCTION fail_forced_disposition()")
+	require.NoError(t, err)
+	acknowledged, err := event.Transition(EventAcknowledged, now.Add(2*time.Minute), "operator-1")
+	require.NoError(t, err)
+	failedDisposition := EventDisposition{ID: "disposition-failed", Scope: scope, EventID: event.ID, Kind: DispositionAcknowledgement, Category: "force_failure", Reason: "force transactional rollback", Actor: "operator-1", OccurredAt: acknowledged.LastSeen}
+	failedAudit := AuditRecord{ID: "audit-ack-failed", Scope: scope, Actor: "operator-1", Action: "event.acknowledged", TargetID: event.ID, OccurredAt: acknowledged.LastSeen, Details: map[string]string{"state": "acknowledged", "category": "force_failure", "reason_present": "true"}}
+	_, err = repository.PutEventAndDisposition(ctx, acknowledged, failedAudit, failedDisposition)
+	require.Error(t, err)
+	stored, err := repository.GetEvent(ctx, scope, event.ID)
+	require.NoError(t, err)
+	require.Equal(t, EventFiring, stored.State, "event and audit roll back when disposition persistence fails")
+	var failedAuditCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT COUNT(*) FROM alert_audit_log WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, failedAudit.ID).Scan(&failedAuditCount))
+	require.Zero(t, failedAuditCount)
+
+	_, err = database.ExecContext(ctx, "DROP TRIGGER fail_forced_disposition ON alert_event_dispositions")
+	require.NoError(t, err)
+	validDisposition := failedDisposition
+	validDisposition.ID, validDisposition.Category = "disposition-ack", "investigating"
+	validAudit := failedAudit
+	validAudit.ID = "audit-ack"
+	validAudit.Details["category"] = "investigating"
+	_, err = repository.PutEventAndDisposition(ctx, acknowledged, validAudit, validDisposition)
+	require.NoError(t, err)
+
+	rootAt := now.Add(3 * time.Minute)
+	root := EventDisposition{ID: "disposition-root", Scope: scope, EventID: event.ID, Kind: DispositionRootCause, Category: "database_capacity", Reason: "connection pool exhausted", Actor: "operator-2", OccurredAt: rootAt}
+	rootAudit := AuditRecord{ID: "audit-root", Scope: scope, Actor: root.Actor, Action: "event.root_cause", TargetID: event.ID, OccurredAt: rootAt, Details: map[string]string{"category": root.Category, "reason_present": "true"}}
+	require.NoError(t, repository.AppendEventDisposition(ctx, root, rootAudit))
+	values, err := repository.ListEventDispositions(ctx, scope, event.ID, 10, 0)
+	require.NoError(t, err)
+	require.Len(t, values, 2)
+	require.Equal(t, DispositionRootCause, values[0].Kind)
+
+	_, err = database.ExecContext(ctx, "UPDATE alert_event_dispositions SET reason = 'rewritten' WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, root.ID)
+	require.ErrorContains(t, err, "append-only")
+	otherScope := Scope{TenantID: scope.TenantID, ProjectID: "other-project"}
+	values, err = repository.ListEventDispositions(ctx, otherScope, event.ID, 10, 0)
+	require.NoError(t, err)
+	require.Empty(t, values)
+}
+
+func TestPostgresEventCursorAndAggregateCoverMoreThanFiveHundredRows(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL event pagination integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchema(t, ctx, dsn)
+	repository := NewPostgresRepository(database)
+	scope := Scope{TenantID: "tenant-pagination", ProjectID: "project-pagination"}
+	rule := AlertRule{ID: "rule-pagination", Scope: scope, Name: "pagination", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: true}
+	_, err := repository.CreateRule(ContextWithAuditActor(ctx, "operator"), rule)
+	require.NoError(t, err)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, err = database.ExecContext(ctx, `INSERT INTO alert_events (id, tenant_id, project_id, rule_id, fingerprint, state, first_seen, last_seen, firing_at, last_actor)
+		SELECT 'event-' || lpad(value::text, 4, '0'), $1, $2, $3, 'fingerprint-' || value::text, 'firing', $4, $4, $4, 'system:evaluator'
+		FROM generate_series(0, 500) AS value`, scope.TenantID, scope.ProjectID, rule.ID, now)
+	require.NoError(t, err)
+
+	counts, err := repository.CountEventsByState(ctx, scope)
+	require.NoError(t, err)
+	require.Equal(t, 501, counts[EventFiring])
+	first, err := repository.ListEvents(ctx, scope, EventFilter{Limit: 500, OrderByID: true})
+	require.NoError(t, err)
+	require.Len(t, first, 500)
+	require.Equal(t, "event-0499", first[len(first)-1].ID)
+
+	_, err = database.ExecContext(ctx, "UPDATE alert_events SET last_seen = $1, firing_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = 'event-0000'", now.Add(time.Minute), scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	second, err := repository.ListEvents(ctx, scope, EventFilter{Limit: 500, OrderByID: true, AfterID: first[len(first)-1].ID})
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	require.Equal(t, "event-0500", second[0].ID, "last_seen changes cannot reorder the dispatch cursor")
+}
+
+func TestPostgresRejectsRawSecretsBeforeAnyControlPlaneTableWrite(t *testing.T) {
+	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL secret-boundary integration tests")
+	}
+	dsn := os.Getenv("DBPILOT_ALERT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ALERT_POSTGRES_DSN is required when DBPILOT_ALERT_POSTGRES_INTEGRATION=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	database, _ := setupNotificationIntegrationSchema(t, ctx, dsn)
+	repository := NewPostgresRepository(database)
+	scope := Scope{TenantID: "tenant-secret", ProjectID: "project-secret"}
+	actorCtx := ContextWithAuditActor(ctx, "operator")
+	now := time.Now().UTC()
+
+	_, err := repository.CreateNotificationPolicy(actorCtx, NotificationPolicy{ID: "policy-secret", Scope: scope, Name: "unsafe", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "password=hunter2", TemplateID: "template-secret", Enabled: true})
+	require.Error(t, err)
+	_, err = repository.CreateRule(actorCtx, AlertRule{ID: "rule-secret", Scope: scope, Name: "unsafe", Metric: "db.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Labels: map[string]string{"api_token": "hunter2"}, Enabled: true})
+	require.Error(t, err)
+	_, err = repository.CreateSilence(actorCtx, Silence{ID: "silence-secret", Scope: scope, Matchers: map[string]string{"label.host": "password=hunter2"}, StartsAt: now, EndsAt: now.Add(time.Hour), CreatedBy: "operator", Reason: "maintenance"})
+	require.Error(t, err)
+	err = repository.Append(ctx, []MetricSample{{Scope: scope, AgentID: "agent-secret", Name: "db.cpu", Labels: map[string]string{"instance": "db-1", "component": "postgres", "role": "db", "host": "db-1", "password": "hunter2"}, Value: 1, SampledAt: now}})
+	require.Error(t, err)
+	delivery := NotificationDelivery{ID: "delivery-secret", IdempotencyKey: "delivery-secret", Scope: scope, EventID: "event-secret", PolicyID: "policy-secret", EventState: EventFiring, Status: DeliveryAttempting, Attempts: 1, AttemptedAt: now, LeaseOwner: "worker", LeaseExpiresAt: now.Add(time.Minute), Request: DeliveryRequest{Scope: scope, EventID: "event-secret", PolicyID: "policy-secret", State: EventFiring, Channel: "webhook", TemplateID: "template-secret", TemplateVersion: "1", Target: "https://allowed.example/hook", SecretRef: "hunter2"}}
+	reserved, err := repository.ReserveNotificationDelivery(ctx, delivery, nil)
+	require.False(t, reserved)
+	require.Error(t, err)
+	err = repository.AppendAudit(ctx, AuditRecord{ID: "audit-secret", Scope: scope, Actor: "operator", Action: "evaluation.failed", TargetID: "rule-secret", OccurredAt: now, Details: map[string]string{"failure_kind": "password=hunter2"}})
+	require.Error(t, err)
+
+	for _, assertion := range []string{
+		"SELECT COUNT(*) FROM notification_policies WHERE tenant_id = $1 AND project_id = $2",
+		"SELECT COUNT(*) FROM alert_rules WHERE tenant_id = $1 AND project_id = $2",
+		"SELECT COUNT(*) FROM alert_silences WHERE tenant_id = $1 AND project_id = $2",
+		"SELECT COUNT(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2",
+		"SELECT COUNT(*) FROM notification_deliveries WHERE tenant_id = $1 AND project_id = $2",
+		"SELECT COUNT(*) FROM alert_audit_log WHERE tenant_id = $1 AND project_id = $2",
+	} {
+		var count int
+		require.NoError(t, database.QueryRowContext(ctx, assertion, scope.TenantID, scope.ProjectID).Scan(&count))
+		require.Zero(t, count, assertion)
+	}
+}
+
 func TestPostgresRetryClaimsEachSlowDeliveryJustInTime(t *testing.T) {
 	if os.Getenv("DBPILOT_ALERT_POSTGRES_INTEGRATION") != "1" {
 		t.Skip("set DBPILOT_ALERT_POSTGRES_INTEGRATION=1 to run PostgreSQL notification integration tests")
@@ -379,7 +727,7 @@ func TestPostgresRetryClaimsEachSlowDeliveryJustInTime(t *testing.T) {
 	repositoryOne := NewPostgresRepository(database)
 	for index := 1; index <= 3; index++ {
 		eventID := fmt.Sprintf("event-jit-%d", index)
-		request := DeliveryRequest{Scope: scope, EventID: eventID, State: EventFiring, Channel: "slow", PolicyID: "policy-jit", TemplateID: "template-jit", TemplateVersion: "1", Target: "recipient", Subject: "subject", Body: "body"}
+		request := DeliveryRequest{Scope: scope, EventID: eventID, State: EventFiring, Channel: "in_app", PolicyID: "policy-jit", TemplateID: "template-jit", TemplateVersion: "1", Target: "recipient", Subject: "subject", Body: "body"}
 		delivery := newNotificationDelivery(request, AlertEvent{ID: eventID, Scope: scope}, dueAt)
 		delivery.LeaseOwner = "seed-owner"
 		delivery.LeaseExpiresAt = dueAt
@@ -391,7 +739,7 @@ func TestPostgresRetryClaimsEachSlowDeliveryJustInTime(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	channel := &slowCountingChannel{name: "slow", delay: 40 * time.Millisecond, started: make(chan string, 8), counts: make(map[string]int)}
+	channel := &slowCountingChannel{name: "in_app", delay: 40 * time.Millisecond, started: make(chan string, 8), counts: make(map[string]int)}
 	workerOne := NewDispatcher(repositoryOne, []DeliveryChannel{channel}, time.Now, nil)
 	workerTwo := NewDispatcher(NewPostgresRepository(databaseTwo), []DeliveryChannel{channel}, time.Now, nil)
 	workerOne.lease, workerTwo.lease = 50*time.Millisecond, 50*time.Millisecond
@@ -445,7 +793,7 @@ func (channel *slowCountingChannel) Deliver(ctx context.Context, request Deliver
 }
 
 func setupNotificationIntegrationSchema(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {
-	return setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0002_notification_delivery_control.sql")
+	return setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0002_notification_delivery_control.sql", "0005_alert_control_plane_integrity.sql")
 }
 
 func setupNotificationIntegrationSchemaThrough(t *testing.T, ctx context.Context, dsn string, migrations ...string) (*sql.DB, string) {
@@ -576,7 +924,7 @@ func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
 	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "metric-batch-writer-2"), "")
 	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
 
-	sample := MetricSample{Scope: Scope{TenantID: "tenant-a", ProjectID: "project-a"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{"instance": "db-a"}, Value: 12, SampledAt: time.Now().UTC()}
+	sample := MetricSample{Scope: Scope{TenantID: "tenant-a", ProjectID: "project-a"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{"instance": "db-a", "component": "postgres", "role": "db", "host": "db-a"}, Value: 12, SampledAt: time.Now().UTC()}
 	type result struct {
 		first bool
 		err   error

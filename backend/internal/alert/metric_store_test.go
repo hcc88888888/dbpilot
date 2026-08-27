@@ -62,16 +62,16 @@ func TestMetricStoreAppendUsesScopedSeriesIdentityAndCanonicalLabels(t *testing.
 		Scope:     alert.Scope{TenantID: "t1", ProjectID: "p1"},
 		AgentID:   "agent-a",
 		Name:      "db.connections",
-		Labels:    map[string]string{"role": "primary", "instance": "db-1"},
+		Labels:    canonicalMetricLabels(),
 		Value:     12,
 		SampledAt: sampledAt,
 	}
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
-		WithArgs("t1", "p1", "agent-a", "db.connections", agentSeriesFingerprint("agent-a", sample.Labels), canonicalJSON(`{"instance":"db-1","role":"primary"}`), 12.0, sampledAt).
+		WithArgs("t1", "p1", "agent-a", "db.connections", agentSeriesFingerprint("agent-a", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
-		WithArgs("t1", "p1", "agent-b", "db.connections", agentSeriesFingerprint("agent-b", sample.Labels), canonicalJSON(`{"instance":"db-1","role":"primary"}`), 12.0, sampledAt).
+		WithArgs("t1", "p1", "agent-b", "db.connections", agentSeriesFingerprint("agent-b", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -87,7 +87,7 @@ func TestMetricStoreAppendBatchCommitsReservationAndSamplesAtomically(t *testing
 	require.NoError(t, err)
 	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
 	sampledAt := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
-	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: sampledAt}
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: canonicalMetricLabels(), Value: 12, SampledAt: sampledAt}
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
@@ -105,7 +105,7 @@ func TestMetricStoreAppendBatchRollsBackFailureWithoutAcknowledging(t *testing.T
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
-	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: time.Now().UTC()}
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: canonicalMetricLabels(), Value: 12, SampledAt: time.Now().UTC()}
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
@@ -122,7 +122,7 @@ func TestMetricStoreAppendBatchFailsClosedWhenReservationCommitIsLost(t *testing
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
-	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: map[string]string{}, Value: 12, SampledAt: time.Now().UTC()}
+	sample := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: canonicalMetricLabels(), Value: 12, SampledAt: time.Now().UTC()}
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
@@ -154,7 +154,16 @@ func TestMetricStoreAppendBatchTreatsCommittedReservationAsDuplicate(t *testing.
 func canonicalJSON(value string) driver.Value { return []byte(value) }
 
 func agentSeriesFingerprint(agentID string, labels map[string]string) string {
-	return alert.SeriesFingerprint(map[string]string{"agent_id": agentID, "instance": labels["instance"], "role": labels["role"]})
+	values := make(map[string]string, len(labels)+1)
+	for key, value := range labels {
+		values[key] = value
+	}
+	values["agent_id"] = agentID
+	return alert.SeriesFingerprint(values)
+}
+
+func canonicalMetricLabels() map[string]string {
+	return map[string]string{"instance": "db-1", "component": "postgres", "role": "primary", "host": "db-a"}
 }
 
 func TestMetricStoreQueryDoesNotTreatMissingLabelAsEmptyValue(t *testing.T) {

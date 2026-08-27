@@ -59,6 +59,19 @@ func (template NotificationTemplate) Version() string {
 	return template.ID
 }
 
+// Version changes whenever persisted policy routing configuration changes.
+// It is part of the delivery identity so a deliberate target/configuration
+// revision can be delivered once without colliding with the previous route.
+func (policy NotificationPolicy) Version() string {
+	if !policy.UpdatedAt.IsZero() {
+		return policy.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if !policy.CreatedAt.IsZero() {
+		return policy.CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return policy.ID
+}
+
 // MarshalJSON exposes only whether authentication is configured. The secret
 // reference itself is an internal persistence concern.
 func (policy NotificationPolicy) MarshalJSON() ([]byte, error) {
@@ -77,6 +90,7 @@ type DeliveryRequest struct {
 	Severity        string            `json:"severity"`
 	Channel         string            `json:"channel"`
 	PolicyID        string            `json:"policy_id"`
+	PolicyVersion   string            `json:"policy_version"`
 	TemplateID      string            `json:"template_id"`
 	TemplateVersion string            `json:"template_version"`
 	Target          string            `json:"target"`
@@ -148,8 +162,12 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, event AlertEvent, st
 	if dispatcher == nil || dispatcher.repository == nil || event.Validate() != nil || state != event.State {
 		return ErrInvalidNotification
 	}
+	now := dispatcher.now().UTC()
 	rule, err := dispatcher.repository.GetRule(ctx, event.Scope, event.RuleID)
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return dispatcher.repository.RecordOrphanedEvent(ctx, event, now)
+		}
 		return err
 	}
 	if rule.Scope != event.Scope {
@@ -159,7 +177,6 @@ func (dispatcher *Dispatcher) Dispatch(ctx context.Context, event AlertEvent, st
 	if err != nil {
 		return err
 	}
-	now := dispatcher.now().UTC()
 	silences, err := dispatcher.repository.ListActiveSilences(ctx, event.Scope, now)
 	if err != nil {
 		return err
@@ -330,8 +347,8 @@ func suppressedDeliveryRequest(route NotificationRoute, rule AlertRule, event Al
 	}
 	return DeliveryRequest{
 		Scope: event.Scope, EventID: event.ID, State: state, Severity: rule.Severity,
-		Channel: route.Policy.Channel, PolicyID: route.Policy.ID, TemplateID: templateID,
-		TemplateVersion: templateVersion, Target: route.Policy.Target,
+		Channel: route.Policy.Channel, PolicyID: route.Policy.ID, PolicyVersion: route.Policy.Version(), TemplateID: templateID,
+		TemplateVersion: templateVersion, Target: route.Policy.Target, SecretRef: route.Policy.SecretRef,
 	}
 }
 
@@ -347,7 +364,7 @@ func (dispatcher *Dispatcher) deliveryRequest(route NotificationRoute, rule Aler
 	}
 	return DeliveryRequest{
 		Scope: event.Scope, EventID: event.ID, State: state, Severity: rule.Severity,
-		Channel: route.Policy.Channel, PolicyID: route.Policy.ID,
+		Channel: route.Policy.Channel, PolicyID: route.Policy.ID, PolicyVersion: route.Policy.Version(),
 		TemplateID: route.Template.ID, TemplateVersion: route.Template.Version(),
 		Target: route.Policy.Target, SecretRef: route.Policy.SecretRef,
 		Subject: subject, Body: body, Labels: cloneMap(event.Labels),
@@ -355,12 +372,17 @@ func (dispatcher *Dispatcher) deliveryRequest(route NotificationRoute, rule Aler
 }
 
 func newNotificationDelivery(request DeliveryRequest, event AlertEvent, at time.Time) NotificationDelivery {
-	key := deliveryIdempotencyKey(event.ID, request.State, request.Channel, request.TemplateVersion)
+	key := deliveryIdempotencyKey(event.ID, request.State, request.Channel, request.PolicyID, request.PolicyVersion, request.TemplateVersion)
 	request.DeliveryID = key
 	return NotificationDelivery{ID: key, Scope: event.Scope, EventID: event.ID, PolicyID: request.PolicyID, EventState: request.State, IdempotencyKey: key, Status: DeliveryAttempting, Attempts: 1, AttemptedAt: at, Request: request}
 }
 
-func deliveryIdempotencyKey(eventID string, state EventState, channel, templateVersion string) string {
+func deliveryIdempotencyKey(eventID string, state EventState, channel, policyID, policyVersion, templateVersion string) string {
+	digest := sha256.Sum256([]byte(canonicalParts("dbpilot.delivery.v2", eventID, string(state), channel, policyID, policyVersion, templateVersion)))
+	return hex.EncodeToString(digest[:])
+}
+
+func legacyDeliveryIdempotencyKey(eventID string, state EventState, channel, templateVersion string) string {
 	digest := sha256.Sum256([]byte(eventID + string(state) + channel + templateVersion))
 	return hex.EncodeToString(digest[:])
 }
@@ -381,7 +403,8 @@ func routeMatches(route NotificationRoute, rule AlertRule, event AlertEvent, at 
 		labels = route.MatchLabels
 	}
 	for key, value := range labels {
-		if event.Labels[key] != value {
+		actual, present := event.Labels[key]
+		if !present || actual != value {
 			return false
 		}
 	}
@@ -428,8 +451,11 @@ func validateNotificationPolicy(policy NotificationPolicy) error {
 	}
 	switch policy.Channel {
 	case "in_app":
+		if strings.TrimSpace(policy.SecretRef) != "" {
+			return ErrInvalidNotification
+		}
 	case "smtp", "webhook":
-		if strings.TrimSpace(policy.SecretRef) == "" {
+		if ValidateSecretReference(policy.SecretRef) != nil {
 			return ErrInvalidNotification
 		}
 	default:
@@ -439,6 +465,9 @@ func validateNotificationPolicy(policy NotificationPolicy) error {
 		if !allowedSeverity(severity) {
 			return ErrInvalidNotification
 		}
+	}
+	if !validLabelMatchers(policy.MatchLabels) {
+		return ErrInvalidNotification
 	}
 	if (policy.WindowStartUTC == "") != (policy.WindowEndUTC == "") {
 		return ErrInvalidNotification
@@ -452,6 +481,47 @@ func validateNotificationPolicy(policy NotificationPolicy) error {
 		}
 	}
 	return nil
+}
+
+// ValidateSecretReference accepts the only reference syntax implemented by
+// the production resolver. Raw credentials and unsupported schemes therefore
+// fail before any policy or delivery row is written.
+func ValidateSecretReference(ref string) error {
+	const prefix = "env://"
+	if !strings.HasPrefix(ref, prefix) {
+		return ErrInvalidNotification
+	}
+	name := strings.TrimPrefix(ref, prefix)
+	if name == "" {
+		return ErrInvalidNotification
+	}
+	for index, character := range name {
+		if (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') || character == '_' || (index > 0 && character >= '0' && character <= '9') {
+			continue
+		}
+		return ErrInvalidNotification
+	}
+	return nil
+}
+
+func validSilenceMatchers(matchers map[string]string) bool {
+	for key, value := range matchers {
+		if strings.TrimSpace(value) == "" || sensitiveField(key) || containsSecretMaterial(value) {
+			return false
+		}
+		switch key {
+		case "fingerprint", "resource", "tenant_id", "project_id", "scope":
+			continue
+		}
+		if strings.HasPrefix(key, "label.") || strings.HasPrefix(key, "resource.") {
+			name := strings.TrimPrefix(strings.TrimPrefix(key, "label."), "resource.")
+			if validLabelName(name) && !sensitiveField(name) {
+				continue
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func validateNotificationTemplate(template NotificationTemplate) error {
@@ -499,13 +569,18 @@ func matchingSilence(silences []Silence, event AlertEvent, at time.Time) bool {
 			case key == "scope":
 				matched = event.Scope.Key() == value
 			case key == "resource":
-				matched = event.Labels["resource"] == value || event.Labels["resource_id"] == value
+				resource, resourcePresent := event.Labels["resource"]
+				resourceID, resourceIDPresent := event.Labels["resource_id"]
+				matched = (resourcePresent && resource == value) || (resourceIDPresent && resourceID == value)
 			case strings.HasPrefix(key, "resource."):
-				matched = event.Labels[strings.TrimPrefix(key, "resource.")] == value
+				actual, present := event.Labels[strings.TrimPrefix(key, "resource.")]
+				matched = present && actual == value
 			case strings.HasPrefix(key, "label."):
-				matched = event.Labels[strings.TrimPrefix(key, "label.")] == value
+				actual, present := event.Labels[strings.TrimPrefix(key, "label.")]
+				matched = present && actual == value
 			default:
-				matched = event.Labels[key] == value
+				actual, present := event.Labels[key]
+				matched = present && actual == value
 			}
 			if !matched {
 				break

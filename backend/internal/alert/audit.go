@@ -69,7 +69,7 @@ func (record AuditRecord) Validate() error {
 
 func allowedAuditAction(action string) bool {
 	switch action {
-	case "rule.created", "rule.updated", "rule.deleted", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "evaluation.failed", "policy.created", "policy.updated", "policy.deleted", "template.created", "template.updated", "template.deleted", "silence.created", "silence.updated", "silence.deleted", "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
+	case "rule.created", "rule.updated", "rule.deleted", "event.pending", "event.firing", "event.acknowledged", "event.resolved", "event.root_cause", "evaluation.failed", "policy.created", "policy.updated", "policy.deleted", "template.created", "template.updated", "template.deleted", "silence.created", "silence.updated", "silence.deleted", "delivery.suppressed", "delivery.delivered", "delivery.retrying", "delivery.retry_scheduled", "delivery.abandoned":
 		return true
 	default:
 		return false
@@ -139,9 +139,31 @@ func allowedAuditDetail(action, key, value string) bool {
 		case "missing":
 			_, err := strconv.ParseBool(value)
 			return err == nil
+		case "missing_dimensions":
+			for _, dimension := range strings.Split(value, ",") {
+				if !containsString(canonicalResourceDimensions[:], dimension) {
+					return false
+				}
+			}
+			return value != ""
 		case "aggregate", "rate":
 			parsed, err := strconv.ParseFloat(value, 64)
 			return err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0)
+		case "failure_kind":
+			return value == "rule_evaluation" || value == "no_data" || value == "evaluation_delay" || value == "queue_backlog"
+		case "category":
+			return validIdentifier(value)
+		case "reason_present":
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
+		}
+	case "event.root_cause":
+		if key == "category" {
+			return validIdentifier(value)
+		}
+		if key == "reason_present" {
+			parsed, err := strconv.ParseBool(value)
+			return err == nil && parsed
 		}
 	case "evaluation.failed":
 		return key == "failure_kind" && value == "rule_evaluation"
@@ -196,7 +218,9 @@ func knownAuditDetailKey(action, key string) bool {
 	case "rule.created", "rule.updated":
 		return key == "aggregation" || key == "operator" || key == "severity" || key == "enabled" || key == "threshold"
 	case "event.pending", "event.firing", "event.acknowledged", "event.resolved":
-		return key == "state" || key == "window_start" || key == "window_end" || key == conditionSinceEvidenceKey || key == "samples" || key == "missing" || key == "aggregate" || key == "rate"
+		return key == "state" || key == "window_start" || key == "window_end" || key == conditionSinceEvidenceKey || key == "samples" || key == "missing" || key == "missing_dimensions" || key == "aggregate" || key == "rate" || key == "failure_kind" || key == "category" || key == "reason_present"
+	case "event.root_cause":
+		return key == "category" || key == "reason_present"
 	case "evaluation.failed":
 		return key == "failure_kind"
 	case "silence.created", "silence.updated", "silence.deleted":

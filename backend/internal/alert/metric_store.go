@@ -178,7 +178,38 @@ func validateMetricSample(sample MetricSample) error {
 	if sample.Scope.Validate() != nil || strings.TrimSpace(sample.AgentID) == "" || strings.TrimSpace(sample.Name) == "" || sample.SampledAt.IsZero() || math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
 		return ErrInvalidMetricSample
 	}
+	return ValidateMetricLabels(sample.Labels)
+}
+
+var canonicalResourceDimensions = [...]string{"instance", "component", "role", "host"}
+
+// ValidateMetricLabels enforces the canonical resource identity and rejects
+// secret-bearing data before it can reach metric storage or event evidence.
+func ValidateMetricLabels(labels map[string]string) error {
+	if labels == nil {
+		return fmt.Errorf("%w: labels are required", ErrInvalidMetricSample)
+	}
+	if missing := MissingResourceDimensions(labels); len(missing) > 0 {
+		return fmt.Errorf("%w: missing canonical resource dimension %s", ErrInvalidMetricSample, strings.Join(missing, ","))
+	}
+	for key, value := range labels {
+		if strings.TrimSpace(key) == "" || sensitiveField(key) || containsSecretMaterial(value) {
+			return fmt.Errorf("%w: unsafe metric label", ErrInvalidMetricSample)
+		}
+	}
 	return nil
+}
+
+// MissingResourceDimensions returns canonical names in stable order so the
+// evaluator can retain secret-safe evidence for malformed historical input.
+func MissingResourceDimensions(labels map[string]string) []string {
+	missing := make([]string, 0, len(canonicalResourceDimensions))
+	for _, dimension := range canonicalResourceDimensions {
+		if strings.TrimSpace(labels[dimension]) == "" {
+			missing = append(missing, dimension)
+		}
+	}
+	return missing
 }
 
 func validateMetricQuery(query MetricQuery) error {

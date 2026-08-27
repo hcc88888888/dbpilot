@@ -114,13 +114,17 @@ func TestPostgresRuleWritesIncludeImmutableAuditActions(t *testing.T) {
 	repository := NewPostgresRepository(db)
 	rule := ruleWithScope()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)INSERT INTO alert_rules.*INSERT INTO alert_audit_log.*rule\.created`).
 		WillReturnRows(sqlmock.NewRows(ruleColumnNames()).AddRow(ruleColumnValues(rule)...))
+	mock.ExpectCommit()
 	_, err = repository.CreateRule(ContextWithAuditActor(context.Background(), "operator-a"), rule)
 	require.NoError(t, err)
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)UPDATE alert_rules.*INSERT INTO alert_audit_log.*rule\.updated`).
 		WillReturnRows(sqlmock.NewRows(ruleColumnNames()).AddRow(ruleColumnValues(rule)...))
+	mock.ExpectCommit()
 	_, err = repository.UpdateRule(ContextWithAuditActor(context.Background(), "operator-b"), rule)
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -289,9 +293,11 @@ func TestPostgresRuleAuditUsesTrustedContextActor(t *testing.T) {
 		require.NoError(t, db.Close())
 	})
 	rule := ruleWithScope()
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)INSERT INTO alert_rules.*rule\.created`).
-		WithArgs(rule.ID, "t1", "p1", rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.For), rule.MissingData, rule.Severity, sqlmock.AnyArg(), sqlmock.AnyArg(), rule.Enabled, "alice").
+		WithArgs(rule.ID, "t1", "p1", rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.EffectiveLookbackWindow()), int64(rule.For), rule.MissingData, rule.Severity, sqlmock.AnyArg(), sqlmock.AnyArg(), rule.Enabled, "alice").
 		WillReturnRows(sqlmock.NewRows(ruleColumnNames()).AddRow(ruleColumnValues(rule)...))
+	mock.ExpectCommit()
 
 	_, err = NewPostgresRepository(db).CreateRule(ContextWithAuditActor(context.Background(), "alice"), rule)
 	require.NoError(t, err)
@@ -359,11 +365,11 @@ func ruleWithScope() AlertRule {
 }
 
 func ruleColumnNames() []string {
-	return []string{"id", "tenant_id", "project_id", "name", "metric", "aggregation", "operator", "threshold", "evaluation_every_ns", "for_duration_ns", "missing_data", "severity", "notification_policy_ids", "labels", "enabled", "created_at", "updated_at"}
+	return []string{"id", "tenant_id", "project_id", "name", "metric", "aggregation", "operator", "threshold", "evaluation_every_ns", "lookback_window_ns", "for_duration_ns", "missing_data", "severity", "notification_policy_ids", "labels", "enabled", "created_at", "updated_at"}
 }
 
 func ruleColumnValues(rule AlertRule) []driver.Value {
-	return []driver.Value{rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.For), rule.MissingData, rule.Severity, "{}", []byte(`{}`), rule.Enabled, rule.CreatedAt, rule.UpdatedAt}
+	return []driver.Value{rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, int64(rule.EvaluationEvery), int64(rule.EffectiveLookbackWindow()), int64(rule.For), rule.MissingData, rule.Severity, "{}", []byte(`{}`), rule.Enabled, rule.CreatedAt, rule.UpdatedAt}
 }
 
 func eventColumnNames() []string {

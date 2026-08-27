@@ -45,6 +45,36 @@ func TestMetricConsumerResolvesScopeAndNormalizesMetricSample(t *testing.T) {
 	require.Equal(t, "db-1", store.samples[0].InstanceID)
 }
 
+func TestMetricConsumerRejectsEachMissingCanonicalResourceDimension(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	for _, missing := range []string{"instance", "component", "role", "host"} {
+		t.Run(missing, func(t *testing.T) {
+			labels := map[string]string{"instance": "db-1", "component": "postgres", "role": "primary", "host": "db-1.internal"}
+			delete(labels, missing)
+			payload := fmt.Sprintf(`{"samples":[{"name":"db.connections","value":12,"sampled_at":"2026-08-26T09:59:00Z","labels":{"instance":%q,"component":%q,"role":%q,"host":%q}}]}`,
+				labels["instance"], labels["component"], labels["role"], labels["host"])
+			err := consumer.ConsumeMetricBatch(context.Background(), "agent-a", []byte(payload), now)
+			require.ErrorContains(t, err, missing)
+		})
+	}
+}
+
+func TestMetricConsumerRejectsSensitiveLabelsBeforePersistence(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	for _, label := range []string{
+		`"password":"hunter2"`,
+		`"note":"token=abcdef"`,
+	} {
+		payload := fmt.Sprintf(`{"samples":[{"name":"db.connections","value":12,"sampled_at":"2026-08-26T09:59:00Z","labels":{"instance":"db-1","component":"postgres","role":"primary","host":"db-1.internal",%s}}]}`, label)
+		err := consumer.ConsumeMetricBatch(context.Background(), "agent-a", []byte(payload), now)
+		require.Error(t, err)
+	}
+	require.Empty(t, store.samples)
+}
+
 func TestMetricConsumerRejectsInvalidEnvelopeAndUnknownAgentScope(t *testing.T) {
 	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
@@ -71,7 +101,7 @@ func TestMetricConsumerAtomicallyStoresBatchIdentityWithSamples(t *testing.T) {
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
 	now := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
 
-	first, err := consumer.ConsumeMetricBatchOnce(context.Background(), "agent-a", "batch-a", []byte(`{"samples":[{"name":"db.connections","value":12,"sampled_at":"2026-08-26T09:59:00Z","labels":{}}]}`), now)
+	first, err := consumer.ConsumeMetricBatchOnce(context.Background(), "agent-a", "batch-a", []byte(`{"samples":[{"name":"db.connections","value":12,"sampled_at":"2026-08-26T09:59:00Z","labels":{"instance":"db-1","component":"postgres","role":"primary","host":"db-1.internal"}}]}`), now)
 	require.NoError(t, err)
 	require.True(t, first)
 	require.Equal(t, "agent-a", store.agentID)

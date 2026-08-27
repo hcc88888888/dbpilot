@@ -17,21 +17,25 @@ import (
 )
 
 var (
-	ErrNotFound = errors.New("alert record not found")
+	ErrNotFound               = errors.New("alert record not found")
+	ErrConfigurationInUse     = errors.New("alert configuration is in use")
+	ErrInvalidPolicyReference = errors.New("alert rule references an unavailable notification policy")
+	ErrRuleScheduleLeaseLost  = errors.New("alert rule evaluation lease was lost")
 )
 
-const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
+const ruleColumnsSQL = "id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, lookback_window_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled, created_at, updated_at"
 const eventColumnsSQL = "id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor"
 const eventUpsertSQL = "INSERT INTO alert_events (id, tenant_id, project_id, rule_id, fingerprint, labels, evidence, state, first_seen, last_seen, firing_at, acknowledged_at, resolved_at, last_actor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, fingerprint) DO UPDATE SET labels = EXCLUDED.labels, evidence = EXCLUDED.evidence, state = EXCLUDED.state, last_seen = EXCLUDED.last_seen, firing_at = EXCLUDED.firing_at, acknowledged_at = EXCLUDED.acknowledged_at, resolved_at = EXCLUDED.resolved_at, last_actor = EXCLUDED.last_actor RETURNING " + eventColumnsSQL
 const eventAdvisoryLockSQL = "SELECT pg_advisory_xact_lock($1)"
 const eventLockSQL = "SELECT " + eventColumnsSQL + " FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND fingerprint = $3 FOR UPDATE"
 const auditInsertSQL = "INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+const dispositionInsertSQL = "INSERT INTO alert_event_dispositions (id, tenant_id, project_id, event_id, kind, category, reason, actor, occurred_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const notificationRouteSQL = "SELECT p.id AS policy_id, p.tenant_id AS policy_tenant_id, p.project_id AS policy_project_id, p.name AS policy_name, p.channel, p.target, p.secret_ref, COALESCE(p.template_id, ''), p.severities, p.match_labels, COALESCE(to_char(p.window_start_utc, 'HH24:MI'), '') AS window_start_utc, COALESCE(to_char(p.window_end_utc, 'HH24:MI'), '') AS window_end_utc, p.enabled, p.created_at AS policy_created_at, p.updated_at AS policy_updated_at, t.id AS resolved_template_id, t.tenant_id AS template_tenant_id, t.project_id AS template_project_id, t.name AS template_name, t.subject, t.body, t.revision AS template_revision, t.legacy_version_from_updated_at, t.created_at AS template_created_at, t.updated_at AS template_updated_at FROM alert_rules r JOIN notification_policies p ON p.tenant_id = r.tenant_id AND p.project_id = r.project_id AND p.id = ANY(r.notification_policy_ids) LEFT JOIN notification_templates t ON t.tenant_id = p.tenant_id AND t.project_id = p.project_id AND t.id = p.template_id WHERE r.tenant_id = $1 AND r.project_id = $2 AND r.id = $3 ORDER BY p.id ASC"
 const notificationPolicyColumnsSQL = "id, tenant_id, project_id, name, channel, target, secret_ref, template_id, severities, match_labels, COALESCE(to_char(window_start_utc, 'HH24:MI'), ''), COALESCE(to_char(window_end_utc, 'HH24:MI'), ''), enabled, created_at, updated_at"
 const notificationTemplateColumnsSQL = "id, tenant_id, project_id, name, subject, body, revision, legacy_version_from_updated_at, created_at, updated_at"
 const notificationDeliveryColumnsSQL = "id, tenant_id, project_id, event_id, policy_id, idempotency_key, event_state, channel, template_id, template_version, status, attempts, attempted_at, next_attempt_at, delivered_at, lease_owner, lease_expires_at, failure_class, request_target, request_subject, request_body, request_labels, request_secret_ref"
 const qualifiedNotificationDeliveryColumnsSQL = "d.id, d.tenant_id, d.project_id, d.event_id, d.policy_id, d.idempotency_key, d.event_state, d.channel, d.template_id, d.template_version, d.status, d.attempts, d.attempted_at, d.next_attempt_at, d.delivered_at, d.lease_owner, d.lease_expires_at, d.failure_class, d.request_target, d.request_subject, d.request_body, d.request_labels, d.request_secret_ref"
-const deliveryInsertSQL = "INSERT INTO notification_deliveries (" + notificationDeliveryColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT (tenant_id, project_id, idempotency_key) DO NOTHING"
+const deliveryInsertSQL = "INSERT INTO notification_deliveries (" + notificationDeliveryColumnsSQL + ") SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23 WHERE NOT EXISTS (SELECT 1 FROM notification_deliveries existing WHERE existing.tenant_id = $2 AND existing.project_id = $3 AND (existing.idempotency_key = $6 OR (existing.idempotency_key = $24 AND existing.policy_id = $5 AND existing.event_state = $7 AND existing.channel = $8 AND existing.template_id = $9 AND existing.template_version = $10 AND existing.request_target = $19 AND existing.request_secret_ref = $23))) ON CONFLICT (tenant_id, project_id, idempotency_key) DO NOTHING"
 const deliveryUpdateSQL = "UPDATE notification_deliveries SET status = $1, attempted_at = $2, next_attempt_at = $3, delivered_at = $4, lease_owner = $5, lease_expires_at = $6, failure_class = $7 WHERE tenant_id = $8 AND project_id = $9 AND id = $10 AND status = 'attempting' AND lease_owner = $11"
 const claimDeliveriesSQL = "WITH candidates AS (SELECT tenant_id, project_id, id FROM notification_deliveries WHERE ((status = 'retry_scheduled' AND next_attempt_at <= $1) OR (status = 'attempting' AND lease_expires_at <= $1)) AND idempotency_key <> '' AND event_state IN ('pending', 'firing', 'acknowledged', 'resolved') AND channel <> '' AND template_id <> '' AND template_version <> '' AND attempts >= 1 ORDER BY COALESCE(next_attempt_at, lease_expires_at), attempted_at FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE notification_deliveries AS d SET status = 'attempting', attempts = d.attempts + 1, attempted_at = $1, next_attempt_at = NULL, lease_owner = $3, lease_expires_at = $4 FROM candidates AS c WHERE d.tenant_id = c.tenant_id AND d.project_id = c.project_id AND d.id = c.id RETURNING " + qualifiedNotificationDeliveryColumnsSQL + ") SELECT " + notificationDeliveryColumnsSQL + " FROM claimed ORDER BY attempted_at, id"
 
@@ -48,22 +52,14 @@ func (r *PostgresRepository) NewID(prefix string) (string, error) {
 }
 
 func (r *PostgresRepository) CreateRule(ctx context.Context, rule AlertRule) (AlertRule, error) {
-	if err := rule.Validate(); err != nil {
-		return AlertRule{}, err
-	}
-	actor, err := auditActorFromContext(ctx)
-	if err != nil {
-		return AlertRule{}, err
-	}
-	labels, err := marshalMap(rule.Labels)
-	if err != nil {
-		return AlertRule{}, err
-	}
-	query := "WITH changed AS (INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':created:' || created_at::text), tenant_id, project_id, $16, 'rule.created', id, created_at, jsonb_build_object('aggregation', aggregation, 'operator', operator, 'threshold', threshold::text, 'severity', severity, 'enabled', enabled::text) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
-	return scanRule(r.db.QueryRowContext(ctx, query, rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled, actor))
+	return r.mutateRule(ctx, rule, false)
 }
 
 func (r *PostgresRepository) UpdateRule(ctx context.Context, rule AlertRule) (AlertRule, error) {
+	return r.mutateRule(ctx, rule, true)
+}
+
+func (r *PostgresRepository) mutateRule(ctx context.Context, rule AlertRule, update bool) (AlertRule, error) {
 	if err := rule.Validate(); err != nil {
 		return AlertRule{}, err
 	}
@@ -75,12 +71,63 @@ func (r *PostgresRepository) UpdateRule(ctx context.Context, rule AlertRule) (Al
 	if err != nil {
 		return AlertRule{}, err
 	}
-	query := "WITH changed AS (UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ns = $6, for_duration_ns = $7, missing_data = $8, severity = $9, notification_policy_ids = $10, labels = $11, enabled = $12, updated_at = NOW() WHERE tenant_id = $13 AND project_id = $14 AND id = $15 RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':updated:' || updated_at::text), tenant_id, project_id, $16, 'rule.updated', id, updated_at, jsonb_build_object('aggregation', aggregation, 'operator', operator, 'threshold', threshold::text, 'severity', severity, 'enabled', enabled::text) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
-	rule, err = scanRule(r.db.QueryRowContext(ctx, query, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(rule.NotificationPolicyIDs), labels, rule.Enabled, rule.Scope.TenantID, rule.Scope.ProjectID, rule.ID, actor))
+	policyIDs := append([]string{}, rule.NotificationPolicyIDs...)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AlertRule{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := validateRulePolicyReferences(ctx, tx, rule.Scope, rule.NotificationPolicyIDs); err != nil {
+		return AlertRule{}, err
+	}
+	query := "WITH changed AS (INSERT INTO alert_rules (id, tenant_id, project_id, name, metric, aggregation, operator, threshold, evaluation_every_ns, lookback_window_ns, for_duration_ns, missing_data, severity, notification_policy_ids, labels, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':created:' || created_at::text), tenant_id, project_id, $17, 'rule.created', id, created_at, jsonb_build_object('aggregation', aggregation, 'operator', operator, 'threshold', threshold::text, 'severity', severity, 'enabled', enabled::text) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
+	args := []any{rule.ID, rule.Scope.TenantID, rule.Scope.ProjectID, rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.EffectiveLookbackWindow().Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(policyIDs), labels, rule.Enabled, actor}
+	if update {
+		query = "WITH changed AS (UPDATE alert_rules SET name = $1, metric = $2, aggregation = $3, operator = $4, threshold = $5, evaluation_every_ns = $6, lookback_window_ns = $7, for_duration_ns = $8, missing_data = $9, severity = $10, notification_policy_ids = $11, labels = $12, enabled = $13, next_evaluation_at = NOW(), evaluation_lease_owner = '', evaluation_lease_expires_at = NULL, updated_at = NOW() WHERE tenant_id = $14 AND project_id = $15 AND id = $16 RETURNING " + ruleColumnsSQL + "), audited AS (INSERT INTO alert_audit_log (id, tenant_id, project_id, actor, action, target_id, occurred_at, details) SELECT 'audit-' || md5(id || ':updated:' || updated_at::text), tenant_id, project_id, $17, 'rule.updated', id, updated_at, jsonb_build_object('aggregation', aggregation, 'operator', operator, 'threshold', threshold::text, 'severity', severity, 'enabled', enabled::text) FROM changed) SELECT " + ruleColumnsSQL + " FROM changed"
+		args = []any{rule.Name, rule.Metric, rule.Aggregation, rule.Operator, rule.Threshold, rule.EvaluationEvery.Nanoseconds(), rule.EffectiveLookbackWindow().Nanoseconds(), rule.For.Nanoseconds(), rule.MissingData, rule.Severity, pq.Array(policyIDs), labels, rule.Enabled, rule.Scope.TenantID, rule.Scope.ProjectID, rule.ID, actor}
+	}
+	stored, err := scanRule(tx.QueryRowContext(ctx, query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AlertRule{}, ErrNotFound
 	}
-	return rule, err
+	if err != nil {
+		return AlertRule{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AlertRule{}, err
+	}
+	return stored, nil
+}
+
+func validateRulePolicyReferences(ctx context.Context, tx *sql.Tx, scope Scope, policyIDs []string) error {
+	if len(policyIDs) == 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = ANY($3) ORDER BY id FOR SHARE", scope.TenantID, scope.ProjectID, pq.Array(policyIDs))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := make(map[string]struct{}, len(policyIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		found[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(found) != len(policyIDs) {
+		return ErrInvalidPolicyReference
+	}
+	for _, id := range policyIDs {
+		if _, ok := found[id]; !ok {
+			return ErrInvalidPolicyReference
+		}
+	}
+	return nil
 }
 
 func (r *PostgresRepository) ListRules(ctx context.Context, scope Scope) ([]AlertRule, error) {
@@ -105,6 +152,74 @@ func (r *PostgresRepository) ListRules(ctx context.Context, scope Scope) ([]Aler
 	return rules, rows.Err()
 }
 
+func (r *PostgresRepository) ClaimDueRules(ctx context.Context, scope Scope, at time.Time, owner string, leaseUntil time.Time, limit int) ([]DueAlertRule, int, error) {
+	if scope.Validate() != nil || at.IsZero() || strings.TrimSpace(owner) == "" || !leaseUntil.After(at) || limit <= 0 {
+		return nil, 0, ErrInvalidRule
+	}
+	if limit > maxDueRulesPerPass {
+		limit = maxDueRulesPerPass
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	const duePredicate = "tenant_id = $1 AND project_id = $2 AND enabled AND next_evaluation_at <= $3 AND (evaluation_lease_expires_at IS NULL OR evaluation_lease_expires_at <= $3)"
+	var dueCount int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM alert_rules WHERE "+duePredicate, scope.TenantID, scope.ProjectID, at).Scan(&dueCount); err != nil {
+		return nil, 0, err
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT "+ruleColumnsSQL+", next_evaluation_at FROM alert_rules WHERE "+duePredicate+" ORDER BY next_evaluation_at, id FOR UPDATE SKIP LOCKED LIMIT $4", scope.TenantID, scope.ProjectID, at, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	due := make([]DueAlertRule, 0, limit)
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		claimed, scanErr := scanDueRule(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			return nil, 0, scanErr
+		}
+		due = append(due, claimed)
+		ids = append(ids, claimed.Rule.ID)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, err
+	}
+	if len(ids) > 0 {
+		if _, err := tx.ExecContext(ctx, "UPDATE alert_rules SET evaluation_lease_owner = $1, evaluation_lease_expires_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND id = ANY($5)", owner, leaseUntil, scope.TenantID, scope.ProjectID, pq.Array(ids)); err != nil {
+			return nil, 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	queueDepth := dueCount - len(due)
+	if queueDepth < 0 {
+		queueDepth = 0
+	}
+	return due, queueDepth, nil
+}
+
+func (r *PostgresRepository) CompleteRuleEvaluation(ctx context.Context, scope Scope, ruleID, owner string, evaluatedAt, nextAt time.Time) error {
+	if scope.Validate() != nil || !validIdentifier(ruleID) || strings.TrimSpace(owner) == "" || evaluatedAt.IsZero() || !nextAt.After(evaluatedAt) {
+		return ErrInvalidRule
+	}
+	result, err := r.db.ExecContext(ctx, "UPDATE alert_rules SET last_evaluated_at = $1, next_evaluation_at = $2, evaluation_lease_owner = '', evaluation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND evaluation_lease_owner = $6", evaluatedAt, nextAt, scope.TenantID, scope.ProjectID, ruleID, owner)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrRuleScheduleLeaseLost
+	}
+	return nil
+}
+
 func (r *PostgresRepository) GetRule(ctx context.Context, scope Scope, id string) (AlertRule, error) {
 	if err := scope.Validate(); err != nil {
 		return AlertRule{}, err
@@ -118,11 +233,11 @@ func (r *PostgresRepository) GetRule(ctx context.Context, scope Scope, id string
 }
 
 func (r *PostgresRepository) DeleteRule(ctx context.Context, scope Scope, id string) error {
-	return r.deleteConfiguration(ctx, scope, id, "alert_rules", "rule.deleted")
+	return r.deleteRule(ctx, scope, id)
 }
 
 func (r *PostgresRepository) PutEvent(ctx context.Context, event AlertEvent) (AlertEvent, error) {
-	return r.mutateEvent(ctx, event, nil)
+	return r.mutateEvent(ctx, event, nil, nil)
 }
 
 func (r *PostgresRepository) PutEventAndAudit(ctx context.Context, event AlertEvent, record AuditRecord) (AlertEvent, error) {
@@ -139,10 +254,37 @@ func (r *PostgresRepository) PutEventAndAudit(ctx context.Context, event AlertEv
 	if err := validateLifecycleAudit(event, record); err != nil {
 		return AlertEvent{}, ErrInvalidAuditRecord
 	}
-	return r.mutateEvent(ctx, event, &record)
+	return r.mutateEvent(ctx, event, &record, nil)
 }
 
-func (r *PostgresRepository) mutateEvent(ctx context.Context, event AlertEvent, suppliedAudit *AuditRecord) (AlertEvent, error) {
+func (r *PostgresRepository) PutEventAndDisposition(ctx context.Context, event AlertEvent, record AuditRecord, disposition EventDisposition) (AlertEvent, error) {
+	if err := disposition.Validate(); err != nil || disposition.Scope != event.Scope || disposition.EventID != event.ID || disposition.Actor != event.LastActor || !disposition.OccurredAt.Equal(event.LastSeen) {
+		return AlertEvent{}, ErrInvalidDisposition
+	}
+	wantKind := DispositionAcknowledgement
+	if event.State == EventResolved {
+		wantKind = DispositionResolution
+	}
+	if disposition.Kind != wantKind {
+		return AlertEvent{}, ErrInvalidDisposition
+	}
+	if err := event.Validate(); err != nil {
+		return AlertEvent{}, err
+	}
+	if err := validateAuditDetailTypes(record); err != nil {
+		return AlertEvent{}, err
+	}
+	record = sanitizeAuditRecord(record)
+	if err := record.Validate(); err != nil {
+		return AlertEvent{}, err
+	}
+	if err := validateLifecycleAudit(event, record); err != nil {
+		return AlertEvent{}, ErrInvalidAuditRecord
+	}
+	return r.mutateEvent(ctx, event, &record, &disposition)
+}
+
+func (r *PostgresRepository) mutateEvent(ctx context.Context, event AlertEvent, suppliedAudit *AuditRecord, suppliedDisposition *EventDisposition) (AlertEvent, error) {
 	if err := event.Validate(); err != nil {
 		return AlertEvent{}, err
 	}
@@ -176,6 +318,14 @@ func (r *PostgresRepository) mutateEvent(ctx context.Context, event AlertEvent, 
 			return AlertEvent{}, auditErr
 		}
 		if err := appendAudit(ctx, tx, record); err != nil {
+			return AlertEvent{}, err
+		}
+	}
+	if suppliedDisposition != nil {
+		if !stateChanged {
+			return AlertEvent{}, ErrInvalidDisposition
+		}
+		if err := insertEventDisposition(ctx, tx, *suppliedDisposition); err != nil {
 			return AlertEvent{}, err
 		}
 	}
@@ -332,11 +482,6 @@ func (r *PostgresRepository) ListEvents(ctx context.Context, scope Scope, filter
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	offset := filter.Offset
-	if offset < 0 {
-		offset = 0
-	}
-
 	query := "SELECT " + eventColumnsSQL + " FROM alert_events WHERE tenant_id = $1 AND project_id = $2"
 	arguments := []any{scope.TenantID, scope.ProjectID}
 	if len(filter.States) > 0 {
@@ -344,11 +489,26 @@ func (r *PostgresRepository) ListEvents(ctx context.Context, scope Scope, filter
 		for index, state := range filter.States {
 			states[index] = string(state)
 		}
-		query += " AND state = ANY($3) ORDER BY last_seen DESC LIMIT $4 OFFSET $5"
-		arguments = append(arguments, pq.Array(states), limit, offset)
+		arguments = append(arguments, pq.Array(states))
+		query += fmt.Sprintf(" AND state = ANY($%d)", len(arguments))
+	}
+	if filter.OrderByID {
+		if filter.AfterID != "" {
+			if len(filter.AfterID) > 512 || strings.ContainsRune(filter.AfterID, '\x00') {
+				return nil, ErrInvalidEvent
+			}
+			arguments = append(arguments, filter.AfterID)
+			query += fmt.Sprintf(" AND id > $%d", len(arguments))
+		}
+		arguments = append(arguments, limit)
+		query += fmt.Sprintf(" ORDER BY id ASC LIMIT $%d", len(arguments))
 	} else {
-		query += " ORDER BY last_seen DESC LIMIT $3 OFFSET $4"
+		offset := filter.Offset
+		if offset < 0 {
+			offset = 0
+		}
 		arguments = append(arguments, limit, offset)
+		query += fmt.Sprintf(" ORDER BY last_seen DESC, id ASC LIMIT $%d OFFSET $%d", len(arguments)-1, len(arguments))
 	}
 	rows, err := r.db.QueryContext(ctx, query, arguments...)
 	if err != nil {
@@ -365,6 +525,84 @@ func (r *PostgresRepository) ListEvents(ctx context.Context, scope Scope, filter
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+func (r *PostgresRepository) CountEventsByState(ctx context.Context, scope Scope) (map[EventState]int, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT state, COUNT(*) FROM alert_events WHERE tenant_id = $1 AND project_id = $2 GROUP BY state ORDER BY state", scope.TenantID, scope.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := make(map[EventState]int)
+	for rows.Next() {
+		var state EventState
+		var count int
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, err
+		}
+		if !allowedEventState(state) {
+			return nil, ErrInvalidEvent
+		}
+		counts[state] = count
+	}
+	return counts, rows.Err()
+}
+
+func (r *PostgresRepository) AppendEventDisposition(ctx context.Context, disposition EventDisposition, record AuditRecord) error {
+	if err := disposition.Validate(); err != nil || disposition.Kind != DispositionRootCause || record.Scope != disposition.Scope || record.TargetID != disposition.EventID || record.Actor != disposition.Actor || !record.OccurredAt.Equal(disposition.OccurredAt) || record.Action != "event.root_cause" {
+		return ErrInvalidDisposition
+	}
+	if err := validateAuditDetailTypes(record); err != nil {
+		return err
+	}
+	record = sanitizeAuditRecord(record)
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var eventID string
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR SHARE", disposition.Scope.TenantID, disposition.Scope.ProjectID, disposition.EventID).Scan(&eventID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if err := appendAudit(ctx, tx, record); err != nil {
+		return err
+	}
+	if err := insertEventDisposition(ctx, tx, disposition); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *PostgresRepository) ListEventDispositions(ctx context.Context, scope Scope, eventID string, limit, offset int) ([]EventDisposition, error) {
+	if scope.Validate() != nil || !validIdentifier(eventID) || limit < 1 || limit > 500 || offset < 0 {
+		return nil, ErrInvalidDisposition
+	}
+	rows, err := r.db.QueryContext(ctx, "SELECT id, tenant_id, project_id, event_id, kind, category, reason, actor, occurred_at FROM alert_event_dispositions WHERE tenant_id = $1 AND project_id = $2 AND event_id = $3 ORDER BY occurred_at DESC, id DESC LIMIT $4 OFFSET $5", scope.TenantID, scope.ProjectID, eventID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]EventDisposition, 0)
+	for rows.Next() {
+		var value EventDisposition
+		if err := rows.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.EventID, &value.Kind, &value.Category, &value.Reason, &value.Actor, &value.OccurredAt); err != nil {
+			return nil, err
+		}
+		if err := value.Validate(); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
 }
 
 func (r *PostgresRepository) ListRuleEvents(ctx context.Context, scope Scope, ruleID string, filter EventFilter) ([]AlertEvent, error) {
@@ -416,6 +654,25 @@ func (r *PostgresRepository) ListRuleEvents(ctx context.Context, scope Scope, ru
 
 func (r *PostgresRepository) AppendAudit(ctx context.Context, record AuditRecord) error {
 	return appendAudit(ctx, r.db, record)
+}
+
+func (r *PostgresRepository) RecordOrphanedEvent(ctx context.Context, event AlertEvent, at time.Time) error {
+	if event.Validate() != nil || at.IsZero() {
+		return ErrInvalidNotification
+	}
+	delivery := NotificationDelivery{
+		ID:    "orphan-" + fingerprintParts(event.Scope.Key(), event.ID, string(event.State))[:24],
+		Scope: event.Scope, EventID: event.ID, PolicyID: "orphan-rule", EventState: event.State,
+		Status: DeliveryAbandoned, Attempts: 0, AttemptedAt: at.UTC(), FailureClass: "orphan_rule",
+		Request: DeliveryRequest{Scope: event.Scope, EventID: event.ID, State: event.State, Channel: "orphan", PolicyID: "orphan-rule", TemplateID: "orphan-rule", TemplateVersion: "orphan-rule"},
+	}
+	record := notificationAudit(delivery, "delivery.abandoned", at)
+	details, err := marshalMap(record.Details)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, auditInsertSQL+" ON CONFLICT (tenant_id, project_id, id) DO NOTHING", record.ID, record.Scope.TenantID, record.Scope.ProjectID, record.Actor, record.Action, event.ID, record.OccurredAt, details)
+	return err
 }
 
 func (r *PostgresRepository) ListNotificationRoutes(ctx context.Context, scope Scope, ruleID string) ([]NotificationRoute, error) {
@@ -610,7 +867,7 @@ func (r *PostgresRepository) GetNotificationPolicy(ctx context.Context, scope Sc
 }
 
 func (r *PostgresRepository) DeleteNotificationPolicy(ctx context.Context, scope Scope, id string) error {
-	return r.deleteConfiguration(ctx, scope, id, "notification_policies", "policy.deleted")
+	return r.deletePolicy(ctx, scope, id)
 }
 
 func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, policy NotificationPolicy, update bool) (NotificationPolicy, error) {
@@ -625,6 +882,10 @@ func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, polic
 	if err != nil {
 		return NotificationPolicy{}, err
 	}
+	severities := policy.Severities
+	if severities == nil {
+		severities = []string{}
+	}
 	start, end := nullableTimeOfDay(policy.WindowStartUTC), nullableTimeOfDay(policy.WindowEndUTC)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -632,11 +893,11 @@ func (r *PostgresRepository) mutateNotificationPolicy(ctx context.Context, polic
 	}
 	defer func() { _ = tx.Rollback() }()
 	query := "INSERT INTO notification_policies (id, tenant_id, project_id, name, channel, target, secret_ref, template_id, severities, match_labels, window_start_utc, window_end_utc, enabled) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::time, $12::time, $13) RETURNING " + notificationPolicyColumnsSQL
-	args := []any{policy.ID, policy.Scope.TenantID, policy.Scope.ProjectID, policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(policy.Severities), labels, start, end, policy.Enabled}
+	args := []any{policy.ID, policy.Scope.TenantID, policy.Scope.ProjectID, policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(severities), labels, start, end, policy.Enabled}
 	action := "policy.created"
 	if update {
 		query = "UPDATE notification_policies SET name = $1, channel = $2, target = $3, secret_ref = $4, template_id = $5, severities = $6, match_labels = $7, window_start_utc = $8::time, window_end_utc = $9::time, enabled = $10, updated_at = NOW() WHERE tenant_id = $11 AND project_id = $12 AND id = $13 RETURNING " + notificationPolicyColumnsSQL
-		args = []any{policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(policy.Severities), labels, start, end, policy.Enabled, policy.Scope.TenantID, policy.Scope.ProjectID, policy.ID}
+		args = []any{policy.Name, policy.Channel, policy.Target, policy.SecretRef, policy.TemplateID, pq.Array(severities), labels, start, end, policy.Enabled, policy.Scope.TenantID, policy.Scope.ProjectID, policy.ID}
 		action = "policy.updated"
 	}
 	stored, err := scanNotificationPolicy(tx.QueryRowContext(ctx, query, args...))
@@ -900,7 +1161,7 @@ func (r *PostgresRepository) DeleteSilence(ctx context.Context, scope Scope, id 
 }
 
 func validateSilence(silence Silence) error {
-	if silence.Scope.Validate() != nil || !validIdentifier(silence.ID) || len(silence.Matchers) == 0 || strings.TrimSpace(silence.CreatedBy) == "" || strings.TrimSpace(silence.Reason) == "" || containsSecretMaterial(silence.Reason) || silence.StartsAt.IsZero() || !silence.EndsAt.After(silence.StartsAt) {
+	if silence.Scope.Validate() != nil || !validIdentifier(silence.ID) || len(silence.Matchers) == 0 || !validSilenceMatchers(silence.Matchers) || strings.TrimSpace(silence.CreatedBy) == "" || strings.TrimSpace(silence.Reason) == "" || containsSecretMaterial(silence.Reason) || silence.StartsAt.IsZero() || !silence.EndsAt.After(silence.StartsAt) {
 		return ErrInvalidNotification
 	}
 	return nil
@@ -953,6 +1214,7 @@ func (r *PostgresRepository) ReserveNotificationDelivery(ctx context.Context, de
 		delivery.Status, delivery.Attempts, delivery.AttemptedAt, nullableTimestamp(delivery.NextAttemptAt), nullableTimestamp(delivery.DeliveredAt),
 		delivery.LeaseOwner, nullableTimestamp(delivery.LeaseExpiresAt), delivery.FailureClass,
 		delivery.Request.Target, delivery.Request.Subject, delivery.Request.Body, labels, delivery.Request.SecretRef,
+		legacyDeliveryIdempotencyKey(delivery.EventID, delivery.EventState, delivery.Request.Channel, delivery.Request.TemplateVersion),
 	)
 	if err != nil {
 		return false, err
@@ -1064,6 +1326,78 @@ func (r *PostgresRepository) ListNotificationDeliveries(ctx context.Context, sco
 	return result, rows.Err()
 }
 
+func (r *PostgresRepository) deleteRule(ctx context.Context, scope Scope, id string) error {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if scope.Validate() != nil || !validIdentifier(id) {
+		return ErrInvalidRule
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var lockedID string
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE", scope.TenantID, scope.ProjectID, id).Scan(&lockedID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	var hasEvents bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM alert_events WHERE tenant_id = $1 AND project_id = $2 AND rule_id = $3)", scope.TenantID, scope.ProjectID, id).Scan(&hasEvents); err != nil {
+		return err
+	}
+	if hasEvents {
+		return ErrConfigurationInUse
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id); err != nil {
+		return err
+	}
+	at := time.Now().UTC()
+	if err := appendAudit(ctx, tx, configurationAudit(scope, actor, "rule.deleted", id, at, nil)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *PostgresRepository) deletePolicy(ctx context.Context, scope Scope, id string) error {
+	actor, err := auditActorFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if scope.Validate() != nil || !validIdentifier(id) {
+		return ErrInvalidNotification
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var lockedID string
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE", scope.TenantID, scope.ProjectID, id).Scan(&lockedID); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	var inUse bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM alert_rules WHERE tenant_id = $1 AND project_id = $2 AND $3 = ANY(notification_policy_ids))", scope.TenantID, scope.ProjectID, id).Scan(&inUse); err != nil {
+		return err
+	}
+	if inUse {
+		return ErrConfigurationInUse
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM notification_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, id); err != nil {
+		return err
+	}
+	at := time.Now().UTC()
+	if err := appendAudit(ctx, tx, configurationAudit(scope, actor, "policy.deleted", id, at, nil)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *PostgresRepository) deleteConfiguration(ctx context.Context, scope Scope, id, table, action string) error {
 	actor, err := auditActorFromContext(ctx)
 	if err != nil {
@@ -1073,7 +1407,7 @@ func (r *PostgresRepository) deleteConfiguration(ctx context.Context, scope Scop
 		return ErrInvalidNotification
 	}
 	switch table {
-	case "alert_rules", "notification_policies", "notification_templates":
+	case "notification_templates":
 	default:
 		return errors.New("unsupported configuration table")
 	}
@@ -1145,6 +1479,26 @@ func validateNotificationDelivery(delivery NotificationDelivery) error {
 	if delivery.Request.Scope != delivery.Scope || delivery.Request.EventID != delivery.EventID || delivery.Request.PolicyID != delivery.PolicyID || delivery.Request.Channel == "" || delivery.Request.TemplateID == "" || delivery.Request.TemplateVersion == "" {
 		return ErrInvalidNotification
 	}
+	switch delivery.Request.Channel {
+	case "in_app":
+		if delivery.Request.SecretRef != "" {
+			return ErrInvalidNotification
+		}
+	case "smtp", "webhook":
+		if ValidateSecretReference(delivery.Request.SecretRef) != nil {
+			return ErrInvalidNotification
+		}
+	default:
+		return ErrInvalidNotification
+	}
+	if containsSecretMaterial(delivery.Request.Target) || containsSecretMaterial(delivery.Request.Subject) || containsSecretMaterial(delivery.Request.Body) {
+		return ErrInvalidNotification
+	}
+	for key, value := range delivery.Request.Labels {
+		if strings.TrimSpace(key) == "" || sensitiveField(key) || containsSecretMaterial(value) {
+			return ErrInvalidNotification
+		}
+	}
 	switch delivery.Status {
 	case DeliveryAttempting, DeliveryDelivered, DeliverySuppressed, DeliveryRetryScheduled, DeliveryAbandoned:
 	default:
@@ -1194,6 +1548,14 @@ func appendAudit(ctx context.Context, database contextExecer, record AuditRecord
 	return err
 }
 
+func insertEventDisposition(ctx context.Context, database contextExecer, disposition EventDisposition) error {
+	if err := disposition.Validate(); err != nil {
+		return err
+	}
+	_, err := database.ExecContext(ctx, dispositionInsertSQL, disposition.ID, disposition.Scope.TenantID, disposition.Scope.ProjectID, disposition.EventID, disposition.Kind, disposition.Category, disposition.Reason, disposition.Actor, disposition.OccurredAt)
+	return err
+}
+
 type rowScanner interface {
 	Scan(...any) error
 }
@@ -1202,17 +1564,36 @@ func scanRule(scanner rowScanner) (AlertRule, error) {
 	var rule AlertRule
 	var policyIDs pq.StringArray
 	var labels []byte
-	var evaluationEveryNS, forDurationNS int64
-	if err := scanner.Scan(&rule.ID, &rule.Scope.TenantID, &rule.Scope.ProjectID, &rule.Name, &rule.Metric, &rule.Aggregation, &rule.Operator, &rule.Threshold, &evaluationEveryNS, &forDurationNS, &rule.MissingData, &rule.Severity, &policyIDs, &labels, &rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
+	var evaluationEveryNS, lookbackWindowNS, forDurationNS int64
+	if err := scanner.Scan(&rule.ID, &rule.Scope.TenantID, &rule.Scope.ProjectID, &rule.Name, &rule.Metric, &rule.Aggregation, &rule.Operator, &rule.Threshold, &evaluationEveryNS, &lookbackWindowNS, &forDurationNS, &rule.MissingData, &rule.Severity, &policyIDs, &labels, &rule.Enabled, &rule.CreatedAt, &rule.UpdatedAt); err != nil {
 		return AlertRule{}, err
 	}
 	rule.EvaluationEvery = durationFromNanoseconds(evaluationEveryNS)
+	rule.LookbackWindow = durationFromNanoseconds(lookbackWindowNS)
 	rule.For = durationFromNanoseconds(forDurationNS)
 	rule.NotificationPolicyIDs = []string(policyIDs)
 	if err := unmarshalMap(labels, &rule.Labels); err != nil {
 		return AlertRule{}, err
 	}
 	return rule, nil
+}
+
+func scanDueRule(scanner rowScanner) (DueAlertRule, error) {
+	var due DueAlertRule
+	var policyIDs pq.StringArray
+	var labels []byte
+	var evaluationEveryNS, lookbackWindowNS, forDurationNS int64
+	if err := scanner.Scan(&due.Rule.ID, &due.Rule.Scope.TenantID, &due.Rule.Scope.ProjectID, &due.Rule.Name, &due.Rule.Metric, &due.Rule.Aggregation, &due.Rule.Operator, &due.Rule.Threshold, &evaluationEveryNS, &lookbackWindowNS, &forDurationNS, &due.Rule.MissingData, &due.Rule.Severity, &policyIDs, &labels, &due.Rule.Enabled, &due.Rule.CreatedAt, &due.Rule.UpdatedAt, &due.DueAt); err != nil {
+		return DueAlertRule{}, err
+	}
+	due.Rule.EvaluationEvery = durationFromNanoseconds(evaluationEveryNS)
+	due.Rule.LookbackWindow = durationFromNanoseconds(lookbackWindowNS)
+	due.Rule.For = durationFromNanoseconds(forDurationNS)
+	due.Rule.NotificationPolicyIDs = []string(policyIDs)
+	if err := unmarshalMap(labels, &due.Rule.Labels); err != nil {
+		return DueAlertRule{}, err
+	}
+	return due, nil
 }
 
 func scanEvent(scanner rowScanner) (AlertEvent, error) {

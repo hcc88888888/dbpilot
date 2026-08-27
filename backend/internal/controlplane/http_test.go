@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,14 +25,31 @@ func TestRuleCreateRejectsPrincipalOutsideProjectBeforeServiceCall(t *testing.T)
 
 func TestEventAcknowledgeWritesActorAndReturnsScopedEvent(t *testing.T) {
 	fixture := newHTTPFixture()
-	response := fixture.request(http.MethodPost, "/api/v1/tenants/t1/projects/p1/alerts/event-1/acknowledge", memberFor("t1", "p1"), nil)
+	response := fixture.request(http.MethodPost, "/api/v1/tenants/t1/projects/p1/alerts/event-1/acknowledge", memberFor("t1", "p1"), []byte(`{"category":"investigating","reason":"operator accepted the incident"}`))
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "actor-1", fixture.repository.lastAudit.Actor)
 	require.Equal(t, "event.acknowledged", fixture.repository.lastAudit.Action)
+	require.Equal(t, alert.DispositionAcknowledgement, fixture.repository.lastDisposition.Kind)
+	require.Equal(t, "operator accepted the incident", fixture.repository.lastDisposition.Reason)
 	var event alert.AlertEvent
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &event))
 	require.Equal(t, alert.EventAcknowledged, event.State)
 	require.Equal(t, fixture.scope, event.Scope)
+}
+
+func TestEventRootCauseCluesAreAppendOnlyScopedAndPaginated(t *testing.T) {
+	fixture := newHTTPFixture()
+	response := fixture.request(http.MethodPost, "/api/v1/tenants/t1/projects/p1/alerts/event-1/root-cause", memberFor("t1", "p1"), []byte(`{"category":"database_capacity","reason":"connection pool exhausted"}`))
+	require.Equal(t, http.StatusCreated, response.Code)
+	require.Equal(t, alert.DispositionRootCause, fixture.repository.lastDisposition.Kind)
+	require.Equal(t, "event.root_cause", fixture.repository.lastAudit.Action)
+
+	response = fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/alerts/event-1/dispositions?limit=1&offset=0", memberFor("t1", "p1"), nil)
+	require.Equal(t, http.StatusOK, response.Code)
+	var values []alert.EventDisposition
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &values))
+	require.Len(t, values, 1)
+	require.Equal(t, "actor-1", values[0].Actor)
 }
 
 func TestAlertOverviewContainsEventCountsAndEvaluatorHealth(t *testing.T) {
@@ -39,6 +57,31 @@ func TestAlertOverviewContainsEventCountsAndEvaluatorHealth(t *testing.T) {
 	response := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/overview", memberFor("t1", "p1"), nil)
 	require.Equal(t, http.StatusOK, response.Code)
 	require.JSONEq(t, `{"events":{"firing":1},"evaluator":{"healthy":true}}`, response.Body.String())
+}
+
+func TestAlertOverviewUsesOnlyRequestedScopeEvaluatorHealth(t *testing.T) {
+	fixture := newHTTPFixture()
+	handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: scopedEvaluator{
+		global:  alert.EvaluatorHealth{FailedRules: 1, LastError: "one or more alert rules failed"},
+		byScope: map[string]alert.EvaluatorHealth{fixture.scope.Key(): {}},
+	}, Now: func() time.Time { return fixture.repository.now }}, memberFor("t1", "p1"))
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/tenants/t1/projects/p1/overview", nil))
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Contains(t, response.Body.String(), `"healthy":true`)
+}
+
+func TestAlertOverviewCountsMoreThanOnePageOfEvents(t *testing.T) {
+	fixture := newHTTPFixture()
+	fixture.repository.events = make(map[string]alert.AlertEvent, 501)
+	for index := 0; index < 501; index++ {
+		id := fmt.Sprintf("event-%04d", index)
+		fixture.repository.events[id] = alert.AlertEvent{ID: id, Scope: fixture.scope, State: alert.EventFiring}
+	}
+	response := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/overview", memberFor("t1", "p1"), nil)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.JSONEq(t, `{"events":{"firing":501},"evaluator":{"healthy":true}}`, response.Body.String())
 }
 
 func TestHTTPHandlerCoversScopedAlertConfigurationRoutes(t *testing.T) {
@@ -171,13 +214,13 @@ func TestHTTPHandlerReturnsScopedNotFoundAndRedactsSecrets(t *testing.T) {
 
 	policy := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/policies/policy-1", memberFor("t1", "p1"), nil)
 	require.Equal(t, http.StatusOK, policy.Code)
-	require.NotContains(t, policy.Body.String(), "secret://webhook/key")
+	require.NotContains(t, policy.Body.String(), "env://DBPILOT_WEBHOOK_TOKEN")
 	require.Contains(t, policy.Body.String(), `"has_secret":true`)
 
 	deliveries := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/alerts/event-1/deliveries", memberFor("t1", "p1"), nil)
 	require.Equal(t, http.StatusOK, deliveries.Code)
 	require.Contains(t, deliveries.Body.String(), `"event_state":"firing"`)
-	require.NotContains(t, deliveries.Body.String(), "secret://delivery/key")
+	require.NotContains(t, deliveries.Body.String(), "env://DBPILOT_WEBHOOK_TOKEN")
 	require.NotContains(t, deliveries.Body.String(), "request_body")
 }
 
@@ -214,10 +257,10 @@ func newHTTPFixture() *httpFixture {
 	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
 	rule := alert.AlertRule{ID: "rule-1", Scope: scope, Name: "CPU", Metric: "host.cpu", Aggregation: "avg", Operator: ">", Threshold: 80, EvaluationEvery: time.Minute, For: time.Minute, MissingData: "ignore", Severity: "critical", Enabled: true, CreatedAt: now, UpdatedAt: now}
 	event := alert.AlertEvent{ID: "event-1", Scope: scope, RuleID: rule.ID, Fingerprint: "fingerprint-1", State: alert.EventFiring, FirstSeen: now.Add(-time.Minute), LastSeen: now, FiringAt: now, LastActor: "system:evaluator"}
-	policy := alert.NotificationPolicy{ID: "policy-1", Scope: scope, Name: "Webhook", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "secret://webhook/key", TemplateID: "template-1", Enabled: true, CreatedAt: now, UpdatedAt: now}
+	policy := alert.NotificationPolicy{ID: "policy-1", Scope: scope, Name: "Webhook", Channel: "webhook", Target: "https://allowed.example/hook", SecretRef: "env://DBPILOT_WEBHOOK_TOKEN", TemplateID: "template-1", Enabled: true, CreatedAt: now, UpdatedAt: now}
 	template := alert.NotificationTemplate{ID: "template-1", Scope: scope, Name: "Default", Subject: "Alert", Body: "{{event.id}}", Revision: 1, CreatedAt: now, UpdatedAt: now}
-	silence := alert.Silence{ID: "silence-1", Scope: scope, Matchers: map[string]string{"host": "db-1"}, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour), CreatedBy: "actor-1", Reason: "maintenance", CreatedAt: now, UpdatedAt: now}
-	delivery := alert.NotificationDelivery{ID: "delivery-1", Scope: scope, EventID: event.ID, PolicyID: policy.ID, EventState: event.State, IdempotencyKey: "delivery-1", Status: alert.DeliveryDelivered, Attempts: 1, AttemptedAt: now, DeliveredAt: now, Request: alert.DeliveryRequest{DeliveryID: "delivery-1", Scope: scope, EventID: event.ID, State: event.State, Channel: "webhook", PolicyID: policy.ID, TemplateID: template.ID, TemplateVersion: "1", SecretRef: "secret://delivery/key", Body: "sensitive request body"}}
+	silence := alert.Silence{ID: "silence-1", Scope: scope, Matchers: map[string]string{"label.host": "db-1"}, StartsAt: now.Add(-time.Hour), EndsAt: now.Add(time.Hour), CreatedBy: "actor-1", Reason: "maintenance", CreatedAt: now, UpdatedAt: now}
+	delivery := alert.NotificationDelivery{ID: "delivery-1", Scope: scope, EventID: event.ID, PolicyID: policy.ID, EventState: event.State, IdempotencyKey: "delivery-1", Status: alert.DeliveryDelivered, Attempts: 1, AttemptedAt: now, DeliveredAt: now, Request: alert.DeliveryRequest{DeliveryID: "delivery-1", Scope: scope, EventID: event.ID, State: event.State, Channel: "webhook", PolicyID: policy.ID, TemplateID: template.ID, TemplateVersion: "1", SecretRef: "env://DBPILOT_WEBHOOK_TOKEN", Body: "sensitive request body"}}
 	repository := &memoryControlPlaneRepository{now: now, rules: map[string]alert.AlertRule{rule.ID: rule}, events: map[string]alert.AlertEvent{event.ID: event}, policies: map[string]alert.NotificationPolicy{policy.ID: policy}, templates: map[string]alert.NotificationTemplate{template.ID: template}, silences: map[string]alert.Silence{silence.ID: silence}, deliveries: []alert.NotificationDelivery{delivery}}
 	services := Services{Repository: repository, Evaluator: healthyEvaluator{}, Now: func() time.Time { return now }}
 	return &httpFixture{scope: scope, repository: repository, handler: NewHTTPHandler(services, memberFor("t1", "p1"))}
@@ -255,12 +298,22 @@ type healthyEvaluator struct{}
 
 func (healthyEvaluator) Health() alert.EvaluatorHealth { return alert.EvaluatorHealth{} }
 
+type scopedEvaluator struct {
+	global  alert.EvaluatorHealth
+	byScope map[string]alert.EvaluatorHealth
+}
+
+func (e scopedEvaluator) Health() alert.EvaluatorHealth { return e.global }
+func (e scopedEvaluator) HealthForScope(scope alert.Scope) alert.EvaluatorHealth {
+	return e.byScope[scope.Key()]
+}
+
 func validRuleBody() []byte {
 	return []byte(`{"name":"CPU","metric":"host.cpu","aggregation":"avg","operator":">","threshold":80,"evaluation_every":"1m","for":"1m","missing_data":"ignore","severity":"critical","enabled":true}`)
 }
 
 func validPolicyBody() []byte {
-	return []byte(`{"name":"Webhook","channel":"webhook","target":"https://allowed.example/hook","secret_ref":"secret://webhook/key","template_id":"template-1","enabled":true}`)
+	return []byte(`{"name":"Webhook","channel":"webhook","target":"https://allowed.example/hook","secret_ref":"env://DBPILOT_WEBHOOK_TOKEN","template_id":"template-1","enabled":true}`)
 }
 
 func validTemplateBody() []byte {
@@ -268,20 +321,22 @@ func validTemplateBody() []byte {
 }
 
 func validSilenceBody() []byte {
-	return []byte(`{"matchers":{"host":"db-1"},"starts_at":"2026-08-27T09:00:00Z","ends_at":"2026-08-27T11:00:00Z","reason":"maintenance"}`)
+	return []byte(`{"matchers":{"label.host":"db-1"},"starts_at":"2026-08-27T09:00:00Z","ends_at":"2026-08-27T11:00:00Z","reason":"maintenance"}`)
 }
 
 type memoryControlPlaneRepository struct {
-	now        time.Time
-	calls      int
-	nextID     int
-	lastAudit  alert.AuditRecord
-	rules      map[string]alert.AlertRule
-	events     map[string]alert.AlertEvent
-	policies   map[string]alert.NotificationPolicy
-	templates  map[string]alert.NotificationTemplate
-	silences   map[string]alert.Silence
-	deliveries []alert.NotificationDelivery
+	now             time.Time
+	calls           int
+	nextID          int
+	lastAudit       alert.AuditRecord
+	rules           map[string]alert.AlertRule
+	events          map[string]alert.AlertEvent
+	policies        map[string]alert.NotificationPolicy
+	templates       map[string]alert.NotificationTemplate
+	silences        map[string]alert.Silence
+	deliveries      []alert.NotificationDelivery
+	dispositions    []alert.EventDisposition
+	lastDisposition alert.EventDisposition
 }
 
 func (repository *memoryControlPlaneRepository) NewID(prefix string) (string, error) {
@@ -331,12 +386,57 @@ func (repository *memoryControlPlaneRepository) PutEventAndAudit(_ context.Conte
 	repository.lastAudit = audit
 	return value, nil
 }
+func (repository *memoryControlPlaneRepository) PutEventAndDisposition(_ context.Context, value alert.AlertEvent, audit alert.AuditRecord, disposition alert.EventDisposition) (alert.AlertEvent, error) {
+	repository.calls++
+	repository.events[value.ID] = value
+	repository.lastAudit = audit
+	repository.lastDisposition = disposition
+	repository.dispositions = append(repository.dispositions, disposition)
+	return value, nil
+}
+func (repository *memoryControlPlaneRepository) AppendEventDisposition(_ context.Context, disposition alert.EventDisposition, audit alert.AuditRecord) error {
+	if event, ok := repository.events[disposition.EventID]; !ok || event.Scope != disposition.Scope {
+		return alert.ErrNotFound
+	}
+	repository.lastAudit = audit
+	repository.lastDisposition = disposition
+	repository.dispositions = append(repository.dispositions, disposition)
+	return nil
+}
+func (repository *memoryControlPlaneRepository) ListEventDispositions(_ context.Context, scope alert.Scope, eventID string, limit, offset int) ([]alert.EventDisposition, error) {
+	values := make([]alert.EventDisposition, 0)
+	for _, disposition := range repository.dispositions {
+		if disposition.Scope == scope && disposition.EventID == eventID {
+			values = append(values, disposition)
+		}
+	}
+	if offset >= len(values) {
+		return []alert.EventDisposition{}, nil
+	}
+	end := offset + limit
+	if end > len(values) {
+		end = len(values)
+	}
+	return values[offset:end], nil
+}
 func (repository *memoryControlPlaneRepository) FindEventByFingerprint(context.Context, alert.Scope, string) (alert.AlertEvent, bool, error) {
 	return alert.AlertEvent{}, false, nil
 }
-func (repository *memoryControlPlaneRepository) ListEvents(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error) {
+func (repository *memoryControlPlaneRepository) ListEvents(_ context.Context, _ alert.Scope, filter alert.EventFilter) ([]alert.AlertEvent, error) {
 	repository.calls++
-	return mapValues(repository.events), nil
+	values := mapValues(repository.events)
+	if filter.Limit > 0 && len(values) > filter.Limit {
+		values = values[:filter.Limit]
+	}
+	return values, nil
+}
+func (repository *memoryControlPlaneRepository) CountEventsByState(context.Context, alert.Scope) (map[alert.EventState]int, error) {
+	repository.calls++
+	counts := make(map[alert.EventState]int)
+	for _, event := range repository.events {
+		counts[event.State]++
+	}
+	return counts, nil
 }
 func (repository *memoryControlPlaneRepository) ListRuleEvents(context.Context, alert.Scope, string, alert.EventFilter) ([]alert.AlertEvent, error) {
 	return nil, nil

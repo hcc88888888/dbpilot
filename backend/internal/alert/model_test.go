@@ -104,3 +104,14 @@ func TestSeriesFingerprintDistinguishesLabelSeries(t *testing.T) {
 		alert.SeriesFingerprint(map[string]string{"host": "db-b"}),
 	)
 }
+
+func TestEventDispositionRequiresSafeAppendOnlyFacts(t *testing.T) {
+	disposition := alert.EventDisposition{ID: "disposition-1", Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, EventID: "event-1", Kind: alert.DispositionRootCause, Category: "database_capacity", Reason: "connection pool exhausted", Actor: "operator-1", OccurredAt: time.Now().UTC()}
+	require.NoError(t, disposition.Validate())
+
+	disposition.Reason = "password=hunter2"
+	require.ErrorIs(t, disposition.Validate(), alert.ErrInvalidDisposition)
+	disposition.Reason = "safe"
+	disposition.Category = "free form"
+	require.ErrorIs(t, disposition.Validate(), alert.ErrInvalidDisposition)
+}

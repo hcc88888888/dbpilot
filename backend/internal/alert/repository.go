@@ -30,12 +30,30 @@ type Repository interface {
 	AppendAudit(context.Context, AuditRecord) error
 }
 
+// DueAlertRule is a leased rule together with the persisted instant at which
+// it became due. The timestamp lets evaluators report schedule delay without
+// guessing from a process-local ticker.
+type DueAlertRule struct {
+	Rule  AlertRule
+	DueAt time.Time
+}
+
+// RuleScheduleRepository is the optional durable scheduling boundary used by
+// production repositories. Claiming uses a renewable, expiring lease so two
+// control-plane replicas cannot evaluate the same due rule concurrently and a
+// crashed replica does not strand work forever.
+type RuleScheduleRepository interface {
+	ClaimDueRules(context.Context, Scope, time.Time, string, time.Time, int) ([]DueAlertRule, int, error)
+	CompleteRuleEvaluation(context.Context, Scope, string, string, time.Time, time.Time) error
+}
+
 // NotificationRepository is the tenant-scoped persistence boundary for
 // routing, silence matching, idempotent delivery reservation, and retries. It
 // stays separate from Repository so event-only stores need not implement
 // notification delivery.
 type NotificationRepository interface {
 	GetRule(context.Context, Scope, string) (AlertRule, error)
+	RecordOrphanedEvent(context.Context, AlertEvent, time.Time) error
 	ListNotificationRoutes(context.Context, Scope, string) ([]NotificationRoute, error)
 	ListActiveSilences(context.Context, Scope, time.Time) ([]Silence, error)
 	ReserveNotificationDelivery(context.Context, NotificationDelivery, *AuditRecord) (bool, error)
@@ -69,6 +87,10 @@ type ControlPlaneRepository interface {
 	NewID(string) (string, error)
 	DeleteRule(context.Context, Scope, string) error
 	GetEvent(context.Context, Scope, string) (AlertEvent, error)
+	CountEventsByState(context.Context, Scope) (map[EventState]int, error)
+	PutEventAndDisposition(context.Context, AlertEvent, AuditRecord, EventDisposition) (AlertEvent, error)
+	AppendEventDisposition(context.Context, EventDisposition, AuditRecord) error
+	ListEventDispositions(context.Context, Scope, string, int, int) ([]EventDisposition, error)
 
 	CreateNotificationPolicy(context.Context, NotificationPolicy) (NotificationPolicy, error)
 	UpdateNotificationPolicy(context.Context, NotificationPolicy) (NotificationPolicy, error)
