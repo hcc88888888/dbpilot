@@ -112,6 +112,9 @@ func TestJobCommandLifecycle(t *testing.T) {
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedBeforeAck))
 	require.Zero(t, publishedBeforeAck)
 
+	// Let the one-second Agent execution lease elapse in wall-clock time. The
+	// independent delivery deadline must still keep the prepared command valid.
+	time.Sleep(1100 * time.Millisecond)
 	dispatched, err = lifecycle.DispatchPending(ctx, created.Add(job.DefaultOutboxLease+2*time.Second))
 	require.NoError(t, err)
 	require.Equal(t, 2, dispatched)
@@ -197,7 +200,7 @@ func contractDatabase(t *testing.T, rawDSN string) *sql.DB {
 func contractOutbox(t *testing.T, value job.Job, commandID, agentID string, at time.Time) job.OutboxMessage {
 	t.Helper()
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{
-		AgentId: agentID, LeaseSeconds: 60,
+		AgentId: agentID, LeaseSeconds: 1,
 		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}},
 	})
 	require.NoError(t, err)

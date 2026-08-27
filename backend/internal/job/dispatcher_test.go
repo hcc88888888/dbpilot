@@ -65,7 +65,8 @@ func TestDispatchPendingOverridesAuthoritySignsEnqueuesWithoutPublishingAndAudit
 	require.Equal(t, "command-a", envelope.GetCommandId())
 	require.Equal(t, fixture.value.ID, envelope.GetJobId())
 	require.Equal(t, fixture.now, envelope.GetIssuedAt().AsTime())
-	require.Equal(t, fixture.now.Add(30*time.Second), envelope.GetExpiresAt().AsTime())
+	require.Equal(t, fixture.now.Add(DefaultCommandDeliveryTTL), envelope.GetExpiresAt().AsTime())
+	require.Equal(t, uint32(30), envelope.GetLeaseSeconds())
 	require.Len(t, envelope.GetNonce(), commandNonceBytes)
 	verifier, verifyErr := agent.NewCommandVerifier("agent-a", fixture.publicKey, []string{"collect_now"})
 	require.NoError(t, verifyErr)
@@ -81,14 +82,14 @@ func TestDispatchRetryUsesByteIdenticalPreparedEnvelopeAndJournalDeduplicates(t 
 	fixture.lifecycle.nonceReader = bytes.NewReader(bytes.Repeat([]byte{0x24}, commandNonceBytes))
 	message := OutboxMessage{
 		ID: "command-a", Scope: fixture.scope, JobID: fixture.value.ID, TargetID: "agent-a", Type: commandOutboxType,
-		Payload: fixture.unsignedEnvelope(t, "agent-a"), AvailableAt: fixture.now, CreatedAt: fixture.now,
+		Payload: fixture.unsignedEnvelopeWithLease(t, "agent-a", 1), AvailableAt: fixture.now, CreatedAt: fixture.now,
 	}
 	fixture.persistence.claimed = []OutboxMessage{message}
 
 	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
 	require.NoError(t, err)
 	require.Equal(t, 1, dispatched)
-	dispatched, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(time.Second))
+	dispatched, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(32*time.Second))
 	require.NoError(t, err)
 	require.Equal(t, 1, dispatched)
 	require.Len(t, fixture.agents.envelopes, 2)
@@ -109,6 +110,89 @@ func TestDispatchRetryUsesByteIdenticalPreparedEnvelopeAndJournalDeduplicates(t 
 	accepted, err = journal.Accept(context.Background(), fixture.agents.envelopes[1])
 	require.NoError(t, err)
 	require.False(t, accepted, "the retry must be a command_id duplicate, not an envelope digest conflict")
+}
+
+func TestNoAcknowledgementRetryNearDeliveryDeadlineUsesSamePreparedEnvelope(t *testing.T) {
+	fixture := newCommandLifecycleFixture(t)
+	fixture.lifecycle.nonceReader = bytes.NewReader(bytes.Repeat([]byte{0x37}, commandNonceBytes))
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(23*time.Hour))
+	require.NoError(t, err)
+	require.Len(t, fixture.agents.envelopes, 2)
+	require.True(t, proto.Equal(fixture.agents.envelopes[0], fixture.agents.envelopes[1]))
+	require.Equal(t, fixture.now.Add(DefaultCommandDeliveryTTL), fixture.agents.envelopes[1].GetExpiresAt().AsTime())
+	require.True(t, fixture.agents.envelopes[1].GetExpiresAt().AsTime().After(fixture.now.Add(23*time.Hour)))
+}
+
+func TestExpiredPreparedCommandTimesOutTargetPublishesAndAuditsWithoutDispatch(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	require.Len(t, fixture.agents.envelopes, 1)
+	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+time.Second))
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	require.Len(t, fixture.agents.envelopes, 1, "expired delivery must not reach the Registry")
+	got := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, got.Status)
+	require.Equal(t, TargetTimedOut, got.TargetResults[0].Status)
+	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
+	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+	require.Equal(t, "delivery_deadline", fixture.audit.events[len(fixture.audit.events)-1].Detail["reason"])
+}
+
+func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	fixture.persistence.markErrors = []error{errors.New("publication unavailable"), nil}
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+time.Second))
+	require.Error(t, err)
+	first := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, first.Status)
+	require.Empty(t, fixture.persistence.published)
+	require.Len(t, fixture.audit.events, 1, "failed publication must defer the timeout audit")
+
+	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+DefaultOutboxLease+2*time.Second))
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
+	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+	require.Len(t, fixture.agents.envelopes, 1)
+}
+
+func TestExpiredDeliveryFinishesSucceededPartialWhenAnotherTargetSucceeded(t *testing.T) {
+	fixture := newCommandLifecycleFixture(t)
+	message := fixture.messageWithLease(t, "command-b", "agent-b", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err := ApplyTransition(current, Transition{
+		Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, At: fixture.now,
+		TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetSucceeded}, {TargetID: "agent-b", Status: TargetRunning}},
+	})
+	require.NoError(t, err)
+	fixture.persistence.jobs[fixture.value.ID] = current
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+time.Second))
+	require.NoError(t, err)
+
+	got := fixture.persistence.currentJob()
+	require.Equal(t, StatusSucceeded, got.Status)
+	require.Equal(t, OutcomePartial, got.Outcome)
+	require.Equal(t, Progress{TotalTargets: 2, CompletedTargets: 1, FailedTargets: 1}, got.Progress)
 }
 
 func TestAcknowledgementPublishesBeforeMutationAndDuplicateRetriesPublicationFailure(t *testing.T) {
@@ -298,15 +382,32 @@ func newCommandLifecycleFixture(t *testing.T) *commandLifecycleFixture {
 	return fixture
 }
 
-func (fixture *commandLifecycleFixture) unsignedEnvelope(t *testing.T, agentID string) []byte {
+func newSingleTargetCommandLifecycleFixture(t *testing.T) *commandLifecycleFixture {
 	t.Helper()
-	encoded, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: agentID, LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+	fixture := newCommandLifecycleFixture(t)
+	fixture.value.TargetResourceIDs = []string{"agent-a"}
+	fixture.value.Progress = Progress{TotalTargets: 1}
+	fixture.persistence.jobs[fixture.value.ID] = fixture.value
+	return fixture
+}
+
+func (fixture *commandLifecycleFixture) unsignedEnvelope(t *testing.T, agentID string) []byte {
+	return fixture.unsignedEnvelopeWithLease(t, agentID, 30)
+}
+
+func (fixture *commandLifecycleFixture) unsignedEnvelopeWithLease(t *testing.T, agentID string, leaseSeconds uint32) []byte {
+	t.Helper()
+	encoded, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: agentID, LeaseSeconds: leaseSeconds, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
 	require.NoError(t, err)
 	return encoded
 }
 
 func (fixture *commandLifecycleFixture) message(t *testing.T, id, agentID string) OutboxMessage {
-	return OutboxMessage{ID: id, Scope: fixture.scope, JobID: fixture.value.ID, TargetID: agentID, Type: commandOutboxType, Payload: fixture.unsignedEnvelope(t, agentID), AvailableAt: fixture.now, CreatedAt: fixture.now}
+	return fixture.messageWithLease(t, id, agentID, 30)
+}
+
+func (fixture *commandLifecycleFixture) messageWithLease(t *testing.T, id, agentID string, leaseSeconds uint32) OutboxMessage {
+	return OutboxMessage{ID: id, Scope: fixture.scope, JobID: fixture.value.ID, TargetID: agentID, Type: commandOutboxType, Payload: fixture.unsignedEnvelopeWithLease(t, agentID, leaseSeconds), AvailableAt: fixture.now, CreatedAt: fixture.now}
 }
 
 func (fixture *commandLifecycleFixture) observerErrors() []error {

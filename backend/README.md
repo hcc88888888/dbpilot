@@ -145,6 +145,12 @@ Agent Hello capability negotiation is authoritative: the dispatcher sends only
 typed command envelopes the live Agent advertised. Delivery is at-least-once;
 `command_outbox.id` is the immutable `command_id`, while the first fully signed
 envelope is atomically persisted and reused byte-for-byte for every lease retry.
+The signed envelope has a fixed 24-hour delivery deadline beginning at first
+preparation; `lease_seconds` is separate and controls only the Agent's execution
+lease after acceptance. Reclaims before the delivery deadline resend the same
+bytes. An unacknowledged command found at or after the deadline is never sent:
+its target is timed out, the Job is finalized under the normal partial/timeout
+rules, the timeout is audited, and the outbox row is terminally published.
 Queue insertion does not mark delivery: only a validated Agent accepted,
 rejected or duplicate acknowledgement publishes the outbox row. The Agent
 journal therefore deduplicates the same ID and digest, and every
