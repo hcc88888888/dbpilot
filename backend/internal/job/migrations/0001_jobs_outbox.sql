@@ -58,7 +58,7 @@ CREATE TABLE command_outbox (
     job_id TEXT NOT NULL,
     target_id TEXT NOT NULL DEFAULT '',
     message_type TEXT NOT NULL,
-    payload JSONB NOT NULL,
+    payload BYTEA NOT NULL,
     available_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     lease_expires_at TIMESTAMPTZ,

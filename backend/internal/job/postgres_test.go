@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestCreateWithOutboxCommitsJobTargetsAndEveryMessage(t *testing.T) {
@@ -27,6 +29,28 @@ func TestCreateWithOutboxCommitsJobTargetsAndEveryMessage(t *testing.T) {
 	mock.ExpectCommit()
 
 	require.NoError(t, repository.CreateWithOutbox(context.Background(), job, messages))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCreateWithOutboxAcceptsUnsignedProtobufCommandPayload(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	value, messages := persistenceFixture()
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "db-1", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+	require.NoError(t, err)
+	messages = []OutboxMessage{{ID: "command-protobuf", Scope: value.Scope, JobID: value.ID, TargetID: "db-1", Type: commandOutboxType, Payload: payload, AvailableAt: value.CreatedAt, CreatedAt: value.CreatedAt}}
+
+	mock.ExpectBegin()
+	expectJobInsert(mock, value)
+	for _, targetID := range value.TargetResourceIDs {
+		expectTargetInsert(mock, value, targetID)
+	}
+	expectOutboxInsert(mock, messages[0], nil)
+	mock.ExpectCommit()
+
+	require.NoError(t, repository.CreateWithOutbox(context.Background(), value, messages))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -306,6 +330,30 @@ func jobRows(job Job) *sqlmock.Rows {
 		job.ErrorSummary, job.ResultSummary, []byte("[]"), job.CreatedAt, job.DispatchedAt, job.StartedAt, job.FinishedAt, job.TimeoutAt,
 		job.CancelRequestedBy, job.CancelRequestedAt, job.RequestID, job.TraceID,
 	)
+}
+
+func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	value, messages := persistenceFixture()
+	message := messages[0]
+
+	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
+	published := message.CreatedAt.Add(time.Minute)
+	mock.ExpectQuery("SELECT .* FROM command_outbox WHERE id = \\$1").WithArgs(message.ID).WillReturnRows(
+		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, message.AvailableAt, message.CreatedAt, nil, published, 2),
+	)
+
+	got, err := repository.LookupCommand(context.Background(), message.ID)
+	require.NoError(t, err)
+	require.Equal(t, value.Scope, got.Scope)
+	require.Equal(t, value.ID, got.JobID)
+	require.Equal(t, message.TargetID, got.TargetID)
+	require.Equal(t, message.Payload, got.Payload)
+	require.NotNil(t, got.PublishedAt)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPostgresRepositoryImplementsRepository(t *testing.T) {

@@ -37,7 +37,21 @@ try {
     New-Item -ItemType Directory -Path $output -Force | Out-Null
     $commit = (& git rev-parse --short HEAD).Trim()
     if ([string]::IsNullOrWhiteSpace($commit)) { $commit = 'unknown' }
-    $ldflags = "-s -w -X main.version=$Version -X main.commit=$commit"
+    $agentLdflags = "-s -w -X main.version=$Version -X main.commit=$commit"
+    $controlplaneLdflags = "-s -w -X main.version=$Version"
+
+    function Build-LinuxBinary {
+        param(
+            [Parameter(Mandatory = $true)] [string] $Name,
+            [Parameter(Mandatory = $true)] [string] $Package,
+            [Parameter(Mandatory = $true)] [string] $Architecture,
+            [Parameter(Mandatory = $true)] [string] $LinkerFlags
+        )
+        $path = Join-Path $output "$Name-linux-$Architecture"
+        & $go build -trimpath -ldflags $LinkerFlags -o $path $Package
+        if ($LASTEXITCODE -ne 0) { throw "$Name linux/$Architecture build failed." }
+        "$((Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant())  $(Split-Path -Leaf $path)" | Set-Content -NoNewline -Encoding ascii "$path.sha256"
+    }
 
     $oldCGO = $env:CGO_ENABLED
     $oldOS = $env:GOOS
@@ -48,17 +62,13 @@ try {
         $env:GOOS = 'linux'
         $env:GOARCH = 'amd64'
         $env:GOAMD64 = 'v1'
-        $amd64 = Join-Path $output 'dbpilot-agent-linux-amd64'
-        & $go build -trimpath -ldflags $ldflags -o $amd64 ./cmd/agent
-        if ($LASTEXITCODE -ne 0) { throw 'amd64 build failed.' }
-        "$((Get-FileHash -Algorithm SHA256 -LiteralPath $amd64).Hash.ToLowerInvariant())  $(Split-Path -Leaf $amd64)" | Set-Content -NoNewline -Encoding ascii "$amd64.sha256"
+		Build-LinuxBinary -Name 'dbpilot-controlplane' -Package './cmd/controlplane' -Architecture 'amd64' -LinkerFlags $controlplaneLdflags
+		Build-LinuxBinary -Name 'dbpilot-agent' -Package './cmd/agent' -Architecture 'amd64' -LinkerFlags $agentLdflags
 
         $env:GOARCH = 'arm64'
         Remove-Item Env:GOAMD64 -ErrorAction SilentlyContinue
-        $arm64 = Join-Path $output 'dbpilot-agent-linux-arm64'
-        & $go build -trimpath -ldflags $ldflags -o $arm64 ./cmd/agent
-        if ($LASTEXITCODE -ne 0) { throw 'arm64 build failed.' }
-        "$((Get-FileHash -Algorithm SHA256 -LiteralPath $arm64).Hash.ToLowerInvariant())  $(Split-Path -Leaf $arm64)" | Set-Content -NoNewline -Encoding ascii "$arm64.sha256"
+		Build-LinuxBinary -Name 'dbpilot-controlplane' -Package './cmd/controlplane' -Architecture 'arm64' -LinkerFlags $controlplaneLdflags
+		Build-LinuxBinary -Name 'dbpilot-agent' -Package './cmd/agent' -Architecture 'arm64' -LinkerFlags $agentLdflags
     }
     finally {
         $env:CGO_ENABLED = $oldCGO

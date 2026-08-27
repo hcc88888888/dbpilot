@@ -25,6 +25,7 @@ const selectTargetsSQL = "SELECT target_id, status, error_summary, result_summar
 const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, completed_targets = $4, failed_targets = $5, skipped_targets = $6, error_summary = $7, result_summary = $8, artifacts = $9, dispatched_at = $10, started_at = $11, finished_at = $12, cancel_requested_by = $13, cancel_requested_at = $14 WHERE tenant_id = $15 AND project_id = $16 AND id = $17 AND version = $18"
 const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts) SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts FROM claimed ORDER BY created_at, id"
 const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = $1, lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND published_at IS NULL"
+const selectOutboxByIDSQL = "SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts FROM command_outbox WHERE id = $1"
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -261,6 +262,20 @@ func (repository *PostgresRepository) MarkOutboxPublished(ctx context.Context, s
 	return nil
 }
 
+func (repository *PostgresRepository) LookupCommand(ctx context.Context, commandID string) (OutboxMessage, error) {
+	if repository == nil || repository.db == nil {
+		return OutboxMessage{}, errors.New("job PostgreSQL repository is unavailable")
+	}
+	if strings.TrimSpace(commandID) == "" {
+		return OutboxMessage{}, ErrNotFound
+	}
+	message, err := scanOutbox(repository.db.QueryRowContext(ctx, selectOutboxByIDSQL, commandID))
+	if err != nil {
+		return OutboxMessage{}, classifyReadError("lookup command", err)
+	}
+	return message, nil
+}
+
 type rowQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -348,7 +363,7 @@ func validateNewJob(value Job) error {
 }
 
 func validateOutboxMessage(value Job, message OutboxMessage) error {
-	if message.ID == "" || message.Type == "" || message.JobID != value.ID || message.Scope != value.Scope || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || !json.Valid(message.Payload) {
+	if message.ID == "" || message.Type == "" || message.JobID != value.ID || message.Scope != value.Scope || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 {
 		return fmt.Errorf("create outbox message: %w", ErrInvalidTransition)
 	}
 	return nil

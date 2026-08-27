@@ -85,10 +85,39 @@ window.DBPILOT_ALERT_CONTEXT = { authenticated: true, tenantId: 'xxx', projectId
 ## 测试
 
 ```bash
-node --test                 # 运行全部前端测试（自动发现 frontend/tests/）
+npm ci
+npm run contracts:lint
+npm run contracts:breaking
+npm run contracts:verify
+node --test
+cd backend && go test ./...
 ```
 
-当前全量 **221** 个用例全部通过。
+标准 `node --test` 会跳过一个 opt-in Prism 集成用例。显式验证 mock server 时运行
+`npm run contracts:mock:test`；脚本会启动固定版本 Prism、执行用例并清理容器。
+
+### 合同开发与完整门禁
+
+OpenAPI 与 Agent Protobuf 的唯一可编辑源分别位于 `contracts/openapi/` 与
+`contracts/protobuf/`。修改后运行 `npm run contracts:generate`，并提交
+`backend/gen/`、`frontend/generated/` 的生成结果；不得直接手改生成文件。
+`contracts:breaking` 以 `origin/main` 为基线阻止破坏性 Agent v1 变更，
+`contracts:verify` 会重新生成并拒绝 drift。
+
+开发期间可用 `npm run contracts:mock:start` 启动 Prism，结束后运行对应的
+Docker Compose `down`；自动化路径优先使用会自行清理的
+`npm run contracts:mock:test`。一条命令运行合同、前端、Go、Prism、真实
+PostgreSQL Job→Command E2E 与 Linux 交叉构建：
+
+```powershell
+powershell -NoProfile -File backend/scripts/verify-contract-foundation.ps1
+powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
+  -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' -Architecture amd64
+```
+
+当前 `/api/v1` 允许一次 pre-stable 迁移。工单、SQL 窗口、SQL 审核、慢 SQL、
+审计日志、锁透视、结构对比与报告这八个模块全部切换到生成客户端和 strict
+server handler 后，v1 进入 additive-only 稳定边界。
 
 ---
 

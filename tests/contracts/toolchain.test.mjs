@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -50,7 +50,7 @@ async function createBreakingFixture({ includeOriginMain, includeCanonicalContra
 }
 
 function runBreaking(root, env = {}) {
-  return run('powershell', ['-NoProfile', '-File', 'scripts/contracts/breaking.ps1'], {
+  return run('pwsh', ['-NoProfile', '-File', 'scripts/contracts/breaking.ps1'], {
     cwd: root,
     env: { ...process.env, ...env },
   });
@@ -58,9 +58,9 @@ function runBreaking(root, env = {}) {
 
 test('contract toolchain is pinned and generated output is tracked', async () => {
   const pkg = JSON.parse(await readFile('package.json', 'utf8'));
-  assert.equal(pkg.scripts['contracts:lint'], 'powershell -NoProfile -File scripts/contracts/lint.ps1');
-  assert.equal(pkg.scripts['contracts:generate'], 'powershell -NoProfile -File scripts/contracts/generate.ps1');
-  assert.equal(pkg.scripts['contracts:breaking'], 'powershell -NoProfile -File scripts/contracts/breaking.ps1');
+  assert.equal(pkg.scripts['contracts:lint'], 'pwsh -NoProfile -File scripts/contracts/lint.ps1');
+  assert.equal(pkg.scripts['contracts:generate'], 'pwsh -NoProfile -File scripts/contracts/generate.ps1');
+  assert.equal(pkg.scripts['contracts:breaking'], 'pwsh -NoProfile -File scripts/contracts/breaking.ps1');
   assert.equal(pkg.devDependencies['@redocly/cli'], '2.2.0');
   assert.equal(pkg.devDependencies['@stoplight/prism-cli'], '5.14.2');
   assert.equal(pkg.devDependencies.typescript, '5.9.2');
@@ -96,7 +96,13 @@ test('breaking check invokes Buf when origin/main contains the canonical contrac
   const binDirectory = join(root, 'bin');
   const invocationLog = join(root, 'buf-invocation.txt');
   await mkdir(binDirectory);
-  await writeFile(join(binDirectory, 'buf.cmd'), '@echo off\r\necho %* > "%BUF_LOG%"\r\n');
+  if (process.platform === 'win32') {
+    await writeFile(join(binDirectory, 'buf.cmd'), '@echo off\r\necho %* > "%BUF_LOG%"\r\n');
+  } else {
+    const fakeBuf = join(binDirectory, 'buf');
+    await writeFile(fakeBuf, '#!/bin/sh\nprintf "%s " "$@" > "$BUF_LOG"\n');
+    await chmod(fakeBuf, 0o755);
+  }
 
   try {
     const result = runBreaking(root, {

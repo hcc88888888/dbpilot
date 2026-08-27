@@ -23,4 +23,5 @@ type Repository interface {
 type DispatchRepository interface {
 	ClaimOutbox(context.Context, int, time.Time) ([]OutboxMessage, error)
 	MarkOutboxPublished(context.Context, platformscope.Scope, string, time.Time) error
+	LookupCommand(context.Context, string) (OutboxMessage, error)
 }

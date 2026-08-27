@@ -71,7 +71,9 @@ directory unless intentionally discarding pending telemetry.
 
 ## Build and smoke evidence
 
-Use an absolute Go 1.27.0 executable path:
+Use an absolute Go 1.27.0 executable path. The build emits both
+`dbpilot-controlplane` and `dbpilot-agent` for linux/amd64 and linux/arm64,
+always with `CGO_ENABLED=0`, plus SHA-256 files:
 
 ```powershell
 powershell -File .\scripts\build-linux.ps1 -OutputDirectory "$pwd\bin" -Version 0.1.0-test -GoBinary 'C:\absolute\path\to\go.exe'
@@ -93,16 +95,64 @@ requires attaching the three runner logs.
 
 ### Windows Docker/Kylin verification
 
-Windows development can verify the Linux executable inside an approved Kylin
-V10 Docker image. Build the amd64/arm64 artifacts first, then run
-`scripts/verify-kylin-docker.ps1` with `-Image` set to the enterprise Kylin
-image and the matching `-Architecture`. The script rejects missing Docker,
-missing images, non-Kylin `/etc/os-release`, architecture mismatches, and
-startup failures. It never substitutes a generic Linux image for Kylin.
+Windows development can verify both Linux executables inside an approved Kylin
+V10 Docker image. The verifier builds both architectures, executes each
+selected-architecture binary with `--version`, starts the Agent with a signed
+sample policy, proves its bbolt command journal opens and closes, and starts
+the control plane through configuration validation until the expected
+PostgreSQL connection failure. It rejects missing Docker/images, non-Kylin
+`/etc/os-release`, architecture mismatches, and unexpected startup failures;
+it always removes its container and temporary keys/binaries and never
+substitutes a generic Linux image.
+
+```powershell
+powershell -NoProfile -File .\scripts\verify-kylin-docker.ps1 `
+  -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' `
+  -Architecture amd64
+```
 
 This container check covers executable compatibility and bootstrap startup.
 Systemd, journald ACLs, kernel metrics, eBPF, and real Kylin service behavior
 must still be verified on Kylin V10 amd64/arm64 VM or bare-metal runners.
+
+## Contract and command lifecycle workflow
+
+Edit only the canonical OpenAPI/Protobuf sources under `../contracts`, then run
+from the repository root:
+
+```powershell
+npm ci
+npm run contracts:lint
+npm run contracts:breaking
+npm run contracts:generate
+npm run contracts:verify
+node --test
+Push-Location backend; go test ./...; Pop-Location
+npm run contracts:mock:test
+powershell -NoProfile -File backend/scripts/verify-contract-foundation.ps1
+```
+
+Commit the generated Go strict server/client, permissions, protobuf, and
+TypeScript client trees. Do not hand-edit `gen/` or `frontend/generated/`.
+The standard Node suite intentionally reports one skipped Prism integration;
+the explicit mock test is the live, self-cleaning Prism check.
+
+Agent Hello capability negotiation is authoritative: the dispatcher sends only
+typed command envelopes the live Agent advertised. Delivery is at-least-once;
+`command_outbox.id` is the immutable `command_id`, the Agent journal deduplicates
+that ID, and every acknowledgement/progress/result is correlated through the
+durable outbox row to tenant/project, Job, target, Artifact references and Audit
+trace fields. The control plane reads an Ed25519 PKCS#8 signing key once from
+`command.signing_private_key_ref`; Agents receive only the matching PKIX public
+key. Arbitrary shell commands are never part of the protocol.
+
+The current `/api/v1` contract has one pre-stable migration window. After
+workorder, SQL window, SQL review, slow SQL, audit log, locks, schema diff and
+reports all use generated clients and strict handlers, v1 changes are
+additive-only. Durable idempotency rows left in unresolved `processing` state
+are deliberately not auto-reclaimed: production operations need an explicit
+future administrator reconciliation procedure before such requests can be
+replayed safely.
 
 ## Database adapter integration verification
 

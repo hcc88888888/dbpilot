@@ -3,12 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "contracts:lint": "powershell -NoProfile -File scripts/contracts/lint.ps1",
-    "contracts:generate": "powershell -NoProfile -File scripts/contracts/generate.ps1",
-    "contracts:breaking": "powershell -NoProfile -File scripts/contracts/breaking.ps1",
-    "contracts:verify": "powershell -NoProfile -File scripts/contracts/verify-drift.ps1",
-    "contracts:mock:start": "powershell -NoProfile -File scripts/contracts/start-mock.ps1",
-    "contracts:mock:test": "powershell -NoProfile -File scripts/contracts/start-mock.ps1 -Test"
+    "contracts:lint": "pwsh -NoProfile -File scripts/contracts/lint.ps1",
+    "contracts:generate": "pwsh -NoProfile -File scripts/contracts/generate.ps1",
+    "contracts:breaking": "pwsh -NoProfile -File scripts/contracts/breaking.ps1",
+    "contracts:verify": "pwsh -NoProfile -File scripts/contracts/verify-drift.ps1",
+    "contracts:mock:start": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1",
+    "contracts:mock:test": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1 -Test"
   },
   "devDependencies": {
     "@redocly/cli": "2.2.0",

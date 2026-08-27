@@ -42,7 +42,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const version = "dev"
+var version = "dev"
 
 type TLSMaterial struct {
 	CertFile     string `yaml:"cert_file"`
@@ -81,6 +81,10 @@ type MonitoringSettings struct {
 	MaximumResponseBytes int `yaml:"maximum_response_bytes,omitempty"`
 }
 
+type CommandSettings struct {
+	SigningPrivateKeyRef string `yaml:"signing_private_key_ref"`
+}
+
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
 }
@@ -111,6 +115,7 @@ type Config struct {
 	EvaluationScopes []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
 	EvaluationEvery  time.Duration              `yaml:"evaluation_every,omitempty"`
 	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
+	Command          CommandSettings            `yaml:"command"`
 
 	HTTPServerTLS     *tls.Config                                `yaml:"-"`
 	GRPCServerTLS     *tls.Config                                `yaml:"-"`
@@ -124,32 +129,35 @@ type Config struct {
 	Channels          []alert.DeliveryChannel                    `yaml:"-"`
 	AgentRegistry     *agentcontrol.Registry                     `yaml:"-"`
 	CommandObserver   agentcontrol.Observer                      `yaml:"-"`
+	CommandSigner     job.CommandSigner                          `yaml:"-"`
 }
 
 type Server struct {
-	config          Config
-	database        *sql.DB
-	ownsDatabase    bool
-	repository      *alert.PostgresRepository
-	evaluator       *alert.Evaluator
-	dispatcher      *alert.Dispatcher
-	httpServer      *http.Server
-	grpcServer      *grpc.Server
-	httpTLS         *tls.Config
-	grpcTLS         *tls.Config
-	ping            func(context.Context) error
-	migrate         func(context.Context) error
-	listen          func(string, string) (net.Listener, error)
-	scopes          []alert.Scope
-	ready           *atomic.Bool
-	evaluateScope   func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents      func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch        func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue        func(context.Context, time.Time) error
-	agentRegistry   *agentcontrol.Registry
-	commandObserver agentcontrol.Observer
-	idempotency     *idempotency.Service
-	workers         sync.WaitGroup
+	config           Config
+	database         *sql.DB
+	ownsDatabase     bool
+	repository       *alert.PostgresRepository
+	evaluator        *alert.Evaluator
+	dispatcher       *alert.Dispatcher
+	httpServer       *http.Server
+	grpcServer       *grpc.Server
+	httpTLS          *tls.Config
+	grpcTLS          *tls.Config
+	ping             func(context.Context) error
+	migrate          func(context.Context) error
+	listen           func(string, string) (net.Listener, error)
+	scopes           []alert.Scope
+	ready            *atomic.Bool
+	evaluateScope    func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents       func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch         func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue         func(context.Context, time.Time) error
+	agentRegistry    *agentcontrol.Registry
+	commandObserver  agentcontrol.Observer
+	commandLifecycle *job.CommandLifecycle
+	dispatchCommands func(context.Context, time.Time) error
+	idempotency      *idempotency.Service
+	workers          sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -250,6 +258,14 @@ func NewServer(config Config) (*Server, error) {
 		grpcTLS.MinVersion = tls.VersionTLS12
 	}
 	grpcTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	secrets := config.SecretResolver
+	if secrets == nil {
+		secrets = environmentSecretResolver{}
+	}
+	commandSigner, err := commandSignerForConfig(context.Background(), config, secrets)
+	if err != nil {
+		return nil, err
+	}
 	database := config.Database
 	ownsDatabase := false
 	if database == nil {
@@ -268,10 +284,6 @@ func NewServer(config Config) (*Server, error) {
 		log.Printf("dbpilot authenticated policy status accepted agent_id=%q version=%d", status.AgentID, status.Version)
 	}))
 	evaluator := alert.NewEvaluator(repository, repository)
-	secrets := config.SecretResolver
-	if secrets == nil {
-		secrets = environmentSecretResolver{}
-	}
 	channels := config.Channels
 	if len(channels) == 0 {
 		allowlist := buildExactWebhookAllowlist(config.WebhookAllowlist)
@@ -309,6 +321,7 @@ func NewServer(config Config) (*Server, error) {
 	ready := &atomic.Bool{}
 	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
 	jobRepository := job.NewPostgresRepository(database)
+	auditService := audit.NewService(audit.NewPostgresStore(database))
 	idempotencyService := idempotency.NewService(idempotency.NewPostgresStore(database))
 	artifactSigner, err := artifact.NewHMACDownloadSigner(strings.TrimRight(config.EventURLBase, "/")+"/api/v1/artifact-downloads", "secret://controlplane/artifact-download", platformdatabase.EnvironmentSecretResolver{})
 	if err != nil {
@@ -320,7 +333,7 @@ func NewServer(config Config) (*Server, error) {
 	services := controlplane.Services{
 		Repository: repository, Evaluator: evaluator,
 		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
-		Jobs: jobRepository, Artifacts: artifact.NewService(artifact.NewPostgresStore(database), artifactSigner), Audit: audit.NewService(audit.NewPostgresStore(database)),
+		Jobs: jobRepository, Artifacts: artifact.NewService(artifact.NewPostgresStore(database), artifactSigner), Audit: auditService,
 		Capabilities: capability.NewService(nil),
 		Idempotency:  idempotencyService,
 		Ready: func(ctx context.Context) error {
@@ -337,12 +350,25 @@ func NewServer(config Config) (*Server, error) {
 	if agentRegistry == nil {
 		agentRegistry = agentcontrol.NewRegistry(64)
 	}
+	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
+		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
+		OnError: func(err error) { log.Printf("command lifecycle event failed: %v", err) },
+	})
+	if err != nil {
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("configure command lifecycle: %w", err)
+	}
 	commandObserver := config.CommandObserver
 	if commandObserver == nil {
-		commandObserver = agentcontrol.NoopObserver{}
+		commandObserver = commandLifecycle
 	}
 	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, idempotency: idempotencyService}, nil
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, dispatchCommands: func(ctx context.Context, at time.Time) error {
+		_, err := commandLifecycle.DispatchPending(ctx, at)
+		return err
+	}, idempotency: idempotencyService}, nil
 }
 
 func validateConfig(config Config) error {
@@ -352,6 +378,9 @@ func validateConfig(config Config) error {
 	}
 	if len(config.WebhookAllowlist) == 0 {
 		return errors.New("webhook_allowlist must contain at least one hostname")
+	}
+	if config.CommandSigner == nil && alert.ValidateSecretReference(config.Command.SigningPrivateKeyRef) != nil {
+		return errors.New("command.signing_private_key_ref must be a Credential Reference")
 	}
 	if err := monitoring.ValidateQueryLimits(config.Monitoring.limits()); err != nil {
 		return errors.New("monitoring limits are invalid")
@@ -600,7 +629,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(2)
+	server.workers.Add(3)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -608,6 +637,10 @@ func (server *Server) startLoops(ctx context.Context) {
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, retryEvery, func(at time.Time) { _ = server.retryDue(ctx, at) })
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, time.Second, func(at time.Time) { _ = server.dispatchCommands(ctx, at) })
 	}()
 }
 
@@ -748,6 +781,26 @@ func (environmentSecretResolver) Resolve(_ context.Context, ref string) ([]byte,
 		return nil, errors.New("secret is unavailable")
 	}
 	return []byte(value), nil
+}
+
+func commandSignerForConfig(ctx context.Context, config Config, resolver alert.SecretResolver) (job.CommandSigner, error) {
+	if config.CommandSigner != nil {
+		return config.CommandSigner, nil
+	}
+	contents, err := resolver.Resolve(ctx, config.Command.SigningPrivateKeyRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve command signing private key: %w", err)
+	}
+	defer func() {
+		for index := range contents {
+			contents[index] = 0
+		}
+	}()
+	signer, err := job.NewEd25519CommandSignerPEM(contents)
+	if err != nil {
+		return nil, fmt.Errorf("configure command signing private key: %w", err)
+	}
+	return signer, nil
 }
 
 type postgresLogBatchDeduplicator struct{ database *sql.DB }

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -32,6 +35,7 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "oidc", config.Identity.Mode)
 	require.Equal(t, "https://identity.example.com", config.Identity.Issuer)
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
+	require.Equal(t, "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", config.Command.SigningPrivateKeyRef)
 }
 
 func TestNewServerRejectsInvalidProductionConfiguration(t *testing.T) {
@@ -172,6 +176,37 @@ func TestNewServerRetainsInjectedAgentControlDependencies(t *testing.T) {
 	require.Same(t, registry, server.agentRegistry)
 	require.Same(t, observer, server.commandObserver)
 	require.Contains(t, server.grpcServer.GetServiceInfo(), "dbpilot.agent.v1.AgentControl")
+}
+
+func TestNewServerWiresDefaultCommandLifecycleToRegistryAndWorker(t *testing.T) {
+	registry := agentcontrol.NewRegistry(7)
+	config := validServerConfig()
+	config.AgentRegistry = registry
+	config.CommandObserver = nil
+
+	server, err := NewServer(config)
+
+	require.NoError(t, err)
+	require.NotNil(t, server.commandLifecycle)
+	require.Same(t, server.commandLifecycle, server.commandObserver)
+	require.NotNil(t, server.dispatchCommands)
+}
+
+func TestNewServerResolvesCommandSigningCredentialOnce(t *testing.T) {
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x42}, ed25519.SeedSize))
+	encoded, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	require.NoError(t, err)
+	resolver := &recordingCommandSecretResolver{value: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded})}
+	config := validServerConfig()
+	config.CommandSigner = nil
+	config.Command.SigningPrivateKeyRef = "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"
+	config.SecretResolver = resolver
+
+	server, err := NewServer(config)
+
+	require.NoError(t, err)
+	require.NotNil(t, server.commandLifecycle)
+	require.Equal(t, []string{"env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"}, resolver.references)
 }
 
 func TestNewServerWiresDurablePlatformIdempotency(t *testing.T) {
@@ -410,6 +445,7 @@ func validServerConfig() Config {
 		GRPCServerTLS:     &tls.Config{MinVersion: tls.VersionTLS12},
 		PrincipalResolver: trustedTestPrincipalResolver{},
 		EvaluationScopes:  []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
+		CommandSigner:     testCommandSigner{},
 	}
 }
 
@@ -438,6 +474,23 @@ func (*testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbea
 func (*testCommandObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
 func (*testCommandObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
 func (*testCommandObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
+
+type testCommandSigner struct{}
+
+func (testCommandSigner) Sign(_ context.Context, envelope *agentv1.CommandEnvelope) error {
+	envelope.Signature = bytes.Repeat([]byte{0x42}, ed25519.SignatureSize)
+	return nil
+}
+
+type recordingCommandSecretResolver struct {
+	value      []byte
+	references []string
+}
+
+func (resolver *recordingCommandSecretResolver) Resolve(_ context.Context, reference string) ([]byte, error) {
+	resolver.references = append(resolver.references, reference)
+	return append([]byte(nil), resolver.value...), nil
+}
 
 type blockingListener struct {
 	closed chan struct{}

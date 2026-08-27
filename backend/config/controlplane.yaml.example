@@ -26,6 +26,10 @@ webhook_allowlist:
 event_url_base: "https://dbpilot.example.com"
 evaluation_every: 15s
 retry_every: 1m
+command:
+  # Credential Reference resolving to one PKCS#8 PEM Ed25519 private key.
+  # The matching PKIX public key is enrolled in each Agent control config.
+  signing_private_key_ref: "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"
 monitoring:
   maximum_instances: 200
   maximum_metrics: 50

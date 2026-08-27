@@ -51,7 +51,7 @@ func resetJobIntegrationSchema(t *testing.T, ctx context.Context, database *sql.
 	require.NoError(t, err)
 	_, err = database.ExecContext(ctx, "DROP TABLE IF EXISTS command_outbox, job_targets, jobs CASCADE")
 	require.NoError(t, err)
-	_, err = database.ExecContext(ctx, "DELETE FROM dbpilot_schema_migrations WHERE name = $1", "job/migrations/0001_jobs_outbox.sql")
+	_, err = database.ExecContext(ctx, "DELETE FROM dbpilot_schema_migrations WHERE name IN ($1, $2)", "job/migrations/0001_jobs_outbox.sql", "job/migrations/0002_command_payload_bytea.sql")
 	require.NoError(t, err)
 }
 

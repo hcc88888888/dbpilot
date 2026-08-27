@@ -1,0 +1,79 @@
+name: Contract foundation
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**'
+      - 'backend/gen/**'
+      - 'frontend/generated/**'
+      - 'scripts/contracts/**'
+      - 'tests/contracts/**'
+      - 'frontend/**'
+      - 'backend/**/*.go'
+      - 'backend/go.mod'
+      - 'backend/go.sum'
+      - 'backend/scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/**'
+      - 'backend/gen/**'
+      - 'frontend/generated/**'
+      - 'scripts/contracts/**'
+      - 'tests/contracts/**'
+      - 'frontend/**'
+      - 'backend/**/*.go'
+      - 'backend/go.mod'
+      - 'backend/go.sum'
+      - 'backend/scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Install locked Node dependencies
+        run: npm ci
+
+      - name: Lint canonical contracts
+        run: npm run contracts:lint
+
+      - name: Reject breaking Agent contract changes
+        run: npm run contracts:breaking
+
+      - name: Reject generated drift
+        run: npm run contracts:verify
+
+      - name: Run frontend and contract tests
+        run: node --test
+
+      - name: Run Go tests
+        working-directory: backend
+        run: go test ./...
+
+      - name: Run live foundation and Linux verification
+        shell: pwsh
+        run: ./backend/scripts/verify-contract-foundation.ps1
