@@ -26,6 +26,7 @@ import (
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/controlplane"
 	"dbpilot.local/platform/internal/ingest"
+	"dbpilot.local/platform/internal/monitoring"
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -258,7 +259,7 @@ func NewServer(config Config) (*Server, error) {
 		listen = net.Listen
 	}
 	ready := &atomic.Bool{}
-	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Ready: func(ctx context.Context) error {
+	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStore(database, nil), Ready: func(ctx context.Context) error {
 		if !ready.Load() {
 			return errors.New("a successful all-scope evaluation pass has not completed")
 		}

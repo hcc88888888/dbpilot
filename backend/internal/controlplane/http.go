@@ -25,13 +25,6 @@ type scopedEvaluatorHealthReader interface {
 	HealthForScope(alert.Scope) alert.EvaluatorHealth
 }
 
-type Services struct {
-	Repository alert.ControlPlaneRepository
-	Evaluator  EvaluatorHealthReader
-	Now        func() time.Time
-	Ready      func(context.Context) error
-}
-
 type ScopedHandler func(http.ResponseWriter, *http.Request, alert.Scope, alert.Principal)
 
 type principalContextKey struct{}
@@ -99,6 +92,21 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 		mux.Handle(pattern, authenticate(resolver, RequireScope(available)))
 	}
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/overview", api.overview)
+	registerMonitoring := func(pattern string, handler ScopedHandler) {
+		available := ScopedHandler(func(writer http.ResponseWriter, request *http.Request, scope alert.Scope, principal alert.Principal) {
+			if services.Monitoring == nil {
+				writeAPIError(writer, http.StatusServiceUnavailable, "unavailable", "control plane is unavailable")
+				return
+			}
+			handler(writer, request, scope, principal)
+		})
+		mux.Handle(pattern, authenticate(resolver, RequireScope(available)))
+	}
+	registerMonitoring("GET /api/v1/tenants/{tenantID}/projects/{projectID}/monitoring/overview", api.monitoringOverview)
+	registerMonitoring("GET /api/v1/tenants/{tenantID}/projects/{projectID}/monitoring/instances", api.monitoringInstances)
+	registerMonitoring("GET /api/v1/tenants/{tenantID}/projects/{projectID}/monitoring/instances/{id}", api.monitoringInstance)
+	registerMonitoring("GET /api/v1/tenants/{tenantID}/projects/{projectID}/monitoring/series", api.monitoringSeries)
+	registerMonitoring("GET /api/v1/tenants/{tenantID}/projects/{projectID}/monitoring/capabilities", api.monitoringCapabilities)
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/alerts", api.listAlerts)
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}", api.getAlert)
 	register("POST /api/v1/tenants/{tenantID}/projects/{projectID}/alerts/{id}/acknowledge", api.acknowledgeAlert)
