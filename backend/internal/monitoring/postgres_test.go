@@ -8,9 +8,60 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/database"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
 )
+
+func TestProductionPostgresMetricBatchHandsOffToMonitoringStoreForCoreEngines(t *testing.T) {
+	for _, engine := range []database.EngineFamily{database.MySQLFamily, database.PostgresFamily, database.OracleFamily} {
+		t.Run(string(engine), func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = db.Close() })
+
+			scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+			now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
+			instanceID := string(engine) + "-1"
+			labels := []byte(fmt.Sprintf(`{"component":%q,"engine":%q,"host":%q,"instance":%q,"role":"primary"}`, engine, engine, instanceID+".internal", instanceID))
+			sample := alert.MetricSample{Scope: scope, AgentID: "agent-a", InstanceID: instanceID, Component: string(engine), Role: "primary", Host: instanceID + ".internal", Name: "host.cpu", Labels: map[string]string{"instance": instanceID, "engine": string(engine), "component": string(engine), "role": "primary", "host": instanceID + ".internal"}, Value: 42, SampledAt: now.Add(-time.Minute)}
+
+			mock.ExpectBegin()
+			mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO ingest_batch_dedup (agent_id, batch_id, state) VALUES ($1, $2, 'processing') ON CONFLICT DO NOTHING RETURNING state")).
+				WithArgs("agent-a", "batch-"+string(engine)).
+				WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
+			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+				WithArgs(scope.TenantID, scope.ProjectID, "agent-a", "host.cpu", sqlmock.AnyArg(), labels, 42.0, sample.SampledAt).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()")).
+				WithArgs(scope.TenantID, scope.ProjectID, instanceID, "agent-a", string(engine), instanceID+".internal", labels, int64(time.Minute), sample.SampledAt).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW() WHERE agent_id = $1 AND batch_id = $2")).
+				WithArgs("agent-a", "batch-"+string(engine)).
+				WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectCommit()
+			first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-"+string(engine), []alert.MetricSample{sample})
+			require.NoError(t, err)
+			require.True(t, first)
+
+			mock.ExpectQuery(regexp.QuoteMeta(instancesSQL)).
+				WithArgs(scope.TenantID, scope.ProjectID, 201).
+				WillReturnRows(instanceRows().AddRow(instanceID, "agent-a", string(engine), instanceID+".internal", labels, int64(time.Minute), sample.SampledAt, now))
+			mock.ExpectQuery(regexp.QuoteMeta(scopeSamplesSQL)).
+				WithArgs(scope.TenantID, scope.ProjectID, now.Add(-MaximumRange), now, 10001).
+				WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "labels", "value", "sampled_at"}).AddRow("agent-a", "host.cpu", labels, 42.0, sample.SampledAt))
+			store := NewPostgresStore(db, DefaultCapabilities())
+			store.SetNow(func() time.Time { return now })
+			page, err := store.ListInstances(context.Background(), scope, InstanceQuery{Limit: 20})
+			require.NoError(t, err)
+			require.Len(t, page.Items, 1)
+			require.Equal(t, engine, page.Items[0].Engine)
+			require.NotNil(t, page.Items[0].Latest["host.cpu"])
+			require.Equal(t, 42.0, *page.Items[0].Latest["host.cpu"])
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
 
 func TestPostgresStoreBuildsScopedInstanceFromMetricSamples(t *testing.T) {
 	db, mock, err := sqlmock.New()

@@ -79,6 +79,39 @@ monitoring:
 `控制面服务` 表示数据来自受控 HTTP API。demo adapter 与 HTTP adapter 独立：HTTP 的
 拒绝、网络或服务错误始终显示固定错误和“重试”按钮，绝不回退到 demo 数据。
 
+## 规范指标名与 capabilities
+
+指标名是区分大小写的稳定标识，不是 UI 文案；同一逻辑指标不得同时以点号和下划线两种
+名字上报。基础监控的跨引擎展示约定如下。它们用于展示、筛选、告警规则和受控模板引用；
+`unit` 由上报样本或能力定义提供，页面不从指标名字推断敏感连接信息。
+
+| 规范 ID | 含义 | 常用单位 | 适用范围 |
+| --- | --- | --- | --- |
+| `host.cpu` | 主机 CPU 使用率 | `%` | 任意受管实例 |
+| `host.memory` | 主机内存使用率 | `%` 或 bytes（以样本 unit 为准） | 任意受管实例 |
+| `db.connections` | 当前数据库连接数 | `count` | MySQL、PostgreSQL 及受控模板 |
+| `db.qps` | 数据库每秒查询数 | `requests/s` | MySQL 受控模板 |
+| `db.transactions` | 数据库事务数或速率 | `count` 或 `transactions/s` | PostgreSQL 受控模板 |
+| `db.sessions` | 数据库会话数 | `count` | Oracle 及受控模板 |
+| `db.wait_time` | 数据库等待时间 | `ms` | Oracle 受控模板 |
+
+上述通用 ID 是基础工作台和 demo 的规范展示词汇，不是绕过 Adapter 的任意 SQL 接口。生产
+`GET .../monitoring/capabilities` 才是某个控制面部署可读取指标的权威目录：只展示
+`metrics: true` 的引擎和其 `metric_ids`，并由后端的受控 Adapter/模板注册填充。调用方
+不得将文档中的一个 ID 视为对所有部署均可查询的承诺。
+
+当前内置 SQL capabilities 的解释如下：
+
+| 引擎 | `metrics` | `metric_ids` 语义 |
+| --- | --- | --- |
+| MySQL | `true` | 内置协议 Adapter 支持指标采集；具体 SQL 模板目录由部署注册，因此空列表不表示可执行任意 SQL。 |
+| PostgreSQL | `true` | 同 MySQL；`transactions` capability 另表示受控事务能力，不是客户端授权。 |
+| Oracle | `true` | 固定只读模板：`oracle.sessions`、`oracle.transactions`、`oracle.locks`、`oracle.tablespace`、`oracle.slow_sql`。 |
+
+新增指标必须先在受控 Agent policy 或 Adapter/模板目录中注册，携带 canonical resource labels
+`instance`、`component`、`role`、`host`，再由 capabilities API 公布。不要以 UI 输入、
+PromQL、原始 SQL 或临时标签创建新指标名；这样既会破坏跨范围聚合，也会绕过安全审计边界。
+
 ## 存储、保留与安全
 
 生产查询使用 PostgreSQL 中由认证摄取维护的 `metric_samples` 与
