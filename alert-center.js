@@ -277,13 +277,21 @@ function secretConfigured(policy) {
 
 function hasTokenizedQueryTarget(target) {
   const text = String(target ?? '').trim();
-  if (!text) return false;
-  try {
-    const url = new URL(text);
-    return [...url.searchParams.keys()].some((key) => /(?:token|secret|password|passwd|pwd|authorization|credential|api[_-]?key|access[_-]?key)/i.test(key));
-  } catch {
-    return false;
-  }
+  const question = text.indexOf('?');
+  if (question < 0) return false;
+  const query = text.slice(question + 1).split('#', 1)[0];
+  if (!query) return false;
+  return query.split(/[&;]/).some((part) => {
+    const rawKey = part.split('=', 1)[0].replace(/\+/g, ' ');
+    let key;
+    try {
+      key = decodeURIComponent(rawKey);
+    } catch {
+      return true;
+    }
+    const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    return /(?:token|key|secret|password|passwd|pwd|auth|signature|sig)/.test(normalized);
+  });
 }
 
 function safePolicyTarget(target) {

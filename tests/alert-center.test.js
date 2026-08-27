@@ -59,6 +59,20 @@ test('tokenized policy target is removed and requires a replacement while a norm
   assert.equal(normalPolicy.targetRequiresReplacement, false);
 });
 
+test('policy target sanitizer hides signature and relative token query variants', () => {
+  for (const target of [
+    'https://hooks.example/ops?signature=top-secret',
+    'https://hooks.example/ops?SIG=top-secret',
+    '/ops?token=top-secret',
+    '/ops?X-Auth_Key=top-secret',
+  ]) {
+    const safe = sanitizePolicyForDisplay({ target });
+    assert.equal(safe.target, '');
+    assert.equal(safe.targetRequiresReplacement, true);
+    assert.equal(JSON.stringify(safe).includes('top-secret'), false);
+  }
+});
+
 test('formatSeverity renders an understandable Chinese severity label', () => {
   assert.equal(formatSeverity('critical'), '紧急');
 });
