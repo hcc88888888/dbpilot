@@ -83,6 +83,7 @@ func (signer *Ed25519CommandSigner) Sign(ctx context.Context, envelope *agentv1.
 
 type CommandAuditRecorder interface {
 	Record(context.Context, audit.Event) (audit.Event, error)
+	RecordOnce(context.Context, audit.Event) (audit.Event, error)
 }
 
 type CommandLifecycleConfig struct {
@@ -212,10 +213,10 @@ func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message O
 	if err != nil {
 		return err
 	}
-	if err := lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, at); err != nil {
+	if _, err := lifecycle.audit.RecordOnce(ctx, lifecycle.auditEvent(value, message, "command.delivery_timed_out", "failure", map[string]any{"reason": "delivery_deadline"}, at, "command.delivery_timed_out:"+message.ID)); err != nil {
 		return err
 	}
-	return lifecycle.recordAuditAt(ctx, value, message, "command.delivery_timed_out", "failure", map[string]any{"reason": "delivery_deadline"}, at)
+	return lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, at)
 }
 
 func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvelope, stored []byte) (*agentv1.CommandEnvelope, error) {
@@ -495,12 +496,16 @@ func (lifecycle *CommandLifecycle) recordAudit(ctx context.Context, value Job, m
 }
 
 func (lifecycle *CommandLifecycle) recordAuditAt(ctx context.Context, value Job, message OutboxMessage, action, result string, detail map[string]any, at time.Time) error {
-	_, err := lifecycle.audit.Record(ctx, audit.Event{
+	_, err := lifecycle.audit.Record(ctx, lifecycle.auditEvent(value, message, action, result, detail, at, ""))
+	return err
+}
+
+func (lifecycle *CommandLifecycle) auditEvent(value Job, message OutboxMessage, action, result string, detail map[string]any, at time.Time, dedupeKey string) audit.Event {
+	return audit.Event{
 		Scope: message.Scope, OccurredAt: at.UTC(), Action: action,
 		Actor: audit.Actor{Type: "system", ID: "agent-control"}, Resource: audit.Resource{Type: "job_target", ID: message.TargetID},
-		Result: result, RequestID: value.RequestID, TraceID: value.TraceID, JobID: message.JobID, CommandID: message.ID, Detail: detail,
-	})
-	return err
+		Result: result, RequestID: value.RequestID, TraceID: value.TraceID, JobID: message.JobID, CommandID: message.ID, DedupeKey: dedupeKey, Detail: detail,
+	}
 }
 
 func hasTimedOutTarget(results []TargetResult) bool {

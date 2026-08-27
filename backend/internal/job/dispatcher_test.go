@@ -145,7 +145,31 @@ func TestExpiredPreparedCommandTimesOutTargetPublishesAndAuditsWithoutDispatch(t
 	require.Equal(t, TargetTimedOut, got.TargetResults[0].Status)
 	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+	require.Equal(t, "command.delivery_timed_out:command-a", fixture.audit.events[len(fixture.audit.events)-1].DedupeKey)
 	require.Equal(t, "delivery_deadline", fixture.audit.events[len(fixture.audit.events)-1].Detail["reason"])
+}
+
+func TestExpiredPreparedCommandAuditFailureLeavesUnpublishedAndRetryRecordsOnce(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	fixture.audit.onceErrors = []error{errors.New("audit unavailable"), nil}
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+time.Second))
+	require.Error(t, err)
+	first := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, first.Status)
+	require.Empty(t, fixture.persistence.published)
+	require.Len(t, fixture.audit.events, 1)
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+DefaultOutboxLease+2*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Len(t, fixture.audit.events, 2)
+	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[1].Action)
+	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 }
 
 func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *testing.T) {
@@ -161,7 +185,7 @@ func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *tes
 	first := fixture.persistence.currentJob()
 	require.Equal(t, StatusTimedOut, first.Status)
 	require.Empty(t, fixture.persistence.published)
-	require.Len(t, fixture.audit.events, 1, "failed publication must defer the timeout audit")
+	require.Len(t, fixture.audit.events, 2, "timeout audit must exist before publication")
 
 	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+DefaultOutboxLease+2*time.Second))
 	require.NoError(t, err)
@@ -169,7 +193,35 @@ func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *tes
 	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
 	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+	require.Len(t, fixture.audit.events, 2, "RecordOnce must not duplicate timeout evidence")
 	require.Len(t, fixture.agents.envelopes, 1)
+}
+
+func TestExpiredPreparedCommandWithPreseededAuditPublishesWithoutDuplicateEvidence(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
+	fixture.persistence.claimed = []OutboxMessage{message}
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	expiredAt := fixture.now.Add(DefaultCommandDeliveryTTL + time.Second)
+	target := TargetResult{TargetID: "agent-a", Status: TargetTimedOut, ErrorSummary: "delivery deadline exceeded", FinishedAt: timePointer(expiredAt)}
+	value, _, err := fixture.lifecycle.applyTarget(context.Background(), message, target, expiredAt)
+	require.NoError(t, err)
+	_, err = fixture.audit.RecordOnce(context.Background(), audit.Event{
+		DedupeKey: "command.delivery_timed_out:command-a", Scope: fixture.scope, OccurredAt: expiredAt,
+		Action: "command.delivery_timed_out", Actor: audit.Actor{Type: "system", ID: "agent-control"},
+		Resource: audit.Resource{Type: "job_target", ID: "agent-a"}, Result: "failure",
+		RequestID: value.RequestID, TraceID: value.TraceID, JobID: value.ID, CommandID: "command-a",
+		Detail: map[string]any{"reason": "delivery_deadline"},
+	})
+	require.NoError(t, err)
+	version := fixture.persistence.currentJob().Version
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), expiredAt.Add(DefaultOutboxLease+time.Second))
+	require.NoError(t, err)
+	require.Equal(t, version, fixture.persistence.currentJob().Version)
+	require.Len(t, fixture.audit.events, 2)
+	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 }
 
 func TestExpiredDeliveryFinishesSucceededPartialWhenAnotherTargetSucceeded(t *testing.T) {
@@ -528,9 +580,35 @@ func (dispatcher *recordingCommandDispatcher) Dispatch(_ context.Context, _ stri
 }
 func (*recordingCommandDispatcher) Cancel(context.Context, string, string) error { return nil }
 
-type recordingAudit struct{ events []audit.Event }
+type recordingAudit struct {
+	events     []audit.Event
+	once       map[string]audit.Event
+	onceErrors []error
+}
 
 func (recorder *recordingAudit) Record(_ context.Context, event audit.Event) (audit.Event, error) {
+	recorder.events = append(recorder.events, event)
+	return event, nil
+}
+
+func (recorder *recordingAudit) RecordOnce(_ context.Context, event audit.Event) (audit.Event, error) {
+	if len(recorder.onceErrors) > 0 {
+		err := recorder.onceErrors[0]
+		recorder.onceErrors = recorder.onceErrors[1:]
+		if err != nil {
+			return audit.Event{}, err
+		}
+	}
+	if recorder.once == nil {
+		recorder.once = make(map[string]audit.Event)
+	}
+	if existing, ok := recorder.once[event.DedupeKey]; ok {
+		if existing.Action != event.Action || existing.Resource != event.Resource || existing.CommandID != event.CommandID || existing.JobID != event.JobID {
+			return audit.Event{}, audit.ErrDedupeConflict
+		}
+		return existing, nil
+	}
+	recorder.once[event.DedupeKey] = event
 	recorder.events = append(recorder.events, event)
 	return event, nil
 }

@@ -169,6 +169,54 @@ func TestJobCommandLifecycle(t *testing.T) {
 	var publishedAfterAck int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedAfterAck))
 	require.Equal(t, 2, publishedAfterAck)
+
+	timeoutCreated := created.Add(time.Hour)
+	timeoutJob := job.Job{
+		ID: "job-delivery-timeout", Type: "contract.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
+		TargetResourceIDs: []string{"agent-a"}, InitiatedBy: "contract-test",
+		SourceResource: job.ResourceReference{ResourceType: "contract_test", ResourceID: "delivery-timeout"},
+		IdempotencyKey: "contract-delivery-timeout", Version: 1, Progress: job.Progress{TotalTargets: 1},
+		Artifacts: []job.ArtifactReference{}, CreatedAt: timeoutCreated, RequestID: "request-delivery-timeout", TraceID: "trace-delivery-timeout",
+	}
+	timeoutMessage := contractOutbox(t, timeoutJob, "command-delivery-timeout", "agent-a", timeoutCreated)
+	require.NoError(t, repository.CreateWithOutbox(ctx, timeoutJob, []job.OutboxMessage{timeoutMessage}))
+	dispatched, err = lifecycle.DispatchPending(ctx, timeoutCreated)
+	require.NoError(t, err)
+	require.Equal(t, 1, dispatched)
+	require.Equal(t, timeoutMessage.ID, streams["agent-a"].nextSent(t).GetCommand().GetCommandId())
+
+	dispatched, err = lifecycle.DispatchPending(ctx, timeoutCreated.Add(job.DefaultCommandDeliveryTTL+time.Second))
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	streams["agent-a"].requireNoSent(t)
+	timedOut, err := repository.Get(ctx, scope, timeoutJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatusTimedOut, timedOut.Status)
+	require.Equal(t, job.TargetTimedOut, timedOut.TargetResults[0].Status)
+	dedupeKey := "command.delivery_timed_out:" + timeoutMessage.ID
+
+	existing, err := auditService.RecordOnce(ctx, audit.Event{
+		DedupeKey: dedupeKey, Scope: scope, OccurredAt: timeoutCreated.Add(job.DefaultCommandDeliveryTTL + 2*time.Second),
+		Action: "command.delivery_timed_out", Actor: audit.Actor{Type: "system", ID: "agent-control"},
+		Resource: audit.Resource{Type: "job_target", ID: "agent-a"}, Result: "failure",
+		RequestID: timeoutJob.RequestID, TraceID: timeoutJob.TraceID, JobID: timeoutJob.ID, CommandID: timeoutMessage.ID,
+		Detail: map[string]any{"reason": "delivery_deadline"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, dedupeKey, existing.DedupeKey)
+	_, err = auditService.RecordOnce(ctx, audit.Event{
+		DedupeKey: dedupeKey, Scope: scope, Action: "command.conflicting", Actor: audit.Actor{Type: "system", ID: "agent-control"},
+		Resource: audit.Resource{Type: "job_target", ID: "agent-a"}, Result: "failure",
+		RequestID: timeoutJob.RequestID, TraceID: timeoutJob.TraceID, JobID: timeoutJob.ID, CommandID: timeoutMessage.ID,
+		Detail: map[string]any{"reason": "delivery_deadline"},
+	})
+	require.ErrorIs(t, err, audit.ErrDedupeConflict)
+	var publishedTimeout bool
+	var timeoutAuditCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT published_at IS NOT NULL FROM command_outbox WHERE id = $1", timeoutMessage.ID).Scan(&publishedTimeout))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND dedupe_key = $3", scope.TenantID, scope.ProjectID, dedupeKey).Scan(&timeoutAuditCount))
+	require.True(t, publishedTimeout)
+	require.Equal(t, 1, timeoutAuditCount, "a published timeout command must have exactly one durable Audit event")
 }
 
 func contractDatabase(t *testing.T, rawDSN string) *sql.DB {
@@ -264,6 +312,14 @@ func (stream *contractAgentStream) nextSent(t *testing.T) *agentv1.ServerMessage
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for AgentControl message")
 		return nil
+	}
+}
+func (stream *contractAgentStream) requireNoSent(t *testing.T) {
+	t.Helper()
+	select {
+	case message := <-stream.sent:
+		t.Fatalf("unexpected AgentControl message after delivery deadline: %s", message.GetMessageId())
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 func (stream *contractAgentStream) Send(message *agentv1.ServerMessage) error {

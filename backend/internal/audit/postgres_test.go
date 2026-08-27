@@ -23,10 +23,34 @@ func TestPostgresStoreAppendPersistsAppendOnlyEvent(t *testing.T) {
 	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
 		value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.OccurredAt, value.Action,
 		value.Actor.Type, value.Actor.ID, value.Resource.Type, value.Resource.ID, value.Result,
-		value.RequestID, value.TraceID, value.JobID, value.CommandID, []byte(`{"count":2}`), value.CreatedAt,
+		value.RequestID, value.TraceID, value.JobID, value.CommandID, value.DedupeKey, []byte(`{"count":2}`), value.CreatedAt,
 	).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	require.NoError(t, NewPostgresStore(database).Append(context.Background(), value))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStoreRecordOnceRejectsConflictingIdentityForDedupeKey(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	value := validEvent()
+	value.ID = "audit-proposed"
+	value.DedupeKey = "command.delivery_timed_out:command-1"
+	value.CommandID = "command-1"
+	value.JobID = "job-1"
+	value.OccurredAt = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	value.CreatedAt = value.OccurredAt
+	mock.ExpectQuery("INSERT INTO audit_events.*ON CONFLICT.*DO NOTHING.*RETURNING").WillReturnRows(sqlmock.NewRows(auditColumnNames()))
+	conflicting := value
+	conflicting.ID = "audit-existing"
+	conflicting.Action = "command.other"
+	mock.ExpectQuery("SELECT .* FROM audit_events WHERE tenant_id = \\$1 AND project_id = \\$2 AND dedupe_key = \\$3").
+		WithArgs(value.Scope.TenantID, value.Scope.ProjectID, value.DedupeKey).
+		WillReturnRows(auditEventRows(conflicting))
+
+	_, err = NewPostgresStore(database).AppendOnce(context.Background(), value)
+	require.ErrorIs(t, err, ErrDedupeConflict)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -44,7 +68,7 @@ func TestServiceRecordPersistsSystemSQLEvidenceThroughPostgresStore(t *testing.T
 	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
 		"audit-sql", value.Scope.TenantID, value.Scope.ProjectID, now, value.Action,
 		value.Actor.Type, value.Actor.ID, value.Resource.Type, value.Resource.ID, value.Result,
-		value.RequestID, value.TraceID, value.JobID, value.CommandID, expectedDetail, now,
+		value.RequestID, value.TraceID, value.JobID, value.CommandID, value.DedupeKey, expectedDetail, now,
 	).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	_, err = service.Record(context.Background(), value)
@@ -96,7 +120,7 @@ func TestPostgresStoreListUsesScopeAndTupleCursor(t *testing.T) {
 	after := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	mock.ExpectQuery("SELECT .* FROM audit_events WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, id\\) > \\(\\$3, \\$4\\) ORDER BY created_at ASC, id ASC LIMIT \\$5").
 		WithArgs(scope.TenantID, scope.ProjectID, after, "audit-1", 11).
-		WillReturnRows(sqlmock.NewRows(auditColumnNames()).AddRow("audit-2", scope.TenantID, scope.ProjectID, after.Add(time.Second), "inspection.finished", "user", "operator-1", "inspection", "inspection-1", "succeeded", "request-1", "trace-1", "job-1", "command-1", []byte(`{"rows":3}`), after.Add(time.Second)))
+		WillReturnRows(sqlmock.NewRows(auditColumnNames()).AddRow("audit-2", scope.TenantID, scope.ProjectID, after.Add(time.Second), "inspection.finished", "user", "operator-1", "inspection", "inspection-1", "succeeded", "request-1", "trace-1", "job-1", "command-1", "", []byte(`{"rows":3}`), after.Add(time.Second)))
 
 	items, err := NewPostgresStore(database).List(context.Background(), scope, StoreListQuery{After: after, AfterID: "audit-1", Limit: 11})
 	require.NoError(t, err)
@@ -118,4 +142,17 @@ func TestPostgresStoreListWithoutCursorStillRequiresExactScope(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, items)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func auditEventRows(value Event) *sqlmock.Rows {
+	detailValue := value.Detail
+	if detailValue == nil {
+		detailValue = map[string]any{}
+	}
+	detail, _ := json.Marshal(detailValue)
+	return sqlmock.NewRows(auditColumnNames()).AddRow(
+		value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.OccurredAt, value.Action,
+		value.Actor.Type, value.Actor.ID, value.Resource.Type, value.Resource.ID, value.Result,
+		value.RequestID, value.TraceID, value.JobID, value.CommandID, value.DedupeKey, detail, value.CreatedAt,
+	)
 }

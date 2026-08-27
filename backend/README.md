@@ -150,7 +150,10 @@ preparation; `lease_seconds` is separate and controls only the Agent's execution
 lease after acceptance. Reclaims before the delivery deadline resend the same
 bytes. An unacknowledged command found at or after the deadline is never sent:
 its target is timed out, the Job is finalized under the normal partial/timeout
-rules, the timeout is audited, and the outbox row is terminally published.
+rules, the timeout Audit row is inserted once under the internal
+`command.delivery_timed_out:<command_id>` deduplication key, and only then is
+the outbox row terminally published. A retry after an Audit or publication
+failure cannot change the Job twice or duplicate the Audit evidence.
 Queue insertion does not mark delivery: only a validated Agent accepted,
 rejected or duplicate acknowledgement publishes the outbox row. The Agent
 journal therefore deduplicates the same ID and digest, and every

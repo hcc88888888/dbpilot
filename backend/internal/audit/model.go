@@ -12,6 +12,7 @@ var (
 	ErrSensitiveDetail = errors.New("audit detail contains sensitive material")
 	ErrImmutableID     = errors.New("audit event ID is service assigned and immutable")
 	ErrInvalidCursor   = errors.New("audit cursor does not belong to scope")
+	ErrDedupeConflict  = errors.New("audit deduplication key conflicts with existing event")
 )
 
 type Actor struct {
@@ -36,6 +37,7 @@ type Event struct {
 	TraceID    string              `json:"trace_id,omitempty"`
 	JobID      string              `json:"job_id,omitempty"`
 	CommandID  string              `json:"command_id,omitempty"`
+	DedupeKey  string              `json:"-"`
 	Detail     map[string]any      `json:"detail,omitempty"`
 	CreatedAt  time.Time           `json:"-"`
 }

@@ -3,6 +3,8 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -29,6 +31,26 @@ func TestRecordRejectsMissingRequiredIdentityFields(t *testing.T) {
 			require.ErrorIs(t, err, ErrInvalidEvent)
 		})
 	}
+}
+
+func TestRecordOnceReturnsExistingEquivalentEventWithoutSecondAppend(t *testing.T) {
+	store := &memoryStore{once: make(map[string]Event)}
+	service := NewService(store)
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	nextID := 0
+	service.newID = func() (string, error) { nextID++; return fmt.Sprintf("audit-%d", nextID), nil }
+	input := validEvent()
+	input.DedupeKey = "command.delivery_timed_out:command-1"
+	input.CommandID = "command-1"
+	input.JobID = "job-1"
+
+	first, err := service.RecordOnce(context.Background(), input)
+	require.NoError(t, err)
+	second, err := service.RecordOnce(context.Background(), input)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, second.ID)
+	require.Len(t, store.appended, 1)
 }
 
 func TestRecordRedactsSQLRecursivelyAndRejectsCredentialKeys(t *testing.T) {
@@ -258,6 +280,19 @@ func validEvent() Event {
 type memoryStore struct {
 	appended []Event
 	listed   []Event
+	once     map[string]Event
+}
+
+func (store *memoryStore) AppendOnce(_ context.Context, value Event) (Event, error) {
+	if existing, ok := store.once[value.DedupeKey]; ok {
+		if existing.Action != value.Action || existing.Resource != value.Resource || existing.CommandID != value.CommandID || existing.JobID != value.JobID || !reflect.DeepEqual(existing.Detail, value.Detail) {
+			return Event{}, ErrDedupeConflict
+		}
+		return existing, nil
+	}
+	store.once[value.DedupeKey] = value
+	store.appended = append(store.appended, value)
+	return value, nil
 }
 
 func (store *memoryStore) Append(_ context.Context, value Event) error {

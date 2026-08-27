@@ -25,6 +25,7 @@ const (
 
 type Store interface {
 	Append(context.Context, Event) error
+	AppendOnce(context.Context, Event) (Event, error)
 	List(context.Context, platformscope.Scope, StoreListQuery) ([]Event, error)
 }
 
@@ -39,6 +40,35 @@ func NewService(store Store) *Service {
 }
 
 func (service *Service) Record(ctx context.Context, input Event) (Event, error) {
+	if input.DedupeKey != "" {
+		return Event{}, ErrInvalidEvent
+	}
+	prepared, err := service.prepareRecord(ctx, input)
+	if err != nil {
+		return Event{}, err
+	}
+	if err := service.store.Append(ctx, cloneEvent(prepared)); err != nil {
+		return Event{}, err
+	}
+	return cloneEvent(prepared), nil
+}
+
+func (service *Service) RecordOnce(ctx context.Context, input Event) (Event, error) {
+	if !canonical(input.DedupeKey) {
+		return Event{}, ErrInvalidEvent
+	}
+	prepared, err := service.prepareRecord(ctx, input)
+	if err != nil {
+		return Event{}, err
+	}
+	stored, err := service.store.AppendOnce(ctx, cloneEvent(prepared))
+	if err != nil {
+		return Event{}, err
+	}
+	return cloneEvent(stored), nil
+}
+
+func (service *Service) prepareRecord(ctx context.Context, input Event) (Event, error) {
 	if service == nil || service.store == nil || ctx == nil {
 		return Event{}, ErrInvalidEvent
 	}
@@ -65,10 +95,7 @@ func (service *Service) Record(ctx context.Context, input Event) (Event, error) 
 	}
 	input.CreatedAt = now
 	input.Detail = detail
-	if err := service.store.Append(ctx, cloneEvent(input)); err != nil {
-		return Event{}, err
-	}
-	return cloneEvent(input), nil
+	return input, nil
 }
 
 func (service *Service) List(ctx context.Context, scope platformscope.Scope, query ListQuery) (Page, error) {
@@ -122,6 +149,9 @@ func (service *Service) List(ctx context.Context, scope platformscope.Scope, que
 
 func validateDraft(value Event) error {
 	if value.Scope.Validate() != nil || !canonical(value.Actor.Type) || !canonical(value.Actor.ID) || !canonical(value.Action) || !canonical(value.Resource.Type) || !canonical(value.Resource.ID) || !canonical(value.Result) || !canonical(value.RequestID) {
+		return ErrInvalidEvent
+	}
+	if value.DedupeKey != "" && !canonical(value.DedupeKey) {
 		return ErrInvalidEvent
 	}
 	return nil

@@ -41,6 +41,7 @@ CREATE TABLE audit_events (
     trace_id TEXT NOT NULL DEFAULT '',
     job_id TEXT NOT NULL DEFAULT '',
     command_id TEXT NOT NULL DEFAULT '',
+    dedupe_key TEXT NOT NULL DEFAULT '',
     detail JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (tenant_id, project_id, id)
@@ -52,6 +53,9 @@ CREATE INDEX audit_events_scope_resource_idx
     ON audit_events (tenant_id, project_id, resource_type, resource_id, created_at DESC);
 CREATE INDEX audit_events_scope_request_idx
     ON audit_events (tenant_id, project_id, request_id, created_at DESC);
+CREATE UNIQUE INDEX audit_events_scope_dedupe_idx
+    ON audit_events (tenant_id, project_id, dedupe_key)
+    WHERE dedupe_key <> '';
 
 CREATE OR REPLACE FUNCTION dbpilot_reject_audit_event_mutation()
 RETURNS trigger
