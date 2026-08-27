@@ -313,6 +313,9 @@ func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Ti
 	resources := metrics.ResourceMetrics()
 	for resourceIndex := 0; resourceIndex < resources.Len(); resourceIndex++ {
 		resource := resources.At(resourceIndex)
+		if err := rejectOTLPMapScopeClaims(resource.Resource().Attributes()); err != nil {
+			return metricEnvelope{}, err
+		}
 		resourceAttributes := otelAttributes(resource.Resource().Attributes())
 		if err := rejectOTLPScopeClaims(resourceAttributes); err != nil {
 			return metricEnvelope{}, err
@@ -346,6 +349,9 @@ func appendOTLPNumberPoints(result *metricEnvelope, name string, resourceAttribu
 		point := points.At(pointIndex)
 		if point.ValueType() != pmetric.NumberDataPointValueTypeDouble && point.ValueType() != pmetric.NumberDataPointValueTypeInt {
 			continue
+		}
+		if err := rejectOTLPMapScopeClaims(point.Attributes()); err != nil {
+			return err
 		}
 		attributes := mapsClone(resourceAttributes)
 		for key, value := range otelAttributes(point.Attributes()) {
@@ -416,6 +422,7 @@ func canonicalOTLPLabels(attributes map[string]string, agentID string) (map[stri
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	normalizedSourceKeys := make(map[string]string, len(keys))
 	for _, key := range keys {
 		if isOTLPScopeClaim(key) {
 			return nil, ErrMetricScopeClaim
@@ -425,12 +432,28 @@ func canonicalOTLPLabels(attributes map[string]string, agentID string) (map[stri
 		if normalized == "" || !metricLabelKey.MatchString(normalized) || isOTLPAgentClaim(key) || isUnsafeOTLPAttribute(normalized, value) {
 			continue
 		}
+		if sourceKey, exists := normalizedSourceKeys[normalized]; exists && sourceKey != key {
+			return nil, fmt.Errorf("%w: normalized OTLP label key collision", ErrInvalidMetricBatch)
+		}
+		normalizedSourceKeys[normalized] = key
 		if _, exists := labels[normalized]; exists || len(labels) >= 64 {
 			continue
 		}
 		labels[normalized] = value
 	}
 	return labels, nil
+}
+
+func rejectOTLPMapScopeClaims(attributes pcommon.Map) error {
+	var err error
+	attributes.Range(func(key string, _ pcommon.Value) bool {
+		if isOTLPScopeClaim(key) {
+			err = ErrMetricScopeClaim
+			return false
+		}
+		return true
+	})
+	return err
 }
 
 func rejectOTLPScopeClaims(attributes map[string]string) error {

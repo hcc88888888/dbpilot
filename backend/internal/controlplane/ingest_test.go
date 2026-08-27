@@ -108,6 +108,53 @@ func TestMetricConsumerRejectsOTLPScopeClaims(t *testing.T) {
 	}
 }
 
+func TestMetricConsumerRejectsOTLPScopeClaimWithNonScalarValue(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	attributes := resourceMetrics.Resource().Attributes()
+	attributes.PutStr("instance", "postgres-1")
+	attributes.PutStr("component", "postgres")
+	attributes.PutStr("role", "primary")
+	attributes.PutStr("host", "postgres-1.internal")
+	attributes.PutEmptySlice("tenant-id")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("host.cpu.utilization")
+	point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	point.SetDoubleValue(42.5)
+	point.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Minute)))
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.ErrorContains(t, err, "scope claim")
+}
+
+func TestMetricConsumerRejectsOTLPNormalizedLabelKeyCollision(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	attributes := resourceMetrics.Resource().Attributes()
+	attributes.PutStr("instance", "postgres-1")
+	attributes.PutStr("component", "postgres")
+	attributes.PutStr("role", "primary")
+	attributes.PutStr("host", "postgres-1.internal")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("system.disk.io")
+	point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	point.SetDoubleValue(1)
+	point.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	point.Attributes().PutStr("device.name", "sda")
+	point.Attributes().PutStr("device-name", "sdb")
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.ErrorIs(t, err, controlplane.ErrInvalidMetricBatch)
+}
+
 func TestMetricConsumerPreservesSafeOTLPSumDimensionsAndUsesReceivedTimeForZeroTimestamp(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
 	store := &recordingStore{}
