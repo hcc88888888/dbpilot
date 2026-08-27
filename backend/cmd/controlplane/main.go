@@ -25,9 +25,16 @@ import (
 	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/artifact"
+	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/controlplane"
+	platformdatabase "dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/ingest"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
+	"dbpilot.local/platform/internal/platformdb"
+	"dbpilot.local/platform/internal/platformscope"
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -79,6 +86,8 @@ func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 
 type IdentitySettings struct {
 	Mode       string                       `yaml:"mode"`
+	Issuer     string                       `yaml:"issuer,omitempty"`
+	Audience   string                       `yaml:"audience,omitempty"`
 	Principals map[string]PrincipalSettings `yaml:"principals,omitempty"`
 }
 
@@ -109,6 +118,7 @@ type Config struct {
 	Migrate           func(context.Context) error                `yaml:"-"`
 	Listen            func(string, string) (net.Listener, error) `yaml:"-"`
 	PrincipalResolver controlplane.PrincipalResolver             `yaml:"-"`
+	OIDCTokenVerifier controlplane.TokenVerifier                 `yaml:"-"`
 	SecretResolver    alert.SecretResolver                       `yaml:"-"`
 	Channels          []alert.DeliveryChannel                    `yaml:"-"`
 	AgentRegistry     *agentcontrol.Registry                     `yaml:"-"`
@@ -192,6 +202,20 @@ func loadConfig(path string) (Config, error) {
 	return config, nil
 }
 
+func composeMigrations(steps ...func(context.Context) error) func(context.Context) error {
+	return func(ctx context.Context) error {
+		for _, step := range steps {
+			if step == nil {
+				return errors.New("migration step is unavailable")
+			}
+			if err := step(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 func NewServer(config Config) (*Server, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
@@ -270,7 +294,11 @@ func NewServer(config Config) (*Server, error) {
 	}
 	migrate := config.Migrate
 	if migrate == nil {
-		migrate = func(ctx context.Context) error { return alert.RunMigrations(ctx, database) }
+		migrate = composeMigrations(
+			func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
+			func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
+			func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
+		)
 	}
 	listen := config.Listen
 	if listen == nil {
@@ -278,12 +306,26 @@ func NewServer(config Config) (*Server, error) {
 	}
 	ready := &atomic.Bool{}
 	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
-	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes, Ready: func(ctx context.Context) error {
-		if !ready.Load() {
-			return errors.New("a successful all-scope evaluation pass has not completed")
+	jobRepository := job.NewPostgresRepository(database)
+	artifactSigner, err := artifact.NewHMACDownloadSigner(strings.TrimRight(config.EventURLBase, "/")+"/api/v1/artifact-downloads", "secret://controlplane/artifact-download", platformdatabase.EnvironmentSecretResolver{})
+	if err != nil {
+		if ownsDatabase {
+			_ = database.Close()
 		}
-		return ping(ctx)
-	}}
+		return nil, fmt.Errorf("configure artifact downloads: %w", err)
+	}
+	services := controlplane.Services{
+		Repository: repository, Evaluator: evaluator,
+		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
+		Jobs: jobRepository, Artifacts: artifact.NewService(artifact.NewPostgresStore(database), artifactSigner), Audit: audit.NewService(audit.NewPostgresStore(database)),
+		Capabilities: capability.NewService(nil),
+		Ready: func(ctx context.Context) error {
+			if !ready.Load() {
+				return errors.New("a successful all-scope evaluation pass has not completed")
+			}
+			return ping(ctx)
+		},
+	}
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
@@ -343,6 +385,14 @@ func validateConfig(config Config) error {
 			if _, err := configuredCertificatePrincipals(config.Identity.Principals); err != nil {
 				return err
 			}
+		case "oidc":
+			issuer, err := url.Parse(config.Identity.Issuer)
+			if err != nil || issuer.Scheme != "https" || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" {
+				return errors.New("OIDC issuer must be a canonical HTTPS URL")
+			}
+			if config.Identity.Audience == "" || config.Identity.Audience != strings.TrimSpace(config.Identity.Audience) || strings.ContainsAny(config.Identity.Audience, "\r\n\t") {
+				return errors.New("OIDC audience is required")
+			}
 		default:
 			return errors.New("trusted HTTP identity adapter is required")
 		}
@@ -382,13 +432,25 @@ func principalResolverForConfig(config Config) (controlplane.PrincipalResolver, 
 			return nil, err
 		}
 		return controlplane.CertificatePrincipalResolver{Principals: principals}, nil
+	case "oidc":
+		verifier := config.OIDCTokenVerifier
+		if verifier == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var err error
+			verifier, err = controlplane.NewOIDCTokenVerifier(ctx, config.Identity.Issuer, config.Identity.Audience)
+			if err != nil {
+				return nil, fmt.Errorf("initialize OIDC provider: %w", err)
+			}
+		}
+		return controlplane.BearerPrincipalResolver{Verifier: verifier}, nil
 	default:
 		return nil, errors.New("trusted HTTP identity adapter is required")
 	}
 }
 
-func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map[string]alert.Principal, error) {
-	principals := make(map[string]alert.Principal, len(settings))
+func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map[string]controlplane.Principal, error) {
+	principals := make(map[string]controlplane.Principal, len(settings))
 	for rawURI, configured := range settings {
 		identityURI, err := url.Parse(rawURI)
 		if err != nil || !identityURI.IsAbs() || identityURI.Host == "" || identityURI.User != nil || identityURI.RawQuery != "" || identityURI.Fragment != "" {
@@ -399,7 +461,7 @@ func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map
 		}
 		projects := make(map[string]struct{}, len(configured.Projects))
 		for _, assignment := range configured.Projects {
-			scope := alert.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}
+			scope := platformscope.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}
 			if scope.Validate() != nil {
 				return nil, errors.New("identity principals contains an invalid project scope")
 			}
@@ -411,7 +473,7 @@ func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map
 		if !configured.PlatformAdmin && len(projects) == 0 {
 			return nil, errors.New("identity principal requires a project scope")
 		}
-		principals[identityURI.String()] = alert.Principal{Subject: configured.Subject, PlatformAdmin: configured.PlatformAdmin, Projects: projects}
+		principals[identityURI.String()] = controlplane.Principal{Subject: configured.Subject, PlatformAdmin: configured.PlatformAdmin, Projects: projects}
 	}
 	return principals, nil
 }

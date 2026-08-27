@@ -3,8 +3,12 @@ module dbpilot.local/platform
 go 1.25.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/coreos/go-oidc/v3 v3.16.0
+	github.com/getkin/kin-openapi v0.142.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.10.9
+	github.com/oapi-codegen/runtime v1.6.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.158.0
@@ -13,7 +17,6 @@ require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/journaldreceiver v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver v0.158.0
-	github.com/oapi-codegen/runtime v1.6.0
 	github.com/prometheus/prometheus v0.313.2
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.5.0
@@ -48,7 +51,6 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v4 v4.3.0 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.7.2 // indirect
 	github.com/Code-Hex/go-generics-cache v1.5.1 // indirect
-	github.com/DATA-DOG/go-sqlmock v1.5.2 // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/alecthomas/participle/v2 v2.1.4 // indirect
@@ -113,7 +115,7 @@ require (
 	github.com/foxboron/go-tpm-keyfiles v0.0.0-20251226215517-609e4778396f // indirect
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
-	github.com/getkin/kin-openapi v0.142.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-kit/log v0.2.1 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

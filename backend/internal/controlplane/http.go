@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/platformscope"
 )
 
 const maxJSONBodyBytes int64 = 1 << 20
@@ -31,21 +32,22 @@ type principalContextKey struct{}
 
 func RequireScope(next ScopedHandler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		principal, ok := request.Context().Value(principalContextKey{}).(alert.Principal)
+		principal, ok := request.Context().Value(principalContextKey{}).(Principal)
 		if !ok || strings.TrimSpace(principal.Subject) == "" {
 			writeAPIError(writer, http.StatusUnauthorized, "unauthenticated", "authentication is required")
 			return
 		}
-		scope := alert.Scope{TenantID: request.PathValue("tenantID"), ProjectID: request.PathValue("projectID")}
-		if scope.Validate() != nil || !headerIdentifier.MatchString(scope.TenantID) || !headerIdentifier.MatchString(scope.ProjectID) {
+		platformScope := platformscope.Scope{TenantID: request.PathValue("tenantID"), ProjectID: request.PathValue("projectID")}
+		if platformScope.Validate() != nil || !headerIdentifier.MatchString(platformScope.TenantID) || !headerIdentifier.MatchString(platformScope.ProjectID) {
 			writeAPIError(writer, http.StatusBadRequest, "invalid_scope", "tenant and project are invalid")
 			return
 		}
-		if !principal.Allows(scope) {
+		if !principal.AllowsScope(platformScope) {
 			writeAPIError(writer, http.StatusForbidden, "forbidden", "project access is forbidden")
 			return
 		}
-		next(writer, request, scope, principal)
+		scope := alert.Scope{TenantID: platformScope.TenantID, ProjectID: platformScope.ProjectID}
+		next(writer, request, scope, principal.AlertPrincipal())
 	})
 }
 
@@ -150,6 +152,7 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 	register("GET /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.getSilence)
 	register("PUT /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.updateSilence)
 	register("DELETE /api/v1/tenants/{tenantID}/projects/{projectID}/silences/{id}", api.deleteSilence)
+	mountPlatformRoutes(mux, services, resolver)
 	return normalizeAPIErrors(mux)
 }
 
@@ -180,6 +183,10 @@ func normalizeAPIErrors(next http.Handler) http.Handler {
 		}
 		buffered := &bufferedResponse{header: make(http.Header)}
 		next.ServeHTTP(buffered, request)
+		if strings.HasPrefix(buffered.header.Get("Content-Type"), "application/problem+json") {
+			copyBufferedResponse(writer, buffered)
+			return
+		}
 		switch {
 		case buffered.status == http.StatusMethodNotAllowed:
 			writeAPIError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "method is not allowed")
@@ -188,16 +195,20 @@ func normalizeAPIErrors(next http.Handler) http.Handler {
 			writeAPIError(writer, http.StatusNotFound, "not_found", "resource was not found")
 			return
 		}
-		for key, values := range buffered.header {
-			writer.Header()[key] = append([]string(nil), values...)
-		}
-		status := buffered.status
-		if status == 0 {
-			status = http.StatusOK
-		}
-		writer.WriteHeader(status)
-		_, _ = writer.Write(buffered.body.Bytes())
+		copyBufferedResponse(writer, buffered)
 	})
+}
+
+func copyBufferedResponse(writer http.ResponseWriter, buffered *bufferedResponse) {
+	for key, values := range buffered.header {
+		writer.Header()[key] = append([]string(nil), values...)
+	}
+	status := buffered.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	writer.WriteHeader(status)
+	_, _ = writer.Write(buffered.body.Bytes())
 }
 
 type httpAPI struct{ services Services }

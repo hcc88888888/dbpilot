@@ -313,21 +313,21 @@ func (fixture *httpFixture) request(method, path string, resolver PrincipalResol
 	return response
 }
 
-type staticPrincipalResolver struct{ principal alert.Principal }
+type staticPrincipalResolver struct{ principal Principal }
 
 func memberFor(tenant, project string) staticPrincipalResolver {
 	scope := alert.Scope{TenantID: tenant, ProjectID: project}
-	return staticPrincipalResolver{principal: alert.Principal{Subject: "actor-1", Projects: map[string]struct{}{scope.Key(): {}}}}
+	return staticPrincipalResolver{principal: Principal{Subject: "actor-1", Projects: map[string]struct{}{scope.Key(): {}}}}
 }
 
-func (resolver staticPrincipalResolver) ResolvePrincipal(*http.Request) (alert.Principal, error) {
+func (resolver staticPrincipalResolver) ResolvePrincipal(*http.Request) (Principal, error) {
 	return resolver.principal, nil
 }
 
 type errorPrincipalResolver struct{ err error }
 
-func (resolver errorPrincipalResolver) ResolvePrincipal(*http.Request) (alert.Principal, error) {
-	return alert.Principal{}, resolver.err
+func (resolver errorPrincipalResolver) ResolvePrincipal(*http.Request) (Principal, error) {
+	return Principal{}, resolver.err
 }
 
 type healthyEvaluator struct{}

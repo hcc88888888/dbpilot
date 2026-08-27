@@ -8,15 +8,15 @@ import (
 	"net/url"
 	"testing"
 
-	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCertificatePrincipalResolverUsesOnlyVerifiedAssignedURI(t *testing.T) {
 	identityURI, err := url.Parse("spiffe://dbpilot.example/operators/alice")
 	require.NoError(t, err)
-	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
-	resolver := CertificatePrincipalResolver{Principals: map[string]alert.Principal{
+	scope := platformscope.Scope{TenantID: "t1", ProjectID: "p1"}
+	resolver := CertificatePrincipalResolver{Principals: map[string]Principal{
 		identityURI.String(): {Subject: "alice", PlatformAdmin: true, Projects: map[string]struct{}{scope.Key(): {}}},
 	}}
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -41,8 +41,8 @@ func TestHeaderPrincipalResolverAcceptsExplicitScopedProjects(t *testing.T) {
 	principal, err := (HeaderPrincipalResolver{}).ResolvePrincipal(request)
 	require.NoError(t, err)
 	require.Equal(t, "actor-1", principal.Subject)
-	require.True(t, principal.Allows(alert.Scope{TenantID: "t1", ProjectID: "p1"}))
-	require.False(t, principal.Allows(alert.Scope{TenantID: "t1", ProjectID: "p2"}))
+	require.True(t, principal.AllowsScope(platformscope.Scope{TenantID: "t1", ProjectID: "p1"}))
+	require.False(t, principal.AllowsScope(platformscope.Scope{TenantID: "t1", ProjectID: "p2"}))
 }
 
 func TestHeaderPrincipalResolverRejectsMissingMalformedAndMultiValueIdentity(t *testing.T) {

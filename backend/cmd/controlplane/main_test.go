@@ -18,6 +18,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/controlplane"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,6 +28,9 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, 15*time.Second, config.EvaluationEvery)
 	require.Equal(t, time.Minute, config.RetryEvery)
 	require.Contains(t, config.Agents, "spiffe-agent-id")
+	require.Equal(t, "oidc", config.Identity.Mode)
+	require.Equal(t, "https://identity.example.com", config.Identity.Issuer)
+	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
 }
 
 func TestNewServerRejectsInvalidProductionConfiguration(t *testing.T) {
@@ -86,6 +90,42 @@ func TestMTLSIdentityModeBuildsConfiguredPrincipalAdapter(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, server)
 	require.Equal(t, tls.RequireAndVerifyClientCert, server.httpTLS.ClientAuth)
+}
+
+func TestOIDCIdentityModeBuildsInjectedBearerResolver(t *testing.T) {
+	config := validServerConfig()
+	config.PrincipalResolver = nil
+	config.Identity = IdentitySettings{Mode: "oidc", Issuer: "https://identity.example.com", Audience: "dbpilot-control-plane"}
+	config.OIDCTokenVerifier = staticOIDCTokenVerifier{claims: controlplane.OIDCClaims{Subject: "operator", PlatformAdmin: true}}
+
+	resolver, err := principalResolverForConfig(config)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer verified-token")
+	principal, err := resolver.ResolvePrincipal(request)
+
+	require.NoError(t, err)
+	require.Equal(t, "operator", principal.Subject)
+	require.True(t, principal.PlatformAdmin)
+}
+
+func TestOIDCIdentityModeRequiresIssuerAndAudience(t *testing.T) {
+	for name, identity := range map[string]IdentitySettings{
+		"missing issuer":   {Mode: "oidc", Audience: "dbpilot-control-plane"},
+		"missing audience": {Mode: "oidc", Issuer: "https://identity.example.com"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := validServerConfig()
+			config.PrincipalResolver = nil
+			config.Identity = identity
+			config.OIDCTokenVerifier = staticOIDCTokenVerifier{}
+
+			server, err := NewServer(config)
+
+			require.Nil(t, server)
+			require.ErrorContains(t, err, "OIDC")
+		})
+	}
 }
 
 func TestConfigStrictlyDecodesSnakeCaseEvaluationScopes(t *testing.T) {
@@ -241,6 +281,28 @@ func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {
 	require.Zero(t, listens)
 }
 
+func TestMigrationSequenceRunsAlertJobAndPlatformStepsInOrder(t *testing.T) {
+	var order []string
+	migrate := composeMigrations(
+		func(context.Context) error { order = append(order, "alert"); return nil },
+		func(context.Context) error { order = append(order, "job"); return nil },
+		func(context.Context) error { order = append(order, "platform"); return nil },
+	)
+
+	require.NoError(t, migrate(context.Background()))
+	require.Equal(t, []string{"alert", "job", "platform"}, order)
+
+	want := errors.New("job migration failed")
+	order = nil
+	migrate = composeMigrations(
+		func(context.Context) error { order = append(order, "alert"); return nil },
+		func(context.Context) error { order = append(order, "job"); return want },
+		func(context.Context) error { order = append(order, "platform"); return nil },
+	)
+	require.ErrorIs(t, migrate(context.Background()), want)
+	require.Equal(t, []string{"alert", "job"}, order)
+}
+
 func TestRunCanceledContextReturnsWithoutMigrationOrListeners(t *testing.T) {
 	config := validServerConfig()
 	migrations, listens := 0, 0
@@ -346,8 +408,17 @@ func validServerConfig() Config {
 
 type trustedTestPrincipalResolver struct{}
 
-func (trustedTestPrincipalResolver) ResolvePrincipal(*http.Request) (alert.Principal, error) {
-	return alert.Principal{Subject: "trusted-test", PlatformAdmin: true}, nil
+func (trustedTestPrincipalResolver) ResolvePrincipal(*http.Request) (controlplane.Principal, error) {
+	return controlplane.Principal{Subject: "trusted-test", PlatformAdmin: true}, nil
+}
+
+type staticOIDCTokenVerifier struct {
+	claims controlplane.OIDCClaims
+	err    error
+}
+
+func (verifier staticOIDCTokenVerifier) Verify(context.Context, string) (controlplane.OIDCClaims, error) {
+	return verifier.claims, verifier.err
 }
 
 type testCommandObserver struct{}

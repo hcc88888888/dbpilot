@@ -1,5 +1,5 @@
-# DBPilot alert control plane. Operator identity is derived from a verified
-# client certificate URI and its static assignment below.
+# DBPilot control plane. Browser operators authenticate with short-lived OIDC
+# Bearer tokens. Agent traffic remains separately authenticated with mTLS.
 database_url: "postgres://dbpilot:replace-me@postgres/dbpilot?sslmode=verify-full"
 
 http:
@@ -7,14 +7,11 @@ http:
   tls:
     cert_file: "/run/secrets/controlplane_http_cert"
     key_file: "/run/secrets/controlplane_http_key"
-    client_ca_file: "/run/secrets/operator_client_ca"
 
 identity:
-  mode: "mtls"
-  principals:
-    "spiffe://dbpilot.example/operators/admin":
-      subject: "platform-admin"
-      platform_admin: true
+  mode: "oidc"
+  issuer: "https://identity.example.com"
+  audience: "dbpilot-control-plane"
 
 grpc:
   address: "0.0.0.0:9443"
