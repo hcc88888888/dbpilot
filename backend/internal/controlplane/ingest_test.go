@@ -131,6 +131,26 @@ func TestMetricConsumerRejectsOTLPScopeClaimWithNonScalarValue(t *testing.T) {
 	require.ErrorContains(t, err, "scope claim")
 }
 
+func TestMetricConsumerRejectsOTLPScopeClaimOnEmptyNumericDatapoint(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	attributes := resourceMetrics.Resource().Attributes()
+	attributes.PutStr("instance", "postgres-1")
+	attributes.PutStr("component", "postgres")
+	attributes.PutStr("role", "primary")
+	attributes.PutStr("host", "postgres-1.internal")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("host.cpu.utilization")
+	metric.SetEmptyGauge().DataPoints().AppendEmpty().Attributes().PutEmptyMap("tenant-id")
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.ErrorContains(t, err, "scope claim")
+}
+
 func TestMetricConsumerRejectsOTLPNormalizedLabelKeyCollision(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})

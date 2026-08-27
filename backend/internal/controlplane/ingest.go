@@ -347,11 +347,11 @@ func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Ti
 func appendOTLPNumberPoints(result *metricEnvelope, name string, resourceAttributes map[string]string, points pmetric.NumberDataPointSlice, agentID string, receivedAt time.Time) error {
 	for pointIndex := 0; pointIndex < points.Len(); pointIndex++ {
 		point := points.At(pointIndex)
-		if point.ValueType() != pmetric.NumberDataPointValueTypeDouble && point.ValueType() != pmetric.NumberDataPointValueTypeInt {
-			continue
-		}
 		if err := rejectOTLPMapScopeClaims(point.Attributes()); err != nil {
 			return err
+		}
+		if point.ValueType() != pmetric.NumberDataPointValueTypeDouble && point.ValueType() != pmetric.NumberDataPointValueTypeInt {
+			continue
 		}
 		attributes := mapsClone(resourceAttributes)
 		for key, value := range otelAttributes(point.Attributes()) {
