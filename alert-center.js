@@ -35,6 +35,9 @@ const TEMPLATE_VARIABLES = [
   ['{{resource.<标签名>}}', 'orders'],
 ];
 
+const TEMPLATE_PLACEHOLDER_PATTERN = /{{\s*([A-Za-z0-9_.-]+)\s*}}/g;
+const TEMPLATE_VALUE_NAMES = new Set(['event.id', 'event.state', 'event.severity', 'event.url', 'evidence.aggregate']);
+
 const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
 
 export function safeText(value) {
@@ -99,9 +102,11 @@ export function validateTemplate(input = {}) {
   if (!String(input.body ?? '').trim()) errors.body = '请填写通知正文';
   for (const field of ['subject', 'body']) {
     if (errors[field]) continue;
-    const unsupported = [...String(input[field] ?? '').matchAll(/{{([^{}]+)}}/g)]
-      .some(([, variable]) => !['event.id', 'event.state', 'event.severity', 'event.url', 'evidence.aggregate'].includes(variable) && !/^resource\.[^\s.{}]+$/.test(variable));
-    if (unsupported) errors[field] = '包含不支持的模板变量';
+    const source = String(input[field] ?? '');
+    const unsupported = [...source.matchAll(TEMPLATE_PLACEHOLDER_PATTERN)]
+      .some(([, variable]) => !TEMPLATE_VALUE_NAMES.has(variable) && !/^resource\.[A-Za-z0-9_.-]+$/.test(variable));
+    const residualBraces = source.replace(TEMPLATE_PLACEHOLDER_PATTERN, '').includes('{{') || source.replace(TEMPLATE_PLACEHOLDER_PATTERN, '').includes('}}');
+    if (unsupported || residualBraces) errors[field] = '包含不支持的模板变量';
   }
   return errors;
 }
@@ -114,6 +119,7 @@ export function validateSilence(input = {}) {
   const startsAtTime = Date.parse(startsAt);
   const endsAtTime = Date.parse(endsAt);
   if (input.hasIncompleteMatchers) errors.matchers = '请完整填写每个匹配条件';
+  else if (input.hasDuplicateMatchers) errors.matchers = '匹配条件不能重复';
   else if (labelEntries(matchers).length === 0) errors.matchers = '至少添加一个匹配条件';
   if (!startsAt) errors.startsAt = '请填写开始时间';
   if (!endsAt) errors.endsAt = '请填写结束时间';
@@ -1029,6 +1035,10 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         const value = String(row.querySelector('[name="matcherValue"]')?.value ?? '').trim();
         return Boolean(key) !== Boolean(value);
       });
+      const matcherKeys = matcherRows
+        .map((row) => String(row.querySelector('[name="matcherKey"]')?.value ?? '').trim().toLowerCase())
+        .filter(Boolean);
+      const hasDuplicateMatchers = new Set(matcherKeys).size !== matcherKeys.length;
       const matchers = matcherRows.reduce((result, row) => {
         const key = String(row.querySelector('[name="matcherKey"]')?.value ?? '').trim();
         const value = String(row.querySelector('[name="matcherValue"]')?.value ?? '').trim();
@@ -1039,6 +1049,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       const input = {
         matchers,
         hasIncompleteMatchers,
+        hasDuplicateMatchers,
         startsAt: String(formData.get('startsAt') ?? '').trim(),
         endsAt: String(formData.get('endsAt') ?? '').trim(),
         reason: String(formData.get('reason') ?? '').trim(),

@@ -120,6 +120,19 @@ test('template validation rejects variables the notification renderer does not s
   });
 });
 
+test('template validation accepts server-valid whitespace around placeholders', () => {
+  assert.deepEqual(validateTemplate({ name: '告警', subject: '{{ event.id }}', body: '{{ resource.database }} {{evidence.aggregate}}' }), {});
+});
+
+test('template validation rejects malformed and non-ASCII resource placeholders', () => {
+  assert.deepEqual(validateTemplate({ name: '告警', subject: '告警 {{event.id', body: '{{resource.数据库}}' }), {
+    subject: '包含不支持的模板变量', body: '包含不支持的模板变量',
+  });
+  assert.deepEqual(validateTemplate({ name: '告警', subject: '{{event id}}', body: '告警正文' }), {
+    subject: '包含不支持的模板变量',
+  });
+});
+
 test('silence must have matcher, future end time, and an ordinary-text reason', () => {
   assert.deepEqual(validateSilence({ matchers: {}, startsAt: '2026-08-27T10:00', endsAt: '2026-08-27T09:00', reason: 'secret=abc' }), {
     matchers: '至少添加一个匹配条件', endsAt: '结束时间必须晚于开始时间', reason: '原因中不能包含凭据或连接串',
@@ -135,6 +148,12 @@ test('silence validation requires an ordinary-text reason', () => {
 test('silence validation rejects a matcher row with only a key or value', () => {
   assert.deepEqual(validateSilence({ matchers: { 'label.instance': 'mysql-01' }, hasIncompleteMatchers: true, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '例行维护' }), {
     matchers: '请完整填写每个匹配条件',
+  });
+});
+
+test('silence validation rejects duplicate normalized matcher keys', () => {
+  assert.deepEqual(validateSilence({ matchers: { 'label.instance': 'mysql-01' }, hasDuplicateMatchers: true, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '例行维护' }), {
+    matchers: '匹配条件不能重复',
   });
 });
 
