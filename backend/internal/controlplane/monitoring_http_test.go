@@ -2,9 +2,11 @@ package controlplane
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,130 @@ import (
 	"dbpilot.local/platform/internal/monitoring"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMetricIngestFeedsMonitoringQueriesWithResolvedScope(t *testing.T) {
+	fixture := newMonitoringIngestFixture(t)
+	err := fixture.consumer.ConsumeMetricBatch(context.Background(), "agent-a", []byte(`{"samples":[{"name":"host.cpu","value":42,"sampled_at":"2026-08-27T09:59:00Z","labels":{"instance":"mysql-1","engine":"mysql","component":"mysql","role":"primary","host":"mysql-1.internal"}}]}`), fixture.now)
+	require.NoError(t, err)
+	require.Len(t, fixture.store.samples, 1)
+	require.Equal(t, fixture.scope, fixture.store.samples[0].Scope)
+
+	result, err := fixture.store.ListInstances(context.Background(), fixture.scope, monitoring.InstanceQuery{Limit: 20})
+	require.NoError(t, err)
+	require.Len(t, result.Items, 1)
+	require.Equal(t, "mysql-1", result.Items[0].ID)
+	require.Equal(t, database.MySQLFamily, result.Items[0].Engine)
+
+	detail, err := fixture.store.GetInstance(context.Background(), fixture.scope, "mysql-1", monitoring.RangeQuery{From: fixture.now.Add(-time.Hour), To: fixture.now, Step: time.Minute})
+	require.NoError(t, err)
+	require.Len(t, detail.Metrics, 1)
+	require.Equal(t, "host.cpu", detail.Metrics[0].Name)
+	require.Equal(t, 42.0, *detail.Metrics[0].Buckets[len(detail.Metrics[0].Buckets)-2].Value)
+}
+
+type monitoringIngestFixture struct {
+	scope    alert.Scope
+	now      time.Time
+	store    *ingestMonitoringStore
+	consumer *MetricConsumer
+}
+
+func newMonitoringIngestFixture(t *testing.T) *monitoringIngestFixture {
+	t.Helper()
+	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
+	store := &ingestMonitoringStore{now: now}
+	return &monitoringIngestFixture{
+		scope:    scope,
+		now:      now,
+		store:    store,
+		consumer: NewMetricConsumer(staticAgentScopeResolver{"agent-a": scope}, store),
+	}
+}
+
+type staticAgentScopeResolver map[string]alert.Scope
+
+func (r staticAgentScopeResolver) ScopeForAgent(_ context.Context, agentID string) (alert.Scope, error) {
+	scope, ok := r[agentID]
+	if !ok {
+		return alert.Scope{}, alert.ErrNotFound
+	}
+	return scope, nil
+}
+
+// ingestMonitoringStore is a test-only bridge proving that the consumer's
+// resolved samples are the records supplied to the monitoring query contract.
+type ingestMonitoringStore struct {
+	mu      sync.RWMutex
+	now     time.Time
+	samples []alert.MetricSample
+}
+
+func (s *ingestMonitoringStore) Append(_ context.Context, samples []alert.MetricSample) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.samples = append(s.samples, samples...)
+	return nil
+}
+
+func (s *ingestMonitoringStore) Query(_ context.Context, query alert.MetricQuery) ([]alert.MetricSample, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]alert.MetricSample, 0)
+	for _, sample := range s.samples {
+		if sample.Scope != query.Scope || sample.Name != query.Name || sample.SampledAt.Before(query.From) || sample.SampledAt.After(query.To) {
+			continue
+		}
+		result = append(result, sample)
+	}
+	return result, nil
+}
+
+func (s *ingestMonitoringStore) monitoringStore() *monitoring.MemoryStore {
+	s.mu.RLock()
+	samples := append([]alert.MetricSample(nil), s.samples...)
+	s.mu.RUnlock()
+	instances := make(map[string]monitoring.Instance)
+	for _, sample := range samples {
+		key := sample.Scope.TenantID + "/" + sample.Scope.ProjectID + "/" + sample.InstanceID
+		instance := instances[key]
+		if instance.ID == "" {
+			instance = monitoring.Instance{ID: sample.InstanceID, Scope: sample.Scope, Engine: database.EngineFamily(sample.Labels["engine"]), Host: sample.Host, AgentID: sample.AgentID, Labels: sample.Labels, CollectEvery: time.Minute}
+		}
+		if sample.SampledAt.After(instance.LastSampleAt) {
+			instance.LastSampleAt = sample.SampledAt
+		}
+		instance.LastHeartbeatAt = s.now
+		instances[key] = instance
+	}
+	values := make([]monitoring.Instance, 0, len(instances))
+	for _, instance := range instances {
+		values = append(values, instance)
+	}
+	store := monitoring.NewMemoryStore(values, samples, nil)
+	store.SetNow(func() time.Time { return s.now })
+	return store
+}
+
+func (s *ingestMonitoringStore) Overview(ctx context.Context, scope alert.Scope, query monitoring.RangeQuery) (monitoring.Overview, error) {
+	return s.monitoringStore().Overview(ctx, scope, query)
+}
+
+func (s *ingestMonitoringStore) ListInstances(ctx context.Context, scope alert.Scope, query monitoring.InstanceQuery) (monitoring.InstancePage, error) {
+	return s.monitoringStore().ListInstances(ctx, scope, query)
+}
+
+func (s *ingestMonitoringStore) GetInstance(ctx context.Context, scope alert.Scope, instanceID string, query monitoring.RangeQuery) (monitoring.InstanceDetail, error) {
+	return s.monitoringStore().GetInstance(ctx, scope, instanceID, query)
+}
+
+func (s *ingestMonitoringStore) Series(ctx context.Context, scope alert.Scope, query monitoring.SeriesQuery) (monitoring.Series, error) {
+	return s.monitoringStore().Series(ctx, scope, query)
+}
+
+func (s *ingestMonitoringStore) Capabilities(ctx context.Context, scope alert.Scope) ([]monitoring.Capability, error) {
+	return s.monitoringStore().Capabilities(ctx, scope)
+}
 
 func TestMonitoringRoutesUseScopeAndRejectCrossProjectInstance(t *testing.T) {
 	fixture := monitoringFixture(t)

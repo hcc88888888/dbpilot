@@ -76,6 +76,24 @@ test('source and fixed failures have safe labels', () => {
   assert.equal(monitoringFailureMessage({ kind: 'network', message: 'password=unsafe' }), '无法连接控制面服务，请检查网络后重试');
 });
 
+test('forbidden monitoring responses keep a fixed permission error with retry and no demo fallback', async () => {
+  const root = { innerHTML: '', addEventListener() {} };
+  const forbidden = Object.assign(new Error('unsafe server detail'), { kind: 'forbidden' });
+  const api = {
+    getOverview() { return Promise.reject(forbidden); },
+    listInstances() { return Promise.reject(forbidden); },
+  };
+  const center = createMonitoringCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' } });
+
+  center.open('overview');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.match(root.innerHTML, /当前账号没有该项目的查看权限/);
+  assert.match(root.innerHTML, /data-monitor-retry/);
+  assert.doesNotMatch(root.innerHTML, /演示数据/);
+  assert.doesNotMatch(root.innerHTML, /unsafe server detail/);
+});
+
 test('scope change aborts the previous load, clears selection, and reloads scoped data', async () => {
   const roots = [];
   const root = {
