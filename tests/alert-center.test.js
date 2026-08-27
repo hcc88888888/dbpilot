@@ -5,8 +5,10 @@ import {
   formatSeverity,
   safeText,
   validateDisposition,
+  validatePolicy,
   validateReason,
   validateRule,
+  sanitizePolicyForDisplay,
 } from '../alert-center.js';
 
 test('safeText prevents markup from becoming alert-detail HTML', () => {
@@ -17,6 +19,30 @@ test('rule validation requires metric, positive threshold, duration, period, and
   assert.deepEqual(validateRule({ metric: '', threshold: 0, for: 'soon', evaluationEvery: '', notificationPolicyIds: [] }), {
     metric: '请选择指标', threshold: '阈值必须大于 0', for: '持续时长格式应为 5m 或 1h', evaluationEvery: '请选择评估周期', notificationPolicyIds: '至少选择一个通知策略',
   });
+});
+
+test('valid rule has bounded duration fields and a policy reference', () => {
+  assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: '10m', evaluationEvery: '1m', notificationPolicyIds: ['policy-1'] }), {});
+});
+
+test('rule validation accepts control-plane duration units', () => {
+  assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: '1s', evaluationEvery: '1m', notificationPolicyIds: ['policy-1'] }), {});
+});
+
+test('policy validation requires a name, supported channel, target, and template', () => {
+  assert.deepEqual(validatePolicy({ name: '', channel: 'pager', target: '', templateId: '' }), {
+    name: '请填写策略名称',
+    channel: '请选择通知渠道',
+    target: '请填写渠道目标',
+    templateId: '请选择通知模板',
+  });
+});
+
+test('policy display exposes configuration state but never a secret reference', () => {
+  const safe = sanitizePolicyForDisplay({ name: '值班 Webhook', secret_ref: 'env://DBPILOT_TOKEN', target: 'https://hooks.example/ops' });
+  assert.equal(safe.secretConfigured, true);
+  assert.equal('secret_ref' in safe, false);
+  assert.equal('secretRef' in safe, false);
 });
 
 test('formatSeverity renders an understandable Chinese severity label', () => {

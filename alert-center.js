@@ -65,10 +65,37 @@ export function validateRule(input = {}) {
 
   if (!metric) errors.metric = '请选择指标';
   if (!Number.isFinite(threshold) || threshold <= 0) errors.threshold = '阈值必须大于 0';
-  if (!/^\d+(?:m|h)$/.test(duration)) errors.for = '持续时长格式应为 5m 或 1h';
+  if (!/^\d+[smhd]$/.test(duration)) errors.for = '持续时长格式应为 5m 或 1h';
   if (!period) errors.evaluationEvery = '请选择评估周期';
   if (!Array.isArray(policyIds) || policyIds.length === 0) errors.notificationPolicyIds = '至少选择一个通知策略';
   return errors;
+}
+
+export function validatePolicy(input = {}) {
+  const errors = {};
+  const channel = String(input.channel ?? '').trim();
+  const templateId = String(input.templateId ?? input.template_id ?? '').trim();
+  if (!String(input.name ?? '').trim()) errors.name = '请填写策略名称';
+  if (!['webhook', 'email', 'sms'].includes(channel)) errors.channel = '请选择通知渠道';
+  if (!String(input.target ?? '').trim()) errors.target = '请填写渠道目标';
+  if (!templateId) errors.templateId = '请选择通知模板';
+  return errors;
+}
+
+export function sanitizePolicyForDisplay(policy = {}) {
+  const {
+    secret_ref: secretRefSnake,
+    secretRef,
+    has_secret: hasSecretSnake,
+    hasSecret,
+    secret_configured: secretConfiguredSnake,
+    secretConfigured,
+    ...safe
+  } = policy;
+  return {
+    ...safe,
+    secretConfigured: Boolean(secretRefSnake || secretRef || hasSecretSnake || hasSecret || secretConfiguredSnake || secretConfigured),
+  };
 }
 
 function isSensitiveText(value) {
@@ -188,6 +215,132 @@ function renderAlertDetailMarkup(event = {}, canManage = false) {
     </div>`;
 }
 
+function listItems(result) {
+  return Array.isArray(result) ? result : Array.isArray(result?.items) ? result.items : [];
+}
+
+function valueOf(item, camel, snake = camel) {
+  return item?.[camel] ?? item?.[snake];
+}
+
+function labelEntries(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  return Object.entries(value).filter(([key, item]) => String(key).trim() && String(item ?? '').trim());
+}
+
+function labelsText(value) {
+  return labelEntries(value).map(([key, item]) => `${key}=${item}`).join('\n');
+}
+
+function labelsFromText(value) {
+  return String(value ?? '').split(/\r?\n|,/).reduce((labels, line) => {
+    const [key, ...rest] = line.split('=');
+    const name = String(key ?? '').trim();
+    const item = rest.join('=').trim();
+    if (name && item) labels[name] = item;
+    return labels;
+  }, {});
+}
+
+function selectorChips(value) {
+  const entries = labelEntries(value);
+  return entries.length
+    ? `<span class="alert-selector-chips">${entries.map(([key, item]) => `<b>${displayValue(key)} = ${displayValue(item)}</b>`).join('')}</span>`
+    : '<span class="alert-empty-value">未限制</span>';
+}
+
+function policyNames(ids, policies) {
+  const names = new Map(policies.map((policy) => [String(policy.id), policy.name ?? policy.id]));
+  const values = Array.isArray(ids) ? ids : [];
+  return values.length ? values.map((id) => displayValue(names.get(String(id)) ?? id)).join('、') : '未配置';
+}
+
+function ruleSummary(rule, policies) {
+  const aggregation = valueOf(rule, 'aggregation') || 'avg';
+  const operator = valueOf(rule, 'operator') || '>';
+  const threshold = valueOf(rule, 'threshold');
+  const period = valueOf(rule, 'evaluationEvery', 'evaluation_every');
+  const duration = valueOf(rule, 'for');
+  const metric = valueOf(rule, 'metric');
+  const policyIds = valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids');
+  return `${aggregation}(${metric || '未选择指标'}) ${operator} ${threshold ?? '—'}，每 ${period || '—'} 评估；持续 ${duration || '—'} 后通知 ${policyNames(policyIds, policies)}。`;
+}
+
+function secretConfigured(policy) {
+  return sanitizePolicyForDisplay(policy).secretConfigured;
+}
+
+function safePolicyTarget(target) {
+  const text = String(target ?? '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    for (const key of [...url.searchParams.keys()]) {
+      if (/(?:token|secret|password|passwd|pwd|authorization|credential|api[_-]?key|access[_-]?key)/i.test(key)) url.searchParams.set(key, '已隐藏');
+    }
+    return url.toString();
+  } catch {
+    return isSensitiveText(text) ? '敏感值已隐藏' : text;
+  }
+}
+
+function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
+  const policyItems = Array.isArray(policies) ? policies : [];
+  const policyIds = valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids') ?? [];
+  const selected = new Set(Array.isArray(policyIds) ? policyIds.map(String) : []);
+  const period = valueOf(rule, 'evaluationEvery', 'evaluation_every') ?? '1m';
+  const lookback = valueOf(rule, 'lookbackWindow', 'lookback_window') ?? period;
+  return `
+    <div class="alert-drawer-head"><div><span class="eyebrow">规则编辑</span><h3>${rule.id ? '编辑规则' : '新建规则'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
+    <form class="alert-config-form" data-rule-form>
+      <label>规则名称<input name="name" required value="${safeText(valueOf(rule, 'name') ?? '')}" placeholder="例如：连接数过高" /></label>
+      <div class="alert-form-grid"><label>指标<input name="metric" required value="${safeText(valueOf(rule, 'metric') ?? '')}" placeholder="db.connections" /></label><label>聚合<select name="aggregation">${['avg', 'max', 'min', 'sum'].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'aggregation') ?? 'avg') ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div>
+      <div class="alert-form-grid"><label>运算符<select name="operator">${['>', '>=', '<', '<=', '==', '!='].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'operator') ?? '>') ? 'selected' : ''}>${safeText(value)}</option>`).join('')}</select></label><label>阈值<input name="threshold" type="number" min="0" step="any" required value="${safeText(valueOf(rule, 'threshold') ?? '')}" /></label></div>
+      <div class="alert-form-grid"><label>评估周期<select name="evaluationEvery">${['10s', '30s', '1m', '5m', '10m', '1h'].map((value) => `<option value="${value}" ${value === period ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label>回看窗口<input name="lookbackWindow" value="${safeText(lookback)}" placeholder="1m" /></label></div>
+      <div class="alert-form-grid"><label>持续时长<input name="for" required value="${safeText(valueOf(rule, 'for') ?? '5m')}" placeholder="5m" /></label><label>缺失数据<select name="missingData">${[['ignore', '忽略'], ['resolve', '恢复'], ['alert', '告警']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(rule, 'missingData', 'missing_data') ?? 'ignore') ? 'selected' : ''}>${label}</option>`).join('')}</select></label></div>
+      <div class="alert-form-grid"><label>严重级别<select name="severity">${['critical', 'warning', 'info'].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'severity') ?? 'warning') ? 'selected' : ''}>${formatSeverity(value)}</option>`).join('')}</select></label><label class="alert-check-label"><input name="enabled" type="checkbox" ${(valueOf(rule, 'enabled') ?? true) ? 'checked' : ''} /> 保存后启用</label></div>
+      <label>标签选择器<textarea name="labels" rows="3" placeholder="instance=db-01">${safeText(labelsText(valueOf(rule, 'labels')))}</textarea></label>
+      <fieldset><legend>通知策略</legend>${policyItems.length ? policyItems.map((policy) => `<label class="alert-check-label"><input name="notificationPolicyIds" type="checkbox" value="${safeText(policy.id)}" ${selected.has(String(policy.id)) ? 'checked' : ''} />${displayValue(policy.name ?? policy.id)}</label>`).join('') : '<p class="alert-form-hint">暂无可引用的通知策略，请先创建通知策略。</p>'}</fieldset>
+      <p class="alert-evaluation-summary" data-rule-summary>${safeText(ruleSummary({ ...rule, evaluationEvery: period, lookbackWindow: lookback }, policyItems))}</p>
+      <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
+      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit">保存规则</button></div>
+    </form>`;
+}
+
+function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
+  const safe = sanitizePolicyForDisplay(policy);
+  const severities = new Set((valueOf(safe, 'severities') ?? []).map(String));
+  const templateId = valueOf(safe, 'templateId', 'template_id') ?? '';
+  return `
+    <div class="alert-drawer-head"><div><span class="eyebrow">通知策略编辑</span><h3>${safe.id ? '编辑通知策略' : '新建通知策略'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
+    <form class="alert-config-form" data-policy-form>
+      <label>策略名称<input name="name" required value="${safeText(valueOf(safe, 'name') ?? '')}" /></label>
+      <div class="alert-form-grid"><label>通知渠道<select name="channel"><option value="">请选择</option>${[['webhook', 'Webhook'], ['email', '邮件'], ['sms', '短信']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(safe, 'channel') ?? '') ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>渠道目标<input name="target" required value="${safeText(safePolicyTarget(valueOf(safe, 'target')))}" placeholder="Webhook 地址或邮箱" /></label></div>
+      <label>通知模板<select name="templateId"><option value="">请选择模板</option>${templates.map((template) => `<option value="${safeText(template.id)}" ${String(template.id) === String(templateId) ? 'selected' : ''}>${displayValue(template.name ?? template.id)}</option>`).join('')}</select></label>
+      ${templates.length ? '' : `<p class="alert-form-hint">暂无可选模板，请填写模板 ID 后保存。</p><label>模板 ID<input name="templateIdFallback" value="${safeText(templateId)}" placeholder="template-1" /></label>`}
+      <fieldset><legend>严重级别范围</legend>${['critical', 'warning', 'info'].map((value) => `<label class="alert-check-label"><input name="severities" type="checkbox" value="${value}" ${severities.has(value) ? 'checked' : ''} />${formatSeverity(value)}</label>`).join('')}</fieldset>
+      <label>路由标签匹配器<textarea name="matchLabels" rows="3" placeholder="database=orders">${safeText(labelsText(valueOf(safe, 'matchLabels', 'match_labels')))}</textarea></label>
+      <div class="alert-form-grid"><label>开始时间（UTC）<input name="windowStartUtc" value="${safeText(valueOf(safe, 'windowStartUtc', 'window_start_utc') ?? '')}" placeholder="09:00" /></label><label>结束时间（UTC）<input name="windowEndUtc" value="${safeText(valueOf(safe, 'windowEndUtc', 'window_end_utc') ?? '')}" placeholder="17:00" /></label></div>
+      <label>Secret 引用（可选）<input name="secretRef" type="password" autocomplete="new-password" placeholder="${safe.secretConfigured ? 'Secret 已配置；输入新引用以替换' : '例如 env://DBPILOT_WEBHOOK_TOKEN'}" /></label>
+      <label class="alert-check-label"><input name="enabled" type="checkbox" ${(valueOf(safe, 'enabled') ?? true) ? 'checked' : ''} /> 保存后启用</label>
+      <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
+      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit">保存策略</button></div>
+    </form>`;
+}
+
+function renderRulesMarkup({ rules, policies, canManage }) {
+  return `
+    <div class="alert-config-toolbar"><div><strong>规则评估</strong><p>每条规则均在当前项目范围内评估。</p></div><div><button type="button" data-rule-create ${canManage ? '' : 'disabled'}>新建规则</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
+    <div class="alert-config-list">${rules.length ? rules.map((rule) => `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(rule, 'name') ?? valueOf(rule, 'metric') ?? rule.id)}</h4><p>${safeText(ruleSummary(rule, policies))}</p></div><span class="alert-status-tag ${statusClass(valueOf(rule, 'severity'))}">${formatSeverity(valueOf(rule, 'severity'))}</span></div><dl class="alert-config-details"><div><dt>指标</dt><dd>${displayValue(valueOf(rule, 'metric'))}</dd></div><div><dt>评估 / 回看</dt><dd>${displayValue(valueOf(rule, 'evaluationEvery', 'evaluation_every'))} / ${displayValue(valueOf(rule, 'lookbackWindow', 'lookback_window'))}</dd></div><div><dt>缺失数据</dt><dd>${displayValue(valueOf(rule, 'missingData', 'missing_data'))}</dd></div><div><dt>标签选择器</dt><dd>${selectorChips(valueOf(rule, 'labels'))}</dd></div><div><dt>通知策略</dt><dd>${policyNames(valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids'), policies)}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(rule, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><span class="alert-status-tag ${valueOf(rule, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(rule, 'enabled') === false ? '已停用' : '已启用'}</span><button type="button" data-rule-edit="${safeText(rule.id)}" ${canManage ? '' : 'disabled'}>编辑</button><button type="button" data-rule-enabled="${safeText(rule.id)}" data-rule-next-enabled="${valueOf(rule, 'enabled') === false ? 'true' : 'false'}" ${canManage ? '' : 'disabled'}>${valueOf(rule, 'enabled') === false ? '启用' : '停用'}</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`).join('') : '<div class="alert-empty"><strong>暂无规则</strong><p>新建规则后将开始对当前项目进行评估。</p></div>'}</div>`;
+}
+
+function renderPoliciesMarkup({ policies, templates, canManage }) {
+  const templateNames = new Map(templates.map((template) => [String(template.id), template.name ?? template.id]));
+  return `
+    <div class="alert-config-toolbar"><div><strong>通知投递</strong><p>Secret 仅显示配置状态，不显示引用或内容。</p></div><div><button type="button" data-policy-create ${canManage ? '' : 'disabled'}>新建通知策略</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
+    <div class="alert-config-list">${policies.length ? policies.map((policy) => { const safe = sanitizePolicyForDisplay(policy); const templateId = valueOf(safe, 'templateId', 'template_id'); return `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(safe, 'name') ?? safe.id)}</h4><p>${displayValue(valueOf(safe, 'channel'))} · ${safeText(safePolicyTarget(valueOf(safe, 'target')))}</p></div><span class="alert-status-tag ${valueOf(safe, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(safe, 'enabled') === false ? '已停用' : '已启用'}</span></div><dl class="alert-config-details"><div><dt>路由标签</dt><dd>${selectorChips(valueOf(safe, 'matchLabels', 'match_labels'))}</dd></div><div><dt>严重级别</dt><dd>${(valueOf(safe, 'severities') ?? []).map(formatSeverity).join('、') || '全部'}</dd></div><div><dt>投递渠道</dt><dd>${displayValue(valueOf(safe, 'channel'))} / ${safeText(safePolicyTarget(valueOf(safe, 'target')))}</dd></div><div><dt>通知模板</dt><dd>${displayValue(templateNames.get(String(templateId)) ?? templateId)}</dd></div><div><dt>Secret</dt><dd>${safe.secretConfigured ? '已配置' : '未配置'}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(safe, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><button type="button" data-policy-edit="${safeText(safe.id)}" ${canManage ? '' : 'disabled'}>编辑</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`; }).join('') : '<div class="alert-empty"><strong>暂无通知策略</strong><p>创建策略后可在规则中选择其作为通知目标。</p></div>'}</div>`;
+}
+
 function permissionsActionMarkup(action, state, canManage) {
   if (state === 'resolved' || !canManage) return '';
   const label = action === 'acknowledge' ? '确认告警' : '恢复告警';
@@ -200,7 +353,7 @@ function showDispositionErrors(form, errors) {
 }
 
 function setBusy(form, busy) {
-  form.querySelectorAll('button, select, textarea').forEach((element) => { element.disabled = busy; });
+  form.querySelectorAll('button, input, select, textarea').forEach((element) => { element.disabled = busy; });
 }
 
 export function createAlertCenter({ root, api, scope, permissions = { manage: false }, onToast = () => {} }) {
@@ -278,6 +431,8 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     if (currentView === 'overview') return renderOverview(signal);
     if (currentView === 'alerts') return renderAlerts(signal);
     if (currentView === 'alert-detail') return renderAlertDetail(signal);
+    if (currentView === 'rules') return renderRules(signal);
+    if (currentView === 'policies') return renderPolicies(signal);
     root.innerHTML = shellMarkup(`<div class="alert-shell-message"><span class="alert-status-tag status-info">准备就绪</span><p>此专用页面已替代通用功能卡片。配置工作流将在相应模块加载时显示。</p></div>`);
     bindShell();
     return Promise.resolve();
@@ -303,6 +458,25 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     destroyed = true;
     aborter?.abort();
     root.replaceChildren();
+  }
+
+  function closeDrawer() {
+    const overlay = root.querySelector('.alert-overlay');
+    if (!overlay) return;
+    overlay.hidden = true;
+    overlay.setAttribute('aria-hidden', 'true');
+    overlay.querySelector('.alert-drawer').replaceChildren();
+  }
+
+  function showDrawer(markup) {
+    const overlay = root.querySelector('.alert-overlay');
+    if (!overlay) return null;
+    overlay.hidden = false;
+    overlay.setAttribute('aria-hidden', 'false');
+    const drawer = overlay.querySelector('.alert-drawer');
+    drawer.innerHTML = markup;
+    drawer.querySelectorAll('[data-alert-drawer-close]').forEach((button) => button.addEventListener('click', closeDrawer));
+    return drawer;
   }
 
   return { open, setScope, destroy };
@@ -359,6 +533,41 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     }
   }
 
+  async function renderRules(signal) {
+    renderLoading('规则');
+    try {
+      const [ruleResult, policyResult] = await Promise.all([
+        api.listRules(currentScope, signal),
+        api.listNotificationPolicies(currentScope, signal),
+      ]);
+      if (signal.aborted || destroyed) return;
+      const rules = listItems(ruleResult);
+      const policies = listItems(policyResult).map(sanitizePolicyForDisplay);
+      root.innerHTML = shellMarkup(renderRulesMarkup({ rules, policies, canManage: permissions.manage }));
+      bindShell();
+      bindRules(rules, policies);
+    } catch (error) {
+      if (!signal.aborted && !destroyed) renderFailure('规则');
+    }
+  }
+
+  async function renderPolicies(signal) {
+    renderLoading('通知策略');
+    try {
+      const work = [api.listNotificationPolicies(currentScope, signal)];
+      if (typeof api.listTemplates === 'function') work.push(api.listTemplates(currentScope, signal));
+      const [policyResult, templateResult] = await Promise.all(work);
+      if (signal.aborted || destroyed) return;
+      const policies = listItems(policyResult).map(sanitizePolicyForDisplay);
+      const templates = listItems(templateResult);
+      root.innerHTML = shellMarkup(renderPoliciesMarkup({ policies, templates, canManage: permissions.manage }));
+      bindShell();
+      bindPolicies(policies, templates);
+    } catch (error) {
+      if (!signal.aborted && !destroyed) renderFailure('通知策略');
+    }
+  }
+
   function bindAlertList() {
     root.querySelector('[data-alert-filters]')?.addEventListener('submit', (event) => {
       event.preventDefault();
@@ -409,6 +618,126 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         setBusy(form, false);
       }
     }));
+  }
+
+  function bindRules(rules, policies) {
+    root.querySelector('[data-rule-create]')?.addEventListener('click', () => openRuleDrawer({}, policies));
+    root.querySelectorAll('[data-rule-edit]').forEach((button) => button.addEventListener('click', () => {
+      const rule = rules.find((item) => String(item.id) === button.dataset.ruleEdit);
+      if (rule) openRuleDrawer(rule, policies);
+    }));
+    root.querySelectorAll('[data-rule-enabled]').forEach((button) => button.addEventListener('click', async () => {
+      if (!permissions.manage) return;
+      button.disabled = true;
+      try {
+        await api.setRuleEnabled(currentScope, button.dataset.ruleEnabled, button.dataset.ruleNextEnabled === 'true', aborter?.signal);
+        onToast(button.dataset.ruleNextEnabled === 'true' ? '规则已启用' : '规则已停用');
+        await renderCurrent();
+      } catch (error) {
+        onToast(error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试');
+        button.disabled = false;
+      }
+    }));
+  }
+
+  function openRuleDrawer(rule, policies, errors = {}) {
+    if (!permissions.manage) return;
+    const drawer = showDrawer(ruleEditorMarkup(rule, policies, errors));
+    const form = drawer?.querySelector('[data-rule-form]');
+    if (!form) return;
+    const updateSummary = () => {
+      const formData = new FormData(form);
+      const selectedPolicies = [...form.querySelectorAll('input[name="notificationPolicyIds"]:checked')].map((input) => input.value);
+      const draft = {
+        ...rule,
+        metric: formData.get('metric'), aggregation: formData.get('aggregation'), operator: formData.get('operator'), threshold: formData.get('threshold'),
+        evaluationEvery: formData.get('evaluationEvery'), for: formData.get('for'), notificationPolicyIds: selectedPolicies,
+      };
+      const summary = form.querySelector('[data-rule-summary]');
+      if (summary) summary.textContent = ruleSummary(draft, policies);
+    };
+    form.addEventListener('input', updateSummary);
+    form.addEventListener('change', updateSummary);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      const notificationPolicyIds = [...form.querySelectorAll('input[name="notificationPolicyIds"]:checked')].map((input) => input.value);
+      const input = {
+        metric: String(formData.get('metric') ?? '').trim(),
+        threshold: Number(formData.get('threshold')), for: String(formData.get('for') ?? '').trim(),
+        evaluationEvery: String(formData.get('evaluationEvery') ?? '').trim(), notificationPolicyIds,
+      };
+      const validation = validateRule(input);
+      const output = form.querySelector('.alert-form-errors');
+      if (Object.keys(validation).length) {
+        if (output) output.textContent = Object.values(validation).join(' ');
+        return;
+      }
+      const payload = {
+        ...(rule.id ? { id: rule.id } : {}),
+        name: String(formData.get('name') ?? '').trim(), metric: input.metric, aggregation: String(formData.get('aggregation') ?? 'avg'), operator: String(formData.get('operator') ?? '>'),
+        threshold: input.threshold, evaluation_every: input.evaluationEvery, lookback_window: String(formData.get('lookbackWindow') ?? '').trim() || input.evaluationEvery,
+        for: input.for, missing_data: String(formData.get('missingData') ?? 'ignore'), severity: String(formData.get('severity') ?? 'warning'),
+        notification_policy_ids: notificationPolicyIds, labels: labelsFromText(formData.get('labels')), enabled: form.querySelector('input[name="enabled"]').checked,
+      };
+      setBusy(form, true);
+      try {
+        await api.saveRule(currentScope, payload, aborter?.signal);
+        closeDrawer();
+        onToast('规则已保存');
+        await renderCurrent();
+      } catch (error) {
+        if (output) output.textContent = error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试';
+        setBusy(form, false);
+      }
+    });
+  }
+
+  function bindPolicies(policies, templates) {
+    root.querySelector('[data-policy-create]')?.addEventListener('click', () => openPolicyDrawer({}, templates));
+    root.querySelectorAll('[data-policy-edit]').forEach((button) => button.addEventListener('click', () => {
+      const policy = policies.find((item) => String(item.id) === button.dataset.policyEdit);
+      if (policy) openPolicyDrawer(policy, templates);
+    }));
+  }
+
+  function openPolicyDrawer(policy, templates, errors = {}) {
+    if (!permissions.manage) return;
+    const safePolicy = sanitizePolicyForDisplay(policy);
+    const drawer = showDrawer(policyEditorMarkup(safePolicy, templates, errors));
+    const form = drawer?.querySelector('[data-policy-form]');
+    if (!form) return;
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      const templateId = String(formData.get('templateId') ?? '').trim() || String(formData.get('templateIdFallback') ?? '').trim();
+      const input = { name: String(formData.get('name') ?? '').trim(), channel: String(formData.get('channel') ?? '').trim(), target: String(formData.get('target') ?? '').trim(), templateId };
+      const validation = validatePolicy(input);
+      const output = form.querySelector('.alert-form-errors');
+      if (Object.keys(validation).length) {
+        if (output) output.textContent = Object.values(validation).join(' ');
+        return;
+      }
+      const secretRef = String(formData.get('secretRef') ?? '').trim();
+      const payload = {
+        ...(safePolicy.id ? { id: safePolicy.id } : {}),
+        name: input.name, channel: input.channel, target: input.target, template_id: templateId,
+        severities: [...form.querySelectorAll('input[name="severities"]:checked')].map((item) => item.value),
+        match_labels: labelsFromText(formData.get('matchLabels')), window_start_utc: String(formData.get('windowStartUtc') ?? '').trim(),
+        window_end_utc: String(formData.get('windowEndUtc') ?? '').trim(), enabled: form.querySelector('input[name="enabled"]').checked,
+        ...(secretRef ? { secret_ref: secretRef } : {}),
+      };
+      setBusy(form, true);
+      try {
+        await api.saveNotificationPolicy(currentScope, payload, aborter?.signal);
+        closeDrawer();
+        onToast('通知策略已保存');
+        await renderCurrent();
+      } catch (error) {
+        if (output) output.textContent = error?.kind === 'conflict' ? '对象已更新或存在引用冲突，请刷新后重试' : '操作未完成，请稍后重试';
+        setBusy(form, false);
+      }
+    });
   }
 }
 
