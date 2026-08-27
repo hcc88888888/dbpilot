@@ -1,7 +1,6 @@
 .worktrees/
 .superpowers/
 .workbuddy/
-backend/gen/
 backend/*.db
 backend/*.pem
 backend/bin/

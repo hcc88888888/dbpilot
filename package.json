@@ -1,0 +1,16 @@
+{
+  "name": "dbpilot-contracts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "contracts:lint": "powershell -NoProfile -File scripts/contracts/lint.ps1",
+    "contracts:generate": "powershell -NoProfile -File scripts/contracts/generate.ps1",
+    "contracts:breaking": "powershell -NoProfile -File scripts/contracts/breaking.ps1",
+    "contracts:verify": "powershell -NoProfile -File scripts/contracts/verify-drift.ps1"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.2.0",
+    "@stoplight/prism-cli": "5.14.2",
+    "typescript": "5.9.2"
+  }
+}
