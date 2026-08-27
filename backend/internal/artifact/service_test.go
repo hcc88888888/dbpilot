@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -49,6 +50,19 @@ func TestCreateDownloadClampsTTLAndContainsNoStorageCredential(t *testing.T) {
 	require.Empty(t, download.Headers)
 }
 
+func TestCreateDownloadClassifiesOnlyFailuresBeforeSignerInvocation(t *testing.T) {
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	storeFailure := errors.New("artifact store unavailable")
+	_, err := NewService(staticStore{err: storeFailure}, staticSigner{}).CreateDownload(context.Background(), scope, "artifact-1", time.Minute)
+	require.ErrorIs(t, err, ErrBeforeDownloadSideEffect)
+	require.ErrorIs(t, err, storeFailure)
+
+	signerFailure := errors.New("signer outcome unknown")
+	_, err = NewService(staticStore{artifact: Artifact{ID: "artifact-1", Scope: scope}}, failingSigner{err: signerFailure}).CreateDownload(context.Background(), scope, "artifact-1", time.Minute)
+	require.ErrorIs(t, err, signerFailure)
+	require.NotErrorIs(t, err, ErrBeforeDownloadSideEffect)
+}
+
 type staticStore struct {
 	artifact Artifact
 	err      error
@@ -62,6 +76,12 @@ type staticSigner struct{}
 
 func (staticSigner) Sign(context.Context, Artifact, time.Duration) (string, error) {
 	return "/download", nil
+}
+
+type failingSigner struct{ err error }
+
+func (signer failingSigner) Sign(context.Context, Artifact, time.Duration) (string, error) {
+	return "", signer.err
 }
 
 type recordingSigner struct {

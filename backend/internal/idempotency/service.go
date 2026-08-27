@@ -4,6 +4,8 @@ package idempotency
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,13 +19,15 @@ import (
 const DefaultTTL = 24 * time.Hour
 
 var (
-	ErrInvalid     = errors.New("invalid idempotency request")
-	ErrKeyConflict = errors.New("idempotency key reused with a different request")
-	ErrInProgress  = errors.New("idempotent request is already processing")
-	ErrNotClaimed  = errors.New("idempotency claim is unavailable")
+	ErrInvalid           = errors.New("invalid idempotency request")
+	ErrKeyConflict       = errors.New("idempotency key reused with a different request")
+	ErrInProgress        = errors.New("idempotent request is already processing")
+	ErrNotClaimed        = errors.New("idempotency claim is unavailable")
+	ErrOwnershipConflict = errors.New("idempotency claim owner does not match")
 )
 
 var fingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var ownerPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
 
 type State string
 
@@ -46,24 +50,26 @@ type Response struct {
 }
 
 type Claim struct {
-	Claimed  bool
-	Response *Response
+	Claimed    bool
+	OwnerToken string
+	Response   *Response
 }
 
 type Store interface {
-	Claim(context.Context, Key, string, time.Time, time.Time) (Claim, error)
-	Complete(context.Context, Key, string, Response, time.Time) (Response, error)
-	Abort(context.Context, Key, string) error
+	Claim(context.Context, Key, string, string, time.Time, time.Time) (Claim, error)
+	Complete(context.Context, Key, string, string, Response, time.Time) (Response, error)
+	Abort(context.Context, Key, string, string) error
 }
 
 type Service struct {
-	store Store
-	now   func() time.Time
-	ttl   time.Duration
+	store    Store
+	now      func() time.Time
+	ttl      time.Duration
+	newOwner func() (string, error)
 }
 
 func NewService(store Store) *Service {
-	return &Service{store: store, now: time.Now, ttl: DefaultTTL}
+	return &Service{store: store, now: time.Now, ttl: DefaultTTL, newOwner: newOwnerToken}
 }
 
 func (service *Service) Begin(ctx context.Context, key Key, fingerprint string) (Claim, error) {
@@ -75,11 +81,26 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string) 
 	if ttl <= 0 {
 		ttl = DefaultTTL
 	}
-	claim, err := service.store.Claim(ctx, key, fingerprint, now, now.Add(ttl))
+	ownerFactory := service.newOwner
+	if ownerFactory == nil {
+		ownerFactory = newOwnerToken
+	}
+	owner, err := ownerFactory()
+	if err != nil || !ownerPattern.MatchString(owner) {
+		return Claim{}, ErrInvalid
+	}
+	claim, err := service.store.Claim(ctx, key, fingerprint, owner, now, now.Add(ttl))
 	if err != nil {
 		return Claim{}, err
 	}
 	if claim.Claimed == (claim.Response != nil) {
+		return Claim{}, ErrInvalid
+	}
+	if claim.Claimed {
+		if claim.OwnerToken != owner {
+			return Claim{}, ErrInvalid
+		}
+	} else if claim.OwnerToken != "" {
 		return Claim{}, ErrInvalid
 	}
 	if claim.Response != nil {
@@ -92,11 +113,11 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string) 
 	return claim, nil
 }
 
-func (service *Service) Complete(ctx context.Context, key Key, fingerprint string, response Response) (Response, error) {
-	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || validateResponse(response) != nil {
+func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response) (Response, error) {
+	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil {
 		return Response{}, ErrInvalid
 	}
-	completed, err := service.store.Complete(ctx, key, fingerprint, cloneResponse(response), service.currentTime())
+	completed, err := service.store.Complete(ctx, key, fingerprint, owner, cloneResponse(response), service.currentTime())
 	if err != nil {
 		return Response{}, err
 	}
@@ -106,11 +127,11 @@ func (service *Service) Complete(ctx context.Context, key Key, fingerprint strin
 	return cloneResponse(completed), nil
 }
 
-func (service *Service) Abort(ctx context.Context, key Key, fingerprint string) error {
-	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) {
+func (service *Service) Abort(ctx context.Context, key Key, fingerprint, owner string) error {
+	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) {
 		return ErrInvalid
 	}
-	return service.store.Abort(ctx, key, fingerprint)
+	return service.store.Abort(ctx, key, fingerprint, owner)
 }
 
 func (service *Service) currentTime() time.Time {
@@ -152,4 +173,12 @@ func cloneResponse(response Response) Response {
 	response.Header = response.Header.Clone()
 	response.Body = append([]byte(nil), response.Body...)
 	return response
+}
+
+func newOwnerToken() (string, error) {
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+	return "owner-" + hex.EncodeToString(random), nil
 }

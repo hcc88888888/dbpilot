@@ -10,10 +10,11 @@ import (
 const MaximumDownloadTTL = 5 * time.Minute
 
 var (
-	ErrNotFound         = errors.New("artifact not found")
-	ErrExpired          = errors.New("artifact expired")
-	ErrInvalid          = errors.New("invalid artifact request")
-	ErrInvalidSignature = errors.New("invalid artifact download signature")
+	ErrNotFound                 = errors.New("artifact not found")
+	ErrExpired                  = errors.New("artifact expired")
+	ErrInvalid                  = errors.New("invalid artifact request")
+	ErrInvalidSignature         = errors.New("invalid artifact download signature")
+	ErrBeforeDownloadSideEffect = errors.New("artifact download failed before signer invocation")
 )
 
 type ResourceReference struct {

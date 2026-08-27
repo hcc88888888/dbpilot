@@ -287,6 +287,79 @@ func TestGeneratedConcurrentDuplicateReturnsRetryableConflictWithoutSecondExecut
 	require.Equal(t, 1, jobs.calls())
 }
 
+func TestAmbiguousJobCommitLeavesClaimProcessingAndRetryDoesNotTransitionAgain(t *testing.T) {
+	jobs := &recordingJobService{transitionErr: job.ErrAmbiguousCommit}
+	store := newHTTPIdempotencyStore()
+	services := Services{Jobs: jobs, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+
+	first := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-ambiguous-1"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
+	require.Len(t, jobs.transitions, 1)
+	require.Zero(t, store.abortCalls)
+
+	retry := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-ambiguous-1"))
+	requireProblem(t, retry, http.StatusConflict, "idempotency_in_progress", retry.Header().Get("X-Request-ID"))
+	require.Len(t, jobs.transitions, 1)
+}
+
+func TestDownloadCompleteFailureLeavesClaimProcessingAndRetryDoesNotResign(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadValue: artifact.Download{
+		URL:       "https://downloads.example/artifact-1?signature=safe",
+		ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC),
+	}}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("idempotency completion unavailable")
+	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	first := servePlatformRequest(services, principal, newDownloadRequest("download-complete-failure-1"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+	require.Zero(t, store.abortCalls)
+
+	retry := servePlatformRequest(services, principal, newDownloadRequest("download-complete-failure-1"))
+	requireProblem(t, retry, http.StatusConflict, "idempotency_in_progress", retry.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+}
+
+func TestDownloadSafePreSideEffectFailureAbortsByOwnerAndCanRetry(t *testing.T) {
+	artifacts := &sequencedArtifactService{
+		errors: []error{errors.Join(artifact.ErrBeforeDownloadSideEffect, artifact.ErrNotFound), nil},
+		value:  artifact.Download{URL: "https://downloads.example/artifact-1?signature=safe", ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC)},
+	}
+	store := newHTTPIdempotencyStore()
+	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	first := servePlatformRequest(services, principal, newDownloadRequest("download-safe-retry-1"))
+	requireProblem(t, first, http.StatusNotFound, "not_found", first.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, store.abortCalls)
+	require.Len(t, store.claimedOwners, 1)
+	require.Equal(t, store.claimedOwners[0], store.abortedOwners[0])
+
+	retry := servePlatformRequest(services, principal, newDownloadRequest("download-safe-retry-1"))
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.Equal(t, 2, artifacts.calls)
+	require.Len(t, store.claimedOwners, 2)
+	require.NotEqual(t, store.claimedOwners[0], store.claimedOwners[1])
+}
+
+func TestDownloadUnknownServiceErrorLeavesClaimProcessing(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadErr: errors.New("signer outcome unknown")}
+	store := newHTTPIdempotencyStore()
+	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	first := servePlatformRequest(services, principal, newDownloadRequest("download-unknown-1"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
+	require.Zero(t, store.abortCalls)
+
+	retry := servePlatformRequest(services, principal, newDownloadRequest("download-unknown-1"))
+	requireProblem(t, retry, http.StatusConflict, "idempotency_in_progress", retry.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+}
+
 func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
 	created := time.Date(2026, 8, 28, 4, 0, 0, 0, time.UTC)
 	expires := created.Add(time.Hour)
@@ -387,6 +460,7 @@ func TestProblemMappingsAreStableAndNeverExposeInternalErrors(t *testing.T) {
 		{name: "not found", err: job.ErrNotFound, status: http.StatusNotFound, code: "not_found"},
 		{name: "conflict", err: job.ErrInvalidTransition, status: http.StatusConflict, code: "conflict"},
 		{name: "precondition", err: ErrPreconditionFailed, status: http.StatusPreconditionFailed, code: "precondition_failed"},
+		{name: "ownership conflict", err: idempotency.ErrOwnershipConflict, status: http.StatusConflict, code: "idempotency_ownership_conflict"},
 		{name: "forbidden", err: ErrForbidden, status: http.StatusForbidden, code: "forbidden"},
 		{name: "timeout", err: context.DeadlineExceeded, status: http.StatusGatewayTimeout, code: "timeout"},
 		{name: "internal", err: errors.New("postgres password=top-secret"), status: http.StatusInternalServerError, code: "internal_error"},
@@ -609,12 +683,17 @@ func (service *recordingCapabilityService) Resolve(input capability.Input) []cap
 }
 
 type httpIdempotencyStore struct {
-	mu      sync.Mutex
-	records map[string]httpIdempotencyRecord
+	mu            sync.Mutex
+	records       map[string]httpIdempotencyRecord
+	completeErr   error
+	abortCalls    int
+	claimedOwners []string
+	abortedOwners []string
 }
 
 type httpIdempotencyRecord struct {
 	fingerprint string
+	owner       string
 	state       idempotency.State
 	response    idempotency.Response
 }
@@ -623,14 +702,15 @@ func newHTTPIdempotencyStore() *httpIdempotencyStore {
 	return &httpIdempotencyStore{records: make(map[string]httpIdempotencyRecord)}
 }
 
-func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key, fingerprint string, _, _ time.Time) (idempotency.Claim, error) {
+func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key, fingerprint, owner string, _, _ time.Time) (idempotency.Claim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, exists := store.records[mapKey]
 	if !exists {
-		store.records[mapKey] = httpIdempotencyRecord{fingerprint: fingerprint, state: idempotency.StateProcessing}
-		return idempotency.Claim{Claimed: true}, nil
+		store.records[mapKey] = httpIdempotencyRecord{fingerprint: fingerprint, owner: owner, state: idempotency.StateProcessing}
+		store.claimedOwners = append(store.claimedOwners, owner)
+		return idempotency.Claim{Claimed: true, OwnerToken: owner}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return idempotency.Claim{}, idempotency.ErrKeyConflict
@@ -642,13 +722,16 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key,
 	return idempotency.Claim{Response: &response}, nil
 }
 
-func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.Key, fingerprint string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
+func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.completeErr != nil {
+		return idempotency.Response{}, store.completeErr
+	}
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, exists := store.records[mapKey]
-	if !exists || record.fingerprint != fingerprint || record.state != idempotency.StateProcessing {
-		return idempotency.Response{}, idempotency.ErrNotClaimed
+	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateProcessing {
+		return idempotency.Response{}, idempotency.ErrOwnershipConflict
 	}
 	record.state = idempotency.StateCompleted
 	record.response = cloneIdempotencyResponse(response)
@@ -656,20 +739,42 @@ func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.K
 	return cloneIdempotencyResponse(record.response), nil
 }
 
-func (store *httpIdempotencyStore) Abort(_ context.Context, key idempotency.Key, fingerprint string) error {
+func (store *httpIdempotencyStore) Abort(_ context.Context, key idempotency.Key, fingerprint, owner string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.abortCalls++
+	store.abortedOwners = append(store.abortedOwners, owner)
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
-	if record, exists := store.records[mapKey]; exists && record.fingerprint == fingerprint && record.state == idempotency.StateProcessing {
+	if record, exists := store.records[mapKey]; exists && record.fingerprint == fingerprint && record.owner == owner && record.state == idempotency.StateProcessing {
 		delete(store.records, mapKey)
+		return nil
 	}
-	return nil
+	return idempotency.ErrOwnershipConflict
 }
 
 func cloneIdempotencyResponse(response idempotency.Response) idempotency.Response {
 	response.Header = response.Header.Clone()
 	response.Body = append([]byte(nil), response.Body...)
 	return response
+}
+
+type sequencedArtifactService struct {
+	errors []error
+	value  artifact.Download
+	calls  int
+}
+
+func (service *sequencedArtifactService) Get(context.Context, platformscope.Scope, string) (artifact.Artifact, error) {
+	return artifact.Artifact{}, nil
+}
+
+func (service *sequencedArtifactService) CreateDownload(context.Context, platformscope.Scope, string, time.Duration) (artifact.Download, error) {
+	index := service.calls
+	service.calls++
+	if index < len(service.errors) && service.errors[index] != nil {
+		return artifact.Download{}, service.errors[index]
+	}
+	return service.value, nil
 }
 
 type blockingJobService struct {

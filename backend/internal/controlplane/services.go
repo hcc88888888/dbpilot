@@ -34,8 +34,8 @@ type CapabilityService interface {
 
 type IdempotencyService interface {
 	Begin(context.Context, idempotency.Key, string) (idempotency.Claim, error)
-	Complete(context.Context, idempotency.Key, string, idempotency.Response) (idempotency.Response, error)
-	Abort(context.Context, idempotency.Key, string) error
+	Complete(context.Context, idempotency.Key, string, string, idempotency.Response) (idempotency.Response, error)
+	Abort(context.Context, idempotency.Key, string, string) error
 }
 
 // Services contains the dependencies made available to HTTP handlers.

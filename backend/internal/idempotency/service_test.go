@@ -21,6 +21,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 	claim, err := service.Begin(context.Background(), key, fingerprint)
 	require.NoError(t, err)
 	require.True(t, claim.Claimed)
+	require.Regexp(t, `^owner-[0-9a-f]{64}$`, claim.OwnerToken)
 	require.Nil(t, claim.Response)
 
 	want := Response{
@@ -28,7 +29,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 		Header: http.Header{"Content-Type": {"application/json"}, "ETag": {`"8"`}, "Location": {"/jobs/job-1"}},
 		Body:   []byte(`{"id":"job-1","version":8}`),
 	}
-	completed, err := service.Complete(context.Background(), key, fingerprint, want)
+	completed, err := service.Complete(context.Background(), key, fingerprint, claim.OwnerToken, want)
 	require.NoError(t, err)
 	require.Equal(t, want, completed)
 
@@ -37,6 +38,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 	replay, err := service.Begin(context.Background(), key, fingerprint)
 	require.NoError(t, err)
 	require.False(t, replay.Claimed)
+	require.Empty(t, replay.OwnerToken)
 	require.Equal(t, want, *replay.Response)
 
 	replay.Response.Header.Set("ETag", `"mutated-again"`)
@@ -80,9 +82,11 @@ func TestServiceAllowsOnlyOneConcurrentClaim(t *testing.T) {
 	close(claims)
 
 	claimed, inProgress := 0, 0
+	owners := make(map[string]struct{})
 	for claim := range claims {
 		if claim.Claimed {
 			claimed++
+			owners[claim.OwnerToken] = struct{}{}
 		}
 	}
 	for err := range results {
@@ -95,6 +99,7 @@ func TestServiceAllowsOnlyOneConcurrentClaim(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, claimed)
+	require.Len(t, owners, 1)
 	require.Equal(t, 1, inProgress)
 }
 
@@ -118,14 +123,14 @@ func TestServiceRejectsInvalidKeysFingerprintsAndResponsesBeforeStore(t *testing
 	require.Zero(t, store.claimCalls)
 
 	validFingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
-	_, err = service.Begin(context.Background(), key, validFingerprint)
+	claim, err := service.Begin(context.Background(), key, validFingerprint)
 	require.NoError(t, err)
 	for _, response := range []Response{
 		{Status: 99, Body: []byte(`{}`)},
 		{Status: 200, Body: []byte(`not-json`)},
 		{Status: 200, Header: http.Header{"X-Test": {"unsafe\r\nvalue"}}, Body: []byte(`{}`)},
 	} {
-		_, err := service.Complete(context.Background(), key, validFingerprint, response)
+		_, err := service.Complete(context.Background(), key, validFingerprint, claim.OwnerToken, response)
 		require.ErrorIs(t, err, ErrInvalid)
 	}
 	require.Zero(t, store.completeCalls)
@@ -147,6 +152,7 @@ type synchronizedStore struct {
 
 type synchronizedRecord struct {
 	fingerprint string
+	owner       string
 	state       State
 	response    Response
 }
@@ -155,15 +161,15 @@ func newSynchronizedStore() *synchronizedStore {
 	return &synchronizedStore{records: make(map[string]synchronizedRecord)}
 }
 
-func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint string, _, _ time.Time) (Claim, error) {
+func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint, owner string, _, _ time.Time) (Claim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.claimCalls++
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, ok := store.records[mapKey]
 	if !ok {
-		store.records[mapKey] = synchronizedRecord{fingerprint: fingerprint, state: StateProcessing}
-		return Claim{Claimed: true}, nil
+		store.records[mapKey] = synchronizedRecord{fingerprint: fingerprint, owner: owner, state: StateProcessing}
+		return Claim{Claimed: true, OwnerToken: owner}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return Claim{}, ErrKeyConflict
@@ -175,14 +181,14 @@ func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint st
 	return Claim{Response: &response}, nil
 }
 
-func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint string, response Response, _ time.Time) (Response, error) {
+func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint, owner string, response Response, _ time.Time) (Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.completeCalls++
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record := store.records[mapKey]
-	if record.fingerprint != fingerprint || record.state != StateProcessing {
-		return Response{}, ErrNotClaimed
+	if record.fingerprint != fingerprint || record.owner != owner || record.state != StateProcessing {
+		return Response{}, ErrOwnershipConflict
 	}
 	record.state = StateCompleted
 	record.response = cloneResponse(response)
@@ -190,11 +196,11 @@ func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint
 	return cloneResponse(record.response), nil
 }
 
-func (store *synchronizedStore) Abort(_ context.Context, key Key, fingerprint string) error {
+func (store *synchronizedStore) Abort(_ context.Context, key Key, fingerprint, owner string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
-	if record, ok := store.records[mapKey]; ok && record.fingerprint == fingerprint && record.state == StateProcessing {
+	if record, ok := store.records[mapKey]; ok && record.fingerprint == fingerprint && record.owner == owner && record.state == StateProcessing {
 		delete(store.records, mapKey)
 	}
 	return nil

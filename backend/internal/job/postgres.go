@@ -201,7 +201,7 @@ func (repository *PostgresRepository) Transition(ctx context.Context, transition
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, fmt.Errorf("commit job transition: %w", err)
+		return Job{}, fmt.Errorf("commit job transition: %w: %w", ErrAmbiguousCommit, err)
 	}
 	return next, nil
 }

@@ -3,6 +3,7 @@ package artifact
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -47,15 +48,15 @@ func (service *Service) Get(ctx context.Context, scope platformscope.Scope, id s
 
 func (service *Service) CreateDownload(ctx context.Context, scope platformscope.Scope, id string, ttl time.Duration) (Download, error) {
 	if service == nil || service.signer == nil || ttl <= 0 {
-		return Download{}, ErrInvalid
+		return Download{}, beforeDownloadSideEffect(ErrInvalid)
 	}
 	value, err := service.Get(ctx, scope, id)
 	if err != nil {
-		return Download{}, err
+		return Download{}, beforeDownloadSideEffect(err)
 	}
 	now := service.currentTime()
 	if value.ExpiresAt != nil && !value.ExpiresAt.After(now) {
-		return Download{}, ErrExpired
+		return Download{}, beforeDownloadSideEffect(ErrExpired)
 	}
 	if ttl > MaximumDownloadTTL {
 		ttl = MaximumDownloadTTL
@@ -64,13 +65,17 @@ func (service *Service) CreateDownload(ctx context.Context, scope platformscope.
 		ttl = value.ExpiresAt.Sub(now)
 	}
 	if ttl <= 0 {
-		return Download{}, ErrExpired
+		return Download{}, beforeDownloadSideEffect(ErrExpired)
 	}
 	signed, err := service.signer.Sign(ctx, value, ttl)
 	if err != nil {
 		return Download{}, err
 	}
 	return Download{URL: signed, ExpiresAt: now.Add(ttl).UTC()}, nil
+}
+
+func beforeDownloadSideEffect(err error) error {
+	return fmt.Errorf("%w: %w", ErrBeforeDownloadSideEffect, err)
 }
 
 func (service *Service) currentTime() time.Time {

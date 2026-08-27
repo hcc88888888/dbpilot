@@ -12,6 +12,7 @@ var (
 	ErrNotFound          = errors.New("job not found")
 	ErrConflict          = errors.New("job version conflict")
 	ErrInvalidTransition = errors.New("invalid job transition")
+	ErrAmbiguousCommit   = errors.New("job transition commit outcome is ambiguous")
 )
 
 const MaximumTargetsPerJob = 10_000

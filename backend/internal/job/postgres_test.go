@@ -197,6 +197,31 @@ func TestTransitionMergesPersistedTargetResultsBeforeUpdating(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestTransitionWrapsCommitFailureAsAmbiguous(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	current := runningJob()
+	at := current.StartedAt.Add(time.Minute)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(jobRows(current))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(
+		sqlmock.NewRows([]string{"target_id", "status", "error_summary", "result_summary", "artifacts", "finished_at"}).
+			AddRow("db-1", string(TargetRunning), "", "", []byte("[]"), nil),
+	)
+	mock.ExpectExec("UPDATE jobs SET").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit().WillReturnError(errors.New("connection lost after commit request"))
+
+	_, err = repository.Transition(context.Background(), Transition{
+		Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version,
+		To: StatusCancelling, Actor: "operator-1", At: at,
+	})
+	require.ErrorIs(t, err, ErrAmbiguousCommit)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestMarkOutboxPublishedReturnsNotFoundForUnknownMessage(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)

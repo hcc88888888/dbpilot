@@ -80,6 +80,7 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 		}
 		return cancelJobIdempotentResponse{response: *claim.Response}, nil
 	}
+	owner := claim.OwnerToken
 	now := time.Now
 	if api.services.Now != nil {
 		now = api.services.Now
@@ -89,14 +90,16 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 		To: job.StatusCancelling, Actor: principal.Subject, At: now().UTC(),
 	})
 	if errors.Is(err, job.ErrConflict) {
-		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
+		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
 			return nil, abortErr
 		}
 		return nil, ErrPreconditionFailed
 	}
 	if err != nil {
-		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
-			return nil, abortErr
+		if jobTransitionFailedBeforeSideEffect(err) {
+			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
+				return nil, abortErr
+			}
 		}
 		return nil, err
 	}
@@ -115,7 +118,7 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	stored.Header.Set("Content-Type", "application/json")
 	stored.Header.Set("ETag", entityTag(value.Version))
 	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, stored)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored)
 	if err != nil {
 		return nil, err
 	}
@@ -170,10 +173,13 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 		}
 		return artifactDownloadIdempotentResponse{response: *claim.Response}, nil
 	}
+	owner := claim.OwnerToken
 	value, err := api.services.Artifacts.CreateDownload(ctx, scope, request.ArtifactId, artifact.MaximumDownloadTTL)
 	if err != nil {
-		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
-			return nil, abortErr
+		if errors.Is(err, artifact.ErrBeforeDownloadSideEffect) {
+			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
+				return nil, abortErr
+			}
 		}
 		return nil, err
 	}
@@ -194,7 +200,7 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	}
 	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
 	stored.Header.Set("Content-Type", "application/json")
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, stored)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored)
 	if err != nil {
 		return nil, err
 	}
@@ -351,6 +357,10 @@ func platformIdempotencyFingerprint(ctx context.Context, operationID, resourceID
 	}
 	digest := sha256.Sum256(input.Bytes())
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func jobTransitionFailedBeforeSideEffect(err error) bool {
+	return errors.Is(err, job.ErrNotFound) || errors.Is(err, job.ErrInvalidTransition)
 }
 
 func (response getJobOKResponse) VisitGetJobResponse(writer http.ResponseWriter) error {

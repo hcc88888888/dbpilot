@@ -10,11 +10,11 @@ import (
 	"time"
 )
 
-const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, state, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'processing', $7, $8, $8) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
-const reclaimExpiredSQL = "UPDATE idempotency_records SET request_fingerprint = $1, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, expires_at = $2, updated_at = $3 WHERE tenant_id = $4 AND project_id = $5 AND actor = $6 AND operation_id = $7 AND idempotency_key = $8 AND expires_at <= $3"
+const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $9) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
+const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, expires_at = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND state = 'completed' AND expires_at <= $4"
 const selectRecordSQL = "SELECT request_fingerprint, state, response_status, response_headers, response_json FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
-const completeClaimSQL = "UPDATE idempotency_records SET state = 'completed', response_status = $1, response_headers = $2, response_json = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND request_fingerprint = $10 AND state = 'processing' AND expires_at > $11"
-const abortClaimSQL = "DELETE FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5 AND request_fingerprint = $6 AND state = 'processing'"
+const completeClaimSQL = "UPDATE idempotency_records SET state = 'completed', response_status = $1, response_headers = $2, response_json = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND request_fingerprint = $10 AND owner_token = $11 AND state = 'processing'"
+const abortClaimSQL = "DELETE FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5 AND request_fingerprint = $6 AND owner_token = $7 AND state = 'processing'"
 
 type PostgresStore struct{ database *sql.DB }
 
@@ -22,8 +22,8 @@ func NewPostgresStore(database *sql.DB) *PostgresStore {
 	return &PostgresStore{database: database}
 }
 
-func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint string, now, expires time.Time) (Claim, error) {
-	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || now.IsZero() || !expires.After(now) {
+func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, owner string, now, expires time.Time) (Claim, error) {
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || now.IsZero() || !expires.After(now) {
 		return Claim{}, ErrInvalid
 	}
 	now, expires = now.UTC(), expires.UTC()
@@ -35,7 +35,7 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint stri
 		_ = transaction.Rollback()
 		return Claim{}, cause
 	}
-	inserted, err := transaction.ExecContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, expires, now)
+	inserted, err := transaction.ExecContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, expires, now)
 	if err != nil {
 		return rollback(fmt.Errorf("insert idempotency claim: %w", err))
 	}
@@ -47,9 +47,9 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint stri
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit idempotency claim: %w", err)
 		}
-		return Claim{Claimed: true}, nil
+		return Claim{Claimed: true, OwnerToken: owner}, nil
 	}
-	reclaimed, err := transaction.ExecContext(ctx, reclaimExpiredSQL, fingerprint, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey)
+	reclaimed, err := transaction.ExecContext(ctx, reclaimExpiredCompletedSQL, fingerprint, owner, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey)
 	if err != nil {
 		return rollback(fmt.Errorf("reclaim expired idempotency key: %w", err))
 	}
@@ -61,7 +61,7 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint stri
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit reclaimed idempotency key: %w", err)
 		}
-		return Claim{Claimed: true}, nil
+		return Claim{Claimed: true, OwnerToken: owner}, nil
 	}
 	record, err := scanClaim(transaction.QueryRowContext(ctx, selectRecordSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey))
 	if err != nil {
@@ -87,8 +87,8 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint stri
 	}
 }
 
-func (store *PostgresStore) Complete(ctx context.Context, key Key, fingerprint string, response Response, at time.Time) (Response, error) {
-	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || validateResponse(response) != nil || at.IsZero() {
+func (store *PostgresStore) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response, at time.Time) (Response, error) {
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || at.IsZero() {
 		return Response{}, ErrInvalid
 	}
 	headerJSON, err := json.Marshal(response.Header)
@@ -96,7 +96,7 @@ func (store *PostgresStore) Complete(ctx context.Context, key Key, fingerprint s
 		return Response{}, ErrInvalid
 	}
 	at = at.UTC()
-	result, err := store.database.ExecContext(ctx, completeClaimSQL, response.Status, string(headerJSON), response.Body, at, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, at)
+	result, err := store.database.ExecContext(ctx, completeClaimSQL, response.Status, string(headerJSON), response.Body, at, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner)
 	if err != nil {
 		return Response{}, fmt.Errorf("complete idempotency claim: %w", err)
 	}
@@ -105,18 +105,25 @@ func (store *PostgresStore) Complete(ctx context.Context, key Key, fingerprint s
 		return Response{}, fmt.Errorf("read idempotency completion result: %w", err)
 	}
 	if rows != 1 {
-		return Response{}, ErrNotClaimed
+		return Response{}, ErrOwnershipConflict
 	}
 	return cloneResponse(response), nil
 }
 
-func (store *PostgresStore) Abort(ctx context.Context, key Key, fingerprint string) error {
-	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) {
+func (store *PostgresStore) Abort(ctx context.Context, key Key, fingerprint, owner string) error {
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) {
 		return ErrInvalid
 	}
-	_, err := store.database.ExecContext(ctx, abortClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint)
+	result, err := store.database.ExecContext(ctx, abortClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner)
 	if err != nil {
 		return fmt.Errorf("abort idempotency claim: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read idempotency abort result: %w", err)
+	}
+	if rows != 1 {
+		return ErrOwnershipConflict
 	}
 	return nil
 }

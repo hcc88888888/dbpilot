@@ -80,6 +80,8 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the request"
 	case errors.Is(err, idempotency.ErrInProgress):
 		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"
+	case errors.Is(err, idempotency.ErrOwnershipConflict):
+		status, code, title = http.StatusConflict, "idempotency_ownership_conflict", "Idempotency claim ownership changed"
 	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired):
 		status, code, title = http.StatusConflict, "conflict", "Resource state conflicts with the request"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
