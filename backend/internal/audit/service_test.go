@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -44,9 +45,13 @@ func TestRecordRedactsSQLRecursivelyAndRejectsCredentialKeys(t *testing.T) {
 	require.Equal(t, "audit-fixed", got.ID)
 	require.Equal(t, time.UTC, got.OccurredAt.Location())
 	require.Equal(t, now.UTC(), got.OccurredAt)
-	nested := got.Detail["operation"].(map[string]any)
-	require.Equal(t, "SELECT statement", nested["sql_summary"])
-	require.Regexp(t, `^sha256:[0-9a-f]{64}$`, nested["sql_digest"])
+	nested := requireDetailMap(t, got.Detail["operation"])
+	evidence := requireDetailSlice(t, nested["sql_evidence"])
+	require.Len(t, evidence, 1)
+	item := requireDetailMap(t, evidence[0])
+	require.Equal(t, "sql_text", item["source_field"])
+	require.Equal(t, "SELECT statement", item["summary"])
+	require.Regexp(t, `^sha256:[0-9a-f]{64}$`, item["digest"])
 	require.NotContains(t, nested, "sql_text")
 	require.Equal(t, got, store.appended[0])
 
@@ -59,6 +64,100 @@ func TestRecordRedactsSQLRecursivelyAndRejectsCredentialKeys(t *testing.T) {
 		input.Detail = detail
 		_, err := service.Record(context.Background(), input)
 		require.ErrorIs(t, err, ErrSensitiveDetail)
+	}
+}
+
+func TestRecordNormalizesEveryJSONSerializableShapeBeforeRedaction(t *testing.T) {
+	type secretStruct struct {
+		Credential string `json:"credential"`
+	}
+	tests := map[string]any{
+		"typed map":     map[string]string{"password": "hunter2"},
+		"typed slice":   []secretStruct{{Credential: "secret://db/prod"}},
+		"struct":        secretStruct{Credential: "secret://db/prod"},
+		"pointer":       &secretStruct{Credential: "secret://db/prod"},
+		"raw message":   json.RawMessage(`{"nested":{"access_token":"hunter2"}}`),
+		"nested shapes": map[string][]*secretStruct{"items": {{Credential: "secret://db/prod"}}},
+	}
+	for name, shape := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := validEvent()
+			value.Detail = map[string]any{"payload": shape}
+			_, err := NewService(&memoryStore{}).Record(context.Background(), value)
+			require.ErrorIs(t, err, ErrSensitiveDetail)
+		})
+	}
+}
+
+func TestRecordRedactsSQLInsideTypedAndRawJSONShapes(t *testing.T) {
+	type queryStruct struct {
+		SQL string `json:"sql_text"`
+	}
+	value := validEvent()
+	value.Detail = map[string]any{
+		"typed": []queryStruct{{SQL: "select * from accounts"}},
+		"raw":   json.RawMessage(`{"statement":"delete from sessions"}`),
+	}
+
+	got, err := NewService(&memoryStore{}).Record(context.Background(), value)
+	require.NoError(t, err)
+	typedItems := requireDetailSlice(t, got.Detail["typed"])
+	typedEvidence := requireDetailSlice(t, requireDetailMap(t, typedItems[0])["sql_evidence"])
+	rawEvidence := requireDetailSlice(t, requireDetailMap(t, got.Detail["raw"])["sql_evidence"])
+	require.Equal(t, "SELECT statement", requireDetailMap(t, typedEvidence[0])["summary"])
+	require.Equal(t, "DELETE statement", requireDetailMap(t, rawEvidence[0])["summary"])
+	require.NotContains(t, got.Detail, "select * from accounts")
+}
+
+func TestRecordDeepCopiesNormalizedTypedValuesAcrossAllBoundaries(t *testing.T) {
+	type payload struct {
+		Items []map[string]string `json:"items"`
+	}
+	original := &payload{Items: []map[string]string{{"status": "before"}}}
+	value := validEvent()
+	value.Detail = map[string]any{"payload": original}
+	store := &memoryStore{}
+
+	got, err := NewService(store).Record(context.Background(), value)
+	require.NoError(t, err)
+	original.Items[0]["status"] = "mutated-input"
+	returnedPayload := requireDetailMap(t, got.Detail["payload"])
+	returnedItems := requireDetailSlice(t, returnedPayload["items"])
+	requireDetailMap(t, returnedItems[0])["status"] = "mutated-return"
+
+	storedPayload := requireDetailMap(t, store.appended[0].Detail["payload"])
+	storedItems := requireDetailSlice(t, storedPayload["items"])
+	stored := requireDetailMap(t, storedItems[0])
+	require.Equal(t, "before", stored["status"])
+}
+
+func TestRecordProducesDeterministicEvidenceForEverySQLField(t *testing.T) {
+	first := validEvent()
+	first.Detail = map[string]any{"statement": "delete from sessions", "safe": "value", "sql_text": "select * from accounts"}
+	second := validEvent()
+	second.Detail = map[string]any{"sql_text": "select * from accounts", "safe": "value", "statement": "delete from sessions"}
+
+	firstGot, err := NewService(&memoryStore{}).Record(context.Background(), first)
+	require.NoError(t, err)
+	secondGot, err := NewService(&memoryStore{}).Record(context.Background(), second)
+	require.NoError(t, err)
+	require.Equal(t, firstGot.Detail, secondGot.Detail)
+	evidence := requireDetailSlice(t, firstGot.Detail["sql_evidence"])
+	require.Len(t, evidence, 2)
+	require.Equal(t, "sql_text", requireDetailMap(t, evidence[0])["source_field"])
+	require.Equal(t, "statement", requireDetailMap(t, evidence[1])["source_field"])
+	encoded, err := json.Marshal(firstGot.Detail)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "select * from accounts")
+	require.NotContains(t, string(encoded), "delete from sessions")
+}
+
+func TestRecordRejectsCallerSuppliedSQLDerivedFields(t *testing.T) {
+	for _, key := range []string{"sql_evidence", "sql_digest", "sql_summary"} {
+		value := validEvent()
+		value.Detail = map[string]any{key: "caller-controlled", "sql_text": "select 1"}
+		_, err := NewService(&memoryStore{}).Record(context.Background(), value)
+		require.ErrorIs(t, err, ErrInvalidEvent)
 	}
 }
 
@@ -90,6 +189,23 @@ func TestListCursorCannotCrossTenantOrProjectScope(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidCursor)
 }
 
+func TestListNormalizesAndCopiesTypedStoredDetail(t *testing.T) {
+	type payload struct {
+		Labels map[string]string `json:"labels"`
+	}
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	created := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	original := &payload{Labels: map[string]string{"status": "before"}}
+	store := &memoryStore{listed: []Event{{ID: "audit-1", Scope: scope, OccurredAt: created, CreatedAt: created, Detail: map[string]any{"payload": original}}}}
+
+	page, err := NewService(store).List(context.Background(), scope, ListQuery{Limit: 10})
+	require.NoError(t, err)
+	returned := requireDetailMap(t, page.Items[0].Detail["payload"])
+	requireDetailMap(t, returned["labels"])["status"] = "mutated-return"
+
+	require.Equal(t, "before", original.Labels["status"])
+}
+
 func validEvent() Event {
 	return Event{
 		Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"},
@@ -110,4 +226,18 @@ func (store *memoryStore) Append(_ context.Context, value Event) error {
 
 func (store *memoryStore) List(_ context.Context, _ platformscope.Scope, _ StoreListQuery) ([]Event, error) {
 	return append([]Event(nil), store.listed...), nil
+}
+
+func requireDetailMap(t *testing.T, value any) map[string]any {
+	t.Helper()
+	result, ok := value.(map[string]any)
+	require.True(t, ok, "expected canonical JSON object, got %T", value)
+	return result
+}
+
+func requireDetailSlice(t *testing.T, value any) []any {
+	t.Helper()
+	result, ok := value.([]any)
+	require.True(t, ok, "expected canonical JSON array, got %T", value)
+	return result
 }

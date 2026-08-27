@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -49,9 +51,6 @@ func (service *Service) Record(ctx context.Context, input Event) (Event, error) 
 	detail, err := sanitizeDetailMap(input.Detail)
 	if err != nil {
 		return Event{}, err
-	}
-	if _, err := json.Marshal(detail); err != nil {
-		return Event{}, ErrInvalidEvent
 	}
 	id, err := service.newID()
 	if err != nil {
@@ -97,6 +96,11 @@ func (service *Service) List(ctx context.Context, scope platformscope.Scope, que
 		if items[index].Scope != scope {
 			return Page{}, ErrInvalidCursor
 		}
+		detail, err := normalizeSanitizedDetailMap(items[index].Detail)
+		if err != nil {
+			return Page{}, err
+		}
+		items[index].Detail = detail
 		items[index] = cloneEvent(items[index])
 		items[index].OccurredAt = items[index].OccurredAt.UTC()
 		items[index].CreatedAt = items[index].CreatedAt.UTC()
@@ -137,37 +141,51 @@ func canonical(value string) bool {
 }
 
 func sanitizeDetailMap(detail map[string]any) (map[string]any, error) {
-	if detail == nil {
-		return map[string]any{}, nil
-	}
-	value, err := sanitizeMap(detail)
+	normalized, err := normalizeDetailMap(detail)
 	if err != nil {
 		return nil, err
 	}
-	return value, nil
+	return sanitizeMap(normalized)
 }
 
 func sanitizeMap(input map[string]any) (map[string]any, error) {
 	result := make(map[string]any, len(input))
-	for key, value := range input {
+	evidence := make([]any, 0)
+	keys := sortedMapKeys(input)
+	for _, key := range keys {
+		value := input[key]
+		if reservedSQLDerivedKey(key) {
+			return nil, ErrInvalidEvent
+		}
 		if sensitiveKey(key) {
 			return nil, ErrSensitiveDetail
 		}
 		if sqlKey(key) {
 			statement, ok := value.(string)
-			if !ok || strings.TrimSpace(statement) == "" {
+			if ok {
+				if strings.TrimSpace(statement) == "" {
+					return nil, ErrInvalidEvent
+				}
+				digest := sha256.Sum256([]byte(statement))
+				evidence = append(evidence, map[string]any{
+					"source_field": key,
+					"digest":       "sha256:" + hex.EncodeToString(digest[:]),
+					"summary":      sqlSummary(statement),
+				})
+				continue
+			}
+			if value == nil {
 				return nil, ErrInvalidEvent
 			}
-			digest := sha256.Sum256([]byte(statement))
-			result["sql_digest"] = "sha256:" + hex.EncodeToString(digest[:])
-			result["sql_summary"] = sqlSummary(statement)
-			continue
 		}
 		sanitized, err := sanitizeValue(value)
 		if err != nil {
 			return nil, err
 		}
 		result[key] = sanitized
+	}
+	if len(evidence) > 0 {
+		result["sql_evidence"] = evidence
 	}
 	return result, nil
 }
@@ -209,6 +227,15 @@ func sensitiveKey(key string) bool {
 func sqlKey(key string) bool {
 	switch normalizeKey(key) {
 	case "sql", "sql_text", "query", "statement":
+		return true
+	default:
+		return false
+	}
+}
+
+func reservedSQLDerivedKey(key string) bool {
+	switch normalizeKey(key) {
+	case "sql_evidence", "sql_digest", "sql_summary":
 		return true
 	default:
 		return false
@@ -278,6 +305,142 @@ func cloneDetailValue(value any) any {
 	default:
 		return typed
 	}
+}
+
+func normalizeDetailMap(detail map[string]any) (map[string]any, error) {
+	if detail == nil {
+		return map[string]any{}, nil
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		return nil, ErrInvalidEvent
+	}
+	return decodeCanonicalDetail(encoded)
+}
+
+func decodeCanonicalDetail(encoded []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var normalized map[string]any
+	if err := decoder.Decode(&normalized); err != nil || normalized == nil {
+		return nil, ErrInvalidEvent
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, ErrInvalidEvent
+	}
+	return normalized, nil
+}
+
+func normalizeSanitizedDetailMap(detail map[string]any) (map[string]any, error) {
+	normalized, err := normalizeDetailMap(detail)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSanitizedMap(normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+func validateSanitizedMap(input map[string]any) error {
+	for _, key := range sortedMapKeys(input) {
+		value := input[key]
+		if sensitiveKey(key) {
+			return ErrSensitiveDetail
+		}
+		switch normalizeKey(key) {
+		case "sql_digest", "sql_summary":
+			return ErrInvalidEvent
+		case "sql_evidence":
+			if err := validateSQLEvidence(value); err != nil {
+				return err
+			}
+			continue
+		}
+		if sqlKey(key) {
+			if _, rawSQL := value.(string); rawSQL {
+				return ErrInvalidEvent
+			}
+		}
+		if err := validateSanitizedValue(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSanitizedValue(value any) error {
+	switch typed := value.(type) {
+	case map[string]any:
+		return validateSanitizedMap(typed)
+	case []any:
+		for _, item := range typed {
+			if err := validateSanitizedValue(item); err != nil {
+				return err
+			}
+		}
+	case string:
+		if containsCredentialMaterial(typed) {
+			return ErrSensitiveDetail
+		}
+	}
+	return nil
+}
+
+func validateSQLEvidence(value any) error {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return ErrInvalidEvent
+	}
+	previous := ""
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok || len(entry) != 3 {
+			return ErrInvalidEvent
+		}
+		source, sourceOK := entry["source_field"].(string)
+		digest, digestOK := entry["digest"].(string)
+		summary, summaryOK := entry["summary"].(string)
+		if !sourceOK || !digestOK || !summaryOK || !sqlKey(source) || source <= previous || !validSQLDigest(digest) || !validSQLSummary(summary) {
+			return ErrInvalidEvent
+		}
+		previous = source
+	}
+	return nil
+}
+
+func validSQLDigest(value string) bool {
+	if len(value) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
+}
+
+func validSQLSummary(value string) bool {
+	switch value {
+	case "SELECT statement", "INSERT statement", "UPDATE statement", "DELETE statement", "CREATE statement", "ALTER statement", "DROP statement", "EXPLAIN statement", "WITH statement", "CALL statement", "SQL statement":
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return ErrInvalidEvent
+	}
+	return nil
+}
+
+func sortedMapKeys(input map[string]any) []string {
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func newAuditID() (string, error) {

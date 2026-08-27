@@ -25,7 +25,7 @@ func (store *PostgresStore) Append(ctx context.Context, value Event) error {
 	if err := validateStored(value); err != nil {
 		return err
 	}
-	detail, err := sanitizeDetailMap(value.Detail)
+	detail, err := normalizeSanitizedDetailMap(value.Detail)
 	if err != nil {
 		return err
 	}
@@ -76,9 +76,11 @@ func scanAuditEvent(scanner interface{ Scan(...any) error }) (Event, error) {
 	if err := scanner.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.OccurredAt, &value.Action, &value.Actor.Type, &value.Actor.ID, &value.Resource.Type, &value.Resource.ID, &value.Result, &value.RequestID, &value.TraceID, &value.JobID, &value.CommandID, &detail, &value.CreatedAt); err != nil {
 		return Event{}, err
 	}
-	if err := json.Unmarshal(detail, &value.Detail); err != nil {
+	decoded, err := decodeCanonicalDetail(detail)
+	if err != nil {
 		return Event{}, err
 	}
+	value.Detail = decoded
 	value.OccurredAt = value.OccurredAt.UTC()
 	value.CreatedAt = value.CreatedAt.UTC()
 	return value, nil

@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -29,6 +30,28 @@ func TestPostgresStoreAppendPersistsAppendOnlyEvent(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestServiceRecordPersistsSystemSQLEvidenceThroughPostgresStore(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	value := validEvent()
+	value.Detail = map[string]any{"sql_text": "select 1"}
+	service := NewService(NewPostgresStore(database))
+	service.now = func() time.Time { return now }
+	service.newID = func() (string, error) { return "audit-sql", nil }
+	expectedDetail := []byte(`{"sql_evidence":[{"digest":"sha256:822ae07d4783158bc1912bb623e5107cc9002d519e1143a9c200ed6ee18b6d0f","source_field":"sql_text","summary":"SELECT statement"}]}`)
+	mock.ExpectExec("INSERT INTO audit_events").WithArgs(
+		"audit-sql", value.Scope.TenantID, value.Scope.ProjectID, now, value.Action,
+		value.Actor.Type, value.Actor.ID, value.Resource.Type, value.Resource.ID, value.Result,
+		value.RequestID, value.TraceID, value.JobID, value.CommandID, expectedDetail, now,
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	_, err = service.Record(context.Background(), value)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresStoreListUsesScopeAndTupleCursor(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -44,6 +67,7 @@ func TestPostgresStoreListUsesScopeAndTupleCursor(t *testing.T) {
 	require.Len(t, items, 1)
 	require.Equal(t, scope, items[0].Scope)
 	require.Equal(t, time.UTC, items[0].OccurredAt.Location())
+	require.Equal(t, json.Number("3"), items[0].Detail["rows"])
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
