@@ -12,6 +12,17 @@ policy_public_key_file: /etc/dbpilot/policy-public-key.pem
 # bootstrapper. This is never raw Collector/YAML configuration.
 policy_file: /var/lib/dbpilot-agent/policy-envelope.json
 data_directory: /var/lib/dbpilot-agent
+
+# Agent-initiated command control uses the same mTLS connection but an
+# independent Ed25519 command-signing key and a durable bbolt journal.
+# Only command kinds backed by a registered typed executor are advertised;
+# arbitrary shell command execution is never enabled.
+control:
+  public_key_file: /etc/dbpilot/control-command-public-key.pem
+  journal_path: /var/lib/dbpilot-agent/command-journal.db
+  heartbeat_interval: 30s
+  reconnect_backoff: 1s
+
 allowed_log_roots:
   - /var/log
 file_collection_enabled: true

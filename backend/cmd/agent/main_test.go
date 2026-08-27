@@ -61,6 +61,25 @@ func TestLoadConfigAcceptsAbsoluteRestrictedConfiguration(t *testing.T) {
 	require.Equal(t, "agent-a", config.AgentID)
 }
 
+func TestLoadConfigAcceptsDurableControlSettings(t *testing.T) {
+	dir := t.TempDir()
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(dir, 0o700))
+	}
+	ca, cert, key := writeSecret(t, dir, "ca.pem"), writeSecret(t, dir, "agent.pem"), writeSecret(t, dir, "key.pem")
+	policyKey, controlKey, policyFile := writeSecret(t, dir, "policy.pem"), writeSecret(t, dir, "control.pem"), writeSecret(t, dir, "policy.json")
+	journalPath := filepath.Join(dir, "commands.db")
+	body := "agent_id: agent-a\nserver_address: ingest.example:9443\nca_file: " + filepath.ToSlash(ca) + "\ncert_file: " + filepath.ToSlash(cert) + "\nkey_file: " + filepath.ToSlash(key) + "\npolicy_public_key_file: " + filepath.ToSlash(policyKey) + "\npolicy_file: " + filepath.ToSlash(policyFile) + "\ndata_directory: " + filepath.ToSlash(dir) + "\ncontrol:\n  public_key_file: " + filepath.ToSlash(controlKey) + "\n  journal_path: " + filepath.ToSlash(journalPath) + "\n  heartbeat_interval: 15s\n  reconnect_backoff: 250ms\n"
+
+	config, err := loadConfig(writeConfig(t, body))
+
+	require.NoError(t, err)
+	require.Equal(t, filepath.ToSlash(controlKey), config.Control.PublicKeyFile)
+	require.Equal(t, filepath.ToSlash(journalPath), config.Control.JournalPath)
+	require.Equal(t, 15*time.Second, config.Control.HeartbeatInterval)
+	require.Equal(t, 250*time.Millisecond, config.Control.ReconnectBackoff)
+}
+
 func TestLoadConfigAcceptsComponentCollectorConfiguration(t *testing.T) {
 	dir := t.TempDir()
 	if runtime.GOOS != "windows" {

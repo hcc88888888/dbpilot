@@ -20,6 +20,7 @@ import (
 
 	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/agent/commandjournal"
 	"dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/exporter"
 	"dbpilot.local/platform/internal/policy"
@@ -49,6 +50,14 @@ type agentConfig struct {
 	Components            []database.ComponentDefinition `yaml:"components"`
 	ComponentSecrets      componentSecretConfig          `yaml:"component_secrets"`
 	ComponentCollection   componentCollectionConfig      `yaml:"component_collection"`
+	Control               agentControlConfig             `yaml:"control"`
+}
+
+type agentControlConfig struct {
+	PublicKeyFile     string        `yaml:"public_key_file"`
+	JournalPath       string        `yaml:"journal_path"`
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"`
+	ReconnectBackoff  time.Duration `yaml:"reconnect_backoff"`
 }
 
 type componentSecretConfig struct {
@@ -152,6 +161,33 @@ func loadConfig(path string) (agentConfig, error) {
 	if runtime.GOOS == "linux" && info.Mode().Perm()&0o002 != 0 {
 		return agentConfig{}, errors.New("data_directory must not be world-writable")
 	}
+	if strings.TrimSpace(settings.Control.PublicKeyFile) == "" {
+		settings.Control.PublicKeyFile = settings.PolicyPublicKeyFile
+	}
+	if strings.TrimSpace(settings.Control.JournalPath) == "" {
+		settings.Control.JournalPath = filepath.Join(settings.DataDirectory, "command-journal.db")
+	}
+	if !filepath.IsAbs(settings.Control.PublicKeyFile) || !filepath.IsAbs(settings.Control.JournalPath) {
+		return agentConfig{}, errors.New("control public-key and journal paths must be absolute")
+	}
+	controlKeyInfo, err := os.Lstat(settings.Control.PublicKeyFile)
+	if err != nil || !controlKeyInfo.Mode().IsRegular() || controlKeyInfo.Mode()&os.ModeSymlink != 0 {
+		return agentConfig{}, errors.New("control public key is unavailable")
+	}
+	journalParent, err := os.Stat(filepath.Dir(settings.Control.JournalPath))
+	if err != nil || !journalParent.IsDir() {
+		return agentConfig{}, errors.New("control journal parent must exist and be a directory")
+	}
+	if journalInfo, journalErr := os.Lstat(settings.Control.JournalPath); journalErr == nil {
+		if !journalInfo.Mode().IsRegular() || journalInfo.Mode()&os.ModeSymlink != 0 {
+			return agentConfig{}, errors.New("control journal must be a regular non-symlink file")
+		}
+	} else if !errors.Is(journalErr, os.ErrNotExist) {
+		return agentConfig{}, errors.New("control journal path is unavailable")
+	}
+	if settings.Control.HeartbeatInterval < 0 || settings.Control.ReconnectBackoff < 0 {
+		return agentConfig{}, errors.New("control heartbeat interval and reconnect backoff must not be negative")
+	}
 	if settings.FileCollectionEnabled && len(settings.AllowedLogRoots) == 0 {
 		return agentConfig{}, errors.New("allowed_log_roots is required when file collection is enabled")
 	}
@@ -177,6 +213,10 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	publicKey, err := loadPublicKey(settings.PolicyPublicKeyFile)
 	if err != nil {
 		return err
+	}
+	controlPublicKey, err := loadPublicKey(settings.Control.PublicKeyFile)
+	if err != nil {
+		return fmt.Errorf("load control-plane command public key: %w", err)
 	}
 	tlsConfig, err := clientTLSConfig(settings)
 	if err != nil {
@@ -205,8 +245,45 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			return fmt.Errorf("configure component collector: %w", err)
 		}
 	}
-	runtime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
-	return runtime.Run(ctx)
+	journal, err := commandjournal.Open(settings.Control.JournalPath)
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	defer journal.Close()
+	executors := agent.NewExecutorRegistry()
+	commandVerifier, err := agent.NewCommandVerifier(settings.AgentID, controlPublicKey, executors.Capabilities())
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	controlAPI := telemetryv1.NewAgentControlClient(connection)
+	controlClient, err := agent.NewControlClient(agent.ControlClientConfig{
+		AgentID: settings.AgentID, AgentVersion: version, StreamOpener: func(streamContext context.Context) (agent.ControlStream, error) {
+			return controlAPI.Connect(streamContext)
+		}, Journal: journal, Verifier: commandVerifier, Executors: executors,
+		HeartbeatInterval: settings.Control.HeartbeatInterval, ReconnectBackoff: settings.Control.ReconnectBackoff,
+	})
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
+	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
+	serviceContext, cancelServices := context.WithCancel(ctx)
+	defer cancelServices()
+	results := make(chan error, 2)
+	go func() { results <- agentRuntime.Run(serviceContext) }()
+	go func() { results <- controlClient.Run(serviceContext) }()
+	first := <-results
+	cancelServices()
+	second := <-results
+	if first != nil && !errors.Is(first, context.Canceled) {
+		return first
+	}
+	if second != nil && !errors.Is(second, context.Canceled) {
+		return second
+	}
+	return nil
 }
 
 func loadPublicKey(path string) (ed25519.PublicKey, error) {

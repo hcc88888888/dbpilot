@@ -107,6 +107,15 @@ func TestNewServerWiresCoreMonitoringCapabilities(t *testing.T) {
 	}
 }
 
+func TestNewServerRegistersAgentControlBesideTelemetryIngest(t *testing.T) {
+	server, err := NewServer(validServerConfig())
+	require.NoError(t, err)
+
+	services := server.grpcServer.GetServiceInfo()
+	require.Contains(t, services, "dbpilot.agent.v1.TelemetryIngest")
+	require.Contains(t, services, "dbpilot.agent.v1.AgentControl")
+}
+
 func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {
 	for name, scopes := range map[string][]EvaluationScopeSettings{
 		"missing":   nil,

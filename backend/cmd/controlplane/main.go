@@ -23,6 +23,7 @@ import (
 	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/controlplane"
 	"dbpilot.local/platform/internal/ingest"
@@ -282,6 +283,7 @@ func NewServer(config Config) (*Server, error) {
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentcontrol.NewRegistry(64), nil))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue}, nil
 }
 
