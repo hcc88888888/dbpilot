@@ -6,7 +6,9 @@
     "contracts:lint": "powershell -NoProfile -File scripts/contracts/lint.ps1",
     "contracts:generate": "powershell -NoProfile -File scripts/contracts/generate.ps1",
     "contracts:breaking": "powershell -NoProfile -File scripts/contracts/breaking.ps1",
-    "contracts:verify": "powershell -NoProfile -File scripts/contracts/verify-drift.ps1"
+    "contracts:verify": "powershell -NoProfile -File scripts/contracts/verify-drift.ps1",
+    "contracts:mock:start": "powershell -NoProfile -File scripts/contracts/start-mock.ps1",
+    "contracts:mock:test": "node --test tests/contracts/prism.test.mjs"
   },
   "devDependencies": {
     "@redocly/cli": "2.2.0",
