@@ -14,10 +14,58 @@ import {
   validateSilence,
   validateTemplate,
   isActiveSilence,
+  isValidSilenceMatcherKey,
+  normalizeDuration,
+  policyEditorMarkup,
+  resolveAlertContext,
+  ruleEditorMarkup,
+  renderAlertDetailMarkup,
   renderTemplatePreview,
   renderAlertListMarkup,
   sanitizePolicyForDisplay,
 } from '../alert-center.js';
+
+test('production bootstrap requires a validated authenticated context and never guesses manage permission', () => {
+  assert.deepEqual(resolveAlertContext('', undefined), {
+    available: true,
+    scope: { tenantId: 'demo', projectId: 'production' },
+    permissions: { manage: true },
+  });
+  assert.deepEqual(resolveAlertContext('https://control.example', {
+    authenticated: true,
+    tenantId: 'tenant-a',
+    projectId: 'project-a',
+    permissions: { manage: false },
+  }), {
+    available: true,
+    scope: { tenantId: 'tenant-a', projectId: 'project-a' },
+    permissions: { manage: false },
+  });
+  assert.deepEqual(resolveAlertContext('https://control.example', {
+    authenticated: true,
+    tenantId: 'tenant-a',
+    projectId: 'project-a',
+  }), {
+    available: true,
+    scope: { tenantId: 'tenant-a', projectId: 'project-a' },
+    permissions: { manage: false },
+  });
+  assert.deepEqual(resolveAlertContext('https://control.example', { tenantId: 'demo', projectId: 'production', permissions: { manage: true } }), {
+    available: false,
+    scope: { tenantId: '未配置', projectId: '未配置' },
+    permissions: { manage: false },
+  });
+});
+
+test('dashboard bootstrap uses the validated alert context contract', async () => {
+  const app = await (await import('node:fs/promises')).readFile(new URL('../app.js', import.meta.url), 'utf8');
+  const docs = await (await import('node:fs/promises')).readFile(new URL('../docs/alert-center-integration.md', import.meta.url), 'utf8');
+  assert.match(app, /resolveAlertContext/);
+  assert.match(app, /available:alertContext\.available/);
+  assert.doesNotMatch(app, /scope:\{tenantId:'demo',projectId:'production'\},permissions:\{manage:true\}/);
+  assert.match(docs, /window\.DBPILOT_ALERT_CONTEXT/);
+  assert.match(docs, /authenticated: true/);
+});
 
 test('demo responses have an explicit safe source label', () => {
   assert.equal(alertSourceLabel('demo'), '演示数据');
@@ -61,6 +109,23 @@ test('rule validation accepts control-plane duration units', () => {
   assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: '1s', evaluationEvery: '1m', notificationPolicyIds: ['policy-1'] }), {});
 });
 
+test('numeric backend durations normalize from nanoseconds for rule editing and validation', () => {
+  assert.equal(normalizeDuration(60_000_000_000), '1m');
+  assert.equal(normalizeDuration(90_000_000_000), '1m30s');
+  assert.equal(normalizeDuration(1_000_000), '1ms');
+  assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: 60_000_000_000, evaluationEvery: 30_000_000_000, notificationPolicyIds: ['policy-1'] }), {});
+  const markup = ruleEditorMarkup({ evaluation_every: 60_000_000_000, lookback_window: 300_000_000_000, for: 90_000_000_000 }, []);
+  assert.match(markup, /option value="1m" selected/);
+  assert.match(markup, /name="lookbackWindow" value="5m"/);
+  assert.match(markup, /name="for" required value="1m30s"/);
+});
+
+test('rule validation rejects a lookback duration the backend cannot parse', () => {
+  assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: '5m', evaluationEvery: '1m', lookbackWindow: 'one minute', notificationPolicyIds: ['policy-1'] }), {
+    lookbackWindow: '回看窗口格式应为 5m 或 1h',
+  });
+});
+
 test('policy validation requires a name, supported channel, target, and template', () => {
   assert.deepEqual(validatePolicy({ name: '', channel: 'pager', target: '', templateId: '' }), {
     name: '请填写策略名称',
@@ -68,6 +133,20 @@ test('policy validation requires a name, supported channel, target, and template
     target: '请填写渠道目标',
     templateId: '请选择通知模板',
   });
+});
+
+test('policy editor and validation use exactly the backend channel set', () => {
+  for (const channel of ['webhook', 'smtp', 'in_app']) {
+    assert.deepEqual(validatePolicy({ name: 'Ops', channel, target: 'operator', templateId: 'template-1' }), {});
+  }
+  for (const channel of ['email', 'sms']) {
+    assert.deepEqual(validatePolicy({ name: 'Ops', channel, target: 'operator', templateId: 'template-1' }), { channel: '请选择通知渠道' });
+  }
+  const markup = policyEditorMarkup({}, []);
+  assert.match(markup, /option value="webhook"/);
+  assert.match(markup, /option value="smtp"/);
+  assert.match(markup, /option value="in_app"/);
+  assert.doesNotMatch(markup, /option value="email"|option value="sms"/);
 });
 
 test('policy display exposes configuration state but never a secret reference', () => {
@@ -195,6 +274,40 @@ test('silence validation rejects duplicate normalized matcher keys', () => {
   assert.deepEqual(validateSilence({ matchers: { 'label.instance': 'mysql-01' }, hasDuplicateMatchers: true, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '例行维护' }), {
     matchers: '匹配条件不能重复',
   });
+});
+
+test('silence matcher keys mirror the backend reserved and namespaced allowlist', () => {
+  for (const key of ['fingerprint', 'resource', 'tenant_id', 'project_id', 'scope', 'label.instance', 'resource.database']) {
+    assert.equal(isValidSilenceMatcherKey(key), true, key);
+  }
+  for (const key of ['instance', 'database', 'label.foo-bar', 'resource.password', 'unknown.namespace']) {
+    assert.equal(isValidSilenceMatcherKey(key), false, key);
+  }
+  assert.deepEqual(validateSilence({ matchers: { instance: 'mysql-01' }, startsAt: '2099-08-27T10:00', endsAt: '2099-08-27T11:00', reason: '例行维护' }), {
+    matchers: '匹配键必须使用保留键或 label. / resource. 前缀',
+  });
+});
+
+test('alert detail safely renders map evidence, delivery history, dispositions, and related rule', () => {
+  const markup = renderAlertDetailMarkup({
+    id: 'alert-1', rule_id: 'rule-1', fingerprint: 'fp-1', state: 'firing', severity: 'critical',
+    first_seen: '2026-08-27T09:00:00Z', last_seen: '2026-08-27T09:30:00Z',
+    evidence: { aggregate: '<img src=x onerror=alert(1)>', samples: '12' },
+    labels: { instance: 'mysql-01' },
+    deliveries: [{ id: 'delivery-1', policy_id: 'policy-1', status: 'delivered', attempts: 1, delivered_at: '2026-08-27T09:31:00Z' }],
+    dispositions: [{ kind: 'root_cause', category: 'capacity', reason: 'disk pressure', actor: 'operator-1', occurred_at: '2026-08-27T09:32:00Z' }],
+    rule: { id: 'rule-1', name: 'Disk pressure', metric: 'disk.used', severity: 'critical' },
+  }, false);
+  assert.match(markup, /aggregate/);
+  assert.match(markup, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(markup, /<img src=x/);
+  assert.match(markup, /投递历史/);
+  assert.match(markup, /policy-1/);
+  assert.match(markup, /根因记录/);
+  assert.match(markup, /disk pressure/);
+  assert.match(markup, /Disk pressure/);
+  assert.match(markup, /disk\.used/);
+  assert.match(markup, /fp-1/);
 });
 
 test('active silence ends strictly before its end timestamp', () => {

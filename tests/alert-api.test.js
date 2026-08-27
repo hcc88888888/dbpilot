@@ -102,6 +102,21 @@ test('HTTP failure never falls back to demo data', async () => {
   );
 });
 
+test('an unavailable authenticated bootstrap never sends a request or falls back to demo data', async () => {
+  let requested = false;
+  const api = createAlertApi({
+    baseUrl: 'https://control.example',
+    available: false,
+    fetchImpl: async () => {
+      requested = true;
+      return new Response('{}');
+    },
+  });
+
+  await assert.rejects(() => api.getOverview(scope), (error) => error.kind === 'unavailable');
+  assert.equal(requested, false);
+});
+
 test('HTTP failures expose fixed Chinese messages without server error details', async () => {
   for (const [status, kind, message] of [
     [401, 'unauthorized', '登录状态已失效，请重新登录'],
@@ -122,24 +137,60 @@ test('HTTP failures expose fixed Chinese messages without server error details',
 });
 
 test('alert list maps a cursor and state server-side, then filters normalized items locally', async () => {
-  let requested;
+  const requested = [];
   const api = createAlertApi({
     baseUrl: 'https://control.example',
     fetchImpl: async (url) => {
-      requested = url;
-      return new Response(JSON.stringify([
-        { id: 'first', state: 'firing', severity: 'warning' },
-        { id: 'second', state: 'firing', severity: 'critical' },
-      ]));
+      requested.push(url);
+      return new Response(JSON.stringify(url.endsWith('/rules')
+        ? [{ id: 'rule-warning', severity: 'warning' }, { id: 'rule-critical', severity: 'critical', name: 'Critical CPU' }]
+        : [{ id: 'first', rule_id: 'rule-warning', state: 'firing' }, { id: 'second', rule_id: 'rule-critical', state: 'firing' }]));
     },
   });
 
   const result = await api.listAlerts(scope, { state: ['firing'], severity: 'critical', limit: 2 }, 'offset:4');
 
-  assert.equal(requested, 'https://control.example/api/v1/tenants/t1/projects/p1/alerts?state=firing&limit=2&offset=4');
+  assert.deepEqual(requested, [
+    'https://control.example/api/v1/tenants/t1/projects/p1/alerts?state=firing&limit=2&offset=4',
+    'https://control.example/api/v1/tenants/t1/projects/p1/rules',
+  ]);
   assert.deepEqual(result.items.map((item) => item.id), ['second']);
+  assert.equal(result.items[0].severity, 'critical');
+  assert.equal(result.items[0].rule_name, 'Critical CPU');
   assert.equal(result.nextCursor, 'offset:6');
   assert.deepEqual(result.scope, scope);
+});
+
+test('HTTP alert detail composes event, delivery, disposition, and related-rule routes', async () => {
+  const requested = [];
+  const api = createAlertApi({
+    baseUrl: 'https://control.example',
+    fetchImpl: async (url) => {
+      const path = new URL(url).pathname.replace('/api/v1/tenants/t1/projects/p1', '');
+      requested.push(path);
+      const response = {
+        '/alerts/alert-1': { id: 'alert-1', rule_id: 'rule-1', state: 'firing', evidence: { aggregate: '92.4' } },
+        '/alerts/alert-1/deliveries': [{ id: 'delivery-1', policy_id: 'policy-1', status: 'delivered' }],
+        '/alerts/alert-1/dispositions': [{ id: 'disposition-1', kind: 'root_cause', category: 'capacity', reason: 'disk pressure' }],
+        '/rules/rule-1': { id: 'rule-1', name: 'Disk pressure', severity: 'critical', evaluation_every: 60_000_000_000 },
+      }[path];
+      return new Response(JSON.stringify(response));
+    },
+  });
+
+  const detail = await api.getAlert(scope, 'alert-1');
+
+  assert.deepEqual(requested, [
+    '/alerts/alert-1',
+    '/alerts/alert-1/deliveries',
+    '/alerts/alert-1/dispositions',
+    '/rules/rule-1',
+  ]);
+  assert.equal(detail.severity, 'critical');
+  assert.equal(detail.rule_name, 'Disk pressure');
+  assert.equal(detail.rule.id, 'rule-1');
+  assert.equal(detail.deliveries[0].status, 'delivered');
+  assert.equal(detail.dispositions[0].kind, 'root_cause');
 });
 
 test('mutation methods use scoped control-plane URLs and JSON request bodies', async () => {

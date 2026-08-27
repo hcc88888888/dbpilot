@@ -15,7 +15,8 @@ const DEFAULT_ALERT_LIMIT = 100;
  * A configured base URL selects the real control-plane API; otherwise the
  * adapter supplies explicitly marked, safe local demo data.
  */
-export function createAlertApi({ baseUrl = '', fetchImpl = globalThis.fetch } = {}) {
+export function createAlertApi({ baseUrl = '', fetchImpl = globalThis.fetch, available = true } = {}) {
+  if (!available) return createUnavailableAdapter();
   if (!baseUrl) return createDemoAdapter();
   if (typeof fetchImpl !== 'function') throw apiFailure('network');
 
@@ -58,12 +59,31 @@ function createHttpAdapter(request) {
 
     async listAlerts(scope, filters = {}, cursor = null, signal) {
       const page = alertPage(filters, cursor);
-      const response = await request(scope, `/alerts${page.query}`, {}, signal);
-      return normalizeList(response, scope, page, filters);
+      const [response, rulesResponse] = await Promise.all([
+        request(scope, `/alerts${page.query}`, {}, signal),
+        request(scope, '/rules', {}, signal),
+      ]);
+      const result = normalizeList(response, scope, page);
+      const rules = Array.isArray(rulesResponse) ? rulesResponse : Array.isArray(rulesResponse?.items) ? rulesResponse.items : [];
+      const rulesByID = new Map(rules.map((rule) => [String(rule.id), safeResource(rule)]));
+      const items = result.items.map((event) => enrichAlertWithRule(event, rulesByID.get(String(event.rule_id ?? event.ruleId))));
+      return { ...result, items: filterAlertItems(items, filters) };
     },
 
     async getAlert(scope, id, signal) {
-      return normalizeEntity(await request(scope, `/alerts/${encodeURIComponent(id)}`, {}, signal), scope);
+      const eventPath = `/alerts/${encodeURIComponent(id)}`;
+      const event = safeResource(await request(scope, eventPath, {}, signal));
+      const ruleID = event.rule_id ?? event.ruleId;
+      const [deliveries, dispositions, rule] = await Promise.all([
+        request(scope, `${eventPath}/deliveries`, {}, signal),
+        request(scope, `${eventPath}/dispositions`, {}, signal),
+        ruleID ? request(scope, `/rules/${encodeURIComponent(ruleID)}`, {}, signal) : Promise.resolve(null),
+      ]);
+      return normalizeEntity(enrichAlertWithRule({
+        ...event,
+        deliveries: Array.isArray(deliveries) ? deliveries : deliveries?.items ?? [],
+        dispositions: Array.isArray(dispositions) ? dispositions : dispositions?.items ?? [],
+      }, rule), scope);
     },
 
     async acknowledgeAlert(scope, id, disposition, signal) {
@@ -92,6 +112,38 @@ function createHttpAdapter(request) {
       await request(scope, `/silences/${encodeURIComponent(id)}`, { method: 'DELETE' }, signal);
       return { source: 'http', scope: cleanScope(scope), id };
     },
+  };
+}
+
+function createUnavailableAdapter() {
+  const unavailable = async () => { throw apiFailure('unavailable'); };
+  return {
+    getOverview: unavailable,
+    listAlerts: unavailable,
+    getAlert: unavailable,
+    acknowledgeAlert: unavailable,
+    resolveAlert: unavailable,
+    listRules: unavailable,
+    saveRule: unavailable,
+    setRuleEnabled: unavailable,
+    listNotificationPolicies: unavailable,
+    saveNotificationPolicy: unavailable,
+    listTemplates: unavailable,
+    saveTemplate: unavailable,
+    listSilences: unavailable,
+    saveSilence: unavailable,
+    endSilence: unavailable,
+  };
+}
+
+function enrichAlertWithRule(event, rawRule) {
+  const rule = rawRule && typeof rawRule === 'object' ? safeResource(rawRule) : null;
+  if (!rule) return event;
+  return {
+    ...event,
+    rule,
+    rule_name: rule.name ?? rule.id,
+    severity: rule.severity ?? event.severity,
   };
 }
 

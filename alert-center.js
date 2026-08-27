@@ -46,6 +46,54 @@ const TEMPLATE_PREVIEW_VALUES = new Map([
 ]);
 
 const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
+const CONTROL_PLANE_DURATION_PATTERN = /^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$/;
+const SILENCE_RESERVED_MATCHER_KEYS = new Set(['fingerprint', 'resource', 'tenant_id', 'project_id', 'scope']);
+
+export function resolveAlertContext(baseUrl, rawContext) {
+  if (!String(baseUrl ?? '').trim()) {
+    return { available: true, scope: { tenantId: 'demo', projectId: 'production' }, permissions: { manage: true } };
+  }
+  const tenantId = typeof rawContext?.tenantId === 'string' ? rawContext.tenantId.trim() : '';
+  const projectId = typeof rawContext?.projectId === 'string' ? rawContext.projectId.trim() : '';
+  const validScopeValue = (value) => value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value);
+  if (rawContext?.authenticated !== true || !validScopeValue(tenantId) || !validScopeValue(projectId)) {
+    return { available: false, scope: { tenantId: '未配置', projectId: '未配置' }, permissions: { manage: false } };
+  }
+  return {
+    available: true,
+    scope: { tenantId, projectId },
+    permissions: { manage: rawContext?.permissions?.manage === true },
+  };
+}
+
+export function normalizeDuration(value) {
+  if (typeof value !== 'number') return String(value ?? '').trim();
+  if (!Number.isSafeInteger(value) || value <= 0) return '';
+  const units = [['h', 3_600_000_000_000], ['m', 60_000_000_000], ['s', 1_000_000_000], ['ms', 1_000_000], ['us', 1_000], ['ns', 1]];
+  let remaining = value;
+  let result = '';
+  for (const [suffix, nanoseconds] of units) {
+    const count = Math.floor(remaining / nanoseconds);
+    if (!count) continue;
+    result += `${count}${suffix}`;
+    remaining -= count * nanoseconds;
+  }
+  return result;
+}
+
+function isPositiveDuration(value) {
+  const normalized = normalizeDuration(value);
+  if (!CONTROL_PLANE_DURATION_PATTERN.test(normalized)) return false;
+  return [...normalized.matchAll(/(\d+(?:\.\d+)?)(?:ns|us|µs|ms|s|m|h)/g)].some(([, amount]) => Number(amount) > 0);
+}
+
+export function isValidSilenceMatcherKey(value) {
+  const key = String(value ?? '').trim();
+  if (SILENCE_RESERVED_MATCHER_KEYS.has(key)) return true;
+  const match = /^(?:label|resource)\.([A-Za-z_][A-Za-z0-9_]*)$/.exec(key);
+  if (!match) return false;
+  return !/(?:password|passwd|secret|token|credential|api_key|authorization)/i.test(match[1]);
+}
 
 export function safeText(value) {
   return String(value ?? '').replace(/[&<>'"]/g, (character) => ({
@@ -89,14 +137,17 @@ export function validateRule(input = {}) {
   const errors = {};
   const metric = String(input.metric ?? '').trim();
   const threshold = Number(input.threshold);
-  const duration = String(input.for ?? '').trim();
-  const period = String(input.evaluationEvery ?? input.evaluation_every ?? '').trim();
+  const duration = normalizeDuration(input.for);
+  const period = normalizeDuration(input.evaluationEvery ?? input.evaluation_every);
+  const rawLookback = input.lookbackWindow ?? input.lookback_window;
+  const lookback = normalizeDuration(rawLookback);
   const policyIds = input.notificationPolicyIds ?? input.notification_policy_ids;
 
   if (!metric) errors.metric = '请选择指标';
   if (!Number.isFinite(threshold) || threshold <= 0) errors.threshold = '阈值必须大于 0';
-  if (!/^\d+[smhd]$/.test(duration)) errors.for = '持续时长格式应为 5m 或 1h';
-  if (!period) errors.evaluationEvery = '请选择评估周期';
+  if (!isPositiveDuration(duration)) errors.for = '持续时长格式应为 5m 或 1h';
+  if (!isPositiveDuration(period)) errors.evaluationEvery = '请选择评估周期';
+  if (rawLookback != null && String(rawLookback).trim() && !isPositiveDuration(lookback)) errors.lookbackWindow = '回看窗口格式应为 5m 或 1h';
   if (!Array.isArray(policyIds) || policyIds.length === 0) errors.notificationPolicyIds = '至少选择一个通知策略';
   return errors;
 }
@@ -106,7 +157,7 @@ export function validatePolicy(input = {}) {
   const channel = String(input.channel ?? '').trim();
   const templateId = String(input.templateId ?? input.template_id ?? '').trim();
   if (!String(input.name ?? '').trim()) errors.name = '请填写策略名称';
-  if (!['webhook', 'email', 'sms'].includes(channel)) errors.channel = '请选择通知渠道';
+  if (!['webhook', 'smtp', 'in_app'].includes(channel)) errors.channel = '请选择通知渠道';
   if (!String(input.target ?? '').trim()) errors.target = '请填写渠道目标';
   if (!templateId) errors.templateId = '请选择通知模板';
   return errors;
@@ -138,6 +189,7 @@ export function validateSilence(input = {}) {
   if (input.hasIncompleteMatchers) errors.matchers = '请完整填写每个匹配条件';
   else if (input.hasDuplicateMatchers) errors.matchers = '匹配条件不能重复';
   else if (labelEntries(matchers).length === 0) errors.matchers = '至少添加一个匹配条件';
+  else if (labelEntries(matchers).some(([key]) => !isValidSilenceMatcherKey(key))) errors.matchers = '匹配键必须使用保留键或 label. / resource. 前缀';
   if (!startsAt) errors.startsAt = '请填写开始时间';
   if (!endsAt) errors.endsAt = '请填写结束时间';
   else if (Number.isNaN(endsAtTime) || (!Number.isNaN(startsAtTime) && endsAtTime <= startsAtTime) || endsAtTime <= Date.now()) errors.endsAt = '结束时间必须晚于开始时间';
@@ -263,33 +315,35 @@ export function renderAlertListMarkup({ items, nextCursor, filters, source, curs
 }
 
 function evidenceItems(event) {
-  const evidence = Array.isArray(event.evidence) ? event.evidence : [];
-  return evidence.map((item) => ({ label: item.label ?? item.type ?? '观测证据', value: item.summary ?? item.value, time: item.observed_at ?? item.observedAt ?? item.at }));
+  const evidence = event.evidence;
+  if (Array.isArray(evidence)) return evidence.map((item) => ({ label: item.label ?? item.type ?? '观测证据', value: item.summary ?? item.value, time: item.observed_at ?? item.observedAt ?? item.at }));
+  return labelEntries(evidence).map(([label, value]) => ({ label, value, time: null }));
 }
 
 function timelineItems(event) {
-  const timeline = event.disposition_timeline ?? event.dispositionTimeline ?? event.disposition_history ?? event.dispositionHistory ?? event.history;
-  return Array.isArray(timeline) ? timeline.map((item) => ({ action: item.action ?? item.state ?? item.category ?? '处置记录', reason: item.reason, time: item.at ?? item.created_at ?? item.createdAt, actor: item.actor ?? item.operator })) : [];
+  const timeline = event.dispositions ?? event.disposition_timeline ?? event.dispositionTimeline ?? event.disposition_history ?? event.dispositionHistory ?? event.history;
+  const actionLabels = { acknowledgement: '确认记录', resolution: '恢复记录', root_cause: '根因记录' };
+  return Array.isArray(timeline) ? timeline.map((item) => ({ action: actionLabels[item.kind] ?? item.action ?? item.state ?? item.category ?? '处置记录', category: item.category, reason: item.reason, time: item.occurred_at ?? item.occurredAt ?? item.at ?? item.created_at ?? item.createdAt, actor: item.actor ?? item.operator })) : [];
 }
 
-function renderAlertDetailMarkup(event = {}, canManage = false) {
+export function renderAlertDetailMarkup(event = {}, canManage = false) {
   const evidence = evidenceItems(event);
   const timeline = timelineItems(event);
   const delivery = Array.isArray(event.deliveries) ? event.deliveries : [];
+  const rule = event.rule && typeof event.rule === 'object' ? event.rule : {};
   const resource = localAlertValue(event, 'resource');
   const state = event.state;
   return `
     <div class="alert-detail-top"><button type="button" class="alert-link-button" data-alert-back>← 返回告警列表</button><div><span class="alert-status-tag ${statusClass(state)}">${stateLabel(state)}</span><span class="alert-status-tag ${statusClass(event.severity)}">${formatSeverity(event.severity)}</span></div><div class="alert-detail-actions">${permissionsActionMarkup('acknowledge', state, canManage)}${permissionsActionMarkup('resolve', state, canManage)}</div></div>
     <div class="alert-detail-grid">
       <div class="alert-detail-main">
-        <article class="alert-panel"><h4>${displayValue(event.title ?? event.name ?? event.id)}</h4><dl class="alert-kv"><div><dt>资源</dt><dd>${displayValue(resource)}</dd></div><div><dt>最近出现</dt><dd>${displayTime(event.last_seen ?? event.lastSeen ?? event.fired_at ?? event.firedAt)}</dd></div></dl></article>
+        <article class="alert-panel"><h4>${displayValue(event.title ?? event.name ?? event.id)}</h4><dl class="alert-kv"><div><dt>事件 ID</dt><dd>${displayValue(event.id)}</dd></div><div><dt>指纹</dt><dd>${displayValue(event.fingerprint)}</dd></div><div><dt>资源</dt><dd>${displayValue(resource)}</dd></div><div><dt>首次出现</dt><dd>${displayTime(event.first_seen ?? event.firstSeen)}</dd></div><div><dt>最近出现</dt><dd>${displayTime(event.last_seen ?? event.lastSeen ?? event.fired_at ?? event.firedAt)}</dd></div><div><dt>资源标签</dt><dd>${selectorChips(event.labels)}</dd></div></dl></article>
         <article class="alert-panel"><h4>观测证据</h4>${evidence.length ? `<ul class="alert-evidence">${evidence.map((item) => `<li><b>${displayValue(item.label)}</b><span>${displayValue(item.value)}</span><time>${displayTime(item.time)}</time></li>`).join('')}</ul>` : '<p>暂无可展示的观测证据。</p>'}</article>
-        <article class="alert-panel"><h4>根因提示</h4><p>${displayValue(event.root_cause_hint ?? event.rootCauseHint)}</p></article>
-        <article class="alert-panel"><h4>处置时间线</h4>${timeline.length ? `<ol class="alert-timeline">${timeline.map((item) => `<li><b>${displayValue(item.action)}</b><span>${displayValue(item.reason)}</span><small>${displayValue(item.actor)} · ${displayTime(item.time)}</small></li>`).join('')}</ol>` : '<p>尚无处置记录。</p>'}</article>
+        <article class="alert-panel"><h4>处置 / 根因时间线</h4>${timeline.length ? `<ol class="alert-timeline">${timeline.map((item) => `<li><b>${displayValue(item.action)}</b><span>${displayValue(item.category)} · ${displayValue(item.reason)}</span><small>${displayValue(item.actor)} · ${displayTime(item.time)}</small></li>`).join('')}</ol>` : '<p>尚无处置或根因记录。</p>'}</article>
       </div>
       <aside class="alert-detail-side">
-        <article class="alert-panel"><h4>通知投递</h4>${delivery.length ? `<ul class="alert-simple-list">${delivery.map((item) => `<li><span>${displayValue(item.channel ?? item.provider ?? item.id)}</span><b class="${statusClass(item.status)}">${displayValue(item.status)}</b></li>`).join('')}</ul>` : '<p>暂无安全可展示的投递记录。</p>'}</article>
-        <article class="alert-panel"><h4>关联规则</h4><p>${displayValue(event.rule_name ?? event.ruleName ?? event.rule_id ?? event.ruleId)}</p></article>
+        <article class="alert-panel"><h4>投递历史</h4>${delivery.length ? `<ul class="alert-simple-list">${delivery.map((item) => `<li><span>${displayValue(item.channel ?? item.provider ?? item.policy_id ?? item.policyId ?? item.id)} · ${displayValue(item.attempts ?? 0, '0')} 次 · ${displayTime(item.delivered_at ?? item.deliveredAt ?? item.attempted_at ?? item.attemptedAt)}</span><b class="${statusClass(item.status)}">${displayValue(item.status)}</b></li>`).join('')}</ul>` : '<p>暂无安全可展示的投递记录。</p>'}</article>
+        <article class="alert-panel"><h4>关联规则</h4><dl class="alert-kv"><div><dt>名称</dt><dd>${displayValue(rule.name ?? event.rule_name ?? event.ruleName ?? event.rule_id ?? event.ruleId)}</dd></div><div><dt>指标</dt><dd>${displayValue(rule.metric)}</dd></div><div><dt>条件</dt><dd>${displayValue(rule.aggregation)} ${displayValue(rule.operator)} ${displayValue(rule.threshold)}</dd></div><div><dt>严重级别</dt><dd>${displayValue(formatSeverity(rule.severity ?? event.severity))}</dd></div></dl></article>
       </aside>
     </div>`;
 }
@@ -338,8 +392,8 @@ function ruleSummary(rule, policies) {
   const aggregation = valueOf(rule, 'aggregation') || 'avg';
   const operator = valueOf(rule, 'operator') || '>';
   const threshold = valueOf(rule, 'threshold');
-  const period = valueOf(rule, 'evaluationEvery', 'evaluation_every');
-  const duration = valueOf(rule, 'for');
+  const period = normalizeDuration(valueOf(rule, 'evaluationEvery', 'evaluation_every'));
+  const duration = normalizeDuration(valueOf(rule, 'for'));
   const metric = valueOf(rule, 'metric');
   const policyIds = valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids');
   return `${aggregation}(${metric || '未选择指标'}) ${operator} ${threshold ?? '—'}，每 ${period || '—'} 评估；持续 ${duration || '—'} 后通知 ${policyNames(policyIds, policies)}。`;
@@ -377,20 +431,23 @@ function policyTargetLabel(policy) {
   return policy.targetRequiresReplacement ? '渠道目标已隐藏，需重新输入' : safePolicyTarget(valueOf(policy, 'target')) || '—';
 }
 
-function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
+export function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
   const policyItems = Array.isArray(policies) ? policies : [];
   const policyIds = valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids') ?? [];
   const selected = new Set(Array.isArray(policyIds) ? policyIds.map(String) : []);
-  const period = valueOf(rule, 'evaluationEvery', 'evaluation_every') ?? '1m';
-  const lookback = valueOf(rule, 'lookbackWindow', 'lookback_window') ?? period;
+  const period = normalizeDuration(valueOf(rule, 'evaluationEvery', 'evaluation_every')) || '1m';
+  const lookback = normalizeDuration(valueOf(rule, 'lookbackWindow', 'lookback_window')) || period;
+  const sustained = normalizeDuration(valueOf(rule, 'for')) || '5m';
+  const standardPeriods = ['10s', '30s', '1m', '5m', '10m', '1h'];
+  const periods = standardPeriods.includes(period) ? standardPeriods : [...standardPeriods, period];
   return `
     <div class="alert-drawer-head"><div><span class="eyebrow">规则编辑</span><h3>${rule.id ? '编辑规则' : '新建规则'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
     <form class="alert-config-form" data-rule-form>
       <label>规则名称<input name="name" required value="${safeText(valueOf(rule, 'name') ?? '')}" placeholder="例如：连接数过高" /></label>
       <div class="alert-form-grid"><label>指标<input name="metric" required value="${safeText(valueOf(rule, 'metric') ?? '')}" placeholder="db.connections" /></label><label>聚合<select name="aggregation">${['avg', 'max', 'min', 'sum'].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'aggregation') ?? 'avg') ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div>
       <div class="alert-form-grid"><label>运算符<select name="operator">${['>', '>=', '<', '<=', '==', '!='].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'operator') ?? '>') ? 'selected' : ''}>${safeText(value)}</option>`).join('')}</select></label><label>阈值<input name="threshold" type="number" min="0" step="any" required value="${safeText(valueOf(rule, 'threshold') ?? '')}" /></label></div>
-      <div class="alert-form-grid"><label>评估周期<select name="evaluationEvery">${['10s', '30s', '1m', '5m', '10m', '1h'].map((value) => `<option value="${value}" ${value === period ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label>回看窗口<input name="lookbackWindow" value="${safeText(lookback)}" placeholder="1m" /></label></div>
-      <div class="alert-form-grid"><label>持续时长<input name="for" required value="${safeText(valueOf(rule, 'for') ?? '5m')}" placeholder="5m" /></label><label>缺失数据<select name="missingData">${[['ignore', '忽略'], ['resolve', '恢复'], ['alert', '告警']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(rule, 'missingData', 'missing_data') ?? 'ignore') ? 'selected' : ''}>${label}</option>`).join('')}</select></label></div>
+      <div class="alert-form-grid"><label>评估周期<select name="evaluationEvery">${periods.map((value) => `<option value="${value}" ${value === period ? 'selected' : ''}>${value}</option>`).join('')}</select></label><label>回看窗口<input name="lookbackWindow" value="${safeText(lookback)}" placeholder="1m" /></label></div>
+      <div class="alert-form-grid"><label>持续时长<input name="for" required value="${safeText(sustained)}" placeholder="5m" /></label><label>缺失数据<select name="missingData">${[['ignore', '忽略'], ['resolve', '恢复'], ['alert', '告警']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(rule, 'missingData', 'missing_data') ?? 'ignore') ? 'selected' : ''}>${label}</option>`).join('')}</select></label></div>
       <div class="alert-form-grid"><label>严重级别<select name="severity">${['critical', 'warning', 'info'].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'severity') ?? 'warning') ? 'selected' : ''}>${formatSeverity(value)}</option>`).join('')}</select></label><label class="alert-check-label"><input name="enabled" type="checkbox" ${(valueOf(rule, 'enabled') ?? true) ? 'checked' : ''} /> 保存后启用</label></div>
       <label>标签选择器<textarea name="labels" rows="3" placeholder="instance=db-01">${safeText(labelsText(valueOf(rule, 'labels')))}</textarea></label>
       <fieldset><legend>通知策略</legend>${policyItems.length ? policyItems.map((policy) => `<label class="alert-check-label"><input name="notificationPolicyIds" type="checkbox" value="${safeText(policy.id)}" ${selected.has(String(policy.id)) ? 'checked' : ''} />${displayValue(policy.name ?? policy.id)}</label>`).join('') : '<p class="alert-form-hint">暂无可引用的通知策略，请先创建通知策略。</p>'}</fieldset>
@@ -400,7 +457,7 @@ function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
     </form>`;
 }
 
-function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
+export function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
   const safe = sanitizePolicyForDisplay(policy);
   const severities = new Set((valueOf(safe, 'severities') ?? []).map(String));
   const templateId = valueOf(safe, 'templateId', 'template_id') ?? '';
@@ -408,7 +465,7 @@ function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
     <div class="alert-drawer-head"><div><span class="eyebrow">通知策略编辑</span><h3>${safe.id ? '编辑通知策略' : '新建通知策略'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
     <form class="alert-config-form" data-policy-form>
       <label>策略名称<input name="name" required value="${safeText(valueOf(safe, 'name') ?? '')}" /></label>
-      <div class="alert-form-grid"><label>通知渠道<select name="channel"><option value="">请选择</option>${[['webhook', 'Webhook'], ['email', '邮件'], ['sms', '短信']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(safe, 'channel') ?? '') ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>渠道目标<input name="target" required value="${safeText(safePolicyTarget(valueOf(safe, 'target')))}" placeholder="${safe.targetRequiresReplacement ? '现有渠道目标已隐藏，请重新输入' : 'Webhook 地址或邮箱'}" /></label></div>
+      <div class="alert-form-grid"><label>通知渠道<select name="channel"><option value="">请选择</option>${[['webhook', 'Webhook'], ['smtp', 'SMTP'], ['in_app', '站内通知']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(safe, 'channel') ?? '') ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>渠道目标<input name="target" required value="${safeText(safePolicyTarget(valueOf(safe, 'target')))}" placeholder="${safe.targetRequiresReplacement ? '现有渠道目标已隐藏，请重新输入' : 'Webhook 地址、SMTP 收件人或站内用户'}" /></label></div>
       <label>通知模板<select name="templateId"><option value="">请选择模板</option>${templates.map((template) => `<option value="${safeText(template.id)}" ${String(template.id) === String(templateId) ? 'selected' : ''}>${displayValue(template.name ?? template.id)}</option>`).join('')}</select></label>
       ${templates.length ? '' : `<p class="alert-form-hint">暂无可选模板，请填写模板 ID 后保存。</p><label>模板 ID<input name="templateIdFallback" value="${safeText(templateId)}" placeholder="template-1" /></label>`}
       <fieldset><legend>严重级别范围</legend>${['critical', 'warning', 'info'].map((value) => `<label class="alert-check-label"><input name="severities" type="checkbox" value="${value}" ${severities.has(value) ? 'checked' : ''} />${formatSeverity(value)}</label>`).join('')}</fieldset>
@@ -453,7 +510,7 @@ function templateEditorMarkup(template = {}, errors = {}) {
 function matcherRowsMarkup(matchers) {
   const entries = labelEntries(matchers);
   const rows = entries.length ? entries : [['', '']];
-  return rows.map(([key, value]) => `<div class="alert-matcher-row"><input name="matcherKey" value="${safeText(key)}" placeholder="标签键，例如 instance" /><input name="matcherValue" value="${safeText(value)}" placeholder="匹配值，例如 mysql-01" /><button type="button" data-silence-matcher-remove aria-label="删除匹配条件">删除</button></div>`).join('');
+  return rows.map(([key, value]) => `<div class="alert-matcher-row"><input name="matcherKey" value="${safeText(key)}" placeholder="例如 label.instance" /><input name="matcherValue" value="${safeText(value)}" placeholder="匹配值，例如 mysql-01" /><button type="button" data-silence-matcher-remove aria-label="删除匹配条件">删除</button></div>`).join('');
 }
 
 function dateTimeInputValue(value) {
@@ -468,7 +525,7 @@ function silenceEditorMarkup(silence = {}, errors = {}) {
   return `
     <div class="alert-drawer-head"><div><span class="eyebrow">静默编辑</span><h3>${silence.id ? '编辑静默' : '新建静默'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
     <form class="alert-config-form" data-silence-form>
-      <fieldset class="alert-matcher-fieldset"><legend>匹配条件</legend><p class="alert-form-hint">每项使用独立的键和值，仅匹配当前项目内符合条件的告警。</p><div data-silence-matchers>${matcherRowsMarkup(valueOf(silence, 'matchers'))}</div><button type="button" data-silence-matcher-add>添加匹配条件</button></fieldset>
+      <fieldset class="alert-matcher-fieldset"><legend>匹配条件</legend><p class="alert-form-hint">键使用 fingerprint、resource、tenant_id、project_id、scope，或 label.&lt;名称&gt; / resource.&lt;名称&gt;。</p><div data-silence-matchers>${matcherRowsMarkup(valueOf(silence, 'matchers'))}</div><button type="button" data-silence-matcher-add>添加匹配条件</button></fieldset>
       <div class="alert-form-grid"><label>开始时间<input name="startsAt" type="datetime-local" required value="${safeText(dateTimeInputValue(valueOf(silence, 'startsAt', 'starts_at')))}" /></label><label>结束时间<input name="endsAt" type="datetime-local" required value="${safeText(dateTimeInputValue(valueOf(silence, 'endsAt', 'ends_at')))}" /></label></div>
       <label>静默原因<textarea name="reason" required maxlength="500" rows="4" placeholder="例如：例行数据库维护；不要填写凭据或连接串">${safeText(valueOf(silence, 'reason') ?? '')}</textarea></label>
       <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
@@ -508,7 +565,7 @@ function renderSilencesMarkup({ silences, canManage }) {
 function renderRulesMarkup({ rules, policies, canManage }) {
   return `
     <div class="alert-config-toolbar"><div><strong>规则评估</strong><p>每条规则均在当前项目范围内评估。</p></div><div><button type="button" data-rule-create ${canManage ? '' : 'disabled'}>新建规则</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
-    <div class="alert-config-list">${rules.length ? rules.map((rule) => `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(rule, 'name') ?? valueOf(rule, 'metric') ?? rule.id)}</h4><p>${safeText(ruleSummary(rule, policies))}</p></div><span class="alert-status-tag ${statusClass(valueOf(rule, 'severity'))}">${formatSeverity(valueOf(rule, 'severity'))}</span></div><dl class="alert-config-details"><div><dt>指标</dt><dd>${displayValue(valueOf(rule, 'metric'))}</dd></div><div><dt>评估 / 回看</dt><dd>${displayValue(valueOf(rule, 'evaluationEvery', 'evaluation_every'))} / ${displayValue(valueOf(rule, 'lookbackWindow', 'lookback_window'))}</dd></div><div><dt>缺失数据</dt><dd>${displayValue(valueOf(rule, 'missingData', 'missing_data'))}</dd></div><div><dt>标签选择器</dt><dd>${selectorChips(valueOf(rule, 'labels'))}</dd></div><div><dt>通知策略</dt><dd>${policyNames(valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids'), policies)}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(rule, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><span class="alert-status-tag ${valueOf(rule, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(rule, 'enabled') === false ? '已停用' : '已启用'}</span><button type="button" data-rule-edit="${safeText(rule.id)}" ${canManage ? '' : 'disabled'}>编辑</button><button type="button" data-rule-enabled="${safeText(rule.id)}" data-rule-next-enabled="${valueOf(rule, 'enabled') === false ? 'true' : 'false'}" ${canManage ? '' : 'disabled'}>${valueOf(rule, 'enabled') === false ? '启用' : '停用'}</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`).join('') : '<div class="alert-empty"><strong>暂无规则</strong><p>新建规则后将开始对当前项目进行评估。</p></div>'}</div>`;
+    <div class="alert-config-list">${rules.length ? rules.map((rule) => `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(rule, 'name') ?? valueOf(rule, 'metric') ?? rule.id)}</h4><p>${safeText(ruleSummary(rule, policies))}</p></div><span class="alert-status-tag ${statusClass(valueOf(rule, 'severity'))}">${formatSeverity(valueOf(rule, 'severity'))}</span></div><dl class="alert-config-details"><div><dt>指标</dt><dd>${displayValue(valueOf(rule, 'metric'))}</dd></div><div><dt>评估 / 回看</dt><dd>${displayValue(normalizeDuration(valueOf(rule, 'evaluationEvery', 'evaluation_every')))} / ${displayValue(normalizeDuration(valueOf(rule, 'lookbackWindow', 'lookback_window')))}</dd></div><div><dt>缺失数据</dt><dd>${displayValue(valueOf(rule, 'missingData', 'missing_data'))}</dd></div><div><dt>标签选择器</dt><dd>${selectorChips(valueOf(rule, 'labels'))}</dd></div><div><dt>通知策略</dt><dd>${policyNames(valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids'), policies)}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(rule, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><span class="alert-status-tag ${valueOf(rule, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(rule, 'enabled') === false ? '已停用' : '已启用'}</span><button type="button" data-rule-edit="${safeText(rule.id)}" ${canManage ? '' : 'disabled'}>编辑</button><button type="button" data-rule-enabled="${safeText(rule.id)}" data-rule-next-enabled="${valueOf(rule, 'enabled') === false ? 'true' : 'false'}" ${canManage ? '' : 'disabled'}>${valueOf(rule, 'enabled') === false ? '启用' : '停用'}</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`).join('') : '<div class="alert-empty"><strong>暂无规则</strong><p>新建规则后将开始对当前项目进行评估。</p></div>'}</div>`;
 }
 
 function renderPoliciesMarkup({ policies, templates, canManage }) {
@@ -890,7 +947,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       const input = {
         metric: String(formData.get('metric') ?? '').trim(),
         threshold: Number(formData.get('threshold')), for: String(formData.get('for') ?? '').trim(),
-        evaluationEvery: String(formData.get('evaluationEvery') ?? '').trim(), notificationPolicyIds,
+        evaluationEvery: String(formData.get('evaluationEvery') ?? '').trim(), lookbackWindow: String(formData.get('lookbackWindow') ?? '').trim(), notificationPolicyIds,
       };
       const validation = validateRule(input);
       const output = form.querySelector('.alert-form-errors');
@@ -901,7 +958,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       const payload = {
         ...(rule.id ? { id: rule.id } : {}),
         name: String(formData.get('name') ?? '').trim(), metric: input.metric, aggregation: String(formData.get('aggregation') ?? 'avg'), operator: String(formData.get('operator') ?? '>'),
-        threshold: input.threshold, evaluation_every: input.evaluationEvery, lookback_window: String(formData.get('lookbackWindow') ?? '').trim() || input.evaluationEvery,
+        threshold: input.threshold, evaluation_every: input.evaluationEvery, lookback_window: input.lookbackWindow || input.evaluationEvery,
         for: input.for, missing_data: String(formData.get('missingData') ?? 'ignore'), severity: String(formData.get('severity') ?? 'warning'),
         notification_policy_ids: notificationPolicyIds, labels: labelsFromText(formData.get('labels')), enabled: form.querySelector('input[name="enabled"]').checked,
       };
@@ -1114,5 +1171,5 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
 }
 
 if (typeof window !== 'undefined') {
-  window.DBPilotAlertCenter = { create: createAlertCenter };
+  window.DBPilotAlertCenter = { create: createAlertCenter, resolveAlertContext };
 }
