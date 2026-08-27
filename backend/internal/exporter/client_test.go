@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

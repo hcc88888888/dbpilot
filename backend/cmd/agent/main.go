@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/exporter"

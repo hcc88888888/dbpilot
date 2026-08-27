@@ -9,12 +9,15 @@ $componentScripts = @(
 Push-Location $repoRoot
 try {
   foreach ($componentScript in $componentScripts) {
-    if (Test-Path $componentScript) {
-      $LASTEXITCODE = 0
-      & $componentScript
-      if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-      }
+    if (-not (Test-Path $componentScript)) {
+      Write-Error "Missing required contract generator: $componentScript"
+      exit 1
+    }
+
+    $LASTEXITCODE = 0
+    & $componentScript
+    if ($LASTEXITCODE -ne 0) {
+      exit $LASTEXITCODE
     }
   }
 }

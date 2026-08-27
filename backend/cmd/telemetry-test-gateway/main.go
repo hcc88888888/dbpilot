@@ -9,7 +9,7 @@ import (
 	"net"
 	"os"
 
-	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/ingest"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"

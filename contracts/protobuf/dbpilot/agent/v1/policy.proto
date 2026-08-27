@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package dbpilot.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/agent/v1;agentv1";
+
+message PolicyUpdate {
+  int64 version = 1;
+  bytes policy = 2;
+  bytes checksum = 3;
+  bytes signature = 4;
+  google.protobuf.Timestamp effective_at = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}

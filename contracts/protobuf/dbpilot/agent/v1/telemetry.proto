@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package dbpilot.telemetry.v1;
+package dbpilot.agent.v1;
 
-option go_package = "dbpilot.local/platform/gen/telemetry/v1;telemetryv1";
+option go_package = "dbpilot.local/platform/gen/agent/v1;agentv1";
 
 service TelemetryIngest {
   rpc PushLogBatch(LogBatch) returns (BatchAck);

@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package dbpilot.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/agent/v1;agentv1";
+
+message Inventory {
+  string snapshot_id = 1;
+  string agent_id = 2;
+  bool full_snapshot = 3;
+  repeated InstanceInventory instances = 4;
+  google.protobuf.Timestamp observed_at = 5;
+}
+
+message InstanceInventory {
+  string instance_id = 1;
+  string database_type = 2;
+  string database_version = 3;
+  string endpoint = 4;
+  map<string, string> attributes = 5;
+}

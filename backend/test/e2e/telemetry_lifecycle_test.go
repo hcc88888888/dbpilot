@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	telemetryv1 "dbpilot.local/platform/gen/telemetry/v1"
+	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/exporter"
 	"dbpilot.local/platform/internal/ingest"

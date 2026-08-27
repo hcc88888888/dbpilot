@@ -1,6 +1,6 @@
 version: v2
 modules:
-  - path: api
+  - path: contracts/protobuf/dbpilot
 lint:
   use:
     - MINIMAL

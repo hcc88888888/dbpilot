@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+package dbpilot.agent.v1;
+
+import "agent/v1/inventory.proto";
+import "agent/v1/policy.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/agent/v1;agentv1";
+
+service AgentControl {
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message AgentMessage {
+  string message_id = 1;
+  google.protobuf.Timestamp sent_at = 2;
+  reserved 3 to 19;
+
+  oneof message {
+    Hello hello = 20;
+    Heartbeat heartbeat = 21;
+    Inventory inventory = 22;
+    CommandAcknowledgement command_acknowledgement = 23;
+    CommandProgress command_progress = 24;
+    CommandResult command_result = 25;
+  }
+}
+
+message ServerMessage {
+  string message_id = 1;
+  google.protobuf.Timestamp sent_at = 2;
+  reserved 3 to 19;
+
+  oneof message {
+    HelloAck hello_ack = 20;
+    PolicyUpdate policy_update = 21;
+    CommandEnvelope command = 22;
+    CommandCancellation command_cancellation = 23;
+    FlowControlInstruction flow_control_instruction = 24;
+  }
+}
+
+message Hello {
+  string protocol_version = 1;
+  string agent_id = 2;
+  string agent_version = 3;
+  string operating_system = 4;
+  string architecture = 5;
+  repeated string capabilities = 6;
+  repeated string database_adapters = 7;
+  repeated CommandRecoveryState active_commands = 8;
+}
+
+message HelloAck {
+  string protocol_version = 1;
+  repeated string capabilities = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message Heartbeat {
+  string agent_id = 1;
+  int64 policy_version = 2;
+  uint32 queued_commands = 3;
+  uint32 running_commands = 4;
+  repeated string active_command_ids = 5;
+}
+
+message CommandEnvelope {
+  string command_id = 1;
+  string job_id = 2;
+  google.protobuf.Timestamp issued_at = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  bytes nonce = 5;
+  bytes signature = 6;
+  uint32 lease_seconds = 7;
+  string agent_id = 8;
+  reserved 9 to 19;
+
+  oneof command {
+    CollectNow collect_now = 20;
+    InspectInstance inspect_instance = 21;
+    ExecuteSQL execute_sql = 22;
+    ExecuteRegisteredProcess execute_registered_process = 23;
+    CollectDiagnostic collect_diagnostic = 24;
+  }
+}
+
+message CollectNow {
+  repeated string collection_kinds = 1;
+  repeated string instance_ids = 2;
+}
+
+message InspectInstance {
+  string instance_id = 1;
+  repeated string inspection_kinds = 2;
+}
+
+message ExecuteSQL {
+  // Every field is required for an ExecuteSQL command to be valid.
+  string instance_id = 1;
+  string workorder_id = 2;
+  int64 review_revision = 3;
+  bytes sql_digest = 4;
+  TransactionPolicy transaction_policy = 5;
+  uint32 timeout_seconds = 6;
+}
+
+message CommandRecoveryState {
+  string command_id = 1;
+  CommandExecutionState state = 2;
+}
+
+enum CommandExecutionState {
+  COMMAND_EXECUTION_STATE_UNSPECIFIED = 0;
+  COMMAND_EXECUTION_STATE_ACCEPTED = 1;
+  COMMAND_EXECUTION_STATE_RUNNING = 2;
+  COMMAND_EXECUTION_STATE_COMPLETED = 3;
+}
+
+enum TransactionPolicy {
+  TRANSACTION_POLICY_UNSPECIFIED = 0;
+  TRANSACTION_POLICY_REQUIRED = 1;
+  TRANSACTION_POLICY_FORBIDDEN = 2;
+  TRANSACTION_POLICY_AUTO_COMMIT = 3;
+}
+
+message ExecuteRegisteredProcess {
+  string process_id = 1;
+  map<string, string> parameters = 2;
+}
+
+message CollectDiagnostic {
+  string instance_id = 1;
+  repeated string diagnostic_kinds = 2;
+}
+
+message CommandAcknowledgement {
+  string command_id = 1;
+  CommandAcknowledgementState state = 2;
+  string reason_code = 3;
+}
+
+enum CommandAcknowledgementState {
+  COMMAND_ACKNOWLEDGEMENT_STATE_UNSPECIFIED = 0;
+  COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED = 1;
+  COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED = 2;
+  COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE = 3;
+}
+
+message CommandProgress {
+  string command_id = 1;
+  uint32 percent = 2;
+  string stage = 3;
+  string message = 4;
+}
+
+message CommandResult {
+  string command_id = 1;
+  CommandResultState state = 2;
+  string summary = 3;
+  repeated ArtifactReference artifacts = 4;
+  string error_code = 5;
+}
+
+enum CommandResultState {
+  COMMAND_RESULT_STATE_UNSPECIFIED = 0;
+  COMMAND_RESULT_STATE_SUCCEEDED = 1;
+  COMMAND_RESULT_STATE_FAILED = 2;
+  COMMAND_RESULT_STATE_CANCELLED = 3;
+  COMMAND_RESULT_STATE_TIMED_OUT = 4;
+}
+
+message ArtifactReference {
+  string artifact_id = 1;
+  string kind = 2;
+  string content_type = 3;
+  uint64 size_bytes = 4;
+  bytes checksum = 5;
+}
+
+message CommandCancellation {
+  string command_id = 1;
+  string reason = 2;
+}
+
+message FlowControlInstruction {
+  uint32 max_in_flight_commands = 1;
+  uint32 heartbeat_interval_seconds = 2;
+  uint32 retry_after_seconds = 3;
+}
