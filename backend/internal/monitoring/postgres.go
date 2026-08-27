@@ -45,6 +45,11 @@ func DefaultQueryLimits() QueryLimits {
 	return QueryLimits{DefaultMaximumInstances, DefaultMaximumMetrics, DefaultMaximumLabels, DefaultMaximumSamples, DefaultMaximumResponseBytes}
 }
 
+// NormalizeQueryLimits applies the public defaults and hard safety caps.
+func NormalizeQueryLimits(limits QueryLimits) QueryLimits {
+	return limits.normalized()
+}
+
 func (limits QueryLimits) normalized() QueryLimits {
 	defaults := DefaultQueryLimits()
 	if limits.MaximumInstances <= 0 {

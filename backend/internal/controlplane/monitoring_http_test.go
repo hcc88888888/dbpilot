@@ -84,9 +84,12 @@ func TestMonitoringQueryLimitErrorIsStableAndRedacted(t *testing.T) {
 	require.JSONEq(t, `{"error":{"code":"query_limit_exceeded","message":"monitoring query exceeds configured limit"}}`, response.Body.String())
 }
 
-func TestMonitoringHTTPChecksFinalResponseEnvelopeSize(t *testing.T) {
+func TestMonitoringHTTPResponseLimitAppliesToMemoryStoreEnvelopeAndNewline(t *testing.T) {
 	fixture := monitoringFixture(t)
-	handler := NewHTTPHandler(Services{Repository: newHTTPFixture().repository, Evaluator: healthyEvaluator{}, Monitoring: envelopeLimitedStore{QueryStore: fixture.store}, Now: func() time.Time { return fixture.now }}, memberFor("t1", "p1"))
+	value := monitoringCapabilitiesResponse{Source: monitoringSource, Scope: fixture.scope, Items: []monitoring.Capability{{Engine: database.MySQLFamily, Metrics: true, MetricIDs: []string{"host.cpu"}}}}
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	handler := NewHTTPHandler(Services{Repository: newHTTPFixture().repository, Evaluator: healthyEvaluator{}, Monitoring: fixture.store, MonitoringResponseBytes: len(encoded), Now: func() time.Time { return fixture.now }}, memberFor("t1", "p1"))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/tenants/t1/projects/p1/monitoring/capabilities", nil))
 	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
@@ -99,10 +102,6 @@ type monitoringHTTPFixture struct {
 	store   monitoring.QueryStore
 	handler http.Handler
 }
-
-type envelopeLimitedStore struct{ monitoring.QueryStore }
-
-func (envelopeLimitedStore) ValidateResponse(any) error { return monitoring.ErrQueryLimit }
 
 func monitoringFixture(t *testing.T) *monitoringHTTPFixture {
 	t.Helper()

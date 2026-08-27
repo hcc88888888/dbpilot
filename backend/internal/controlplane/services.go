@@ -14,6 +14,9 @@ type Services struct {
 	Repository alert.ControlPlaneRepository
 	Evaluator  EvaluatorHealthReader
 	Monitoring monitoring.QueryStore
-	Now        func() time.Time
-	Ready      func(context.Context) error
+	// MonitoringResponseBytes caps complete monitoring HTTP envelopes for every
+	// QueryStore implementation. Zero uses monitoring's conservative default.
+	MonitoringResponseBytes int
+	Now                     func() time.Time
+	Ready                   func(context.Context) error
 }

@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -124,16 +125,19 @@ func (api httpAPI) monitoringCapabilities(writer http.ResponseWriter, request *h
 	api.writeMonitoringJSON(writer, monitoringCapabilitiesResponse{Source: monitoringSource, Scope: scope, Items: values})
 }
 
-type monitoringResponseSizer interface{ ValidateResponse(any) error }
-
 func (api httpAPI) writeMonitoringJSON(writer http.ResponseWriter, value any) {
-	if sizer, ok := api.services.Monitoring.(monitoringResponseSizer); ok {
-		if err := sizer.ValidateResponse(value); err != nil {
-			monitoringAPIError(writer, err)
-			return
-		}
+	payload, err := json.Marshal(value)
+	if err != nil || len(payload)+1 > api.monitoringResponseLimit() {
+		monitoringAPIError(writer, monitoring.ErrQueryLimit)
+		return
 	}
-	writeJSON(writer, http.StatusOK, value)
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(append(payload, '\n'))
+}
+
+func (api httpAPI) monitoringResponseLimit() int {
+	return monitoring.NormalizeQueryLimits(monitoring.QueryLimits{MaximumResponseBytes: api.services.MonitoringResponseBytes}).MaximumResponseBytes
 }
 
 func monitoringRange(request *http.Request, now time.Time) (monitoring.RangeQuery, error) {

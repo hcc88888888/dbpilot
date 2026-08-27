@@ -272,7 +272,8 @@ func NewServer(config Config) (*Server, error) {
 		listen = net.Listen
 	}
 	ready := &atomic.Bool{}
-	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), config.Monitoring.limits()), Ready: func(ctx context.Context) error {
+	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
+	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes, Ready: func(ctx context.Context) error {
 		if !ready.Load() {
 			return errors.New("a successful all-scope evaluation pass has not completed")
 		}
