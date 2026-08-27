@@ -37,6 +37,13 @@ const TEMPLATE_VARIABLES = [
 
 const TEMPLATE_PLACEHOLDER_PATTERN = /{{\s*([A-Za-z0-9_.-]+)\s*}}/g;
 const TEMPLATE_VALUE_NAMES = new Set(['event.id', 'event.state', 'event.severity', 'event.url', 'evidence.aggregate']);
+const TEMPLATE_PREVIEW_VALUES = new Map([
+  ['event.id', 'alert-20260827-01'],
+  ['event.state', 'firing'],
+  ['event.severity', 'critical'],
+  ['event.url', 'https://dbpilot.example/alerts/alert-20260827-01'],
+  ['evidence.aggregate', '92.4'],
+]);
 
 const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
 
@@ -404,11 +411,16 @@ function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
     </form>`;
 }
 
-function renderTemplatePreview(template = {}) {
-  let preview = safeText(`${String(valueOf(template, 'subject') ?? '')}\n\n${String(valueOf(template, 'body') ?? '')}`.trim());
-  TEMPLATE_VARIABLES.forEach(([variable, example]) => { preview = preview.replaceAll(variable, example); });
-  preview = preview.replace(/{{resource\.[^{}]+}}/g, 'orders');
-  return preview;
+function templatePreviewText(template = {}) {
+  const source = `${String(valueOf(template, 'subject') ?? '')}\n\n${String(valueOf(template, 'body') ?? '')}`.trim();
+  return source.replace(TEMPLATE_PLACEHOLDER_PATTERN, (token, variable) => {
+    if (TEMPLATE_PREVIEW_VALUES.has(variable)) return TEMPLATE_PREVIEW_VALUES.get(variable);
+    return /^resource\.[A-Za-z0-9_.-]+$/.test(variable) ? 'orders' : token;
+  });
+}
+
+export function renderTemplatePreview(template = {}) {
+  return safeText(templatePreviewText(template));
 }
 
 function templateVariableMarkup() {
@@ -945,10 +957,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     const updatePreview = () => {
       const preview = form.querySelector('[data-template-preview]');
       if (!preview) return;
-      let text = `${String(form.elements.subject.value ?? '').trim()}\n\n${String(form.elements.body.value ?? '').trim()}`.trim();
-      TEMPLATE_VARIABLES.forEach(([variable, example]) => { text = text.replaceAll(variable, example); });
-      text = text.replace(/{{resource\.[^{}]+}}/g, 'orders');
-      preview.textContent = text;
+      preview.textContent = templatePreviewText({ subject: form.elements.subject.value, body: form.elements.body.value });
     };
     form.addEventListener('input', updatePreview);
     form.addEventListener('submit', async (event) => {

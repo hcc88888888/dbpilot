@@ -11,6 +11,7 @@ import {
   validateSilence,
   validateTemplate,
   isActiveSilence,
+  renderTemplatePreview,
   sanitizePolicyForDisplay,
 } from '../alert-center.js';
 
@@ -122,6 +123,10 @@ test('template validation rejects variables the notification renderer does not s
 
 test('template validation accepts server-valid whitespace around placeholders', () => {
   assert.deepEqual(validateTemplate({ name: '告警', subject: '{{ event.id }}', body: '{{ resource.database }} {{evidence.aggregate}}' }), {});
+});
+
+test('template preview resolves server-valid whitespace event and resource variables as text', () => {
+  assert.equal(renderTemplatePreview({ subject: '{{ event.id }}', body: '{{ resource.database }}' }), 'alert-20260827-01\n\norders');
 });
 
 test('template validation rejects malformed and non-ASCII resource placeholders', () => {
