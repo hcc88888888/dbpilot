@@ -152,6 +152,16 @@ func TestAlertControlPlaneMigrationHasScopedIndexesAndDailyMetricPartitions(t *t
 	require.NotEqual(t, alert.SeriesFingerprint(map[string]string{"host": "db-a"}), alert.SeriesFingerprint(map[string]string{"host": "db-b"}))
 }
 
+func TestMonitoringInstanceStateMigrationPersistsScopedLiveness(t *testing.T) {
+	migration, err := os.ReadFile(filepath.Join("migrations", "0006_monitoring_instance_state.sql"))
+	require.NoError(t, err)
+	content := string(migration)
+	require.Contains(t, content, "CREATE TABLE monitoring_instances")
+	require.Contains(t, content, "PRIMARY KEY (tenant_id, project_id, instance_id)")
+	require.Contains(t, content, "last_heartbeat_at TIMESTAMPTZ NOT NULL")
+	require.Contains(t, content, "monitoring_instances_scope_heartbeat_idx")
+}
+
 func TestPostgresRepositoryRejectsInvalidEventsBeforeWriting(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

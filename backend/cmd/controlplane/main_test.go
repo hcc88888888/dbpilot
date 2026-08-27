@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -93,6 +94,17 @@ func TestConfigStrictlyDecodesSnakeCaseEvaluationScopes(t *testing.T) {
 	config, err := loadConfig(path)
 	require.NoError(t, err)
 	require.Equal(t, []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}}, config.EvaluationScopes)
+}
+
+func TestNewServerWiresCoreMonitoringCapabilities(t *testing.T) {
+	server, err := NewServer(validServerConfig())
+	require.NoError(t, err)
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/tenants/tenant-a/projects/project-a/monitoring/capabilities", nil))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	for _, engine := range []string{"mysql", "postgres", "oracle"} {
+		require.Contains(t, response.Body.String(), `"engine":"`+engine+`"`)
+	}
 }
 
 func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {

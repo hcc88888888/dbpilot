@@ -70,8 +70,14 @@ func TestMetricStoreAppendUsesScopedSeriesIdentityAndCanonicalLabels(t *testing.
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
 		WithArgs("t1", "p1", "agent-a", "db.connections", agentSeriesFingerprint("agent-a", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO monitoring_instances").
+		WithArgs("t1", "p1", "db-1", "agent-a", "", "db-a", canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), int64(time.Minute), sampledAt).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
 		WithArgs("t1", "p1", "agent-b", "db.connections", agentSeriesFingerprint("agent-b", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO monitoring_instances").
+		WithArgs("t1", "p1", "db-1", "agent-b", "", "db-a", canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), int64(time.Minute), sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
@@ -92,6 +98,7 @@ func TestMetricStoreAppendBatchCommitsReservationAndSamplesAtomically(t *testing
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
 	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO monitoring_instances").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -127,6 +134,7 @@ func TestMetricStoreAppendBatchFailsClosedWhenReservationCommitIsLost(t *testing
 	mock.ExpectBegin()
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
 	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectExec("INSERT INTO monitoring_instances").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectRollback()
 

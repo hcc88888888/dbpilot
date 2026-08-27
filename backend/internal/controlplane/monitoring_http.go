@@ -220,6 +220,8 @@ func monitoringAPIError(writer http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, monitoring.ErrInstanceNotFound), errors.Is(err, alert.ErrNotFound):
 		writeAPIError(writer, http.StatusNotFound, "not_found", "resource was not found")
+	case errors.Is(err, monitoring.ErrQueryLimit):
+		writeAPIError(writer, http.StatusRequestEntityTooLarge, "query_limit_exceeded", "monitoring query exceeds configured limit")
 	case errors.Is(err, monitoring.ErrInvalidRange), errors.Is(err, monitoring.ErrRangeTooLarge), errors.Is(err, monitoring.ErrTooManyBuckets), errors.Is(err, monitoring.ErrInvalidQuery):
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request", "query is invalid")
 	default:

@@ -52,6 +52,7 @@ type AtomicMetricBatchStore interface {
 }
 
 const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING"
+const monitoringInstanceUpsertSQL = "INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()"
 const metricBatchReserveSQL = "INSERT INTO ingest_batch_dedup (agent_id, batch_id, state) VALUES ($1, $2, 'processing') ON CONFLICT DO NOTHING RETURNING state"
 const metricBatchCommitSQL = "UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW() WHERE agent_id = $1 AND batch_id = $2"
 const metricQuerySQL = "SELECT tenant_id, project_id, agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC"
@@ -135,6 +136,17 @@ func appendMetricSamples(ctx context.Context, executor metricSampleExecutor, sam
 			return fmt.Errorf("encode metric labels: %w", err)
 		}
 		if _, err := executor.ExecContext(ctx, metricInsertSQL, sample.Scope.TenantID, sample.Scope.ProjectID, sample.AgentID, sample.Name, metricSeriesFingerprint(sample.AgentID, sample.Labels), labels, sample.Value, sample.SampledAt); err != nil {
+			return err
+		}
+		instanceID := sample.InstanceID
+		if instanceID == "" {
+			instanceID = sample.Labels["instance"]
+		}
+		host := sample.Host
+		if host == "" {
+			host = sample.Labels["host"]
+		}
+		if _, err := executor.ExecContext(ctx, monitoringInstanceUpsertSQL, sample.Scope.TenantID, sample.Scope.ProjectID, instanceID, sample.AgentID, sample.Labels["engine"], host, labels, int64(time.Minute), sample.SampledAt); err != nil {
 			return err
 		}
 	}

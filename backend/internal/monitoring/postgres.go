@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,20 +13,78 @@ import (
 	"dbpilot.local/platform/internal/database"
 )
 
-const postgresMetricSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND sampled_at >= $3 AND sampled_at <= $4 ORDER BY sampled_at ASC, agent_id ASC, metric ASC"
+const (
+	DefaultMaximumInstances     = MaximumPageSize
+	DefaultMaximumMetrics       = 50
+	DefaultMaximumLabels        = 32
+	DefaultMaximumSamples       = 10000
+	DefaultMaximumResponseBytes = 1 << 20
+	stateFields                 = "instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at"
+)
 
-// PostgresStore projects the existing, scoped metric_samples table into the
-// storage-neutral monitoring query model. It never accepts scope fields from
-// database labels or samples.
+var ErrQueryLimit = errors.New("monitoring query exceeds configured limit")
+
+const instancesSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 ORDER BY instance_id ASC LIMIT $3"
+const instanceSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3"
+const instanceSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC, metric ASC LIMIT $6"
+const seriesSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND metric = $4 AND sampled_at >= $5 AND sampled_at <= $6 ORDER BY sampled_at ASC, agent_id ASC LIMIT $7"
+
+// QueryLimits bounds storage reads before values enter memory or a response.
+// Zero-valued fields use conservative defaults.
+type QueryLimits struct {
+	MaximumInstances, MaximumMetrics, MaximumLabels, MaximumSamples, MaximumResponseBytes int
+}
+
+func DefaultQueryLimits() QueryLimits {
+	return QueryLimits{DefaultMaximumInstances, DefaultMaximumMetrics, DefaultMaximumLabels, DefaultMaximumSamples, DefaultMaximumResponseBytes}
+}
+
+func (limits QueryLimits) normalized() QueryLimits {
+	defaults := DefaultQueryLimits()
+	if limits.MaximumInstances <= 0 {
+		limits.MaximumInstances = defaults.MaximumInstances
+	}
+	if limits.MaximumMetrics <= 0 {
+		limits.MaximumMetrics = defaults.MaximumMetrics
+	}
+	if limits.MaximumLabels <= 0 {
+		limits.MaximumLabels = defaults.MaximumLabels
+	}
+	if limits.MaximumSamples <= 0 {
+		limits.MaximumSamples = defaults.MaximumSamples
+	}
+	if limits.MaximumResponseBytes <= 0 {
+		limits.MaximumResponseBytes = defaults.MaximumResponseBytes
+	}
+	return limits
+}
+
+// DefaultCapabilities exposes the built-in SQL adapter catalog without opening
+// any database or resolving any secret.
+func DefaultCapabilities() []Capability {
+	return []Capability{
+		CapabilityFromMatrix(database.MySQLFamily, database.NewMySQLFactory(nil, nil).Capabilities()),
+		CapabilityFromMatrix(database.PostgresFamily, database.NewPostgresFactory(nil, nil).Capabilities()),
+		CapabilityFromMatrix(database.OracleFamily, database.NewOracleFactory(nil, nil).Capabilities()),
+	}
+}
+
+// PostgresStore uses persisted, authenticated instance state for identity and
+// liveness; display-range samples never define whether an instance exists.
 type PostgresStore struct {
 	db           *sql.DB
 	capabilities []Capability
+	limits       QueryLimits
 	mu           sync.RWMutex
 	now          func() time.Time
 }
 
 func NewPostgresStore(db *sql.DB, capabilities []Capability) *PostgresStore {
-	return &PostgresStore{db: db, capabilities: copyCapabilities(capabilities), now: time.Now}
+	return NewPostgresStoreWithLimits(db, capabilities, DefaultQueryLimits())
+}
+
+func NewPostgresStoreWithLimits(db *sql.DB, capabilities []Capability, limits QueryLimits) *PostgresStore {
+	return &PostgresStore{db: db, capabilities: copyCapabilities(capabilities), limits: limits.normalized(), now: time.Now}
 }
 
 func (s *PostgresStore) SetNow(now func() time.Time) {
@@ -35,9 +92,9 @@ func (s *PostgresStore) SetNow(now func() time.Time) {
 	defer s.mu.Unlock()
 	if now == nil {
 		s.now = time.Now
-		return
+	} else {
+		s.now = now
 	}
-	s.now = now
 }
 
 func (s *PostgresStore) Overview(ctx context.Context, scope alert.Scope, query RangeQuery) (Overview, error) {
@@ -48,31 +105,36 @@ func (s *PostgresStore) Overview(ctx context.Context, scope alert.Scope, query R
 	if err := query.Validate(now); err != nil {
 		return Overview{}, err
 	}
-	store, err := s.memoryForRange(ctx, scope, query.From, query.To, now)
+	instances, err := s.instances(ctx, scope)
 	if err != nil {
 		return Overview{}, err
 	}
-	return store.Overview(ctx, scope, query)
+	value, err := s.memory(instances, nil, now).Overview(ctx, scope, query)
+	if err != nil {
+		return Overview{}, err
+	}
+	return value, s.ensureResponse(value)
 }
 
 func (s *PostgresStore) ListInstances(ctx context.Context, scope alert.Scope, query InstanceQuery) (InstancePage, error) {
 	if err := scope.Validate(); err != nil {
 		return InstancePage{}, err
 	}
-	now := s.currentTime()
-	// Validate before opening a database cursor so malformed pagination never
-	// consumes storage work.
 	if _, err := NewMemoryStore(nil, nil, nil).ListInstances(ctx, scope, query); err != nil {
 		return InstancePage{}, err
 	}
-	store, err := s.memoryForRange(ctx, scope, now.Add(-MaximumRange), now, now)
+	instances, err := s.instances(ctx, scope)
 	if err != nil {
 		return InstancePage{}, err
 	}
-	return store.ListInstances(ctx, scope, query)
+	value, err := s.memory(instances, nil, s.currentTime()).ListInstances(ctx, scope, query)
+	if err != nil {
+		return InstancePage{}, err
+	}
+	return value, s.ensureResponse(value)
 }
 
-func (s *PostgresStore) GetInstance(ctx context.Context, scope alert.Scope, instanceID string, query RangeQuery) (InstanceDetail, error) {
+func (s *PostgresStore) GetInstance(ctx context.Context, scope alert.Scope, id string, query RangeQuery) (InstanceDetail, error) {
 	if err := scope.Validate(); err != nil {
 		return InstanceDetail{}, err
 	}
@@ -80,11 +142,19 @@ func (s *PostgresStore) GetInstance(ctx context.Context, scope alert.Scope, inst
 	if err := query.Validate(now); err != nil {
 		return InstanceDetail{}, err
 	}
-	store, err := s.memoryForRange(ctx, scope, query.From, query.To, now)
+	instance, err := s.instance(ctx, scope, id)
 	if err != nil {
 		return InstanceDetail{}, err
 	}
-	return store.GetInstance(ctx, scope, instanceID, query)
+	samples, err := s.samples(ctx, instanceSamplesSQL, []any{scope.TenantID, scope.ProjectID, id, query.From.UTC(), query.To.UTC(), s.queryLimits().MaximumSamples + 1}, scope)
+	if err != nil {
+		return InstanceDetail{}, err
+	}
+	value, err := s.memory([]Instance{instance}, samples, now).GetInstance(ctx, scope, id, query)
+	if err != nil {
+		return InstanceDetail{}, err
+	}
+	return value, s.ensureResponse(value)
 }
 
 func (s *PostgresStore) Series(ctx context.Context, scope alert.Scope, query SeriesQuery) (Series, error) {
@@ -98,44 +168,83 @@ func (s *PostgresStore) Series(ctx context.Context, scope alert.Scope, query Ser
 	if err := query.Range.Validate(now); err != nil {
 		return Series{}, err
 	}
-	store, err := s.memoryForRange(ctx, scope, query.Range.From, query.Range.To, now)
+	instance, err := s.instance(ctx, scope, query.InstanceID)
 	if err != nil {
 		return Series{}, err
 	}
-	return store.Series(ctx, scope, query)
+	samples, err := s.samples(ctx, seriesSamplesSQL, []any{scope.TenantID, scope.ProjectID, query.InstanceID, query.Metric, query.Range.From.UTC(), query.Range.To.UTC(), s.queryLimits().MaximumSamples + 1}, scope)
+	if err != nil {
+		return Series{}, err
+	}
+	value, err := s.memory([]Instance{instance}, samples, now).Series(ctx, scope, query)
+	if err != nil {
+		return Series{}, err
+	}
+	return value, s.ensureResponse(value)
 }
 
 func (s *PostgresStore) Capabilities(ctx context.Context, scope alert.Scope) ([]Capability, error) {
 	if err := scope.Validate(); err != nil {
 		return nil, err
 	}
-	return NewMemoryStore(nil, nil, s.capabilityCopy()).Capabilities(ctx, scope)
-}
-
-func (s *PostgresStore) memoryForRange(ctx context.Context, scope alert.Scope, from, to, now time.Time) (*MemoryStore, error) {
-	samples, err := s.samples(ctx, scope, from, to)
+	values, err := NewMemoryStore(nil, nil, s.capabilityCopy()).Capabilities(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
-	instances := instancesFromSamples(scope, samples)
-	store := NewMemoryStore(instances, samples, s.capabilityCopy())
-	store.SetSource("postgres")
-	store.SetNow(func() time.Time { return now })
-	return store, nil
+	return values, s.ensureResponse(values)
 }
 
-func (s *PostgresStore) samples(ctx context.Context, scope alert.Scope, from, to time.Time) ([]alert.MetricSample, error) {
+func (s *PostgresStore) instances(ctx context.Context, scope alert.Scope) ([]Instance, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("monitoring PostgreSQL store is unavailable")
 	}
-	rows, err := s.db.QueryContext(ctx, postgresMetricSamplesSQL, scope.TenantID, scope.ProjectID, from.UTC(), to.UTC())
+	limits := s.queryLimits()
+	rows, err := s.db.QueryContext(ctx, instancesSQL, scope.TenantID, scope.ProjectID, limits.MaximumInstances+1)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	result := make([]alert.MetricSample, 0)
+	result := make([]Instance, 0, limits.MaximumInstances)
 	for rows.Next() {
+		if len(result) == limits.MaximumInstances {
+			return nil, ErrQueryLimit
+		}
+		value, err := scanInstance(rows, scope, limits)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (s *PostgresStore) instance(ctx context.Context, scope alert.Scope, id string) (Instance, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(id) == "" {
+		return Instance{}, ErrInstanceNotFound
+	}
+	value, err := scanInstance(s.db.QueryRowContext(ctx, instanceSQL, scope.TenantID, scope.ProjectID, id), scope, s.queryLimits())
+	if errors.Is(err, sql.ErrNoRows) {
+		return Instance{}, ErrInstanceNotFound
+	}
+	return value, err
+}
+
+func (s *PostgresStore) samples(ctx context.Context, statement string, arguments []any, scope alert.Scope) ([]alert.MetricSample, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("monitoring PostgreSQL store is unavailable")
+	}
+	limits := s.queryLimits()
+	rows, err := s.db.QueryContext(ctx, statement, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]alert.MetricSample, 0, limits.MaximumSamples)
+	metrics := make(map[string]struct{})
+	for rows.Next() {
+		if len(result) == limits.MaximumSamples {
+			return nil, ErrQueryLimit
+		}
 		var sample alert.MetricSample
 		var labels []byte
 		if err := rows.Scan(&sample.AgentID, &sample.Name, &labels, &sample.Value, &sample.SampledAt); err != nil {
@@ -143,6 +252,15 @@ func (s *PostgresStore) samples(ctx context.Context, scope alert.Scope, from, to
 		}
 		if err := json.Unmarshal(labels, &sample.Labels); err != nil {
 			return nil, err
+		}
+		if len(sample.Labels) > limits.MaximumLabels {
+			return nil, ErrQueryLimit
+		}
+		if _, exists := metrics[sample.Name]; !exists {
+			if len(metrics) == limits.MaximumMetrics {
+				return nil, ErrQueryLimit
+			}
+			metrics[sample.Name] = struct{}{}
 		}
 		sample.Scope = scope
 		sample.InstanceID = sample.Labels["instance"]
@@ -152,47 +270,45 @@ func (s *PostgresStore) samples(ctx context.Context, scope alert.Scope, from, to
 		sample.SampledAt = sample.SampledAt.UTC()
 		result = append(result, sample)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return result, rows.Err()
 }
 
-func instancesFromSamples(scope alert.Scope, samples []alert.MetricSample) []Instance {
-	byID := make(map[string]Instance)
-	for _, sample := range samples {
-		instanceID := strings.TrimSpace(sample.InstanceID)
-		if instanceID == "" {
-			continue
-		}
-		instance, exists := byID[instanceID]
-		if !exists {
-			instance = Instance{ID: instanceID, Scope: scope, AgentID: sample.AgentID, Host: sample.Host, Labels: copyStringMap(sample.Labels), Latest: make(map[string]*float64)}
-			if engine := database.EngineFamily(strings.TrimSpace(sample.Labels["engine"])); engine != "" {
-				instance.Engine = engine
-			}
-		}
-		if sample.SampledAt.After(instance.LastSampleAt) {
-			instance.LastSampleAt = sample.SampledAt
-			// The compatible metric table has no dedicated heartbeat column. A
-			// current metric proves collector liveness, but no label is trusted
-			// as a separate scope or heartbeat authority.
-			instance.LastHeartbeatAt = sample.SampledAt
-		}
-		value := sample.Value
-		if current, ok := instance.Latest[sample.Name]; !ok || current == nil || sample.SampledAt.Equal(instance.LastSampleAt) {
-			instance.Latest[sample.Name] = &value
-		}
-		byID[instanceID] = instance
+func scanInstance(scanner interface{ Scan(...any) error }, scope alert.Scope, limits QueryLimits) (Instance, error) {
+	var value Instance
+	var labels []byte
+	var every int64
+	if err := scanner.Scan(&value.ID, &value.AgentID, &value.Engine, &value.Host, &labels, &every, &value.LastSampleAt, &value.LastHeartbeatAt); err != nil {
+		return Instance{}, err
 	}
-	result := make([]Instance, 0, len(byID))
-	for _, instance := range byID {
-		result = append(result, instance)
+	if err := json.Unmarshal(labels, &value.Labels); err != nil {
+		return Instance{}, err
 	}
-	sort.Slice(result, func(left, right int) bool { return result[left].ID < result[right].ID })
-	return result
+	if len(value.Labels) > limits.MaximumLabels {
+		return Instance{}, ErrQueryLimit
+	}
+	value.Scope = scope
+	value.CollectEvery = time.Duration(every)
+	if value.CollectEvery <= 0 {
+		value.CollectEvery = DefaultStep
+	}
+	value.LastSampleAt = value.LastSampleAt.UTC()
+	value.LastHeartbeatAt = value.LastHeartbeatAt.UTC()
+	return value, nil
 }
 
+func (s *PostgresStore) memory(instances []Instance, samples []alert.MetricSample, now time.Time) *MemoryStore {
+	store := NewMemoryStore(instances, samples, s.capabilityCopy())
+	store.SetSource("postgres")
+	store.SetNow(func() time.Time { return now })
+	return store
+}
+func (s *PostgresStore) ensureResponse(value any) error {
+	encoded, err := json.Marshal(value)
+	if err != nil || len(encoded) > s.queryLimits().MaximumResponseBytes {
+		return ErrQueryLimit
+	}
+	return nil
+}
 func (s *PostgresStore) currentTime() time.Time {
 	s.mu.RLock()
 	now := s.now
@@ -202,11 +318,15 @@ func (s *PostgresStore) currentTime() time.Time {
 	}
 	return now().UTC()
 }
-
 func (s *PostgresStore) capabilityCopy() []Capability {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return copyCapabilities(s.capabilities)
+}
+func (s *PostgresStore) queryLimits() QueryLimits {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.limits
 }
 
 var _ QueryStore = (*PostgresStore)(nil)

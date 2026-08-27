@@ -64,6 +64,18 @@ type SMTPSettings struct {
 	ImplicitTLS bool   `yaml:"implicit_tls"`
 }
 
+type MonitoringSettings struct {
+	MaximumInstances     int `yaml:"maximum_instances,omitempty"`
+	MaximumMetrics       int `yaml:"maximum_metrics,omitempty"`
+	MaximumLabels        int `yaml:"maximum_labels,omitempty"`
+	MaximumSamples       int `yaml:"maximum_samples,omitempty"`
+	MaximumResponseBytes int `yaml:"maximum_response_bytes,omitempty"`
+}
+
+func (settings MonitoringSettings) limits() monitoring.QueryLimits {
+	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
+}
+
 type IdentitySettings struct {
 	Mode       string                       `yaml:"mode"`
 	Principals map[string]PrincipalSettings `yaml:"principals,omitempty"`
@@ -82,6 +94,7 @@ type Config struct {
 	GRPC             ListenerConfig             `yaml:"grpc"`
 	Agents           map[string]AgentAssignment `yaml:"agents"`
 	SMTP             SMTPSettings               `yaml:"smtp"`
+	Monitoring       MonitoringSettings         `yaml:"monitoring,omitempty"`
 	Identity         IdentitySettings           `yaml:"identity"`
 	EventURLBase     string                     `yaml:"event_url_base"`
 	EvaluationScopes []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
@@ -259,7 +272,7 @@ func NewServer(config Config) (*Server, error) {
 		listen = net.Listen
 	}
 	ready := &atomic.Bool{}
-	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStore(database, nil), Ready: func(ctx context.Context) error {
+	services := controlplane.Services{Repository: repository, Evaluator: evaluator, Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), config.Monitoring.limits()), Ready: func(ctx context.Context) error {
 		if !ready.Load() {
 			return errors.New("a successful all-scope evaluation pass has not completed")
 		}
@@ -278,6 +291,11 @@ func validateConfig(config Config) error {
 	}
 	if len(config.WebhookAllowlist) == 0 {
 		return errors.New("webhook_allowlist must contain at least one hostname")
+	}
+	for _, value := range []int{config.Monitoring.MaximumInstances, config.Monitoring.MaximumMetrics, config.Monitoring.MaximumLabels, config.Monitoring.MaximumSamples, config.Monitoring.MaximumResponseBytes} {
+		if value < 0 {
+			return errors.New("monitoring limits must not be negative")
+		}
 	}
 	for _, host := range config.WebhookAllowlist {
 		if host == "" || host != strings.ToLower(strings.TrimSpace(host)) || strings.ContainsAny(host, "/:@") {

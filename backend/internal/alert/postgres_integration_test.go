@@ -793,7 +793,7 @@ func (channel *slowCountingChannel) Deliver(ctx context.Context, request Deliver
 }
 
 func setupNotificationIntegrationSchema(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {
-	return setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0002_notification_delivery_control.sql", "0005_alert_control_plane_integrity.sql")
+	return setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0002_notification_delivery_control.sql", "0005_alert_control_plane_integrity.sql", "0006_monitoring_instance_state.sql")
 }
 
 func setupNotificationIntegrationSchemaThrough(t *testing.T, ctx context.Context, dsn string, migrations ...string) (*sql.DB, string) {
@@ -920,7 +920,7 @@ func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql")
+	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql", "0006_monitoring_instance_state.sql")
 	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "metric-batch-writer-2"), "")
 	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
 

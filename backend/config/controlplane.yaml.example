@@ -29,6 +29,12 @@ webhook_allowlist:
 event_url_base: "https://dbpilot.example.com"
 evaluation_every: 15s
 retry_every: 1m
+monitoring:
+  maximum_instances: 200
+  maximum_metrics: 50
+  maximum_labels: 32
+  maximum_samples: 10000
+  maximum_response_bytes: 1048576
 evaluation_scopes:
   - tenant_id: "tenant-1"
     project_id: "project-1"

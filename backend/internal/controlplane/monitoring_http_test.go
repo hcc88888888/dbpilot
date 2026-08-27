@@ -77,6 +77,13 @@ func TestMonitoringRoutesReturnInstancesSeriesAndCapabilities(t *testing.T) {
 	}
 }
 
+func TestMonitoringQueryLimitErrorIsStableAndRedacted(t *testing.T) {
+	response := httptest.NewRecorder()
+	monitoringAPIError(response, monitoring.ErrQueryLimit)
+	require.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	require.JSONEq(t, `{"error":{"code":"query_limit_exceeded","message":"monitoring query exceeds configured limit"}}`, response.Body.String())
+}
+
 type monitoringHTTPFixture struct {
 	scope   alert.Scope
 	now     time.Time
