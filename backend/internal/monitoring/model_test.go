@@ -62,6 +62,16 @@ func TestInstanceDTORedactsCommonCredentialLabelsAndInlineSecrets(t *testing.T) 
 	require.Empty(t, got.ErrorSummary)
 }
 
+func TestInstanceDTORedactsWhitespaceSeparatedInlineSecrets(t *testing.T) {
+	got := RedactInstance(Instance{
+		Labels:       map[string]string{"engine": "mysql", "diagnostic": "ToKeN : abc"},
+		ErrorSummary: "collector rejected request: PASSWORD = hunter2",
+	})
+
+	require.Equal(t, map[string]string{"engine": "mysql"}, got.Labels)
+	require.Empty(t, got.ErrorSummary)
+}
+
 func TestMemoryStoreRejectsCrossScopeInstanceAndReturnsCopies(t *testing.T) {
 	scope := alert.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
 	store := NewMemoryStore(

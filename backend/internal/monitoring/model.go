@@ -5,6 +5,7 @@ package monitoring
 import (
 	"errors"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,8 @@ var (
 	ErrInvalidQuery     = errors.New("invalid monitoring query")
 	ErrInstanceNotFound = errors.New("monitoring instance not found")
 )
+
+var inlineSecretAssignment = regexp.MustCompile(`(?i)\b(?:password|secret|token|credential|authorization|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key|dsn)\b\s*(?:=|:)\s*\S+`)
 
 // RangeQuery bounds any time series lookup. Validate normalizes the query in
 // place so callers use the same UTC values that reach storage.
@@ -316,6 +319,9 @@ func sensitiveLabel(key string) bool {
 func containsSecret(value string) bool {
 	normalized := strings.ToLower(value)
 	if strings.Contains(normalized, "secret://") || strings.Contains(normalized, "://") && strings.Contains(normalized, "@") {
+		return true
+	}
+	if inlineSecretAssignment.MatchString(value) {
 		return true
 	}
 	for _, key := range []string{"password", "secret", "token", "credential", "authorization", "api_key", "access_key", "client_secret", "private_key", "dsn"} {
