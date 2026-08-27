@@ -1,0 +1,51 @@
+FieldError:
+  type: object
+  required: [field, code, message]
+  properties:
+    field:
+      type: string
+      minLength: 1
+    code:
+      type: string
+      minLength: 1
+    message:
+      type: string
+      minLength: 1
+Problem:
+  type: object
+  required: [type, title, status, code, request_id]
+  properties:
+    type:
+      type: string
+      format: uri-reference
+      minLength: 1
+    title:
+      type: string
+      minLength: 1
+    status:
+      type: integer
+      minimum: 100
+      maximum: 599
+    detail:
+      type: string
+    instance:
+      type: string
+      format: uri-reference
+    code:
+      type: string
+      minLength: 1
+    request_id:
+      $ref: ./identifiers.yaml#/RequestId
+    errors:
+      type: array
+      items:
+        $ref: '#/FieldError'
+ProblemResponse:
+  description: RFC 9457 Problem Details response.
+  content:
+    application/problem+json:
+      schema:
+        $ref: '#/Problem'
+      examples:
+        validation:
+          externalValue: ../../examples/platform/problem-validation.json

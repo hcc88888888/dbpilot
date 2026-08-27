@@ -1,0 +1,107 @@
+JobStatus:
+  type: string
+  enum: [queued, dispatched, running, succeeded, failed, cancelling, cancelled, timed_out]
+JobOutcome:
+  type: string
+  enum: [complete, partial, none]
+JobProgress:
+  type: object
+  required: [total_targets, completed_targets, failed_targets, skipped_targets]
+  properties:
+    total_targets:
+      type: integer
+      minimum: 0
+    completed_targets:
+      type: integer
+      minimum: 0
+    failed_targets:
+      type: integer
+      minimum: 0
+    skipped_targets:
+      type: integer
+      minimum: 0
+ResourceReference:
+  type: object
+  required: [resource_type, resource_id]
+  properties:
+    resource_type:
+      type: string
+      minLength: 1
+    resource_id:
+      $ref: ./identifiers.yaml#/ResourceId
+Job:
+  type: object
+  required:
+    - id
+    - type
+    - status
+    - outcome
+    - tenant_id
+    - project_id
+    - version
+    - progress
+    - source_resource
+    - created_at
+    - request_id
+    - trace_id
+    - artifacts
+  properties:
+    id:
+      $ref: ./identifiers.yaml#/JobId
+    type:
+      type: string
+      minLength: 1
+    status:
+      $ref: '#/JobStatus'
+    outcome:
+      $ref: '#/JobOutcome'
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    instance_id:
+      $ref: ./identifiers.yaml#/InstanceId
+    target_resource_ids:
+      type: array
+      items:
+        $ref: ./identifiers.yaml#/ResourceId
+    initiated_by:
+      type: string
+      minLength: 1
+    source_resource:
+      $ref: '#/ResourceReference'
+    idempotency_key:
+      type: string
+      minLength: 1
+    version:
+      type: integer
+      minimum: 1
+    progress:
+      $ref: '#/JobProgress'
+    error_summary:
+      type: string
+    result_summary:
+      type: string
+    artifacts:
+      type: array
+      items:
+        $ref: ./artifacts.yaml#/ArtifactReference
+    created_at:
+      type: string
+      format: date-time
+    dispatched_at:
+      type: [string, 'null']
+      format: date-time
+    started_at:
+      type: [string, 'null']
+      format: date-time
+    finished_at:
+      type: [string, 'null']
+      format: date-time
+    timeout_at:
+      type: [string, 'null']
+      format: date-time
+    request_id:
+      $ref: ./identifiers.yaml#/RequestId
+    trace_id:
+      $ref: ./identifiers.yaml#/TraceId

@@ -1,0 +1,16 @@
+{
+  "type": "https://dbpilot.local/problems/validation",
+  "title": "请求参数校验失败",
+  "status": 400,
+  "detail": "一个或多个字段不符合要求。",
+  "instance": "/api/v1/tenants/tenant_demo/projects/project_demo/audit-events",
+  "code": "validation_failed",
+  "request_id": "req_01J8YZXB5PV7XJ3VP9AJ1FPQH3",
+  "errors": [
+    {
+      "field": "limit",
+      "code": "maximum",
+      "message": "limit 不能大于 500。"
+    }
+  ]
+}

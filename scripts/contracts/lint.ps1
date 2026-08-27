@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
-$openApiDocument = Join-Path $repoRoot 'contracts/openapi.yaml'
+$openApiDocument = Join-Path $repoRoot 'contracts/openapi/dbpilot-api.yaml'
 $bufConfig = Join-Path $repoRoot 'buf.yaml'
 
 Push-Location $repoRoot

@@ -1,0 +1,32 @@
+Capability:
+  type: object
+  required: [name, enabled, reason_code, database_types, agent_capabilities, required_permission]
+  properties:
+    name:
+      type: string
+      minLength: 1
+    enabled:
+      type: boolean
+    reason_code:
+      type: [string, 'null']
+    database_types:
+      type: array
+      items:
+        type: string
+        minLength: 1
+    agent_capabilities:
+      type: array
+      items:
+        type: string
+        minLength: 1
+    required_permission:
+      type: string
+      minLength: 1
+CapabilitySet:
+  type: object
+  required: [capabilities]
+  properties:
+    capabilities:
+      type: array
+      items:
+        $ref: '#/Capability'

@@ -1,0 +1,31 @@
+{
+  "id": "job_01J8YZW7FKD1YQ5E0ZFX6WHG8M",
+  "type": "inspection.run",
+  "status": "running",
+  "outcome": "none",
+  "tenant_id": "tenant_demo",
+  "project_id": "project_demo",
+  "instance_id": "instance_primary",
+  "target_resource_ids": ["instance_primary"],
+  "initiated_by": "user_123",
+  "source_resource": {
+    "resource_type": "inspection_run",
+    "resource_id": "inspection_456"
+  },
+  "idempotency_key": "7d34d5ee-0c37-4e02-8221-7d0c06319f46",
+  "version": 3,
+  "progress": {
+    "total_targets": 4,
+    "completed_targets": 1,
+    "failed_targets": 0,
+    "skipped_targets": 0
+  },
+  "artifacts": [],
+  "created_at": "2026-08-28T08:00:00Z",
+  "dispatched_at": "2026-08-28T08:00:02Z",
+  "started_at": "2026-08-28T08:00:05Z",
+  "finished_at": null,
+  "timeout_at": "2026-08-28T08:30:00Z",
+  "request_id": "req_01J8YZW5H8Z6B9W8R5M62HDSSK",
+  "trace_id": "trace_01J8YZW5H8Z6B9W8R5M62HDSSK"
+}

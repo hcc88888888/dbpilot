@@ -1,0 +1,68 @@
+ArtifactReference:
+  type: object
+  required: [artifact_id, kind]
+  properties:
+    artifact_id:
+      $ref: ./identifiers.yaml#/ArtifactId
+    kind:
+      type: string
+      minLength: 1
+Artifact:
+  type: object
+  required:
+    - id
+    - kind
+    - content_type
+    - size_bytes
+    - checksum
+    - tenant_id
+    - project_id
+    - created_at
+  properties:
+    id:
+      $ref: ./identifiers.yaml#/ArtifactId
+    kind:
+      type: string
+      minLength: 1
+    content_type:
+      type: string
+      minLength: 1
+    size_bytes:
+      type: integer
+      minimum: 0
+    checksum:
+      type: string
+      minLength: 1
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    source_resource:
+      $ref: ./jobs.yaml#/ResourceReference
+    job_id:
+      $ref: ./identifiers.yaml#/JobId
+    created_by:
+      type: string
+      minLength: 1
+    created_at:
+      type: string
+      format: date-time
+    expires_at:
+      type: [string, 'null']
+      format: date-time
+DownloadDescriptor:
+  type: object
+  required: [url, expires_at]
+  properties:
+    url:
+      type: string
+      format: uri
+      minLength: 1
+      description: Short-lived, authorized download URL.
+    expires_at:
+      type: string
+      format: date-time
+    headers:
+      type: object
+      additionalProperties:
+        type: string

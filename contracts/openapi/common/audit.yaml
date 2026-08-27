@@ -1,0 +1,56 @@
+AuditActor:
+  type: object
+  required: [type, id]
+  properties:
+    type:
+      type: string
+      minLength: 1
+    id:
+      type: string
+      minLength: 1
+AuditEvent:
+  type: object
+  required:
+    - id
+    - occurred_at
+    - action
+    - tenant_id
+    - project_id
+    - actor
+    - request_id
+  properties:
+    id:
+      $ref: ./identifiers.yaml#/AuditEventId
+    occurred_at:
+      type: string
+      format: date-time
+    action:
+      type: string
+      minLength: 1
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    actor:
+      $ref: '#/AuditActor'
+    source_resource:
+      $ref: ./jobs.yaml#/ResourceReference
+    job_id:
+      $ref: ./identifiers.yaml#/JobId
+    request_id:
+      $ref: ./identifiers.yaml#/RequestId
+    trace_id:
+      $ref: ./identifiers.yaml#/TraceId
+    detail:
+      type: object
+      additionalProperties: true
+AuditEventPage:
+  type: object
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      items:
+        $ref: '#/AuditEvent'
+    page:
+      $ref: ./pagination.yaml#/Page

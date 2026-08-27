@@ -1,0 +1,187 @@
+/jobs/{job_id}:
+  get:
+    operationId: getJob
+    summary: Get a job
+    x-dbpilot-permission: platform.jobs.read
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          $ref: ../common/identifiers.yaml#/JobId
+    responses:
+      '200':
+        description: Job state.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/jobs.yaml#/Job
+            examples:
+              running:
+                externalValue: ../../examples/platform/job-running.json
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/jobs/{job_id}/actions/cancel:
+  post:
+    operationId: cancelJob
+    summary: Request job cancellation
+    x-dbpilot-permission: platform.jobs.cancel
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          $ref: ../common/identifiers.yaml#/JobId
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        description: Job entity tag matching the version being cancelled.
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '202':
+        description: Job cancellation was accepted.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+              format: uri-reference
+          ETag:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../common/jobs.yaml#/Job
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '412':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/artifacts/{artifact_id}:
+  get:
+    operationId: getArtifact
+    summary: Get artifact metadata
+    x-dbpilot-permission: platform.artifacts.read
+    parameters:
+      - name: artifact_id
+        in: path
+        required: true
+        schema:
+          $ref: ../common/identifiers.yaml#/ArtifactId
+    responses:
+      '200':
+        description: Artifact metadata.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/artifacts.yaml#/Artifact
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/artifacts/{artifact_id}/actions/download:
+  post:
+    operationId: createArtifactDownload
+    summary: Create a short-lived artifact download descriptor
+    x-dbpilot-permission: platform.artifacts.download
+    parameters:
+      - name: artifact_id
+        in: path
+        required: true
+        schema:
+          $ref: ../common/identifiers.yaml#/ArtifactId
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '200':
+        description: Short-lived authorized download descriptor; never file bytes.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/artifacts.yaml#/DownloadDescriptor
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/audit-events:
+  get:
+    operationId: listAuditEvents
+    summary: List audit events
+    x-dbpilot-permission: platform.audit.read
+    parameters:
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+    responses:
+      '200':
+        description: Cursor-paginated audit events.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/audit.yaml#/AuditEventPage
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/capabilities:
+  get:
+    operationId: getCapabilities
+    summary: Get effective capabilities
+    x-dbpilot-permission: platform.capabilities.read
+    responses:
+      '200':
+        description: Capabilities available to the caller in this project.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/permissions.yaml#/CapabilitySet
+            examples:
+              default:
+                externalValue: ../../examples/platform/capabilities.json
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse

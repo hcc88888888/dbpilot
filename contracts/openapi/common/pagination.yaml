@@ -1,0 +1,12 @@
+Page:
+  type: object
+  required: [limit, has_more]
+  properties:
+    limit:
+      type: integer
+      minimum: 1
+      maximum: 500
+    next_cursor:
+      type: [string, 'null']
+    has_more:
+      type: boolean

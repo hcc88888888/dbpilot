@@ -1,0 +1,36 @@
+TenantId:
+  type: string
+  minLength: 1
+  description: Opaque tenant identifier.
+ProjectId:
+  type: string
+  minLength: 1
+  description: Opaque project identifier.
+JobId:
+  type: string
+  minLength: 1
+  description: Opaque job identifier.
+ArtifactId:
+  type: string
+  minLength: 1
+  description: Opaque artifact identifier.
+AuditEventId:
+  type: string
+  minLength: 1
+  description: Opaque audit event identifier.
+RequestId:
+  type: string
+  minLength: 1
+  description: Request correlation identifier.
+TraceId:
+  type: string
+  minLength: 1
+  description: Distributed trace identifier.
+InstanceId:
+  type: string
+  minLength: 1
+  description: Opaque database instance identifier.
+ResourceId:
+  type: string
+  minLength: 1
+  description: Opaque business resource identifier.

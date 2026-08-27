@@ -1,0 +1,63 @@
+openapi: 3.1.0
+info:
+  title: DBPilot Control Plane API
+  version: 1.0.0
+  description: Common platform REST contract for DBPilot control-plane resources. Errors use application/problem+json.
+servers:
+  - url: /api/v1/tenants/{tenant_id}/projects/{project_id}
+    variables:
+      tenant_id:
+        default: tenant
+        description: Opaque tenant identifier.
+      project_id:
+        default: project
+        description: Opaque project identifier.
+security:
+  - bearerAuth: []
+paths:
+  $ref: ./modules/platform.yaml
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    TenantId:
+      $ref: ./common/identifiers.yaml#/TenantId
+    ProjectId:
+      $ref: ./common/identifiers.yaml#/ProjectId
+    JobId:
+      $ref: ./common/identifiers.yaml#/JobId
+    ArtifactId:
+      $ref: ./common/identifiers.yaml#/ArtifactId
+    AuditEventId:
+      $ref: ./common/identifiers.yaml#/AuditEventId
+    RequestId:
+      $ref: ./common/identifiers.yaml#/RequestId
+    Page:
+      $ref: ./common/pagination.yaml#/Page
+    Problem:
+      $ref: ./common/errors.yaml#/Problem
+    FieldError:
+      $ref: ./common/errors.yaml#/FieldError
+    Job:
+      $ref: ./common/jobs.yaml#/Job
+    JobStatus:
+      $ref: ./common/jobs.yaml#/JobStatus
+    JobOutcome:
+      $ref: ./common/jobs.yaml#/JobOutcome
+    Artifact:
+      $ref: ./common/artifacts.yaml#/Artifact
+    ArtifactReference:
+      $ref: ./common/artifacts.yaml#/ArtifactReference
+    DownloadDescriptor:
+      $ref: ./common/artifacts.yaml#/DownloadDescriptor
+    AuditEvent:
+      $ref: ./common/audit.yaml#/AuditEvent
+    AuditEventPage:
+      $ref: ./common/audit.yaml#/AuditEventPage
+    Capability:
+      $ref: ./common/permissions.yaml#/Capability
+    CapabilitySet:
+      $ref: ./common/permissions.yaml#/CapabilitySet

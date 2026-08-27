@@ -1,0 +1,20 @@
+{
+  "capabilities": [
+    {
+      "name": "inspection.run",
+      "enabled": true,
+      "reason_code": null,
+      "database_types": ["postgresql", "mysql"],
+      "agent_capabilities": ["inspect_instance"],
+      "required_permission": "inspections.run"
+    },
+    {
+      "name": "backup.restore",
+      "enabled": false,
+      "reason_code": "permission_denied",
+      "database_types": ["postgresql"],
+      "agent_capabilities": ["restore_backup"],
+      "required_permission": "backups.restore"
+    }
+  ]
+}
