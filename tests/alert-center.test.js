@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildAlertFilters,
+  alertFailureMessage,
+  alertSourceLabel,
   formatSeverity,
   safeText,
   validateDisposition,
@@ -12,8 +14,33 @@ import {
   validateTemplate,
   isActiveSilence,
   renderTemplatePreview,
+  renderAlertListMarkup,
   sanitizePolicyForDisplay,
 } from '../alert-center.js';
+
+test('demo responses have an explicit safe source label', () => {
+  assert.equal(alertSourceLabel('demo'), '演示数据');
+  assert.equal(alertSourceLabel('control-plane'), '控制面服务');
+});
+
+test('forbidden adapter failures preserve the user-safe permission message', () => {
+  assert.equal(
+    alertFailureMessage({ kind: 'forbidden', message: '当前账号没有该项目的操作权限' }, '告警数据'),
+    '当前账号没有该项目的操作权限',
+  );
+});
+
+test('alert-list pager renders without relying on controller-local cursor state', () => {
+  const markup = renderAlertListMarkup({
+    items: [],
+    nextCursor: '25',
+    filters: {},
+    source: 'demo',
+    cursor: null,
+  });
+  assert.match(markup, /data-alert-prev disabled/);
+  assert.match(markup, /data-alert-next="25"/);
+});
 
 test('safeText prevents markup from becoming alert-detail HTML', () => {
   assert.equal(safeText('<img src=x onerror=alert(1)>'), '&lt;img src=x onerror=alert(1)&gt;');

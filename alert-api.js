@@ -104,7 +104,7 @@ function createDemoAdapter() {
     silences: [{ id: 'silence-1', matchers: { 'label.instance': 'mysql-demo-01' }, reason: '演示维护窗口' }],
   };
 
-  const list = (key) => async (scope) => normalizeList(store[key], scope, null);
+  const list = (key) => async (scope) => normalizeList(store[key], scope, null, {}, 'demo');
   const save = (key, collection, prefix) => async (scope, value) => {
     const payload = writePayload(collection, value);
     const id = value?.id || `${prefix}-${store[key].length + 1}`;

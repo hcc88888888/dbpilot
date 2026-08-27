@@ -57,6 +57,16 @@ export function formatSeverity(value) {
   return SEVERITY_LABELS[String(value ?? '').toLowerCase()] || '未知';
 }
 
+export function alertSourceLabel(source) {
+  return source === 'demo' ? '演示数据' : source ? '控制面服务' : '当前项目';
+}
+
+export function alertFailureMessage(error, label) {
+  return error?.kind === 'forbidden'
+    ? '当前账号没有该项目的操作权限'
+    : `暂时无法加载${label}`;
+}
+
 export function validateReason(value) {
   return SENSITIVE_VALUE_PATTERN.test(String(value ?? ''))
     ? '原因中不能包含凭据或连接串'
@@ -234,7 +244,7 @@ function renderOverviewMarkup(overview = {}) {
     </div>`;
 }
 
-function renderAlertListMarkup({ items, nextCursor, filters, source }) {
+export function renderAlertListMarkup({ items, nextCursor, filters, source, cursor }) {
   return `
     <form class="alert-filter-bar" data-alert-filters>
       <label>状态<select name="state"><option value="">全部</option>${['firing', 'acknowledged', 'resolved'].map((value) => `<option value="${value}" ${filters.state === value ? 'selected' : ''}>${stateLabel(value)}</option>`).join('')}</select></label>
@@ -249,7 +259,7 @@ function renderAlertListMarkup({ items, nextCursor, filters, source }) {
     <div class="alert-table-wrap">
       ${items.length ? `<table class="alert-table"><thead><tr><th>事件</th><th>状态</th><th>级别</th><th>资源</th><th>最近出现</th></tr></thead><tbody>${items.map((item) => `<tr><td><button type="button" class="alert-event-link" data-alert-event="${safeText(item.id)}">${displayValue(item.title ?? item.name ?? item.id)}</button></td><td><span class="alert-status-tag ${statusClass(item.state)}">${stateLabel(item.state)}</span></td><td><span class="alert-status-tag ${statusClass(item.severity)}">${formatSeverity(item.severity)}</span></td><td>${displayValue(localAlertValue(item, 'resource'))}</td><td>${displayTime(item.last_seen ?? item.lastSeen ?? item.fired_at ?? item.firedAt ?? item.updated_at ?? item.updatedAt)}</td></tr>`).join('')}</tbody></table>` : '<div class="alert-empty"><strong>暂无匹配告警</strong><p>请调整筛选条件或等待下一次规则评估。</p></div>'}
     </div>
-    <div class="alert-pager"><span>来源：${displayValue(source === 'demo' ? '演示数据' : '控制面服务')}</span><div><button type="button" data-alert-prev ${alertCursor ? '' : 'disabled'}>上一页</button><button type="button" data-alert-next="${safeText(nextCursor ?? '')}" ${nextCursor ? '' : 'disabled'}>下一页</button></div></div>`;
+    <div class="alert-pager"><span>来源：${displayValue(alertSourceLabel(source))}</span><div><button type="button" data-alert-prev ${cursor ? '' : 'disabled'}>上一页</button><button type="button" data-alert-next="${safeText(nextCursor ?? '')}" ${nextCursor ? '' : 'disabled'}>下一页</button></div></div>`;
 }
 
 function evidenceItems(event) {
@@ -536,6 +546,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
   let alertCursor = null;
   let alertCursorHistory = [];
   let endedSilenceHistory = [];
+  let currentSource = null;
 
   function isView(value) {
     return ALERT_VIEWS.some(([view]) => view === value);
@@ -554,7 +565,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
           </div>
           <div class="alert-context" aria-label="当前作用域">
             <span class="alert-scope">租户 ${safeText(currentScope.tenantId)} <i>/</i> 项目 ${safeText(currentScope.projectId)}</span>
-            <span class="alert-source-badge">当前项目</span>
+            <span class="alert-source-badge">${alertSourceLabel(currentSource)}</span>
           </div>
         </header>
         <div class="alert-workbench">
@@ -586,9 +597,14 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     bindShell();
   }
 
-  function renderFailure(label) {
-    root.innerHTML = shellMarkup(`<div class="alert-error" role="alert"><strong>暂时无法加载${safeText(label)}</strong><button type="button" data-alert-retry>重试</button></div>`);
+  function renderFailure(label, error) {
+    if (error?.kind === 'forbidden') currentSource = null;
+    root.innerHTML = shellMarkup(`<div class="alert-error" role="alert"><strong>${safeText(alertFailureMessage(error, label))}</strong><button type="button" data-alert-retry>重试</button></div>`);
     bindShell();
+  }
+
+  function rememberSource(result) {
+    currentSource = result?.source ?? currentSource;
   }
 
   function renderCurrent() {
@@ -657,6 +673,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     try {
       const overview = await api.getOverview(currentScope, signal);
       if (signal.aborted || destroyed) return;
+      rememberSource(overview);
       root.innerHTML = shellMarkup(renderOverviewMarkup(overview));
       bindShell();
       root.querySelectorAll('[data-alert-event]').forEach((row) => row.addEventListener('click', () => {
@@ -664,7 +681,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         open('alert-detail');
       }));
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('监控概览');
+      if (!signal.aborted && !destroyed) renderFailure('监控概览', error);
     }
   }
 
@@ -674,12 +691,13 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       const requestFilters = { ...alertFilters, limit: 25 };
       const result = await api.listAlerts(currentScope, requestFilters, alertCursor, signal);
       if (signal.aborted || destroyed) return;
+      rememberSource(result);
       const items = filterRenderedAlerts(result.items, alertFilters);
-      root.innerHTML = shellMarkup(renderAlertListMarkup({ items, nextCursor: result.nextCursor, filters: alertFilters, source: result.source }));
+      root.innerHTML = shellMarkup(renderAlertListMarkup({ items, nextCursor: result.nextCursor, filters: alertFilters, source: result.source, cursor: alertCursor }));
       bindShell();
       bindAlertList();
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('告警数据');
+      if (!signal.aborted && !destroyed) renderFailure('告警数据', error);
     }
   }
 
@@ -689,6 +707,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     try {
       const event = await api.getAlert(currentScope, selectedEventId, signal);
       if (signal.aborted || destroyed) return;
+      rememberSource(event);
       root.innerHTML = shellMarkup(renderAlertDetailMarkup(event, permissions.manage));
       bindShell();
       bindAlertDetail(event.id);
@@ -700,7 +719,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         onToast('对象已被删除或无权访问');
         return renderCurrent();
       }
-      renderFailure('告警详情');
+      renderFailure('告警详情', error);
     }
   }
 
@@ -712,13 +731,14 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
         api.listNotificationPolicies(currentScope, signal),
       ]);
       if (signal.aborted || destroyed) return;
+      rememberSource(ruleResult);
       const rules = listItems(ruleResult);
       const policies = listItems(policyResult).map(sanitizePolicyForDisplay);
       root.innerHTML = shellMarkup(renderRulesMarkup({ rules, policies, canManage: permissions.manage }));
       bindShell();
       bindRules(rules, policies);
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('规则');
+      if (!signal.aborted && !destroyed) renderFailure('规则', error);
     }
   }
 
@@ -729,13 +749,14 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       if (typeof api.listTemplates === 'function') work.push(api.listTemplates(currentScope, signal));
       const [policyResult, templateResult] = await Promise.all(work);
       if (signal.aborted || destroyed) return;
+      rememberSource(policyResult);
       const policies = listItems(policyResult).map(sanitizePolicyForDisplay);
       const templates = listItems(templateResult);
       root.innerHTML = shellMarkup(renderPoliciesMarkup({ policies, templates, canManage: permissions.manage }));
       bindShell();
       bindPolicies(policies, templates);
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('通知策略');
+      if (!signal.aborted && !destroyed) renderFailure('通知策略', error);
     }
   }
 
@@ -744,12 +765,13 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     try {
       const result = await api.listTemplates(currentScope, signal);
       if (signal.aborted || destroyed) return;
+      rememberSource(result);
       const templates = listItems(result);
       root.innerHTML = shellMarkup(renderTemplatesMarkup({ templates, canManage: permissions.manage }));
       bindShell();
       bindTemplates(templates);
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('通知模板');
+      if (!signal.aborted && !destroyed) renderFailure('通知模板', error);
     }
   }
 
@@ -758,6 +780,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
     try {
       const result = await api.listSilences(currentScope, signal);
       if (signal.aborted || destroyed) return;
+      rememberSource(result);
       const listedSilences = listItems(result);
       const listedIDs = new Set(listedSilences.map((silence) => String(silence.id)));
       const silences = [...listedSilences, ...endedSilenceHistory.filter((silence) => !listedIDs.has(String(silence.id)))];
@@ -765,7 +788,7 @@ export function createAlertCenter({ root, api, scope, permissions = { manage: fa
       bindShell();
       bindSilences(silences);
     } catch (error) {
-      if (!signal.aborted && !destroyed) renderFailure('静默');
+      if (!signal.aborted && !destroyed) renderFailure('静默', error);
     }
   }
 

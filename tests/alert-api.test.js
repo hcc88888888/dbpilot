@@ -38,6 +38,17 @@ test('demo adapter marks data as demo and removes unsafe delivery fields', async
   assert.equal('secret_ref' in policy, false);
 });
 
+test('demo configuration lists retain the demo source marker', async () => {
+  const api = createAlertApi();
+  const results = await Promise.all([
+    api.listRules(scope),
+    api.listNotificationPolicies(scope),
+    api.listTemplates(scope),
+    api.listSilences(scope),
+  ]);
+  assert.deepEqual(results.map((result) => result.source), ['demo', 'demo', 'demo', 'demo']);
+});
+
 test('HTTP DTO normalization recursively removes secrets and raw delivery request bodies', async () => {
   const api = createAlertApi({
     baseUrl: 'https://control.example',
