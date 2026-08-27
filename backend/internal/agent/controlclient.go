@@ -20,6 +20,8 @@ const ControlProtocolVersion = "1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
 
+const controlSendQueueCapacity = 64
+
 type ProgressReporter interface {
 	Report(*agentv1.CommandProgress) error
 }
@@ -88,6 +90,8 @@ type CommandJournal interface {
 	Start(context.Context, string, time.Time) error
 	Complete(context.Context, string, *agentv1.CommandResult, time.Time) error
 	Active(context.Context) ([]commandjournal.Entry, error)
+	PendingResults(context.Context) ([]commandjournal.Entry, error)
+	MarkReported(context.Context, string, time.Time) error
 }
 
 type ControlClientConfig struct {
@@ -119,12 +123,28 @@ type ControlClient struct {
 	reconnectBackoff  time.Duration
 	now               func() time.Time
 
-	streamMu        sync.RWMutex
-	stream          ControlStream
+	sessionMu       sync.RWMutex
+	session         *controlSession
 	sendMu          sync.Mutex
 	runningMu       sync.Mutex
 	running         map[string]context.CancelFunc
+	executorWait    sync.WaitGroup
 	messageSequence atomic.Uint64
+	executionErrors chan error
+}
+
+type controlSendRequest struct {
+	message *agentv1.AgentMessage
+	result  chan error
+}
+
+type controlSession struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stream     ControlStream
+	outgoing   chan controlSendRequest
+	sendErrors chan error
+	wait       sync.WaitGroup
 }
 
 func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
@@ -150,32 +170,59 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		heartbeatInterval: boundedDuration(config.HeartbeatInterval, 30*time.Second, 10*time.Millisecond, 5*time.Minute),
 		reconnectBackoff:  boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
 		now:               config.Now, running: make(map[string]context.CancelFunc),
+		executionErrors: make(chan error, 1),
 	}, nil
 }
 
-func (c *ControlClient) Run(ctx context.Context) error {
-	defer c.cancelAll()
+func (c *ControlClient) Run(ctx context.Context) (runErr error) {
+	defer func() {
+		c.cancelAll()
+		c.executorWait.Wait()
+		if runErr == nil {
+			select {
+			case runErr = <-c.executionErrors:
+			default:
+			}
+		}
+	}()
 	for {
+		select {
+		case executionErr := <-c.executionErrors:
+			return executionErr
+		default:
+		}
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		stream, err := c.openStream(ctx)
+		sessionContext, cancelSession := context.WithCancel(ctx)
+		stream, err := c.openStream(sessionContext)
 		if err == nil {
-			c.setStream(stream)
-			err = c.runSession(ctx, stream)
-			c.clearStream(stream)
+			err = c.runSession(sessionContext, cancelSession, stream, ctx)
+			cancelSession()
 			_ = stream.CloseSend()
+		} else {
+			cancelSession()
 		}
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !waitContext(ctx, c.reconnectBackoff) {
+		var fatal *fatalControlError
+		if errors.As(err, &fatal) {
+			return fatal.err
+		}
+		if err := c.waitForReconnect(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if ctx.Err() != nil {
 			return nil
 		}
 	}
 }
 
-func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) error {
+func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFunc, stream ControlStream, executionParent context.Context) error {
 	active, err := c.journal.Active(ctx)
 	if err != nil {
 		return fmt.Errorf("load command recovery state: %w", err)
@@ -194,6 +241,8 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 		DatabaseAdapters: append([]string(nil), c.databaseAdapters...), ActiveCommands: recovery,
 	}}}
 	if err := c.sendOnStream(stream, hello); err != nil {
+		cancel()
+		_ = stream.CloseSend()
 		return err
 	}
 
@@ -202,7 +251,10 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 		err     error
 	}
 	received := make(chan receiveResult, 1)
+	session := &controlSession{ctx: ctx, cancel: cancel, stream: stream, outgoing: make(chan controlSendRequest, controlSendQueueCapacity), sendErrors: make(chan error, 1)}
+	session.wait.Add(1)
 	go func() {
+		defer session.wait.Done()
 		for {
 			message, receiveErr := stream.Recv()
 			select {
@@ -214,6 +266,12 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 				return
 			}
 		}
+	}()
+	defer func() {
+		session.cancel()
+		_ = stream.CloseSend()
+		c.clearSession(session)
+		session.wait.Wait()
 	}()
 
 	var first receiveResult
@@ -228,6 +286,12 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
+	session.wait.Add(1)
+	go c.runSendLoop(session)
+	c.setSession(session)
+	if err := c.replayPendingResults(ctx, session); err != nil {
+		return err
+	}
 
 	heartbeats := time.NewTicker(c.heartbeatInterval)
 	defer heartbeats.Stop()
@@ -237,11 +301,15 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 			if item.err != nil {
 				return item.err
 			}
-			if err := c.handleServerMessage(ctx, item.message); err != nil {
+			if err := c.handleServerMessage(ctx, executionParent, item.message); err != nil {
 				return err
 			}
+		case sendErr := <-session.sendErrors:
+			return sendErr
+		case executionErr := <-c.executionErrors:
+			return &fatalControlError{err: executionErr}
 		case <-heartbeats.C:
-			if err := c.sendHeartbeat(stream); err != nil {
+			if err := c.sendHeartbeat(session); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -250,13 +318,42 @@ func (c *ControlClient) runSession(ctx context.Context, stream ControlStream) er
 	}
 }
 
-func (c *ControlClient) handleServerMessage(ctx context.Context, message *agentv1.ServerMessage) error {
+type fatalControlError struct{ err error }
+
+func (e *fatalControlError) Error() string { return e.err.Error() }
+func (e *fatalControlError) Unwrap() error { return e.err }
+
+func (c *ControlClient) runSendLoop(session *controlSession) {
+	defer session.wait.Done()
+	for {
+		select {
+		case request := <-session.outgoing:
+			if session.ctx.Err() != nil {
+				request.result <- ErrControlStreamDisconnected
+				return
+			}
+			err := c.sendOnStream(session.stream, request.message)
+			request.result <- err
+			if err != nil {
+				select {
+				case session.sendErrors <- err:
+				default:
+				}
+				return
+			}
+		case <-session.ctx.Done():
+			return
+		}
+	}
+}
+
+func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context, message *agentv1.ServerMessage) error {
 	if message == nil {
 		return errors.New("empty control-plane message")
 	}
 	switch typed := message.GetMessage().(type) {
 	case *agentv1.ServerMessage_Command:
-		return c.handleCommand(ctx, typed.Command)
+		return c.handleCommand(ctx, executionParent, typed.Command)
 	case *agentv1.ServerMessage_CommandCancellation:
 		if typed.CommandCancellation != nil {
 			c.cancelCommand(typed.CommandCancellation.GetCommandId())
@@ -271,7 +368,7 @@ func (c *ControlClient) handleServerMessage(ctx context.Context, message *agentv
 	return nil
 }
 
-func (c *ControlClient) handleCommand(ctx context.Context, envelope *agentv1.CommandEnvelope) error {
+func (c *ControlClient) handleCommand(ctx, executionParent context.Context, envelope *agentv1.CommandEnvelope) error {
 	if err := c.verifier.Verify(ctx, envelope); err != nil {
 		return c.sendAcknowledgement(envelopeID(envelope), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, commandRejectionReason(err))
 	}
@@ -281,6 +378,12 @@ func (c *ControlClient) handleCommand(ctx context.Context, envelope *agentv1.Com
 	}
 	accepted, err := c.journal.Accept(ctx, envelope)
 	if err != nil {
+		if errors.Is(err, commandjournal.ErrCommandIDConflict) {
+			return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, "COMMAND_ID_CONFLICT")
+		}
+		if errors.Is(err, commandjournal.ErrNonceReplay) {
+			return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, "NONCE_REPLAY")
+		}
 		return fmt.Errorf("durably accept command: %w", err)
 	}
 	if !accepted {
@@ -289,12 +392,14 @@ func (c *ControlClient) handleCommand(ctx context.Context, envelope *agentv1.Com
 	if err := c.journal.Start(ctx, envelope.GetCommandId(), c.now()); err != nil {
 		return fmt.Errorf("start accepted command: %w", err)
 	}
-	executionContext, cancel := context.WithCancel(ctx)
+	executionContext, cancel := context.WithCancel(executionParent)
 	c.runningMu.Lock()
 	c.running[envelope.GetCommandId()] = cancel
 	c.runningMu.Unlock()
 	ackErr := c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED, "")
+	c.executorWait.Add(1)
 	go func() {
+		defer c.executorWait.Done()
 		defer cancel()
 		c.execute(executionContext, envelope, executor)
 	}()
@@ -318,15 +423,45 @@ func (c *ControlClient) execute(ctx context.Context, envelope *agentv1.CommandEn
 			result.Summary = "command execution failed"
 		}
 	}
-	if err := c.journal.Complete(context.Background(), envelope.GetCommandId(), result, c.now()); err == nil {
-		_ = c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}})
+	if err := c.journal.Complete(context.Background(), envelope.GetCommandId(), result, c.now()); err != nil {
+		c.reportExecutionError(fmt.Errorf("persist terminal command result: %w", err))
+	} else if err := c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}}); err == nil {
+		if markErr := c.journal.MarkReported(context.Background(), envelope.GetCommandId(), c.now()); markErr != nil {
+			c.reportExecutionError(fmt.Errorf("mark terminal command result reported: %w", markErr))
+		}
 	}
 	c.runningMu.Lock()
 	delete(c.running, envelope.GetCommandId())
 	c.runningMu.Unlock()
 }
 
-func (c *ControlClient) sendHeartbeat(stream ControlStream) error {
+func (c *ControlClient) replayPendingResults(ctx context.Context, session *controlSession) error {
+	pending, err := c.journal.PendingResults(ctx)
+	if err != nil {
+		return &fatalControlError{err: fmt.Errorf("load pending command results: %w", err)}
+	}
+	for _, entry := range pending {
+		if entry.Result == nil {
+			continue
+		}
+		if err := c.sendThroughSession(session, &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: entry.Result}}); err != nil {
+			return err
+		}
+		if err := c.journal.MarkReported(ctx, entry.CommandID, c.now()); err != nil {
+			return &fatalControlError{err: fmt.Errorf("mark replayed command result reported: %w", err)}
+		}
+	}
+	return nil
+}
+
+func (c *ControlClient) reportExecutionError(err error) {
+	select {
+	case c.executionErrors <- err:
+	default:
+	}
+}
+
+func (c *ControlClient) sendHeartbeat(session *controlSession) error {
 	c.runningMu.Lock()
 	active := make([]string, 0, len(c.running))
 	for commandID := range c.running {
@@ -335,7 +470,7 @@ func (c *ControlClient) sendHeartbeat(stream ControlStream) error {
 	c.runningMu.Unlock()
 	sort.Strings(active)
 	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: c.agentID, RunningCommands: uint32(len(active)), ActiveCommandIds: active}}}
-	return c.sendOnStream(stream, message)
+	return c.sendThroughSession(session, message)
 }
 
 func (c *ControlClient) sendAcknowledgement(commandID string, state agentv1.CommandAcknowledgementState, reason string) error {
@@ -381,28 +516,45 @@ func (c *ControlClient) cancelAll() {
 	}
 }
 
-func (c *ControlClient) setStream(stream ControlStream) {
-	c.streamMu.Lock()
-	c.stream = stream
-	c.streamMu.Unlock()
+func (c *ControlClient) setSession(session *controlSession) {
+	c.sessionMu.Lock()
+	c.session = session
+	c.sessionMu.Unlock()
 }
 
-func (c *ControlClient) clearStream(expected ControlStream) {
-	c.streamMu.Lock()
-	if c.stream == expected {
-		c.stream = nil
+func (c *ControlClient) clearSession(expected *controlSession) {
+	c.sessionMu.Lock()
+	if c.session == expected {
+		c.session = nil
 	}
-	c.streamMu.Unlock()
+	c.sessionMu.Unlock()
 }
 
 func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {
-	c.streamMu.RLock()
-	stream := c.stream
-	c.streamMu.RUnlock()
-	if stream == nil {
+	c.sessionMu.RLock()
+	defer c.sessionMu.RUnlock()
+	if c.session == nil {
 		return ErrControlStreamDisconnected
 	}
-	return c.sendOnStream(stream, message)
+	return c.sendThroughSession(c.session, message)
+}
+
+func (c *ControlClient) sendThroughSession(session *controlSession, message *agentv1.AgentMessage) error {
+	if session.ctx.Err() != nil {
+		return ErrControlStreamDisconnected
+	}
+	request := controlSendRequest{message: message, result: make(chan error, 1)}
+	select {
+	case session.outgoing <- request:
+	case <-session.ctx.Done():
+		return ErrControlStreamDisconnected
+	}
+	select {
+	case err := <-request.result:
+		return err
+	case <-session.ctx.Done():
+		return ErrControlStreamDisconnected
+	}
 }
 
 func (c *ControlClient) sendOnStream(stream ControlStream, message *agentv1.AgentMessage) error {
@@ -450,13 +602,15 @@ func boundedDuration(value, fallback, minimum, maximum time.Duration) time.Durat
 	return value
 }
 
-func waitContext(ctx context.Context, duration time.Duration) bool {
-	timer := time.NewTimer(duration)
+func (c *ControlClient) waitForReconnect(ctx context.Context) error {
+	timer := time.NewTimer(c.reconnectBackoff)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
-		return true
+		return nil
+	case executionErr := <-c.executionErrors:
+		return executionErr
 	case <-ctx.Done():
-		return false
+		return ctx.Err()
 	}
 }

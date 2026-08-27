@@ -111,29 +111,33 @@ type Config struct {
 	PrincipalResolver controlplane.PrincipalResolver             `yaml:"-"`
 	SecretResolver    alert.SecretResolver                       `yaml:"-"`
 	Channels          []alert.DeliveryChannel                    `yaml:"-"`
+	AgentRegistry     *agentcontrol.Registry                     `yaml:"-"`
+	CommandObserver   agentcontrol.Observer                      `yaml:"-"`
 }
 
 type Server struct {
-	config        Config
-	database      *sql.DB
-	ownsDatabase  bool
-	repository    *alert.PostgresRepository
-	evaluator     *alert.Evaluator
-	dispatcher    *alert.Dispatcher
-	httpServer    *http.Server
-	grpcServer    *grpc.Server
-	httpTLS       *tls.Config
-	grpcTLS       *tls.Config
-	ping          func(context.Context) error
-	migrate       func(context.Context) error
-	listen        func(string, string) (net.Listener, error)
-	scopes        []alert.Scope
-	ready         *atomic.Bool
-	evaluateScope func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents    func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch      func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue      func(context.Context, time.Time) error
-	workers       sync.WaitGroup
+	config          Config
+	database        *sql.DB
+	ownsDatabase    bool
+	repository      *alert.PostgresRepository
+	evaluator       *alert.Evaluator
+	dispatcher      *alert.Dispatcher
+	httpServer      *http.Server
+	grpcServer      *grpc.Server
+	httpTLS         *tls.Config
+	grpcTLS         *tls.Config
+	ping            func(context.Context) error
+	migrate         func(context.Context) error
+	listen          func(string, string) (net.Listener, error)
+	scopes          []alert.Scope
+	ready           *atomic.Bool
+	evaluateScope   func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents      func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch        func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue        func(context.Context, time.Time) error
+	agentRegistry   *agentcontrol.Registry
+	commandObserver agentcontrol.Observer
+	workers         sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -283,8 +287,16 @@ func NewServer(config Config) (*Server, error) {
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentcontrol.NewRegistry(64), nil))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue}, nil
+	agentRegistry := config.AgentRegistry
+	if agentRegistry == nil {
+		agentRegistry = agentcontrol.NewRegistry(64)
+	}
+	commandObserver := config.CommandObserver
+	if commandObserver == nil {
+		commandObserver = agentcontrol.NoopObserver{}
+	}
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver))
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver}, nil
 }
 
 func validateConfig(config Config) error {

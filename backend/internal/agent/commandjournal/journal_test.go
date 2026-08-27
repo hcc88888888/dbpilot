@@ -43,6 +43,61 @@ func TestJournalAcceptDeduplicatesCommandIDDurably(t *testing.T) {
 	require.Equal(t, sha256.Sum256(deterministic), entry.EnvelopeDigest)
 }
 
+func TestJournalRejectsCommandIDCollisionWithDifferentEnvelopeDigest(t *testing.T) {
+	journal, err := Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	expiresAt := time.Now().Add(time.Hour)
+	original := journalEnvelope("command-a", expiresAt)
+	accepted, err := journal.Accept(context.Background(), original)
+	require.NoError(t, err)
+	require.True(t, accepted)
+
+	collision := proto.Clone(original).(*agentv1.CommandEnvelope)
+	collision.JobId = "different-job"
+	accepted, err = journal.Accept(context.Background(), collision)
+	require.False(t, accepted)
+	require.ErrorIs(t, err, ErrCommandIDConflict)
+	accepted, err = journal.Accept(context.Background(), original)
+	require.NoError(t, err)
+	require.False(t, accepted, "exact envelope replay remains a duplicate")
+}
+
+func TestJournalPersistsNonceReservationAcrossRestartAndReclaimsExpiry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "commands.db")
+	now := time.Unix(1_725_000_000, 0).UTC()
+	journal, err := Open(path)
+	require.NoError(t, err)
+	journal.now = func() time.Time { return now }
+	first := journalEnvelope("command-a", now.Add(time.Hour))
+	first.Nonce = []byte("shared-nonce")
+	accepted, err := journal.Accept(context.Background(), first)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	require.NoError(t, journal.Close())
+
+	reopened, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	reopened.now = func() time.Time { return now }
+	exactReplay := proto.Clone(first).(*agentv1.CommandEnvelope)
+	accepted, err = reopened.Accept(context.Background(), exactReplay)
+	require.NoError(t, err)
+	require.False(t, accepted)
+	reusedNonce := journalEnvelope("command-b", now.Add(time.Hour))
+	reusedNonce.Nonce = []byte("shared-nonce")
+	accepted, err = reopened.Accept(context.Background(), reusedNonce)
+	require.False(t, accepted)
+	require.ErrorIs(t, err, ErrNonceReplay)
+
+	reopened.now = func() time.Time { return now.Add(2 * time.Hour) }
+	afterExpiry := journalEnvelope("command-c", now.Add(3*time.Hour))
+	afterExpiry.Nonce = []byte("shared-nonce")
+	accepted, err = reopened.Accept(context.Background(), afterExpiry)
+	require.NoError(t, err)
+	require.True(t, accepted, "expired nonce reservation may be reclaimed")
+}
+
 func TestJournalActiveReturnsOnlyAcceptedAndRunningCommands(t *testing.T) {
 	journal, err := Open(filepath.Join(t.TempDir(), "commands.db"))
 	require.NoError(t, err)
@@ -88,6 +143,40 @@ func TestJournalCompletedResultSurvivesCloseAndReopen(t *testing.T) {
 	require.Equal(t, now.Add(time.Minute), entry.StartedAt)
 	require.Equal(t, now.Add(2*time.Minute), entry.CompletedAt)
 	require.True(t, proto.Equal(wantResult, entry.Result))
+}
+
+func TestJournalCompletedResultRemainsPendingUntilDurablyMarkedReported(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "commands.db")
+	now := time.Unix(1_725_000_000, 0).UTC()
+	journal, err := Open(path)
+	require.NoError(t, err)
+	accepted, err := journal.Accept(context.Background(), journalEnvelope("command-a", now.Add(time.Hour)))
+	require.NoError(t, err)
+	require.True(t, accepted)
+	require.NoError(t, journal.Start(context.Background(), "command-a", now.Add(time.Minute)))
+	result := &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "done"}
+	require.NoError(t, journal.Complete(context.Background(), "command-a", result, now.Add(2*time.Minute)))
+	pending, err := journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.True(t, proto.Equal(result, pending[0].Result))
+	require.True(t, pending[0].ReportedAt.IsZero())
+	require.NoError(t, journal.Close())
+
+	reopened, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	pending, err = reopened.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "completed but unreported result must survive restart")
+	reportedAt := now.Add(3 * time.Minute)
+	require.NoError(t, reopened.MarkReported(context.Background(), "command-a", reportedAt))
+	pending, err = reopened.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, pending)
+	entry, err := reopened.Get(context.Background(), "command-a")
+	require.NoError(t, err)
+	require.Equal(t, reportedAt, entry.ReportedAt)
 }
 
 func TestJournalRejectsStartingExpiredCommand(t *testing.T) {

@@ -24,6 +24,8 @@ var (
 	ErrCommandNotFound   = errors.New("command journal entry was not found")
 	ErrCommandExpired    = errors.New("command has expired")
 	ErrInvalidTransition = errors.New("invalid command journal state transition")
+	ErrCommandIDConflict = errors.New("command ID is already bound to a different envelope")
+	ErrNonceReplay       = errors.New("command nonce is already reserved by a different envelope")
 )
 
 type State string
@@ -43,6 +45,7 @@ type Entry struct {
 	AcceptedAt     time.Time
 	StartedAt      time.Time
 	CompletedAt    time.Time
+	ReportedAt     time.Time
 	Result         *agentv1.CommandResult
 }
 
@@ -52,6 +55,8 @@ type Journal interface {
 	Start(context.Context, string, time.Time) error
 	Complete(context.Context, string, *agentv1.CommandResult, time.Time) error
 	Active(context.Context) ([]Entry, error)
+	PendingResults(context.Context) ([]Entry, error)
+	MarkReported(context.Context, string, time.Time) error
 }
 
 type storedEntry struct {
@@ -62,7 +67,14 @@ type storedEntry struct {
 	AcceptedAtUnixNano  int64  `json:"accepted_at_unix_nano"`
 	StartedAtUnixNano   int64  `json:"started_at_unix_nano,omitempty"`
 	CompletedAtUnixNano int64  `json:"completed_at_unix_nano,omitempty"`
+	ReportedAtUnixNano  int64  `json:"reported_at_unix_nano,omitempty"`
 	Result              []byte `json:"result,omitempty"`
+}
+
+type nonceReservation struct {
+	CommandID         string `json:"command_id"`
+	EnvelopeDigestHex string `json:"envelope_digest"`
+	ExpiresAtUnixNano int64  `json:"expires_at_unix_nano"`
 }
 
 type BoltJournal struct {
@@ -102,7 +114,7 @@ func (j *BoltJournal) Accept(ctx context.Context, envelope *agentv1.CommandEnvel
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if envelope == nil || strings.TrimSpace(envelope.GetCommandId()) == "" || envelope.GetCommand() == nil || envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() {
+	if envelope == nil || strings.TrimSpace(envelope.GetCommandId()) == "" || envelope.GetCommand() == nil || len(envelope.GetNonce()) == 0 || envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() {
 		return false, ErrInvalidEnvelope
 	}
 	encodedEnvelope, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
@@ -119,16 +131,46 @@ func (j *BoltJournal) Accept(ctx context.Context, envelope *agentv1.CommandEnvel
 		return false, fmt.Errorf("marshal command journal entry: %w", err)
 	}
 	inserted := false
+	reservation := nonceReservation{CommandID: envelope.GetCommandId(), EnvelopeDigestHex: entry.EnvelopeDigestHex, ExpiresAtUnixNano: entry.ExpiresAtUnixNano}
+	encodedReservation, err := json.Marshal(reservation)
+	if err != nil {
+		return false, fmt.Errorf("marshal command nonce reservation: %w", err)
+	}
+	nonceDigest := sha256.Sum256(envelope.GetNonce())
+	nonceKey := append([]byte("nonce:"), []byte(hex.EncodeToString(nonceDigest[:]))...)
+	now := j.now().UTC()
 	err = j.database.Update(func(transaction *bbolt.Tx) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		bucket := transaction.Bucket(commandsBucket)
 		key := []byte(envelope.GetCommandId())
-		if bucket.Get(key) != nil {
-			return nil
+		if existing := bucket.Get(key); existing != nil {
+			stored, err := decodeStoredEntry(existing)
+			if err != nil {
+				return err
+			}
+			if stored.EnvelopeDigestHex == entry.EnvelopeDigestHex {
+				return nil
+			}
+			return ErrCommandIDConflict
+		}
+		meta := transaction.Bucket(metaBucket)
+		if encoded := meta.Get(nonceKey); encoded != nil {
+			var existing nonceReservation
+			if err := json.Unmarshal(encoded, &existing); err != nil {
+				return fmt.Errorf("decode command nonce reservation: %w", err)
+			}
+			if time.Unix(0, existing.ExpiresAtUnixNano).After(now) {
+				if existing.CommandID != reservation.CommandID || existing.EnvelopeDigestHex != reservation.EnvelopeDigestHex {
+					return ErrNonceReplay
+				}
+			}
 		}
 		if err := bucket.Put(key, encodedEntry); err != nil {
+			return err
+		}
+		if err := meta.Put(nonceKey, encodedReservation); err != nil {
 			return err
 		}
 		inserted = true
@@ -248,6 +290,49 @@ func (j *BoltJournal) Active(ctx context.Context) ([]Entry, error) {
 	return entries, nil
 }
 
+func (j *BoltJournal) PendingResults(ctx context.Context) ([]Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entries := make([]Entry, 0)
+	err := j.database.View(func(transaction *bbolt.Tx) error {
+		return transaction.Bucket(commandsBucket).ForEach(func(_, encoded []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			stored, err := decodeStoredEntry(encoded)
+			if err != nil {
+				return err
+			}
+			if stored.State != StateCompleted || stored.ReportedAtUnixNano != 0 || len(stored.Result) == 0 {
+				return nil
+			}
+			entry, err := publicEntry(stored)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, entry)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pending command results: %w", err)
+	}
+	return entries, nil
+}
+
+func (j *BoltJournal) MarkReported(ctx context.Context, commandID string, at time.Time) error {
+	return j.transition(ctx, commandID, func(entry *storedEntry) error {
+		if entry.State != StateCompleted || len(entry.Result) == 0 {
+			return fmt.Errorf("%w: %s to reported", ErrInvalidTransition, entry.State)
+		}
+		if entry.ReportedAtUnixNano == 0 {
+			entry.ReportedAtUnixNano = at.UTC().UnixNano()
+		}
+		return nil
+	})
+}
+
 func (j *BoltJournal) Get(ctx context.Context, commandID string) (Entry, error) {
 	if err := ctx.Err(); err != nil {
 		return Entry{}, err
@@ -288,7 +373,7 @@ func publicEntry(stored storedEntry) (Entry, error) {
 	}
 	entry := Entry{
 		CommandID: stored.CommandID, State: stored.State, ExpiresAt: time.Unix(0, stored.ExpiresAtUnixNano).UTC(),
-		AcceptedAt: time.Unix(0, stored.AcceptedAtUnixNano).UTC(), StartedAt: unixNanoTime(stored.StartedAtUnixNano), CompletedAt: unixNanoTime(stored.CompletedAtUnixNano),
+		AcceptedAt: time.Unix(0, stored.AcceptedAtUnixNano).UTC(), StartedAt: unixNanoTime(stored.StartedAtUnixNano), CompletedAt: unixNanoTime(stored.CompletedAtUnixNano), ReportedAt: unixNanoTime(stored.ReportedAtUnixNano),
 	}
 	copy(entry.EnvelopeDigest[:], digestBytes)
 	if len(stored.Result) > 0 {

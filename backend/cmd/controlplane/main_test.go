@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
 	"github.com/stretchr/testify/require"
 )
@@ -114,6 +116,21 @@ func TestNewServerRegistersAgentControlBesideTelemetryIngest(t *testing.T) {
 	services := server.grpcServer.GetServiceInfo()
 	require.Contains(t, services, "dbpilot.agent.v1.TelemetryIngest")
 	require.Contains(t, services, "dbpilot.agent.v1.AgentControl")
+}
+
+func TestNewServerRetainsInjectedAgentControlDependencies(t *testing.T) {
+	registry := agentcontrol.NewRegistry(7)
+	observer := &testCommandObserver{}
+	config := validServerConfig()
+	config.AgentRegistry = registry
+	config.CommandObserver = observer
+
+	server, err := NewServer(config)
+
+	require.NoError(t, err)
+	require.Same(t, registry, server.agentRegistry)
+	require.Same(t, observer, server.commandObserver)
+	require.Contains(t, server.grpcServer.GetServiceInfo(), "dbpilot.agent.v1.AgentControl")
 }
 
 func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {
@@ -332,6 +349,14 @@ type trustedTestPrincipalResolver struct{}
 func (trustedTestPrincipalResolver) ResolvePrincipal(*http.Request) (alert.Principal, error) {
 	return alert.Principal{Subject: "trusted-test", PlatformAdmin: true}, nil
 }
+
+type testCommandObserver struct{}
+
+func (*testCommandObserver) Connected(context.Context, agentcontrol.SessionInfo)                   {}
+func (*testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
+func (*testCommandObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
+func (*testCommandObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
+func (*testCommandObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
 
 type blockingListener struct {
 	closed chan struct{}

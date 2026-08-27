@@ -24,13 +24,14 @@ type Observer interface {
 	Result(context.Context, string, *agentv1.CommandResult)
 }
 
-type noopObserver struct{}
+// NoopObserver is the safe pre-integration default for command business events.
+type NoopObserver struct{}
 
-func (noopObserver) Connected(context.Context, SessionInfo)                                {}
-func (noopObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
-func (noopObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
-func (noopObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
-func (noopObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
+func (NoopObserver) Connected(context.Context, SessionInfo)                                {}
+func (NoopObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
+func (NoopObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
+func (NoopObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
+func (NoopObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
 
 type Server struct {
 	agentv1.UnimplementedAgentControlServer
@@ -44,7 +45,7 @@ func NewServer(registry *Registry, observer Observer) *Server {
 		registry = NewRegistry(64)
 	}
 	if observer == nil {
-		observer = noopObserver{}
+		observer = NoopObserver{}
 	}
 	return &Server{registry: registry, observer: observer, now: time.Now}
 }
