@@ -13,8 +13,8 @@ import {
   sqlReviewFailureMessage,
   sqlReviewSourceLabel,
   validateReviewSubmission,
-} from '../sql-review.js';
-import { createSqlReviewApi } from '../sql-review-api.js';
+} from '../modules/sql-review/sql-review.js';
+import { createSqlReviewApi } from '../modules/sql-review/sql-review-api.js';
 
 const RULES = [
   { id: 'R-001', name: '禁止 SELECT *', category: '查询规范', severity: 'warning', description: '', enabled: true },

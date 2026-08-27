@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createReportsApi } from '../reports-api.js';
+import { createReportsApi } from '../modules/reports/reports-api.js';
 import {
   buildReportFilters,
   createReportsCenter,
@@ -13,7 +13,7 @@ import {
   safeText,
   validateEmailList,
   validateReportTemplate,
-} from '../reports.js';
+} from '../modules/reports/reports.js';
 
 test('report type and status labels render Chinese with unknown fallbacks', () => {
   assert.equal(reportTypeLabel('inspection'), '巡检');

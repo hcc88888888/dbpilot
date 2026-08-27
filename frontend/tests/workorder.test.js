@@ -11,8 +11,8 @@ import {
   validateTicket,
   workOrderFailureMessage,
   workOrderSourceLabel,
-} from '../workorder.js';
-import { createWorkOrderApi } from '../workorder-api.js';
+} from '../modules/workorder/workorder.js';
+import { createWorkOrderApi } from '../modules/workorder/workorder-api.js';
 
 test('validateTicket rejects empty title, empty SQL, and credential-bearing SQL', () => {
   const empty = validateTicket({ title: '', sql: '', reason: '' });

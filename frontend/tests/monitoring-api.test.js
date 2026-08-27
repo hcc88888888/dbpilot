@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMonitoringApi } from '../monitoring-api.js';
+import { createMonitoringApi } from '../modules/monitoring/monitoring-api.js';
 
 const scope = { tenantId: 'tenant-a', projectId: 'project-a' };
 

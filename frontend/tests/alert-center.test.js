@@ -23,7 +23,7 @@ import {
   renderTemplatePreview,
   renderAlertListMarkup,
   sanitizePolicyForDisplay,
-} from '../alert-center.js';
+} from '../modules/alerts/alert-center.js';
 
 test('production bootstrap requires a validated authenticated context and never guesses manage permission', () => {
   assert.deepEqual(resolveAlertContext('', undefined), {
@@ -59,7 +59,7 @@ test('production bootstrap requires a validated authenticated context and never 
 
 test('dashboard bootstrap uses the validated alert context contract', async () => {
   const app = await (await import('node:fs/promises')).readFile(new URL('../app.js', import.meta.url), 'utf8');
-  const docs = await (await import('node:fs/promises')).readFile(new URL('../docs/alert-center-integration.md', import.meta.url), 'utf8');
+  const docs = await (await import('node:fs/promises')).readFile(new URL('../../docs/alert-center-integration.md', import.meta.url), 'utf8');
   assert.match(app, /resolveAlertContext/);
   assert.match(app, /available:alertContext\.available/);
   assert.doesNotMatch(app, /scope:\{tenantId:'demo',projectId:'production'\},permissions:\{manage:true\}/);

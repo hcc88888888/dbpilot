@@ -1,14 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createAlertApi } from '../alert-api.js';
+import { createAlertApi } from '../modules/alerts/alert-api.js';
 
 const scope = { tenantId: 't1', projectId: 'p1' };
 
 test('the HTML loads the adapter as a module before the dashboard script', async () => {
-  const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
-  const adapter = html.indexOf('<script type="module" src="alert-api.js"></script>');
-  const dashboard = html.indexOf('<script src="app.js"></script>');
+  const html = await readFile(new URL('../../index.html', import.meta.url), 'utf8');
+  const adapter = html.indexOf('<script type="module" src="frontend/modules/alerts/alert-api.js"></script>');
+  const dashboard = html.indexOf('<script src="frontend/app.js"></script>');
   assert.ok(adapter >= 0);
   assert.ok(adapter < dashboard);
 });

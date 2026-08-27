@@ -11,8 +11,8 @@ import {
   schemaDiffFailureMessage,
   schemaDiffSourceLabel,
   validateDiffRequest,
-} from '../schema-diff.js';
-import { createSchemaDiffApi } from '../schema-diff-api.js';
+} from '../modules/schema-diff/schema-diff.js';
+import { createSchemaDiffApi } from '../modules/schema-diff/schema-diff-api.js';
 
 test('diff, object status, and object type labels map to fixed Chinese text', () => {
   assert.deepEqual(['completed', 'running'].map(diffStatusLabel), ['已完成', '对比中']);

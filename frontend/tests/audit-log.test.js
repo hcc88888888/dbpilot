@@ -12,8 +12,8 @@ import {
   renderAuditOverviewMarkup,
   safeText,
   validateAuditRange,
-} from '../audit-log.js';
-import { createAuditApi } from '../audit-log-api.js';
+} from '../modules/audit-log/audit-log.js';
+import { createAuditApi } from '../modules/audit-log/audit-log-api.js';
 
 test('audit action and result labels map to Chinese with unknown fallbacks', () => {
   assert.equal(auditActionLabel('login'), '登录');

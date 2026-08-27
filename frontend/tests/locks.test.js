@@ -11,8 +11,8 @@ import {
   locksSourceLabel,
   renderLockDetailMarkup,
   renderLockListMarkup,
-} from '../locks.js';
-import { createLocksApi, redactLocksDTO } from '../locks-api.js';
+} from '../modules/locks/locks.js';
+import { createLocksApi, redactLocksDTO } from '../modules/locks/locks-api.js';
 
 test('lock type / status / mode labels map to fixed Chinese text with safe fallbacks', () => {
   assert.deepEqual(

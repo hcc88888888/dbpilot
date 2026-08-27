@@ -13,8 +13,8 @@ import {
   sqlFailureMessage,
   sqlSourceLabel,
   validateSql,
-} from '../sql-window.js';
-import { createSqlWindowApi } from '../sql-window-api.js';
+} from '../modules/sql-window/sql-window.js';
+import { createSqlWindowApi } from '../modules/sql-window/sql-window-api.js';
 
 const scope = { tenantId: 'tenant-a', projectId: 'project-a' };
 

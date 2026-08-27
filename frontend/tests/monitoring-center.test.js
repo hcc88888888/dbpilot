@@ -9,7 +9,7 @@ import {
   renderMonitoringOverview,
   safeMetricValue,
   validateRange,
-} from '../monitoring-center.js';
+} from '../modules/monitoring/monitoring-center.js';
 
 test('range validation rejects invalid ordering, ranges over seven days, and unsafe steps', () => {
   assert.equal(validateRange('2026-08-27T10:00:00Z', '2026-08-27T09:00:00Z', '5m').kind, 'invalid-range');

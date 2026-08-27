@@ -12,8 +12,8 @@ import {
   slowSqlStateLabel,
   suggestionKindLabel,
   validateThreshold,
-} from '../slow-sql.js';
-import { createSlowSqlApi, redactSlowSqlDTO } from '../slow-sql-api.js';
+} from '../modules/slow-sql/slow-sql.js';
+import { createSlowSqlApi, redactSlowSqlDTO } from '../modules/slow-sql/slow-sql-api.js';
 
 test('formatDuration / formatMilliseconds format ms values with safe fallback', () => {
   assert.equal(formatMilliseconds(850), '850ms');
