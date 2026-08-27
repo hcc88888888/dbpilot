@@ -40,11 +40,59 @@ type BatchDeduplicator interface {
 	Remember(agentID, batchID string, ack *telemetryv1.BatchAck)
 }
 
+// DurableBatchDeduplicator atomically accepts an opaque batch identity in
+// shared storage. It is used by production log ingestion; failures prevent an
+// acknowledgement. Metric ingestion uses AtomicMetricBatchConsumer instead so
+// its payload write shares the reservation transaction.
+type DurableBatchDeduplicator interface {
+	AcceptBatchOnce(context.Context, string, string) (bool, error)
+}
+
+// MetricBatchConsumer receives a verified, checksum-valid, newly accepted
+// metric batch. It is optional so the local telemetry test gateway remains a
+// payload-opaque contract server.
+type MetricBatchConsumer interface {
+	ConsumeMetricBatch(context.Context, string, []byte, time.Time) error
+}
+
+// AtomicMetricBatchConsumer durably reserves a batch identity and commits its
+// metric samples in one storage transaction. The boolean reports whether this
+// call committed the batch; false means a prior call already committed it.
+type AtomicMetricBatchConsumer interface {
+	ConsumeMetricBatchOnce(context.Context, string, string, []byte, time.Time) (bool, error)
+}
+
+// PolicyStatusMetadata is the authenticated, body-free status receipt exposed
+// to server observability after a policy-status RPC has passed authorization.
+type PolicyStatusMetadata struct {
+	AgentID    string
+	Version    int64
+	State      string
+	ErrorCode  string
+	ReportedAt time.Time
+}
+
+// PolicyStatusObserver observes only authenticated policy-status reports.
+// Implementations must not retain TLS material or request bodies.
+type PolicyStatusObserver interface {
+	ObservePolicyStatus(PolicyStatusMetadata)
+}
+
+// PolicyStatusObserverFunc adapts a function to PolicyStatusObserver.
+type PolicyStatusObserverFunc func(PolicyStatusMetadata)
+
+func (observer PolicyStatusObserverFunc) ObservePolicyStatus(value PolicyStatusMetadata) {
+	observer(value)
+}
+
 // Service validates and acknowledges DBPilot telemetry batches.
 type Service struct {
 	telemetryv1.UnimplementedTelemetryIngestServer
 	identities AgentIdentityResolver
 	dedup      BatchDeduplicator
+	durable    DurableBatchDeduplicator
+	metrics    MetricBatchConsumer
+	statuses   PolicyStatusObserver
 	dedupMu    sync.Mutex
 	receivedMu sync.Mutex
 	received   []BatchMetadata
@@ -60,35 +108,57 @@ type BatchMetadata struct {
 	ReceivedAt   time.Time
 }
 
-func NewService(identities AgentIdentityResolver, dedup BatchDeduplicator) *Service {
-	return &Service{identities: identities, dedup: dedup}
+func NewService(identities AgentIdentityResolver, dedup BatchDeduplicator, metrics ...MetricBatchConsumer) *Service {
+	service := &Service{identities: identities, dedup: dedup}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
+}
+
+func NewDurableService(identities AgentIdentityResolver, dedup DurableBatchDeduplicator, metrics ...MetricBatchConsumer) *Service {
+	service := &Service{identities: identities, durable: dedup}
+	if len(metrics) > 0 {
+		service.metrics = metrics[0]
+	}
+	return service
+}
+
+// SetPolicyStatusObserver configures a synchronous server-side observation
+// boundary. Configure it before registering the service with a gRPC server.
+func (s *Service) SetPolicyStatusObserver(observer PolicyStatusObserver) {
+	s.statuses = observer
 }
 
 func (s *Service) PushLogBatch(ctx context.Context, batch *telemetryv1.LogBatch) (*telemetryv1.BatchAck, error) {
 	if batch == nil {
 		return nil, status.Error(codes.InvalidArgument, "log batch is required")
 	}
-	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum)
+	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum, nil)
 }
 
 func (s *Service) PushMetricBatch(ctx context.Context, batch *telemetryv1.MetricBatch) (*telemetryv1.BatchAck, error) {
 	if batch == nil {
 		return nil, status.Error(codes.InvalidArgument, "metric batch is required")
 	}
-	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum)
+	return s.accept(ctx, batch.BatchId, batch.AgentId, batch.SourceId, batch.Payload, batch.Checksum, s.metrics)
 }
 
 func (s *Service) ReportPolicyStatus(ctx context.Context, report *telemetryv1.PolicyStatus) (*telemetryv1.PolicyStatusAck, error) {
 	if report == nil {
 		return nil, status.Error(codes.InvalidArgument, "policy status is required")
 	}
-	if _, err := s.authorize(ctx, report.AgentId); err != nil {
+	authenticatedAgentID, err := s.authorize(ctx, report.AgentId)
+	if err != nil {
 		return nil, err
+	}
+	if s.statuses != nil {
+		s.statuses.ObservePolicyStatus(PolicyStatusMetadata{AgentID: authenticatedAgentID, Version: report.Version, State: report.State, ErrorCode: report.ErrorCode, ReportedAt: time.Unix(report.ReportedAtUnix, 0).UTC()})
 	}
 	return &telemetryv1.PolicyStatusAck{Accepted: true}, nil
 }
 
-func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID string, payload, checksum []byte) (*telemetryv1.BatchAck, error) {
+func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID string, payload, checksum []byte, metricConsumer MetricBatchConsumer) (*telemetryv1.BatchAck, error) {
 	authenticatedAgentID, err := s.authorize(ctx, claimedAgentID)
 	if err != nil {
 		return nil, err
@@ -103,21 +173,86 @@ func (s *Service) accept(ctx context.Context, batchID, claimedAgentID, sourceID 
 	if len(checksum) != len(expected) || subtle.ConstantTimeCompare(expected[:], checksum) != 1 {
 		return nil, status.Error(codes.InvalidArgument, "batch checksum is invalid")
 	}
+	if atomicConsumer, ok := metricConsumer.(AtomicMetricBatchConsumer); ok {
+		first, err := atomicConsumer.ConsumeMetricBatchOnce(ctx, authenticatedAgentID, batchID, payload, time.Now().UTC())
+		if err != nil {
+			return nil, metricConsumerFailure(err)
+		}
+		ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
+		if first {
+			s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
+		}
+		return ack, nil
+	}
+	if s.durable != nil && metricConsumer == nil {
+		first, err := s.durable.AcceptBatchOnce(ctx, authenticatedAgentID, batchID)
+		if err != nil {
+			return nil, sanitizedMetricConsumerError(codes.Unavailable, "batch processing is temporarily unavailable", err)
+		}
+		ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
+		if first {
+			s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
+		}
+		return ack, nil
+	}
 	if s.dedup == nil {
-		return nil, status.Error(codes.Internal, "batch deduplicator is unavailable")
+		return nil, status.Error(codes.Unavailable, "batch deduplicator is temporarily unavailable")
 	}
 	s.dedupMu.Lock()
 	defer s.dedupMu.Unlock()
 	if ack, ok := s.dedup.Lookup(authenticatedAgentID, batchID); ok {
 		return ack, nil
 	}
+	if metricConsumer != nil {
+		if err := metricConsumer.ConsumeMetricBatch(ctx, authenticatedAgentID, payload, time.Now().UTC()); err != nil {
+			return nil, metricConsumerFailure(err)
+		}
+	}
 	ack := &telemetryv1.BatchAck{BatchId: batchID, Accepted: true}
 	s.dedup.Remember(authenticatedAgentID, batchID, ack)
-	s.receivedMu.Lock()
-	s.received = append(s.received, BatchMetadata{BatchID: batchID, AgentID: authenticatedAgentID, SourceID: sourceID, PayloadBytes: len(payload), ReceivedAt: time.Now().UTC()})
-	s.receivedMu.Unlock()
+	s.recordReceipt(batchID, authenticatedAgentID, sourceID, len(payload))
 	return ack, nil
 }
+
+func (s *Service) recordReceipt(batchID, agentID, sourceID string, payloadBytes int) {
+	s.receivedMu.Lock()
+	defer s.receivedMu.Unlock()
+	s.received = append(s.received, BatchMetadata{BatchID: batchID, AgentID: agentID, SourceID: sourceID, PayloadBytes: payloadBytes, ReceivedAt: time.Now().UTC()})
+}
+
+type metricBatchValidationFailure interface {
+	error
+	IsMetricBatchValidation() bool
+}
+
+func metricConsumerFailure(err error) error {
+	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
+		return sanitizedMetricConsumerError(codes.Canceled, "metric batch processing canceled", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.DeadlineExceeded {
+		return sanitizedMetricConsumerError(codes.DeadlineExceeded, "metric batch processing deadline exceeded", err)
+	}
+	var validation metricBatchValidationFailure
+	if errors.As(err, &validation) && validation.IsMetricBatchValidation() {
+		return sanitizedMetricConsumerError(codes.InvalidArgument, "metric batch is invalid", err)
+	}
+	return sanitizedMetricConsumerError(codes.Unavailable, "metric batch processing is temporarily unavailable", err)
+}
+
+// metricConsumerStatusError keeps the original cause available to local
+// observability while GRPCStatus exposes only a stable, non-sensitive message.
+type metricConsumerStatusError struct {
+	status *status.Status
+	cause  error
+}
+
+func sanitizedMetricConsumerError(code codes.Code, message string, cause error) error {
+	return &metricConsumerStatusError{status: status.New(code, message), cause: cause}
+}
+
+func (e *metricConsumerStatusError) Error() string              { return e.status.Err().Error() }
+func (e *metricConsumerStatusError) Unwrap() error              { return e.cause }
+func (e *metricConsumerStatusError) GRPCStatus() *status.Status { return e.status }
 
 func (s *Service) authorize(ctx context.Context, claimedAgentID string) (string, error) {
 	authenticatedAgentID, err := verifiedSPIFFEAgent(ctx)

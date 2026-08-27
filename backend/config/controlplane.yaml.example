@@ -1,0 +1,56 @@
+# DBPilot alert control plane. Operator identity is derived from a verified
+# client certificate URI and its static assignment below.
+database_url: "postgres://dbpilot:replace-me@postgres/dbpilot?sslmode=verify-full"
+
+http:
+  address: "0.0.0.0:8443"
+  tls:
+    cert_file: "/run/secrets/controlplane_http_cert"
+    key_file: "/run/secrets/controlplane_http_key"
+    client_ca_file: "/run/secrets/operator_client_ca"
+
+identity:
+  mode: "mtls"
+  principals:
+    "spiffe://dbpilot.example/operators/admin":
+      subject: "platform-admin"
+      platform_admin: true
+
+grpc:
+  address: "0.0.0.0:9443"
+  tls:
+    cert_file: "/run/secrets/controlplane_grpc_cert"
+    key_file: "/run/secrets/controlplane_grpc_key"
+    client_ca_file: "/run/secrets/agent_client_ca"
+
+webhook_allowlist:
+  - "hooks.example.com"
+
+event_url_base: "https://dbpilot.example.com"
+evaluation_every: 15s
+retry_every: 1m
+monitoring:
+  maximum_instances: 200
+  maximum_metrics: 50
+  maximum_labels: 32
+  maximum_samples: 10000
+  maximum_response_bytes: 1048576
+evaluation_scopes:
+  - tenant_id: "tenant-1"
+    project_id: "project-1"
+
+# Inventory is the trusted Agent-to-scope assignment. Agent payload fields can
+# never override this mapping.
+agents:
+  "spiffe-agent-id":
+    tenant_id: "tenant-1"
+    project_id: "project-1"
+
+# Optional. SMTP passwords remain env:// Secret references stored on policies;
+# they are resolved only for a delivery and never serialized by the API.
+smtp:
+  address: "smtp.example.com:465"
+  server_name: "smtp.example.com"
+  username: "dbpilot@example.com"
+  from: "dbpilot@example.com"
+  implicit_tls: true
