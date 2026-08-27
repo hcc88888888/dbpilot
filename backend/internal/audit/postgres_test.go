@@ -52,6 +52,42 @@ func TestServiceRecordPersistsSystemSQLEvidenceThroughPostgresStore(t *testing.T
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresStoreRejectsEveryRawSQLFieldShapeBeforeExec(t *testing.T) {
+	values := map[string]struct {
+		key   string
+		value any
+	}{
+		"typed slice": {key: "query", value: []string{"select password from users"}},
+		"object":      {key: "sql", value: map[string]any{"text": "select password from users"}},
+		"number":      {key: "statement", value: 7},
+		"boolean":     {key: "sql_text", value: true},
+		"null":        {key: "query", value: nil},
+	}
+	for name, fixture := range values {
+		for _, nested := range []bool{false, true} {
+			depth := "root"
+			detail := map[string]any{fixture.key: fixture.value}
+			if nested {
+				depth = "nested"
+				detail = map[string]any{"operation": detail}
+			}
+			t.Run(name+"/"+depth, func(t *testing.T) {
+				database, _, err := sqlmock.New()
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = database.Close() })
+				value := validEvent()
+				value.ID = "audit-invalid-sql"
+				value.OccurredAt = time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+				value.CreatedAt = value.OccurredAt
+				value.Detail = detail
+
+				err = NewPostgresStore(database).Append(context.Background(), value)
+				require.ErrorIs(t, err, ErrInvalidEvent)
+			})
+		}
+	}
+}
+
 func TestPostgresStoreListUsesScopeAndTupleCursor(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)

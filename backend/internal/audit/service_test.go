@@ -161,6 +161,47 @@ func TestRecordRejectsCallerSuppliedSQLDerivedFields(t *testing.T) {
 	}
 }
 
+func TestRecordRejectsEveryNonStringSQLFieldAtRootAndNestedDepth(t *testing.T) {
+	values := map[string]struct {
+		key   string
+		value any
+	}{
+		"typed slice": {key: "query", value: []string{"select password from users"}},
+		"object":      {key: "sql", value: map[string]any{"text": "select password from users"}},
+		"number":      {key: "statement", value: 7},
+		"boolean":     {key: "sql_text", value: true},
+		"null":        {key: "query", value: nil},
+	}
+	for name, fixture := range values {
+		for _, nested := range []bool{false, true} {
+			depth := "root"
+			detail := map[string]any{fixture.key: fixture.value}
+			if nested {
+				depth = "nested"
+				detail = map[string]any{"operation": detail}
+			}
+			t.Run(name+"/"+depth, func(t *testing.T) {
+				value := validEvent()
+				value.Detail = detail
+				_, err := NewService(&memoryStore{}).Record(context.Background(), value)
+				require.ErrorIs(t, err, ErrInvalidEvent)
+			})
+		}
+	}
+}
+
+func TestRecordAcceptsStringForEverySQLFieldName(t *testing.T) {
+	for _, key := range []string{"sql", "query", "statement", "sql_text"} {
+		value := validEvent()
+		value.Detail = map[string]any{key: "select 1"}
+
+		got, err := NewService(&memoryStore{}).Record(context.Background(), value)
+		require.NoError(t, err)
+		evidence := requireDetailSlice(t, got.Detail["sql_evidence"])
+		require.Equal(t, key, requireDetailMap(t, evidence[0])["source_field"])
+	}
+}
+
 func TestRecordRejectsCallerSuppliedImmutableID(t *testing.T) {
 	value := validEvent()
 	value.ID = "caller-controlled"

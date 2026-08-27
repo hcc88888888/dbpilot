@@ -162,21 +162,16 @@ func sanitizeMap(input map[string]any) (map[string]any, error) {
 		}
 		if sqlKey(key) {
 			statement, ok := value.(string)
-			if ok {
-				if strings.TrimSpace(statement) == "" {
-					return nil, ErrInvalidEvent
-				}
-				digest := sha256.Sum256([]byte(statement))
-				evidence = append(evidence, map[string]any{
-					"source_field": key,
-					"digest":       "sha256:" + hex.EncodeToString(digest[:]),
-					"summary":      sqlSummary(statement),
-				})
-				continue
-			}
-			if value == nil {
+			if !ok || strings.TrimSpace(statement) == "" {
 				return nil, ErrInvalidEvent
 			}
+			digest := sha256.Sum256([]byte(statement))
+			evidence = append(evidence, map[string]any{
+				"source_field": key,
+				"digest":       "sha256:" + hex.EncodeToString(digest[:]),
+				"summary":      sqlSummary(statement),
+			})
+			continue
 		}
 		sanitized, err := sanitizeValue(value)
 		if err != nil {
@@ -358,9 +353,7 @@ func validateSanitizedMap(input map[string]any) error {
 			continue
 		}
 		if sqlKey(key) {
-			if _, rawSQL := value.(string); rawSQL {
-				return ErrInvalidEvent
-			}
+			return ErrInvalidEvent
 		}
 		if err := validateSanitizedValue(value); err != nil {
 			return err
