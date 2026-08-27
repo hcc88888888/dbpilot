@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $composeFile = Join-Path $repoRoot 'deploy/contracts/prism.compose.yaml'
-$projectName = 'dbpilot-contracts'
+$projectName = if ($Test) { 'dbpilot-contracts-' + $PID + '-' + [guid]::NewGuid().ToString('N') } else { 'dbpilot-contracts' }
 $baseUrl = 'http://localhost:4010'
 $readinessUrl = "$baseUrl/api/v1/tenants/demo/projects/demo/capabilities"
 $prismTest = Join-Path $repoRoot 'tests/contracts/prism.test.mjs'
@@ -14,10 +14,6 @@ $prismTest = Join-Path $repoRoot 'tests/contracts/prism.test.mjs'
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
   throw 'Docker Desktop is required to start the contract mock.'
 }
-if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
-  throw 'curl.exe is required to check contract mock readiness.'
-}
-
 & docker info *> $null
 if ($LASTEXITCODE -ne 0) {
   throw 'Docker Desktop is not running or is not ready.'
@@ -32,8 +28,8 @@ try {
 
   for ($attempt = 1; $attempt -le 60; $attempt++) {
     try {
-      & curl.exe --fail --silent --show-error --max-time 2 --header 'Authorization: Bearer prism-readiness-token' $readinessUrl 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) {
+      $response = Invoke-WebRequest -UseBasicParsing -Uri $readinessUrl -Headers @{ Authorization = 'Bearer prism-readiness-token' } -TimeoutSec 2
+      if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
         if (-not $Test) {
           Write-Output $baseUrl
           return
@@ -41,8 +37,11 @@ try {
 
         $hadIntegrationFlag = Test-Path Env:DBPILOT_PRISM_INTEGRATION
         $previousIntegrationFlag = $env:DBPILOT_PRISM_INTEGRATION
+		$hadProjectFlag = Test-Path Env:DBPILOT_PRISM_COMPOSE_PROJECT
+		$previousProjectFlag = $env:DBPILOT_PRISM_COMPOSE_PROJECT
         try {
           $env:DBPILOT_PRISM_INTEGRATION = '1'
+		  $env:DBPILOT_PRISM_COMPOSE_PROJECT = $projectName
           & node --test $prismTest
           if ($LASTEXITCODE -ne 0) {
             throw 'Prism integration test failed.'
@@ -55,6 +54,12 @@ try {
           else {
             Remove-Item Env:DBPILOT_PRISM_INTEGRATION -ErrorAction SilentlyContinue
           }
+		  if ($hadProjectFlag) {
+			$env:DBPILOT_PRISM_COMPOSE_PROJECT = $previousProjectFlag
+		  }
+		  else {
+			Remove-Item Env:DBPILOT_PRISM_COMPOSE_PROJECT -ErrorAction SilentlyContinue
+		  }
         }
         return
       }

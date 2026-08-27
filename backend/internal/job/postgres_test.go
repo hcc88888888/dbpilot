@@ -107,10 +107,10 @@ func TestClaimOutboxLeasesRowsWithSkipLockedInCreationOrder(t *testing.T) {
 	at := time.Date(2026, 8, 28, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
 	createdOne := at.Add(-2 * time.Minute)
 	createdTwo := at.Add(-time.Minute)
-	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
+	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "prepared_envelope", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
 	rows := sqlmock.NewRows(columns).
-		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", []byte(`{"command_id":"command-1"}`), createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1).
-		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", []byte(`{"command_id":"command-2"}`), createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1)
+		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", []byte(`{"command_id":"command-1"}`), nil, createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1).
+		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", []byte(`{"command_id":"command-2"}`), nil, createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1)
 	mock.ExpectQuery("(?s)FOR UPDATE SKIP LOCKED.*SET lease_expires_at.*ORDER BY created_at, id").
 		WithArgs(at.UTC(), 2, at.UTC().Add(DefaultOutboxLease)).
 		WillReturnRows(rows)
@@ -313,7 +313,7 @@ func expectTargetInsert(mock sqlmock.Sqlmock, job Job, targetID string) {
 func expectOutboxInsert(mock sqlmock.Sqlmock, message OutboxMessage, insertErr error) {
 	expectation := mock.ExpectExec("INSERT INTO command_outbox").WithArgs(
 		message.ID, message.Scope.TenantID, message.Scope.ProjectID, message.JobID, message.TargetID, message.Type, message.Payload,
-		message.AvailableAt.UTC(), message.CreatedAt.UTC(), nil, nil, 0,
+		nil, message.AvailableAt.UTC(), message.CreatedAt.UTC(), nil, nil, 0,
 	)
 	if insertErr != nil {
 		expectation.WillReturnError(insertErr)
@@ -340,10 +340,10 @@ func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *test
 	value, messages := persistenceFixture()
 	message := messages[0]
 
-	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
+	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "prepared_envelope", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
 	published := message.CreatedAt.Add(time.Minute)
 	mock.ExpectQuery("SELECT .* FROM command_outbox WHERE id = \\$1").WithArgs(message.ID).WillReturnRows(
-		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, message.AvailableAt, message.CreatedAt, nil, published, 2),
+		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, nil, message.AvailableAt, message.CreatedAt, nil, published, 2),
 	)
 
 	got, err := repository.LookupCommand(context.Background(), message.ID)
@@ -353,6 +353,24 @@ func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *test
 	require.Equal(t, message.TargetID, got.TargetID)
 	require.Equal(t, message.Payload, got.Payload)
 	require.NotNil(t, got.PublishedAt)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPrepareCommandEnvelopeStoresOnceAndReturnsPersistedBytes(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	proposed := []byte("signed-envelope-proposal")
+	stored := []byte("signed-envelope-already-stored")
+	mock.ExpectQuery("UPDATE command_outbox.*prepared_envelope.*COALESCE.*RETURNING prepared_envelope").
+		WithArgs(scope.TenantID, scope.ProjectID, "command-1", proposed).
+		WillReturnRows(sqlmock.NewRows([]string{"prepared_envelope"}).AddRow(stored))
+
+	got, err := repository.PrepareCommandEnvelope(context.Background(), scope, "command-1", proposed)
+	require.NoError(t, err)
+	require.Equal(t, stored, got)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -17,6 +17,11 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
 $backendRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $repoRoot = (Resolve-Path (Join-Path $backendRoot '..')).Path
+$null = . (Join-Path $PSScriptRoot 'container-safety.ps1')
+$approvedImage = 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1'
+if ($Image -cne $approvedImage) {
+    throw "Kylin verification requires the approved image reference '$approvedImage'."
+}
 
 if ([string]::IsNullOrWhiteSpace($DockerBinary)) {
     $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
@@ -77,12 +82,19 @@ $imageID = (& $DockerBinary image inspect --format '{{.Id}}' $Image 2>$null | Ou
 if ([string]::IsNullOrWhiteSpace($imageID)) {
     throw "Kylin image '$Image' is not available locally. Pull it from the approved enterprise registry or pass -Pull."
 }
+if ($Architecture -eq 'arm64') {
+    $dockerArchitecture = (& $DockerBinary info --format '{{.Architecture}}' | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $dockerArchitecture -notin @('aarch64', 'arm64')) {
+        throw 'Kylin arm64 runtime verification requires a native arm64 Docker host; emulation is not accepted as evidence.'
+    }
+}
 
 $temporaryRoot = Join-Path $backendRoot ('.tmp-kylin-' + [guid]::NewGuid().ToString('N'))
 $fixtureDirectory = Join-Path $temporaryRoot 'runtime'
 $binaryDirectory = Join-Path $temporaryRoot 'bin'
 $fixtureSource = Join-Path $temporaryRoot 'main.go'
 $container = $null
+$containerName = New-DBPilotOwnedContainerName -Prefix 'dbpilot-kylin-smoke'
 $primaryFailure = $null
 
 try {
@@ -201,8 +213,7 @@ command:
     }
 
     $platform = if ($Architecture -eq 'amd64') { 'linux/amd64' } else { 'linux/arm64' }
-    $container = (& $DockerBinary create --platform $platform $Image /bin/sh -c 'sleep 300' | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($container)) { throw 'Unable to create Kylin validation container.' }
+	$container = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $containerName -CreateArguments @('--platform', $platform, $Image, '/bin/sh', '-c', 'sleep 300')
     Invoke-Docker @('cp', $agentBinary, "${container}:/opt/dbpilot-agent")
     Invoke-Docker @('cp', $controlplaneBinary, "${container}:/opt/dbpilot-controlplane")
     Invoke-Docker @('cp', (Join-Path $fixtureDirectory '.'), "${container}:/runtime")
@@ -211,10 +222,9 @@ command:
     $smoke = @'
 set -eu
 . /etc/os-release
-case "${ID:-}" in
-  kylin|kylin-server|neokylin|kylinsec) ;;
-  *) echo "unexpected OS ID: ${ID:-unknown}" >&2; exit 41 ;;
-esac
+test "${ID:-}" = kylin
+test "${VERSION_ID:-}" = V10
+test "${VERSION:-}" = 'V10 (Tercel)'
 arch="$(uname -m)"
 case "${DBPILOT_EXPECTED_ARCH}" in
   amd64) test "$arch" = x86_64 ;;
@@ -258,11 +268,12 @@ catch {
     throw
 }
 finally {
-    if (-not [string]::IsNullOrWhiteSpace($container)) {
-        $cleanupOutput = & $DockerBinary rm -f $container 2>&1
-        if ($LASTEXITCODE -ne 0 -and $null -eq $primaryFailure) {
-            throw "Kylin container cleanup failed: $(($cleanupOutput | Out-String).Trim())"
-        }
-    }
+	try {
+		Remove-DBPilotOwnedContainer -DockerBinary $DockerBinary -ContainerID $container
+	}
+	catch {
+		if ($null -eq $primaryFailure) { throw }
+		Write-Error $_ -ErrorAction Continue
+	}
     Remove-SafeTemporaryDirectory $temporaryRoot
 }

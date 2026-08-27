@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
+import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
@@ -91,29 +92,75 @@ test('breaking check accepts an available origin/main without the canonical cont
   }
 });
 
-test('breaking check invokes Buf when origin/main contains the canonical contract', async () => {
+test('breaking check invokes the pinned Buf container when origin/main contains the canonical contract', async () => {
   const root = await createBreakingFixture({ includeOriginMain: true, includeCanonicalContract: true });
   const binDirectory = join(root, 'bin');
-  const invocationLog = join(root, 'buf-invocation.txt');
+  const invocationLog = join(root, 'docker-invocation.txt');
   await mkdir(binDirectory);
   if (process.platform === 'win32') {
-    await writeFile(join(binDirectory, 'buf.cmd'), '@echo off\r\necho %* > "%BUF_LOG%"\r\n');
+    await writeFile(join(binDirectory, 'docker.cmd'), '@echo off\r\necho %* > "%DOCKER_LOG%"\r\n');
   } else {
-    const fakeBuf = join(binDirectory, 'buf');
-    await writeFile(fakeBuf, '#!/bin/sh\nprintf "%s " "$@" > "$BUF_LOG"\n');
-    await chmod(fakeBuf, 0o755);
+    const fakeDocker = join(binDirectory, 'docker');
+    await writeFile(fakeDocker, '#!/bin/sh\nprintf "%s " "$@" > "$DOCKER_LOG"\n');
+    await chmod(fakeDocker, 0o755);
   }
 
   try {
     const result = runBreaking(root, {
-      BUF_LOG: invocationLog,
-      PATH: `${binDirectory};${process.env.PATH}`,
+      DOCKER_LOG: invocationLog,
+      PATH: `${binDirectory}${delimiter}${process.env.PATH}`,
     });
     assert.equal(result.status, 0, result.stderr);
     const invocation = await readFile(invocationLog, 'utf8');
-    assert.match(invocation, /^breaking /);
-    assert.match(invocation, /\.git#branch=origin\/main/);
+    assert.match(invocation, /^run --rm /);
+    assert.match(invocation, /bufbuild\/buf:1\.57\.2 breaking \/workspace/);
+    assert.match(invocation, /--against \/baseline/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Prism launcher works without curl and cleans its Compose project', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dbpilot-prism-launcher-'));
+  const binDirectory = join(root, 'bin');
+  const dockerLog = join(root, 'docker-invocations.txt');
+  await mkdir(binDirectory);
+  if (process.platform === 'win32') {
+    await writeFile(join(binDirectory, 'docker.cmd'), '@echo off\r\necho %* >> "%DOCKER_LOG%"\r\n');
+  } else {
+    const fakeDocker = join(binDirectory, 'docker');
+    await writeFile(fakeDocker, '#!/bin/sh\nprintf "%s " "$@" >> "$DOCKER_LOG"\nprintf "\\n" >> "$DOCKER_LOG"\n');
+    await chmod(fakeDocker, 0o755);
+  }
+
+  const body = await readFile(join(repoRoot, 'contracts', 'examples', 'platform', 'capabilities.json'));
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(body);
+  });
+  await new Promise((resolve) => server.listen(4010, resolve));
+
+  try {
+    const psHome = run('pwsh', ['-NoProfile', '-Command', '$PSHOME']).stdout.trim();
+    const minimalPath = [binDirectory, dirname(process.execPath), psHome].join(delimiter);
+    const child = spawn('pwsh', ['-NoProfile', '-File', 'scripts/contracts/start-mock.ps1', '-Test'], {
+      cwd: repoRoot,
+      env: { ...process.env, DOCKER_LOG: dockerLog, PATH: minimalPath },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const [code] = await new Promise((resolve) => child.on('close', (...args) => resolve(args)));
+    assert.equal(code, 0, `${stdout}\n${stderr}`);
+    const invocations = await readFile(dockerLog, 'utf8');
+    const project = invocations.match(/compose -p (dbpilot-contracts-[0-9]+-[a-f0-9]{32}) /)?.[1];
+    assert.ok(project, invocations);
+    assert.match(invocations, new RegExp(`compose -p ${project} .* up -d`));
+    assert.match(invocations, new RegExp(`compose -p ${project} .* down --volumes --remove-orphans`));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });

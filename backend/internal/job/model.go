@@ -119,17 +119,18 @@ type Transition struct {
 }
 
 type OutboxMessage struct {
-	ID          string              `json:"id"`
-	Scope       platformscope.Scope `json:"scope"`
-	JobID       string              `json:"job_id"`
-	TargetID    string              `json:"target_id,omitempty"`
-	Type        string              `json:"type"`
-	Payload     []byte              `json:"payload"`
-	AvailableAt time.Time           `json:"available_at"`
-	CreatedAt   time.Time           `json:"created_at"`
-	LeasedUntil *time.Time          `json:"leased_until,omitempty"`
-	PublishedAt *time.Time          `json:"published_at,omitempty"`
-	Attempts    int                 `json:"attempts"`
+	ID               string              `json:"id"`
+	Scope            platformscope.Scope `json:"scope"`
+	JobID            string              `json:"job_id"`
+	TargetID         string              `json:"target_id,omitempty"`
+	Type             string              `json:"type"`
+	Payload          []byte              `json:"payload"`
+	PreparedEnvelope []byte              `json:"-"`
+	AvailableAt      time.Time           `json:"available_at"`
+	CreatedAt        time.Time           `json:"created_at"`
+	LeasedUntil      *time.Time          `json:"leased_until,omitempty"`
+	PublishedAt      *time.Time          `json:"published_at,omitempty"`
+	Attempts         int                 `json:"attempts"`
 }
 
 func ApplyTransition(current Job, transition Transition) (Job, error) {
@@ -143,6 +144,9 @@ func ApplyTransition(current Job, transition Transition) (Job, error) {
 		return Job{}, ErrInvalidTransition
 	}
 	if transition.To == StatusCancelling && transition.Actor == "" {
+		return Job{}, ErrInvalidTransition
+	}
+	if current.Status == StatusCancelling && transition.To == StatusCancelling && len(transition.TargetResults) == 0 {
 		return Job{}, ErrInvalidTransition
 	}
 	if !validTargetUpdates(current, transition.TargetResults) {
@@ -182,8 +186,10 @@ func ApplyTransition(current Job, transition Transition) (Job, error) {
 			next.StartedAt = timePointer(at)
 		}
 	case StatusCancelling:
-		next.CancelRequestedBy = transition.Actor
-		next.CancelRequestedAt = timePointer(at)
+		if current.Status != StatusCancelling {
+			next.CancelRequestedBy = transition.Actor
+			next.CancelRequestedAt = timePointer(at)
+		}
 	case StatusSucceeded, StatusFailed, StatusCancelled, StatusTimedOut:
 		next.FinishedAt = timePointer(at)
 	}
@@ -295,7 +301,7 @@ func allowedTransition(from, to Status) bool {
 	case StatusRunning:
 		return to == StatusRunning || to == StatusSucceeded || to == StatusFailed || to == StatusTimedOut || to == StatusCancelling
 	case StatusCancelling:
-		return to == StatusCancelled
+		return to == StatusCancelling || to == StatusCancelled
 	default:
 		return false
 	}

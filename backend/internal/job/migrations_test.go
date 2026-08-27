@@ -26,6 +26,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)DO \\$\\$.*ALTER TABLE command_outbox.*payload TYPE BYTEA").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0002_command_payload_bytea.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0003_prepared_command_envelope.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("ALTER TABLE command_outbox.*prepared_envelope BYTEA").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0003_prepared_command_envelope.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -49,4 +55,7 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	upgrade, err := migrationFiles.ReadFile("migrations/0002_command_payload_bytea.sql")
 	require.NoError(t, err)
 	require.Contains(t, string(upgrade), "payload TYPE BYTEA")
+	prepared, err := migrationFiles.ReadFile("migrations/0003_prepared_command_envelope.sql")
+	require.NoError(t, err)
+	require.Contains(t, string(prepared), "prepared_envelope BYTEA")
 }

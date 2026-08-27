@@ -97,6 +97,7 @@ func TestJobCommandLifecycle(t *testing.T) {
 	dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Second))
 	require.NoError(t, err)
 	require.Equal(t, 2, dispatched)
+	firstDelivery := make(map[string]*agentv1.CommandEnvelope, len(messages))
 	for _, message := range messages {
 		envelope := streams[message.TargetID].nextSent(t).GetCommand()
 		require.NotNil(t, envelope)
@@ -105,6 +106,23 @@ func TestJobCommandLifecycle(t *testing.T) {
 		verifier, verifyErr := agent.NewCommandVerifier(message.TargetID, publicKey, []string{"collect_now"})
 		require.NoError(t, verifyErr)
 		require.NoError(t, verifier.Verify(ctx, envelope))
+		firstDelivery[message.ID] = envelope
+	}
+	var publishedBeforeAck int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedBeforeAck))
+	require.Zero(t, publishedBeforeAck)
+
+	dispatched, err = lifecycle.DispatchPending(ctx, created.Add(job.DefaultOutboxLease+2*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 2, dispatched)
+	for _, message := range messages {
+		retry := streams[message.TargetID].nextSent(t).GetCommand()
+		require.True(t, proto.Equal(firstDelivery[message.ID], retry))
+		firstBytes, marshalErr := proto.MarshalOptions{Deterministic: true}.Marshal(firstDelivery[message.ID])
+		require.NoError(t, marshalErr)
+		retryBytes, marshalErr := proto.MarshalOptions{Deterministic: true}.Marshal(retry)
+		require.NoError(t, marshalErr)
+		require.Equal(t, firstBytes, retryBytes)
 	}
 
 	streams["agent-a"].push(
@@ -145,6 +163,9 @@ func TestJobCommandLifecycle(t *testing.T) {
 		seenCommands[event.CommandID] = true
 	}
 	require.Equal(t, map[string]bool{"command-a": true, "command-b": true}, seenCommands)
+	var publishedAfterAck int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedAfterAck))
+	require.Equal(t, 2, publishedAfterAck)
 }
 
 func contractDatabase(t *testing.T, rawDSN string) *sql.DB {

@@ -11,8 +11,9 @@ Collector process.
 
 ## Supported platforms and installation
 
-Release builds support CentOS 7+ and Kylin V10+ on amd64. Kylin V10+ arm64 is
-also supported for the Agent. Install the matching binary at
+Release builds support CentOS 7+ and Kylin V10+ on amd64. The build also emits
+arm64 artifacts, but arm64 runtime support requires evidence from a native
+arm64 Kylin runner or VM before release. Install the matching binary at
 `/usr/local/bin/dbpilot-agent`, install
 `packaging/systemd/dbpilot-agent.service`, copy the example configuration to
 `/etc/dbpilot/agent.yaml`, and create a non-login `dbpilot` user.
@@ -95,14 +96,15 @@ requires attaching the three runner logs.
 
 ### Windows Docker/Kylin verification
 
-Windows development can verify both Linux executables inside an approved Kylin
-V10 Docker image. The verifier builds both architectures, executes each
-selected-architecture binary with `--version`, starts the Agent with a signed
+Windows development can verify both Linux executables inside the exact
+`cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` image. The verifier builds
+both architectures, executes each selected-architecture binary with `--version`, starts the Agent with a signed
 sample policy, proves its bbolt command journal opens and closes, and starts
 the control plane through configuration validation until the expected
 PostgreSQL connection failure. It rejects missing Docker/images, non-Kylin
 `/etc/os-release`, architecture mismatches, and unexpected startup failures;
-it always removes its container and temporary keys/binaries and never
+it requires the exact Kylin V10/Tercel release identity, always removes only
+the uniquely named container it created plus temporary keys/binaries, and never
 substitutes a generic Linux image.
 
 ```powershell
@@ -114,6 +116,8 @@ powershell -NoProfile -File .\scripts\verify-kylin-docker.ps1 `
 This container check covers executable compatibility and bootstrap startup.
 Systemd, journald ACLs, kernel metrics, eBPF, and real Kylin service behavior
 must still be verified on Kylin V10 amd64/arm64 VM or bare-metal runners.
+An arm64 invocation is accepted only on a native arm64 Docker host; emulation
+is not production runtime evidence.
 
 ## Contract and command lifecycle workflow
 
@@ -139,10 +143,14 @@ the explicit mock test is the live, self-cleaning Prism check.
 
 Agent Hello capability negotiation is authoritative: the dispatcher sends only
 typed command envelopes the live Agent advertised. Delivery is at-least-once;
-`command_outbox.id` is the immutable `command_id`, the Agent journal deduplicates
-that ID, and every acknowledgement/progress/result is correlated through the
-durable outbox row to tenant/project, Job, target, Artifact references and Audit
-trace fields. The control plane reads an Ed25519 PKCS#8 signing key once from
+`command_outbox.id` is the immutable `command_id`, while the first fully signed
+envelope is atomically persisted and reused byte-for-byte for every lease retry.
+Queue insertion does not mark delivery: only a validated Agent accepted,
+rejected or duplicate acknowledgement publishes the outbox row. The Agent
+journal therefore deduplicates the same ID and digest, and every
+acknowledgement/progress/result is correlated through the durable outbox row to
+tenant/project, Job, target, Artifact references and Audit trace fields. The
+control plane reads an Ed25519 PKCS#8 signing key once from
 `command.signing_private_key_ref`; Agents receive only the matching PKIX public
 key. Arbitrary shell commands are never part of the protocol.
 

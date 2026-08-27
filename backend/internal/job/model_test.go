@@ -79,6 +79,20 @@ func TestTransitionAllowsCancellation(t *testing.T) {
 	require.Equal(t, finishedAt.UTC(), *current.FinishedAt)
 }
 
+func TestCancellingSelfTransitionRequiresTargetEvidenceAndPreservesRequester(t *testing.T) {
+	current := runningJob()
+	cancelling, err := ApplyTransition(current, Transition{To: StatusCancelling, Actor: "operator-1", At: current.CreatedAt.Add(3 * time.Second)})
+	require.NoError(t, err)
+
+	_, err = ApplyTransition(cancelling, Transition{To: StatusCancelling, Actor: "operator-1", At: current.CreatedAt.Add(4 * time.Second)})
+	require.ErrorIs(t, err, ErrInvalidTransition)
+
+	next, err := ApplyTransition(cancelling, Transition{To: StatusCancelling, Actor: "operator-1", At: current.CreatedAt.Add(4 * time.Second), TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetCancelled}}})
+	require.NoError(t, err)
+	require.Equal(t, cancelling.CancelRequestedBy, next.CancelRequestedBy)
+	require.Equal(t, cancelling.CancelRequestedAt, next.CancelRequestedAt)
+}
+
 func TestTransitionRejectsTerminalRegressionAndCancellation(t *testing.T) {
 	finished := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	terminal := runningJob()

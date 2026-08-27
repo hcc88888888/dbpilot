@@ -8,11 +8,12 @@ const execFileAsync = promisify(execFile);
 const composeFile = fileURLToPath(new URL('../../deploy/contracts/prism.compose.yaml', import.meta.url));
 const mockBaseUrl = process.env.DBPILOT_CONTRACT_MOCK_URL ?? 'http://localhost:4010';
 const integrationEnabled = process.env.DBPILOT_PRISM_INTEGRATION === '1';
+const composeProject = process.env.DBPILOT_PRISM_COMPOSE_PROJECT ?? 'dbpilot-contracts';
 
 if (integrationEnabled) {
   test.after(async () => {
     try {
-      await execFileAsync('docker', ['compose', '-p', 'dbpilot-contracts', '-f', composeFile, 'down', '--volumes', '--remove-orphans']);
+      await execFileAsync('docker', ['compose', '-p', composeProject, '-f', composeFile, 'down', '--volumes', '--remove-orphans']);
     }
     catch {
       // Cleanup must not mask the contract assertion that caused the test to fail.

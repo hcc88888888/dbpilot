@@ -59,6 +59,7 @@ CREATE TABLE command_outbox (
     target_id TEXT NOT NULL DEFAULT '',
     message_type TEXT NOT NULL,
     payload BYTEA NOT NULL,
+    prepared_envelope BYTEA,
     available_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     lease_expires_at TIMESTAMPTZ,

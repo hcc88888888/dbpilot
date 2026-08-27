@@ -157,25 +157,38 @@ func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.
 }
 
 func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message OutboxMessage, at time.Time) error {
-	envelope, err := decodeUnsignedCommand(message)
+	unsigned, err := decodeUnsignedCommand(message)
 	if err != nil {
 		return err
 	}
-	envelope.CommandId = message.ID
-	envelope.JobId = message.JobID
-	envelope.IssuedAt = timestamppb.New(at)
-	envelope.ExpiresAt = timestamppb.New(at.Add(time.Duration(envelope.GetLeaseSeconds()) * time.Second))
-	envelope.Nonce = make([]byte, commandNonceBytes)
-	if _, err := io.ReadFull(lifecycle.nonceReader, envelope.Nonce); err != nil {
-		return fmt.Errorf("generate command nonce: %w", err)
+	proposed := append([]byte(nil), message.PreparedEnvelope...)
+	if len(proposed) == 0 {
+		envelope := proto.Clone(unsigned).(*agentv1.CommandEnvelope)
+		envelope.CommandId = message.ID
+		envelope.JobId = message.JobID
+		envelope.IssuedAt = timestamppb.New(at)
+		envelope.ExpiresAt = timestamppb.New(at.Add(time.Duration(envelope.GetLeaseSeconds()) * time.Second))
+		envelope.Nonce = make([]byte, commandNonceBytes)
+		if _, err := io.ReadFull(lifecycle.nonceReader, envelope.Nonce); err != nil {
+			return fmt.Errorf("generate command nonce: %w", err)
+		}
+		if err := lifecycle.signer.Sign(ctx, envelope); err != nil {
+			return err
+		}
+		proposed, err = proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+		if err != nil {
+			return fmt.Errorf("marshal prepared command envelope: %w", err)
+		}
 	}
-	if err := lifecycle.signer.Sign(ctx, envelope); err != nil {
+	stored, err := lifecycle.dispatchRepository.PrepareCommandEnvelope(ctx, message.Scope, message.ID, proposed)
+	if err != nil {
+		return err
+	}
+	envelope, err := decodePreparedCommand(message, unsigned, stored)
+	if err != nil {
 		return err
 	}
 	if err := lifecycle.agents.Dispatch(ctx, envelope.GetAgentId(), envelope); err != nil {
-		return err
-	}
-	if err := lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, at); err != nil {
 		return err
 	}
 	value, err := lifecycle.ensureDispatched(ctx, message, at)
@@ -183,6 +196,34 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 		return err
 	}
 	return lifecycle.recordAudit(ctx, value, message, "command.dispatched", "success", map[string]any{"state": "dispatched"})
+}
+
+func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvelope, stored []byte) (*agentv1.CommandEnvelope, error) {
+	if unsigned == nil || len(stored) == 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	envelope := new(agentv1.CommandEnvelope)
+	if err := proto.Unmarshal(stored, envelope); err != nil || len(envelope.ProtoReflect().GetUnknown()) != 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err != nil || !bytes.Equal(canonical, stored) {
+		return nil, ErrInvalidCommandPayload
+	}
+	if envelope.GetCommandId() != message.ID || envelope.GetJobId() != message.JobID || envelope.GetAgentId() != message.TargetID || envelope.GetIssuedAt() == nil || !envelope.GetIssuedAt().IsValid() || envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() || !envelope.GetExpiresAt().AsTime().After(envelope.GetIssuedAt().AsTime()) || len(envelope.GetNonce()) != commandNonceBytes || len(envelope.GetSignature()) != ed25519.SignatureSize {
+		return nil, ErrInvalidCommandPayload
+	}
+	preparedPayload := proto.Clone(envelope).(*agentv1.CommandEnvelope)
+	preparedPayload.CommandId = ""
+	preparedPayload.JobId = ""
+	preparedPayload.IssuedAt = nil
+	preparedPayload.ExpiresAt = nil
+	preparedPayload.Nonce = nil
+	preparedPayload.Signature = nil
+	if !proto.Equal(preparedPayload, unsigned) {
+		return nil, ErrInvalidCommandPayload
+	}
+	return envelope, nil
 }
 
 func decodeUnsignedCommand(message OutboxMessage) (*agentv1.CommandEnvelope, error) {
@@ -244,7 +285,7 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
-	lifecycle.observe(ctx, agentID, acknowledgement.GetCommandId(), "command.acknowledged", result, target, map[string]any{"state": acknowledgement.GetState().String()})
+	lifecycle.observe(ctx, agentID, acknowledgement.GetCommandId(), "command.acknowledged", result, target, map[string]any{"state": acknowledgement.GetState().String()}, true)
 }
 
 func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string, progress *agentv1.CommandProgress) {
@@ -252,7 +293,7 @@ func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string,
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
-	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()})
+	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()}, false)
 }
 
 func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, result *agentv1.CommandResult) {
@@ -282,10 +323,10 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		}
 		target.Artifacts = append(target.Artifacts, ArtifactReference{ArtifactID: reference.GetArtifactId(), Kind: reference.GetKind()})
 	}
-	lifecycle.observe(ctx, agentID, result.GetCommandId(), "command.result", auditResult, target, map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)})
+	lifecycle.observe(ctx, agentID, result.GetCommandId(), "command.result", auditResult, target, map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)}, false)
 }
 
-func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, commandID, action, result string, target TargetResult, detail map[string]any) {
+func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, commandID, action, result string, target TargetResult, detail map[string]any, publish bool) {
 	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, commandID)
 	if err != nil {
 		lifecycle.onError(err)
@@ -305,6 +346,12 @@ func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, command
 		recordErr := lifecycle.recordAudit(ctx, value, message, "command.rejected", "failure", map[string]any{"reason": "agent_mismatch"})
 		lifecycle.onError(errors.Join(ErrCommandAgentMismatch, recordErr))
 		return
+	}
+	if publish {
+		if err := lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, lifecycle.currentTime()); err != nil {
+			lifecycle.onError(err)
+			return
+		}
 	}
 	target.TargetID = message.TargetID
 	value, mutated, err := lifecycle.applyTarget(ctx, message, target)
@@ -356,10 +403,16 @@ func (lifecycle *CommandLifecycle) applyTarget(ctx context.Context, message Outb
 		if found && existing.Status == TargetRunning && target.Status == TargetRunning {
 			return current, mutated, nil
 		}
-		if current.Status != StatusDispatched && current.Status != StatusRunning {
+		if current.Status != StatusDispatched && current.Status != StatusRunning && current.Status != StatusCancelling {
 			return Job{}, mutated, ErrInvalidTransition
 		}
-		next, err := lifecycle.jobs.Transition(ctx, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{target}, At: lifecycle.currentTime()})
+		transitionTo := StatusRunning
+		actor := ""
+		if current.Status == StatusCancelling {
+			transitionTo = StatusCancelling
+			actor = current.CancelRequestedBy
+		}
+		next, err := lifecycle.jobs.Transition(ctx, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: transitionTo, TargetResults: []TargetResult{target}, Actor: actor, At: lifecycle.currentTime()})
 		if errors.Is(err, ErrConflict) {
 			continue
 		}
@@ -394,7 +447,9 @@ func (lifecycle *CommandLifecycle) finalize(ctx context.Context, candidate Job) 
 			return current, mutated, nil
 		}
 		to := StatusFailed
-		if current.Progress.CompletedTargets > 0 {
+		if current.Status == StatusCancelling {
+			to = StatusCancelled
+		} else if current.Progress.CompletedTargets > 0 {
 			to = StatusSucceeded
 		}
 		next, err := lifecycle.jobs.Transition(ctx, Transition{

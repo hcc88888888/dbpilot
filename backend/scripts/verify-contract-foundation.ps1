@@ -11,7 +11,9 @@ if ($PSVersionTable.PSVersion.Major -ge 7) {
 
 $backendRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $repoRoot = (Resolve-Path (Join-Path $backendRoot '..')).Path
-$postgresContainer = 'dbpilot-contract-postgres'
+$null = . (Join-Path $PSScriptRoot 'container-safety.ps1')
+$postgresContainer = New-DBPilotOwnedContainerName -Prefix 'dbpilot-contract-postgres'
+$postgresContainerID = $null
 $temporaryRoot = Join-Path $backendRoot ('.tmp-contract-foundation-' + [guid]::NewGuid().ToString('N'))
 $primaryFailure = $null
 
@@ -98,22 +100,17 @@ try {
         Pop-Location
     }
 
-    $existing = & $DockerBinary ps -a --filter "name=^/$postgresContainer$" --format '{{.Names}}'
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect the contract PostgreSQL container.' }
-    if ($existing -eq $postgresContainer) {
-        Invoke-Checked $DockerBinary @('rm', '-f', $postgresContainer)
-    }
-    Invoke-Checked $DockerBinary @(
-        'run', '--detach', '--name', $postgresContainer,
+	$postgresContainerID = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $postgresContainer -CreateArguments @(
         '--publish', '127.0.0.1:55432:5432',
         '--env', 'POSTGRES_DB=dbpilot_contract',
         '--env', 'POSTGRES_USER=dbpilot_contract',
         '--env', 'POSTGRES_PASSWORD=dbpilot_contract',
         'postgres:16-alpine'
     )
+	Invoke-Checked $DockerBinary @('start', $postgresContainerID)
     $ready = $false
     for ($attempt = 1; $attempt -le 60; $attempt++) {
-        & $DockerBinary exec $postgresContainer pg_isready -U dbpilot_contract -d dbpilot_contract *> $null
+		& $DockerBinary exec $postgresContainerID pg_isready -U dbpilot_contract -d dbpilot_contract *> $null
         if ($LASTEXITCODE -eq 0) {
             $ready = $true
             break
@@ -155,12 +152,12 @@ finally {
     if ($hadE2E) { $env:DBPILOT_CONTRACT_E2E = $previousE2E } else { Remove-Item Env:DBPILOT_CONTRACT_E2E -ErrorAction SilentlyContinue }
     if ($hadDSN) { $env:DBPILOT_CONTRACT_POSTGRES_DSN = $previousDSN } else { Remove-Item Env:DBPILOT_CONTRACT_POSTGRES_DSN -ErrorAction SilentlyContinue }
 
-    $containerExists = & $DockerBinary ps -a --filter "name=^/$postgresContainer$" --format '{{.Names}}' 2>$null
-    if ($containerExists -eq $postgresContainer) {
-        $cleanupOutput = & $DockerBinary rm -f $postgresContainer 2>&1
-        if ($LASTEXITCODE -ne 0 -and $null -eq $primaryFailure) {
-            throw "Contract PostgreSQL cleanup failed: $(($cleanupOutput | Out-String).Trim())"
-        }
-    }
+	try {
+		Remove-DBPilotOwnedContainer -DockerBinary $DockerBinary -ContainerID $postgresContainerID
+	}
+	catch {
+		if ($null -eq $primaryFailure) { throw }
+		Write-Error $_ -ErrorAction Continue
+	}
     Remove-SafeTemporaryDirectory
 }

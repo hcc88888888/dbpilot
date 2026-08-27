@@ -19,13 +19,14 @@ const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, ins
 const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)"
 const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
-const insertOutboxSQL = "INSERT INTO command_outbox (id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+const insertOutboxSQL = "INSERT INTO command_outbox (id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
 const selectJobSQL = "SELECT " + jobColumnsSQL + " FROM jobs WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
 const selectTargetsSQL = "SELECT target_id, status, error_summary, result_summary, artifacts, finished_at FROM job_targets WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY target_id"
 const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, completed_targets = $4, failed_targets = $5, skipped_targets = $6, error_summary = $7, result_summary = $8, artifacts = $9, dispatched_at = $10, started_at = $11, finished_at = $12, cancel_requested_by = $13, cancel_requested_at = $14 WHERE tenant_id = $15 AND project_id = $16 AND id = $17 AND version = $18"
-const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts) SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts FROM claimed ORDER BY created_at, id"
-const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = $1, lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND published_at IS NULL"
-const selectOutboxByIDSQL = "SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts FROM command_outbox WHERE id = $1"
+const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts) SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts FROM claimed ORDER BY created_at, id"
+const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4"
+const selectOutboxByIDSQL = "SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts FROM command_outbox WHERE id = $1"
+const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4) WHERE tenant_id = $1 AND project_id = $2 AND id = $3 RETURNING prepared_envelope"
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -276,6 +277,23 @@ func (repository *PostgresRepository) LookupCommand(ctx context.Context, command
 	return message, nil
 }
 
+func (repository *PostgresRepository) PrepareCommandEnvelope(ctx context.Context, scope platformscope.Scope, commandID string, proposed []byte) ([]byte, error) {
+	if repository == nil || repository.db == nil {
+		return nil, errors.New("job PostgreSQL repository is unavailable")
+	}
+	if scope.Validate() != nil || strings.TrimSpace(commandID) == "" || len(proposed) == 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	var stored []byte
+	if err := repository.db.QueryRowContext(ctx, prepareCommandEnvelopeSQL, scope.TenantID, scope.ProjectID, commandID, proposed).Scan(&stored); err != nil {
+		return nil, classifyReadError("prepare command envelope", err)
+	}
+	if len(stored) == 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	return append([]byte(nil), stored...), nil
+}
+
 type rowQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -338,7 +356,7 @@ func scanJob(row rowScanner) (Job, error) {
 func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	var value OutboxMessage
 	var leased, published sql.NullTime
-	err := row.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.JobID, &value.TargetID, &value.Type, &value.Payload, &value.AvailableAt, &value.CreatedAt, &leased, &published, &value.Attempts)
+	err := row.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.JobID, &value.TargetID, &value.Type, &value.Payload, &value.PreparedEnvelope, &value.AvailableAt, &value.CreatedAt, &leased, &published, &value.Attempts)
 	if err != nil {
 		return OutboxMessage{}, err
 	}
@@ -403,6 +421,7 @@ func normalizeOutboxMessage(value Job, message OutboxMessage) OutboxMessage {
 	message.LeasedUntil = utcPointer(message.LeasedUntil)
 	message.PublishedAt = utcPointer(message.PublishedAt)
 	message.Payload = append([]byte(nil), message.Payload...)
+	message.PreparedEnvelope = append([]byte(nil), message.PreparedEnvelope...)
 	return message
 }
 
@@ -420,7 +439,14 @@ func targetArgs(scope platformscope.Scope, jobID string, value TargetResult, art
 }
 
 func outboxInsertArgs(value OutboxMessage) []any {
-	return []any{value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.JobID, value.TargetID, value.Type, value.Payload, value.AvailableAt, value.CreatedAt, nullableTime(value.LeasedUntil), nullableTime(value.PublishedAt), value.Attempts}
+	return []any{value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.JobID, value.TargetID, value.Type, value.Payload, nullableBytes(value.PreparedEnvelope), value.AvailableAt, value.CreatedAt, nullableTime(value.LeasedUntil), nullableTime(value.PublishedAt), value.Attempts}
+}
+
+func nullableBytes(value []byte) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return value
 }
 
 func updateJobArgs(value Job, currentVersion int64, artifacts []byte) []any {
