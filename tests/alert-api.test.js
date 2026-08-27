@@ -43,6 +43,7 @@ test('HTTP DTO normalization recursively removes secrets and raw delivery reques
       token: 'top-level-token',
       private_key: 'private-key-material',
       connection_string: 'postgres://operator:password@db.example/alerts',
+      dsn: 'postgres://operator:password@db.example/alerts',
       nested: { api_token: 'nested-token', safe: 'kept' },
       deliveries: [{
         id: 'delivery-1', status: 'delivered', token: 'delivery-token',

@@ -228,7 +228,7 @@ function redactDTO(value, inDelivery = false) {
 function isUnsafeDTOKey(key, inDelivery) {
   const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
   if (normalized === 'scope' || normalized === 'audit' || normalized === 'auditdetails') return true;
-  if (/(secret|token|password|credential|authorization|apikey|privatekey|connectionstring)/.test(normalized)) return true;
+  if (normalized === 'dsn' || /(secret|token|password|credential|authorization|apikey|privatekey|connectionstring)/.test(normalized)) return true;
   if (!inDelivery) return false;
   return normalized === 'body' || normalized === 'request' || normalized === 'response' || normalized.includes('requestbody') || normalized.includes('responsebody') || normalized.includes('requestpayload');
 }
