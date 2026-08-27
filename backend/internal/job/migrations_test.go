@@ -35,6 +35,7 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 		"CREATE INDEX job_targets_scope_idx",
 		"CREATE INDEX command_outbox_lease_idx",
 		"lease_expires_at",
+		"total_targets <= 10000",
 	} {
 		require.Contains(t, schema, required)
 	}

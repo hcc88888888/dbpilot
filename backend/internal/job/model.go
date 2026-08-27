@@ -14,6 +14,8 @@ var (
 	ErrInvalidTransition = errors.New("invalid job transition")
 )
 
+const MaximumTargetsPerJob = 10_000
+
 type Status string
 
 const (
@@ -133,13 +135,16 @@ func ApplyTransition(current Job, transition Transition) (Job, error) {
 	if transition.CurrentVersion != 0 && transition.CurrentVersion != current.Version {
 		return Job{}, ErrConflict
 	}
+	if err := ValidateTargets(current); err != nil {
+		return Job{}, err
+	}
 	if transition.At.IsZero() || !allowedTransition(current.Status, transition.To) {
 		return Job{}, ErrInvalidTransition
 	}
 	if transition.To == StatusCancelling && transition.Actor == "" {
 		return Job{}, ErrInvalidTransition
 	}
-	if transition.Progress != nil && !validProgressChange(current.Progress, *transition.Progress) {
+	if !validTargetUpdates(current, transition.TargetResults) {
 		return Job{}, ErrInvalidTransition
 	}
 
@@ -147,12 +152,17 @@ func ApplyTransition(current Job, transition Transition) (Job, error) {
 	at := transition.At.UTC()
 	next.Status = transition.To
 	next.Version++
-	if transition.Progress != nil {
-		next.Progress = *transition.Progress
-	}
 	if transition.TargetResults != nil {
 		next.TargetResults = mergeTargetResults(next.TargetResults, transition.TargetResults)
 	}
+	reconciled := AggregateProgressForTargets(next.TargetResourceIDs, next.TargetResults)
+	if transition.Progress != nil && *transition.Progress != reconciled {
+		return Job{}, ErrInvalidTransition
+	}
+	if !validProgressChange(current.Progress, reconciled) {
+		return Job{}, ErrInvalidTransition
+	}
+	next.Progress = reconciled
 	if transition.ErrorSummary != "" {
 		next.ErrorSummary = transition.ErrorSummary
 	}
@@ -186,6 +196,9 @@ func ApplyTransition(current Job, transition Transition) (Job, error) {
 	} else {
 		next.Outcome = OutcomeNone
 	}
+	if transition.To == StatusSucceeded && !validSucceededJob(next) {
+		return Job{}, ErrInvalidTransition
+	}
 	return next, nil
 }
 
@@ -198,6 +211,8 @@ func AggregateOutcome(results []TargetResult) Outcome {
 			succeeded++
 		case TargetFailed, TargetSkipped, TargetCancelled, TargetTimedOut:
 			other++
+		default:
+			return OutcomeNone
 		}
 	}
 	if succeeded > 0 && other > 0 {
@@ -228,6 +243,48 @@ func AggregateProgress(results []TargetResult) Progress {
 	return progress
 }
 
+// AggregateProgressForTargets reconciles persisted counters with the expected
+// target set. Missing target rows are treated as queued and contribute no
+// terminal counter.
+func AggregateProgressForTargets(expected []string, results []TargetResult) Progress {
+	progress := AggregateProgress(results)
+	progress.TotalTargets = len(expected)
+	return progress
+}
+
+// ValidateTargets is the pure invariant gate shared by creation and state
+// transitions. It bounds fan-out, rejects duplicate/unknown targets, and keeps
+// persisted counters derived from target rows.
+func ValidateTargets(value Job) error {
+	if len(value.TargetResourceIDs) > MaximumTargetsPerJob || value.Progress.TotalTargets != len(value.TargetResourceIDs) {
+		return ErrInvalidTransition
+	}
+	expected := make(map[string]struct{}, len(value.TargetResourceIDs))
+	for _, id := range value.TargetResourceIDs {
+		if id == "" {
+			return ErrInvalidTransition
+		}
+		if _, duplicate := expected[id]; duplicate {
+			return ErrInvalidTransition
+		}
+		expected[id] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(value.TargetResults))
+	for _, result := range value.TargetResults {
+		if _, ok := expected[result.TargetID]; !ok || !validTargetStatus(result.Status) {
+			return ErrInvalidTransition
+		}
+		if _, duplicate := seen[result.TargetID]; duplicate {
+			return ErrInvalidTransition
+		}
+		seen[result.TargetID] = struct{}{}
+	}
+	if value.Progress != AggregateProgressForTargets(value.TargetResourceIDs, value.TargetResults) {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
 func allowedTransition(from, to Status) bool {
 	switch from {
 	case StatusQueued:
@@ -241,6 +298,73 @@ func allowedTransition(from, to Status) bool {
 	default:
 		return false
 	}
+}
+
+func validTargetUpdates(current Job, updates []TargetResult) bool {
+	if updates == nil {
+		return true
+	}
+	expected := make(map[string]struct{}, len(current.TargetResourceIDs))
+	for _, id := range current.TargetResourceIDs {
+		expected[id] = struct{}{}
+	}
+	states := make(map[string]TargetStatus, len(current.TargetResults))
+	for _, result := range current.TargetResults {
+		states[result.TargetID] = result.Status
+	}
+	seen := make(map[string]struct{}, len(updates))
+	for _, update := range updates {
+		if _, ok := expected[update.TargetID]; !ok || !validTargetStatus(update.Status) {
+			return false
+		}
+		if _, duplicate := seen[update.TargetID]; duplicate {
+			return false
+		}
+		seen[update.TargetID] = struct{}{}
+		from := states[update.TargetID]
+		if from == "" {
+			from = TargetQueued
+		}
+		if !allowedTargetTransition(from, update.Status) {
+			return false
+		}
+	}
+	return true
+}
+
+func allowedTargetTransition(from, to TargetStatus) bool {
+	if isTerminalTarget(from) {
+		return false
+	}
+	switch from {
+	case TargetQueued:
+		return to == TargetQueued || to == TargetRunning || isTerminalTarget(to)
+	case TargetRunning:
+		return to == TargetRunning || isTerminalTarget(to)
+	default:
+		return false
+	}
+}
+
+func validTargetStatus(status TargetStatus) bool {
+	return status == TargetQueued || status == TargetRunning || isTerminalTarget(status)
+}
+
+func isTerminalTarget(status TargetStatus) bool {
+	return status == TargetSucceeded || status == TargetFailed || status == TargetSkipped || status == TargetCancelled || status == TargetTimedOut
+}
+
+func validSucceededJob(value Job) bool {
+	if len(value.TargetResourceIDs) == 0 || len(value.TargetResults) != len(value.TargetResourceIDs) {
+		return false
+	}
+	for _, result := range value.TargetResults {
+		if !isTerminalTarget(result.Status) {
+			return false
+		}
+	}
+	terminalCount := value.Progress.CompletedTargets + value.Progress.FailedTargets + value.Progress.SkippedTargets
+	return terminalCount == value.Progress.TotalTargets && (value.Outcome == OutcomeComplete || value.Outcome == OutcomePartial)
 }
 
 func validProgressChange(current, next Progress) bool {

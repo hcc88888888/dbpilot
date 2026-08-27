@@ -99,6 +99,45 @@ func TestClaimOutboxLeasesRowsWithSkipLockedInCreationOrder(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestGetReadsJobAndTargetsInOneSnapshotTransaction(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	value, _ := persistenceFixture()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(jobRows(value))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(
+		sqlmock.NewRows([]string{"target_id", "status", "error_summary", "result_summary", "artifacts", "finished_at"}).
+			AddRow("db-1", string(TargetQueued), "", "", []byte("[]"), nil).
+			AddRow("db-2", string(TargetQueued), "", "", []byte("[]"), nil),
+	)
+	mock.ExpectCommit()
+
+	got, err := repository.Get(context.Background(), value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"db-1", "db-2"}, got.TargetResourceIDs)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetRollsBackSnapshotWhenTargetReadFails(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	value, _ := persistenceFixture()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(jobRows(value))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs("tenant-1", "project-1", "job-1").WillReturnError(errors.New("connection reset"))
+	mock.ExpectRollback()
+
+	_, err = repository.Get(context.Background(), value.Scope, value.ID)
+	require.ErrorContains(t, err, "get job targets")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestTransitionReturnsConflictWhenVersionWasAlreadyAdvanced(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -109,12 +148,18 @@ func TestTransitionReturnsConflictWhenVersionWasAlreadyAdvanced(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(jobRows(job))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs("tenant-1", "project-1", "job-1").WillReturnRows(
+		sqlmock.NewRows([]string{"target_id", "status", "error_summary", "result_summary", "artifacts", "finished_at"}).
+			AddRow("db-1", string(TargetRunning), "", "", []byte("[]"), nil),
+	)
 	mock.ExpectExec("UPDATE jobs SET .* WHERE tenant_id = \\$[0-9]+ AND project_id = \\$[0-9]+ AND id = \\$[0-9]+ AND version = \\$[0-9]+").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectRollback()
 
+	completed := Progress{TotalTargets: 1, CompletedTargets: 1}
 	_, err = repository.Transition(context.Background(), Transition{
 		Scope: job.Scope, JobID: job.ID, CurrentVersion: job.Version, To: StatusSucceeded, At: transitionAt,
+		Progress: &completed, TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}},
 	})
 	require.ErrorIs(t, err, ErrConflict)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -158,9 +203,27 @@ func TestMarkOutboxPublishedReturnsNotFoundForUnknownMessage(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 	repository := NewPostgresRepository(database)
 	at := time.Date(2026, 8, 28, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
-	mock.ExpectExec("UPDATE command_outbox SET published_at").WithArgs(at.UTC(), "missing").WillReturnResult(sqlmock.NewResult(0, 0))
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	mock.ExpectExec("UPDATE command_outbox SET published_at").WithArgs(at.UTC(), scope.TenantID, scope.ProjectID, "missing").WillReturnResult(sqlmock.NewResult(0, 0))
 
-	err = repository.MarkOutboxPublished(context.Background(), "missing", at)
+	err = repository.MarkOutboxPublished(context.Background(), scope, "missing", at)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMarkOutboxPublishedCannotUpdateAnotherScope(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	at := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	wrongScope := platformscope.Scope{TenantID: "tenant-other", ProjectID: "project-other"}
+
+	mock.ExpectExec("UPDATE command_outbox SET published_at").
+		WithArgs(at, wrongScope.TenantID, wrongScope.ProjectID, "msg-1").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err = repository.MarkOutboxPublished(context.Background(), wrongScope, "msg-1", at)
 	require.ErrorIs(t, err, ErrNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -222,4 +285,5 @@ func jobRows(job Job) *sqlmock.Rows {
 
 func TestPostgresRepositoryImplementsRepository(t *testing.T) {
 	var _ Repository = (*PostgresRepository)(nil)
+	var _ DispatchRepository = (*PostgresRepository)(nil)
 }

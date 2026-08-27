@@ -11,7 +11,7 @@ CREATE TABLE jobs (
     source_resource_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     version BIGINT NOT NULL CHECK (version >= 1),
-    total_targets INTEGER NOT NULL CHECK (total_targets >= 0),
+    total_targets INTEGER NOT NULL CHECK (total_targets >= 0 AND total_targets <= 10000),
     completed_targets INTEGER NOT NULL DEFAULT 0 CHECK (completed_targets >= 0),
     failed_targets INTEGER NOT NULL DEFAULT 0 CHECK (failed_targets >= 0),
     skipped_targets INTEGER NOT NULL DEFAULT 0 CHECK (skipped_targets >= 0),

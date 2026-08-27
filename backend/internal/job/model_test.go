@@ -3,6 +3,7 @@ package job
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -21,7 +22,9 @@ func TestTransitionAllowsSuccessfulLifecycle(t *testing.T) {
 	current := Job{
 		ID: "job-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"},
 		Type: "inspection.run", Status: StatusQueued, Outcome: OutcomeNone, Version: 1,
-		Progress: Progress{TotalTargets: 2}, CreatedAt: created,
+		TargetResourceIDs: []string{"db-1", "db-2"},
+		TargetResults:     []TargetResult{{TargetID: "db-1", Status: TargetQueued}, {TargetID: "db-2", Status: TargetQueued}},
+		Progress:          Progress{TotalTargets: 2}, CreatedAt: created,
 	}
 
 	dispatchedAt := created.Add(time.Second)
@@ -79,7 +82,8 @@ func TestTransitionAllowsCancellation(t *testing.T) {
 func TestTransitionRejectsTerminalRegressionAndCancellation(t *testing.T) {
 	finished := time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC)
 	terminal := runningJob()
-	terminal = requireTransition(t, terminal, Transition{To: StatusSucceeded, At: finished})
+	completed := Progress{TotalTargets: 1, CompletedTargets: 1}
+	terminal = requireTransition(t, terminal, Transition{To: StatusSucceeded, At: finished, Progress: &completed, TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}}})
 
 	_, err := ApplyTransition(terminal, Transition{To: StatusRunning, At: finished.Add(time.Second)})
 	require.ErrorIs(t, err, ErrInvalidTransition)
@@ -104,9 +108,99 @@ func TestAggregateTargetResultsReturnsPartialForMixedResults(t *testing.T) {
 	require.Equal(t, Progress{TotalTargets: 2, CompletedTargets: 1, FailedTargets: 1}, AggregateProgress(results))
 }
 
+func TestAggregateOutcomeRequiresEveryTargetToBeTerminal(t *testing.T) {
+	tests := []struct {
+		name    string
+		results []TargetResult
+		want    Outcome
+	}{
+		{name: "all succeeded", results: []TargetResult{{Status: TargetSucceeded}, {Status: TargetSucceeded}}, want: OutcomeComplete},
+		{name: "success and failure", results: []TargetResult{{Status: TargetSucceeded}, {Status: TargetFailed}}, want: OutcomePartial},
+		{name: "success and running", results: []TargetResult{{Status: TargetSucceeded}, {Status: TargetRunning}}, want: OutcomeNone},
+		{name: "all failed", results: []TargetResult{{Status: TargetFailed}, {Status: TargetFailed}}, want: OutcomeNone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, AggregateOutcome(test.results))
+		})
+	}
+}
+
+func TestValidateTargetsRejectsDuplicatesUnknownAndMaximumOverflow(t *testing.T) {
+	base := runningJob()
+	base.TargetResourceIDs = []string{"db-1", "db-1"}
+	base.Progress.TotalTargets = 2
+	require.ErrorIs(t, ValidateTargets(base), ErrInvalidTransition)
+
+	overflow := Job{TargetResourceIDs: make([]string, MaximumTargetsPerJob+1), Progress: Progress{TotalTargets: MaximumTargetsPerJob + 1}}
+	for index := range overflow.TargetResourceIDs {
+		overflow.TargetResourceIDs[index] = fmt.Sprintf("db-%d", index)
+	}
+	require.ErrorIs(t, ValidateTargets(overflow), ErrInvalidTransition)
+
+	base = runningJob()
+	progress := Progress{TotalTargets: 1, CompletedTargets: 1}
+	_, err := ApplyTransition(base, Transition{
+		To: StatusRunning, At: base.StartedAt.Add(time.Second), Progress: &progress,
+		TargetResults: []TargetResult{{TargetID: "db-unknown", Status: TargetSucceeded}},
+	})
+	require.ErrorIs(t, err, ErrInvalidTransition)
+}
+
+func TestTransitionRejectsDuplicateUpdatesAndTerminalTargetRegression(t *testing.T) {
+	current := runningJob()
+	at := current.StartedAt.Add(time.Second)
+	_, err := ApplyTransition(current, Transition{
+		To: StatusRunning, At: at,
+		TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetRunning}, {TargetID: "db-1", Status: TargetRunning}},
+	})
+	require.ErrorIs(t, err, ErrInvalidTransition)
+
+	current.TargetResults[0].Status = TargetSucceeded
+	current.Progress = Progress{TotalTargets: 1, CompletedTargets: 1}
+	_, err = ApplyTransition(current, Transition{
+		To: StatusRunning, At: at,
+		TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetRunning}},
+	})
+	require.ErrorIs(t, err, ErrInvalidTransition)
+}
+
+func TestTransitionRequiresConsistentCompleteTargetsForSucceeded(t *testing.T) {
+	tests := []struct {
+		name     string
+		results  []TargetResult
+		progress Progress
+		wantErr  bool
+		outcome  Outcome
+	}{
+		{name: "all succeeded", results: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}, {TargetID: "db-2", Status: TargetSucceeded}}, progress: Progress{TotalTargets: 2, CompletedTargets: 2}, outcome: OutcomeComplete},
+		{name: "partial success", results: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}, {TargetID: "db-2", Status: TargetFailed}}, progress: Progress{TotalTargets: 2, CompletedTargets: 1, FailedTargets: 1}, outcome: OutcomePartial},
+		{name: "running target", results: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}, {TargetID: "db-2", Status: TargetRunning}}, progress: Progress{TotalTargets: 2, CompletedTargets: 1}, wantErr: true},
+		{name: "counter mismatch", results: []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}, {TargetID: "db-2", Status: TargetFailed}}, progress: Progress{TotalTargets: 2, CompletedTargets: 2}, wantErr: true},
+		{name: "no successful target", results: []TargetResult{{TargetID: "db-1", Status: TargetFailed}, {TargetID: "db-2", Status: TargetSkipped}}, progress: Progress{TotalTargets: 2, FailedTargets: 1, SkippedTargets: 1}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			current := runningJob()
+			current.TargetResourceIDs = []string{"db-1", "db-2"}
+			current.TargetResults = []TargetResult{{TargetID: "db-1", Status: TargetRunning}, {TargetID: "db-2", Status: TargetRunning}}
+			current.Progress = Progress{TotalTargets: 2}
+			got, err := ApplyTransition(current, Transition{To: StatusSucceeded, At: current.StartedAt.Add(time.Second), Progress: &test.progress, TargetResults: test.results})
+			if test.wantErr {
+				require.ErrorIs(t, err, ErrInvalidTransition)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.outcome, got.Outcome)
+			require.Equal(t, test.progress, got.Progress)
+		})
+	}
+}
+
 func TestTransitionMergesIncrementalTargetResultsWhileRunning(t *testing.T) {
 	current := runningJob()
 	originalStartedAt := *current.StartedAt
+	current.TargetResourceIDs = []string{"db-1", "db-2"}
 	current.Progress = Progress{TotalTargets: 2, CompletedTargets: 1}
 	current.TargetResults = []TargetResult{{TargetID: "db-1", Status: TargetSucceeded}}
 	at := current.StartedAt.Add(time.Minute)
@@ -138,6 +232,7 @@ func runningJob() Job {
 	return Job{
 		ID: "job-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"},
 		Type: "inspection.run", Status: StatusRunning, Outcome: OutcomeNone, Version: 3,
+		TargetResourceIDs: []string{"db-1"}, TargetResults: []TargetResult{{TargetID: "db-1", Status: TargetRunning}},
 		Progress: Progress{TotalTargets: 1}, CreatedAt: created, DispatchedAt: &dispatched, StartedAt: &started,
 	}
 }

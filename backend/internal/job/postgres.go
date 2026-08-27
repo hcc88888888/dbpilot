@@ -24,7 +24,7 @@ const selectJobSQL = "SELECT " + jobColumnsSQL + " FROM jobs WHERE tenant_id = $
 const selectTargetsSQL = "SELECT target_id, status, error_summary, result_summary, artifacts, finished_at FROM job_targets WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY target_id"
 const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, completed_targets = $4, failed_targets = $5, skipped_targets = $6, error_summary = $7, result_summary = $8, artifacts = $9, dispatched_at = $10, started_at = $11, finished_at = $12, cancel_requested_by = $13, cancel_requested_at = $14 WHERE tenant_id = $15 AND project_id = $16 AND id = $17 AND version = $18"
 const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts) SELECT id, tenant_id, project_id, job_id, target_id, message_type, payload, available_at, created_at, lease_expires_at, published_at, attempts FROM claimed ORDER BY created_at, id"
-const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = $1, lease_expires_at = NULL WHERE id = $2 AND published_at IS NULL"
+const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = $1, lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND published_at IS NULL"
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -104,20 +104,35 @@ func (repository *PostgresRepository) Get(ctx context.Context, scope platformsco
 	if strings.TrimSpace(id) == "" {
 		return Job{}, ErrNotFound
 	}
-	value, err := scanJob(repository.db.QueryRowContext(ctx, selectJobSQL, scope.TenantID, scope.ProjectID, id))
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
-		return Job{}, classifyReadError("get job", err)
+		return Job{}, fmt.Errorf("begin job snapshot: %w", err)
 	}
-	results, err := repository.getTargets(ctx, scope, id)
+	rollback := func(cause error) (Job, error) {
+		_ = tx.Rollback()
+		return Job{}, cause
+	}
+	value, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL, scope.TenantID, scope.ProjectID, id))
 	if err != nil {
-		return Job{}, err
+		return rollback(classifyReadError("get job", err))
+	}
+	results, err := getTargetsFrom(ctx, tx, scope, id)
+	if err != nil {
+		return rollback(err)
 	}
 	value.TargetResults = results
 	value.TargetResourceIDs = make([]string, len(results))
 	for index := range results {
 		value.TargetResourceIDs[index] = results[index].TargetID
 	}
-	return normalizeJobUTC(value), nil
+	value = normalizeJobUTC(value)
+	if err := ValidateTargets(value); err != nil {
+		return rollback(fmt.Errorf("validate persisted job targets: %w", err))
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, fmt.Errorf("commit job snapshot: %w", err)
+	}
+	return value, nil
 }
 
 func (repository *PostgresRepository) Transition(ctx context.Context, transition Transition) (Job, error) {
@@ -142,15 +157,13 @@ func (repository *PostgresRepository) Transition(ctx context.Context, transition
 	if transition.CurrentVersion == 0 {
 		transition.CurrentVersion = current.Version
 	}
-	if transition.TargetResults != nil {
-		current.TargetResults, err = getTargetsFrom(ctx, tx, transition.Scope, transition.JobID)
-		if err != nil {
-			return rollback(Job{}, err)
-		}
-		current.TargetResourceIDs = make([]string, len(current.TargetResults))
-		for index := range current.TargetResults {
-			current.TargetResourceIDs[index] = current.TargetResults[index].TargetID
-		}
+	current.TargetResults, err = getTargetsFrom(ctx, tx, transition.Scope, transition.JobID)
+	if err != nil {
+		return rollback(Job{}, err)
+	}
+	current.TargetResourceIDs = make([]string, len(current.TargetResults))
+	for index := range current.TargetResults {
+		current.TargetResourceIDs[index] = current.TargetResults[index].TargetID
 	}
 	next, err := ApplyTransition(current, transition)
 	if err != nil {
@@ -224,14 +237,17 @@ func (repository *PostgresRepository) ClaimOutbox(ctx context.Context, limit int
 	return messages, nil
 }
 
-func (repository *PostgresRepository) MarkOutboxPublished(ctx context.Context, id string, at time.Time) error {
+func (repository *PostgresRepository) MarkOutboxPublished(ctx context.Context, scope platformscope.Scope, id string, at time.Time) error {
 	if repository == nil || repository.db == nil {
 		return errors.New("job PostgreSQL repository is unavailable")
+	}
+	if err := scope.Validate(); err != nil {
+		return err
 	}
 	if strings.TrimSpace(id) == "" || at.IsZero() {
 		return ErrNotFound
 	}
-	result, err := repository.db.ExecContext(ctx, markOutboxPublishedSQL, at.UTC(), id)
+	result, err := repository.db.ExecContext(ctx, markOutboxPublishedSQL, at.UTC(), scope.TenantID, scope.ProjectID, id)
 	if err != nil {
 		return fmt.Errorf("mark outbox published: %w", err)
 	}
@@ -243,10 +259,6 @@ func (repository *PostgresRepository) MarkOutboxPublished(ctx context.Context, i
 		return ErrNotFound
 	}
 	return nil
-}
-
-func (repository *PostgresRepository) getTargets(ctx context.Context, scope platformscope.Scope, id string) ([]TargetResult, error) {
-	return getTargetsFrom(ctx, repository.db, scope, id)
 }
 
 type rowQueryer interface {
@@ -329,8 +341,8 @@ func validateNewJob(value Job) error {
 	if strings.TrimSpace(value.ID) == "" || strings.TrimSpace(value.Type) == "" || strings.TrimSpace(value.IdempotencyKey) == "" || value.Status != StatusQueued || value.Outcome != OutcomeNone || value.Version < 1 || value.CreatedAt.IsZero() || !validProgressChange(value.Progress, value.Progress) {
 		return fmt.Errorf("create job: %w", ErrInvalidTransition)
 	}
-	if value.Progress.TotalTargets != len(value.TargetResourceIDs) {
-		return fmt.Errorf("create job target count: %w", ErrInvalidTransition)
+	if err := ValidateTargets(value); err != nil {
+		return fmt.Errorf("create job targets: %w", err)
 	}
 	return nil
 }
