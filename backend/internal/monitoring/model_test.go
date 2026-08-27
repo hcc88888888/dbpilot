@@ -52,6 +52,16 @@ func TestInstanceDTONeverCarriesRawPayloadOrSecret(t *testing.T) {
 	require.Equal(t, "mysql", got.Labels["engine"])
 }
 
+func TestInstanceDTORedactsCommonCredentialLabelsAndInlineSecrets(t *testing.T) {
+	got := RedactInstance(Instance{
+		Labels:       map[string]string{"api_key": "key-1", "access_key": "key-2", "client_secret": "key-3", "engine": "mysql"},
+		ErrorSummary: "collector rejected request: password=hunter2",
+	})
+
+	require.Equal(t, map[string]string{"engine": "mysql"}, got.Labels)
+	require.Empty(t, got.ErrorSummary)
+}
+
 func TestMemoryStoreRejectsCrossScopeInstanceAndReturnsCopies(t *testing.T) {
 	scope := alert.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
 	store := NewMemoryStore(
@@ -90,6 +100,22 @@ func TestMemoryStoreDetailBuildsNullBucketsWithoutMutatingStoredDTO(t *testing.T
 	require.Nil(t, detail.Metrics[0].Buckets[1].Value)
 	require.NotContains(t, detail.Instance.Labels, "password")
 	require.Empty(t, detail.Instance.RawPayload)
+}
+
+func TestMemoryStoreDetailUsesNewestNonNilBucketForLatest(t *testing.T) {
+	scope := alert.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	store := NewMemoryStore(
+		[]Instance{{ID: "db-1", Scope: scope, LastSampleAt: time.Date(2026, 8, 27, 9, 30, 0, 0, time.UTC), LastHeartbeatAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC), CollectEvery: time.Hour}},
+		[]alert.MetricSample{{Scope: scope, InstanceID: "db-1", Name: "host.cpu", Value: 12, SampledAt: time.Date(2026, 8, 27, 9, 30, 0, 0, time.UTC)}},
+		nil,
+	)
+	store.SetNow(func() time.Time { return time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC) })
+
+	detail, err := store.GetInstance(context.Background(), scope, "db-1", RangeQuery{From: time.Date(2026, 8, 27, 9, 0, 0, 0, time.UTC), To: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC), Step: time.Hour})
+	require.NoError(t, err)
+	require.Nil(t, detail.Metrics[0].Buckets[1].Value)
+	require.NotNil(t, detail.Instance.Latest["host.cpu"])
+	require.Equal(t, 12.0, *detail.Instance.Latest["host.cpu"])
 }
 
 func TestMemoryStoreOverviewReturnsClassifiedRedactedInstances(t *testing.T) {

@@ -158,9 +158,7 @@ func (s *MemoryStore) GetInstance(_ context.Context, scope alert.Scope, instance
 	for _, metric := range metrics {
 		series := buildMetricSeries(samples, scope, instanceID, metric, query)
 		detail.Metrics = append(detail.Metrics, series)
-		if len(series.Buckets) > 0 {
-			instance.Latest[metric] = copyFloat(series.Buckets[len(series.Buckets)-1].Value)
-		}
+		instance.Latest[metric] = latestSeriesValue(series)
 	}
 	detail.Instance = RedactInstance(instance)
 	return detail, nil
@@ -330,6 +328,15 @@ func copyFloat(value *float64) *float64 {
 	}
 	copy := *value
 	return &copy
+}
+
+func latestSeriesValue(series Series) *float64 {
+	for index := len(series.Buckets) - 1; index >= 0; index-- {
+		if series.Buckets[index].Value != nil {
+			return copyFloat(series.Buckets[index].Value)
+		}
+	}
+	return nil
 }
 
 var _ QueryStore = (*MemoryStore)(nil)

@@ -300,9 +300,14 @@ func redactLabels(labels map[string]string) map[string]string {
 
 func sensitiveLabel(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
-	for _, word := range []string{"password", "secret", "token", "credential", "authorization", "dsn", "connection_string", "private_key"} {
-		if normalized == word || strings.HasSuffix(normalized, "_"+word) || strings.HasPrefix(normalized, word+"_") {
+	for _, word := range []string{"password", "secret", "token", "credential", "authorization", "dsn", "key"} {
+		if normalized == word {
 			return true
+		}
+		for _, separator := range []string{"_", "-", "."} {
+			if strings.HasSuffix(normalized, separator+word) || strings.HasPrefix(normalized, word+separator) {
+				return true
+			}
 		}
 	}
 	return false
@@ -310,7 +315,15 @@ func sensitiveLabel(key string) bool {
 
 func containsSecret(value string) bool {
 	normalized := strings.ToLower(value)
-	return strings.Contains(normalized, "secret://") || strings.Contains(normalized, "://") && strings.Contains(normalized, "@")
+	if strings.Contains(normalized, "secret://") || strings.Contains(normalized, "://") && strings.Contains(normalized, "@") {
+		return true
+	}
+	for _, key := range []string{"password", "secret", "token", "credential", "authorization", "api_key", "access_key", "client_secret", "private_key", "dsn"} {
+		if strings.Contains(normalized, key+"=") || strings.Contains(normalized, key+":") || strings.Contains(normalized, "\""+key+"\"") {
+			return true
+		}
+	}
+	return false
 }
 
 func redactText(value string) string {
