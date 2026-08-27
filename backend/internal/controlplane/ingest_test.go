@@ -62,7 +62,6 @@ func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
 	resourceAttributes.PutStr("component", "postgres")
 	resourceAttributes.PutStr("role", "primary")
 	resourceAttributes.PutStr("host.name", "postgres-1.internal")
-	resourceAttributes.PutStr("tenant_id", "payload-must-not-control-scope")
 	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
 	metric.SetName("host.cpu.utilization")
 	point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
@@ -77,7 +76,102 @@ func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
 	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
 	require.Equal(t, "agent-a", store.samples[0].AgentID)
 	require.Equal(t, "postgres-1.internal", store.samples[0].Host)
-	require.NotContains(t, store.samples[0].Labels, "tenant_id")
+}
+
+func TestMetricConsumerRejectsOTLPScopeClaims(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})
+	for _, location := range []string{"resource", "datapoint"} {
+		t.Run(location, func(t *testing.T) {
+			metrics := pmetric.NewMetrics()
+			resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+			attributes := resourceMetrics.Resource().Attributes()
+			attributes.PutStr("instance", "postgres-1")
+			attributes.PutStr("component", "postgres")
+			attributes.PutStr("role", "primary")
+			attributes.PutStr("host", "postgres-1.internal")
+			metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+			metric.SetName("host.cpu.utilization")
+			point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+			point.SetDoubleValue(42.5)
+			point.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Minute)))
+			if location == "resource" {
+				attributes.PutStr("tenant_id", "payload-scope")
+			} else {
+				point.Attributes().PutStr("project-id", "payload-scope")
+			}
+			payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+			require.NoError(t, err)
+			err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+			require.ErrorContains(t, err, "scope claim")
+		})
+	}
+}
+
+func TestMetricConsumerPreservesSafeOTLPSumDimensionsAndUsesReceivedTimeForZeroTimestamp(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	attributes := resourceMetrics.Resource().Attributes()
+	attributes.PutStr("instance", "postgres-1")
+	attributes.PutStr("component", "postgres")
+	attributes.PutStr("role", "primary")
+	attributes.PutStr("host", "postgres-1.internal")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("system.disk.io")
+	points := metric.SetEmptySum().DataPoints()
+	for _, device := range []string{"sda", "sdb"} {
+		point := points.AppendEmpty()
+		point.SetIntValue(7)
+		point.Attributes().PutStr("device.name", device)
+		point.Attributes().PutStr("cpu-id", "0")
+		point.Attributes().PutStr("agent_id", "untrusted-payload-agent")
+		point.Attributes().PutStr("api.token", "secret-value")
+	}
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.NoError(t, err)
+	require.Len(t, store.samples, 2)
+	require.Equal(t, float64(7), store.samples[0].Value)
+	require.Equal(t, now, store.samples[0].SampledAt)
+	require.Equal(t, "sda", store.samples[0].Labels["device_name"])
+	require.Equal(t, "sdb", store.samples[1].Labels["device_name"])
+	require.Equal(t, "0", store.samples[0].Labels["cpu_id"])
+	require.NotContains(t, store.samples[0].Labels, "agent_id")
+	require.NotContains(t, store.samples[0].Labels, "api_token")
+	require.NotEqual(t, alert.SeriesFingerprint(store.samples[0].Labels), alert.SeriesFingerprint(store.samples[1].Labels))
+}
+
+func TestMetricConsumerLimitsOTLPAttributeLabels(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	metrics := pmetric.NewMetrics()
+	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
+	attributes := resourceMetrics.Resource().Attributes()
+	attributes.PutStr("instance", "postgres-1")
+	attributes.PutStr("component", "postgres")
+	attributes.PutStr("role", "primary")
+	attributes.PutStr("host", "postgres-1.internal")
+	metric := resourceMetrics.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	metric.SetName("host.cpu.utilization")
+	point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+	point.SetDoubleValue(1)
+	point.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	for index := 0; index < 70; index++ {
+		point.Attributes().PutStr(fmt.Sprintf("dimension-%02d", index), "value")
+	}
+	payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+	require.NoError(t, err)
+
+	err = consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now)
+	require.NoError(t, err)
+	require.Len(t, store.samples, 1)
+	require.Len(t, store.samples[0].Labels, 64)
 }
 
 func TestMetricConsumerAcceptsDependencyCollectorEnvelopeWithoutTrustingAgentID(t *testing.T) {

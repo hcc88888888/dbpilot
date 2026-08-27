@@ -11,8 +11,10 @@ import (
 	"io"
 	"math"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/database"
@@ -312,6 +314,9 @@ func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Ti
 	for resourceIndex := 0; resourceIndex < resources.Len(); resourceIndex++ {
 		resource := resources.At(resourceIndex)
 		resourceAttributes := otelAttributes(resource.Resource().Attributes())
+		if err := rejectOTLPScopeClaims(resourceAttributes); err != nil {
+			return metricEnvelope{}, err
+		}
 		scopes := resource.ScopeMetrics()
 		for scopeIndex := 0; scopeIndex < scopes.Len(); scopeIndex++ {
 			metricList := scopes.At(scopeIndex).Metrics()
@@ -319,9 +324,13 @@ func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Ti
 				metric := metricList.At(metricIndex)
 				switch metric.Type() {
 				case pmetric.MetricTypeGauge:
-					appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Gauge().DataPoints(), agentID, receivedAt)
+					if err := appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Gauge().DataPoints(), agentID, receivedAt); err != nil {
+						return metricEnvelope{}, err
+					}
 				case pmetric.MetricTypeSum:
-					appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Sum().DataPoints(), agentID, receivedAt)
+					if err := appendOTLPNumberPoints(&result, metric.Name(), resourceAttributes, metric.Sum().DataPoints(), agentID, receivedAt); err != nil {
+						return metricEnvelope{}, err
+					}
 				}
 			}
 		}
@@ -332,28 +341,40 @@ func decodeOTLPMetricEnvelope(payload []byte, agentID string, receivedAt time.Ti
 	return result, nil
 }
 
-func appendOTLPNumberPoints(result *metricEnvelope, name string, resourceAttributes map[string]string, points pmetric.NumberDataPointSlice, agentID string, receivedAt time.Time) {
+func appendOTLPNumberPoints(result *metricEnvelope, name string, resourceAttributes map[string]string, points pmetric.NumberDataPointSlice, agentID string, receivedAt time.Time) error {
 	for pointIndex := 0; pointIndex < points.Len(); pointIndex++ {
 		point := points.At(pointIndex)
+		if point.ValueType() != pmetric.NumberDataPointValueTypeDouble && point.ValueType() != pmetric.NumberDataPointValueTypeInt {
+			continue
+		}
 		attributes := mapsClone(resourceAttributes)
 		for key, value := range otelAttributes(point.Attributes()) {
 			attributes[key] = value
 		}
-		timestamp := point.Timestamp().AsTime()
-		if timestamp.IsZero() {
-			timestamp = point.StartTimestamp().AsTime()
+		labels, err := canonicalOTLPLabels(attributes, agentID)
+		if err != nil {
+			return err
 		}
-		if timestamp.IsZero() {
-			timestamp = receivedAt
+		timestamp := point.Timestamp()
+		if timestamp == 0 {
+			timestamp = point.StartTimestamp()
+		}
+		sampledAt := receivedAt
+		if timestamp != 0 {
+			sampledAt = timestamp.AsTime()
+		}
+		if sampledAt.IsZero() {
+			sampledAt = receivedAt
 		}
 		value := point.DoubleValue()
 		if point.ValueType() == pmetric.NumberDataPointValueTypeInt {
 			value = float64(point.IntValue())
 		}
 		result.Samples = append(result.Samples, metricPayload{
-			Name: name, Value: value, SampledAt: timestamp.UTC().Format(time.RFC3339Nano), Labels: canonicalOTLPLabels(attributes, agentID),
+			Name: name, Value: value, SampledAt: sampledAt.UTC().Format(time.RFC3339Nano), Labels: labels,
 		})
 	}
+	return nil
 }
 
 func otelAttributes(attributes pcommon.Map) map[string]string {
@@ -374,7 +395,7 @@ func otelAttributes(attributes pcommon.Map) map[string]string {
 	return result
 }
 
-func canonicalOTLPLabels(attributes map[string]string, agentID string) map[string]string {
+func canonicalOTLPLabels(attributes map[string]string, agentID string) (map[string]string, error) {
 	component := firstMetricAttribute(attributes, "component", "service.name", "db.system", "dbpilot.source.id")
 	if component == "" {
 		component = "telemetry"
@@ -383,13 +404,91 @@ func canonicalOTLPLabels(attributes map[string]string, agentID string) map[strin
 	if engine == "" {
 		engine = component
 	}
-	return map[string]string{
+	labels := map[string]string{
 		"instance":  firstNonEmpty(firstMetricAttribute(attributes, "instance", "service.instance.id", "db.instance.id", "dbpilot.source.id", "service.name"), agentID),
 		"component": component,
 		"role":      firstNonEmpty(firstMetricAttribute(attributes, "role", "db.role", "service.role"), "collector"),
 		"host":      firstNonEmpty(firstMetricAttribute(attributes, "host", "host.name", "server.address", "net.host.name"), agentID),
 		"engine":    engine,
 	}
+	keys := make([]string, 0, len(attributes))
+	for key := range attributes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if isOTLPScopeClaim(key) {
+			return nil, ErrMetricScopeClaim
+		}
+		normalized := normalizeOTLPLabelKey(key)
+		value := strings.TrimSpace(attributes[key])
+		if normalized == "" || !metricLabelKey.MatchString(normalized) || isOTLPAgentClaim(key) || isUnsafeOTLPAttribute(normalized, value) {
+			continue
+		}
+		if _, exists := labels[normalized]; exists || len(labels) >= 64 {
+			continue
+		}
+		labels[normalized] = value
+	}
+	return labels, nil
+}
+
+func rejectOTLPScopeClaims(attributes map[string]string) error {
+	for key := range attributes {
+		if isOTLPScopeClaim(key) {
+			return ErrMetricScopeClaim
+		}
+	}
+	return nil
+}
+
+func isOTLPScopeClaim(key string) bool {
+	normalized := normalizeOTLPLabelKey(key)
+	return normalized == "tenant" || normalized == "tenant_id" || normalized == "project" || normalized == "project_id" || normalized == "scope" || strings.HasSuffix(normalized, "_tenant_id") || strings.HasSuffix(normalized, "_project_id")
+}
+
+func isOTLPAgentClaim(key string) bool {
+	normalized := normalizeOTLPLabelKey(key)
+	return normalized == "agent" || normalized == "agent_id" || strings.HasSuffix(normalized, "_agent_id")
+}
+
+func normalizeOTLPLabelKey(key string) string {
+	var result strings.Builder
+	separator := false
+	for _, character := range strings.ToLower(strings.TrimSpace(key)) {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) || character == '_' {
+			result.WriteRune(character)
+			separator = false
+			continue
+		}
+		if !separator && result.Len() > 0 {
+			result.WriteByte('_')
+			separator = true
+		}
+	}
+	normalized := strings.Trim(result.String(), "_")
+	if normalized == "" {
+		return ""
+	}
+	if first := normalized[0]; first >= '0' && first <= '9' {
+		normalized = "_" + normalized
+	}
+	return normalized
+}
+
+func isUnsafeOTLPAttribute(key, value string) bool {
+	for _, marker := range []string{"password", "passwd", "secret", "token", "credential", "api_key", "authorization"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	normalized := strings.ToLower(value)
+	for _, marker := range []string{"password=", "passwd=", "secret=", "token=", "bearer ", "authorization:", "postgres://", "postgresql://", "mysql://"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func firstMetricAttribute(attributes map[string]string, keys ...string) string {
