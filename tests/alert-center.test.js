@@ -120,6 +120,31 @@ test('numeric backend durations normalize from nanoseconds for rule editing and 
   assert.match(markup, /name="for" required value="1m30s"/);
 });
 
+test('decimal nanosecond strings preserve long backend durations in the rule editor', () => {
+  assert.equal(normalizeDuration('9072000000000000'), '2520h');
+  assert.equal(normalizeDuration('9223372036854775807'), '2562047h47m16s854ms775us807ns');
+  const markup = ruleEditorMarkup({
+    evaluation_every: '60000000000',
+    lookback_window: '9072000000000000',
+    for: '9223372036854775807',
+  }, []);
+  assert.match(markup, /option value="1m" selected/);
+  assert.match(markup, /name="lookbackWindow" value="2520h"/);
+  assert.match(markup, /name="for" required value="2562047h47m16s854ms775us807ns"/);
+});
+
+test('unsafe numeric duration responses lock editing instead of substituting defaults', () => {
+  const markup = ruleEditorMarkup({
+    evaluation_every: 60_000_000_000,
+    lookback_window: 60_000_000_000,
+    for: 9_072_000_000_000_000,
+  }, []);
+  assert.match(markup, /data-duration-precision-guard/);
+  assert.match(markup, /规则已锁定，避免覆盖无法无损读取的持续时长/);
+  assert.match(markup, /<fieldset[^>]*disabled/);
+  assert.doesNotMatch(markup, /name="for" required value="5m"/);
+});
+
 test('rule validation rejects a lookback duration the backend cannot parse', () => {
   assert.deepEqual(validateRule({ metric: 'db.connections', threshold: 80, for: '5m', evaluationEvery: '1m', lookbackWindow: 'one minute', notificationPolicyIds: ['policy-1'] }), {
     lookbackWindow: '回看窗口格式应为 5m 或 1h',

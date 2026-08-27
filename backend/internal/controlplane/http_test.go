@@ -23,6 +23,35 @@ func TestRuleCreateRejectsPrincipalOutsideProjectBeforeServiceCall(t *testing.T)
 	require.Zero(t, fixture.repository.calls)
 }
 
+func TestRuleResponsesSerializeLongDurationsAsLosslessStrings(t *testing.T) {
+	fixture := newHTTPFixture()
+	rule := fixture.repository.rules["rule-1"]
+	rule.EvaluationEvery = time.Duration(9_072_000_000_000_000)
+	rule.LookbackWindow = time.Duration(9_223_372_036_854_775_807)
+	rule.For = time.Duration(9_223_372_036_854_775_807)
+	fixture.repository.rules[rule.ID] = rule
+
+	response := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/rules/rule-1", memberFor("t1", "p1"), nil)
+	require.Equal(t, http.StatusOK, response.Code)
+
+	var output struct {
+		EvaluationEvery string `json:"evaluation_every"`
+		LookbackWindow  string `json:"lookback_window"`
+		For             string `json:"for"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &output))
+	require.Equal(t, "2520h0m0s", output.EvaluationEvery)
+	require.Equal(t, "2562047h47m16.854775807s", output.LookbackWindow)
+	require.Equal(t, "2562047h47m16.854775807s", output.For)
+
+	var input ruleInput
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &input))
+	roundTripped := input.value(fixture.scope, rule.ID)
+	require.Equal(t, rule.EvaluationEvery, roundTripped.EvaluationEvery)
+	require.Equal(t, rule.LookbackWindow, roundTripped.LookbackWindow)
+	require.Equal(t, rule.For, roundTripped.For)
+}
+
 func TestEventAcknowledgeWritesActorAndReturnsScopedEvent(t *testing.T) {
 	fixture := newHTTPFixture()
 	response := fixture.request(http.MethodPost, "/api/v1/tenants/t1/projects/p1/alerts/event-1/acknowledge", memberFor("t1", "p1"), []byte(`{"category":"investigating","reason":"operator accepted the incident"}`))

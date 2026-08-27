@@ -47,6 +47,7 @@ const TEMPLATE_PREVIEW_VALUES = new Map([
 
 const SENSITIVE_VALUE_PATTERN = /(?:\b(?:password|passwd|pwd|token|secret|authorization|credential|api[_\s-]?key|access[_\s-]?key|client[_\s-]?secret)\b|\bbearer\s+\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+(?::[^\s/@]*)?@[^\s/]+)/i;
 const CONTROL_PLANE_DURATION_PATTERN = /^(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+$/;
+const CONTROL_PLANE_MAX_DURATION_NS = 9_223_372_036_854_775_807n;
 const SILENCE_RESERVED_MATCHER_KEYS = new Set(['fingerprint', 'resource', 'tenant_id', 'project_id', 'scope']);
 
 export function resolveAlertContext(baseUrl, rawContext) {
@@ -67,14 +68,24 @@ export function resolveAlertContext(baseUrl, rawContext) {
 }
 
 export function normalizeDuration(value) {
-  if (typeof value !== 'number') return String(value ?? '').trim();
-  if (!Number.isSafeInteger(value) || value <= 0) return '';
-  const units = [['h', 3_600_000_000_000], ['m', 60_000_000_000], ['s', 1_000_000_000], ['ms', 1_000_000], ['us', 1_000], ['ns', 1]];
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!/^\d+$/.test(text)) return text;
+    return formatNanoseconds(BigInt(text));
+  }
+  if (typeof value === 'bigint') return formatNanoseconds(value);
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return '';
+  return formatNanoseconds(BigInt(value));
+}
+
+function formatNanoseconds(value) {
+  if (value <= 0n || value > CONTROL_PLANE_MAX_DURATION_NS) return '';
+  const units = [['h', 3_600_000_000_000n], ['m', 60_000_000_000n], ['s', 1_000_000_000n], ['ms', 1_000_000n], ['us', 1_000n], ['ns', 1n]];
   let remaining = value;
   let result = '';
   for (const [suffix, nanoseconds] of units) {
-    const count = Math.floor(remaining / nanoseconds);
-    if (!count) continue;
+    const count = remaining / nanoseconds;
+    if (count === 0n) continue;
     result += `${count}${suffix}`;
     remaining -= count * nanoseconds;
   }
@@ -431,18 +442,29 @@ function policyTargetLabel(policy) {
   return policy.targetRequiresReplacement ? '渠道目标已隐藏，需重新输入' : safePolicyTarget(valueOf(policy, 'target')) || '—';
 }
 
+function ruleEditorDuration(value, fallback) {
+  if (value == null || String(value).trim() === '') return { value: fallback, invalid: false };
+  const normalized = normalizeDuration(value);
+  return { value: normalized, invalid: !isPositiveDuration(normalized) };
+}
+
 export function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
   const policyItems = Array.isArray(policies) ? policies : [];
   const policyIds = valueOf(rule, 'notificationPolicyIds', 'notification_policy_ids') ?? [];
   const selected = new Set(Array.isArray(policyIds) ? policyIds.map(String) : []);
-  const period = normalizeDuration(valueOf(rule, 'evaluationEvery', 'evaluation_every')) || '1m';
-  const lookback = normalizeDuration(valueOf(rule, 'lookbackWindow', 'lookback_window')) || period;
-  const sustained = normalizeDuration(valueOf(rule, 'for')) || '5m';
+  const periodInput = ruleEditorDuration(valueOf(rule, 'evaluationEvery', 'evaluation_every'), '1m');
+  const period = periodInput.value;
+  const lookbackInput = ruleEditorDuration(valueOf(rule, 'lookbackWindow', 'lookback_window'), period);
+  const lookback = lookbackInput.value;
+  const sustainedInput = ruleEditorDuration(valueOf(rule, 'for'), '5m');
+  const sustained = sustainedInput.value;
+  const durationLocked = periodInput.invalid || lookbackInput.invalid || sustainedInput.invalid;
   const standardPeriods = ['10s', '30s', '1m', '5m', '10m', '1h'];
   const periods = standardPeriods.includes(period) ? standardPeriods : [...standardPeriods, period];
   return `
     <div class="alert-drawer-head"><div><span class="eyebrow">规则编辑</span><h3>${rule.id ? '编辑规则' : '新建规则'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
     <form class="alert-config-form" data-rule-form>
+      <fieldset${durationLocked ? ' disabled data-duration-precision-guard' : ''}>
       <label>规则名称<input name="name" required value="${safeText(valueOf(rule, 'name') ?? '')}" placeholder="例如：连接数过高" /></label>
       <div class="alert-form-grid"><label>指标<input name="metric" required value="${safeText(valueOf(rule, 'metric') ?? '')}" placeholder="db.connections" /></label><label>聚合<select name="aggregation">${['avg', 'max', 'min', 'sum'].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'aggregation') ?? 'avg') ? 'selected' : ''}>${value}</option>`).join('')}</select></label></div>
       <div class="alert-form-grid"><label>运算符<select name="operator">${['>', '>=', '<', '<=', '==', '!='].map((value) => `<option value="${value}" ${value === (valueOf(rule, 'operator') ?? '>') ? 'selected' : ''}>${safeText(value)}</option>`).join('')}</select></label><label>阈值<input name="threshold" type="number" min="0" step="any" required value="${safeText(valueOf(rule, 'threshold') ?? '')}" /></label></div>
@@ -452,8 +474,10 @@ export function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
       <label>标签选择器<textarea name="labels" rows="3" placeholder="instance=db-01">${safeText(labelsText(valueOf(rule, 'labels')))}</textarea></label>
       <fieldset><legend>通知策略</legend>${policyItems.length ? policyItems.map((policy) => `<label class="alert-check-label"><input name="notificationPolicyIds" type="checkbox" value="${safeText(policy.id)}" ${selected.has(String(policy.id)) ? 'checked' : ''} />${displayValue(policy.name ?? policy.id)}</label>`).join('') : '<p class="alert-form-hint">暂无可引用的通知策略，请先创建通知策略。</p>'}</fieldset>
       <p class="alert-evaluation-summary" data-rule-summary>${safeText(ruleSummary({ ...rule, evaluationEvery: period, lookbackWindow: lookback }, policyItems))}</p>
+      </fieldset>
+      ${durationLocked ? '<p class="alert-form-errors" data-duration-precision-guard>规则已锁定，避免覆盖无法无损读取的持续时长；请升级控制面服务后刷新此规则。</p>' : ''}
       <p class="alert-form-errors" aria-live="polite">${safeText(Object.values(errors).join(' '))}</p>
-      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit">保存规则</button></div>
+      <div class="alert-drawer-actions"><button type="button" data-alert-drawer-close>取消</button><button type="submit" ${durationLocked ? 'disabled' : ''}>保存规则</button></div>
     </form>`;
 }
 

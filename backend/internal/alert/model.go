@@ -4,6 +4,7 @@ package alert
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -128,6 +129,37 @@ type AlertRule struct {
 	Enabled               bool              `json:"enabled"`
 	CreatedAt             time.Time         `json:"created_at"`
 	UpdatedAt             time.Time         `json:"updated_at"`
+}
+
+// MarshalJSON encodes duration fields as Go duration strings. JSON numbers
+// larger than JavaScript's safe-integer range lose precision in browser
+// clients, while duration strings remain exact through a read-edit-write cycle.
+func (r AlertRule) MarshalJSON() ([]byte, error) {
+	type alertRuleJSON struct {
+		ID                    string            `json:"id"`
+		Scope                 Scope             `json:"scope"`
+		Name                  string            `json:"name"`
+		Metric                string            `json:"metric"`
+		Aggregation           string            `json:"aggregation"`
+		Operator              string            `json:"operator"`
+		Threshold             float64           `json:"threshold"`
+		EvaluationEvery       string            `json:"evaluation_every"`
+		LookbackWindow        string            `json:"lookback_window"`
+		For                   string            `json:"for"`
+		MissingData           string            `json:"missing_data"`
+		Severity              string            `json:"severity"`
+		NotificationPolicyIDs []string          `json:"notification_policy_ids,omitempty"`
+		Labels                map[string]string `json:"labels,omitempty"`
+		Enabled               bool              `json:"enabled"`
+		CreatedAt             time.Time         `json:"created_at"`
+		UpdatedAt             time.Time         `json:"updated_at"`
+	}
+	return json.Marshal(alertRuleJSON{
+		ID: r.ID, Scope: r.Scope, Name: r.Name, Metric: r.Metric, Aggregation: r.Aggregation, Operator: r.Operator,
+		Threshold: r.Threshold, EvaluationEvery: r.EvaluationEvery.String(), LookbackWindow: r.LookbackWindow.String(),
+		For: r.For.String(), MissingData: r.MissingData, Severity: r.Severity, NotificationPolicyIDs: r.NotificationPolicyIDs,
+		Labels: r.Labels, Enabled: r.Enabled, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	})
 }
 
 func (r AlertRule) Validate() error {
