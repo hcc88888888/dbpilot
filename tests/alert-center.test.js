@@ -45,6 +45,20 @@ test('policy display exposes configuration state but never a secret reference', 
   assert.equal('secretRef' in safe, false);
 });
 
+test('tokenized policy target is removed and requires a replacement while a normal target remains editable', () => {
+  const protectedPolicy = sanitizePolicyForDisplay({ target: 'https://hooks.example/ops?token=top-secret&route=primary' });
+  assert.equal(protectedPolicy.target, '');
+  assert.equal(protectedPolicy.targetRequiresReplacement, true);
+  assert.equal(JSON.stringify(protectedPolicy).includes('top-secret'), false);
+  assert.deepEqual(validatePolicy({ name: '值班', channel: 'webhook', target: protectedPolicy.target, templateId: 'template-1' }), {
+    target: '请填写渠道目标',
+  });
+
+  const normalPolicy = sanitizePolicyForDisplay({ target: 'https://hooks.example/ops?route=primary' });
+  assert.equal(normalPolicy.target, 'https://hooks.example/ops?route=primary');
+  assert.equal(normalPolicy.targetRequiresReplacement, false);
+});
+
 test('formatSeverity renders an understandable Chinese severity label', () => {
   assert.equal(formatSeverity('critical'), '紧急');
 });

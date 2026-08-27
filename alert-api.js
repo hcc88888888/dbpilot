@@ -99,7 +99,7 @@ function createDemoAdapter() {
   const store = {
     alerts: [{ id: 'alert-1', title: '复制延迟过高', state: 'firing', severity: 'critical', last_seen: '2026-08-27T09:30:00Z' }],
     rules: [{ id: 'rule-1', name: '复制延迟', enabled: true, severity: 'critical' }],
-    notificationPolicies: [{ id: 'policy-1', name: '值班通知', channel: 'webhook', enabled: true, secret_ref: 'env://DBPILOT_WEBHOOK_TOKEN' }],
+    notificationPolicies: [{ id: 'policy-1', name: '值班通知', channel: 'webhook', enabled: true, has_secret: true }],
     templates: [{ id: 'template-1', name: '默认模板', subject: '数据库告警', body: '{{event.id}}' }],
     silences: [{ id: 'silence-1', matchers: { 'label.instance': 'mysql-demo-01' }, reason: '演示维护窗口' }],
   };
@@ -219,10 +219,16 @@ function redactDTO(value, inDelivery = false) {
   if (Array.isArray(value)) return value.map((item) => redactDTO(item, inDelivery));
   if (!value || typeof value !== 'object') return value;
   return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
+    if (isSecretConfigurationMarker(key)) return [['has_secret', Boolean(item)]];
     if (isUnsafeDTOKey(key, inDelivery)) return [];
     if (key === 'deliveries') return [[key, Array.isArray(item) ? item.map(safeDelivery) : []]];
     return [[key, redactDTO(item, inDelivery)]];
   }));
+}
+
+function isSecretConfigurationMarker(key) {
+  const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return normalized === 'hassecret' || normalized === 'secretconfigured';
 }
 
 function isUnsafeDTOKey(key, inDelivery) {

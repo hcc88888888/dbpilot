@@ -84,6 +84,8 @@ export function validatePolicy(input = {}) {
 
 export function sanitizePolicyForDisplay(policy = {}) {
   const {
+    target: rawTarget,
+    targetRequiresReplacement: ignoredTargetReplacement,
     secret_ref: secretRefSnake,
     secretRef,
     has_secret: hasSecretSnake,
@@ -92,8 +94,11 @@ export function sanitizePolicyForDisplay(policy = {}) {
     secretConfigured,
     ...safe
   } = policy;
+  const targetRequiresReplacement = hasTokenizedQueryTarget(rawTarget);
   return {
     ...safe,
+    ...(rawTarget === undefined ? {} : { target: targetRequiresReplacement ? '' : rawTarget }),
+    targetRequiresReplacement,
     secretConfigured: Boolean(secretRefSnake || secretRef || hasSecretSnake || hasSecret || secretConfiguredSnake || secretConfigured),
   };
 }
@@ -270,18 +275,24 @@ function secretConfigured(policy) {
   return sanitizePolicyForDisplay(policy).secretConfigured;
 }
 
-function safePolicyTarget(target) {
+function hasTokenizedQueryTarget(target) {
   const text = String(target ?? '').trim();
-  if (!text) return '';
+  if (!text) return false;
   try {
     const url = new URL(text);
-    for (const key of [...url.searchParams.keys()]) {
-      if (/(?:token|secret|password|passwd|pwd|authorization|credential|api[_-]?key|access[_-]?key)/i.test(key)) url.searchParams.set(key, '已隐藏');
-    }
-    return url.toString();
+    return [...url.searchParams.keys()].some((key) => /(?:token|secret|password|passwd|pwd|authorization|credential|api[_-]?key|access[_-]?key)/i.test(key));
   } catch {
-    return isSensitiveText(text) ? '敏感值已隐藏' : text;
+    return false;
   }
+}
+
+function safePolicyTarget(target) {
+  const text = String(target ?? '').trim();
+  return hasTokenizedQueryTarget(text) ? '' : text;
+}
+
+function policyTargetLabel(policy) {
+  return policy.targetRequiresReplacement ? '渠道目标已隐藏，需重新输入' : safePolicyTarget(valueOf(policy, 'target')) || '—';
 }
 
 function ruleEditorMarkup(rule = {}, policies = {}, errors = {}) {
@@ -315,7 +326,7 @@ function policyEditorMarkup(policy = {}, templates = [], errors = {}) {
     <div class="alert-drawer-head"><div><span class="eyebrow">通知策略编辑</span><h3>${safe.id ? '编辑通知策略' : '新建通知策略'}</h3></div><button type="button" class="alert-drawer-close" data-alert-drawer-close aria-label="关闭">×</button></div>
     <form class="alert-config-form" data-policy-form>
       <label>策略名称<input name="name" required value="${safeText(valueOf(safe, 'name') ?? '')}" /></label>
-      <div class="alert-form-grid"><label>通知渠道<select name="channel"><option value="">请选择</option>${[['webhook', 'Webhook'], ['email', '邮件'], ['sms', '短信']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(safe, 'channel') ?? '') ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>渠道目标<input name="target" required value="${safeText(safePolicyTarget(valueOf(safe, 'target')))}" placeholder="Webhook 地址或邮箱" /></label></div>
+      <div class="alert-form-grid"><label>通知渠道<select name="channel"><option value="">请选择</option>${[['webhook', 'Webhook'], ['email', '邮件'], ['sms', '短信']].map(([value, label]) => `<option value="${value}" ${value === (valueOf(safe, 'channel') ?? '') ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>渠道目标<input name="target" required value="${safeText(safePolicyTarget(valueOf(safe, 'target')))}" placeholder="${safe.targetRequiresReplacement ? '现有渠道目标已隐藏，请重新输入' : 'Webhook 地址或邮箱'}" /></label></div>
       <label>通知模板<select name="templateId"><option value="">请选择模板</option>${templates.map((template) => `<option value="${safeText(template.id)}" ${String(template.id) === String(templateId) ? 'selected' : ''}>${displayValue(template.name ?? template.id)}</option>`).join('')}</select></label>
       ${templates.length ? '' : `<p class="alert-form-hint">暂无可选模板，请填写模板 ID 后保存。</p><label>模板 ID<input name="templateIdFallback" value="${safeText(templateId)}" placeholder="template-1" /></label>`}
       <fieldset><legend>严重级别范围</legend>${['critical', 'warning', 'info'].map((value) => `<label class="alert-check-label"><input name="severities" type="checkbox" value="${value}" ${severities.has(value) ? 'checked' : ''} />${formatSeverity(value)}</label>`).join('')}</fieldset>
@@ -338,7 +349,7 @@ function renderPoliciesMarkup({ policies, templates, canManage }) {
   const templateNames = new Map(templates.map((template) => [String(template.id), template.name ?? template.id]));
   return `
     <div class="alert-config-toolbar"><div><strong>通知投递</strong><p>Secret 仅显示配置状态，不显示引用或内容。</p></div><div><button type="button" data-policy-create ${canManage ? '' : 'disabled'}>新建通知策略</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></div>
-    <div class="alert-config-list">${policies.length ? policies.map((policy) => { const safe = sanitizePolicyForDisplay(policy); const templateId = valueOf(safe, 'templateId', 'template_id'); return `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(safe, 'name') ?? safe.id)}</h4><p>${displayValue(valueOf(safe, 'channel'))} · ${safeText(safePolicyTarget(valueOf(safe, 'target')))}</p></div><span class="alert-status-tag ${valueOf(safe, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(safe, 'enabled') === false ? '已停用' : '已启用'}</span></div><dl class="alert-config-details"><div><dt>路由标签</dt><dd>${selectorChips(valueOf(safe, 'matchLabels', 'match_labels'))}</dd></div><div><dt>严重级别</dt><dd>${(valueOf(safe, 'severities') ?? []).map(formatSeverity).join('、') || '全部'}</dd></div><div><dt>投递渠道</dt><dd>${displayValue(valueOf(safe, 'channel'))} / ${safeText(safePolicyTarget(valueOf(safe, 'target')))}</dd></div><div><dt>通知模板</dt><dd>${displayValue(templateNames.get(String(templateId)) ?? templateId)}</dd></div><div><dt>Secret</dt><dd>${safe.secretConfigured ? '已配置' : '未配置'}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(safe, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><button type="button" data-policy-edit="${safeText(safe.id)}" ${canManage ? '' : 'disabled'}>编辑</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`; }).join('') : '<div class="alert-empty"><strong>暂无通知策略</strong><p>创建策略后可在规则中选择其作为通知目标。</p></div>'}</div>`;
+    <div class="alert-config-list">${policies.length ? policies.map((policy) => { const safe = sanitizePolicyForDisplay(policy); const templateId = valueOf(safe, 'templateId', 'template_id'); return `<article class="alert-config-card"><div class="alert-config-card-head"><div><h4>${displayValue(valueOf(safe, 'name') ?? safe.id)}</h4><p>${displayValue(valueOf(safe, 'channel'))} · ${safeText(policyTargetLabel(safe))}</p></div><span class="alert-status-tag ${valueOf(safe, 'enabled') === false ? 'status-info' : 'status-success'}">${valueOf(safe, 'enabled') === false ? '已停用' : '已启用'}</span></div><dl class="alert-config-details"><div><dt>路由标签</dt><dd>${selectorChips(valueOf(safe, 'matchLabels', 'match_labels'))}</dd></div><div><dt>严重级别</dt><dd>${(valueOf(safe, 'severities') ?? []).map(formatSeverity).join('、') || '全部'}</dd></div><div><dt>投递渠道</dt><dd>${displayValue(valueOf(safe, 'channel'))} / ${safeText(policyTargetLabel(safe))}</dd></div><div><dt>通知模板</dt><dd>${displayValue(templateNames.get(String(templateId)) ?? templateId)}</dd></div><div><dt>Secret</dt><dd>${safe.secretConfigured ? '已配置' : '未配置'}</dd></div><div><dt>更新时间</dt><dd>${displayTime(valueOf(safe, 'updatedAt', 'updated_at'))}</dd></div></dl><div class="alert-config-card-actions"><button type="button" data-policy-edit="${safeText(safe.id)}" ${canManage ? '' : 'disabled'}>编辑</button>${canManage ? '' : '<span class="alert-control-lock">需要项目管理权限</span>'}</div></article>`; }).join('') : '<div class="alert-empty"><strong>暂无通知策略</strong><p>创建策略后可在规则中选择其作为通知目标。</p></div>'}</div>`;
 }
 
 function permissionsActionMarkup(action, state, canManage) {

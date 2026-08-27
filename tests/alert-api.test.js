@@ -30,9 +30,12 @@ test('HTTP adapter escapes scope and never accepts a response scope override', a
 test('demo adapter marks data as demo and removes unsafe delivery fields', async () => {
   const api = createAlertApi();
   const detail = await api.getAlert({ tenantId: 'demo', projectId: 'production' }, 'alert-1');
+  const [policy] = (await api.listNotificationPolicies({ tenantId: 'demo', projectId: 'production' })).items;
   assert.equal(detail.source, 'demo');
   assert.equal('secret_ref' in detail.deliveries[0], false);
   assert.equal('body' in detail.deliveries[0], false);
+  assert.equal(policy.has_secret, true);
+  assert.equal('secret_ref' in policy, false);
 });
 
 test('HTTP DTO normalization recursively removes secrets and raw delivery request bodies', async () => {
@@ -59,6 +62,22 @@ test('HTTP DTO normalization recursively removes secrets and raw delivery reques
     id: 'alert-1', nested: { safe: 'kept' },
     deliveries: [{ id: 'delivery-1', status: 'delivered', safe: 'kept' }],
   }]);
+});
+
+test('notification-policy normalization retains only a boolean secret configuration marker', async () => {
+  const api = createAlertApi({
+    baseUrl: 'https://control.example',
+    fetchImpl: async () => new Response(JSON.stringify([{
+      id: 'policy-1', name: '值班 Webhook', target: 'https://hooks.example/ops',
+      has_secret: 'configured', secret_ref: 'env://DBPILOT_WEBHOOK_TOKEN',
+    }])),
+  });
+
+  const [policy] = (await api.listNotificationPolicies(scope)).items;
+  assert.deepEqual(policy, {
+    id: 'policy-1', name: '值班 Webhook', target: 'https://hooks.example/ops', has_secret: true,
+  });
+  assert.equal('secret_ref' in policy, false);
 });
 
 test('HTTP failure never falls back to demo data', async () => {
