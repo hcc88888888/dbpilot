@@ -3,6 +3,8 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
@@ -48,7 +51,7 @@ func (api platformAPI) GetJob(ctx context.Context, request openapi.GetJobRequest
 }
 
 func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobRequestObject) (openapi.CancelJobResponseObject, error) {
-	if api.services.Jobs == nil {
+	if api.services.Jobs == nil || api.services.Idempotency == nil {
 		return nil, ErrServiceUnavailable
 	}
 	scope, principal, err := platformRequestIdentity(ctx)
@@ -62,6 +65,21 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if err != nil {
 		return nil, ErrInvalidRequest
 	}
+	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "cancelJob", IdempotencyKey: request.Params.IdempotencyKey}
+	fingerprint, err := platformIdempotencyFingerprint(ctx, key.OperationID, request.JobId, request.Params.IfMatch)
+	if err != nil {
+		return nil, err
+	}
+	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if claim.Response != nil {
+		if claim.Response.Status != http.StatusAccepted {
+			return nil, errors.New("stored cancellation response has an invalid status")
+		}
+		return cancelJobIdempotentResponse{response: *claim.Response}, nil
+	}
 	now := time.Now
 	if api.services.Now != nil {
 		now = api.services.Now
@@ -71,9 +89,15 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 		To: job.StatusCancelling, Actor: principal.Subject, At: now().UTC(),
 	})
 	if errors.Is(err, job.ErrConflict) {
+		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
+			return nil, abortErr
+		}
 		return nil, ErrPreconditionFailed
 	}
 	if err != nil {
+		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
+			return nil, abortErr
+		}
 		return nil, err
 	}
 	if value.ID != request.JobId || value.Scope != scope {
@@ -83,13 +107,19 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if err != nil {
 		return nil, err
 	}
-	return openapi.CancelJob202JSONResponse{
-		Body: response,
-		Headers: openapi.CancelJob202ResponseHeaders{
-			ETag:     entityTag(value.Version),
-			Location: "/api/v1/tenants/" + url.PathEscape(scope.TenantID) + "/projects/" + url.PathEscape(scope.ProjectID) + "/jobs/" + url.PathEscape(value.ID),
-		},
-	}, nil
+	responseBody, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	stored := idempotency.Response{Status: http.StatusAccepted, Header: make(http.Header), Body: responseBody}
+	stored.Header.Set("Content-Type", "application/json")
+	stored.Header.Set("ETag", entityTag(value.Version))
+	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, stored)
+	if err != nil {
+		return nil, err
+	}
+	return cancelJobIdempotentResponse{response: completed}, nil
 }
 
 func (api platformAPI) GetArtifact(ctx context.Context, request openapi.GetArtifactRequestObject) (openapi.GetArtifactResponseObject, error) {
@@ -115,18 +145,36 @@ func (api platformAPI) GetArtifact(ctx context.Context, request openapi.GetArtif
 }
 
 func (api platformAPI) CreateArtifactDownload(ctx context.Context, request openapi.CreateArtifactDownloadRequestObject) (openapi.CreateArtifactDownloadResponseObject, error) {
-	if api.services.Artifacts == nil {
+	if api.services.Artifacts == nil || api.services.Idempotency == nil {
 		return nil, ErrServiceUnavailable
 	}
-	scope, _, err := platformRequestIdentity(ctx)
+	scope, principal, err := platformRequestIdentity(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if !validIdempotencyKey(request.Params.IdempotencyKey) {
 		return nil, ErrInvalidRequest
 	}
+	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "createArtifactDownload", IdempotencyKey: request.Params.IdempotencyKey}
+	fingerprint, err := platformIdempotencyFingerprint(ctx, key.OperationID, request.ArtifactId, "")
+	if err != nil {
+		return nil, err
+	}
+	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if claim.Response != nil {
+		if claim.Response.Status != http.StatusOK {
+			return nil, errors.New("stored artifact download response has an invalid status")
+		}
+		return artifactDownloadIdempotentResponse{response: *claim.Response}, nil
+	}
 	value, err := api.services.Artifacts.CreateDownload(ctx, scope, request.ArtifactId, artifact.MaximumDownloadTTL)
 	if err != nil {
+		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint); abortErr != nil {
+			return nil, abortErr
+		}
 		return nil, err
 	}
 	var headers *map[string]string
@@ -137,9 +185,20 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 		}
 		headers = &copyHeaders
 	}
-	return openapi.CreateArtifactDownload200JSONResponse{
+	descriptor := openapi.DownloadDescriptor{
 		Url: value.URL, ExpiresAt: value.ExpiresAt.UTC(), Headers: headers,
-	}, nil
+	}
+	responseBody, err := json.Marshal(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
+	stored.Header.Set("Content-Type", "application/json")
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, stored)
+	if err != nil {
+		return nil, err
+	}
+	return artifactDownloadIdempotentResponse{response: completed}, nil
 }
 
 func (api platformAPI) ListAuditEvents(ctx context.Context, request openapi.ListAuditEventsRequestObject) (openapi.ListAuditEventsResponseObject, error) {
@@ -256,6 +315,42 @@ func entityTag(version int64) string { return `"` + strconv.FormatInt(version, 1
 type getJobOKResponse struct {
 	Body openapi.Job
 	ETag string
+}
+
+type cancelJobIdempotentResponse struct{ response idempotency.Response }
+
+func (response cancelJobIdempotentResponse) VisitCancelJobResponse(writer http.ResponseWriter) error {
+	return writeIdempotencyResponse(writer, response.response)
+}
+
+type artifactDownloadIdempotentResponse struct{ response idempotency.Response }
+
+func (response artifactDownloadIdempotentResponse) VisitCreateArtifactDownloadResponse(writer http.ResponseWriter) error {
+	return writeIdempotencyResponse(writer, response.response)
+}
+
+func writeIdempotencyResponse(writer http.ResponseWriter, response idempotency.Response) error {
+	for name, values := range response.Header {
+		writer.Header()[name] = append([]string(nil), values...)
+	}
+	writer.WriteHeader(response.Status)
+	_, err := writer.Write(response.Body)
+	return err
+}
+
+func platformIdempotencyFingerprint(ctx context.Context, operationID, resourceID, ifMatch string) (string, error) {
+	metadata, ok := ctx.Value(platformRequestMetadataContextKey{}).(platformRequestMetadata)
+	if !ok || metadata.Path == "" || metadata.Method == "" || metadata.IfMatch != ifMatch {
+		return "", ErrInvalidRequest
+	}
+	var input bytes.Buffer
+	for _, value := range []string{operationID, metadata.Method, metadata.Path, resourceID, metadata.RawQuery, string(metadata.Body), ifMatch} {
+		input.WriteString(strconv.Itoa(len(value)))
+		input.WriteByte(':')
+		input.WriteString(value)
+	}
+	digest := sha256.Sum256(input.Bytes())
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
 func (response getJobOKResponse) VisitGetJobResponse(writer http.ResponseWriter) error {

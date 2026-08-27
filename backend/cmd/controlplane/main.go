@@ -30,6 +30,7 @@ import (
 	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/ingest"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
@@ -147,6 +148,7 @@ type Server struct {
 	retryDue        func(context.Context, time.Time) error
 	agentRegistry   *agentcontrol.Registry
 	commandObserver agentcontrol.Observer
+	idempotency     *idempotency.Service
 	workers         sync.WaitGroup
 }
 
@@ -307,6 +309,7 @@ func NewServer(config Config) (*Server, error) {
 	ready := &atomic.Bool{}
 	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
 	jobRepository := job.NewPostgresRepository(database)
+	idempotencyService := idempotency.NewService(idempotency.NewPostgresStore(database))
 	artifactSigner, err := artifact.NewHMACDownloadSigner(strings.TrimRight(config.EventURLBase, "/")+"/api/v1/artifact-downloads", "secret://controlplane/artifact-download", platformdatabase.EnvironmentSecretResolver{})
 	if err != nil {
 		if ownsDatabase {
@@ -319,6 +322,7 @@ func NewServer(config Config) (*Server, error) {
 		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
 		Jobs: jobRepository, Artifacts: artifact.NewService(artifact.NewPostgresStore(database), artifactSigner), Audit: audit.NewService(audit.NewPostgresStore(database)),
 		Capabilities: capability.NewService(nil),
+		Idempotency:  idempotencyService,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
@@ -338,7 +342,7 @@ func NewServer(config Config) (*Server, error) {
 		commandObserver = agentcontrol.NoopObserver{}
 	}
 	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver}, nil
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, idempotency: idempotencyService}, nil
 }
 
 func validateConfig(config Config) error {

@@ -8,6 +8,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
@@ -31,6 +32,12 @@ type CapabilityService interface {
 	Resolve(capability.Input) []capability.Capability
 }
 
+type IdempotencyService interface {
+	Begin(context.Context, idempotency.Key, string) (idempotency.Claim, error)
+	Complete(context.Context, idempotency.Key, string, idempotency.Response) (idempotency.Response, error)
+	Abort(context.Context, idempotency.Key, string) error
+}
+
 // Services contains the dependencies made available to HTTP handlers.
 // Monitoring deliberately uses its storage-neutral QueryStore boundary.
 type Services struct {
@@ -41,6 +48,7 @@ type Services struct {
 	Artifacts    ArtifactService
 	Audit        AuditService
 	Capabilities CapabilityService
+	Idempotency  IdempotencyService
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated
 	// principal and never trusts this callback for user authorization.

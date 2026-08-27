@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/platformscope"
@@ -19,7 +22,7 @@ const platformRouteBase = "/api/v1/tenants/{tenantID}/projects/{projectID}"
 
 func mountPlatformRoutes(mux *http.ServeMux, services Services, resolver PrincipalResolver) {
 	validator := newPlatformResponseValidator()
-	registrar := platformRouteRegistrar{mux: mux, resolver: resolver, validator: validator}
+	registrar := &platformRouteRegistrar{mux: mux, resolver: resolver, validator: validator, allowed: make(map[string]map[string]struct{})}
 	strict := openapi.NewStrictHandlerWithOptions(
 		platformAPI{services: services},
 		[]openapi.StrictMiddlewareFunc{generatedAuthorizationMiddleware(Authorizer{})},
@@ -45,15 +48,90 @@ type platformRouteRegistrar struct {
 	mux       *http.ServeMux
 	resolver  PrincipalResolver
 	validator platformResponseValidator
+	mu        sync.RWMutex
+	allowed   map[string]map[string]struct{}
 }
 
-func (registrar platformRouteRegistrar) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
-	secured := authenticatePlatform(registrar.resolver, requirePlatformScope(http.HandlerFunc(handler)))
-	registrar.mux.Handle(pattern, withRequestID(registrar.validator.middleware(secured)))
+func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	method, path, ok := strings.Cut(pattern, " ")
+	if !ok || method == "" || !strings.HasPrefix(path, "/") {
+		panic("invalid generated platform route pattern")
+	}
+	registrar.mu.Lock()
+	methods := registrar.allowed[path]
+	firstPathRegistration := methods == nil
+	if firstPathRegistration {
+		methods = make(map[string]struct{})
+		registrar.allowed[path] = methods
+	}
+	methods[method] = struct{}{}
+	registrar.mu.Unlock()
+
+	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)))
+	secured := authenticatePlatform(registrar.resolver, requirePlatformScope(validated))
+	registrar.mux.Handle(pattern, withRequestID(registrar.validator.middleware(exactPlatformMethod(method, secured))))
+	if firstPathRegistration {
+		registrar.mux.Handle(path, withRequestID(registrar.validator.middleware(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			writePlatformMethodNotAllowed(writer, request, registrar.allowedMethods(path))
+		}))))
+	}
 }
 
-func (registrar platformRouteRegistrar) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+type platformRequestMetadata struct {
+	Method   string
+	Path     string
+	RawQuery string
+	IfMatch  string
+	Body     []byte
+}
+
+type platformRequestMetadataContextKey struct{}
+
+func capturePlatformRequestMetadata(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(io.LimitReader(request.Body, maxJSONBodyBytes+1))
+		if err != nil || int64(len(body)) > maxJSONBodyBytes {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		metadata := platformRequestMetadata{
+			Method: request.Method, Path: request.URL.EscapedPath(), RawQuery: request.URL.RawQuery,
+			IfMatch: request.Header.Get("If-Match"), Body: append([]byte(nil), body...),
+		}
+		ctx := context.WithValue(request.Context(), platformRequestMetadataContextKey{}, metadata)
+		next.ServeHTTP(writer, request.WithContext(ctx))
+	})
+}
+
+func (registrar *platformRouteRegistrar) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	registrar.mux.ServeHTTP(writer, request)
+}
+
+func (registrar *platformRouteRegistrar) allowedMethods(path string) string {
+	registrar.mu.RLock()
+	defer registrar.mu.RUnlock()
+	methods := make([]string, 0, len(registrar.allowed[path]))
+	for method := range registrar.allowed[path] {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	return strings.Join(methods, ", ")
+}
+
+func exactPlatformMethod(method string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != method {
+			writePlatformMethodNotAllowed(writer, request, method)
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
+func writePlatformMethodNotAllowed(writer http.ResponseWriter, request *http.Request, allow string) {
+	writer.Header().Set("Allow", allow)
+	writePlatformProblem(writer, request, ErrMethodNotAllowed)
 }
 
 func authenticatePlatform(resolver PrincipalResolver, next http.Handler) http.Handler {
@@ -128,12 +206,47 @@ func (validator platformResponseValidator) middleware(next http.Handler) http.Ha
 	})
 }
 
+func (validator platformResponseValidator) requestMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if validator.err != nil || validator.router == nil {
+			writePlatformProblem(writer, request, validator.err)
+			return
+		}
+		route, pathParameters, err := validator.router.FindRoute(request)
+		if err != nil {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		input := &openapi3filter.RequestValidationInput{
+			Request: request, PathParams: pathParameters, Route: route,
+			Options: &openapi3filter.Options{
+				AuthenticationFunc:                openapi3filter.NoopAuthenticationFunc,
+				RejectWhenRequestBodyNotSpecified: true,
+			},
+		}
+		if err := openapi3filter.ValidateRequest(request.Context(), input); err != nil {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		next.ServeHTTP(writer, request)
+	})
+}
+
 func (validator platformResponseValidator) validate(request *http.Request, status int, header http.Header, body []byte) error {
-	route, pathParameters, err := validator.router.FindRoute(request)
+	validationRequest := request
+	if status == http.StatusMethodNotAllowed {
+		allowed := strings.Split(header.Get("Allow"), ", ")
+		if len(allowed) == 0 || allowed[0] == "" {
+			return ErrMethodNotAllowed
+		}
+		validationRequest = request.Clone(request.Context())
+		validationRequest.Method = allowed[0]
+	}
+	route, pathParameters, err := validator.router.FindRoute(validationRequest)
 	if err != nil {
 		return err
 	}
-	requestInput := &openapi3filter.RequestValidationInput{Request: request, PathParams: pathParameters, Route: route}
+	requestInput := &openapi3filter.RequestValidationInput{Request: validationRequest, PathParams: pathParameters, Route: route}
 	responseInput := (&openapi3filter.ResponseValidationInput{RequestValidationInput: requestInput, Status: status, Header: header}).SetBodyBytes(body)
 	if err := openapi3filter.ValidateResponse(request.Context(), responseInput); err == nil {
 		return nil

@@ -49,3 +49,15 @@ ProblemResponse:
       examples:
         validation:
           externalValue: ../../examples/platform/problem-validation.json
+MethodNotAllowedProblemResponse:
+  description: RFC 9457 Problem Details response for an unsupported HTTP method.
+  headers:
+    Allow:
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  content:
+    application/problem+json:
+      schema:
+        $ref: '#/Problem'

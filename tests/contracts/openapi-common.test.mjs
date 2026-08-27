@@ -138,6 +138,14 @@ test('bundled contract structurally defines the common platform contract', async
   assert.ok(cancel.responses['412']);
 
   for (const { operation } of operations) {
+    assert.ok(operation.responses['400'], `${operation.operationId} documents request validation failures`);
+    const methodNotAllowed = resolveLocalReference(document, operation.responses['405']);
+    assert.equal(methodNotAllowed.headers.Allow.required, true, `${operation.operationId} 405 requires Allow`);
+    assert.equal(methodNotAllowed.headers.Allow.schema.type, 'string');
+  }
+  assert.ok(document.paths['/artifacts/{artifact_id}/actions/download'].post.responses['409']);
+
+  for (const { operation } of operations) {
     for (const [status, response] of Object.entries(operation.responses)) {
       if (Number(status) >= 400) {
         const problemResponse = resolveLocalReference(document, response);

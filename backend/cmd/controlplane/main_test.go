@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -171,6 +172,12 @@ func TestNewServerRetainsInjectedAgentControlDependencies(t *testing.T) {
 	require.Same(t, registry, server.agentRegistry)
 	require.Same(t, observer, server.commandObserver)
 	require.Contains(t, server.grpcServer.GetServiceInfo(), "dbpilot.agent.v1.AgentControl")
+}
+
+func TestNewServerWiresDurablePlatformIdempotency(t *testing.T) {
+	server, err := NewServer(validServerConfig())
+	require.NoError(t, err)
+	require.NotNil(t, server.idempotency)
 }
 
 func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {
@@ -417,8 +424,11 @@ type staticOIDCTokenVerifier struct {
 	err    error
 }
 
-func (verifier staticOIDCTokenVerifier) Verify(context.Context, string) (controlplane.OIDCClaims, error) {
-	return verifier.claims, verifier.err
+func (verifier staticOIDCTokenVerifier) Verify(context.Context, string) (json.RawMessage, error) {
+	if verifier.err != nil {
+		return nil, verifier.err
+	}
+	return json.Marshal(verifier.claims)
 }
 
 type testCommandObserver struct{}

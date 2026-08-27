@@ -19,12 +19,16 @@
             examples:
               running:
                 externalValue: ../../examples/platform/job-running.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
       '401':
         $ref: ../common/errors.yaml#/ProblemResponse
       '403':
         $ref: ../common/errors.yaml#/ProblemResponse
       '404':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
 /jobs/{job_id}/actions/cancel:
   post:
     operationId: cancelJob
@@ -74,6 +78,8 @@
         $ref: ../common/errors.yaml#/ProblemResponse
       '404':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
       '409':
         $ref: ../common/errors.yaml#/ProblemResponse
       '412':
@@ -96,12 +102,16 @@
           application/json:
             schema:
               $ref: ../common/artifacts.yaml#/Artifact
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
       '401':
         $ref: ../common/errors.yaml#/ProblemResponse
       '403':
         $ref: ../common/errors.yaml#/ProblemResponse
       '404':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
 /artifacts/{artifact_id}/actions/download:
   post:
     operationId: createArtifactDownload
@@ -133,6 +143,10 @@
       '403':
         $ref: ../common/errors.yaml#/ProblemResponse
       '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
         $ref: ../common/errors.yaml#/ProblemResponse
 /audit-events:
   get:
@@ -166,6 +180,8 @@
         $ref: ../common/errors.yaml#/ProblemResponse
       '403':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
 /capabilities:
   get:
     operationId: getCapabilities
@@ -181,7 +197,11 @@
             examples:
               default:
                 externalValue: ../../examples/platform/capabilities.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
       '401':
         $ref: ../common/errors.yaml#/ProblemResponse
       '403':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse

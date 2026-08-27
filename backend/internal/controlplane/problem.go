@@ -12,12 +12,14 @@ import (
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
 
 var (
 	ErrInvalidRequest     = errors.New("invalid platform request")
+	ErrMethodNotAllowed   = errors.New("platform method is not allowed")
 	ErrPreconditionFailed = errors.New("platform precondition failed")
 	ErrServiceUnavailable = errors.New("platform service unavailable")
 )
@@ -68,10 +70,16 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusUnauthorized, "unauthenticated", "Authentication is required"
 	case errors.Is(err, ErrForbidden):
 		status, code, title = http.StatusForbidden, "forbidden", "Access is forbidden"
+	case errors.Is(err, ErrMethodNotAllowed):
+		status, code, title = http.StatusMethodNotAllowed, "method_not_allowed", "Method is not allowed"
 	case errors.Is(err, job.ErrNotFound), errors.Is(err, artifact.ErrNotFound):
 		status, code, title = http.StatusNotFound, "not_found", "Resource was not found"
 	case errors.Is(err, ErrPreconditionFailed):
 		status, code, title = http.StatusPreconditionFailed, "precondition_failed", "Request precondition failed"
+	case errors.Is(err, idempotency.ErrKeyConflict):
+		status, code, title = http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the request"
+	case errors.Is(err, idempotency.ErrInProgress):
+		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"
 	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired):
 		status, code, title = http.StatusConflict, "conflict", "Resource state conflicts with the request"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
@@ -107,6 +115,9 @@ func writePlatformProblem(writer http.ResponseWriter, request *http.Request, err
 	}
 	problem := problemForError(err, requestID, instance)
 	writer.Header().Set("Content-Type", "application/problem+json")
+	if errors.Is(err, idempotency.ErrInProgress) {
+		writer.Header().Set("Retry-After", "1")
+	}
 	if requestID != "" {
 		writer.Header().Set("X-Request-ID", requestID)
 	}

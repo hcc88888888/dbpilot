@@ -1,8 +1,11 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -23,7 +26,7 @@ type OIDCClaims struct {
 }
 
 type TokenVerifier interface {
-	Verify(context.Context, string) (OIDCClaims, error)
+	Verify(context.Context, string) (json.RawMessage, error)
 }
 
 type BearerPrincipalResolver struct {
@@ -46,8 +49,15 @@ func (resolver BearerPrincipalResolver) ResolvePrincipal(request *http.Request) 
 	if token == "" || value != "Bearer "+token || strings.ContainsAny(token, " ,\t\r\n") {
 		return Principal{}, ErrUnauthenticated
 	}
-	claims, err := resolver.Verifier.Verify(request.Context(), token)
+	rawClaims, err := resolver.Verifier.Verify(request.Context(), token)
 	if err != nil {
+		return Principal{}, ErrUnauthenticated
+	}
+	if err := rejectDuplicateJSONMembers(rawClaims); err != nil {
+		return Principal{}, ErrUnauthenticated
+	}
+	var claims OIDCClaims
+	if err := json.Unmarshal(rawClaims, &claims); err != nil {
 		return Principal{}, ErrUnauthenticated
 	}
 	return principalFromClaims(claims)
@@ -77,6 +87,9 @@ func principalFromClaims(claims OIDCClaims) (Principal, error) {
 			if permission == "" || permission != strings.TrimSpace(permission) || strings.ContainsAny(permission, "\r\n\t") {
 				return Principal{}, ErrUnauthenticated
 			}
+			if _, duplicate := permissions[permission]; duplicate {
+				return Principal{}, ErrUnauthenticated
+			}
 			permissions[permission] = struct{}{}
 		}
 		principal.Projects[key] = struct{}{}
@@ -89,19 +102,83 @@ type coreosTokenVerifier struct {
 	verifier *oidc.IDTokenVerifier
 }
 
-func (verifier coreosTokenVerifier) Verify(ctx context.Context, raw string) (OIDCClaims, error) {
+func (verifier coreosTokenVerifier) Verify(ctx context.Context, raw string) (json.RawMessage, error) {
 	if verifier.verifier == nil || ctx == nil || raw == "" {
-		return OIDCClaims{}, ErrUnauthenticated
+		return nil, ErrUnauthenticated
 	}
 	token, err := verifier.verifier.Verify(ctx, raw)
 	if err != nil {
-		return OIDCClaims{}, err
+		return nil, err
 	}
-	var claims OIDCClaims
+	var claims json.RawMessage
 	if err := token.Claims(&claims); err != nil {
-		return OIDCClaims{}, err
+		return nil, err
 	}
 	return claims, nil
+}
+
+func rejectDuplicateJSONMembers(raw json.RawMessage) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := consumeUniqueJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeUniqueJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return errors.New("JSON object key is not a string")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return errors.New("duplicate JSON object member")
+			}
+			seen[key] = struct{}{}
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim('}') {
+			return errors.New("invalid JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := consumeUniqueJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		end, err := decoder.Token()
+		if err != nil || end != json.Delim(']') {
+			return errors.New("invalid JSON array")
+		}
+	default:
+		return errors.New("unexpected JSON delimiter")
+	}
+	return nil
 }
 
 // NewOIDCTokenVerifier performs discovery once and returns a verifier whose

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -57,11 +59,10 @@ func TestGeneratedCancelUsesURLScopeAuthenticatedActorAndConditionalVersion(t *t
 		value.Version = 8
 		return value
 	}()}
-	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", strings.NewReader(`{"actor":"attacker","tenant_id":"tenant-b","project_id":"project-b"}`))
-	request.Header.Set("Content-Type", "application/json")
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", nil)
 	request.Header.Set("Idempotency-Key", "cancel-job-1")
 	request.Header.Set("If-Match", `"7"`)
-	response := servePlatformRequest(Services{Jobs: jobs, Now: func() time.Time { return time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC) }}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
+	response := servePlatformRequest(Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Now: func() time.Time { return time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC) }}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
 
 	require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
 	require.Equal(t, `"8"`, response.Header().Get("ETag"))
@@ -74,6 +75,79 @@ func TestGeneratedCancelUsesURLScopeAuthenticatedActorAndConditionalVersion(t *t
 	require.Equal(t, "trusted-user", jobs.transitions[0].Actor)
 	require.Equal(t, time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC), jobs.transitions[0].At)
 	requireOpenAPIResponse(t, request, response)
+}
+
+func TestPlatformRequestValidationRejectsUnexpectedBodyQueryAndHeaderBeforeServices(t *testing.T) {
+	t.Run("unexpected body", func(t *testing.T) {
+		jobs := &recordingJobService{}
+		services := Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", strings.NewReader(`{"actor":"attacker","tenant_id":"tenant-b","project_id":"project-b"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "cancel-job-1")
+		request.Header.Set("If-Match", `"7"`)
+
+		response := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
+
+		requireProblem(t, response, http.StatusBadRequest, "invalid_request", response.Header().Get("X-Request-ID"))
+		require.Empty(t, jobs.transitions)
+	})
+
+	t.Run("query maximum", func(t *testing.T) {
+		audits := &recordingAuditService{}
+		request := httptest.NewRequest(http.MethodGet, platformBasePath+"/audit-events?limit=501", nil)
+
+		response := servePlatformRequest(Services{Audit: audits}, principalWith(platformTestScope, openapi.PermissionListAuditEvents), request)
+
+		requireProblem(t, response, http.StatusBadRequest, "invalid_request", response.Header().Get("X-Request-ID"))
+		require.Zero(t, audits.calls)
+	})
+
+	t.Run("empty required header", func(t *testing.T) {
+		artifacts := &recordingArtifactService{}
+		request := httptest.NewRequest(http.MethodPost, platformBasePath+"/artifacts/artifact-1/actions/download", nil)
+		request.Header["Idempotency-Key"] = []string{""}
+
+		response := servePlatformRequest(Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), request)
+
+		requireProblem(t, response, http.StatusBadRequest, "invalid_request", response.Header().Get("X-Request-ID"))
+		require.Zero(t, artifacts.downloadCalls)
+	})
+}
+
+func TestPlatformMethodGateRejectsHEADAndUnsupportedMethodsBeforeServices(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		permission string
+		allow      string
+		services   func() (Services, func() int)
+	}{
+		{name: "head get job", method: http.MethodHead, path: platformBasePath + "/jobs/job-1", permission: openapi.PermissionGetJob, allow: http.MethodGet, services: func() (Services, func() int) {
+			jobs := &recordingJobService{getValue: validPlatformJob()}
+			return Services{Jobs: jobs}, func() int { return jobs.getCalls }
+		}},
+		{name: "post get job", method: http.MethodPost, path: platformBasePath + "/jobs/job-1", permission: openapi.PermissionGetJob, allow: http.MethodGet, services: func() (Services, func() int) {
+			jobs := &recordingJobService{getValue: validPlatformJob()}
+			return Services{Jobs: jobs}, func() int { return jobs.getCalls }
+		}},
+		{name: "put artifact download", method: http.MethodPut, path: platformBasePath + "/artifacts/artifact-1/actions/download", permission: openapi.PermissionCreateArtifactDownload, allow: http.MethodPost, services: func() (Services, func() int) {
+			artifacts := &recordingArtifactService{}
+			return Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, func() int { return artifacts.downloadCalls }
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			services, calls := test.services()
+			request := httptest.NewRequest(test.method, test.path, nil)
+
+			response := servePlatformRequest(services, principalWith(platformTestScope, test.permission), request)
+
+			requireProblem(t, response, http.StatusMethodNotAllowed, "method_not_allowed", response.Header().Get("X-Request-ID"))
+			require.Equal(t, test.allow, response.Header().Get("Allow"))
+			require.Zero(t, calls())
+		})
+	}
 }
 
 func TestGeneratedCancelRequiresIdempotencyKeyAndIfMatch(t *testing.T) {
@@ -92,7 +166,7 @@ func TestGeneratedCancelRequiresIdempotencyKeyAndIfMatch(t *testing.T) {
 			request.Header.Set("X-Request-ID", "request-invalid-1")
 			configure(request)
 
-			response := servePlatformRequest(Services{Jobs: jobs}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
+			response := servePlatformRequest(Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
 
 			requireProblem(t, response, http.StatusBadRequest, "invalid_request", "request-invalid-1")
 			require.Empty(t, jobs.transitions)
@@ -106,10 +180,111 @@ func TestGeneratedCancelReturnsPreconditionFailedForStaleETag(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", nil)
 	request.Header.Set("Idempotency-Key", "cancel-job-1")
 	request.Header.Set("If-Match", `"6"`)
-	response := servePlatformRequest(Services{Jobs: jobs}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
+	response := servePlatformRequest(Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
 
 	requireProblem(t, response, http.StatusPreconditionFailed, "precondition_failed", response.Header().Get("X-Request-ID"))
 	requireOpenAPIResponse(t, request, response)
+}
+
+func TestGeneratedCancelReplaysCompletedResponseWithOriginalStaleETag(t *testing.T) {
+	jobs := &recordingJobService{transitionValue: func() job.Job {
+		value := validPlatformJob()
+		value.Status = job.StatusCancelling
+		value.Version = 8
+		return value
+	}()}
+	idempotencyService := idempotency.NewService(newHTTPIdempotencyStore())
+	services := Services{Jobs: jobs, Idempotency: idempotencyService, Now: func() time.Time { return time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC) }}
+
+	firstRequest := newCancelRequest(`"7"`, "cancel-job-1")
+	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionCancelJob), firstRequest)
+	secondRequest := newCancelRequest(`"7"`, "cancel-job-1")
+	second := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionCancelJob), secondRequest)
+
+	require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+	require.Equal(t, first.Code, second.Code)
+	require.Equal(t, first.Body.Bytes(), second.Body.Bytes())
+	require.Equal(t, first.Header().Get("ETag"), second.Header().Get("ETag"))
+	require.Equal(t, first.Header().Get("Location"), second.Header().Get("Location"))
+	require.Len(t, jobs.transitions, 1)
+	requireOpenAPIResponse(t, firstRequest, first)
+	requireOpenAPIResponse(t, secondRequest, second)
+}
+
+func TestGeneratedArtifactDownloadReplaysDescriptorWithoutSecondSignerCall(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadValue: artifact.Download{
+		URL:       "https://downloads.example/artifact-1?signature=safe",
+		ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC),
+	}}
+	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	firstRequest := newDownloadRequest("download-artifact-1")
+	first := servePlatformRequest(services, principal, firstRequest)
+	secondRequest := newDownloadRequest("download-artifact-1")
+	second := servePlatformRequest(services, principal, secondRequest)
+
+	require.Equal(t, http.StatusOK, first.Code, first.Body.String())
+	require.Equal(t, first.Code, second.Code)
+	require.Equal(t, first.Body.Bytes(), second.Body.Bytes())
+	require.Equal(t, 1, artifacts.downloadCalls)
+	requireOpenAPIResponse(t, firstRequest, first)
+	requireOpenAPIResponse(t, secondRequest, second)
+}
+
+func TestGeneratedExpiredArtifactDownloadReturnsDocumentedConflict(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadErr: artifact.ErrExpired}
+	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	request := newDownloadRequest("download-expired-1")
+
+	response := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), request)
+
+	requireProblem(t, response, http.StatusConflict, "conflict", response.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+	requireOpenAPIResponse(t, request, response)
+}
+
+func TestGeneratedIdempotencyKeyFingerprintCollisionReturnsConflict(t *testing.T) {
+	jobs := &recordingJobService{transitionValue: func() job.Job {
+		value := validPlatformJob()
+		value.Status = job.StatusCancelling
+		value.Version = 8
+		return value
+	}()}
+	services := Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+	first := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-job-1"))
+	require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+
+	collision := servePlatformRequest(services, principal, newCancelRequest(`"6"`, "cancel-job-1"))
+
+	requireProblem(t, collision, http.StatusConflict, "idempotency_conflict", collision.Header().Get("X-Request-ID"))
+	require.Len(t, jobs.transitions, 1)
+}
+
+func TestGeneratedConcurrentDuplicateReturnsRetryableConflictWithoutSecondExecution(t *testing.T) {
+	jobs := newBlockingJobService()
+	services := Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+	handler := NewHTTPHandler(services, platformStaticPrincipalResolver{principal: principal})
+	first := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		handler.ServeHTTP(first, newCancelRequest(`"7"`, "cancel-job-1"))
+	}()
+	<-jobs.started
+
+	duplicate := httptest.NewRecorder()
+	handler.ServeHTTP(duplicate, newCancelRequest(`"7"`, "cancel-job-1"))
+	close(jobs.proceed)
+	<-firstDone
+
+	requireProblem(t, duplicate, http.StatusConflict, "idempotency_in_progress", duplicate.Header().Get("X-Request-ID"))
+	require.Equal(t, "1", duplicate.Header().Get("Retry-After"))
+	require.Equal(t, 1, jobs.calls())
+	require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
+	require.Equal(t, 1, jobs.calls())
 }
 
 func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
@@ -129,7 +304,7 @@ func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
 
 	downloadRequest := httptest.NewRequest(http.MethodPost, platformBasePath+"/artifacts/artifact-1/actions/download", nil)
 	downloadRequest.Header.Set("Idempotency-Key", "download-artifact-1")
-	downloadResponse := servePlatformRequest(Services{Artifacts: artifacts}, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), downloadRequest)
+	downloadResponse := servePlatformRequest(Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), downloadRequest)
 	require.Equal(t, http.StatusOK, downloadResponse.Code, downloadResponse.Body.String())
 	require.Equal(t, platformTestScope, artifacts.downloadScope)
 	require.Equal(t, "artifact-1", artifacts.downloadID)
@@ -230,10 +405,63 @@ func TestProblemMappingsAreStableAndNeverExposeInternalErrors(t *testing.T) {
 	}
 }
 
+func TestPlatformIdempotencyFingerprintBindsRequestInputsAndExcludesIdentityToken(t *testing.T) {
+	metadata := platformRequestMetadata{
+		Method: http.MethodPost, Path: platformBasePath + "/jobs/job-1/actions/cancel",
+		RawQuery: "", IfMatch: `"7"`, Body: []byte(`{"reason":"operator"}`),
+	}
+	baseContext := context.WithValue(context.Background(), platformRequestMetadataContextKey{}, metadata)
+	base, err := platformIdempotencyFingerprint(baseContext, "cancelJob", "job-1", `"7"`)
+	require.NoError(t, err)
+
+	mutations := []struct {
+		name       string
+		metadata   platformRequestMetadata
+		operation  string
+		resourceID string
+		ifMatch    string
+	}{
+		{name: "path", metadata: func() platformRequestMetadata { value := metadata; value.Path += "-other"; return value }(), operation: "cancelJob", resourceID: "job-1", ifMatch: `"7"`},
+		{name: "body", metadata: func() platformRequestMetadata {
+			value := metadata
+			value.Body = []byte(`{"reason":"other"}`)
+			return value
+		}(), operation: "cancelJob", resourceID: "job-1", ifMatch: `"7"`},
+		{name: "resource", metadata: metadata, operation: "cancelJob", resourceID: "job-2", ifMatch: `"7"`},
+		{name: "if match", metadata: func() platformRequestMetadata { value := metadata; value.IfMatch = `"8"`; return value }(), operation: "cancelJob", resourceID: "job-1", ifMatch: `"8"`},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), platformRequestMetadataContextKey{}, mutation.metadata)
+			got, err := platformIdempotencyFingerprint(ctx, mutation.operation, mutation.resourceID, mutation.ifMatch)
+			require.NoError(t, err)
+			require.NotEqual(t, base, got)
+		})
+	}
+
+	identityContext := context.WithValue(baseContext, principalContextKey{}, Principal{Subject: "different-user"})
+	withDifferentIdentity, err := platformIdempotencyFingerprint(identityContext, "cancelJob", "job-1", `"7"`)
+	require.NoError(t, err)
+	require.Equal(t, base, withDifferentIdentity, "identity and bearer token material belong in the durable key, never the request fingerprint")
+}
+
 func servePlatformRequest(services Services, principal Principal, request *http.Request) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
 	NewHTTPHandler(services, platformStaticPrincipalResolver{principal: principal}).ServeHTTP(response, request)
 	return response
+}
+
+func newCancelRequest(ifMatch, idempotencyKey string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", nil)
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	request.Header.Set("If-Match", ifMatch)
+	return request
+}
+
+func newDownloadRequest(idempotencyKey string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/artifacts/artifact-1/actions/download", nil)
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	return request
 }
 
 func requireProblem(t *testing.T, response *httptest.ResponseRecorder, status int, code, requestID string) openapi.Problem {
@@ -332,6 +560,7 @@ func (service *recordingJobService) Transition(_ context.Context, transition job
 }
 
 type recordingArtifactService struct {
+	getCalls      int
 	getValue      artifact.Artifact
 	getErr        error
 	getScope      platformscope.Scope
@@ -340,15 +569,18 @@ type recordingArtifactService struct {
 	downloadScope platformscope.Scope
 	downloadID    string
 	downloadTTL   time.Duration
+	downloadCalls int
 }
 
 func (service *recordingArtifactService) Get(_ context.Context, scope platformscope.Scope, _ string) (artifact.Artifact, error) {
+	service.getCalls++
 	service.getScope = scope
 	return service.getValue, service.getErr
 }
 
 func (service *recordingArtifactService) CreateDownload(_ context.Context, scope platformscope.Scope, id string, ttl time.Duration) (artifact.Download, error) {
 	service.downloadScope, service.downloadID, service.downloadTTL = scope, id, ttl
+	service.downloadCalls++
 	return service.downloadValue, service.downloadErr
 }
 
@@ -357,9 +589,11 @@ type recordingAuditService struct {
 	err   error
 	scope platformscope.Scope
 	query audit.ListQuery
+	calls int
 }
 
 func (service *recordingAuditService) List(_ context.Context, scope platformscope.Scope, query audit.ListQuery) (audit.Page, error) {
+	service.calls++
 	service.scope, service.query = scope, query
 	return service.page, service.err
 }
@@ -372,4 +606,103 @@ type recordingCapabilityService struct {
 func (service *recordingCapabilityService) Resolve(input capability.Input) []capability.Capability {
 	service.input = input
 	return service.values
+}
+
+type httpIdempotencyStore struct {
+	mu      sync.Mutex
+	records map[string]httpIdempotencyRecord
+}
+
+type httpIdempotencyRecord struct {
+	fingerprint string
+	state       idempotency.State
+	response    idempotency.Response
+}
+
+func newHTTPIdempotencyStore() *httpIdempotencyStore {
+	return &httpIdempotencyStore{records: make(map[string]httpIdempotencyRecord)}
+}
+
+func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key, fingerprint string, _, _ time.Time) (idempotency.Claim, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record, exists := store.records[mapKey]
+	if !exists {
+		store.records[mapKey] = httpIdempotencyRecord{fingerprint: fingerprint, state: idempotency.StateProcessing}
+		return idempotency.Claim{Claimed: true}, nil
+	}
+	if record.fingerprint != fingerprint {
+		return idempotency.Claim{}, idempotency.ErrKeyConflict
+	}
+	if record.state == idempotency.StateProcessing {
+		return idempotency.Claim{}, idempotency.ErrInProgress
+	}
+	response := cloneIdempotencyResponse(record.response)
+	return idempotency.Claim{Response: &response}, nil
+}
+
+func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.Key, fingerprint string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record, exists := store.records[mapKey]
+	if !exists || record.fingerprint != fingerprint || record.state != idempotency.StateProcessing {
+		return idempotency.Response{}, idempotency.ErrNotClaimed
+	}
+	record.state = idempotency.StateCompleted
+	record.response = cloneIdempotencyResponse(response)
+	store.records[mapKey] = record
+	return cloneIdempotencyResponse(record.response), nil
+}
+
+func (store *httpIdempotencyStore) Abort(_ context.Context, key idempotency.Key, fingerprint string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	if record, exists := store.records[mapKey]; exists && record.fingerprint == fingerprint && record.state == idempotency.StateProcessing {
+		delete(store.records, mapKey)
+	}
+	return nil
+}
+
+func cloneIdempotencyResponse(response idempotency.Response) idempotency.Response {
+	response.Header = response.Header.Clone()
+	response.Body = append([]byte(nil), response.Body...)
+	return response
+}
+
+type blockingJobService struct {
+	mu      sync.Mutex
+	count   int
+	started chan struct{}
+	proceed chan struct{}
+}
+
+func newBlockingJobService() *blockingJobService {
+	return &blockingJobService{started: make(chan struct{}), proceed: make(chan struct{})}
+}
+
+func (service *blockingJobService) Get(context.Context, platformscope.Scope, string) (job.Job, error) {
+	return validPlatformJob(), nil
+}
+
+func (service *blockingJobService) Transition(_ context.Context, _ job.Transition) (job.Job, error) {
+	service.mu.Lock()
+	service.count++
+	if service.count == 1 {
+		close(service.started)
+	}
+	service.mu.Unlock()
+	<-service.proceed
+	value := validPlatformJob()
+	value.Status = job.StatusCancelling
+	value.Version = 8
+	return value, nil
+}
+
+func (service *blockingJobService) calls() int {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.count
 }
