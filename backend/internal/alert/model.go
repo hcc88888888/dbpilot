@@ -162,6 +162,74 @@ func (r AlertRule) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// UnmarshalJSON accepts both the current exact duration strings and legacy
+// numeric nanosecond values so typed Go clients can decode all rule responses.
+func (r *AlertRule) UnmarshalJSON(data []byte) error {
+	type alertRuleAlias AlertRule
+	type alertRuleJSON struct {
+		*alertRuleAlias
+		EvaluationEvery json.RawMessage `json:"evaluation_every"`
+		LookbackWindow  json.RawMessage `json:"lookback_window"`
+		For             json.RawMessage `json:"for"`
+	}
+
+	decoded := alertRuleAlias(*r)
+	wire := alertRuleJSON{alertRuleAlias: &decoded}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	evaluationEvery := decoded.EvaluationEvery
+	lookbackWindow := decoded.LookbackWindow
+	forDuration := decoded.For
+	var err error
+	if hasJSONDuration(wire.EvaluationEvery) {
+		evaluationEvery, err = decodeJSONDuration(wire.EvaluationEvery)
+		if err != nil {
+			return fmt.Errorf("decode evaluation_every: %w", err)
+		}
+	}
+	if hasJSONDuration(wire.LookbackWindow) {
+		lookbackWindow, err = decodeJSONDuration(wire.LookbackWindow)
+		if err != nil {
+			return fmt.Errorf("decode lookback_window: %w", err)
+		}
+	}
+	if hasJSONDuration(wire.For) {
+		forDuration, err = decodeJSONDuration(wire.For)
+		if err != nil {
+			return fmt.Errorf("decode for: %w", err)
+		}
+	}
+
+	decoded.EvaluationEvery = evaluationEvery
+	decoded.LookbackWindow = lookbackWindow
+	decoded.For = forDuration
+	*r = AlertRule(decoded)
+	return nil
+}
+
+func hasJSONDuration(value json.RawMessage) bool {
+	return len(value) > 0 && strings.TrimSpace(string(value)) != "null"
+}
+
+func decodeJSONDuration(value json.RawMessage) (time.Duration, error) {
+	var stringValue string
+	if err := json.Unmarshal(value, &stringValue); err == nil {
+		duration, err := time.ParseDuration(stringValue)
+		if err != nil {
+			return 0, err
+		}
+		return duration, nil
+	}
+
+	var nanoseconds int64
+	if err := json.Unmarshal(value, &nanoseconds); err != nil {
+		return 0, err
+	}
+	return time.Duration(nanoseconds), nil
+}
+
 func (r AlertRule) Validate() error {
 	if r.Scope.Validate() != nil || strings.TrimSpace(r.Name) == "" || strings.TrimSpace(r.Metric) == "" {
 		return ErrInvalidRule

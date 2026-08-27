@@ -1,6 +1,7 @@
 package alert_test
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -8,6 +9,32 @@ import (
 	"dbpilot.local/platform/internal/alert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAlertRuleUnmarshalJSONAcceptsStringAndLegacyNumericDurations(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "duration strings",
+			body: `{"id":"rule-1","name":"CPU","evaluation_every":"2520h0m0s","lookback_window":"2m30s","for":"2562047h47m16.854775807s","notification_policy_ids":["policy-1"],"labels":{"host":"db-1"}}`,
+		},
+		{
+			name: "legacy nanosecond numbers",
+			body: `{"id":"rule-1","name":"CPU","evaluation_every":9072000000000000,"lookback_window":150000000000,"for":9223372036854775807,"notification_policy_ids":["policy-1"],"labels":{"host":"db-1"}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var rule alert.AlertRule
+			require.NoError(t, json.Unmarshal([]byte(test.body), &rule))
+			require.Equal(t, time.Duration(9_072_000_000_000_000), rule.EvaluationEvery)
+			require.Equal(t, 2*time.Minute+30*time.Second, rule.LookbackWindow)
+			require.Equal(t, time.Duration(9_223_372_036_854_775_807), rule.For)
+			require.Equal(t, []string{"policy-1"}, rule.NotificationPolicyIDs)
+			require.Equal(t, map[string]string{"host": "db-1"}, rule.Labels)
+		})
+	}
+}
 
 func TestRuleValidateRejectsUnsafeOrIncompleteDefinition(t *testing.T) {
 	rule := alert.AlertRule{

@@ -50,6 +50,13 @@ func TestRuleResponsesSerializeLongDurationsAsLosslessStrings(t *testing.T) {
 	require.Equal(t, rule.EvaluationEvery, roundTripped.EvaluationEvery)
 	require.Equal(t, rule.LookbackWindow, roundTripped.LookbackWindow)
 	require.Equal(t, rule.For, roundTripped.For)
+
+	var typedClientRule alert.AlertRule
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &typedClientRule))
+	require.Equal(t, rule.EvaluationEvery, typedClientRule.EvaluationEvery)
+	require.Equal(t, rule.LookbackWindow, typedClientRule.LookbackWindow)
+	require.Equal(t, rule.For, typedClientRule.For)
+	require.Equal(t, rule.Name, typedClientRule.Name)
 }
 
 func TestEventAcknowledgeWritesActorAndReturnsScopedEvent(t *testing.T) {
