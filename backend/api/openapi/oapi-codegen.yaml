@@ -1,0 +1,9 @@
+package: openapi
+generate:
+  models: true
+  std-http-server: true
+  strict-server: true
+  embedded-spec: true
+output: gen/openapi/dbpilot.gen.go
+output-options:
+  skip-prune: false
