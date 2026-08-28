@@ -25,6 +25,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/job"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +39,37 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "https://identity.example.com", config.Identity.Issuer)
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
 	require.Equal(t, "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", config.Command.SigningPrivateKeyRef)
+	require.Equal(t, "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY", config.Command.ExecutionTokenKeyRef)
+}
+
+func TestNewServerRejectsExecutionTokenProtectionKeysOtherThan32RawBytes(t *testing.T) {
+	for _, size := range []int{31, 33} {
+		t.Run(fmt.Sprintf("%d bytes", size), func(t *testing.T) {
+			resolver := &recordingCommandSecretResolver{value: bytes.Repeat([]byte{0x44}, size)}
+			config := validServerConfig()
+			config.CommandTokenProtector = nil
+			config.Command.ExecutionTokenKeyRef = "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"
+			config.SecretResolver = resolver
+
+			server, err := NewServer(config)
+			require.Nil(t, server)
+			require.ErrorContains(t, err, "exactly 32 bytes")
+			require.Equal(t, []string{"env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"}, resolver.references)
+		})
+	}
+}
+
+func TestNewServerResolvesExactExecutionTokenProtectionKeyOnce(t *testing.T) {
+	resolver := &recordingCommandSecretResolver{value: bytes.Repeat([]byte{0x45}, 32)}
+	config := validServerConfig()
+	config.CommandTokenProtector = nil
+	config.Command.ExecutionTokenKeyRef = "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"
+	config.SecretResolver = resolver
+
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server.commandLifecycle)
+	require.Equal(t, []string{"env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"}, resolver.references)
 }
 
 func TestNewServerRejectsInvalidProductionConfiguration(t *testing.T) {
@@ -522,6 +554,7 @@ func validServerConfig() Config {
 		PrincipalResolver:       trustedTestPrincipalResolver{},
 		EvaluationScopes:        []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
 		CommandSigner:           testCommandSigner{},
+		CommandTokenProtector:   testCommandTokenProtector{},
 		Artifact:                ArtifactSettings{SigningKeyRef: "secret://controlplane/artifact-download"},
 		ArtifactSecretResolver:  platformdatabase.StaticSecretResolver{"secret://controlplane/artifact-download": bytes.Repeat([]byte{0x42}, 32)},
 		ArtifactDownloadHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
@@ -561,6 +594,19 @@ type testCommandSigner struct{}
 func (testCommandSigner) Sign(_ context.Context, envelope *agentv1.CommandEnvelope) error {
 	envelope.Signature = bytes.Repeat([]byte{0x42}, ed25519.SignatureSize)
 	return nil
+}
+
+type testCommandTokenProtector struct{}
+
+func (testCommandTokenProtector) Protect(_ context.Context, token []byte) ([]byte, error) {
+	return append([]byte("test:"), token...), nil
+}
+
+func (testCommandTokenProtector) Unprotect(_ context.Context, ciphertext []byte) ([]byte, error) {
+	if !bytes.HasPrefix(ciphertext, []byte("test:")) {
+		return nil, job.ErrInvalidCommandPayload
+	}
+	return append([]byte(nil), ciphertext[len("test:"):]...), nil
 }
 
 type recordingCommandSecretResolver struct {

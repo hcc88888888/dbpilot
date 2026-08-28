@@ -3,6 +3,9 @@ package job
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -21,8 +24,8 @@ const DefaultOutboxLease = 30 * time.Second
 const DefaultCancellationRetry = 30 * time.Second
 
 const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id"
-const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts"
-const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts"
+const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at"
+const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at"
 const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)"
 const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
@@ -33,15 +36,15 @@ const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, c
 const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND cancellation_requested_at IS NULL AND command_status = 'pending' AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
 const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4"
 const selectOutboxByIDSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE id = $1"
-const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4) WHERE tenant_id = $1 AND project_id = $2 AND id = $3 RETURNING prepared_envelope"
-const requestCommandCancellationSQL = "UPDATE command_outbox SET cancellation_requested_at = COALESCE(cancellation_requested_at, $4), cancellation_reason = CASE WHEN cancellation_requested_at IS NULL THEN $5 ELSE cancellation_reason END, cancellation_available_at = COALESCE(cancellation_available_at, $4), lease_expires_at = NULL WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND command_status IN ('pending', 'active')"
-const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND command_status IN ('pending', 'active') AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
+const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4), command_phase = CASE WHEN command_phase = 'pending' THEN 'preparing' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing') RETURNING prepared_envelope"
+const requestCommandCancellationSQL = "UPDATE command_outbox SET cancellation_requested_at = COALESCE(cancellation_requested_at, $4), cancellation_reason = CASE WHEN cancellation_requested_at IS NULL THEN $5 ELSE cancellation_reason END, cancellation_available_at = COALESCE(cancellation_available_at, $4), lease_expires_at = NULL, command_phase = CASE WHEN command_phase IN ('start_authorized', 'running', 'cancelling') THEN 'cancelling' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND command_status IN ('pending', 'active')"
+const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND (command_phase IN ('pending', 'preparing', 'prepared') OR (command_phase IN ('start_authorized', 'running', 'cancelling') AND start_enqueued_at IS NOT NULL)) AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
 const deferCancellationSQL = "UPDATE command_outbox SET cancellation_available_at = $1, cancellation_lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND cancellation_requested_at IS NOT NULL AND command_status IN ('pending', 'active')"
-const acknowledgeCommandSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL, command_status = $2, acknowledged_at = COALESCE(acknowledged_at, $1), execution_deadline_at = $3, execution_last_heartbeat_at = CASE WHEN $2 = 'active' THEN $1 ELSE execution_last_heartbeat_at END WHERE tenant_id = $4 AND project_id = $5 AND id = $6 AND command_status IN ('pending', 'active', 'rejected')"
+const acknowledgeCommandSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL, command_status = $2, command_phase = CASE WHEN $2 = 'active' THEN CASE WHEN command_phase = 'cancelling' THEN 'cancelling' ELSE 'running' END ELSE 'rejected' END, acknowledged_at = COALESCE(acknowledged_at, $1), execution_deadline_at = $3, execution_last_heartbeat_at = CASE WHEN $2 = 'active' THEN $1 ELSE execution_last_heartbeat_at END, start_enqueued_at = CASE WHEN $2 = 'active' THEN COALESCE(start_enqueued_at, $1) ELSE start_enqueued_at END, terminal_at = CASE WHEN $2 = 'rejected' THEN $1 ELSE terminal_at END WHERE tenant_id = $4 AND project_id = $5 AND id = $6 AND command_status IN ('pending', 'active', 'rejected') AND (($2 = 'active' AND command_phase IN ('start_authorized', 'running', 'cancelling')) OR ($2 = 'rejected' AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'rejected')))"
 const renewCommandLeaseSQL = "UPDATE command_outbox SET execution_last_heartbeat_at = $1, execution_deadline_at = $2, recovery_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND command_status = 'active'"
 const claimExpiredCommandsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NOT NULL AND command_status IN ('pending', 'active') AND execution_deadline_at IS NOT NULL AND execution_deadline_at <= $1 AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at <= $1) ORDER BY execution_deadline_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET recovery_lease_expires_at = $3 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY execution_deadline_at, id"
-const markCommandTerminalSQL = "UPDATE command_outbox SET command_status = $1, published_at = COALESCE(published_at, $2), lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL, cancellation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND (command_status IN ('pending', 'active', 'rejected') OR command_status = $1)"
-const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND cancellation_requested_at IS NOT NULL AND command_status IN ('pending', 'active') ORDER BY created_at, id LIMIT $2"
+const markCommandTerminalSQL = "UPDATE command_outbox SET command_status = $1, command_phase = $1, terminal_at = COALESCE(terminal_at, $2), published_at = COALESCE(published_at, $2), lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL, recovery_claim_token = NULL, recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND (command_status IN ('pending', 'active', 'rejected') OR command_status = $1)"
+const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND cancellation_requested_at IS NOT NULL AND (command_phase IN ('pending', 'preparing', 'prepared') OR (command_phase IN ('start_authorized', 'running', 'cancelling') AND start_enqueued_at IS NOT NULL)) ORDER BY created_at, id LIMIT $2"
 
 type PostgresRepository struct {
 	db               *sql.DB
@@ -456,6 +459,393 @@ func (repository *PostgresRepository) PrepareCommandEnvelope(ctx context.Context
 	return append([]byte(nil), stored...), nil
 }
 
+func (repository *PostgresRepository) MarkPrepared(ctx context.Context, scope platformscope.Scope, commandID string, digest [32]byte, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	result, err := repository.db.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = 'prepared', prepare_digest = COALESCE(prepare_digest, $4),
+			prepared_at = COALESCE(prepared_at, $5), published_at = COALESCE(published_at, $5), lease_expires_at = NULL
+		WHERE tenant_id = $1 AND project_id = $2 AND id = $3
+			AND cancellation_requested_at IS NULL
+			AND command_phase IN ('pending', 'preparing', 'prepared')
+			AND (prepare_digest IS NULL OR prepare_digest = $4)
+	`, scope.TenantID, scope.ProjectID, commandID, digest[:], at.UTC())
+	if err != nil {
+		return classifyWriteError("mark command prepared", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read prepared command update result: %w", err)
+	}
+	if updated == 1 {
+		return nil
+	}
+	var phase CommandPhase
+	var storedDigest []byte
+	var cancellation sql.NullTime
+	err = repository.db.QueryRowContext(ctx, `SELECT command_phase, prepare_digest, cancellation_requested_at FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND id = $3`, scope.TenantID, scope.ProjectID, commandID).Scan(&phase, &storedDigest, &cancellation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("classify prepared command: %w", err)
+	}
+	if subtle.ConstantTimeCompare(storedDigest, digest[:]) == 1 && (phase == CommandPhasePrepared || phase == CommandPhaseStartAuthorized || phase == CommandPhaseRunning || phase == CommandPhaseCancelling) {
+		return nil
+	}
+	return ErrConflict
+}
+
+func (repository *PostgresRepository) AuthorizeStart(ctx context.Context, scope platformscope.Scope, commandID string, expectedDigest [32]byte, tokenHash [32]byte, tokenCiphertext []byte, at, deadline time.Time) (StartGrant, error) {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || len(tokenCiphertext) == 0 || at.IsZero() || !deadline.After(at) {
+		return StartGrant{}, ErrInvalidCommandPayload
+	}
+	var jobID, targetID string
+	if err := repository.db.QueryRowContext(ctx, `SELECT job_id, target_id FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND id = $3`, scope.TenantID, scope.ProjectID, commandID).Scan(&jobID, &targetID); err != nil {
+		return StartGrant{}, classifyReadError("lookup command for Start", err)
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return StartGrant{}, fmt.Errorf("begin command Start authorization: %w", err)
+	}
+	rollback := func(cause error) (StartGrant, error) {
+		_ = tx.Rollback()
+		return StartGrant{}, cause
+	}
+	var jobStatus Status
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM jobs WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID).Scan(&jobStatus); err != nil {
+		return rollback(classifyReadError("lock Job for Start", err))
+	}
+	var targetStatus TargetStatus
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM job_targets WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND target_id = $4 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID, targetID).Scan(&targetStatus); err != nil {
+		return rollback(classifyReadError("lock Job target for Start", err))
+	}
+	if isTerminalTarget(targetStatus) {
+		return rollback(ErrConflict)
+	}
+	var phase CommandPhase
+	var cancellation sql.NullTime
+	var storedDigest, storedTokenHash, storedCiphertext []byte
+	var executionRevision, recoveryRevision uint64
+	var storedDeadline sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT command_phase, cancellation_requested_at, prepare_digest, execution_token_hash,
+			execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at
+		FROM command_outbox
+		WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND job_id = $4 AND target_id = $5
+		FOR UPDATE
+	`, scope.TenantID, scope.ProjectID, commandID, jobID, targetID).Scan(&phase, &cancellation, &storedDigest, &storedTokenHash, &storedCiphertext, &executionRevision, &recoveryRevision, &storedDeadline)
+	if err != nil {
+		return rollback(classifyReadError("lock command for Start", err))
+	}
+	if subtle.ConstantTimeCompare(storedDigest, expectedDigest[:]) != 1 {
+		return rollback(ErrConflict)
+	}
+	if phase == CommandPhaseStartAuthorized || phase == CommandPhaseRunning || phase == CommandPhaseCancelling {
+		grant, grantErr := startGrantFromStored(commandID, storedTokenHash, storedCiphertext, executionRevision, recoveryRevision, storedDeadline)
+		if grantErr != nil {
+			return rollback(grantErr)
+		}
+		if err := tx.Commit(); err != nil {
+			return StartGrant{}, fmt.Errorf("commit duplicate command Start authorization: %w", err)
+		}
+		return grant, nil
+	}
+	if jobStatus == StatusCancelling || isTerminal(jobStatus) || cancellation.Valid {
+		return rollback(ErrConflict)
+	}
+	if phase != CommandPhasePrepared {
+		return rollback(ErrConflict)
+	}
+	executionRevision = 1
+	recoveryRevision = 1
+	result, err := tx.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = 'start_authorized', command_status = 'active', execution_token_hash = $1,
+			execution_token_ciphertext = $2, execution_revision = $3, recovery_revision = $4,
+			start_deadline_at = $5, execution_deadline_at = $5, execution_last_heartbeat_at = $6,
+			recovery_claim_token = NULL, recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL,
+			recovery_lease_expires_at = NULL
+		WHERE tenant_id = $7 AND project_id = $8 AND id = $9 AND command_phase = 'prepared'
+			AND cancellation_requested_at IS NULL AND prepare_digest = $10
+	`, tokenHash[:], tokenCiphertext, executionRevision, recoveryRevision, deadline.UTC(), at.UTC(), scope.TenantID, scope.ProjectID, commandID, expectedDigest[:])
+	if err != nil {
+		return rollback(classifyWriteError("authorize command Start", err))
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return rollback(fmt.Errorf("read command Start authorization result: %w", err))
+	}
+	if updated != 1 {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return StartGrant{}, fmt.Errorf("commit command Start authorization: %w: %w", ErrAmbiguousCommit, err)
+	}
+	return StartGrant{CommandID: commandID, TokenHash: tokenHash, TokenCiphertext: append([]byte(nil), tokenCiphertext...), ExecutionRevision: executionRevision, RecoveryRevision: recoveryRevision, StartDeadline: deadline.UTC()}, nil
+}
+
+func startGrantFromStored(commandID string, tokenHash, ciphertext []byte, executionRevision, recoveryRevision uint64, deadline sql.NullTime) (StartGrant, error) {
+	if len(tokenHash) != sha256.Size || len(ciphertext) == 0 || executionRevision == 0 || recoveryRevision == 0 || !deadline.Valid {
+		return StartGrant{}, ErrInvalidCommandPayload
+	}
+	var hash [sha256.Size]byte
+	copy(hash[:], tokenHash)
+	return StartGrant{CommandID: commandID, TokenHash: hash, TokenCiphertext: append([]byte(nil), ciphertext...), ExecutionRevision: executionRevision, RecoveryRevision: recoveryRevision, StartDeadline: deadline.Time.UTC()}, nil
+}
+
+func (repository *PostgresRepository) MarkStartEnqueued(ctx context.Context, scope platformscope.Scope, commandID string, executionRevision uint64, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || executionRevision == 0 || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	result, err := repository.db.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET start_enqueued_at = COALESCE(start_enqueued_at, $1)
+		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
+			AND execution_revision = $5
+			AND command_phase IN ('start_authorized', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled', 'timed_out')
+	`, at.UTC(), scope.TenantID, scope.ProjectID, commandID, executionRevision)
+	if err != nil {
+		return classifyWriteError("mark command Start enqueued", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read command Start enqueue result: %w", err)
+	}
+	if updated != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) RenewExecutionLease(ctx context.Context, scope platformscope.Scope, commandID string, tokenHash [32]byte, expectedExecutionRevision uint64, at, deadline time.Time) (uint64, error) {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || expectedExecutionRevision == 0 || at.IsZero() || !deadline.After(at) {
+		return 0, ErrInvalidCommandPayload
+	}
+	var recoveryRevision uint64
+	err := repository.db.QueryRowContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = CASE WHEN command_phase = 'start_authorized' THEN 'running' ELSE command_phase END,
+			recovery_revision = recovery_revision + 1, execution_last_heartbeat_at = $1,
+			execution_deadline_at = $2, start_enqueued_at = COALESCE(start_enqueued_at, $1), recovery_claim_token = NULL,
+			recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL,
+			recovery_lease_expires_at = NULL
+		WHERE tenant_id = $3 AND project_id = $4 AND id = $5
+			AND command_phase IN ('start_authorized', 'running', 'cancelling')
+			AND execution_token_hash = $6 AND execution_revision = $7
+		RETURNING recovery_revision
+	`, at.UTC(), deadline.UTC(), scope.TenantID, scope.ProjectID, commandID, tokenHash[:], expectedExecutionRevision).Scan(&recoveryRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrConflict
+	}
+	if err != nil {
+		return 0, fmt.Errorf("renew fenced execution lease: %w", err)
+	}
+	return recoveryRevision, nil
+}
+
+func (repository *PostgresRepository) ClaimExpiredExecution(ctx context.Context, limit int, at time.Time) ([]RecoveryClaim, error) {
+	if repository == nil || repository.db == nil || ctx == nil || limit <= 0 || at.IsZero() {
+		return nil, ErrInvalidCommandPayload
+	}
+	at = at.UTC()
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin expired execution claim: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT tenant_id, project_id, id, job_id, target_id, execution_deadline_at, recovery_revision
+		FROM command_outbox
+		WHERE command_phase IN ('start_authorized', 'running', 'cancelling')
+			AND execution_deadline_at IS NOT NULL AND execution_deadline_at <= $1
+			AND (recovery_claim_token IS NULL OR recovery_lease_expires_at <= $1)
+		ORDER BY execution_deadline_at, id
+		FOR UPDATE SKIP LOCKED
+		LIMIT $2
+	`, at, limit)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("select expired execution claims: %w", err)
+	}
+	claims := make([]RecoveryClaim, 0, limit)
+	for rows.Next() {
+		var claim RecoveryClaim
+		if err := rows.Scan(&claim.Scope.TenantID, &claim.Scope.ProjectID, &claim.CommandID, &claim.JobID, &claim.TargetID, &claim.ClaimedDeadline, &claim.ClaimedRecoveryRevision); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("scan expired execution claim: %w", err)
+		}
+		claim.ClaimedDeadline = claim.ClaimedDeadline.UTC()
+		claims = append(claims, claim)
+	}
+	if err := rows.Close(); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("close expired execution claims: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("iterate expired execution claims: %w", err)
+	}
+	for index := range claims {
+		if _, err := rand.Read(claims[index].ClaimToken[:]); err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("generate recovery claim token: %w", err)
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE command_outbox
+			SET recovery_claim_token = $1, recovery_claimed_deadline = $2,
+				recovery_claimed_revision = $3, recovery_lease_expires_at = $4
+			WHERE tenant_id = $5 AND project_id = $6 AND id = $7
+				AND command_phase IN ('start_authorized', 'running', 'cancelling')
+				AND execution_deadline_at = $2 AND recovery_revision = $3
+		`, claims[index].ClaimToken[:], claims[index].ClaimedDeadline, claims[index].ClaimedRecoveryRevision, at.Add(DefaultOutboxLease), claims[index].Scope.TenantID, claims[index].Scope.ProjectID, claims[index].CommandID)
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, classifyWriteError("claim expired execution", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil || updated != 1 {
+			_ = tx.Rollback()
+			if err != nil {
+				return nil, fmt.Errorf("read expired execution claim result: %w", err)
+			}
+			return nil, ErrConflict
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expired execution claims: %w", err)
+	}
+	return claims, nil
+}
+
+func (repository *PostgresRepository) FinalizeExpiredExecution(ctx context.Context, claim RecoveryClaim, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || claim.Scope.Validate() != nil || strings.TrimSpace(claim.CommandID) == "" || claim.ClaimedDeadline.IsZero() || claim.ClaimedRecoveryRevision == 0 || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	result, err := repository.db.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = 'timed_out', command_status = 'timed_out', terminal_at = $1,
+			execution_deadline_at = NULL, recovery_lease_expires_at = NULL,
+			recovery_claim_token = NULL, recovery_claimed_deadline = NULL,
+			recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL
+		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
+			AND command_phase IN ('start_authorized', 'running', 'cancelling')
+			AND recovery_claim_token = $5 AND execution_deadline_at = $6
+			AND recovery_claimed_deadline = $6 AND recovery_revision = $7
+			AND recovery_claimed_revision = $7
+	`, at.UTC(), claim.Scope.TenantID, claim.Scope.ProjectID, claim.CommandID, claim.ClaimToken[:], claim.ClaimedDeadline.UTC(), claim.ClaimedRecoveryRevision)
+	if err != nil {
+		return classifyWriteError("finalize expired execution", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read expired execution finalization result: %w", err)
+	}
+	if updated != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {
+	base := TerminalResultOutcome{CommandID: input.CommandID}
+	if repository == nil || repository.db == nil || ctx == nil || input.Scope.Validate() != nil || strings.TrimSpace(input.CommandID) == "" || input.ExpectedExecutionRevision == 0 || !terminalCommandStatus(input.Status) || input.Status == CommandRejected || input.At.IsZero() {
+		return base, ErrInvalidCommandPayload
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return base, fmt.Errorf("begin terminal result persistence: %w", err)
+	}
+	rollback := func(cause error) (TerminalResultOutcome, error) {
+		_ = tx.Rollback()
+		return base, cause
+	}
+	var phase CommandPhase
+	var storedStatus CommandStatus
+	var storedTokenHash, storedDigest []byte
+	var storedExecutionRevision uint64
+	err = tx.QueryRowContext(ctx, `
+		SELECT job_id, target_id, command_phase, command_status, execution_token_hash,
+			execution_revision, terminal_result_digest
+		FROM command_outbox
+		WHERE tenant_id = $1 AND project_id = $2 AND id = $3
+		FOR UPDATE
+	`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID).Scan(&base.JobID, &base.TargetID, &phase, &storedStatus, &storedTokenHash, &storedExecutionRevision, &storedDigest)
+	if err != nil {
+		return rollback(classifyReadError("lock command terminal result", err))
+	}
+	base.Status = storedStatus
+	if len(storedDigest) == sha256.Size {
+		copy(base.ResultDigest[:], storedDigest)
+	}
+	fenceMatches := len(storedTokenHash) == sha256.Size && subtle.ConstantTimeCompare(storedTokenHash, input.TokenHash[:]) == 1 && storedExecutionRevision == input.ExpectedExecutionRevision
+	if phase == CommandPhaseSucceeded || phase == CommandPhaseFailed || phase == CommandPhaseCancelled || phase == CommandPhaseTimedOut || phase == CommandPhaseRejected {
+		if !fenceMatches {
+			return rollback(ErrConflict)
+		}
+		if storedStatus == input.Status && len(storedDigest) == sha256.Size && subtle.ConstantTimeCompare(storedDigest, input.ResultDigest[:]) == 1 {
+			base.Persisted = true
+			base.Duplicate = true
+			if err := tx.Commit(); err != nil {
+				return TerminalResultOutcome{}, fmt.Errorf("commit duplicate terminal result: %w", err)
+			}
+			return base, nil
+		}
+		base.Conflict = true
+		if err := tx.Commit(); err != nil {
+			return TerminalResultOutcome{}, fmt.Errorf("commit terminal result conflict classification: %w", err)
+		}
+		return base, nil
+	}
+	if !fenceMatches || (phase != CommandPhaseStartAuthorized && phase != CommandPhaseRunning && phase != CommandPhaseCancelling) {
+		return rollback(ErrConflict)
+	}
+	phase = phaseForCommandStatus(input.Status)
+	result, err := tx.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = $1, command_status = $2, terminal_result_digest = $3, terminal_at = $4,
+			execution_deadline_at = NULL, recovery_lease_expires_at = NULL,
+			recovery_claim_token = NULL, recovery_claimed_deadline = NULL,
+			recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL
+		WHERE tenant_id = $5 AND project_id = $6 AND id = $7
+			AND command_phase IN ('start_authorized', 'running', 'cancelling')
+			AND execution_token_hash = $8 AND execution_revision = $9
+	`, string(phase), string(input.Status), input.ResultDigest[:], input.At.UTC(), input.Scope.TenantID, input.Scope.ProjectID, input.CommandID, input.TokenHash[:], input.ExpectedExecutionRevision)
+	if err != nil {
+		return rollback(classifyWriteError("persist terminal result", err))
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return rollback(fmt.Errorf("read terminal result persistence: %w", err))
+	}
+	if updated != 1 {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return TerminalResultOutcome{}, fmt.Errorf("commit terminal result: %w: %w", ErrAmbiguousCommit, err)
+	}
+	return TerminalResultOutcome{CommandID: input.CommandID, JobID: base.JobID, TargetID: base.TargetID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+
+func phaseForCommandStatus(status CommandStatus) CommandPhase {
+	switch status {
+	case CommandSucceeded:
+		return CommandPhaseSucceeded
+	case CommandFailed:
+		return CommandPhaseFailed
+	case CommandCancelled:
+		return CommandPhaseCancelled
+	case CommandTimedOut:
+		return CommandPhaseTimedOut
+	case CommandRejected:
+		return CommandPhaseRejected
+	default:
+		return CommandPhasePending
+	}
+}
+
 type rowQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
@@ -518,11 +908,16 @@ func scanJob(row rowScanner) (Job, error) {
 func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	var value OutboxMessage
 	var leased, published, acknowledged, executionDeadline, lastHeartbeat, recoveryLeased, cancelRequested, cancelAvailable, cancelLeased sql.NullTime
+	var prepared, startDeadline, startEnqueued, claimedDeadline, terminal sql.NullTime
+	var claimedRevision sql.NullInt64
 	err := row.Scan(
 		&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.JobID, &value.TargetID, &value.Type,
 		&value.Payload, &value.PreparedEnvelope, &value.AvailableAt, &value.CreatedAt, &leased, &published, &value.Attempts,
 		&value.CommandStatus, &acknowledged, &executionDeadline, &lastHeartbeat, &recoveryLeased,
 		&cancelRequested, &value.CancellationReason, &cancelAvailable, &cancelLeased, &value.CancellationAttempts,
+		&value.Phase, &value.PrepareDigest, &prepared, &value.ExecutionTokenHash, &value.ExecutionTokenCiphertext,
+		&value.ExecutionRevision, &value.RecoveryRevision, &startDeadline, &startEnqueued, &value.RecoveryClaimToken,
+		&claimedDeadline, &claimedRevision, &value.TerminalResultDigest, &terminal,
 	)
 	if err != nil {
 		return OutboxMessage{}, err
@@ -538,6 +933,19 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	value.CancellationRequestedAt = nullTimePointer(cancelRequested)
 	value.CancellationAvailableAt = nullTimePointer(cancelAvailable)
 	value.CancellationLeasedUntil = nullTimePointer(cancelLeased)
+	value.PreparedAt = nullTimePointer(prepared)
+	value.StartDeadline = nullTimePointer(startDeadline)
+	value.StartEnqueuedAt = nullTimePointer(startEnqueued)
+	value.RecoveryClaimedDeadline = nullTimePointer(claimedDeadline)
+	if claimedRevision.Valid && claimedRevision.Int64 > 0 {
+		value.RecoveryClaimedRevision = uint64(claimedRevision.Int64)
+	}
+	value.TerminalAt = nullTimePointer(terminal)
+	value.PrepareDigest = append([]byte(nil), value.PrepareDigest...)
+	value.ExecutionTokenHash = append([]byte(nil), value.ExecutionTokenHash...)
+	value.ExecutionTokenCiphertext = append([]byte(nil), value.ExecutionTokenCiphertext...)
+	value.RecoveryClaimToken = append([]byte(nil), value.RecoveryClaimToken...)
+	value.TerminalResultDigest = append([]byte(nil), value.TerminalResultDigest...)
 	return value, nil
 }
 
@@ -555,7 +963,7 @@ func validateNewJob(value Job) error {
 }
 
 func validateOutboxMessage(ctx context.Context, value Job, message OutboxMessage, authorizer commandvalidation.TargetAuthorizer) error {
-	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 {
+	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 || message.Phase != "" || len(message.PrepareDigest) != 0 || message.PreparedAt != nil || len(message.ExecutionTokenHash) != 0 || len(message.ExecutionTokenCiphertext) != 0 || message.ExecutionRevision != 0 || message.RecoveryRevision != 0 || message.StartDeadline != nil || message.StartEnqueuedAt != nil || len(message.RecoveryClaimToken) != 0 || message.RecoveryClaimedDeadline != nil || message.RecoveryClaimedRevision != 0 || len(message.TerminalResultDigest) != 0 || message.TerminalAt != nil {
 		return fmt.Errorf("create outbox message: %w", ErrInvalidCommandPayload)
 	}
 	envelope := new(agentv1.CommandEnvelope)

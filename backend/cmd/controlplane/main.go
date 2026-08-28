@@ -84,6 +84,7 @@ type MonitoringSettings struct {
 
 type CommandSettings struct {
 	SigningPrivateKeyRef string `yaml:"signing_private_key_ref"`
+	ExecutionTokenKeyRef string `yaml:"execution_token_key_ref"`
 }
 
 type ArtifactSettings struct {
@@ -137,6 +138,7 @@ type Config struct {
 	AgentRegistry           *agentcontrol.Registry                     `yaml:"-"`
 	CommandObserver         agentcontrol.Observer                      `yaml:"-"`
 	CommandSigner           job.CommandSigner                          `yaml:"-"`
+	CommandTokenProtector   job.TokenProtector                         `yaml:"-"`
 	ArtifactDownloadHandler http.Handler                               `yaml:"-"`
 	ArtifactSecretResolver  platformdatabase.SecretResolver            `yaml:"-"`
 	CommandTargetAuthorizer commandvalidation.TargetAuthorizer         `yaml:"-"`
@@ -277,6 +279,10 @@ func NewServer(config Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	commandTokenProtector, err := commandTokenProtectorForConfig(context.Background(), config, secrets)
+	if err != nil {
+		return nil, err
+	}
 	database := config.Database
 	ownsDatabase := false
 	if database == nil {
@@ -397,8 +403,8 @@ func NewServer(config Config) (*Server, error) {
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
-		TargetAuthorizer: config.CommandTargetAuthorizer,
-		OnError:          func(err error) { log.Printf("command lifecycle event failed: %v", err) },
+		TargetAuthorizer: config.CommandTargetAuthorizer, TokenProtector: commandTokenProtector,
+		OnError: func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
 		if artifactBlobs != nil {
@@ -434,6 +440,9 @@ func validateConfig(config Config) error {
 	}
 	if config.CommandSigner == nil && alert.ValidateSecretReference(config.Command.SigningPrivateKeyRef) != nil {
 		return errors.New("command.signing_private_key_ref must be a Credential Reference")
+	}
+	if config.CommandTokenProtector == nil && alert.ValidateSecretReference(config.Command.ExecutionTokenKeyRef) != nil {
+		return errors.New("command.execution_token_key_ref must be a Credential Reference")
 	}
 	if strings.TrimSpace(config.Artifact.SigningKeyRef) == "" {
 		return errors.New("artifact.signing_key_ref is required")
@@ -888,6 +897,26 @@ func commandSignerForConfig(ctx context.Context, config Config, resolver alert.S
 		return nil, fmt.Errorf("configure command signing private key: %w", err)
 	}
 	return signer, nil
+}
+
+func commandTokenProtectorForConfig(ctx context.Context, config Config, resolver alert.SecretResolver) (job.TokenProtector, error) {
+	if config.CommandTokenProtector != nil {
+		return config.CommandTokenProtector, nil
+	}
+	key, err := resolver.Resolve(ctx, config.Command.ExecutionTokenKeyRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve command execution token key: %w", err)
+	}
+	defer func() {
+		for index := range key {
+			key[index] = 0
+		}
+	}()
+	protector, err := job.NewAES256GCMTokenProtector(key)
+	if err != nil {
+		return nil, fmt.Errorf("configure command execution token protection: %w", err)
+	}
+	return protector, nil
 }
 
 type postgresLogBatchDeduplicator struct{ database *sql.DB }

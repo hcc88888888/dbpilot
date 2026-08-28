@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
@@ -96,6 +99,8 @@ type CommandLifecycleConfig struct {
 	ClaimLimit         int
 	Now                func() time.Time
 	NonceReader        io.Reader
+	TokenReader        io.Reader
+	TokenProtector     TokenProtector
 	OnError            func(error)
 	TargetAuthorizer   commandvalidation.TargetAuthorizer
 }
@@ -112,12 +117,15 @@ type CommandLifecycle struct {
 	claimLimit         int
 	now                func() time.Time
 	nonceReader        io.Reader
+	tokenReader        io.Reader
+	tokenProtector     TokenProtector
 	onError            func(error)
 	targetAuthorizer   commandvalidation.TargetAuthorizer
+	transitionStripes  [64]sync.Mutex
 }
 
 func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, error) {
-	if config.DispatchRepository == nil || config.Jobs == nil || config.Agents == nil || config.Signer == nil || config.Audit == nil {
+	if config.DispatchRepository == nil || config.Jobs == nil || config.Agents == nil || config.Signer == nil || config.Audit == nil || config.TokenProtector == nil {
 		return nil, errors.New("command lifecycle dependencies are required")
 	}
 	if config.ClaimLimit < 0 {
@@ -132,13 +140,16 @@ func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, erro
 	if config.NonceReader == nil {
 		config.NonceReader = rand.Reader
 	}
+	if config.TokenReader == nil {
+		config.TokenReader = rand.Reader
+	}
 	if config.OnError == nil {
 		config.OnError = func(error) {}
 	}
 	return &CommandLifecycle{
 		dispatchRepository: config.DispatchRepository, jobs: config.Jobs, agents: config.Agents,
 		signer: config.Signer, audit: config.Audit, claimLimit: config.ClaimLimit,
-		now: config.Now, nonceReader: config.NonceReader, onError: config.OnError,
+		now: config.Now, nonceReader: config.NonceReader, tokenReader: config.TokenReader, tokenProtector: config.TokenProtector, onError: config.OnError,
 		targetAuthorizer: config.TargetAuthorizer,
 	}, nil
 }
@@ -253,20 +264,50 @@ func (lifecycle *CommandLifecycle) dispatchCancellations(ctx context.Context, at
 	}
 	var result []error
 	for _, message := range messages {
-		if message.PublishedAt == nil && (message.CommandStatus == "" || message.CommandStatus == CommandPending) {
+		preStart := message.Phase == "" || message.Phase == CommandPhasePending || message.Phase == CommandPhasePreparing || message.Phase == CommandPhasePrepared
+		if preStart && message.PublishedAt == nil && message.PreparedAt == nil {
 			if err := lifecycle.cancelUndelivered(ctx, message, at); err != nil {
 				result = append(result, fmt.Errorf("cancel undelivered command %q: %w", message.ID, err))
 			}
 			continue
 		}
-		if err := lifecycle.agents.Cancel(ctx, message.TargetID, message.ID); err != nil {
+		if err := lifecycle.dispatchCancellation(ctx, message); err != nil {
 			result = append(result, fmt.Errorf("dispatch command cancellation %q: %w", message.ID, err))
+			continue
+		}
+		if preStart {
+			if err := lifecycle.cancelUndelivered(ctx, message, at); err != nil {
+				result = append(result, fmt.Errorf("terminalize prepared command cancellation %q: %w", message.ID, err))
+			}
+			continue
 		}
 		if err := lifecycle.dispatchRepository.DeferCancellation(ctx, message.Scope, message.ID, at.Add(DefaultCancellationRetry)); err != nil && !errors.Is(err, ErrNotFound) {
 			result = append(result, fmt.Errorf("defer command cancellation %q: %w", message.ID, err))
 		}
 	}
 	return errors.Join(result...)
+}
+
+func (lifecycle *CommandLifecycle) dispatchCancellation(ctx context.Context, message OutboxMessage) error {
+	unlock := lifecycle.lockCommandTransition(message.ID)
+	defer unlock()
+	started := message.Phase == CommandPhaseStartAuthorized || message.Phase == CommandPhaseRunning || message.Phase == CommandPhaseCancelling
+	if !started {
+		return lifecycle.agents.Cancel(ctx, message.TargetID, message.ID)
+	}
+	if message.ExecutionRevision == 0 || len(message.ExecutionTokenCiphertext) == 0 || len(message.ExecutionTokenHash) != sha256.Size {
+		return ErrInvalidCommandPayload
+	}
+	token, err := lifecycle.tokenProtector.Unprotect(ctx, message.ExecutionTokenCiphertext)
+	if err != nil {
+		return fmt.Errorf("recover cancellation execution token: %w", err)
+	}
+	defer clearSensitiveBytes(token)
+	hash := sha256.Sum256(token)
+	if len(message.ExecutionTokenHash) != sha256.Size || subtle.ConstantTimeCompare(hash[:], message.ExecutionTokenHash) != 1 {
+		return ErrInvalidCommandPayload
+	}
+	return lifecycle.agents.CancelExecution(ctx, message.TargetID, message.ID, token, message.ExecutionRevision, message.CancellationReason)
 }
 
 func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
@@ -283,12 +324,24 @@ func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, messag
 }
 
 func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time.Time) error {
-	messages, err := lifecycle.dispatchRepository.ClaimExpiredCommands(ctx, lifecycle.claimLimit, at)
+	claims, err := lifecycle.dispatchRepository.ClaimExpiredExecution(ctx, lifecycle.claimLimit, at)
 	if err != nil {
 		return err
 	}
 	var result []error
-	for _, message := range messages {
+	for _, claim := range claims {
+		if err := lifecycle.dispatchRepository.FinalizeExpiredExecution(ctx, claim, at); err != nil {
+			if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+				continue
+			}
+			result = append(result, fmt.Errorf("fence expired command %q: %w", claim.CommandID, err))
+			continue
+		}
+		message, lookupErr := lifecycle.dispatchRepository.LookupCommand(ctx, claim.CommandID)
+		if lookupErr != nil {
+			result = append(result, fmt.Errorf("lookup expired command %q: %w", claim.CommandID, lookupErr))
+			continue
+		}
 		target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "execution lease expired", FinishedAt: timePointer(at)}
 		value, _, applyErr := lifecycle.applyTarget(ctx, message, target, at)
 		if applyErr != nil {
@@ -299,9 +352,6 @@ func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time
 		if _, recordErr := lifecycle.audit.RecordOnce(ctx, event); recordErr != nil {
 			result = append(result, fmt.Errorf("audit expired command %q: %w", message.ID, recordErr))
 			continue
-		}
-		if markErr := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); markErr != nil {
-			result = append(result, fmt.Errorf("terminalize expired command %q: %w", message.ID, markErr))
 		}
 	}
 	return errors.Join(result...)
@@ -389,11 +439,107 @@ func (lifecycle *CommandLifecycle) ensureDispatched(ctx context.Context, message
 	return Job{}, ErrConflict
 }
 
+func (lifecycle *CommandLifecycle) Prepared(ctx context.Context, agentID string, prepared *agentv1.CommandPrepared) (*agentv1.CommandStart, error) {
+	if lifecycle == nil || prepared == nil || strings.TrimSpace(prepared.GetCommandId()) == "" || len(prepared.GetEnvelopeDigest()) != sha256.Size {
+		return nil, ErrInvalidCommandPayload
+	}
+	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, prepared.GetCommandId())
+	if err != nil {
+		return nil, err
+	}
+	if message.TargetID != agentID {
+		return nil, ErrCommandAgentMismatch
+	}
+	if len(message.PreparedEnvelope) == 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	envelopeDigest := sha256.Sum256(message.PreparedEnvelope)
+	if subtle.ConstantTimeCompare(envelopeDigest[:], prepared.GetEnvelopeDigest()) != 1 {
+		return nil, ErrConflict
+	}
+	unlock := lifecycle.lockCommandTransition(message.ID)
+	defer unlock()
+	var digest [sha256.Size]byte
+	copy(digest[:], prepared.GetEnvelopeDigest())
+	at := lifecycle.currentTime()
+	if err := lifecycle.dispatchRepository.MarkPrepared(ctx, message.Scope, message.ID, digest, at); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	unsigned, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	if err != nil {
+		return nil, err
+	}
+	value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+	if err != nil {
+		return nil, err
+	}
+	deadline := executionDeadline(value, unsigned.GetLeaseSeconds(), at)
+	if !deadline.After(at) {
+		return nil, nil
+	}
+	token := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(lifecycle.tokenReader, token); err != nil {
+		return nil, fmt.Errorf("generate execution token: %w", err)
+	}
+	defer clearSensitiveBytes(token)
+	tokenHash := sha256.Sum256(token)
+	ciphertext, err := lifecycle.tokenProtector.Protect(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("protect execution token: %w", err)
+	}
+	grant, err := lifecycle.dispatchRepository.AuthorizeStart(ctx, message.Scope, message.ID, digest, tokenHash, ciphertext, at, deadline)
+	if err != nil {
+		if errors.Is(err, ErrConflict) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	persistedToken, err := lifecycle.tokenProtector.Unprotect(ctx, grant.TokenCiphertext)
+	if err != nil {
+		return nil, fmt.Errorf("recover persisted execution token: %w", err)
+	}
+	defer clearSensitiveBytes(persistedToken)
+	persistedHash := sha256.Sum256(persistedToken)
+	if subtle.ConstantTimeCompare(persistedHash[:], grant.TokenHash[:]) != 1 || grant.ExecutionRevision == 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	if !grant.StartDeadline.After(at) {
+		return nil, nil
+	}
+	start := &agentv1.CommandStart{
+		CommandId: message.ID, ExecutionToken: append([]byte(nil), persistedToken...), LeaseRevision: grant.ExecutionRevision,
+		LeaseSeconds: unsigned.GetLeaseSeconds(), StartDeadline: timestamppb.New(grant.StartDeadline),
+	}
+	if err := lifecycle.agents.Start(ctx, agentID, start); err != nil {
+		return nil, err
+	}
+	if err := lifecycle.dispatchRepository.MarkStartEnqueued(ctx, message.Scope, message.ID, grant.ExecutionRevision, lifecycle.currentTime()); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (lifecycle *CommandLifecycle) lockCommandTransition(commandID string) func() {
+	digest := sha256.Sum256([]byte(commandID))
+	stripe := &lifecycle.transitionStripes[int(digest[0])%len(lifecycle.transitionStripes)]
+	stripe.Lock()
+	return stripe.Unlock
+}
+
+func clearSensitiveBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+}
+
 func (lifecycle *CommandLifecycle) Connected(ctx context.Context, session agentcontrol.SessionInfo) {
-	active := make([]string, 0, len(session.ActiveCommands))
+	active := make([]executionLeaseFence, 0, len(session.ActiveCommands))
 	for _, state := range session.ActiveCommands {
 		if state != nil && strings.TrimSpace(state.GetCommandId()) != "" && (state.GetState() == agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_ACCEPTED || state.GetState() == agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING) {
-			active = append(active, state.GetCommandId())
+			active = append(active, executionLeaseFence{commandID: state.GetCommandId(), token: append([]byte(nil), state.GetExecutionToken()...), executionRevision: state.GetLeaseRevision()})
 		}
 	}
 	lifecycle.renewExecutionLeases(ctx, session.AgentID, active, lifecycle.currentTime())
@@ -403,7 +549,7 @@ func (lifecycle *CommandLifecycle) Connected(ctx context.Context, session agentc
 		return
 	}
 	for _, message := range messages {
-		if err := lifecycle.agents.Cancel(ctx, session.AgentID, message.ID); err != nil {
+		if err := lifecycle.dispatchCancellation(ctx, message); err != nil {
 			lifecycle.onError(err)
 		}
 	}
@@ -414,20 +560,32 @@ func (lifecycle *CommandLifecycle) Heartbeat(ctx context.Context, agentID string
 		lifecycle.onError(ErrCommandAgentMismatch)
 		return
 	}
-	lifecycle.renewExecutionLeases(ctx, agentID, heartbeat.GetActiveCommandIds(), lifecycle.currentTime())
+	active := make([]executionLeaseFence, 0, len(heartbeat.GetActiveCommands()))
+	for _, command := range heartbeat.GetActiveCommands() {
+		if command != nil {
+			active = append(active, executionLeaseFence{commandID: command.GetCommandId(), token: append([]byte(nil), command.GetExecutionToken()...), executionRevision: command.GetLeaseRevision()})
+		}
+	}
+	lifecycle.renewExecutionLeases(ctx, agentID, active, lifecycle.currentTime())
 }
 
-func (lifecycle *CommandLifecycle) renewExecutionLeases(ctx context.Context, agentID string, commandIDs []string, at time.Time) {
-	seen := make(map[string]struct{}, len(commandIDs))
-	for _, commandID := range commandIDs {
-		if strings.TrimSpace(commandID) == "" {
+type executionLeaseFence struct {
+	commandID         string
+	token             []byte
+	executionRevision uint64
+}
+
+func (lifecycle *CommandLifecycle) renewExecutionLeases(ctx context.Context, agentID string, commands []executionLeaseFence, at time.Time) {
+	seen := make(map[string]struct{}, len(commands))
+	for _, command := range commands {
+		if strings.TrimSpace(command.commandID) == "" || len(command.token) != sha256.Size || command.executionRevision == 0 {
 			continue
 		}
-		if _, duplicate := seen[commandID]; duplicate {
+		if _, duplicate := seen[command.commandID]; duplicate {
 			continue
 		}
-		seen[commandID] = struct{}{}
-		message, err := lifecycle.dispatchRepository.LookupCommand(ctx, commandID)
+		seen[command.commandID] = struct{}{}
+		message, err := lifecycle.dispatchRepository.LookupCommand(ctx, command.commandID)
 		if err != nil {
 			lifecycle.onError(err)
 			continue
@@ -450,7 +608,8 @@ func (lifecycle *CommandLifecycle) renewExecutionLeases(ctx context.Context, age
 		if !deadline.After(at) {
 			continue
 		}
-		if err := lifecycle.dispatchRepository.RenewCommandLease(ctx, message.Scope, message.ID, at, deadline); err != nil && !errors.Is(err, ErrNotFound) {
+		tokenHash := sha256.Sum256(command.token)
+		if _, err := lifecycle.dispatchRepository.RenewExecutionLease(ctx, message.Scope, message.ID, tokenHash, command.executionRevision, at, deadline); err != nil && !errors.Is(err, ErrNotFound) {
 			lifecycle.onError(err)
 		}
 	}
@@ -487,8 +646,19 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 	at := lifecycle.currentTime()
 	switch acknowledgement.GetState() {
 	case agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE:
+		if message.Phase != "" && message.Phase != CommandPhaseStartAuthorized && message.Phase != CommandPhaseRunning && message.Phase != CommandPhaseCancelling {
+			lifecycle.onError(ErrConflict)
+			return
+		}
+		if message.Phase != "" && (message.ExecutionRevision == 0 || len(message.ExecutionTokenHash) != sha256.Size) {
+			lifecycle.onError(ErrInvalidCommandPayload)
+			return
+		}
 		target = TargetResult{Status: TargetRunning}
 	case agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED:
+		if message.CancellationRequestedAt != nil {
+			return
+		}
 		target = TargetResult{Status: TargetFailed, ErrorSummary: acknowledgement.GetReasonCode(), FinishedAt: timePointer(at)}
 		auditResult = "failure"
 		commandStatus = CommandRejected
@@ -530,6 +700,26 @@ func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string,
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
+	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, progress.GetCommandId())
+	if err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	if message.Phase != "" {
+		if message.Phase != CommandPhaseStartAuthorized && message.Phase != CommandPhaseRunning && message.Phase != CommandPhaseCancelling {
+			lifecycle.onError(ErrConflict)
+			return
+		}
+		if len(progress.GetExecutionToken()) != sha256.Size || progress.GetLeaseRevision() != message.ExecutionRevision || message.ExecutionRevision == 0 || len(message.ExecutionTokenHash) != sha256.Size {
+			lifecycle.onError(ErrConflict)
+			return
+		}
+		hash := sha256.Sum256(progress.GetExecutionToken())
+		if subtle.ConstantTimeCompare(hash[:], message.ExecutionTokenHash) != 1 {
+			lifecycle.onError(ErrConflict)
+			return
+		}
+	}
 	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()})
 }
 
@@ -537,6 +727,11 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	if result == nil || strings.TrimSpace(result.GetCommandId()) == "" || len(result.GetSummary()) > maximumInlineResultSummary {
 		return agentcontrol.ResultPersistence{}, ErrInvalidCommandPayload
 	}
+	encodedResult, err := proto.MarshalOptions{Deterministic: true}.Marshal(result)
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, ErrInvalidCommandPayload
+	}
+	resultDigest := sha256.Sum256(encodedResult)
 	target := TargetResult{ResultSummary: result.GetSummary(), FinishedAt: timePointer(lifecycle.currentTime())}
 	auditResult := "success"
 	commandStatus := CommandSucceeded
@@ -563,35 +758,70 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	}
 	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, result.GetCommandId())
 	if err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
 	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
 	if err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
-	}
-	value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
-	if err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
 	if envelope.GetAgentId() != agentID || message.TargetID != agentID {
+		value, getErr := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if getErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, getErr
+		}
 		recordErr := lifecycle.recordAudit(ctx, value, message, "command.rejected", "failure", map[string]any{"reason": "agent_mismatch"})
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, errors.Join(ErrCommandAgentMismatch, recordErr)
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, errors.Join(ErrCommandAgentMismatch, recordErr)
 	}
+	if len(result.GetExecutionToken()) != sha256.Size || result.GetLeaseRevision() == 0 {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
+	}
+	tokenHash := sha256.Sum256(result.GetExecutionToken())
 	target.TargetID = message.TargetID
 	at := lifecycle.currentTime()
-	value, _, err = lifecycle.applyTarget(ctx, message, target, at)
+	terminal, err := lifecycle.dispatchRepository.PersistTerminalResult(ctx, TerminalResultCAS{
+		Scope: message.Scope, CommandID: message.ID, TokenHash: tokenHash,
+		ExpectedExecutionRevision: result.GetLeaseRevision(), Status: commandStatus, ResultDigest: resultDigest, At: at,
+	})
 	if err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+	}
+	if terminal.Conflict {
+		value, getErr := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if getErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, getErr
+		}
+		event := lifecycle.auditEvent(value, message, "command.result_conflict", "failure", map[string]any{"stored_status": string(terminal.Status), "incoming_status": string(commandStatus)}, at, "command.result_conflict:"+message.ID+":"+fmt.Sprintf("%x", resultDigest[:]))
+		if _, recordErr := lifecycle.audit.RecordOnce(ctx, event); recordErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, recordErr
+		}
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
+	}
+	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+	}
+	storedTarget, found := targetFor(value.TargetResults, message.TargetID)
+	if !found || !matchingTerminalTarget(storedTarget, target) {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrConflict
 	}
 	detail := map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)}
 	event := lifecycle.auditEvent(value, message, "command.result", auditResult, detail, at, "command.result:"+message.ID)
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
-	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatus, at); err != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
+}
+
+func matchingTerminalTarget(stored, incoming TargetResult) bool {
+	if stored.TargetID != incoming.TargetID || stored.Status != incoming.Status || stored.ErrorSummary != incoming.ErrorSummary || stored.ResultSummary != incoming.ResultSummary || len(stored.Artifacts) != len(incoming.Artifacts) {
+		return false
 	}
-	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
+	for index := range stored.Artifacts {
+		if stored.Artifacts[index] != incoming.Artifacts[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, commandID, action, result string, target TargetResult, detail map[string]any) {
@@ -832,3 +1062,4 @@ func collectArtifacts(results []TargetResult) []ArtifactReference {
 }
 
 var _ agentcontrol.Observer = (*CommandLifecycle)(nil)
+var _ agentcontrol.PreparedObserver = (*CommandLifecycle)(nil)

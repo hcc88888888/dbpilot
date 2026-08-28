@@ -263,13 +263,40 @@ func (r *Registry) Cancel(ctx context.Context, agentID, commandID string) error 
 		cancellation.ExecutionToken = append([]byte(nil), token...)
 		cancellation.LeaseRevision = current.leaseRevisions[commandID]
 	}
+	err := enqueueCancellation(current, commandID, cancellation)
+	r.mu.RUnlock()
+	return err
+}
+
+// CancelExecution sends the durable control-plane fence even after a Registry
+// restart, when the in-memory Start maps are intentionally empty.
+func (r *Registry) CancelExecution(ctx context.Context, agentID, commandID string, executionToken []byte, executionRevision uint64, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(commandID) == "" || len(executionToken) != sha256.Size || executionRevision == 0 {
+		return &dispatchError{err: ErrInvalidCommand}
+	}
+	r.mu.RLock()
+	current, exists := r.sessions[agentID]
+	if !exists {
+		r.mu.RUnlock()
+		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
+	}
+	cancellation := &agentv1.CommandCancellation{
+		CommandId: commandID, Reason: reason, ExecutionToken: append([]byte(nil), executionToken...), LeaseRevision: executionRevision,
+	}
+	err := enqueueCancellation(current, commandID, cancellation)
+	r.mu.RUnlock()
+	return err
+}
+
+func enqueueCancellation(current *session, commandID string, cancellation *agentv1.CommandCancellation) error {
 	message := &agentv1.ServerMessage{MessageId: commandID, Message: &agentv1.ServerMessage_CommandCancellation{CommandCancellation: cancellation}}
 	select {
 	case current.send <- message:
-		r.mu.RUnlock()
 		return nil
 	default:
-		r.mu.RUnlock()
 		return &dispatchError{err: ErrSessionQueueFull, retryable: true}
 	}
 }
@@ -327,5 +354,7 @@ var _ Dispatcher = (*Registry)(nil)
 
 type Dispatcher interface {
 	Dispatch(context.Context, string, *agentv1.CommandEnvelope) error
+	Start(context.Context, string, *agentv1.CommandStart) error
 	Cancel(context.Context, string, string) error
+	CancelExecution(context.Context, string, string, []byte, uint64, string) error
 }

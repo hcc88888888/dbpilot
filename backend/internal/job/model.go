@@ -119,28 +119,98 @@ type Transition struct {
 }
 
 type OutboxMessage struct {
-	ID                      string              `json:"id"`
-	Scope                   platformscope.Scope `json:"scope"`
-	JobID                   string              `json:"job_id"`
-	TargetID                string              `json:"target_id,omitempty"`
-	Type                    string              `json:"type"`
-	Payload                 []byte              `json:"payload"`
-	PreparedEnvelope        []byte              `json:"-"`
-	AvailableAt             time.Time           `json:"available_at"`
-	CreatedAt               time.Time           `json:"created_at"`
-	LeasedUntil             *time.Time          `json:"leased_until,omitempty"`
-	PublishedAt             *time.Time          `json:"published_at,omitempty"`
-	Attempts                int                 `json:"attempts"`
-	CommandStatus           CommandStatus       `json:"command_status"`
-	AcknowledgedAt          *time.Time          `json:"acknowledged_at,omitempty"`
-	ExecutionDeadline       *time.Time          `json:"execution_deadline,omitempty"`
-	LastHeartbeatAt         *time.Time          `json:"last_heartbeat_at,omitempty"`
-	RecoveryLeasedUntil     *time.Time          `json:"recovery_leased_until,omitempty"`
-	CancellationRequestedAt *time.Time          `json:"cancellation_requested_at,omitempty"`
-	CancellationReason      string              `json:"cancellation_reason,omitempty"`
-	CancellationAvailableAt *time.Time          `json:"cancellation_available_at,omitempty"`
-	CancellationLeasedUntil *time.Time          `json:"cancellation_leased_until,omitempty"`
-	CancellationAttempts    int                 `json:"cancellation_attempts"`
+	ID                       string              `json:"id"`
+	Scope                    platformscope.Scope `json:"scope"`
+	JobID                    string              `json:"job_id"`
+	TargetID                 string              `json:"target_id,omitempty"`
+	Type                     string              `json:"type"`
+	Payload                  []byte              `json:"payload"`
+	PreparedEnvelope         []byte              `json:"-"`
+	AvailableAt              time.Time           `json:"available_at"`
+	CreatedAt                time.Time           `json:"created_at"`
+	LeasedUntil              *time.Time          `json:"leased_until,omitempty"`
+	PublishedAt              *time.Time          `json:"published_at,omitempty"`
+	Attempts                 int                 `json:"attempts"`
+	CommandStatus            CommandStatus       `json:"command_status"`
+	AcknowledgedAt           *time.Time          `json:"acknowledged_at,omitempty"`
+	ExecutionDeadline        *time.Time          `json:"execution_deadline,omitempty"`
+	LastHeartbeatAt          *time.Time          `json:"last_heartbeat_at,omitempty"`
+	RecoveryLeasedUntil      *time.Time          `json:"recovery_leased_until,omitempty"`
+	CancellationRequestedAt  *time.Time          `json:"cancellation_requested_at,omitempty"`
+	CancellationReason       string              `json:"cancellation_reason,omitempty"`
+	CancellationAvailableAt  *time.Time          `json:"cancellation_available_at,omitempty"`
+	CancellationLeasedUntil  *time.Time          `json:"cancellation_leased_until,omitempty"`
+	CancellationAttempts     int                 `json:"cancellation_attempts"`
+	Phase                    CommandPhase        `json:"command_phase"`
+	PrepareDigest            []byte              `json:"-"`
+	PreparedAt               *time.Time          `json:"prepared_at,omitempty"`
+	ExecutionTokenHash       []byte              `json:"-"`
+	ExecutionTokenCiphertext []byte              `json:"-"`
+	ExecutionRevision        uint64              `json:"execution_revision"`
+	RecoveryRevision         uint64              `json:"recovery_revision"`
+	StartDeadline            *time.Time          `json:"start_deadline,omitempty"`
+	StartEnqueuedAt          *time.Time          `json:"start_enqueued_at,omitempty"`
+	RecoveryClaimToken       []byte              `json:"-"`
+	RecoveryClaimedDeadline  *time.Time          `json:"recovery_claimed_deadline,omitempty"`
+	RecoveryClaimedRevision  uint64              `json:"recovery_claimed_revision"`
+	TerminalResultDigest     []byte              `json:"-"`
+	TerminalAt               *time.Time          `json:"terminal_at,omitempty"`
+}
+
+type CommandPhase string
+
+const (
+	CommandPhasePending         CommandPhase = "pending"
+	CommandPhasePreparing       CommandPhase = "preparing"
+	CommandPhasePrepared        CommandPhase = "prepared"
+	CommandPhaseStartAuthorized CommandPhase = "start_authorized"
+	CommandPhaseRunning         CommandPhase = "running"
+	CommandPhaseCancelling      CommandPhase = "cancelling"
+	CommandPhaseSucceeded       CommandPhase = "succeeded"
+	CommandPhaseFailed          CommandPhase = "failed"
+	CommandPhaseCancelled       CommandPhase = "cancelled"
+	CommandPhaseTimedOut        CommandPhase = "timed_out"
+	CommandPhaseRejected        CommandPhase = "rejected"
+)
+
+type StartGrant struct {
+	CommandID         string
+	TokenHash         [32]byte
+	TokenCiphertext   []byte
+	ExecutionRevision uint64
+	RecoveryRevision  uint64
+	StartDeadline     time.Time
+}
+
+type RecoveryClaim struct {
+	Scope                   platformscope.Scope
+	CommandID               string
+	JobID                   string
+	TargetID                string
+	ClaimToken              [32]byte
+	ClaimedDeadline         time.Time
+	ClaimedRecoveryRevision uint64
+}
+
+type TerminalResultCAS struct {
+	Scope                     platformscope.Scope
+	CommandID                 string
+	TokenHash                 [32]byte
+	ExpectedExecutionRevision uint64
+	Status                    CommandStatus
+	ResultDigest              [32]byte
+	At                        time.Time
+}
+
+type TerminalResultOutcome struct {
+	CommandID    string
+	JobID        string
+	TargetID     string
+	Status       CommandStatus
+	ResultDigest [32]byte
+	Persisted    bool
+	Duplicate    bool
+	Conflict     bool
 }
 
 type CommandStatus string

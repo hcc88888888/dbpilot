@@ -24,6 +24,13 @@ type DispatchRepository interface {
 	ClaimOutbox(context.Context, int, time.Time) ([]OutboxMessage, error)
 	LookupCommand(context.Context, string) (OutboxMessage, error)
 	PrepareCommandEnvelope(context.Context, platformscope.Scope, string, []byte) ([]byte, error)
+	MarkPrepared(context.Context, platformscope.Scope, string, [32]byte, time.Time) error
+	AuthorizeStart(context.Context, platformscope.Scope, string, [32]byte, [32]byte, []byte, time.Time, time.Time) (StartGrant, error)
+	MarkStartEnqueued(context.Context, platformscope.Scope, string, uint64, time.Time) error
+	RenewExecutionLease(context.Context, platformscope.Scope, string, [32]byte, uint64, time.Time, time.Time) (uint64, error)
+	ClaimExpiredExecution(context.Context, int, time.Time) ([]RecoveryClaim, error)
+	FinalizeExpiredExecution(context.Context, RecoveryClaim, time.Time) error
+	PersistTerminalResult(context.Context, TerminalResultCAS) (TerminalResultOutcome, error)
 	ClaimPendingCancellations(context.Context, int, time.Time) ([]OutboxMessage, error)
 	DeferCancellation(context.Context, platformscope.Scope, string, time.Time) error
 	AcknowledgeCommand(context.Context, platformscope.Scope, string, CommandStatus, time.Time, *time.Time) error

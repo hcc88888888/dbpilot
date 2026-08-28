@@ -1,9 +1,11 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -53,6 +55,8 @@ func TestJobCommandLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	signer, err := job.NewEd25519CommandSigner(privateKey)
 	require.NoError(t, err)
+	tokenProtector, err := job.NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x52}, 32))
+	require.NoError(t, err)
 	repository := job.NewPostgresRepository(database)
 	auditService := audit.NewService(audit.NewPostgresStore(database))
 	registry := agentcontrol.NewRegistry(8)
@@ -63,6 +67,7 @@ func TestJobCommandLifecycle(t *testing.T) {
 		Signer:             signer,
 		Audit:              auditService,
 		ClaimLimit:         8,
+		TokenProtector:     tokenProtector,
 	})
 	require.NoError(t, err)
 
@@ -128,16 +133,26 @@ func TestJobCommandLifecycle(t *testing.T) {
 		require.NoError(t, marshalErr)
 		require.Equal(t, firstBytes, retryBytes)
 	}
+	starts := make(map[string]*agentv1.CommandStart, len(messages))
+	for _, message := range messages {
+		streams[message.TargetID].push(contractPrepared(t, firstDelivery[message.ID]))
+		start := streams[message.TargetID].nextSent(t).GetCommandStart()
+		require.NotNil(t, start)
+		require.Equal(t, message.ID, start.GetCommandId())
+		require.Len(t, start.GetExecutionToken(), 32)
+		require.Equal(t, uint64(1), start.GetLeaseRevision())
+		starts[message.ID] = start
+	}
 
 	streams["agent-a"].push(
 		contractAck("command-a"),
-		contractProgress("command-a", 50),
-		contractResult("command-a", agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, "artifact-large-output"),
+		contractProgress(starts["command-a"], 50),
+		contractResult(starts["command-a"], agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, "artifact-large-output"),
 	)
 	streams["agent-b"].push(
 		contractAck("command-b"),
-		contractProgress("command-b", 75),
-		contractResult("command-b", agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ""),
+		contractProgress(starts["command-b"], 75),
+		contractResult(starts["command-b"], agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ""),
 	)
 
 	var completed job.Job
@@ -151,7 +166,7 @@ func TestJobCommandLifecycle(t *testing.T) {
 	require.Equal(t, 1, completed.Progress.FailedTargets)
 	require.Len(t, completed.TargetResults, 2)
 	require.Equal(t, []job.ArtifactReference{{ArtifactID: "artifact-large-output", Kind: "command-output"}}, completed.TargetResults[0].Artifacts)
-	encoded, err := proto.Marshal(&agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Artifacts: []*agentv1.ArtifactReference{{ArtifactId: "artifact-large-output", Kind: "command-output", SizeBytes: 8 << 20}}})
+	encoded, err := proto.Marshal(&agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Artifacts: []*agentv1.ArtifactReference{{ArtifactId: "artifact-large-output", Kind: "command-output", SizeBytes: 8 << 20}}, ExecutionToken: starts["command-a"].GetExecutionToken(), LeaseRevision: starts["command-a"].GetLeaseRevision()})
 	require.NoError(t, err)
 	require.Less(t, len(encoded), 1024, "large output must be represented by metadata, not inline bytes")
 
@@ -177,6 +192,42 @@ func TestJobCommandLifecycle(t *testing.T) {
 	var publishedAfterAck int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedAfterAck))
 	require.Equal(t, 2, publishedAfterAck)
+
+	raceCreated := created.Add(30 * time.Minute)
+	raceJob := job.Job{
+		ID: "job-start-cancel-race", Type: "contract.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
+		TargetResourceIDs: []string{"agent-a"}, InitiatedBy: "contract-test",
+		SourceResource: job.ResourceReference{ResourceType: "contract_test", ResourceID: "start-cancel-race"},
+		IdempotencyKey: "contract-start-cancel-race", Version: 1, Progress: job.Progress{TotalTargets: 1},
+		Artifacts: []job.ArtifactReference{}, CreatedAt: raceCreated, RequestID: "request-start-cancel-race", TraceID: "trace-start-cancel-race",
+	}
+	raceMessage := contractOutbox(t, raceJob, "command-start-cancel-race", "agent-a", raceCreated)
+	require.NoError(t, repository.CreateWithOutbox(ctx, raceJob, []job.OutboxMessage{raceMessage}))
+	dispatched, err = lifecycle.DispatchPending(ctx, raceCreated.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 1, dispatched)
+	raceEnvelope := streams["agent-a"].nextSent(t).GetCommand()
+	require.Equal(t, raceMessage.ID, raceEnvelope.GetCommandId())
+	streams["agent-a"].push(contractPrepared(t, raceEnvelope))
+	raceStart := streams["agent-a"].nextSent(t).GetCommandStart()
+	require.NotNil(t, raceStart, "Start must be enqueued only after its PostgreSQL CAS commits")
+	raceCurrent, err := repository.Get(ctx, scope, raceJob.ID)
+	require.NoError(t, err)
+	_, err = repository.RequestCancel(ctx, scope, raceJob.ID, "operator", raceCurrent.Version, time.Now().UTC())
+	require.NoError(t, err)
+	_, err = lifecycle.DispatchPending(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	raceCancellation := streams["agent-a"].nextSent(t).GetCommandCancellation()
+	require.NotNil(t, raceCancellation)
+	require.Equal(t, raceStart.GetExecutionToken(), raceCancellation.GetExecutionToken())
+	require.Equal(t, raceStart.GetLeaseRevision(), raceCancellation.GetLeaseRevision())
+	streams["agent-a"].push(contractAck(raceMessage.ID), contractResult(raceStart, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ""))
+	raceResultAck := streams["agent-a"].nextSent(t).GetCommandResultAcknowledgement()
+	require.NotNil(t, raceResultAck)
+	require.True(t, raceResultAck.GetPersisted())
+	raceCompleted, err := repository.Get(ctx, scope, raceJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatusSucceeded, raceCompleted.Status, "Start-winning cancellation must preserve the Agent's true terminal result")
 
 	timeoutCreated := created.Add(time.Hour)
 	timeoutJob := job.Job{
@@ -265,7 +316,11 @@ func TestJobCommandLifecycle(t *testing.T) {
 	dispatched, err = lifecycle.DispatchPending(ctx, recoveryCreated.Add(time.Second))
 	require.NoError(t, err)
 	require.Equal(t, 1, dispatched)
-	require.Equal(t, recoveryMessage.ID, streams["agent-a"].nextSent(t).GetCommand().GetCommandId())
+	recoveryEnvelope := streams["agent-a"].nextSent(t).GetCommand()
+	require.Equal(t, recoveryMessage.ID, recoveryEnvelope.GetCommandId())
+	streams["agent-a"].push(contractPrepared(t, recoveryEnvelope))
+	recoveryStart := streams["agent-a"].nextSent(t).GetCommandStart()
+	require.NotNil(t, recoveryStart)
 	streams["agent-a"].push(contractAck(recoveryMessage.ID))
 	require.Eventually(t, func() bool {
 		var status string
@@ -329,12 +384,20 @@ func contractAck(commandID string) *agentv1.AgentMessage {
 	return &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandAcknowledgement{CommandAcknowledgement: &agentv1.CommandAcknowledgement{CommandId: commandID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED}}}
 }
 
-func contractProgress(commandID string, percent uint32) *agentv1.AgentMessage {
-	return &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: commandID, Percent: percent, Stage: "executing"}}}
+func contractPrepared(t *testing.T, envelope *agentv1.CommandEnvelope) *agentv1.AgentMessage {
+	t.Helper()
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	return &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandPrepared{CommandPrepared: &agentv1.CommandPrepared{CommandId: envelope.GetCommandId(), EnvelopeDigest: digest[:]}}}
 }
 
-func contractResult(commandID string, state agentv1.CommandResultState, artifactID string) *agentv1.AgentMessage {
-	result := &agentv1.CommandResult{CommandId: commandID, State: state, Summary: state.String()}
+func contractProgress(start *agentv1.CommandStart, percent uint32) *agentv1.AgentMessage {
+	return &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: start.GetCommandId(), Percent: percent, Stage: "executing", ExecutionToken: append([]byte(nil), start.GetExecutionToken()...), LeaseRevision: start.GetLeaseRevision()}}}
+}
+
+func contractResult(start *agentv1.CommandStart, state agentv1.CommandResultState, artifactID string) *agentv1.AgentMessage {
+	result := &agentv1.CommandResult{CommandId: start.GetCommandId(), State: state, Summary: state.String(), ExecutionToken: append([]byte(nil), start.GetExecutionToken()...), LeaseRevision: start.GetLeaseRevision()}
 	if artifactID != "" {
 		result.Artifacts = []*agentv1.ArtifactReference{{ArtifactId: artifactID, Kind: "command-output", ContentType: "application/octet-stream", SizeBytes: 8 << 20}}
 	}
