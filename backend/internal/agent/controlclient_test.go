@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -220,6 +221,73 @@ func TestSameSessionDuplicateAndMismatchedStartNeverReexecute(t *testing.T) {
 	require.Equal(t, int32(1), executor.calls.Load(), "mismatched Start must not execute")
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
+	tests := []struct {
+		name     string
+		token    byte
+		revision uint64
+	}{
+		{name: "exact fence is idempotent", token: 0x76, revision: 23},
+		{name: "mismatched fence is ignored", token: 0x77, revision: 24},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+			journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = journal.Close() })
+			executor := &lateDuplicateBlockingExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
+			registry := NewExecutorRegistry()
+			require.NoError(t, registry.Register(CommandKindCollectNow, executor))
+			verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+			require.NoError(t, err)
+			now := time.Now().UTC()
+			deadline := now.Add(250 * time.Millisecond)
+			verifier.now = func() time.Time { return now }
+			stream := newFakeControlStream()
+			stream.receive <- helloAckMessage()
+			commandID := "command-late-duplicate-" + strings.ReplaceAll(test.name, " ", "-")
+			stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, commandID, "agent-a", []byte("nonce-"+commandID), now, now.Add(time.Hour))}}
+			originalToken := testExecutionToken(0x76)
+			stream.receive <- commandStartMessage(commandID, originalToken, 23, deadline)
+			client, err := NewControlClient(ControlClientConfig{
+				AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+				Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+			})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- client.Run(ctx) }()
+			select {
+			case <-executor.started:
+			case <-time.After(time.Second):
+				t.Fatal("executor did not start")
+			}
+			if wait := time.Until(deadline.Add(time.Millisecond)); wait > 0 {
+				time.Sleep(wait)
+			}
+
+			stream.receive <- commandStartMessage(commandID, testExecutionToken(test.token), test.revision, deadline)
+			require.Eventually(t, func() bool {
+				entry, getErr := journal.Get(context.Background(), commandID)
+				return getErr == nil && entry.State == commandjournal.StateRunning
+			}, time.Second, time.Millisecond)
+			require.Equal(t, int32(1), executor.calls.Load())
+			require.NoError(t, client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a"}}}), "late duplicate must not disconnect the healthy session")
+
+			close(executor.release)
+			require.Eventually(t, func() bool {
+				entry, getErr := journal.Get(context.Background(), commandID)
+				return getErr == nil && entry.State == commandjournal.StateCompleted && entry.Result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
+			}, time.Second, time.Millisecond)
+			require.Equal(t, int32(1), executor.calls.Load())
+			cancel()
+			require.NoError(t, <-done)
+		})
+	}
 }
 
 func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
@@ -1024,6 +1092,22 @@ func (e *shutdownCompletionExecutor) Execute(ctx context.Context, envelope *agen
 type sameSessionBlockingExecutor struct {
 	calls   atomic.Int32
 	started chan struct{}
+}
+
+type lateDuplicateBlockingExecutor struct {
+	calls   atomic.Int32
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *lateDuplicateBlockingExecutor) Execute(_ context.Context, envelope *agentv1.CommandEnvelope, _ ProgressReporter) (*agentv1.CommandResult, error) {
+	e.calls.Add(1)
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+	<-e.release
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED}, nil
 }
 
 func (e *sameSessionBlockingExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ ProgressReporter) (*agentv1.CommandResult, error) {

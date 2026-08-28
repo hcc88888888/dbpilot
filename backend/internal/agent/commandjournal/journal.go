@@ -29,6 +29,8 @@ var (
 	ErrCommandIDConflict     = errors.New("command ID is already bound to a different envelope")
 	ErrNonceReplay           = errors.New("command nonce is already reserved by a different envelope")
 	ErrStartMismatch         = errors.New("command start fence does not match the journal entry")
+	ErrAlreadyRunning        = errors.New("command is already running with this execution fence")
+	ErrStartConflict         = errors.New("command is running with a different execution fence")
 	ErrStartDeadlineExceeded = errors.New("command start deadline has expired")
 	ErrResultDigestMismatch  = errors.New("command result acknowledgement digest does not match")
 )
@@ -231,11 +233,16 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 	}
 	if err := j.transition(ctx, commandID, func(entry *storedEntry) error {
 		now := j.now().UTC()
-		if !now.Before(startDeadline.UTC()) {
-			return ErrStartDeadlineExceeded
-		}
 		switch entry.State {
+		case StateRunning:
+			if matchesFence(entry, executionToken, leaseRevision) {
+				return ErrAlreadyRunning
+			}
+			return ErrStartConflict
 		case StatePrepared:
+			if !now.Before(startDeadline.UTC()) {
+				return ErrStartDeadlineExceeded
+			}
 			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
 			}
@@ -247,7 +254,10 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 			return nil
 		case StateStartAuthorized:
 			if !matchesFence(entry, executionToken, leaseRevision) {
-				return ErrStartMismatch
+				return ErrStartConflict
+			}
+			if !now.Before(startDeadline.UTC()) {
+				return ErrStartDeadlineExceeded
 			}
 			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
@@ -264,11 +274,24 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 	}
 	return j.transition(ctx, commandID, func(entry *storedEntry) error {
 		now := j.now().UTC()
-		if !now.Before(startDeadline.UTC()) {
-			return ErrStartDeadlineExceeded
-		}
-		if entry.State != StateStartAuthorized || !matchesFence(entry, executionToken, leaseRevision) {
-			return ErrStartMismatch
+		switch entry.State {
+		case StateRunning:
+			if matchesFence(entry, executionToken, leaseRevision) {
+				return ErrAlreadyRunning
+			}
+			return ErrStartConflict
+		case StateStartAuthorized:
+			if !matchesFence(entry, executionToken, leaseRevision) {
+				return ErrStartConflict
+			}
+			if !now.Before(startDeadline.UTC()) {
+				return ErrStartDeadlineExceeded
+			}
+		default:
+			if !matchesFence(entry, executionToken, leaseRevision) {
+				return ErrStartMismatch
+			}
+			return fmt.Errorf("%w: %s to running", ErrInvalidTransition, entry.State)
 		}
 		entry.State = StateRunning
 		entry.StartedAtUnixNano = now.UnixNano()

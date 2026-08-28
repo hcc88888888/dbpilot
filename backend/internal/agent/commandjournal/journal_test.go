@@ -69,8 +69,8 @@ func TestStartAuthorizesMatchingTokenAndRevisionOnce(t *testing.T) {
 	require.Equal(t, StateRunning, entry.State)
 	require.Equal(t, token, entry.ExecutionToken)
 	require.Equal(t, uint64(9), entry.LeaseRevision)
-	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(30*time.Minute)), ErrInvalidTransition)
-	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", bytes.Repeat([]byte{0x3b}, sha256.Size), 9, now.Add(30*time.Minute)), ErrStartMismatch)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(30*time.Minute)), ErrAlreadyRunning)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", bytes.Repeat([]byte{0x3b}, sha256.Size), 9, now.Add(30*time.Minute)), ErrStartConflict)
 }
 
 func TestStartAuthorizedReopenBecomesInterruptedAndRejectsLaterStart(t *testing.T) {
@@ -127,6 +127,30 @@ func TestStartDeadlineIsCheckedAtJournalTransactionTime(t *testing.T) {
 	entry, getErr := journal.Get(context.Background(), "command-deadline")
 	require.NoError(t, getErr)
 	require.Equal(t, StatePrepared, entry.State)
+}
+
+func TestRunningStartChecksFenceBeforeExpiredDeadlineWithoutMutation(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	deadline := now.Add(time.Minute)
+	token := bytes.Repeat([]byte{0x4e}, sha256.Size)
+	journal, err := Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	journal.now = func() time.Time { return now }
+	prepared, err := journal.Prepare(context.Background(), journalEnvelope("command-running-deadline", now.Add(time.Hour)), now)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-running-deadline", token, 14, deadline))
+	journal.now = func() time.Time { return deadline.Add(time.Nanosecond) }
+
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-running-deadline", token, 14, deadline), ErrAlreadyRunning)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-running-deadline", bytes.Repeat([]byte{0x4f}, sha256.Size), 14, deadline), ErrStartConflict)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-running-deadline", token, 15, deadline), ErrStartConflict)
+	entry, err := journal.Get(context.Background(), "command-running-deadline")
+	require.NoError(t, err)
+	require.Equal(t, StateRunning, entry.State)
+	require.Equal(t, token, entry.ExecutionToken)
+	require.Equal(t, uint64(14), entry.LeaseRevision)
 }
 
 func TestInterruptedRunningReopenProducesOnePendingResultWithoutReexecution(t *testing.T) {

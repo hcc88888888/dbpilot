@@ -485,13 +485,16 @@ func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context,
 		if errors.Is(err, commandjournal.ErrStartDeadlineExceeded) {
 			return c.expireAuthorizedStart(ctx, start.GetCommandId())
 		}
+		if errors.Is(err, commandjournal.ErrAlreadyRunning) || errors.Is(err, commandjournal.ErrStartConflict) {
+			return nil
+		}
 		if errors.Is(err, commandjournal.ErrInvalidTransition) {
 			return nil
 		}
 		return fmt.Errorf("authorize prepared command start: %w", err)
 	}
 	if !c.now().UTC().Before(startDeadline) {
-		return c.expireAuthorizedStart(ctx, start.GetCommandId())
+		return c.interruptUnlaunchedStart(ctx, start.GetCommandId())
 	}
 	executionContext, cancel := context.WithCancel(executionParent)
 	c.runningMu.Lock()
@@ -507,14 +510,37 @@ func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context,
 }
 
 func (c *ControlClient) expireAuthorizedStart(ctx context.Context, commandID string) error {
-	if err := c.journal.MarkInterrupted(ctx, commandID, c.now()); err != nil {
-		if errors.Is(err, commandjournal.ErrInvalidTransition) {
-			if cancelErr := c.journal.CancelPrepared(ctx, commandID, c.now()); cancelErr == nil || errors.Is(cancelErr, commandjournal.ErrInvalidTransition) {
-				return nil
-			} else {
-				return fmt.Errorf("persist expired prepared command: %w", cancelErr)
-			}
+	entry, err := c.journal.Get(ctx, commandID)
+	if err != nil {
+		return fmt.Errorf("load expired command start: %w", err)
+	}
+	switch entry.State {
+	case commandjournal.StateRunning, commandjournal.StateInterrupted, commandjournal.StateCompleted, commandjournal.StateCancelled:
+		return nil
+	case commandjournal.StatePrepared:
+		if err := c.journal.CancelPrepared(ctx, commandID, c.now()); err != nil && !errors.Is(err, commandjournal.ErrInvalidTransition) {
+			return fmt.Errorf("persist expired prepared command: %w", err)
 		}
+		return nil
+	case commandjournal.StateStartAuthorized:
+		return c.persistInterruptedStart(ctx, commandID)
+	default:
+		return fmt.Errorf("expire command start from unsupported state %q", entry.State)
+	}
+}
+
+func (c *ControlClient) interruptUnlaunchedStart(ctx context.Context, commandID string) error {
+	c.runningMu.Lock()
+	_, launched := c.running[commandID]
+	c.runningMu.Unlock()
+	if launched {
+		return nil
+	}
+	return c.persistInterruptedStart(ctx, commandID)
+}
+
+func (c *ControlClient) persistInterruptedStart(ctx context.Context, commandID string) error {
+	if err := c.journal.MarkInterrupted(ctx, commandID, c.now()); err != nil {
 		return fmt.Errorf("persist interrupted command start: %w", err)
 	}
 	entry, err := c.journal.Get(ctx, commandID)
