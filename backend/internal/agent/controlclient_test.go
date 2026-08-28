@@ -18,6 +18,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -589,7 +590,13 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 	entry, err := journal.Get(context.Background(), "command-a")
 	require.NoError(t, err)
 	second.receive <- resultAckMessage("command-a", entry.ResultDigest[:], false, true, "PERSISTENCE_RETRY")
-	time.Sleep(20 * time.Millisecond)
+	second.receive <- resultAckMessage("command-a", entry.ResultDigest[:], false, true, "PERSISTENCE_RETRY")
+	require.Eventually(t, func() bool { return countResults(second.sentMessages()) == 2 }, time.Second, time.Millisecond)
+	resent := commandResults(second.sentMessages())
+	require.Len(t, resent, 2)
+	require.True(t, proto.Equal(resent[0], resent[1]), "same-session retry must resend the exact pending Result")
+	time.Sleep(50 * time.Millisecond)
+	require.Equal(t, 2, countResults(second.sentMessages()), "duplicate retryable acknowledgements must not create concurrent resend timers")
 	pending, err = journal.PendingResults(context.Background())
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "negative/retryable acknowledgement must keep the result pending")
@@ -605,8 +612,103 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 	require.NoError(t, <-done)
 }
 
+func TestControlClientPersistsNonRetryableResultConflictAndDoesNotReplayItAfterReconnect(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, immediateExecutor{}))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	verifier.now = func() time.Time { return now }
+	first, second := newFakeControlStream(), newFakeControlStream()
+	first.receive <- helloAckMessage()
+	second.receive <- helloAckMessage()
+	first.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-conflict", "agent-a", []byte("nonce-conflict"), now, now.Add(time.Minute))}}
+	first.receive <- commandStartMessage("command-conflict", testExecutionToken(0x0a), 10, now.Add(30*time.Second))
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{first, second}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry,
+		HeartbeatInterval: time.Hour, ReconnectBackoff: time.Millisecond,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	require.Eventually(t, func() bool { return countResults(first.sentMessages()) == 1 }, time.Second, time.Millisecond)
+	entry, err := journal.Get(context.Background(), "command-conflict")
+	require.NoError(t, err)
+	first.receive <- resultAckMessage("command-conflict", entry.ResultDigest[:], false, false, "RESULT_CONFLICT")
+	require.Eventually(t, func() bool {
+		conflicted, getErr := journal.Get(context.Background(), "command-conflict")
+		return getErr == nil && conflicted.State == commandjournal.StateResultConflicted && conflicted.ConflictReason == "RESULT_CONFLICT"
+	}, time.Second, time.Millisecond)
+	first.receiveErrors <- io.EOF
+	require.Eventually(t, func() bool { return len(second.sentMessages()) > 0 }, time.Second, time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	require.Zero(t, countResults(second.sentMessages()), "reconnect must not replay forensic conflicts")
+	conflicted, err := journal.Get(context.Background(), "command-conflict")
+	require.NoError(t, err)
+	require.True(t, proto.Equal(entry.Result, conflicted.Result), "conflict must retain exact result bytes")
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestControlClientShutdownCancelsPendingResultRetryTimer(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, immediateExecutor{}))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	verifier.now = func() time.Time { return now }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-shutdown-retry", "agent-a", []byte("nonce-shutdown-retry"), now, now.Add(time.Minute))}}
+	stream.receive <- commandStartMessage("command-shutdown-retry", testExecutionToken(0x0b), 11, now.Add(30*time.Second))
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry,
+		HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, ResultRetryBackoff: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	require.Eventually(t, func() bool { return countResults(stream.sentMessages()) == 1 }, time.Second, time.Millisecond)
+	entry, err := journal.Get(context.Background(), "command-shutdown-retry")
+	require.NoError(t, err)
+	stream.receive <- resultAckMessage("command-shutdown-retry", entry.ResultDigest[:], false, true, "PERSISTENCE_RETRY")
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case runErr := <-done:
+		require.NoError(t, runErr)
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("Run did not join the cancelled Result retry timer")
+	}
+	require.Equal(t, 1, countResults(stream.sentMessages()))
+}
+
 func resultAckMessage(commandID string, resultDigest []byte, persisted, retryable bool, reason string) *agentv1.ServerMessage {
 	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: &agentv1.CommandResultAcknowledgement{CommandId: commandID, ResultDigest: resultDigest, Persisted: persisted, Retryable: retryable, ReasonCode: reason}}}
+}
+
+func commandResults(messages []*agentv1.AgentMessage) []*agentv1.CommandResult {
+	results := make([]*agentv1.CommandResult, 0)
+	for _, message := range messages {
+		if result := message.GetCommandResult(); result != nil {
+			results = append(results, result)
+		}
+	}
+	return results
 }
 
 func TestControlClientSurfacesTerminalResultPersistenceFailure(t *testing.T) {

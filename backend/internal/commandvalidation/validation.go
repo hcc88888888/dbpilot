@@ -155,7 +155,7 @@ func ValidateCancellation(cancellation *agentv1.CommandCancellation) error {
 }
 
 func ValidateResultAcknowledgement(acknowledgement *agentv1.CommandResultAcknowledgement) error {
-	if acknowledgement == nil || !validIdentifier(acknowledgement.GetCommandId()) || len(acknowledgement.GetResultDigest()) != sha256.Size || (acknowledgement.GetPersisted() && acknowledgement.GetRetryable()) {
+	if acknowledgement == nil || !validIdentifier(acknowledgement.GetCommandId()) || len(acknowledgement.GetResultDigest()) != sha256.Size || (acknowledgement.GetPersisted() && acknowledgement.GetRetryable()) || (!acknowledgement.GetPersisted() && !validIdentifier(acknowledgement.GetReasonCode())) {
 		return ErrInvalidCommand
 	}
 	return nil

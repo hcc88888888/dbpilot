@@ -220,6 +220,48 @@ func TestResultAckRequiresMatchingPersistedResultDigest(t *testing.T) {
 	require.Empty(t, pending)
 }
 
+func TestNonRetryableResultConflictPersistsForensicStateAndRetainsResultBytes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "commands.db")
+	now := time.Unix(1_725_000_000, 0).UTC()
+	token := bytes.Repeat([]byte{0x6d}, sha256.Size)
+	journal, err := Open(path)
+	require.NoError(t, err)
+	prepared, err := journal.Prepare(context.Background(), journalEnvelope("command-conflict", now.Add(time.Hour)), now)
+	require.NoError(t, err)
+	require.True(t, prepared)
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-conflict", token, 14, now.Add(30*time.Minute)))
+	result := &agentv1.CommandResult{
+		CommandId: "command-conflict", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED,
+		Summary: "durable result bytes", ExecutionToken: token, LeaseRevision: 14,
+	}
+	require.NoError(t, journal.Complete(context.Background(), "command-conflict", result, now.Add(2*time.Minute)))
+	entry, err := journal.Get(context.Background(), "command-conflict")
+	require.NoError(t, err)
+	conflictedAt := now.Add(3 * time.Minute)
+	require.NoError(t, journal.MarkResultConflicted(context.Background(), "command-conflict", entry.ResultDigest, "RESULT_CONFLICT", conflictedAt))
+	require.NoError(t, journal.MarkResultConflicted(context.Background(), "command-conflict", entry.ResultDigest, "RESULT_CONFLICT", conflictedAt.Add(time.Minute)), "exact retry must be idempotent")
+	pending, err := journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, pending, "forensic conflicts must not be replayed automatically")
+	conflicted, err := journal.Get(context.Background(), "command-conflict")
+	require.NoError(t, err)
+	require.Equal(t, StateResultConflicted, conflicted.State)
+	require.Equal(t, "RESULT_CONFLICT", conflicted.ConflictReason)
+	require.Equal(t, conflictedAt, conflicted.ConflictedAt)
+	require.True(t, proto.Equal(result, conflicted.Result), "forensic state must retain exact result bytes")
+	require.NoError(t, journal.Close())
+
+	reopened, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Close() })
+	conflicted, err = reopened.Get(context.Background(), "command-conflict")
+	require.NoError(t, err)
+	require.Equal(t, StateResultConflicted, conflicted.State)
+	require.Equal(t, "RESULT_CONFLICT", conflicted.ConflictReason)
+	require.True(t, proto.Equal(result, conflicted.Result))
+}
+
 func TestJournalAcceptDeduplicatesCommandIDDurably(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "commands.db")
 	now := time.Unix(1_725_000_000, 123).UTC()

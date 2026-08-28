@@ -126,37 +126,40 @@ type CommandJournal interface {
 	Active(context.Context) ([]commandjournal.Entry, error)
 	PendingResults(context.Context) ([]commandjournal.Entry, error)
 	MarkReported(context.Context, string, [sha256.Size]byte, time.Time) error
+	MarkResultConflicted(context.Context, string, [sha256.Size]byte, string, time.Time) error
 	Get(context.Context, string) (commandjournal.Entry, error)
 }
 
 type ControlClientConfig struct {
-	AgentID           string
-	AgentVersion      string
-	OperatingSystem   string
-	Architecture      string
-	DatabaseAdapters  []string
-	StreamOpener      StreamOpener
-	Journal           CommandJournal
-	Verifier          *CommandVerifier
-	Executors         *ExecutorRegistry
-	HeartbeatInterval time.Duration
-	ReconnectBackoff  time.Duration
-	Now               func() time.Time
+	AgentID            string
+	AgentVersion       string
+	OperatingSystem    string
+	Architecture       string
+	DatabaseAdapters   []string
+	StreamOpener       StreamOpener
+	Journal            CommandJournal
+	Verifier           *CommandVerifier
+	Executors          *ExecutorRegistry
+	HeartbeatInterval  time.Duration
+	ReconnectBackoff   time.Duration
+	ResultRetryBackoff time.Duration
+	Now                func() time.Time
 }
 
 type ControlClient struct {
-	agentID           string
-	agentVersion      string
-	operatingSystem   string
-	architecture      string
-	databaseAdapters  []string
-	openStream        StreamOpener
-	journal           CommandJournal
-	verifier          *CommandVerifier
-	executors         *ExecutorRegistry
-	heartbeatInterval time.Duration
-	reconnectBackoff  time.Duration
-	now               func() time.Time
+	agentID            string
+	agentVersion       string
+	operatingSystem    string
+	architecture       string
+	databaseAdapters   []string
+	openStream         StreamOpener
+	journal            CommandJournal
+	verifier           *CommandVerifier
+	executors          *ExecutorRegistry
+	heartbeatInterval  time.Duration
+	reconnectBackoff   time.Duration
+	resultRetryBackoff time.Duration
+	now                func() time.Time
 
 	sessionMu       sync.RWMutex
 	session         *controlSession
@@ -180,13 +183,17 @@ type runningCommand struct {
 }
 
 type controlSession struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	stream     ControlStream
-	outgoing   chan controlSendRequest
-	sendErrors chan error
-	wait       sync.WaitGroup
+	ctx           context.Context
+	cancel        context.CancelFunc
+	stream        ControlStream
+	outgoing      chan controlSendRequest
+	sendErrors    chan error
+	wait          sync.WaitGroup
+	resultRetryMu sync.Mutex
+	resultRetries map[string]*scheduledResultRetry
 }
+
+type scheduledResultRetry struct{ cancel context.CancelFunc }
 
 func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 	if strings.TrimSpace(config.AgentID) == "" {
@@ -208,9 +215,10 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		agentID: config.AgentID, agentVersion: config.AgentVersion, operatingSystem: config.OperatingSystem, architecture: config.Architecture,
 		databaseAdapters: append([]string(nil), config.DatabaseAdapters...), openStream: config.StreamOpener, journal: config.Journal,
 		verifier: config.Verifier, executors: config.Executors,
-		heartbeatInterval: boundedDuration(config.HeartbeatInterval, 30*time.Second, 10*time.Millisecond, 5*time.Minute),
-		reconnectBackoff:  boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
-		now:               config.Now, running: make(map[string]runningCommand),
+		heartbeatInterval:  boundedDuration(config.HeartbeatInterval, 30*time.Second, 10*time.Millisecond, 5*time.Minute),
+		reconnectBackoff:   boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
+		resultRetryBackoff: boundedDuration(config.ResultRetryBackoff, 100*time.Millisecond, 10*time.Millisecond, 5*time.Second),
+		now:                config.Now, running: make(map[string]runningCommand),
 		executionErrors: make(chan error, 1),
 	}, nil
 }
@@ -295,7 +303,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 		err     error
 	}
 	received := make(chan receiveResult, 1)
-	session := &controlSession{ctx: ctx, cancel: cancel, stream: stream, outgoing: make(chan controlSendRequest, controlSendQueueCapacity), sendErrors: make(chan error, 1)}
+	session := &controlSession{ctx: ctx, cancel: cancel, stream: stream, outgoing: make(chan controlSendRequest, controlSendQueueCapacity), sendErrors: make(chan error, 1), resultRetries: make(map[string]*scheduledResultRetry)}
 	session.wait.Add(1)
 	go func() {
 		defer session.wait.Done()
@@ -412,7 +420,11 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		if err := commandvalidation.ValidateResultAcknowledgement(acknowledgement); err != nil {
 			return errors.New("command result acknowledgement is invalid")
 		}
+		if !acknowledgement.GetPersisted() && acknowledgement.GetRetryable() {
+			return c.scheduleResultRetry(ctx, acknowledgement)
+		}
 		if acknowledgement.GetPersisted() && !acknowledgement.GetRetryable() {
+			c.cancelResultRetry(acknowledgement.GetCommandId())
 			var digest [sha256.Size]byte
 			copy(digest[:], acknowledgement.GetResultDigest())
 			if err := c.journal.MarkReported(ctx, acknowledgement.GetCommandId(), digest, c.now()); err != nil {
@@ -420,6 +432,16 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 					return nil
 				}
 				return &fatalControlError{err: fmt.Errorf("mark durably acknowledged command result reported: %w", err)}
+			}
+		} else if !acknowledgement.GetRetryable() {
+			c.cancelResultRetry(acknowledgement.GetCommandId())
+			var digest [sha256.Size]byte
+			copy(digest[:], acknowledgement.GetResultDigest())
+			if err := c.journal.MarkResultConflicted(ctx, acknowledgement.GetCommandId(), digest, acknowledgement.GetReasonCode(), c.now()); err != nil {
+				if errors.Is(err, commandjournal.ErrResultDigestMismatch) {
+					return nil
+				}
+				return &fatalControlError{err: fmt.Errorf("persist non-retryable command result conflict: %w", err)}
 			}
 		}
 	case *agentv1.ServerMessage_PolicyUpdate, *agentv1.ServerMessage_FlowControlInstruction:
@@ -430,6 +452,82 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		return errors.New("unsupported control-plane message")
 	}
 	return nil
+}
+
+func (c *ControlClient) scheduleResultRetry(ctx context.Context, acknowledgement *agentv1.CommandResultAcknowledgement) error {
+	entry, err := c.journal.Get(ctx, acknowledgement.GetCommandId())
+	if err != nil {
+		return &fatalControlError{err: fmt.Errorf("load retryable command result: %w", err)}
+	}
+	if entry.Result == nil || (entry.State != commandjournal.StateCompleted && entry.State != commandjournal.StateInterrupted) || !entry.ReportedAt.IsZero() || subtle.ConstantTimeCompare(entry.ResultDigest[:], acknowledgement.GetResultDigest()) != 1 {
+		return nil
+	}
+	c.sessionMu.RLock()
+	session := c.session
+	c.sessionMu.RUnlock()
+	if session == nil || session.ctx.Err() != nil {
+		return ErrControlStreamDisconnected
+	}
+	session.resultRetryMu.Lock()
+	if _, exists := session.resultRetries[acknowledgement.GetCommandId()]; exists {
+		session.resultRetryMu.Unlock()
+		return nil
+	}
+	retryContext, cancel := context.WithCancel(session.ctx)
+	retry := &scheduledResultRetry{cancel: cancel}
+	session.resultRetries[acknowledgement.GetCommandId()] = retry
+	session.wait.Add(1)
+	session.resultRetryMu.Unlock()
+	resultDigest := entry.ResultDigest
+	commandID := entry.CommandID
+	go func() {
+		defer session.wait.Done()
+		defer c.finishResultRetry(session, commandID, retry)
+		timer := time.NewTimer(c.resultRetryBackoff)
+		defer timer.Stop()
+		select {
+		case <-retryContext.Done():
+			return
+		case <-timer.C:
+		}
+		pending, loadErr := c.journal.Get(retryContext, commandID)
+		if loadErr != nil || pending.Result == nil || (pending.State != commandjournal.StateCompleted && pending.State != commandjournal.StateInterrupted) || !pending.ReportedAt.IsZero() || subtle.ConstantTimeCompare(pending.ResultDigest[:], resultDigest[:]) != 1 {
+			return
+		}
+		select {
+		case <-retryContext.Done():
+			return
+		default:
+		}
+		_ = c.sendThroughSession(session, &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: pending.Result}})
+	}()
+	return nil
+}
+
+func (c *ControlClient) finishResultRetry(session *controlSession, commandID string, expected *scheduledResultRetry) {
+	session.resultRetryMu.Lock()
+	if session.resultRetries[commandID] == expected {
+		delete(session.resultRetries, commandID)
+	}
+	session.resultRetryMu.Unlock()
+}
+
+func (c *ControlClient) cancelResultRetry(commandID string) {
+	c.sessionMu.RLock()
+	session := c.session
+	c.sessionMu.RUnlock()
+	if session == nil {
+		return
+	}
+	session.resultRetryMu.Lock()
+	retry := session.resultRetries[commandID]
+	if retry != nil {
+		delete(session.resultRetries, commandID)
+	}
+	session.resultRetryMu.Unlock()
+	if retry != nil {
+		retry.cancel()
+	}
 }
 
 func (c *ControlClient) handleCommand(ctx, executionParent context.Context, envelope *agentv1.CommandEnvelope) error {

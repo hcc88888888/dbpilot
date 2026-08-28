@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -38,12 +39,13 @@ var (
 type State string
 
 const (
-	StatePrepared        State = "prepared"
-	StateStartAuthorized State = "start_authorized"
-	StateRunning         State = "running"
-	StateInterrupted     State = "interrupted"
-	StateCompleted       State = "completed"
-	StateCancelled       State = "cancelled"
+	StatePrepared         State = "prepared"
+	StateStartAuthorized  State = "start_authorized"
+	StateRunning          State = "running"
+	StateInterrupted      State = "interrupted"
+	StateCompleted        State = "completed"
+	StateCancelled        State = "cancelled"
+	StateResultConflicted State = "result_conflicted"
 )
 
 // Entry is the recovery-safe view of one journaled command.
@@ -63,6 +65,8 @@ type Entry struct {
 	LeaseRevision      uint64
 	Result             *agentv1.CommandResult
 	ResultDigest       [sha256.Size]byte
+	ConflictedAt       time.Time
+	ConflictReason     string
 }
 
 // Journal is the persistence boundary consumed by the Agent control client.
@@ -75,6 +79,7 @@ type Journal interface {
 	Active(context.Context) ([]Entry, error)
 	PendingResults(context.Context) ([]Entry, error)
 	MarkReported(context.Context, string, [sha256.Size]byte, time.Time) error
+	MarkResultConflicted(context.Context, string, [sha256.Size]byte, string, time.Time) error
 	Get(context.Context, string) (Entry, error)
 }
 
@@ -95,7 +100,11 @@ type storedEntry struct {
 	Result                      []byte `json:"result,omitempty"`
 	ResultDigestHex             string `json:"result_digest,omitempty"`
 	AcknowledgedResultDigestHex string `json:"acknowledged_result_digest,omitempty"`
+	ResultConflictedAtUnixNano  int64  `json:"result_conflicted_at_unix_nano,omitempty"`
+	ResultConflictReason        string `json:"result_conflict_reason,omitempty"`
 }
+
+var resultConflictReasonPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
 
 type nonceReservation struct {
 	CommandID         string `json:"command_id"`
@@ -500,6 +509,34 @@ func (j *BoltJournal) MarkReported(ctx context.Context, commandID string, result
 	})
 }
 
+func (j *BoltJournal) MarkResultConflicted(ctx context.Context, commandID string, resultDigest [sha256.Size]byte, reason string, at time.Time) error {
+	if !resultConflictReasonPattern.MatchString(reason) || at.IsZero() {
+		return ErrInvalidTransition
+	}
+	return j.transition(ctx, commandID, func(entry *storedEntry) error {
+		storedDigest, err := decodeDigest(entry.ResultDigestHex, "result")
+		if err != nil {
+			return err
+		}
+		if subtle.ConstantTimeCompare(storedDigest[:], resultDigest[:]) != 1 {
+			return ErrResultDigestMismatch
+		}
+		if entry.State == StateResultConflicted {
+			if entry.ResultConflictReason == reason {
+				return nil
+			}
+			return ErrInvalidTransition
+		}
+		if (entry.State != StateCompleted && entry.State != StateInterrupted) || len(entry.Result) == 0 || entry.ReportedAtUnixNano != 0 {
+			return fmt.Errorf("%w: %s to result_conflicted", ErrInvalidTransition, entry.State)
+		}
+		entry.State = StateResultConflicted
+		entry.ResultConflictedAtUnixNano = at.UTC().UnixNano()
+		entry.ResultConflictReason = reason
+		return nil
+	})
+}
+
 func (j *BoltJournal) Get(ctx context.Context, commandID string) (Entry, error) {
 	if err := ctx.Err(); err != nil {
 		return Entry{}, err
@@ -544,6 +581,7 @@ func publicEntry(stored storedEntry) (Entry, error) {
 		StartedAt: unixNanoTime(stored.StartedAtUnixNano), InterruptedAt: unixNanoTime(stored.InterruptedAtUnixNano),
 		CompletedAt: unixNanoTime(stored.CompletedAtUnixNano), ReportedAt: unixNanoTime(stored.ReportedAtUnixNano),
 		ExecutionToken: append([]byte(nil), stored.ExecutionToken...), LeaseRevision: stored.LeaseRevision,
+		ConflictedAt: unixNanoTime(stored.ResultConflictedAtUnixNano), ConflictReason: stored.ResultConflictReason,
 	}
 	if len(stored.Envelope) > 0 {
 		entry.Envelope = &agentv1.CommandEnvelope{}
