@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,7 +32,8 @@ type Evaluator struct {
 // EvaluateTarget produces one finding per immutable item version. It does
 // not infer health from unknown, stale, malformed, or unsupported evidence.
 func (e *Evaluator) EvaluateTarget(ctx context.Context, snapshot RunSnapshot, target TargetRun) ([]Finding, error) {
-	if snapshot.Validate() != nil || target.Validate() != nil || !snapshotHasTarget(snapshot, target.TargetID) {
+	canonicalTarget, err := canonicalSnapshotTarget(snapshot, target)
+	if err != nil {
 		return nil, ErrInvalidEvaluation
 	}
 	now := e.now()
@@ -47,7 +49,7 @@ func (e *Evaluator) EvaluateTarget(ctx context.Context, snapshot RunSnapshot, ta
 	})
 	findings := make([]Finding, 0, len(items))
 	for _, item := range items {
-		finding, err := e.evaluateItem(ctx, snapshot, target, item, now)
+		finding, err := e.evaluateItem(ctx, snapshot, canonicalTarget, item, now)
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +100,10 @@ func (e *Evaluator) evaluateMetric(ctx context.Context, snapshot RunSnapshot, ta
 	if malformed || len(usable) == 0 {
 		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": rule.MetricName, "samples": strconv.Itoa(len(usable))}), nil
 	}
-	value := aggregateObservations(rule.Aggregation, usable)
+	value, ok := aggregateObservations(rule.Aggregation, usable)
+	if !ok || !finite(value) {
+		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": rule.MetricName, "samples": strconv.Itoa(len(usable))}), nil
+	}
 	level := metricLevel(value, rule)
 	observedAt := usable[len(usable)-1].ObservedAt.UTC()
 	return thresholdFinding(snapshot, target, item, level, observedAt, rule, value, len(usable)), nil
@@ -116,21 +121,30 @@ func evaluateMetadata(snapshot RunSnapshot, target TargetRun, item Item, now tim
 	if name == "" {
 		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"samples": "0"})
 	}
-	observation, ok := latestObservation(target.Observations, target.TargetID, SourceMetadata, name, now.Add(-5*time.Minute), now)
-	if !ok {
+	observation, ok, malformed := latestObservation(target.Observations, target.TargetID, SourceMetadata, name, now.Add(-5*time.Minute), now)
+	if !ok || malformed {
 		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": name, "samples": "0"})
 	}
 	level := LevelHealthy
 	switch item.ID {
 	case "host.oom.evidence":
+		if !nonNegativeCount(observation.Value) {
+			return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": name, "samples": "0"})
+		}
 		if observation.Value >= 1 {
 			level = LevelCritical
 		}
 	case "host.time.synchronization":
+		if observation.Value != 0 && observation.Value != 1 {
+			return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": name, "samples": "0"})
+		}
 		if observation.Value != 1 {
 			level = LevelCritical
 		}
 	case "database.process.presence":
+		if !nonNegativeCount(observation.Value) {
+			return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": name, "samples": "0"})
+		}
 		if observation.Value <= 0 {
 			level = LevelCritical
 		}
@@ -142,13 +156,14 @@ func evaluateMetadata(snapshot RunSnapshot, target TargetRun, item Item, now tim
 
 func evaluateLogSummary(snapshot RunSnapshot, target TargetRun, item Item, now time.Time) Finding {
 	from := now.Add(-5 * time.Minute)
-	errorsObservation, errorsOK := latestObservation(target.Observations, target.TargetID, SourceLogSummary, "dbpilot.inspection.host.log.error_count", from, now)
-	warningsObservation, warningsOK := latestObservation(target.Observations, target.TargetID, SourceLogSummary, "dbpilot.inspection.host.log.warning_count", from, now)
-	if !errorsOK || !warningsOK {
+	warningsObservation, warningsOK, warningsMalformed := latestObservation(target.Observations, target.TargetID, SourceLogSummary, "dbpilot.inspection.host.log.warning_count", from, now)
+	errorsObservation, errorsOK, errorsMalformed := latestObservation(target.Observations, target.TargetID, SourceLogSummary, "dbpilot.inspection.host.log.error_count", from, now)
+	criticalObservation, criticalOK, criticalMalformed := latestObservation(target.Observations, target.TargetID, SourceLogSummary, "dbpilot.inspection.host.log.critical_count", from, now)
+	if !warningsOK || !errorsOK || !criticalOK || warningsMalformed || errorsMalformed || criticalMalformed || !nonNegativeCount(warningsObservation.Value) || !nonNegativeCount(errorsObservation.Value) || !nonNegativeCount(criticalObservation.Value) {
 		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"samples": "0"})
 	}
 	level := LevelHealthy
-	if errorsObservation.Value >= 1 {
+	if errorsObservation.Value >= 1 || criticalObservation.Value >= 1 {
 		level = LevelCritical
 	} else if warningsObservation.Value >= 1 {
 		level = LevelWarning
@@ -157,8 +172,11 @@ func evaluateLogSummary(snapshot RunSnapshot, target TargetRun, item Item, now t
 	if warningsObservation.ObservedAt.After(observedAt) {
 		observedAt = warningsObservation.ObservedAt
 	}
+	if criticalObservation.ObservedAt.After(observedAt) {
+		observedAt = criticalObservation.ObservedAt
+	}
 	return baseFinding(snapshot, target, item, level, observedAt.UTC(), map[string]string{
-		"error_count": formatFloat(errorsObservation.Value), "warning_count": formatFloat(warningsObservation.Value), "observed_at": observedAt.UTC().Format(time.RFC3339Nano), "samples": "2",
+		"error_count": formatFloat(errorsObservation.Value), "warning_count": formatFloat(warningsObservation.Value), "critical_count": formatFloat(criticalObservation.Value), "observed_at": observedAt.UTC().Format(time.RFC3339Nano), "samples": "3",
 	})
 }
 
@@ -191,19 +209,27 @@ func usableMetricObservations(input []Observation, targetID string, rule MetricR
 	return deduplicated, malformed
 }
 
-func latestObservation(input []Observation, targetID string, source SourceType, name string, from, to time.Time) (Observation, bool) {
+func latestObservation(input []Observation, targetID string, source SourceType, name string, from, to time.Time) (Observation, bool, bool) {
 	filtered := make([]Observation, 0, len(input))
+	malformed := false
 	for _, observation := range input {
-		if observation.TargetID != targetID || observation.SourceType != source || observation.Name != name || !isUTC(observation.ObservedAt) || !finite(observation.Value) || observation.ObservedAt.Before(from) || observation.ObservedAt.After(to) {
+		if observation.TargetID != targetID || observation.Name != name {
+			continue
+		}
+		if observation.SourceType != source || !isUTC(observation.ObservedAt) || !finite(observation.Value) {
+			malformed = true
+			continue
+		}
+		if observation.ObservedAt.Before(from) || observation.ObservedAt.After(to) {
 			continue
 		}
 		filtered = append(filtered, observation)
 	}
 	if len(filtered) == 0 {
-		return Observation{}, false
+		return Observation{}, false, malformed
 	}
 	sort.Slice(filtered, func(i, j int) bool { return observationLess(filtered[i], filtered[j]) })
-	return filtered[len(filtered)-1], true
+	return filtered[len(filtered)-1], true, malformed
 }
 
 func thresholdFinding(snapshot RunSnapshot, target TargetRun, item Item, level FindingLevel, observedAt time.Time, rule MetricRule, value float64, samples int) Finding {
@@ -221,16 +247,17 @@ func baseFinding(snapshot RunSnapshot, target TargetRun, item Item, level Findin
 	return Finding{Scope: snapshot.Scope, RunID: snapshot.ID, TargetID: target.TargetID, ItemID: item.ID, ItemVersion: item.Version, Level: level, ObservedAt: observedAt.UTC(), Evidence: evidence}
 }
 
-func aggregateObservations(aggregation Aggregation, observations []Observation) float64 {
+func aggregateObservations(aggregation Aggregation, observations []Observation) (float64, bool) {
 	switch aggregation {
 	case AggregationLatest:
-		return observations[len(observations)-1].Value
+		return observations[len(observations)-1].Value, true
 	case AggregationAverage:
-		var sum float64
+		average := 0.0
+		divisor := float64(len(observations))
 		for _, observation := range observations {
-			sum += observation.Value
+			average += observation.Value / divisor
 		}
-		return sum / float64(len(observations))
+		return average, finite(average)
 	case AggregationMaximum:
 		value := observations[0].Value
 		for _, observation := range observations[1:] {
@@ -238,7 +265,7 @@ func aggregateObservations(aggregation Aggregation, observations []Observation) 
 				value = observation.Value
 			}
 		}
-		return value
+		return value, true
 	case AggregationMinimum:
 		value := observations[0].Value
 		for _, observation := range observations[1:] {
@@ -246,9 +273,9 @@ func aggregateObservations(aggregation Aggregation, observations []Observation) 
 				value = observation.Value
 			}
 		}
-		return value
+		return value, true
 	default:
-		return 0
+		return 0, false
 	}
 }
 
@@ -349,13 +376,38 @@ func hasCapabilities(target TargetRun, required []string) bool {
 	return true
 }
 
-func snapshotHasTarget(snapshot RunSnapshot, targetID string) bool {
-	for _, target := range snapshot.Targets {
-		if target.TargetID == targetID {
-			return true
-		}
+func canonicalSnapshotTarget(snapshot RunSnapshot, selector TargetRun) (TargetRun, error) {
+	if snapshot.validateHeader() != nil || !validID(selector.TargetID) || !validID(selector.AgentID) {
+		return TargetRun{}, ErrInvalidEvaluation
 	}
-	return false
+	var selected TargetRun
+	matches := 0
+	observations := 0
+	for _, target := range snapshot.Targets {
+		if len(target.Observations) > maxTargetObservations {
+			return TargetRun{}, ErrInvalidEvaluation
+		}
+		observations += len(target.Observations)
+		if observations > maxSnapshotObservations {
+			return TargetRun{}, ErrInvalidEvaluation
+		}
+		if target.TargetID != selector.TargetID {
+			continue
+		}
+		matches++
+		if target.AgentID != selector.AgentID || target.Validate() != nil {
+			return TargetRun{}, ErrInvalidEvaluation
+		}
+		selected = target
+	}
+	if matches != 1 {
+		return TargetRun{}, ErrInvalidEvaluation
+	}
+	return selected, nil
+}
+
+func nonNegativeCount(value float64) bool {
+	return finite(value) && value >= 0 && math.Trunc(value) == value
 }
 
 func (e *Evaluator) now() time.Time {

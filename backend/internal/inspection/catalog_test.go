@@ -44,6 +44,10 @@ func TestBuiltinHostCatalogPublishesVersionOneThresholds(t *testing.T) {
 	if byID["host.time.synchronization"].SourceType != SourceMetadata || byID["database.process.presence"].SourceType != SourceMetadata || byID["host.log.error_summary"].SourceType != SourceLogSummary {
 		t.Fatal("metadata and log-summary catalog sources must remain explicit")
 	}
+	logSelector := byID["host.log.error_summary"].EvidenceSelector
+	if len(logSelector) != 3 || logSelector[0] != "warning_count" || logSelector[1] != "error_count" || logSelector[2] != "critical_count" {
+		t.Fatalf("log selector = %#v, want warning/error/critical counters", logSelector)
+	}
 }
 
 func TestBuiltinHostCatalogReturnsIndependentItemValues(t *testing.T) {

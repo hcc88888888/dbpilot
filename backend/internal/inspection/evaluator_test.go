@@ -119,7 +119,9 @@ func TestEvaluatorDeduplicatesSamplesAndDoesNotLeakLabels(t *testing.T) {
 func TestEvaluatorMarksUnadvertisedSourceUnsupported(t *testing.T) {
 	// Break caught: a target cannot be called healthy when its Agent never advertised the required source.
 	now := testTime()
-	findings, err := (&Evaluator{Evidence: &memoryEvidenceStore{}, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), metricSnapshot(AggregationLatest), TargetRun{TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating})
+	snapshot := metricSnapshot(AggregationLatest)
+	snapshot.Targets[0].AdvertisedSources = nil
+	findings, err := (&Evaluator{Evidence: &memoryEvidenceStore{}, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +140,7 @@ func TestEvaluatorUsesBuiltinMetadataAndLogSemantics(t *testing.T) {
 		},
 		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending}},
 	}
-	target := TargetRun{
+	canonicalTarget := TargetRun{
 		TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating, TrustedProcessAllowlist: false,
 		AdvertisedSources: []SourceType{SourceMetadata, SourceLogSummary},
 		Observations: []Observation{
@@ -147,9 +149,11 @@ func TestEvaluatorUsesBuiltinMetadataAndLogSemantics(t *testing.T) {
 			metadataObservation("process", "dbpilot.inspection.host.database.required_process_count", 0, now),
 			{ID: "errors", TargetID: "target-1", Name: "dbpilot.inspection.host.log.error_count", SourceType: SourceLogSummary, Value: 0, ObservedAt: now},
 			{ID: "warnings", TargetID: "target-1", Name: "dbpilot.inspection.host.log.warning_count", SourceType: SourceLogSummary, Value: 1, ObservedAt: now},
+			{ID: "critical", TargetID: "target-1", Name: "dbpilot.inspection.host.log.critical_count", SourceType: SourceLogSummary, Value: 0, ObservedAt: now},
 		},
 	}
-	findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, target)
+	snapshot.Targets = []TargetRun{canonicalTarget}
+	findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,18 +188,187 @@ func TestEvaluatorReturnsFindingsInItemVersionOrder(t *testing.T) {
 	}
 }
 
+func TestEvaluatorUsesOnlyTheCanonicalSnapshotTarget(t *testing.T) {
+	// Break caught: caller-provided sources or observations must not replace the immutable target snapshot.
+	now := testTime()
+	snapshot := metadataSnapshot("host.oom.evidence", []Observation{metadataObservation("canonical", "dbpilot.inspection.host.oom.count", 0, now)})
+	forged := TargetRun{
+		TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating, AdvertisedSources: []SourceType{SourceMetadata},
+		Observations: []Observation{metadataObservation("forged", "dbpilot.inspection.host.oom.count", 1, now)},
+	}
+	findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings[0].Level != LevelHealthy {
+		t.Fatalf("forged evidence changed canonical finding to %q", findings[0].Level)
+	}
+	forged.AgentID = "agent-2"
+	if _, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, forged); err == nil {
+		t.Fatal("same target id with a different agent id must be rejected")
+	}
+}
+
+func TestEvaluatorIgnoresMalformedSiblingEvidence(t *testing.T) {
+	// Break caught: evaluating one bounded target must not be blocked by unrelated sibling evidence.
+	now := testTime()
+	snapshot := metricSnapshot(AggregationLatest)
+	snapshot.Targets = append(snapshot.Targets, TargetRun{
+		TargetID: "target-2", AgentID: "agent-2", Status: TargetPending, AdvertisedSources: []SourceType{SourceMetadata},
+		Observations: []Observation{{ID: "bad", TargetID: "target-2", Name: "bad.name", SourceType: SourceMetadata, Value: math.NaN(), ObservedAt: now}},
+	})
+	store := &memoryEvidenceStore{observations: []Observation{metricObservation("good", "target-1", "system.filesystem.utilization", 1, now)}}
+	findings, err := (&Evaluator{Evidence: store, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings[0].Level != LevelHealthy {
+		t.Fatalf("selected target finding = %q, want healthy", findings[0].Level)
+	}
+}
+
+func TestEvaluatorTreatsMalformedMetadataEvidenceAsMissingData(t *testing.T) {
+	// Break caught: malformed count/boolean metadata must not abort a target or be treated as healthy.
+	now := testTime()
+	invalidTime := now.In(time.FixedZone("CST", 8*60*60))
+	for _, tc := range []struct {
+		name    string
+		itemID  string
+		trusted bool
+		observe Observation
+	}{
+		{"negative oom count", "host.oom.evidence", false, metadataObservation("oom-negative", "dbpilot.inspection.host.oom.count", -1, now)},
+		{"fractional oom count", "host.oom.evidence", false, metadataObservation("oom-fraction", "dbpilot.inspection.host.oom.count", 0.5, now)},
+		{"invalid time sync value", "host.time.synchronization", false, metadataObservation("sync-invalid", "dbpilot.inspection.host.time.synchronized", 2, now)},
+		{"fractional time sync value", "host.time.synchronization", false, metadataObservation("sync-fraction", "dbpilot.inspection.host.time.synchronized", 0.5, now)},
+		{"negative process count", "database.process.presence", true, metadataObservation("process-negative", "dbpilot.inspection.host.database.required_process_count", -1, now)},
+		{"fractional process count", "database.process.presence", true, metadataObservation("process-fraction", "dbpilot.inspection.host.database.required_process_count", 0.5, now)},
+		{"non utc metadata", "host.oom.evidence", false, metadataObservation("oom-time", "dbpilot.inspection.host.oom.count", 0, invalidTime)},
+		{"wrong metadata source", "host.oom.evidence", false, Observation{ID: "oom-source", TargetID: "target-1", Name: "dbpilot.inspection.host.oom.count", SourceType: SourceMetric, Labels: map[string]string{}, Value: 0, ObservedAt: now}},
+		{"wrong metadata name", "host.oom.evidence", false, metadataObservation("oom-name", "dbpilot.inspection.host.unknown_count", 0, now)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := metadataSnapshot(tc.itemID, []Observation{tc.observe})
+			snapshot.Targets[0].TrustedProcessAllowlist = tc.trusted
+			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings[0].Level != LevelMissingData {
+				t.Fatalf("malformed metadata level = %q, want missing_data", findings[0].Level)
+			}
+		})
+	}
+}
+
+func TestEvaluatorAppliesFullLogWindowSemantics(t *testing.T) {
+	// Break caught: a missing or malformed log counter must not masquerade as a healthy window.
+	now := testTime()
+	for _, tc := range []struct {
+		name         string
+		observations []Observation
+		want         FindingLevel
+	}{
+		{"all zero healthy", logObservations(now, 0, 0, 0), LevelHealthy},
+		{"warning only", logObservations(now, 1, 0, 0), LevelWarning},
+		{"error critical", logObservations(now, 0, 1, 0), LevelCritical},
+		{"critical critical", logObservations(now, 0, 0, 1), LevelCritical},
+		{"missing critical counter", logObservations(now, 0, 0, 0)[:2], LevelMissingData},
+		{"negative warning counter", logObservations(now, -1, 0, 0), LevelMissingData},
+		{"fractional error counter", logObservations(now, 0, 0.5, 0), LevelMissingData},
+		{"wrong counter source", []Observation{{ID: "warning", TargetID: "target-1", Name: "dbpilot.inspection.host.log.warning_count", SourceType: SourceMetadata, Value: 0, ObservedAt: now}, logObservations(now, 0, 0, 0)[1], logObservations(now, 0, 0, 0)[2]}, LevelMissingData},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := metadataSnapshot("host.log.error_summary", tc.observations)
+			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings[0].Level != tc.want {
+				t.Fatalf("log level = %q, want %q", findings[0].Level, tc.want)
+			}
+		})
+	}
+}
+
+func TestEvaluatorHonorsLowSideThresholdEquality(t *testing.T) {
+	// Break caught: low-side rules must classify their lower critical boundary before warning.
+	now := testTime()
+	for _, tc := range []struct {
+		value float64
+		want  FindingLevel
+	}{
+		{10.1, LevelHealthy}, {10, LevelWarning}, {5.1, LevelWarning}, {5, LevelCritical},
+	} {
+		t.Run(formatFloat(tc.value), func(t *testing.T) {
+			snapshot := lowSideMetricSnapshot()
+			store := &memoryEvidenceStore{observations: []Observation{metricObservation("sample", "target-1", "dbpilot.inspection.host.free_ratio", tc.value, now)}}
+			findings, err := (&Evaluator{Evidence: store, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings[0].Level != tc.want {
+				t.Fatalf("low-side %v = %q, want %q", tc.value, findings[0].Level, tc.want)
+			}
+		})
+	}
+}
+
+func TestEvaluatorAveragesMaxFiniteValuesWithoutOverflow(t *testing.T) {
+	// Break caught: summing finite max-float samples can overflow and emit non-finite evidence.
+	now := testTime()
+	snapshot := metricSnapshot(AggregationAverage)
+	snapshot.Items[0].MetricRule.WarningThreshold = math.MaxFloat64 / 3
+	snapshot.Items[0].MetricRule.CriticalThreshold = math.MaxFloat64 / 2
+	store := &memoryEvidenceStore{observations: []Observation{
+		metricObservation("first", "target-1", "system.filesystem.utilization", math.MaxFloat64, now.Add(-time.Minute)),
+		metricObservation("second", "target-1", "system.filesystem.utilization", math.MaxFloat64, now),
+	}}
+	findings, err := (&Evaluator{Evidence: store, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings[0].Level != LevelCritical || findings[0].Evidence["value"] == "+Inf" || findings[0].Evidence["value"] == "NaN" {
+		t.Fatalf("overflow-safe average finding = %#v", findings[0])
+	}
+}
+
 func testTime() time.Time { return time.Date(2026, 8, 28, 10, 0, 0, 0, time.UTC) }
 
 func metricSnapshot(aggregation Aggregation) RunSnapshot {
 	return RunSnapshot{
 		ID: "run-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, CreatedAt: testTime(),
-		Items:   []Item{{ID: "host.filesystem.utilization", Version: 1, ScopeType: ScopeHost, SourceType: SourceMetric, System: true, MetricRule: &MetricRule{MetricName: "system.filesystem.utilization", Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: aggregation, Operator: OperatorGTE, WarningThreshold: 80, CriticalThreshold: 90}}},
-		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending}},
+		Items:   []Item{{ID: "custom.filesystem.utilization", Version: 1, ScopeType: ScopeHost, SourceType: SourceMetric, EvidenceSelector: []string{"value"}, MetricRule: &MetricRule{MetricName: "system.filesystem.utilization", Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: aggregation, Operator: OperatorGTE, WarningThreshold: 80, CriticalThreshold: 90}}},
+		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending, AdvertisedSources: []SourceType{SourceMetric}}},
 	}
 }
 
 func metricTarget() TargetRun {
-	return TargetRun{TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating, AdvertisedSources: []SourceType{SourceMetric}}
+	return TargetRun{TargetID: "target-1", AgentID: "agent-1"}
+}
+
+func metadataSnapshot(itemID string, observations []Observation) RunSnapshot {
+	return RunSnapshot{
+		ID: "run-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, CreatedAt: testTime(),
+		Items:   []Item{builtinItem(itemID)},
+		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending, AdvertisedSources: []SourceType{SourceMetadata, SourceLogSummary}, Observations: observations}},
+	}
+}
+
+func lowSideMetricSnapshot() RunSnapshot {
+	return RunSnapshot{
+		ID: "run-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, CreatedAt: testTime(),
+		Items:   []Item{{ID: "custom.free_ratio", Version: 1, ScopeType: ScopeHost, SourceType: SourceMetric, EvidenceSelector: []string{"value"}, MetricRule: &MetricRule{MetricName: "dbpilot.inspection.host.free_ratio", Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: AggregationLatest, Operator: OperatorLTE, WarningThreshold: 10, CriticalThreshold: 5}}},
+		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending, AdvertisedSources: []SourceType{SourceMetric}}},
+	}
+}
+
+func logObservations(now time.Time, warning, errors, critical float64) []Observation {
+	return []Observation{
+		{ID: "warning", TargetID: "target-1", Name: "dbpilot.inspection.host.log.warning_count", SourceType: SourceLogSummary, Value: warning, ObservedAt: now},
+		{ID: "error", TargetID: "target-1", Name: "dbpilot.inspection.host.log.error_count", SourceType: SourceLogSummary, Value: errors, ObservedAt: now},
+		{ID: "critical", TargetID: "target-1", Name: "dbpilot.inspection.host.log.critical_count", SourceType: SourceLogSummary, Value: critical, ObservedAt: now},
+	}
 }
 
 func metricObservation(id, targetID, name string, value float64, observedAt time.Time) Observation {

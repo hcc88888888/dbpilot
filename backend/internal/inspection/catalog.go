@@ -36,7 +36,7 @@ func BuiltinHostItems() []Item {
 		},
 		{
 			ID: "host.log.error_summary", Version: 1, Name: "Error log summary", Category: "host", ScopeType: ScopeHost, SourceType: SourceLogSummary, System: true,
-			EvidenceSelector: []string{"error_count", "warning_count"},
+			EvidenceSelector: []string{"warning_count", "error_count", "critical_count"},
 		},
 	}
 	return cloneItems(items)

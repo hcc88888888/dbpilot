@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
+	"reflect"
 	"strings"
 	"time"
 
@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	maxSnapshotItems   = 200
-	maxSnapshotTargets = 10000
-	maxEvidenceBytes   = 64 * 1024
+	maxSnapshotItems        = 200
+	maxSnapshotTargets      = 10000
+	maxSnapshotObservations = 10000
+	maxTargetObservations   = 256
+	maxEvidenceBytes        = 64 * 1024
 )
 
 var (
@@ -141,6 +143,12 @@ func (i Item) Validate() error {
 	if !validID(i.ID) || i.Version < 1 || i.ScopeType != ScopeHost || !validSource(i.SourceType) || !validEvidenceSelector(i.EvidenceSelector) || !validCapabilities(i.RequiredCapabilities) {
 		return ErrInvalidItem
 	}
+	if i.System {
+		return validateCanonicalSystemItem(i)
+	}
+	if builtinItemID(i.ID) {
+		return ErrInvalidItem
+	}
 	if i.SourceType == SourceMetric {
 		if i.MetricRule == nil || i.MetricRule.Validate() != nil {
 			return ErrInvalidItem
@@ -149,9 +157,6 @@ func (i Item) Validate() error {
 			return ErrInvalidItem
 		}
 		return nil
-	}
-	if !i.System {
-		return ErrInvalidItem
 	}
 	if i.MetricRule != nil || len(i.EvidenceSelector) == 0 {
 		return ErrInvalidItem
@@ -192,7 +197,7 @@ type TargetRun struct {
 }
 
 func (t TargetRun) Validate() error {
-	if !validID(t.TargetID) || !validID(t.AgentID) || !validTargetStatus(t.Status) || (!t.ObservedAt.IsZero() && !isUTC(t.ObservedAt)) || !validCapabilities(t.Capabilities) {
+	if !validID(t.TargetID) || !validID(t.AgentID) || !validTargetStatus(t.Status) || (!t.ObservedAt.IsZero() && !isUTC(t.ObservedAt)) || !validCapabilities(t.Capabilities) || len(t.Observations) > maxTargetObservations {
 		return ErrInvalidTargetRun
 	}
 	seenSources := make(map[SourceType]struct{}, len(t.AdvertisedSources))
@@ -204,16 +209,6 @@ func (t TargetRun) Validate() error {
 			return ErrInvalidTargetRun
 		}
 		seenSources[source] = struct{}{}
-	}
-	seenObservations := make(map[string]struct{}, len(t.Observations))
-	for _, observation := range t.Observations {
-		if observation.TargetID != t.TargetID || observation.Validate() != nil {
-			return ErrInvalidTargetRun
-		}
-		if _, exists := seenObservations[observation.ID]; exists {
-			return ErrInvalidTargetRun
-		}
-		seenObservations[observation.ID] = struct{}{}
 	}
 	return nil
 }
@@ -229,6 +224,28 @@ type RunSnapshot struct {
 }
 
 func (r RunSnapshot) Validate() error {
+	if err := r.validateHeader(); err != nil {
+		return err
+	}
+	targets := make(map[string]struct{}, len(r.Targets))
+	observations := 0
+	for _, target := range r.Targets {
+		if target.Validate() != nil {
+			return ErrInvalidRunSnapshot
+		}
+		if _, exists := targets[target.TargetID]; exists {
+			return ErrInvalidRunSnapshot
+		}
+		targets[target.TargetID] = struct{}{}
+		observations += len(target.Observations)
+		if observations > maxSnapshotObservations {
+			return ErrInvalidRunSnapshot
+		}
+	}
+	return nil
+}
+
+func (r RunSnapshot) validateHeader() error {
 	if !validID(r.ID) || r.Scope.Validate() != nil || !isUTC(r.CreatedAt) || len(r.Items) == 0 || len(r.Items) > maxSnapshotItems || len(r.Targets) == 0 || len(r.Targets) > maxSnapshotTargets {
 		return ErrInvalidRunSnapshot
 	}
@@ -242,16 +259,6 @@ func (r RunSnapshot) Validate() error {
 			return ErrInvalidRunSnapshot
 		}
 		items[key] = struct{}{}
-	}
-	targets := make(map[string]struct{}, len(r.Targets))
-	for _, target := range r.Targets {
-		if target.Validate() != nil {
-			return ErrInvalidRunSnapshot
-		}
-		if _, exists := targets[target.TargetID]; exists {
-			return ErrInvalidRunSnapshot
-		}
-		targets[target.TargetID] = struct{}{}
 	}
 	return nil
 }
@@ -317,6 +324,9 @@ func AggregateRunStatus(statuses []TargetStatus) RunStatus {
 	succeeded := false
 	allCancelled := true
 	for _, status := range statuses {
+		if status == TargetPending || status == TargetCollecting || status == TargetEvaluating {
+			return RunEvaluating
+		}
 		if status == TargetSucceeded {
 			succeeded = true
 		}
@@ -338,10 +348,22 @@ func AggregateRunStatus(statuses []TargetStatus) RunStatus {
 	return RunFailed
 }
 
-func sortedSources(sources []SourceType) []SourceType {
-	result := append([]SourceType(nil), sources...)
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
-	return result
+func validateCanonicalSystemItem(item Item) error {
+	for _, canonical := range BuiltinHostItems() {
+		if canonical.ID == item.ID && canonical.Version == item.Version && reflect.DeepEqual(canonical, item) {
+			return nil
+		}
+	}
+	return ErrInvalidItem
+}
+
+func builtinItemID(id string) bool {
+	for _, item := range BuiltinHostItems() {
+		if item.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func validID(value string) bool {

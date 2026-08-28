@@ -1,6 +1,7 @@
 package inspection
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,6 +29,11 @@ func TestAggregateRunStatusDoesNotHideTargetFailure(t *testing.T) {
 	if got := AggregateRunStatus([]TargetStatus{TargetFailed, TargetUnsupported}); got != RunFailed {
 		t.Fatalf("unsuccessful target statuses = %q, want %q", got, RunFailed)
 	}
+	for _, status := range []TargetStatus{TargetPending, TargetCollecting, TargetEvaluating} {
+		if got := AggregateRunStatus([]TargetStatus{TargetSucceeded, status}); got != RunEvaluating {
+			t.Fatalf("nonterminal target %q produced %q, want %q", status, got, RunEvaluating)
+		}
+	}
 }
 
 func TestModelRejectsMutableOrUnboundedRunSnapshots(t *testing.T) {
@@ -38,7 +44,8 @@ func TestModelRejectsMutableOrUnboundedRunSnapshots(t *testing.T) {
 		CreatedAt: utc,
 		Items: []Item{{
 			ID: "cpu.utilization", Version: 1, ScopeType: ScopeHost, SourceType: SourceMetric,
-			MetricRule: &MetricRule{MetricName: "system.cpu.utilization", Window: time.Minute, Aggregation: AggregationLatest, Operator: OperatorGTE, WarningThreshold: 80, CriticalThreshold: 90},
+			EvidenceSelector: []string{"value"},
+			MetricRule:       &MetricRule{MetricName: "system.cpu.utilization", Window: time.Minute, Aggregation: AggregationLatest, Operator: OperatorGTE, WarningThreshold: 80, CriticalThreshold: 90},
 		}},
 		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending}},
 	}
@@ -56,7 +63,7 @@ func TestModelRejectsMutableOrUnboundedRunSnapshots(t *testing.T) {
 		}},
 		{"too many targets", func(v *RunSnapshot) {
 			for i := 0; i < 10000; i++ {
-				v.Targets = append(v.Targets, TargetRun{TargetID: "target-" + string(rune(i+1)), AgentID: "agent", Status: TargetPending})
+				v.Targets = append(v.Targets, TargetRun{TargetID: fmt.Sprintf("target-%d", i), AgentID: "agent", Status: TargetPending})
 			}
 		}},
 		{"non UTC created at", func(v *RunSnapshot) { v.CreatedAt = utc.In(time.FixedZone("CST", 8*60*60)) }},
@@ -112,5 +119,59 @@ func TestMetricRuleRequiresCriticalThresholdOnTheSevereSide(t *testing.T) {
 	invalidLowSide.CriticalThreshold = 10
 	if err := invalidLowSide.Validate(); err == nil {
 		t.Fatal("low-side critical threshold above warning must be rejected")
+	}
+}
+
+func TestSystemItemsMustExactlyMatchTheCanonicalCatalog(t *testing.T) {
+	// Break caught: accepting a spoofed system item would let a caller rewrite a version-one decision.
+	canonical := builtinItem("host.filesystem.utilization")
+	cases := []struct {
+		name string
+		edit func(*Item)
+	}{
+		{"unknown system id", func(item *Item) { item.ID = "host.unreviewed.utilization" }},
+		{"wrong system version", func(item *Item) { item.Version = 2 }},
+		{"mutated threshold", func(item *Item) { item.MetricRule.WarningThreshold = 79 }},
+		{"mutated selector", func(item *Item) { item.EvidenceSelector = []string{"value"} }},
+		{"mutated capability", func(item *Item) { item.RequiredCapabilities = []string{"host.metrics"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := cloneItems([]Item{canonical})[0]
+			tc.edit(&item)
+			if err := item.Validate(); err == nil {
+				t.Fatal("spoofed system item must be rejected")
+			}
+		})
+	}
+	custom := cloneItems([]Item{canonical})[0]
+	custom.System = false
+	custom.EvidenceSelector = []string{"value"}
+	if err := custom.Validate(); err == nil {
+		t.Fatal("custom item must not reuse a built-in id")
+	}
+}
+
+func TestSnapshotBoundsEmbeddedObservations(t *testing.T) {
+	// Break caught: unbounded normalized evidence can exhaust evaluator memory before a finding is produced.
+	base := metricSnapshot(AggregationLatest)
+	for index := 0; index < 257; index++ {
+		base.Targets[0].Observations = append(base.Targets[0].Observations, Observation{ID: fmt.Sprintf("sample-%d", index), TargetID: "target-1", Name: "dbpilot.inspection.host.oom.count", SourceType: SourceMetadata, Value: 0, ObservedAt: testTime()})
+	}
+	if err := base.Validate(); err == nil {
+		t.Fatal("target with more than 256 observations must be rejected")
+	}
+
+	total := metricSnapshot(AggregationLatest)
+	total.Targets = nil
+	for targetIndex := 0; targetIndex < 40; targetIndex++ {
+		target := TargetRun{TargetID: fmt.Sprintf("target-%d", targetIndex), AgentID: "agent-1", Status: TargetPending}
+		for observationIndex := 0; observationIndex < 256; observationIndex++ {
+			target.Observations = append(target.Observations, Observation{ID: fmt.Sprintf("sample-%d", observationIndex), TargetID: target.TargetID, Name: "dbpilot.inspection.host.oom.count", SourceType: SourceMetadata, Value: 0, ObservedAt: testTime()})
+		}
+		total.Targets = append(total.Targets, target)
+	}
+	if err := total.Validate(); err == nil {
+		t.Fatal("snapshot with more than 10000 observations must be rejected")
 	}
 }
