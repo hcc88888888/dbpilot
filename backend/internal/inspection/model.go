@@ -126,17 +126,23 @@ func (r MetricRule) Validate() error {
 // System metadata/log items use their stable ID semantics; first-stage custom
 // items are represented only by SourceMetric and a MetricRule.
 type Item struct {
-	ID                     string      `json:"id"`
-	Version                int         `json:"version"`
-	Name                   string      `json:"name"`
-	Category               string      `json:"category"`
-	ScopeType              ScopeType   `json:"scope_type"`
-	SourceType             SourceType  `json:"source_type"`
-	System                 bool        `json:"system"`
-	MetricRule             *MetricRule `json:"metric_rule,omitempty"`
-	EvidenceSelector       []string    `json:"evidence_selector,omitempty"`
-	RequiredCapabilities   []string    `json:"required_capabilities,omitempty"`
-	RecommendationTemplate string      `json:"recommendation_template"`
+	Scope                  platformscope.Scope `json:"scope,omitempty"`
+	ID                     string              `json:"id"`
+	Version                int                 `json:"version"`
+	Name                   string              `json:"name"`
+	Description            string              `json:"description,omitempty"`
+	Category               string              `json:"category"`
+	ScopeType              ScopeType           `json:"scope_type"`
+	SourceType             SourceType          `json:"source_type"`
+	System                 bool                `json:"system"`
+	MetricRule             *MetricRule         `json:"metric_rule,omitempty"`
+	EvidenceSelector       []string            `json:"evidence_selector,omitempty"`
+	RequiredCapabilities   []string            `json:"required_capabilities,omitempty"`
+	RecommendationTemplate string              `json:"recommendation_template"`
+	DocumentationURL       string              `json:"documentation_url,omitempty"`
+	Enabled                bool                `json:"enabled"`
+	CreatedAt              time.Time           `json:"created_at,omitempty"`
+	UpdatedAt              time.Time           `json:"updated_at,omitempty"`
 }
 
 func (i Item) Validate() error {
@@ -186,14 +192,19 @@ func (o Observation) Validate() error {
 // TargetRun records immutable target identity plus the Agent-advertised
 // source types and normalized non-metric evidence for a particular run.
 type TargetRun struct {
-	TargetID                string        `json:"target_id"`
-	AgentID                 string        `json:"agent_id"`
-	Status                  TargetStatus  `json:"status"`
-	ObservedAt              time.Time     `json:"observed_at,omitempty"`
-	AdvertisedSources       []SourceType  `json:"advertised_sources,omitempty"`
-	Capabilities            []string      `json:"capabilities,omitempty"`
-	TrustedProcessAllowlist bool          `json:"trusted_process_allowlist"`
-	Observations            []Observation `json:"observations,omitempty"`
+	TargetID                string            `json:"target_id"`
+	AgentID                 string            `json:"agent_id"`
+	CommandID               string            `json:"command_id,omitempty"`
+	DisplayName             string            `json:"display_name,omitempty"`
+	Host                    string            `json:"host,omitempty"`
+	Labels                  map[string]string `json:"labels,omitempty"`
+	Status                  TargetStatus      `json:"status"`
+	ErrorCode               string            `json:"error_code,omitempty"`
+	ObservedAt              time.Time         `json:"observed_at,omitempty"`
+	AdvertisedSources       []SourceType      `json:"advertised_sources,omitempty"`
+	Capabilities            []string          `json:"capabilities,omitempty"`
+	TrustedProcessAllowlist bool              `json:"trusted_process_allowlist"`
+	Observations            []Observation     `json:"observations,omitempty"`
 }
 
 func (t TargetRun) Validate() error {
@@ -265,6 +276,7 @@ func (r RunSnapshot) validateHeader() error {
 
 // Finding is the bounded, secret-safe immutable output of one item version.
 type Finding struct {
+	ID                string              `json:"id,omitempty"`
 	Scope             platformscope.Scope `json:"scope"`
 	RunID             string              `json:"run_id"`
 	TargetID          string              `json:"target_id"`
@@ -275,6 +287,8 @@ type Finding struct {
 	WarningThreshold  *float64            `json:"warning_threshold,omitempty"`
 	CriticalThreshold *float64            `json:"critical_threshold,omitempty"`
 	Evidence          map[string]string   `json:"evidence"`
+	Summary           string              `json:"summary,omitempty"`
+	Recommendation    string              `json:"recommendation,omitempty"`
 }
 
 func (f Finding) Validate() error {
@@ -349,6 +363,15 @@ func AggregateRunStatus(statuses []TargetStatus) RunStatus {
 }
 
 func validateCanonicalSystemItem(item Item) error {
+	item.Scope = platformscope.Scope{}
+	item.Enabled = false
+	item.CreatedAt = time.Time{}
+	item.UpdatedAt = time.Time{}
+	if item.MetricRule != nil && item.MetricRule.Labels == nil {
+		rule := *item.MetricRule
+		rule.Labels = map[string]string{}
+		item.MetricRule = &rule
+	}
 	for _, canonical := range BuiltinHostItems() {
 		if canonical.ID == item.ID && canonical.Version == item.Version && reflect.DeepEqual(canonical, item) {
 			return nil

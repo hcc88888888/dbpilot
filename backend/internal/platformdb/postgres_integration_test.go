@@ -13,6 +13,8 @@ import (
 
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/inspection"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -46,9 +48,14 @@ func TestPlatformPostgresIntegration(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 	require.NoError(t, RunMigrations(ctx, database))
 	require.NoError(t, RunMigrations(ctx, database))
+	require.NoError(t, job.RunMigrations(ctx, database))
+	require.NoError(t, inspection.RunMigrations(ctx, database))
 	var applied int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM dbpilot_schema_migrations WHERE name = $1", "platformdb/migrations/0001_platform_services.sql").Scan(&applied))
 	require.Equal(t, 1, applied)
+	var inspectionRuns string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT 'inspection_runs'::regclass::text").Scan(&inspectionRuns))
+	require.Equal(t, "inspection_runs", inspectionRuns)
 
 	scope := platformscope.Scope{TenantID: "tenant-integration", ProjectID: "project-integration"}
 	wrongScope := platformscope.Scope{TenantID: scope.TenantID, ProjectID: "project-other"}

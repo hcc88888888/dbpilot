@@ -8,6 +8,7 @@ require (
 	github.com/getkin/kin-openapi v0.142.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.10.9
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/oapi-codegen/runtime v1.6.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.158.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza v0.158.0
