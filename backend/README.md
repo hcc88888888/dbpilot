@@ -99,9 +99,12 @@ requires attaching the three runner logs.
 Windows development can verify both Linux executables inside the exact
 `cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` image. The verifier builds
 both architectures, executes each selected-architecture binary with `--version`, starts the Agent with a signed
-sample policy, proves its bbolt command journal opens and closes, and starts
-the control plane through configuration validation until the expected
-PostgreSQL connection failure. It rejects missing Docker/images, non-Kylin
+sample policy, proves its bbolt command journal opens and closes, and runs a
+two-phase protocol probe proving a prepared command remains unexecuted without
+Start. It also resolves the command execution-token and Artifact signing
+credentials, validates the private Artifact storage root, and starts the
+control plane through readiness initialization until the expected PostgreSQL
+connection failure. It rejects missing Docker/images, non-Kylin
 `/etc/os-release`, architecture mismatches, and unexpected startup failures;
 it requires the exact Kylin V10/Tercel release identity, always removes only
 the uniquely named container it created plus temporary keys/binaries, and never
@@ -144,32 +147,61 @@ the explicit mock test is the live, self-cleaning Prism check.
 Agent Hello capability negotiation is authoritative: the dispatcher sends only
 typed command envelopes the live Agent advertised. Delivery is at-least-once;
 `command_outbox.id` is the immutable `command_id`, while the first fully signed
-envelope is atomically persisted and reused byte-for-byte for every lease retry.
-The signed envelope has a fixed 24-hour delivery deadline beginning at first
-preparation; `lease_seconds` is separate and controls only the Agent's execution
-lease after acceptance. Reclaims before the delivery deadline resend the same
-bytes. An unacknowledged command found at or after the deadline is never sent:
-its target is timed out, the Job is finalized under the normal partial/timeout
-rules, the timeout Audit row is inserted once under the internal
-`command.delivery_timed_out:<command_id>` deduplication key, and only then is
-the outbox row terminally published. A retry after an Audit or publication
-failure cannot change the Job twice or duplicate the Audit evidence.
-Queue insertion does not mark delivery: only a validated Agent accepted,
-rejected or duplicate acknowledgement publishes the outbox row. The Agent
-journal therefore deduplicates the same ID and digest, and every
-acknowledgement/progress/result is correlated through the durable outbox row to
-tenant/project, Job, target, Artifact references and Audit trace fields. The
-control plane reads an Ed25519 PKCS#8 signing key once from
-`command.signing_private_key_ref`; Agents receive only the matching PKIX public
+envelope is atomically persisted and reused byte-for-byte for every Prepare
+retry. The signed envelope has a fixed 24-hour delivery deadline beginning at
+first preparation. Prepare only synchronously stores the complete envelope and
+digest in the Agent bbolt journal. It never invokes an executor.
+
+After `CommandPrepared`, the control plane locks the Job, target, and command in
+PostgreSQL. If cancellation has not won, it atomically commits
+`start_authorized`, a random execution-token hash/ciphertext, the execution
+revision, and the initial deadline before sending `CommandStart`. Only an exact
+token/revision match may enter running. If cancellation commits first, no Start
+fence is created and an unfenced Cancel removes the Agent's prepared entry. If
+Start commits first, cancellation replays the identical persisted Start before
+sending a fenced Cancel; the final Job state follows the Agent's honest Result,
+including success after a late cancellation request.
+
+Active heartbeats carry the execution token and revision. PostgreSQL renewal
+increments the recovery revision and clears any timeout claim. A timeout worker
+may finalize only when its claim token, claimed deadline, and claimed recovery
+revision still match, so stale workers cannot overwrite a heartbeat or Result.
+Execution results are also fenced by token/revision and keep large output in
+Artifact references rather than inline payloads.
+
+The Agent retains every terminal Result until `CommandResultAcknowledgement`
+has `persisted=true` and the exact result digest. The control plane emits that
+Ack only after the Command/Job/target/Artifact references and idempotent Audit
+evidence are durable. A crash before Ack causes reconnect replay of the same
+Result. If an Agent process restarts with a running journal entry, it does not
+run the executor again: it reports `EXECUTION_INTERRUPTED`, the control plane
+records durable timed-out evidence, and operators must inspect the target
+database before deciding whether remediation or a new command is safe.
+
+The control plane reads an Ed25519 PKCS#8 signing key once from
+`command.signing_private_key_ref` and a separate exact 32-byte AES key from
+`command.execution_token_key_ref`; Agents receive only the matching PKIX public
 key. Arbitrary shell commands are never part of the protocol.
+
+HTTP idempotency persists the phases `processing → side_effect_committed →
+audited → completed`. Cancellation responses and Artifact download descriptors
+are stored before Audit. A same-fingerprint retry from
+`side_effect_committed` uses the original request/trace identity and stable
+Audit dedupe key to repair Audit and complete the saved response without
+repeating Job cancellation or signing a second descriptor. A bare `processing`
+row has no proof that a side effect committed and is therefore not guessed or
+automatically reclaimed.
+
+Artifact readiness is a startup boundary: the local storage root must be a
+private, openable directory and the signing Credential Reference must resolve
+to an acceptable key before the capability or HTTP download path becomes
+ready. Startup fails closed rather than advertising an unusable Artifact
+service.
 
 The current `/api/v1` contract has one pre-stable migration window. After
 workorder, SQL window, SQL review, slow SQL, audit log, locks, schema diff and
 reports all use generated clients and strict handlers, v1 changes are
-additive-only. Durable idempotency rows left in unresolved `processing` state
-are deliberately not auto-reclaimed: production operations need an explicit
-future administrator reconciliation procedure before such requests can be
-replayed safely.
+additive-only.
 
 ## Database adapter integration verification
 

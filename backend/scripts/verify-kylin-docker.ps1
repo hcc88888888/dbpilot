@@ -93,6 +93,7 @@ $temporaryRoot = Join-Path $backendRoot ('.tmp-kylin-' + [guid]::NewGuid().ToStr
 $fixtureDirectory = Join-Path $temporaryRoot 'runtime'
 $binaryDirectory = Join-Path $temporaryRoot 'bin'
 $fixtureSource = Join-Path $temporaryRoot 'main.go'
+$protocolProbeSource = Join-Path $temporaryRoot 'protocol-probe.go'
 $container = $null
 $containerName = New-DBPilotOwnedContainerName -Prefix 'dbpilot-kylin-smoke'
 $primaryFailure = $null
@@ -103,6 +104,7 @@ try {
 package main
 
 import (
+	"context"
     "crypto/ed25519"
     "crypto/rand"
     "crypto/x509"
@@ -115,7 +117,10 @@ import (
     "path/filepath"
     "time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/agent/commandjournal"
     "dbpilot.local/platform/internal/policy"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func must(err error) { if err != nil { panic(err) } }
@@ -131,6 +136,8 @@ func keyPair(directory, prefix string) (ed25519.PublicKey, ed25519.PrivateKey) {
 func main() {
     directory := os.Args[1]
     must(os.MkdirAll(directory, 0700))
+	dataDirectory := filepath.Join(directory, "data")
+	must(os.MkdirAll(dataDirectory, 0700))
     _, policyPrivate := keyPair(directory, "policy")
     keyPair(directory, "command")
     caPublic, caPrivate, err := ed25519.GenerateKey(rand.Reader); must(err)
@@ -148,9 +155,41 @@ func main() {
     envelope, err := policy.Sign(policyPrivate, value); must(err)
     encoded, err := json.Marshal(envelope); must(err)
     write(filepath.Join(directory, "policy.json"), encoded, 0600)
+	journal, err := commandjournal.Open(filepath.Join(dataDirectory, "command-journal.db")); must(err)
+	prepared := &agentv1.CommandEnvelope{
+		CommandId:"kylin-protocol-prepare", JobId:"kylin-protocol-job", AgentId:"kylin-smoke-agent",
+		Nonce:[]byte("kylin-protocol-nonce"), LeaseSeconds:30, IssuedAt:timestamppb.New(now), ExpiresAt:timestamppb.New(now.Add(time.Hour)),
+		Command:&agentv1.CommandEnvelope_CollectNow{CollectNow:&agentv1.CollectNow{CollectionKinds:[]string{"health"}}},
+	}
+	created, err := journal.Prepare(context.Background(), prepared, now); must(err)
+	if !created { panic("prepared protocol fixture was not created") }
+	must(journal.Close())
 }
 '@
     [System.IO.File]::WriteAllText($fixtureSource, $fixtureProgram, [Text.UTF8Encoding]::new($false))
+	$protocolProbe = @'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"dbpilot.local/platform/internal/agent/commandjournal"
+)
+
+func main() {
+	if len(os.Args) != 2 { panic("journal path is required") }
+	journal, err := commandjournal.Open(os.Args[1]); if err != nil { panic(err) }
+	defer journal.Close()
+	entry, err := journal.Get(context.Background(), "kylin-protocol-prepare"); if err != nil { panic(err) }
+	if entry.State != commandjournal.StatePrepared { panic(fmt.Sprintf("prepared command changed state: %s", entry.State)) }
+	pending, err := journal.PendingResults(context.Background()); if err != nil { panic(err) }
+	if len(pending) != 0 { panic("Prepare-only command produced a result without Start") }
+	fmt.Println("Kylin protocol smoke passed: prepared_without_start=true executor_calls=0")
+}
+'@
+	[System.IO.File]::WriteAllText($protocolProbeSource, $protocolProbe, [Text.UTF8Encoding]::new($false))
 
     Push-Location $backendRoot
     try {
@@ -200,6 +239,7 @@ evaluation_scopes:
     project_id: "project-smoke"
 command:
   signing_private_key_ref: "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"
+  execution_token_key_ref: "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"
 artifact:
   storage_root: "/runtime/data/artifacts"
   signing_key_ref: "secret://controlplane/artifact-download"
@@ -208,6 +248,29 @@ artifact:
 
     & (Join-Path $PSScriptRoot 'build-linux.ps1') -OutputDirectory $binaryDirectory -Version $Version -GoBinary $GoBinary
     if ($LASTEXITCODE -ne 0) { throw 'Linux binary build failed.' }
+	$protocolProbeBinary = Join-Path $binaryDirectory "dbpilot-protocol-smoke-linux-$Architecture"
+	$hadCGOEnabled = Test-Path Env:CGO_ENABLED
+	$previousCGOEnabled = $env:CGO_ENABLED
+	$hadGOOS = Test-Path Env:GOOS
+	$previousGOOS = $env:GOOS
+	$hadGOARCH = Test-Path Env:GOARCH
+	$previousGOARCH = $env:GOARCH
+	try {
+		$env:CGO_ENABLED = '0'
+		$env:GOOS = 'linux'
+		$env:GOARCH = $Architecture
+		Push-Location $backendRoot
+		try {
+			& $GoBinary build -trimpath -o $protocolProbeBinary $protocolProbeSource
+			if ($LASTEXITCODE -ne 0) { throw 'Kylin protocol smoke build failed.' }
+		}
+		finally { Pop-Location }
+	}
+	finally {
+		if ($hadCGOEnabled) { $env:CGO_ENABLED = $previousCGOEnabled } else { Remove-Item Env:CGO_ENABLED -ErrorAction SilentlyContinue }
+		if ($hadGOOS) { $env:GOOS = $previousGOOS } else { Remove-Item Env:GOOS -ErrorAction SilentlyContinue }
+		if ($hadGOARCH) { $env:GOARCH = $previousGOARCH } else { Remove-Item Env:GOARCH -ErrorAction SilentlyContinue }
+	}
 
     $agentBinary = Join-Path $binaryDirectory "dbpilot-agent-linux-$Architecture"
     $controlplaneBinary = Join-Path $binaryDirectory "dbpilot-controlplane-linux-$Architecture"
@@ -219,6 +282,7 @@ artifact:
 	$container = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $containerName -CreateArguments @('--platform', $platform, $Image, '/bin/sh', '-c', 'sleep 300')
     Invoke-Docker @('cp', $agentBinary, "${container}:/opt/dbpilot-agent")
     Invoke-Docker @('cp', $controlplaneBinary, "${container}:/opt/dbpilot-controlplane")
+	Invoke-Docker @('cp', $protocolProbeBinary, "${container}:/opt/dbpilot-protocol-smoke")
     Invoke-Docker @('cp', (Join-Path $fixtureDirectory '.'), "${container}:/runtime")
     Invoke-Docker @('start', $container)
 
@@ -233,10 +297,12 @@ case "${DBPILOT_EXPECTED_ARCH}" in
   amd64) test "$arch" = x86_64 ;;
   arm64) test "$arch" = aarch64 ;;
 esac
-chmod 0755 /opt/dbpilot-agent /opt/dbpilot-controlplane
+chmod 0755 /opt/dbpilot-agent /opt/dbpilot-controlplane /opt/dbpilot-protocol-smoke
 chmod 0600 /runtime/*.pem /runtime/*.json /runtime/*.yaml
 mkdir -p /runtime/data
 chmod 0700 /runtime/data
+mkdir -p /runtime/data/artifacts
+chmod 0700 /runtime/data/artifacts
 /opt/dbpilot-agent --version
 /opt/dbpilot-controlplane --version
 
@@ -253,15 +319,18 @@ if grep -E 'parse configuration|load control-plane command public key|no usable 
   cat /runtime/agent-startup.log >&2
   exit 43
 fi
+/opt/dbpilot-protocol-smoke /runtime/data/command-journal.db
 
 export DBPILOT_COMMAND_SIGNING_PRIVATE_KEY="$(cat /runtime/command-private.pem)"
+export DBPILOT_COMMAND_EXECUTION_TOKEN_KEY='0123456789abcdef0123456789abcdef'
+export DBPILOT_SECRET_CONTROLPLANE_ARTIFACT_DOWNLOAD='0123456789abcdef0123456789abcdef'
 set +e
 /opt/dbpilot-controlplane --config /runtime/controlplane.yaml >/runtime/controlplane-startup.log 2>&1
 controlplane_status=$?
 set -e
 test "$controlplane_status" -ne 0
 grep 'database readiness' /runtime/controlplane-startup.log >/dev/null
-printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s journal=opened policy=parsed\n' "${ID}" "${VERSION_ID:-unknown}" "$arch"
+printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s journal=opened policy=parsed protocol=two-phase\n' "${ID}" "${VERSION_ID:-unknown}" "$arch"
 '@
     $smoke = $smoke.Replace("`r`n", "`n").Replace("`r", "`n")
     $encodedSmoke = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($smoke))
@@ -272,12 +341,29 @@ catch {
     throw
 }
 finally {
+	$cleanupFailures = @()
 	try {
 		Remove-DBPilotOwnedContainer -DockerBinary $DockerBinary -ContainerID $container
+		if (-not [string]::IsNullOrWhiteSpace($container)) {
+			$remaining = @(& $DockerBinary ps -a --no-trunc --filter "id=$container" --format '{{.ID}}')
+			if ($LASTEXITCODE -ne 0) { throw 'Unable to verify Kylin container cleanup.' }
+			if ($remaining -contains $container) { throw "Kylin verifier left container '$container' behind." }
+		}
 	}
 	catch {
-		if ($null -eq $primaryFailure) { throw }
-		Write-Error $_ -ErrorAction Continue
+		$cleanupFailures += $_
 	}
-    Remove-SafeTemporaryDirectory $temporaryRoot
+	try {
+		Remove-SafeTemporaryDirectory $temporaryRoot
+		if (Test-Path -LiteralPath $temporaryRoot) {
+			throw "Kylin verifier left temporary directory '$temporaryRoot' behind."
+		}
+	}
+	catch {
+		$cleanupFailures += $_
+	}
+	if ($cleanupFailures.Count -gt 0) {
+		if ($null -eq $primaryFailure) { throw $cleanupFailures[0] }
+		foreach ($cleanupFailure in $cleanupFailures) { Write-Error $cleanupFailure -ErrorAction Continue }
+	}
 }

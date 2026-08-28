@@ -122,6 +122,7 @@ func TestTwoPhaseCancelBeforePreparedPreventsStartDispatch(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, start)
 	require.Empty(t, fixture.agents.starts, "a cancellation transaction that commits first must prevent Start")
+	require.Equal(t, []string{"cancel-unfenced:" + message.ID}, fixture.agents.events, "the Agent's durable Prepare must be cleared even when cancellation wins the database CAS")
 }
 
 func TestPreparedRecoveryPeriodicallyAuthorizesAndReplaysStart(t *testing.T) {
@@ -384,6 +385,34 @@ func TestResultFenceContradictoryLateResultReturnsNonRetryableConflict(t *testin
 	require.NoError(t, err)
 	require.True(t, outcome.Persisted)
 	require.Equal(t, version, fixture.persistence.currentJob().Version)
+}
+
+func TestInterruptedAgentResultDurablyTimesOutWithoutReexecution(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-interrupted", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err := ApplyTransition(current, Transition{
+		Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning,
+		TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now,
+	})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{
+		CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED,
+		Summary: "command execution was interrupted before a terminal result", ErrorCode: "EXECUTION_INTERRUPTED",
+		ExecutionToken: token, LeaseRevision: 1,
+	})
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, "EXECUTION_INTERRUPTED", fixture.persistence.currentJob().TargetResults[0].ErrorSummary)
+	require.Equal(t, "command.result", fixture.audit.events[0].Action)
+	require.Equal(t, "failure", fixture.audit.events[0].Result)
 }
 
 func TestTwoPhaseRunningCancellationUsesPersistedExecutionFence(t *testing.T) {

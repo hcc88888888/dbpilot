@@ -572,7 +572,7 @@ func (lifecycle *CommandLifecycle) Prepared(ctx context.Context, agentID string,
 	at := lifecycle.currentTime()
 	if err := lifecycle.dispatchRepository.MarkPrepared(ctx, message.Scope, message.ID, digest, at); err != nil {
 		if errors.Is(err, ErrConflict) {
-			return nil, nil
+			return nil, lifecycle.agents.CancelPrepared(ctx, message.TargetID, message.ID, message.CancellationReason)
 		}
 		return nil, err
 	}
@@ -907,6 +907,9 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		commandStatus = CommandCancelled
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT:
 		target.Status, auditResult = TargetTimedOut, "failure"
+		commandStatus = CommandTimedOut
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		target.Status, target.ErrorSummary, auditResult = TargetTimedOut, result.GetErrorCode(), "failure"
 		commandStatus = CommandTimedOut
 	default:
 		return agentcontrol.ResultPersistence{}, ErrInvalidCommandPayload

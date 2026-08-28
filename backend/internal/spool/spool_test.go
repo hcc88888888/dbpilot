@@ -17,7 +17,7 @@ import (
 
 func openStore(t *testing.T, limits spool.Limits) *spool.Store {
 	t.Helper()
-	store, err := spool.Open(t.TempDir(), limits)
+	store, err := spool.Open(secureSpoolRoot(t), limits)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,12 +25,20 @@ func openStore(t *testing.T, limits spool.Limits) *spool.Store {
 	return store
 }
 
+func secureSpoolRoot(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "spool")
+	require.NoError(t, os.Mkdir(root, 0o700))
+	require.NoError(t, os.Chmod(root, 0o700))
+	return root
+}
+
 func batch(id string, size int, priority int) spool.Batch {
 	return spool.Batch{ID: id, SourceID: "source", CreatedAt: time.Unix(1, 0).Add(time.Duration(len(id)) * time.Second), Priority: priority, Payload: bytes.Repeat([]byte("x"), size)}
 }
 
 func TestPolicyAndCheckpointPersistAcrossReopen(t *testing.T) {
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	limits := spool.Limits{MaxBytes: 8192, SegmentBytes: 1024}
 	store, err := spool.Open(root, limits)
 	if err != nil {
@@ -93,7 +101,7 @@ func TestAppendPendingOrderDuplicateAndAck(t *testing.T) {
 
 func TestSegmentRotationAndRecoveryTruncatesIncompleteFinalRecord(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	limits := spool.Limits{MaxBytes: 8192, SegmentBytes: 100}
 	store, err := spool.Open(root, limits)
 	if err != nil {
@@ -135,7 +143,7 @@ func TestSegmentRotationAndRecoveryTruncatesIncompleteFinalRecord(t *testing.T) 
 
 func TestCorruptSegmentIsQuarantined(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	limits := spool.Limits{MaxBytes: 8192, SegmentBytes: 100}
 	store, err := spool.Open(root, limits)
 	if err != nil {
@@ -243,7 +251,7 @@ func TestOpenRejectsLinuxSymlinkAndInsecureRoots(t *testing.T) {
 
 func TestAuditIOFailureRaisesHealthFinding(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	store, err := spool.Open(root, spool.Limits{MaxBytes: 4096, SegmentBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +295,7 @@ func TestMetricEvictionUsesPriorityThenAge(t *testing.T) {
 
 func TestSegmentBytesKeepsActiveSegmentUntilRotation(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	store, err := spool.Open(root, spool.Limits{MaxBytes: 8192, SegmentBytes: 600})
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +332,7 @@ func TestPendingRejectsClosedStore(t *testing.T) {
 
 func TestCloseAuditSealFailureRaisesHealthFinding(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	store, err := spool.Open(root, spool.Limits{MaxBytes: 4096, SegmentBytes: 4096})
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +371,7 @@ func TestRecordHealthFindingExposesExporterFailure(t *testing.T) {
 
 func TestOpenRestoresReplacementBackupAfterInterruptedCompaction(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
+	root := secureSpoolRoot(t)
 	limits := spool.Limits{MaxBytes: 4096, SegmentBytes: 100}
 	store, err := spool.Open(root, limits)
 	if err != nil {

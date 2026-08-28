@@ -8,20 +8,33 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/agent/commandjournal"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
@@ -32,8 +45,341 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestTwoPhaseCommandLifecycle(t *testing.T) {
+	if os.Getenv("DBPILOT_CONTRACT_E2E") != "1" {
+		t.Skip("set DBPILOT_CONTRACT_E2E=1 to run the two-phase command lifecycle")
+	}
+	dsn := os.Getenv("DBPILOT_CONTRACT_POSTGRES_DSN")
+	require.NotEmpty(t, dsn, "DBPILOT_CONTRACT_POSTGRES_DSN is required")
+
+	t.Run("cancel after Prepare wins before Start and executor remains untouched", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		environment := newContractCommandEnvironment(t, ctx, dsn)
+		registry := agentcontrol.NewRegistry(16)
+		lifecycle := environment.newLifecycle(t, registry)
+		preparedGate := newBlockingPreparedObserver(lifecycle)
+		_, streamOpener := startCommandControlServer(t, registry, preparedGate)
+		executor := &countingCommandExecutor{}
+		journal := startContractAgent(t, ctx, streamOpener, environment.publicKey, executor, 20*time.Millisecond)
+		require.Eventually(t, func() bool { _, connected := registry.Session("agent-a"); return connected }, 3*time.Second, 10*time.Millisecond)
+
+		scope := platformscope.Scope{TenantID: "tenant-prepare-cancel", ProjectID: "project-prepare-cancel"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-prepare-cancel", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-prepare-cancel", "agent-a", created)
+		require.NoError(t, environment.repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		preparedGate.wait(t)
+
+		current, err := environment.repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		_, err = environment.repository.RequestCancel(ctx, scope, value.ID, "operator", current.Version, time.Now().UTC())
+		require.NoError(t, err)
+		preparedGate.release()
+		preparedGate.waitDone(t)
+		require.Eventually(t, func() bool {
+			_, dispatchErr := lifecycle.DispatchPending(ctx, time.Now().UTC())
+			if dispatchErr != nil {
+				return false
+			}
+			cancelled, getErr := environment.repository.Get(ctx, scope, value.ID)
+			return getErr == nil && cancelled.Status == job.StatusCancelled
+		}, 3*time.Second, 20*time.Millisecond)
+		require.Eventually(t, func() bool {
+			entry, getErr := journal.Get(ctx, message.ID)
+			return getErr == nil && entry.State == commandjournal.StateCancelled
+		}, 3*time.Second, 20*time.Millisecond)
+		require.Zero(t, executor.calls.Load())
+		var tokenCount int
+		require.NoError(t, environment.database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE id = $1 AND execution_token_hash IS NOT NULL", message.ID).Scan(&tokenCount))
+		require.Zero(t, tokenCount, "Cancel-winning transaction must prevent creation of a Start fence")
+	})
+
+	t.Run("Start-winning cancellation preserves the executor result", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		environment := newContractCommandEnvironment(t, ctx, dsn)
+		registry := agentcontrol.NewRegistry(16)
+		lifecycle := environment.newLifecycle(t, registry)
+		_, streamOpener := startCommandControlServer(t, registry, lifecycle)
+		executor := newStartWinningExecutor()
+		t.Cleanup(executor.finishSuccessfully)
+		journal := startContractAgent(t, ctx, streamOpener, environment.publicKey, executor, 20*time.Millisecond)
+		require.Eventually(t, func() bool { _, connected := registry.Session("agent-a"); return connected }, 3*time.Second, 10*time.Millisecond)
+
+		scope := platformscope.Scope{TenantID: "tenant-start-cancel", ProjectID: "project-start-cancel"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-start-cancel", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-start-cancel", "agent-a", created)
+		require.NoError(t, environment.repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		executor.waitStarted(t)
+		current, err := environment.repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		_, err = environment.repository.RequestCancel(ctx, scope, value.ID, "operator", current.Version, time.Now().UTC())
+		require.NoError(t, err)
+		require.Eventually(t, func() bool {
+			_, dispatchErr := lifecycle.DispatchPending(ctx, time.Now().UTC())
+			return dispatchErr == nil && executor.wasCancelled()
+		}, 3*time.Second, 20*time.Millisecond)
+		executor.finishSuccessfully()
+		require.Eventually(t, func() bool {
+			completed, getErr := environment.repository.Get(ctx, scope, value.ID)
+			return getErr == nil && completed.Status == job.StatusSucceeded
+		}, 3*time.Second, 20*time.Millisecond)
+		require.Equal(t, int32(1), executor.calls.Load(), "an exact Start replay must not invoke the executor twice")
+		require.Eventually(t, func() bool {
+			pending, pendingErr := journal.PendingResults(ctx)
+			return pendingErr == nil && len(pending) == 0
+		}, 3*time.Second, 20*time.Millisecond)
+		var phase string
+		require.NoError(t, environment.database.QueryRowContext(ctx, "SELECT command_phase FROM command_outbox WHERE id = $1", message.ID).Scan(&phase))
+		require.Equal(t, string(job.CommandPhaseSucceeded), phase)
+	})
+
+	t.Run("heartbeat invalidates a stale timeout claim", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		environment := newContractCommandEnvironment(t, ctx, dsn)
+		registry := agentcontrol.NewRegistry(16)
+		lifecycle := environment.newLifecycle(t, registry)
+		_, streamOpener := startCommandControlServer(t, registry, lifecycle)
+		executor := newBlockingCommandExecutor()
+		startContractAgent(t, ctx, streamOpener, environment.publicKey, executor, 20*time.Millisecond)
+		require.Eventually(t, func() bool { _, connected := registry.Session("agent-a"); return connected }, 3*time.Second, 10*time.Millisecond)
+
+		scope := platformscope.Scope{TenantID: "tenant-heartbeat-timeout", ProjectID: "project-heartbeat-timeout"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-heartbeat-timeout", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-heartbeat-timeout", "agent-a", created)
+		require.NoError(t, environment.repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		executor.waitStarted(t)
+
+		claimAt := time.Now().UTC().Add(10 * time.Second)
+		claims, err := environment.repository.ClaimExpiredExecution(ctx, 1, claimAt)
+		require.NoError(t, err)
+		require.Len(t, claims, 1)
+		claim := claims[0]
+		require.Equal(t, message.ID, claim.CommandID)
+		require.Eventually(t, func() bool {
+			var claimCleared bool
+			var revision uint64
+			queryErr := environment.database.QueryRowContext(ctx, "SELECT recovery_claim_token IS NULL, recovery_revision FROM command_outbox WHERE id = $1", message.ID).Scan(&claimCleared, &revision)
+			return queryErr == nil && claimCleared && revision > claim.ClaimedRecoveryRevision
+		}, 3*time.Second, 20*time.Millisecond)
+		err = environment.repository.FinalizeExpiredExecution(ctx, claim, claimAt.Add(time.Millisecond))
+		require.ErrorIs(t, err, job.ErrConflict)
+		current, err := environment.repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.NotEqual(t, job.StatusTimedOut, current.Status)
+		require.NotEqual(t, job.TargetTimedOut, current.TargetResults[0].Status)
+	})
+
+	t.Run("control-plane crash before ResultAck replays the durable result", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		environment := newContractCommandEnvironment(t, ctx, dsn)
+		firstRegistry := agentcontrol.NewRegistry(16)
+		firstLifecycle := environment.newLifecycle(t, firstRegistry)
+		crashObserver := newPersistBeforeAckObserver(firstLifecycle)
+		stopFirstServer, firstOpener := startCommandControlServer(t, firstRegistry, crashObserver)
+		executor := &countingCommandExecutor{}
+		executors := agent.NewExecutorRegistry()
+		require.NoError(t, executors.Register(agent.CommandKindCollectNow, executor))
+		verifier, err := agent.NewCommandVerifier("agent-a", environment.publicKey, executors.Capabilities())
+		require.NoError(t, err)
+		journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "result-replay.db"))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = journal.Close() })
+
+		firstClient := startContractControlClient(t, ctx, firstOpener, journal, verifier, executors, 20*time.Millisecond)
+		require.Eventually(t, func() bool { _, connected := firstRegistry.Session("agent-a"); return connected }, 3*time.Second, 10*time.Millisecond)
+		scope := platformscope.Scope{TenantID: "tenant-result-replay", ProjectID: "project-result-replay"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-result-replay", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-result-replay", "agent-a", created)
+		require.NoError(t, environment.repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := firstLifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		crashObserver.waitPersisted(t)
+		completed, err := environment.repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.StatusSucceeded, completed.Status)
+		stopFirstServer()
+		firstClient.stop(t)
+		pending, err := journal.PendingResults(ctx)
+		require.NoError(t, err)
+		require.Len(t, pending, 1, "a result without ResultAck must remain durable")
+
+		secondRegistry := agentcontrol.NewRegistry(16)
+		secondLifecycle := environment.newLifecycle(t, secondRegistry)
+		_, secondOpener := startCommandControlServer(t, secondRegistry, secondLifecycle)
+		secondClient := startContractControlClient(t, ctx, secondOpener, journal, verifier, executors, 20*time.Millisecond)
+		defer secondClient.stop(t)
+		require.Eventually(t, func() bool {
+			remaining, pendingErr := journal.PendingResults(ctx)
+			return pendingErr == nil && len(remaining) == 0
+		}, 3*time.Second, 20*time.Millisecond)
+		require.Equal(t, int32(1), executor.calls.Load())
+		var auditCount int
+		require.NoError(t, environment.database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE command_id = $1 AND action = 'command.result'", message.ID).Scan(&auditCount))
+		require.Equal(t, 1, auditCount, "replayed Result must reuse durable Audit evidence")
+		secondClient.stop(t)
+		require.NoError(t, journal.Close())
+	})
+
+	t.Run("running Agent restart reports interruption without re-execution", func(t *testing.T) {
+		database := contractDatabase(t, dsn)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		require.NoError(t, job.RunMigrations(ctx, database))
+		require.NoError(t, platformdb.RunMigrations(ctx, database))
+
+		publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		signer, err := job.NewEd25519CommandSigner(privateKey)
+		require.NoError(t, err)
+		tokenProtector, err := job.NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x61}, 32))
+		require.NoError(t, err)
+		repository := job.NewPostgresRepository(database)
+		auditService := audit.NewService(audit.NewPostgresStore(database))
+		dispatcher := newCapturedCommandDispatcher()
+		lifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
+			DispatchRepository: repository, Jobs: repository, Agents: dispatcher, Signer: signer,
+			Audit: auditService, ClaimLimit: 8, TokenProtector: tokenProtector,
+		})
+		require.NoError(t, err)
+
+		scope := platformscope.Scope{TenantID: "tenant-restart", ProjectID: "project-restart"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-agent-restart", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-agent-restart", "agent-a", created)
+		require.NoError(t, repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		envelope := dispatcher.nextEnvelope(t)
+		require.Equal(t, message.ID, envelope.GetCommandId())
+		_, err = lifecycle.Prepared(ctx, "agent-a", contractPrepared(t, envelope).GetCommandPrepared())
+		require.NoError(t, err)
+		start := dispatcher.nextStart(t)
+
+		journalPath := filepath.Join(t.TempDir(), "command-journal.db")
+		journal, err := commandjournal.Open(journalPath)
+		require.NoError(t, err)
+		prepared, err := journal.Prepare(ctx, envelope, time.Now().UTC())
+		require.NoError(t, err)
+		require.True(t, prepared)
+		require.NoError(t, journal.AuthorizeStart(ctx, start.GetCommandId(), start.GetExecutionToken(), start.GetLeaseRevision(), start.GetStartDeadline().AsTime()))
+		require.NoError(t, journal.Close())
+		journal, err = commandjournal.Open(journalPath)
+		require.NoError(t, err)
+
+		registry := agentcontrol.NewRegistry(16)
+		stopServer, streamOpener := startCommandControlServer(t, registry, lifecycle)
+		defer stopServer()
+		executor := &countingCommandExecutor{}
+		executors := agent.NewExecutorRegistry()
+		require.NoError(t, executors.Register(agent.CommandKindCollectNow, executor))
+		verifier, err := agent.NewCommandVerifier("agent-a", publicKey, executors.Capabilities())
+		require.NoError(t, err)
+		client, err := agent.NewControlClient(agent.ControlClientConfig{
+			AgentID: "agent-a", AgentVersion: "e2e", StreamOpener: streamOpener, Journal: journal,
+			Verifier: verifier, Executors: executors, HeartbeatInterval: 20 * time.Millisecond, ReconnectBackoff: 20 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		clientContext, stopClient := context.WithCancel(ctx)
+		clientDone := make(chan error, 1)
+		go func() { clientDone <- client.Run(clientContext) }()
+		defer func() {
+			stopClient()
+			require.NoError(t, <-clientDone)
+			require.NoError(t, journal.Close())
+		}()
+
+		require.Eventually(t, func() bool {
+			current, getErr := repository.Get(ctx, scope, value.ID)
+			return getErr == nil && current.Status == job.StatusTimedOut
+		}, 3*time.Second, 20*time.Millisecond)
+		current, err := repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.TargetTimedOut, current.TargetResults[0].Status)
+		require.Zero(t, executor.calls.Load(), "an interrupted running command must never execute again after Agent restart")
+		pending, err := journal.PendingResults(ctx)
+		require.NoError(t, err)
+		require.Empty(t, pending, "the interrupted result remains pending until its durable ResultAck arrives")
+		var auditCount int
+		require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE command_id = $1 AND action = 'command.result'", message.ID).Scan(&auditCount))
+		require.Equal(t, 1, auditCount)
+	})
+
+	t.Run("HTTP cancel retry reconciles Audit without repeating the transaction", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		database := contractDatabase(t, dsn)
+		require.NoError(t, job.RunMigrations(ctx, database))
+		require.NoError(t, platformdb.RunMigrations(ctx, database))
+		repository := job.NewPostgresRepository(database)
+		scope := platformscope.Scope{TenantID: "tenant-http-reconcile", ProjectID: "project-http-reconcile"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-http-reconcile", scope, "agent-a", created)
+		require.NoError(t, repository.CreateWithOutbox(ctx, value, nil))
+		realAudit := audit.NewService(audit.NewPostgresStore(database))
+		failingAudit := &failOnceContractAudit{inner: realAudit, fail: true}
+		services := controlplane.Services{
+			Jobs: repository, Audit: failingAudit,
+			Idempotency: idempotency.NewService(idempotency.NewPostgresStore(database)),
+		}
+		resolver := contractPrincipalResolver{principal: controlplane.Principal{
+			Subject: "operator-http", Grants: map[string]map[string]struct{}{scope.Key(): {openapi.PermissionCancelJob: {}}},
+		}}
+		handler := controlplane.NewHTTPHandler(services, resolver)
+		newRequest := func(requestID, traceID string) *http.Request {
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/"+scope.TenantID+"/projects/"+scope.ProjectID+"/jobs/"+value.ID+"/actions/cancel", nil)
+			request.Header.Set("If-Match", `"1"`)
+			request.Header.Set("Idempotency-Key", "cancel-http-reconcile")
+			request.Header.Set("X-Request-ID", requestID)
+			request.Header.Set("traceparent", "00-"+traceID+"-2222222222222222-01")
+			return request
+		}
+		first := httptest.NewRecorder()
+		handler.ServeHTTP(first, newRequest("request-http-original", "11111111111111111111111111111111"))
+		require.Equal(t, http.StatusInternalServerError, first.Code, first.Body.String())
+		afterFirst, err := repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.StatusCancelling, afterFirst.Status)
+		require.Equal(t, int64(2), afterFirst.Version)
+
+		retry := httptest.NewRecorder()
+		handler.ServeHTTP(retry, newRequest("request-http-retry", "33333333333333333333333333333333"))
+		require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+		afterRetry, err := repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, int64(2), afterRetry.Version, "reconciliation must not request cancellation twice")
+		var auditCount int
+		var auditRequestID, auditTraceID string
+		require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*), min(request_id), min(trace_id) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND action = 'job.cancel_requested'", scope.TenantID, scope.ProjectID).Scan(&auditCount, &auditRequestID, &auditTraceID))
+		require.Equal(t, 1, auditCount)
+		require.Equal(t, "request-http-original", auditRequestID)
+		require.Equal(t, "11111111111111111111111111111111", auditTraceID)
+		var state string
+		require.NoError(t, database.QueryRowContext(ctx, "SELECT state FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND idempotency_key = $3", scope.TenantID, scope.ProjectID, "cancel-http-reconcile").Scan(&state))
+		require.Equal(t, string(idempotency.StateCompleted), state)
+	})
+}
 
 // A missing durable command lookup, a scope-blind publication update, an
 // unsigned command, or a result path that inlines large output makes this test
@@ -406,6 +752,431 @@ func contractOutbox(t *testing.T, value job.Job, commandID, agentID string, at t
 	})
 	require.NoError(t, err)
 	return job.OutboxMessage{ID: commandID, Scope: value.Scope, JobID: value.ID, TargetID: agentID, Type: "agent.command", Payload: payload, AvailableAt: at, CreatedAt: at}
+}
+
+func contractJob(id string, scope platformscope.Scope, agentID string, created time.Time) job.Job {
+	return job.Job{
+		ID: id, Type: "contract.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
+		TargetResourceIDs: []string{agentID}, InitiatedBy: "contract-test",
+		SourceResource: job.ResourceReference{ResourceType: "contract_test", ResourceID: id},
+		IdempotencyKey: id, Version: 1, Progress: job.Progress{TotalTargets: 1},
+		Artifacts: []job.ArtifactReference{}, CreatedAt: created, RequestID: "request-" + id, TraceID: "trace-" + id,
+	}
+}
+
+type contractCommandEnvironment struct {
+	database       *sql.DB
+	repository     *job.PostgresRepository
+	audit          *audit.Service
+	publicKey      ed25519.PublicKey
+	signer         job.CommandSigner
+	tokenProtector job.TokenProtector
+}
+
+func newContractCommandEnvironment(t *testing.T, ctx context.Context, dsn string) *contractCommandEnvironment {
+	t.Helper()
+	database := contractDatabase(t, dsn)
+	require.NoError(t, job.RunMigrations(ctx, database))
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := job.NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	tokenProtector, err := job.NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x63}, 32))
+	require.NoError(t, err)
+	return &contractCommandEnvironment{
+		database: database, repository: job.NewPostgresRepository(database), audit: audit.NewService(audit.NewPostgresStore(database)),
+		publicKey: publicKey, signer: signer, tokenProtector: tokenProtector,
+	}
+}
+
+func (environment *contractCommandEnvironment) newLifecycle(t *testing.T, agents agentcontrol.Dispatcher) *job.CommandLifecycle {
+	t.Helper()
+	lifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
+		DispatchRepository: environment.repository, Jobs: environment.repository, Agents: agents,
+		Signer: environment.signer, Audit: environment.audit, ClaimLimit: 8, TokenProtector: environment.tokenProtector,
+	})
+	require.NoError(t, err)
+	return lifecycle
+}
+
+type blockingPreparedObserver struct {
+	*job.CommandLifecycle
+	received    chan struct{}
+	proceed     chan struct{}
+	done        chan struct{}
+	receivedOne sync.Once
+	releaseOne  sync.Once
+}
+
+func newBlockingPreparedObserver(lifecycle *job.CommandLifecycle) *blockingPreparedObserver {
+	return &blockingPreparedObserver{CommandLifecycle: lifecycle, received: make(chan struct{}), proceed: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (observer *blockingPreparedObserver) Prepared(ctx context.Context, agentID string, prepared *agentv1.CommandPrepared) (*agentv1.CommandStart, error) {
+	observer.receivedOne.Do(func() { close(observer.received) })
+	select {
+	case <-observer.proceed:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	start, err := observer.CommandLifecycle.Prepared(ctx, agentID, prepared)
+	close(observer.done)
+	return start, err
+}
+
+func (observer *blockingPreparedObserver) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case <-observer.received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for durable Agent Prepare")
+	}
+}
+
+func (observer *blockingPreparedObserver) release() {
+	observer.releaseOne.Do(func() { close(observer.proceed) })
+}
+
+func (observer *blockingPreparedObserver) waitDone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-observer.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for prepared transaction outcome")
+	}
+}
+
+type startWinningExecutor struct {
+	calls     atomic.Int32
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+	startOne  sync.Once
+	cancelOne sync.Once
+	finishOne sync.Once
+}
+
+func newStartWinningExecutor() *startWinningExecutor {
+	return &startWinningExecutor{started: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (executor *startWinningExecutor) Execute(ctx context.Context, _ *agentv1.CommandEnvelope, _ agent.ProgressReporter) (*agentv1.CommandResult, error) {
+	executor.calls.Add(1)
+	executor.startOne.Do(func() { close(executor.started) })
+	<-ctx.Done()
+	executor.cancelOne.Do(func() { close(executor.cancelled) })
+	<-executor.release
+	return &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "committed before cancellation"}, nil
+}
+
+func (executor *startWinningExecutor) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-executor.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for executor Start")
+	}
+}
+
+func (executor *startWinningExecutor) wasCancelled() bool {
+	select {
+	case <-executor.cancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (executor *startWinningExecutor) finishSuccessfully() {
+	executor.finishOne.Do(func() { close(executor.release) })
+}
+
+type blockingCommandExecutor struct {
+	calls    atomic.Int32
+	started  chan struct{}
+	startOne sync.Once
+}
+
+func newBlockingCommandExecutor() *blockingCommandExecutor {
+	return &blockingCommandExecutor{started: make(chan struct{})}
+}
+
+func (executor *blockingCommandExecutor) Execute(ctx context.Context, _ *agentv1.CommandEnvelope, _ agent.ProgressReporter) (*agentv1.CommandResult, error) {
+	executor.calls.Add(1)
+	executor.startOne.Do(func() { close(executor.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (executor *blockingCommandExecutor) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-executor.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for executor Start")
+	}
+}
+
+type contractControlClientHandle struct {
+	cancel context.CancelFunc
+	done   chan error
+	once   sync.Once
+}
+
+func startContractControlClient(t *testing.T, parent context.Context, opener agent.StreamOpener, journal agent.CommandJournal, verifier *agent.CommandVerifier, executors *agent.ExecutorRegistry, heartbeat time.Duration) *contractControlClientHandle {
+	t.Helper()
+	client, err := agent.NewControlClient(agent.ControlClientConfig{
+		AgentID: "agent-a", AgentVersion: "e2e", StreamOpener: opener, Journal: journal,
+		Verifier: verifier, Executors: executors, HeartbeatInterval: heartbeat, ReconnectBackoff: 20 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(parent)
+	handle := &contractControlClientHandle{cancel: cancel, done: make(chan error, 1)}
+	go func() { handle.done <- client.Run(ctx) }()
+	return handle
+}
+
+func (handle *contractControlClientHandle) stop(t *testing.T) {
+	t.Helper()
+	handle.once.Do(func() {
+		handle.cancel()
+		require.NoError(t, <-handle.done)
+	})
+}
+
+func startContractAgent(t *testing.T, parent context.Context, opener agent.StreamOpener, publicKey ed25519.PublicKey, executor agent.CommandExecutor, heartbeat time.Duration) *commandjournal.BoltJournal {
+	t.Helper()
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "live-command-journal.db"))
+	require.NoError(t, err)
+	executors := agent.NewExecutorRegistry()
+	require.NoError(t, executors.Register(agent.CommandKindCollectNow, executor))
+	verifier, err := agent.NewCommandVerifier("agent-a", publicKey, executors.Capabilities())
+	require.NoError(t, err)
+	handle := startContractControlClient(t, parent, opener, journal, verifier, executors, heartbeat)
+	t.Cleanup(func() {
+		handle.stop(t)
+		require.NoError(t, journal.Close())
+	})
+	return journal
+}
+
+type persistBeforeAckObserver struct {
+	*job.CommandLifecycle
+	persisted chan struct{}
+	once      sync.Once
+}
+
+func newPersistBeforeAckObserver(lifecycle *job.CommandLifecycle) *persistBeforeAckObserver {
+	return &persistBeforeAckObserver{CommandLifecycle: lifecycle, persisted: make(chan struct{})}
+}
+
+func (observer *persistBeforeAckObserver) Result(ctx context.Context, agentID string, result *agentv1.CommandResult) (agentcontrol.ResultPersistence, error) {
+	outcome, err := observer.CommandLifecycle.Result(ctx, agentID, result)
+	if err != nil {
+		return outcome, err
+	}
+	observer.once.Do(func() { close(observer.persisted) })
+	<-ctx.Done()
+	return outcome, ctx.Err()
+}
+
+func (observer *persistBeforeAckObserver) waitPersisted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-observer.persisted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for durable result and Audit before simulated crash")
+	}
+}
+
+type failOnceContractAudit struct {
+	inner *audit.Service
+	mu    sync.Mutex
+	fail  bool
+}
+
+func (service *failOnceContractAudit) RecordOnce(ctx context.Context, event audit.Event) (audit.Event, error) {
+	service.mu.Lock()
+	fail := service.fail
+	service.fail = false
+	service.mu.Unlock()
+	if fail {
+		return audit.Event{}, errors.New("injected Audit outage")
+	}
+	return service.inner.RecordOnce(ctx, event)
+}
+
+func (service *failOnceContractAudit) List(ctx context.Context, scope platformscope.Scope, query audit.ListQuery) (audit.Page, error) {
+	return service.inner.List(ctx, scope, query)
+}
+
+type contractPrincipalResolver struct{ principal controlplane.Principal }
+
+func (resolver contractPrincipalResolver) ResolvePrincipal(*http.Request) (controlplane.Principal, error) {
+	return resolver.principal, nil
+}
+
+type capturedCommandDispatcher struct {
+	envelopes chan *agentv1.CommandEnvelope
+	starts    chan *agentv1.CommandStart
+}
+
+func newCapturedCommandDispatcher() *capturedCommandDispatcher {
+	return &capturedCommandDispatcher{envelopes: make(chan *agentv1.CommandEnvelope, 16), starts: make(chan *agentv1.CommandStart, 16)}
+}
+
+func (dispatcher *capturedCommandDispatcher) Dispatch(_ context.Context, _ string, envelope *agentv1.CommandEnvelope) error {
+	dispatcher.envelopes <- proto.Clone(envelope).(*agentv1.CommandEnvelope)
+	return nil
+}
+
+func (dispatcher *capturedCommandDispatcher) Start(_ context.Context, _ string, start *agentv1.CommandStart) error {
+	dispatcher.starts <- proto.Clone(start).(*agentv1.CommandStart)
+	return nil
+}
+
+func (dispatcher *capturedCommandDispatcher) ReplayStart(ctx context.Context, agentID string, start *agentv1.CommandStart) error {
+	return dispatcher.Start(ctx, agentID, start)
+}
+
+func (*capturedCommandDispatcher) Cancel(context.Context, string, string) error { return nil }
+func (*capturedCommandDispatcher) CancelPrepared(context.Context, string, string, string) error {
+	return nil
+}
+func (*capturedCommandDispatcher) CancelExecution(context.Context, string, string, []byte, uint64, string) error {
+	return nil
+}
+
+func (dispatcher *capturedCommandDispatcher) nextEnvelope(t *testing.T) *agentv1.CommandEnvelope {
+	t.Helper()
+	select {
+	case envelope := <-dispatcher.envelopes:
+		return envelope
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for captured command envelope")
+		return nil
+	}
+}
+
+func (dispatcher *capturedCommandDispatcher) nextStart(t *testing.T) *agentv1.CommandStart {
+	t.Helper()
+	select {
+	case start := <-dispatcher.starts:
+		return start
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for captured command Start")
+		return nil
+	}
+}
+
+type countingCommandExecutor struct{ calls atomic.Int32 }
+
+func (executor *countingCommandExecutor) Execute(context.Context, *agentv1.CommandEnvelope, agent.ProgressReporter) (*agentv1.CommandResult, error) {
+	executor.calls.Add(1)
+	return &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "executed"}, nil
+}
+
+type e2eGRPCControlStream struct {
+	grpc.BidiStreamingClient[agentv1.AgentMessage, agentv1.ServerMessage]
+	connection *grpc.ClientConn
+}
+
+func (stream *e2eGRPCControlStream) CloseSend() error {
+	streamErr := stream.BidiStreamingClient.CloseSend()
+	connectionErr := stream.connection.Close()
+	if streamErr != nil {
+		return streamErr
+	}
+	return connectionErr
+}
+
+func startCommandControlServer(t *testing.T, registry *agentcontrol.Registry, observer agentcontrol.Observer) (func(), agent.StreamOpener) {
+	t.Helper()
+	serverTLS, clientTLS := commandControlTLS(t)
+	listener := bufconn.Listen(1 << 20)
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	agentv1.RegisterAgentControlServer(server, agentcontrol.NewServer(registry, observer))
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			server.Stop()
+			_ = listener.Close()
+			<-serveDone
+		})
+	}
+	t.Cleanup(stop)
+	opener := func(ctx context.Context) (agent.ControlStream, error) {
+		connection, err := grpc.DialContext(
+			ctx, "bufnet",
+			grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+			grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)), grpc.WithBlock(),
+		)
+		if err != nil {
+			return nil, err
+		}
+		stream, err := agentv1.NewAgentControlClient(connection).Connect(ctx)
+		if err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+		return &e2eGRPCControlStream{BidiStreamingClient: stream, connection: connection}, nil
+	}
+	return stop, opener
+}
+
+func commandControlTLS(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
+	caPublic, caPrivate, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	caTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(101), Subject: pkix.Name{CommonName: "DBPilot command E2E CA"},
+		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), IsCA: true, BasicConstraintsValid: true,
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caPublic, caPrivate)
+	require.NoError(t, err)
+	caCertificate, err := x509.ParseCertificate(caDER)
+	require.NoError(t, err)
+	serverCertificate := commandControlCertificate(t, 102, "bufnet", []string{"bufnet"}, nil, caCertificate, caPrivate)
+	clientCertificate := commandControlCertificate(t, 103, "agent-a", nil, []string{"spiffe://dbpilot.local/agent/agent-a"}, caCertificate, caPrivate)
+	pool := x509.NewCertPool()
+	pool.AddCert(caCertificate)
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate}, ClientAuth: tls.RequireAndVerifyClientCert,
+		ClientCAs: pool, MinVersion: tls.VersionTLS12,
+	}, &tls.Config{
+		Certificates: []tls.Certificate{clientCertificate}, RootCAs: pool, ServerName: "bufnet", MinVersion: tls.VersionTLS12,
+	}
+}
+
+func commandControlCertificate(t *testing.T, serial int64, commonName string, dnsNames, uriStrings []string, ca *x509.Certificate, caKey ed25519.PrivateKey) tls.Certificate {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: commonName}, DNSNames: dnsNames,
+		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+	}
+	for _, raw := range uriStrings {
+		identity, err := url.Parse(raw)
+		require.NoError(t, err)
+		template.URIs = append(template.URIs, identity)
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, template, ca, publicKey, caKey)
+	require.NoError(t, err)
+	privateDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	require.NoError(t, err)
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}),
+	)
+	require.NoError(t, err)
+	return certificate
 }
 
 func contractHello(agentID string) *agentv1.AgentMessage {

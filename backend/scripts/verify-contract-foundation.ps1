@@ -94,7 +94,8 @@ try {
 
     Push-Location $backendRoot
     try {
-        Invoke-Checked $GoBinary @('test', './...')
+		Invoke-Checked $GoBinary @('test', './...', '-count=1')
+		Invoke-Checked $GoBinary @('vet', './...')
     }
     finally {
         Pop-Location
@@ -123,7 +124,7 @@ try {
     $env:DBPILOT_CONTRACT_POSTGRES_DSN = 'postgres://dbpilot_contract:dbpilot_contract@127.0.0.1:55432/dbpilot_contract?sslmode=disable'
     Push-Location $backendRoot
     try {
-        Invoke-Checked $GoBinary @('test', './test/e2e', '-run', 'TestJobCommandLifecycle', '-v', '-count=1')
+		Invoke-Checked $GoBinary @('test', './test/e2e', '-run', 'Test(JobCommandLifecycle|TwoPhaseCommandLifecycle)', '-v', '-count=1')
     }
     finally {
         Pop-Location
@@ -152,12 +153,29 @@ finally {
     if ($hadE2E) { $env:DBPILOT_CONTRACT_E2E = $previousE2E } else { Remove-Item Env:DBPILOT_CONTRACT_E2E -ErrorAction SilentlyContinue }
     if ($hadDSN) { $env:DBPILOT_CONTRACT_POSTGRES_DSN = $previousDSN } else { Remove-Item Env:DBPILOT_CONTRACT_POSTGRES_DSN -ErrorAction SilentlyContinue }
 
+	$cleanupFailures = @()
 	try {
 		Remove-DBPilotOwnedContainer -DockerBinary $DockerBinary -ContainerID $postgresContainerID
+		if (-not [string]::IsNullOrWhiteSpace($postgresContainerID)) {
+			$remaining = @(& $DockerBinary ps -a --no-trunc --filter "id=$postgresContainerID" --format '{{.ID}}')
+			if ($LASTEXITCODE -ne 0) { throw 'Unable to verify foundation container cleanup.' }
+			if ($remaining -contains $postgresContainerID) { throw "Foundation verifier left container '$postgresContainerID' behind." }
+		}
 	}
 	catch {
-		if ($null -eq $primaryFailure) { throw }
-		Write-Error $_ -ErrorAction Continue
+		$cleanupFailures += $_
 	}
-    Remove-SafeTemporaryDirectory
+	try {
+		Remove-SafeTemporaryDirectory
+		if (Test-Path -LiteralPath $temporaryRoot) {
+			throw "Foundation verifier left temporary directory '$temporaryRoot' behind."
+		}
+	}
+	catch {
+		$cleanupFailures += $_
+	}
+	if ($cleanupFailures.Count -gt 0) {
+		if ($null -eq $primaryFailure) { throw $cleanupFailures[0] }
+		foreach ($cleanupFailure in $cleanupFailures) { Write-Error $cleanupFailure -ErrorAction Continue }
+	}
 }

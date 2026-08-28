@@ -115,6 +115,20 @@ powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
   -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' -Architecture amd64
 ```
 
+Agent 命令采用 `Prepare → Start` 两阶段执行。Prepare 只把签名 envelope 同步写入
+Agent journal，不调用 executor；只有控制面在 PostgreSQL 中原子提交 Start fence 后，
+匹配 execution token/revision 的 Start 才能产生副作用。取消事务若先提交，则不生成
+Start 且清除 prepared journal；Start 若先提交，则发送带 fence 的取消，最终状态以 Agent
+真实 Result 为准。heartbeat 与 timeout claim 使用 recovery revision CAS，旧 timeout worker
+不能覆盖续租或终态结果。
+
+Agent 会保留 terminal Result，直到控制面持久化 Job、Command、Artifact 引用及 Audit 后
+返回匹配 digest 的 `ResultAck`；控制面在 Ack 前崩溃时，Agent 重连会重投。Agent 在
+running 状态崩溃后不会自动重执行，重启证据记为 timed_out 并要求人工核对真实数据库
+副作用。HTTP 写操作在业务副作用已提交而 Audit 失败时，使用持久化响应和稳定 dedupe key
+补写 Audit，不重复执行取消/签名。Artifact capability 只在存储根可安全打开且签名密钥满足
+readiness 要求后启用。
+
 当前 `/api/v1` 允许一次 pre-stable 迁移。工单、SQL 窗口、SQL 审核、慢 SQL、
 审计日志、锁透视、结构对比与报告这八个模块全部切换到生成客户端和 strict
 server handler 后，v1 进入 additive-only 稳定边界。

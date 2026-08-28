@@ -82,9 +82,13 @@ jobs:
       - name: Run frontend and contract tests
         run: node --test
 
-      - name: Run Go tests
+      - name: Run Go tests on Ubuntu
         working-directory: backend
-        run: go test ./...
+        run: go test ./... -count=1
+
+      - name: Vet Go integration wiring
+        working-directory: backend
+        run: go vet ./...
 
       - name: Run live foundation and Linux verification
         shell: pwsh
