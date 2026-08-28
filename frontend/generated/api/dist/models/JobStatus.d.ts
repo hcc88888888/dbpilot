@@ -22,6 +22,7 @@ export declare const JobStatus: {
     readonly Cancelling: "cancelling";
     readonly Cancelled: "cancelled";
     readonly TimedOut: "timed_out";
+    readonly UnknownDefaultOpenApi: "11184809";
 };
 export type JobStatus = typeof JobStatus[keyof typeof JobStatus];
 export declare function instanceOfJobStatus(value: any): boolean;

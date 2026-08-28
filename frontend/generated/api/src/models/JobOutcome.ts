@@ -20,7 +20,8 @@
 export const JobOutcome = {
     Complete: 'complete',
     Partial: 'partial',
-    None: 'none'
+    None: 'none',
+    UnknownDefaultOpenApi: '11184809'
 } as const;
 export type JobOutcome = typeof JobOutcome[keyof typeof JobOutcome];
 

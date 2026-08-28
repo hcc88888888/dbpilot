@@ -134,6 +134,35 @@ func (r *Registry) Session(agentID string) (SessionInfo, bool) {
 	}, true
 }
 
+func (r *Registry) snapshot(agentID string, expected *session) (SessionInfo, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current, exists := r.sessions[agentID]
+	if !exists || current != expected {
+		return SessionInfo{}, false
+	}
+	leasing := make(map[string]time.Time, len(current.leases))
+	for commandID, deadline := range current.leases {
+		leasing[commandID] = deadline
+	}
+	return SessionInfo{AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing}, true
+}
+
+func (r *Registry) enqueue(agentID string, message *agentv1.ServerMessage) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current, exists := r.sessions[agentID]
+	if !exists {
+		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
+	}
+	select {
+	case current.send <- message:
+		return nil
+	default:
+		return &dispatchError{err: ErrSessionQueueFull, retryable: true}
+	}
+}
+
 func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agentv1.CommandEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -3,7 +3,9 @@ package commandjournal
 import (
 	"context"
 	"crypto/sha256"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -13,6 +15,21 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestOpenRehardensExistingJournalPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose POSIX read permission bits")
+	}
+	path := filepath.Join(t.TempDir(), "commands.db")
+	require.NoError(t, os.WriteFile(path, nil, 0o666))
+	require.NoError(t, os.Chmod(path, 0o666))
+	journal, err := Open(path)
+	require.NoError(t, err)
+	require.NoError(t, journal.Close())
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
 
 func TestJournalAcceptDeduplicatesCommandIDDurably(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "commands.db")

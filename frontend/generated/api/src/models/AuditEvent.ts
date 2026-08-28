@@ -72,6 +72,12 @@ export interface AuditEvent {
     actor: AuditActor;
     /**
      *
+     * @type {string}
+     * @memberof AuditEvent
+     */
+    result: string;
+    /**
+     *
      * @type {ResourceReference}
      * @memberof AuditEvent
      */
@@ -82,6 +88,12 @@ export interface AuditEvent {
      * @memberof AuditEvent
      */
     jobId?: string;
+    /**
+     * Opaque Agent command identifier.
+     * @type {string}
+     * @memberof AuditEvent
+     */
+    commandId?: string;
     /**
      * Request correlation identifier.
      * @type {string}
@@ -112,6 +124,7 @@ export function instanceOfAuditEvent(value: object): value is AuditEvent {
     if (!('tenantId' in value) || value['tenantId'] === undefined) return false;
     if (!('projectId' in value) || value['projectId'] === undefined) return false;
     if (!('actor' in value) || value['actor'] === undefined) return false;
+    if (!('result' in value) || value['result'] === undefined) return false;
     if (!('requestId' in value) || value['requestId'] === undefined) return false;
     return true;
 }
@@ -132,8 +145,10 @@ export function AuditEventFromJSONTyped(json: any, ignoreDiscriminator: boolean)
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
         'actor': AuditActorFromJSON(json['actor']),
+        'result': json['result'],
         'sourceResource': json['source_resource'] == null ? undefined : ResourceReferenceFromJSON(json['source_resource']),
         'jobId': json['job_id'] == null ? undefined : json['job_id'],
+        'commandId': json['command_id'] == null ? undefined : json['command_id'],
         'requestId': json['request_id'],
         'traceId': json['trace_id'] == null ? undefined : json['trace_id'],
         'detail': json['detail'] == null ? undefined : json['detail'],
@@ -157,8 +172,10 @@ export function AuditEventToJSONTyped(value?: AuditEvent | null, ignoreDiscrimin
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],
         'actor': AuditActorToJSON(value['actor']),
+        'result': value['result'],
         'source_resource': ResourceReferenceToJSON(value['sourceResource']),
         'job_id': value['jobId'],
+        'command_id': value['commandId'],
         'request_id': value['requestId'],
         'trace_id': value['traceId'],
         'detail': value['detail'],

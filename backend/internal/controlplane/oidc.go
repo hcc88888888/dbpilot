@@ -70,7 +70,7 @@ func principalFromClaims(claims OIDCClaims) (Principal, error) {
 	principal := Principal{
 		Subject:       claims.Subject,
 		PlatformAdmin: claims.PlatformAdmin,
-		Projects:      make(map[string]struct{}, len(claims.Grants)),
+		Projects:      make(map[string]struct{}),
 		Grants:        make(map[string]map[string]struct{}, len(claims.Grants)),
 	}
 	for _, claim := range claims.Grants {
@@ -92,7 +92,6 @@ func principalFromClaims(claims OIDCClaims) (Principal, error) {
 			}
 			permissions[permission] = struct{}{}
 		}
-		principal.Projects[key] = struct{}{}
 		principal.Grants[key] = permissions
 	}
 	return principal, nil

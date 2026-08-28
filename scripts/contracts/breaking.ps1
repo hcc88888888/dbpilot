@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $bufConfig = Join-Path $repoRoot 'buf.yaml'
-$agentContractPath = 'contracts/protobuf/dbpilot/agent/v1/command.proto'
+$agentContractPath = 'contracts/protobuf/dbpilot'
 $baselineRoot = Join-Path ([IO.Path]::GetTempPath()) ('dbpilot-breaking-' + [guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $baselineRoot 'baseline.tar'
 
@@ -48,7 +48,7 @@ try {
     -v "${repoRoot}:/workspace:ro" `
     -v "${baselineRoot}:/baseline:ro" `
     -w /workspace `
-    bufbuild/buf:1.57.2 breaking /workspace --path $agentContractPath --against /baseline
+    bufbuild/buf:1.57.2 breaking /workspace --against /baseline
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }

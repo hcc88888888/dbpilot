@@ -38,6 +38,7 @@ message ServerMessage {
     CommandEnvelope command = 22;
     CommandCancellation command_cancellation = 23;
     FlowControlInstruction flow_control_instruction = 24;
+    CommandResultAcknowledgement command_result_acknowledgement = 25;
   }
 }
 
@@ -161,6 +162,14 @@ message CommandResult {
   string summary = 3;
   repeated ArtifactReference artifacts = 4;
   string error_code = 5;
+}
+
+// Sent only after the control plane durably applies the terminal result and
+// its idempotent audit evidence. Agents retain results until persisted=true.
+message CommandResultAcknowledgement {
+  string command_id = 1;
+  bool persisted = 2;
+  string reason_code = 3;
 }
 
 enum CommandResultState {

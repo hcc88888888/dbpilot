@@ -23,7 +23,8 @@ export const JobStatus = {
     Failed: 'failed',
     Cancelling: 'cancelling',
     Cancelled: 'cancelled',
-    TimedOut: 'timed_out'
+    TimedOut: 'timed_out',
+    UnknownDefaultOpenApi: '11184809'
 };
 export function instanceOfJobStatus(value) {
     for (const key in JobStatus) {

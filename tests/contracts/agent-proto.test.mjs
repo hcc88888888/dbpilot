@@ -9,7 +9,8 @@ test('Agent v1 exposes typed commands and forbids arbitrary shell', async () => 
   for (const required of ['service AgentControl',
     'rpc Connect(stream AgentMessage) returns (stream ServerMessage)',
     'oneof command', 'CollectNow', 'InspectInstance', 'ExecuteSQL',
-    'ExecuteRegisteredProcess', 'CollectDiagnostic', 'service TelemetryIngest']) {
+    'ExecuteRegisteredProcess', 'CollectDiagnostic', 'CommandResultAcknowledgement',
+    'command_result_acknowledgement = 25', 'service TelemetryIngest']) {
     assert.match(files, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.doesNotMatch(files, /shell_command/);

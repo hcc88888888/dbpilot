@@ -127,6 +127,11 @@ test('bundled contract structurally defines the common platform contract', async
   assertUtcTimestampReference(Artifact.properties.expires_at, true);
   assertUtcTimestampReference(DownloadDescriptor.properties.expires_at);
   assertUtcTimestampReference(AuditEvent.properties.occurred_at);
+	assert.ok(AuditEvent.required.includes('result'));
+	assert.equal(AuditEvent.properties.result.minLength, 1);
+	assert.deepEqual(AuditEvent.properties.command_id, { $ref: '#/components/schemas/CommandId' });
+	assert.equal(document.paths['/audit-events'].get.parameters.find((parameter) => parameter.name === 'limit').schema.maximum, 100);
+	assert.equal(document.components.schemas.ArtifactId.pattern, '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$');
 
   const cancel = document.paths['/jobs/{job_id}/actions/cancel'].post;
   for (const header of ['Idempotency-Key', 'If-Match']) {

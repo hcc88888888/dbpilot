@@ -28,6 +28,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/idempotency"
@@ -85,6 +86,11 @@ type CommandSettings struct {
 	SigningPrivateKeyRef string `yaml:"signing_private_key_ref"`
 }
 
+type ArtifactSettings struct {
+	StorageRoot   string `yaml:"storage_root"`
+	SigningKeyRef string `yaml:"signing_key_ref"`
+}
+
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
 }
@@ -116,20 +122,24 @@ type Config struct {
 	EvaluationEvery  time.Duration              `yaml:"evaluation_every,omitempty"`
 	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
 	Command          CommandSettings            `yaml:"command"`
+	Artifact         ArtifactSettings           `yaml:"artifact"`
 
-	HTTPServerTLS     *tls.Config                                `yaml:"-"`
-	GRPCServerTLS     *tls.Config                                `yaml:"-"`
-	Database          *sql.DB                                    `yaml:"-"`
-	Ping              func(context.Context) error                `yaml:"-"`
-	Migrate           func(context.Context) error                `yaml:"-"`
-	Listen            func(string, string) (net.Listener, error) `yaml:"-"`
-	PrincipalResolver controlplane.PrincipalResolver             `yaml:"-"`
-	OIDCTokenVerifier controlplane.TokenVerifier                 `yaml:"-"`
-	SecretResolver    alert.SecretResolver                       `yaml:"-"`
-	Channels          []alert.DeliveryChannel                    `yaml:"-"`
-	AgentRegistry     *agentcontrol.Registry                     `yaml:"-"`
-	CommandObserver   agentcontrol.Observer                      `yaml:"-"`
-	CommandSigner     job.CommandSigner                          `yaml:"-"`
+	HTTPServerTLS           *tls.Config                                `yaml:"-"`
+	GRPCServerTLS           *tls.Config                                `yaml:"-"`
+	Database                *sql.DB                                    `yaml:"-"`
+	Ping                    func(context.Context) error                `yaml:"-"`
+	Migrate                 func(context.Context) error                `yaml:"-"`
+	Listen                  func(string, string) (net.Listener, error) `yaml:"-"`
+	PrincipalResolver       controlplane.PrincipalResolver             `yaml:"-"`
+	OIDCTokenVerifier       controlplane.TokenVerifier                 `yaml:"-"`
+	SecretResolver          alert.SecretResolver                       `yaml:"-"`
+	Channels                []alert.DeliveryChannel                    `yaml:"-"`
+	AgentRegistry           *agentcontrol.Registry                     `yaml:"-"`
+	CommandObserver         agentcontrol.Observer                      `yaml:"-"`
+	CommandSigner           job.CommandSigner                          `yaml:"-"`
+	ArtifactDownloadHandler http.Handler                               `yaml:"-"`
+	ArtifactSecretResolver  platformdatabase.SecretResolver            `yaml:"-"`
+	CommandTargetAuthorizer commandvalidation.TargetAuthorizer         `yaml:"-"`
 }
 
 type Server struct {
@@ -320,22 +330,44 @@ func NewServer(config Config) (*Server, error) {
 	}
 	ready := &atomic.Bool{}
 	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
-	jobRepository := job.NewPostgresRepository(database)
+	jobRepository := job.NewPostgresRepositoryWithTargetAuthorizer(database, config.CommandTargetAuthorizer)
 	auditService := audit.NewService(audit.NewPostgresStore(database))
 	idempotencyService := idempotency.NewService(idempotency.NewPostgresStore(database))
-	artifactSigner, err := artifact.NewHMACDownloadSigner(strings.TrimRight(config.EventURLBase, "/")+"/api/v1/artifact-downloads", "secret://controlplane/artifact-download", platformdatabase.EnvironmentSecretResolver{})
+	artifactSecrets := config.ArtifactSecretResolver
+	if artifactSecrets == nil {
+		artifactSecrets = platformdatabase.EnvironmentSecretResolver{}
+	}
+	artifactSigner, err := artifact.NewHMACDownloadSigner(strings.TrimRight(config.EventURLBase, "/")+"/api/v1/artifact-downloads", config.Artifact.SigningKeyRef, artifactSecrets)
 	if err != nil {
 		if ownsDatabase {
 			_ = database.Close()
 		}
 		return nil, fmt.Errorf("configure artifact downloads: %w", err)
 	}
+	artifactService := artifact.NewService(artifact.NewPostgresStore(database), artifactSigner)
+	artifactContent := config.ArtifactDownloadHandler
+	if artifactContent == nil {
+		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, artifact.NewLocalBlobStore(config.Artifact.StorageRoot))
+		if err != nil {
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("configure artifact content route: %w", err)
+		}
+	}
+	agentRegistry := config.AgentRegistry
+	if agentRegistry == nil {
+		agentRegistry = agentcontrol.NewRegistry(64)
+	}
 	services := controlplane.Services{
 		Repository: repository, Evaluator: evaluator,
 		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
-		Jobs: jobRepository, Artifacts: artifact.NewService(artifact.NewPostgresStore(database), artifactSigner), Audit: auditService,
-		Capabilities: capability.NewService(nil),
-		Idempotency:  idempotencyService,
+		Jobs: jobRepository, Artifacts: artifactService, Audit: auditService, ArtifactContent: artifactContent,
+		Capabilities: capability.NewService(capability.FoundationCatalog()),
+		CapabilityInput: func(_ context.Context, scope platformscope.Scope) capability.Input {
+			return foundationCapabilityInput(scope, config.Agents, agentRegistry)
+		},
+		Idempotency: idempotencyService,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
@@ -346,13 +378,10 @@ func NewServer(config Config) (*Server, error) {
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
-	agentRegistry := config.AgentRegistry
-	if agentRegistry == nil {
-		agentRegistry = agentcontrol.NewRegistry(64)
-	}
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
-		OnError: func(err error) { log.Printf("command lifecycle event failed: %v", err) },
+		TargetAuthorizer: config.CommandTargetAuthorizer,
+		OnError:          func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
 		if ownsDatabase {
@@ -379,8 +408,18 @@ func validateConfig(config Config) error {
 	if len(config.WebhookAllowlist) == 0 {
 		return errors.New("webhook_allowlist must contain at least one hostname")
 	}
+	eventBase, err := url.Parse(config.EventURLBase)
+	if err != nil || eventBase.Scheme != "https" || eventBase.Host == "" || eventBase.User != nil || eventBase.RawQuery != "" || eventBase.Fragment != "" {
+		return errors.New("event_url_base must be a canonical HTTPS URL")
+	}
 	if config.CommandSigner == nil && alert.ValidateSecretReference(config.Command.SigningPrivateKeyRef) != nil {
 		return errors.New("command.signing_private_key_ref must be a Credential Reference")
+	}
+	if strings.TrimSpace(config.Artifact.SigningKeyRef) == "" {
+		return errors.New("artifact.signing_key_ref is required")
+	}
+	if config.ArtifactDownloadHandler == nil && strings.TrimSpace(config.Artifact.StorageRoot) == "" {
+		return errors.New("artifact.storage_root is required")
 	}
 	if err := monitoring.ValidateQueryLimits(config.Monitoring.limits()); err != nil {
 		return errors.New("monitoring limits are invalid")
@@ -753,6 +792,26 @@ func configuredScopes(config Config) []alert.Scope {
 		result = append(result, byKey[key])
 	}
 	return result
+}
+
+func foundationCapabilityInput(scope platformscope.Scope, assignments map[string]AgentAssignment, registry *agentcontrol.Registry) capability.Input {
+	input := capability.Input{DeploymentFlags: capability.FoundationDeploymentFlags(), AgentCapabilities: make(map[string]bool)}
+	if registry == nil {
+		return input
+	}
+	for agentID, assignment := range assignments {
+		if assignment.TenantID != scope.TenantID || assignment.ProjectID != scope.ProjectID {
+			continue
+		}
+		session, ok := registry.Session(agentID)
+		if !ok {
+			continue
+		}
+		for _, advertised := range session.Capabilities {
+			input.AgentCapabilities[advertised] = true
+		}
+	}
+	return input
 }
 
 type exactWebhookAllowlist map[string]struct{}

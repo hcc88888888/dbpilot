@@ -111,6 +111,30 @@ func TestRecordNormalizesEveryJSONSerializableShapeBeforeRedaction(t *testing.T)
 	}
 }
 
+func TestRecordRejectsPrivateKeysDSNsPEMAndCredentialConnectionURIsAtAnyDepth(t *testing.T) {
+	tests := map[string]map[string]any{
+		"private_key key": {"nested": map[string]any{"private_key": "opaque"}},
+		"privatekey key":  {"items": []any{map[string]any{"privatekey": "opaque"}}},
+		"dsn key":         {"config": map[string]any{"dsn": "opaque"}},
+		"PEM block":       {"nested": map[string]any{"value": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}},
+		"MongoDB URI":     {"value": "mongodb://dbuser:dbpass@mongo.example/app"},
+		"MongoDB SRV URI": {"value": "mongodb+srv://dbuser:dbpass@mongo.example/app"},
+		"Neo4j URI":       {"value": "neo4j://graph:secret@graph.example"},
+		"Redis URI":       {"value": "redis://default:secret@cache.example/0"},
+		"generic URI":     {"value": "https://user:secret@database.example/connect"},
+	}
+	for name, detail := range tests {
+		t.Run(name, func(t *testing.T) {
+			value := validEvent()
+			value.Detail = detail
+			_, err := NewService(&memoryStore{}).Record(context.Background(), value)
+			require.ErrorIs(t, err, ErrSensitiveDetail)
+			require.NotContains(t, err.Error(), "secret")
+			require.NotContains(t, err.Error(), "dbpass")
+		})
+	}
+}
+
 func TestRecordRedactsSQLInsideTypedAndRawJSONShapes(t *testing.T) {
 	type queryStruct struct {
 		SQL string `json:"sql_text"`

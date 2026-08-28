@@ -18,7 +18,8 @@
 export const JobOutcome = {
     Complete: 'complete',
     Partial: 'partial',
-    None: 'none'
+    None: 'none',
+    UnknownDefaultOpenApi: '11184809'
 };
 export function instanceOfJobOutcome(value) {
     for (const key in JobOutcome) {

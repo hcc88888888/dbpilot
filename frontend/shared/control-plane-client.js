@@ -48,17 +48,19 @@ export function createControlPlaneClient({
   getAccessToken = () => undefined,
   fetchImpl = globalThis.fetch,
   requestIdFactory = defaultRequestId,
+	traceparentFactory = defaultTraceparent,
 } = {}) {
   if (typeof getAccessToken !== 'function') throw new TypeError('getAccessToken must be a function');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
   if (typeof requestIdFactory !== 'function') throw new TypeError('requestIdFactory must be a function');
+	if (typeof traceparentFactory !== 'function') throw new TypeError('traceparentFactory must be a function');
 
   return {
     forScope({ tenantId, projectId }) {
       const configuration = new Configuration({
         basePath: scopedBaseUrl(baseUrl, tenantId, projectId),
         fetchApi: fetchImpl,
-        middleware: [requestMiddleware({ getAccessToken, requestIdFactory })],
+        middleware: [requestMiddleware({ getAccessToken, requestIdFactory, traceparentFactory })],
       });
       const api = new PlatformApi(configuration);
 
@@ -114,11 +116,13 @@ function controlPlanePlatform(api) {
   });
 }
 
-function requestMiddleware({ getAccessToken, requestIdFactory }) {
+function requestMiddleware({ getAccessToken, requestIdFactory, traceparentFactory }) {
   return {
     async pre({ url, init }) {
       const token = await getAccessToken();
       const requestId = await requestIdFactory();
+			const candidate = await traceparentFactory();
+			const traceparent = isValidTraceparent(candidate) ? candidate : defaultTraceparent();
       return {
         url,
         init: {
@@ -127,6 +131,7 @@ function requestMiddleware({ getAccessToken, requestIdFactory }) {
             ...init.headers,
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
             ...(requestId ? { 'X-Request-ID': String(requestId) } : {}),
+					traceparent,
           },
         },
       };
@@ -180,4 +185,27 @@ function isAbortError(error) {
 function defaultRequestId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   return `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isValidTraceparent(value) {
+	if (typeof value !== 'string' || value !== value.trim().toLowerCase()) return false;
+	const match = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(value);
+	return Boolean(match && match[1] !== 'ff' && !/^0+$/.test(match[2]) && !/^0+$/.test(match[3]));
+}
+
+function defaultTraceparent() {
+	const trace = randomHex(16);
+	const parent = randomHex(8);
+	return `00-${trace}-${parent}-01`;
+}
+
+function randomHex(size) {
+	const bytes = new Uint8Array(size);
+	if (globalThis.crypto?.getRandomValues) {
+		globalThis.crypto.getRandomValues(bytes);
+	} else {
+		for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+	}
+	if (bytes.every((value) => value === 0)) bytes[bytes.length - 1] = 1;
+	return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }

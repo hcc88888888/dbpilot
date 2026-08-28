@@ -4,6 +4,12 @@ on:
   pull_request:
     paths:
       - 'contracts/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'redocly.yaml'
+      - 'backend/api/openapi/**'
+      - 'deploy/contracts/**'
+      - 'frontend/generated/api/openapi-generator-config.json'
       - 'backend/gen/**'
       - 'frontend/generated/**'
       - 'scripts/contracts/**'
@@ -20,6 +26,12 @@ on:
     branches: [main]
     paths:
       - 'contracts/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'redocly.yaml'
+      - 'backend/api/openapi/**'
+      - 'deploy/contracts/**'
+      - 'frontend/generated/api/openapi-generator-config.json'
       - 'backend/gen/**'
       - 'frontend/generated/**'
       - 'scripts/contracts/**'

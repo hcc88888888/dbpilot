@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -241,7 +242,7 @@ func sanitizeValue(value any) (any, error) {
 
 func sensitiveKey(key string) bool {
 	normalized := normalizeKey(key)
-	for _, marker := range []string{"password", "passwd", "token", "credential", "secret", "authorization", "api_key"} {
+	for _, marker := range []string{"password", "passwd", "token", "credential", "secret", "authorization", "api_key", "private_key", "privatekey", "dsn"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
@@ -278,13 +279,15 @@ func normalizeKey(key string) string {
 
 func containsCredentialMaterial(value string) bool {
 	normalized := strings.ToLower(value)
-	for _, marker := range []string{"password=", "passwd=", "token=", "credential=", "secret=", "authorization:", "bearer ", "secret://", "postgres://", "postgresql://", "mysql://"} {
+	for _, marker := range []string{"password=", "passwd=", "token=", "credential=", "secret=", "authorization:", "bearer ", "secret://", "postgres://", "postgresql://", "mysql://", "-----begin private key-----", "-----begin encrypted private key-----", "-----begin rsa private key-----", "-----begin ec private key-----", "-----begin openssh private key-----"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
 	}
-	return false
+	return credentialURLPattern.MatchString(value)
 }
+
+var credentialURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://(?:[^\s/@]+(?::[^\s/@]*)?|:[^\s/@]+)@`)
 
 func sqlSummary(statement string) string {
 	fields := strings.Fields(statement)

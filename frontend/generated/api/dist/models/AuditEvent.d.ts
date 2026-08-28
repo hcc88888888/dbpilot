@@ -55,6 +55,12 @@ export interface AuditEvent {
     actor: AuditActor;
     /**
      *
+     * @type {string}
+     * @memberof AuditEvent
+     */
+    result: string;
+    /**
+     *
      * @type {ResourceReference}
      * @memberof AuditEvent
      */
@@ -65,6 +71,12 @@ export interface AuditEvent {
      * @memberof AuditEvent
      */
     jobId?: string;
+    /**
+     * Opaque Agent command identifier.
+     * @type {string}
+     * @memberof AuditEvent
+     */
+    commandId?: string;
     /**
      * Request correlation identifier.
      * @type {string}

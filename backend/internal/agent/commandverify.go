@@ -11,6 +11,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -21,6 +22,7 @@ var (
 	ErrCommandAgentMismatch         = errors.New("command Agent ID does not match this Agent")
 	ErrCommandCapabilityUnavailable = errors.New("command capability is not advertised")
 	ErrCommandNonceReplay           = errors.New("command nonce was already used")
+	ErrCommandTargetUnauthorized    = errors.New("command target is not authorized for this Agent")
 )
 
 type CommandKind string
@@ -39,12 +41,19 @@ type nonceRecord struct {
 }
 
 type CommandVerifier struct {
-	agentID      string
-	publicKey    ed25519.PublicKey
-	capabilities map[CommandKind]struct{}
-	now          func() time.Time
-	mu           sync.Mutex
-	nonces       map[string]nonceRecord
+	agentID          string
+	publicKey        ed25519.PublicKey
+	capabilities     map[CommandKind]struct{}
+	now              func() time.Time
+	mu               sync.Mutex
+	nonces           map[string]nonceRecord
+	targetAuthorizer commandvalidation.TargetAuthorizer
+}
+
+func (v *CommandVerifier) SetTargetAuthorizer(authorizer commandvalidation.TargetAuthorizer) {
+	v.mu.Lock()
+	v.targetAuthorizer = authorizer
+	v.mu.Unlock()
 }
 
 func NewCommandVerifier(agentID string, publicKey ed25519.PublicKey, capabilities []string) (*CommandVerifier, error) {
@@ -69,7 +78,7 @@ func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandE
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if envelope == nil || strings.TrimSpace(envelope.GetCommandId()) == "" || envelope.GetCommand() == nil || len(envelope.GetNonce()) == 0 || envelope.GetIssuedAt() == nil || !envelope.GetIssuedAt().IsValid() || envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() {
+	if envelope == nil || strings.TrimSpace(envelope.GetCommandId()) == "" || envelope.GetCommand() == nil || envelope.GetLeaseSeconds() == 0 || envelope.GetLeaseSeconds() > commandvalidation.MaximumTimeoutSeconds || len(envelope.GetNonce()) == 0 || envelope.GetIssuedAt() == nil || !envelope.GetIssuedAt().IsValid() || envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() {
 		return ErrInvalidCommandEnvelope
 	}
 	if subtle.ConstantTimeCompare([]byte(v.agentID), []byte(envelope.GetAgentId())) != 1 {
@@ -97,6 +106,15 @@ func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandE
 	}
 	if len(envelope.GetSignature()) != ed25519.SignatureSize || !ed25519.Verify(v.publicKey, payload, envelope.GetSignature()) {
 		return ErrInvalidCommandSignature
+	}
+	v.mu.Lock()
+	targetAuthorizer := v.targetAuthorizer
+	v.mu.Unlock()
+	if err := commandvalidation.Validate(ctx, envelope, targetAuthorizer); err != nil {
+		if errors.Is(err, commandvalidation.ErrTargetUnauthorized) {
+			return ErrCommandTargetUnauthorized
+		}
+		return ErrInvalidCommandEnvelope
 	}
 
 	nonceKey := string(envelope.GetNonce())

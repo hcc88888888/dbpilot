@@ -133,6 +133,35 @@ func TestOIDCIdentityModeRequiresIssuerAndAudience(t *testing.T) {
 	}
 }
 
+func TestNewServerExposesNonemptyFoundationCapabilityCatalog(t *testing.T) {
+	config := validServerConfig()
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/tenants/tenant-a/projects/project-a/capabilities", nil)
+	response := httptest.NewRecorder()
+
+	server.httpServer.Handler.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var body struct {
+		Capabilities []struct {
+			Name       string `json:"name"`
+			Enabled    bool   `json:"enabled"`
+			ReasonCode string `json:"reason_code"`
+		} `json:"capabilities"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	require.Len(t, body.Capabilities, 4)
+	for _, value := range body.Capabilities {
+		if value.Name == "agent.control" {
+			require.False(t, value.Enabled)
+			require.Equal(t, "agent_unsupported", value.ReasonCode)
+			return
+		}
+	}
+	t.Fatal("agent.control capability missing")
+}
+
 func TestConfigStrictlyDecodesSnakeCaseEvaluationScopes(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "controlplane.yaml")
@@ -437,15 +466,18 @@ func TestRunCancellationWaitsForWorkersToExit(t *testing.T) {
 
 func validServerConfig() Config {
 	return Config{
-		DatabaseURL:       "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",
-		WebhookAllowlist:  []string{"hooks.example.com"},
-		HTTP:              ListenerConfig{Address: "127.0.0.1:8443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused"}},
-		GRPC:              ListenerConfig{Address: "127.0.0.1:9443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused", ClientCAFile: "unused"}},
-		HTTPServerTLS:     &tls.Config{MinVersion: tls.VersionTLS12},
-		GRPCServerTLS:     &tls.Config{MinVersion: tls.VersionTLS12},
-		PrincipalResolver: trustedTestPrincipalResolver{},
-		EvaluationScopes:  []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
-		CommandSigner:     testCommandSigner{},
+		DatabaseURL:             "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",
+		WebhookAllowlist:        []string{"hooks.example.com"},
+		EventURLBase:            "https://control.example",
+		HTTP:                    ListenerConfig{Address: "127.0.0.1:8443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused"}},
+		GRPC:                    ListenerConfig{Address: "127.0.0.1:9443", TLS: TLSMaterial{CertFile: "unused", KeyFile: "unused", ClientCAFile: "unused"}},
+		HTTPServerTLS:           &tls.Config{MinVersion: tls.VersionTLS12},
+		GRPCServerTLS:           &tls.Config{MinVersion: tls.VersionTLS12},
+		PrincipalResolver:       trustedTestPrincipalResolver{},
+		EvaluationScopes:        []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
+		CommandSigner:           testCommandSigner{},
+		Artifact:                ArtifactSettings{SigningKeyRef: "secret://controlplane/artifact-download"},
+		ArtifactDownloadHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 	}
 }
 
@@ -473,7 +505,9 @@ func (*testCommandObserver) Connected(context.Context, agentcontrol.SessionInfo)
 func (*testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
 func (*testCommandObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
 func (*testCommandObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
-func (*testCommandObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
+func (*testCommandObserver) Result(_ context.Context, _ string, result *agentv1.CommandResult) (agentcontrol.ResultPersistence, error) {
+	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
+}
 
 type testCommandSigner struct{}
 

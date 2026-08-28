@@ -17,6 +17,7 @@ export declare const JobOutcome: {
     readonly Complete: "complete";
     readonly Partial: "partial";
     readonly None: "none";
+    readonly UnknownDefaultOpenApi: "11184809";
 };
 export type JobOutcome = typeof JobOutcome[keyof typeof JobOutcome];
 export declare function instanceOfJobOutcome(value: any): boolean;

@@ -18,6 +18,20 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+func TestExecutorRegistryGatesRegisteredProcessIDs(t *testing.T) {
+	registry := NewExecutorRegistry()
+	require.Error(t, registry.Register(CommandKindExecuteRegisteredProcess, immediateExecutor{}), "a kind-wide process executor would bypass the process allowlist")
+	require.Error(t, registry.RegisterProcess("sh -c", immediateExecutor{}))
+	require.NoError(t, registry.RegisterProcess("collector.health", immediateExecutor{}))
+
+	allowed := &agentv1.CommandEnvelope{Command: &agentv1.CommandEnvelope_ExecuteRegisteredProcess{ExecuteRegisteredProcess: &agentv1.ExecuteRegisteredProcess{ProcessId: "collector.health"}}}
+	_, ok := registry.executor(allowed)
+	require.True(t, ok)
+	denied := &agentv1.CommandEnvelope{Command: &agentv1.CommandEnvelope_ExecuteRegisteredProcess{ExecuteRegisteredProcess: &agentv1.ExecuteRegisteredProcess{ProcessId: "collector.other"}}}
+	_, ok = registry.executor(denied)
+	require.False(t, ok)
+}
+
 func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -210,6 +224,14 @@ func TestControlClientDurablyAcknowledgesExecutesReportsAndDeduplicates(t *testi
 	entry, err := realJournal.Get(context.Background(), "command-a")
 	require.NoError(t, err)
 	require.Equal(t, commandjournal.StateCompleted, entry.State)
+	pending, err := realJournal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "a successful stream send is not a durability acknowledgement")
+	stream.receive <- resultAckMessage("command-a", true, "")
+	require.Eventually(t, func() bool {
+		pending, pendingErr := realJournal.PendingResults(context.Background())
+		return pendingErr == nil && len(pending) == 0
+	}, time.Second, time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
 }
@@ -248,6 +270,15 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 
 	require.Eventually(t, func() bool { return countResults(second.sentMessages()) == 1 }, 2*time.Second, time.Millisecond)
 	require.Zero(t, countResults(first.sentMessages()), "failed result send must not be treated as delivered")
+	pending, err := journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "reconnect send must remain pending without server durability acknowledgement")
+	second.receive <- resultAckMessage("command-a", false, "PERSISTENCE_RETRY")
+	time.Sleep(20 * time.Millisecond)
+	pending, err = journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "negative/retryable acknowledgement must keep the result pending")
+	second.receive <- resultAckMessage("command-a", true, "")
 	require.Eventually(t, func() bool {
 		pending, pendingErr := journal.PendingResults(context.Background())
 		return pendingErr == nil && len(pending) == 0
@@ -257,6 +288,10 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 	require.False(t, entry.ReportedAt.IsZero())
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func resultAckMessage(commandID string, persisted bool, reason string) *agentv1.ServerMessage {
+	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: &agentv1.CommandResultAcknowledgement{CommandId: commandID, Persisted: persisted, ReasonCode: reason}}}
 }
 
 func TestControlClientSurfacesTerminalResultPersistenceFailure(t *testing.T) {

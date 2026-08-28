@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -88,9 +89,20 @@ func Open(path string) (*BoltJournal, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("command journal path is required")
 	}
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return nil, fmt.Errorf("harden existing command journal permissions: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect command journal: %w", err)
+	}
 	database, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open command journal: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = database.Close()
+		return nil, fmt.Errorf("harden command journal permissions: %w", err)
 	}
 	journal := &BoltJournal{database: database, now: time.Now}
 	if err := database.Update(func(transaction *bbolt.Tx) error {

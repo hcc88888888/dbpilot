@@ -39,6 +39,19 @@ type Capability struct {
 
 type Service struct{ catalog []Definition }
 
+func FoundationCatalog() []Definition {
+	return []Definition{
+		{Name: "platform.jobs", DeploymentFlags: []string{"jobs"}, RequiredPermission: "platform.jobs.read"},
+		{Name: "platform.audit", DeploymentFlags: []string{"audit"}, RequiredPermission: "platform.audit.read"},
+		{Name: "platform.artifacts", DeploymentFlags: []string{"artifacts"}, RequiredPermission: "platform.artifacts.read"},
+		{Name: "agent.control", DeploymentFlags: []string{"agent_control"}, AgentCapabilities: []string{"collect_now"}, RequiredPermission: "platform.jobs.cancel"},
+	}
+}
+
+func FoundationDeploymentFlags() map[string]bool {
+	return map[string]bool{"jobs": true, "audit": true, "artifacts": true, "agent_control": true}
+}
+
 func NewService(catalog []Definition) Service {
 	return Service{catalog: cloneCatalog(catalog)}
 }

@@ -17,6 +17,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
@@ -36,7 +37,7 @@ func TestEd25519CommandSignerParsesPKCS8PEMAndMatchesAgentVerifier(t *testing.T)
 	envelope := &agentv1.CommandEnvelope{
 		CommandId: "command-1", JobId: "job-1", AgentId: "agent-a", LeaseSeconds: 30,
 		IssuedAt: timestamp(now), ExpiresAt: timestamp(now.Add(time.Minute)), Nonce: bytes.Repeat([]byte{0x42}, commandNonceBytes),
-		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}},
+		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}},
 	}
 	require.NoError(t, signer.Sign(context.Background(), envelope))
 	verifier, err := agent.NewCommandVerifier("agent-a", publicKey, []string{"collect_now"})
@@ -247,7 +248,7 @@ func TestExpiredDeliveryFinishesSucceededPartialWhenAnotherTargetSucceeded(t *te
 	require.Equal(t, Progress{TotalTargets: 2, CompletedTargets: 1, FailedTargets: 1}, got.Progress)
 }
 
-func TestAcknowledgementPublishesBeforeMutationAndDuplicateRetriesPublicationFailure(t *testing.T) {
+func TestAcknowledgementPersistsJobAndAuditBeforePublicationAndRetriesMarker(t *testing.T) {
 	fixture := newCommandLifecycleFixture(t)
 	fixture.persistence.messages["command-a"] = fixture.message(t, "command-a", "agent-a")
 	fixture.persistence.jobs[fixture.value.ID] = transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
@@ -255,9 +256,10 @@ func TestAcknowledgementPublishesBeforeMutationAndDuplicateRetriesPublicationFai
 	before := fixture.persistence.currentJob()
 
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
-	require.Equal(t, before.Version, fixture.persistence.currentJob().Version)
+	require.Greater(t, fixture.persistence.currentJob().Version, before.Version)
+	require.Equal(t, TargetRunning, fixture.persistence.currentJob().TargetResults[0].Status)
 	require.Empty(t, fixture.persistence.published)
-	require.Empty(t, fixture.audit.events)
+	require.Len(t, fixture.audit.events, 1)
 	require.Len(t, fixture.observerErrors(), 1)
 
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE})
@@ -267,7 +269,7 @@ func TestAcknowledgementPublishesBeforeMutationAndDuplicateRetriesPublicationFai
 	require.Equal(t, 2, fixture.persistence.markCalls)
 }
 
-func TestRejectedAcknowledgementPublishesBeforeFailedTargetMapping(t *testing.T) {
+func TestRejectedAcknowledgementDurablyTerminalizesTargetBeforePublication(t *testing.T) {
 	fixture := newCommandLifecycleFixture(t)
 	fixture.persistence.messages["command-a"] = fixture.message(t, "command-a", "agent-a")
 	fixture.persistence.jobs[fixture.value.ID] = transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
@@ -277,6 +279,24 @@ func TestRejectedAcknowledgementPublishesBeforeFailedTargetMapping(t *testing.T)
 	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
 	require.Equal(t, "failure", fixture.audit.events[0].Result)
+}
+
+func TestAcceptedAcknowledgementPersistsExecutionDeadlineBoundedByJobTimeout(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	timeout := fixture.now.Add(10 * time.Second)
+	value := fixture.value
+	value.TimeoutAt = &timeout
+	fixture.persistence.jobs[value.ID] = transitionForTest(t, value, StatusDispatched, fixture.now)
+	message := fixture.messageWithLease(t, "command-a", "agent-a", 30)
+	fixture.persistence.messages[message.ID] = message
+
+	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: message.ID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
+
+	stored := fixture.persistence.messages[message.ID]
+	require.Equal(t, CommandActive, stored.CommandStatus)
+	require.NotNil(t, stored.ExecutionDeadline)
+	require.Equal(t, timeout, *stored.ExecutionDeadline)
+	require.Equal(t, fixture.now, *stored.LastHeartbeatAt)
 }
 
 func TestDispatchPendingRejectsPayloadAuthorityAndAgentMismatchWithoutPublishing(t *testing.T) {
@@ -293,7 +313,7 @@ func TestDispatchPendingRejectsPayloadAuthorityAndAgentMismatchWithoutPublishing
 	} {
 		t.Run(name, func(t *testing.T) {
 			fixture := newCommandLifecycleFixture(t)
-			envelope := &agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}}
+			envelope := &agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}}}
 			message := OutboxMessage{ID: "command-a", Scope: fixture.scope, JobID: fixture.value.ID, TargetID: "agent-a", Type: commandOutboxType, AvailableAt: fixture.now, CreatedAt: fixture.now}
 			mutate(envelope, &message)
 			message.Payload, _ = proto.Marshal(envelope)
@@ -317,12 +337,16 @@ func TestObserverLooksUpEveryEventRetriesConflictsAndAggregatesPartialResult(t *
 
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
 	fixture.lifecycle.Progress(context.Background(), "agent-a", &agentv1.CommandProgress{CommandId: "command-a", Percent: 50, Stage: "executing"})
-	fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{
 		CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "stored externally",
 		Artifacts: []*agentv1.ArtifactReference{{ArtifactId: "artifact-large", Kind: "command-output", SizeBytes: 10 << 20}},
 	})
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-b", &agentv1.CommandAcknowledgement{CommandId: "command-b", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
-	fixture.lifecycle.Result(context.Background(), "agent-b", &agentv1.CommandResult{CommandId: "command-b", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, Summary: "target failed", ErrorCode: "target_error"})
+	outcome, err = fixture.lifecycle.Result(context.Background(), "agent-b", &agentv1.CommandResult{CommandId: "command-b", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, Summary: "target failed", ErrorCode: "target_error"})
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
 
 	got := fixture.persistence.currentJob()
 	require.Equal(t, StatusSucceeded, got.Status)
@@ -336,7 +360,8 @@ func TestObserverLooksUpEveryEventRetriesConflictsAndAggregatesPartialResult(t *
 	}
 
 	version := got.Version
-	fixture.lifecycle.Result(context.Background(), "agent-b", &agentv1.CommandResult{CommandId: "command-b", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, Summary: "duplicate"})
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-b", &agentv1.CommandResult{CommandId: "command-b", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, Summary: "target failed", ErrorCode: "target_error"})
+	require.NoError(t, err)
 	require.Equal(t, version, fixture.persistence.currentJob().Version, "late terminal result must not mutate the Job")
 	require.Empty(t, fixture.observerErrors())
 }
@@ -369,13 +394,17 @@ func TestCancelledResultCompletesCancellingJobAndLateDuplicateIsNoOp(t *testing.
 	fixture.persistence.jobs[fixture.value.ID] = current
 
 	result := &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, Summary: "cancelled"}
-	fixture.lifecycle.Result(context.Background(), "agent-a", result)
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", result)
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
 	intermediate := fixture.persistence.currentJob()
 	require.Equal(t, StatusCancelling, intermediate.Status)
 	require.Equal(t, TargetCancelled, intermediate.TargetResults[0].Status)
 
 	result = &agentv1.CommandResult{CommandId: "command-b", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, Summary: "cancelled"}
-	fixture.lifecycle.Result(context.Background(), "agent-b", result)
+	outcome, err = fixture.lifecycle.Result(context.Background(), "agent-b", result)
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
 
 	got := fixture.persistence.currentJob()
 	require.Equal(t, StatusCancelled, got.Status)
@@ -384,11 +413,90 @@ func TestCancelledResultCompletesCancellingJobAndLateDuplicateIsNoOp(t *testing.
 	require.Equal(t, "command.result", fixture.audit.events[0].Action)
 	require.Equal(t, "failure", fixture.audit.events[0].Result)
 	version := got.Version
-	fixture.lifecycle.Result(context.Background(), "agent-b", result)
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-b", result)
+	require.NoError(t, err)
 	require.Equal(t, version, fixture.persistence.currentJob().Version)
-	require.Len(t, fixture.audit.events, 3)
-	require.Equal(t, "duplicate", fixture.audit.events[2].Result)
+	require.Len(t, fixture.audit.events, 2, "result retry uses RecordOnce evidence")
 	require.Empty(t, fixture.observerErrors())
+}
+
+func TestCancellationIntentPreventsUndeliveredExecutionAndTerminalizesLocally(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.claimed = []OutboxMessage{message}
+	_, err := fixture.persistence.RequestCancel(context.Background(), fixture.scope, fixture.value.ID, "operator", fixture.value.Version, fixture.now)
+	require.NoError(t, err)
+
+	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	require.Empty(t, fixture.agents.envelopes)
+	require.Equal(t, StatusCancelled, fixture.persistence.currentJob().Status)
+	require.Equal(t, CommandCancelled, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, "command.cancelled_before_dispatch", fixture.audit.events[0].Action)
+}
+
+func TestTooLateSuccessfulResultWinsOverCancellationRequest(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	published := fixture.now.Add(-time.Second)
+	message.PublishedAt = &published
+	message.CommandStatus = CommandActive
+	fixture.persistence.messages[message.ID] = message
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now})
+	require.NoError(t, err)
+	current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusCancelling, Actor: "operator", At: fixture.now})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "completed before cancellation arrived"})
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.Equal(t, StatusSucceeded, fixture.persistence.currentJob().Status)
+	require.Equal(t, OutcomeComplete, fixture.persistence.currentJob().Outcome)
+}
+
+func TestReconnectRenewsKnownActiveCommandsAndReplaysCancellation(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	requested := fixture.now.Add(-time.Second)
+	message.CommandStatus = CommandActive
+	message.CancellationRequestedAt = &requested
+	fixture.persistence.messages[message.ID] = message
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING}}})
+
+	require.Equal(t, []string{"agent-a/command-a"}, fixture.agents.cancellations)
+	renewed := fixture.persistence.messages[message.ID]
+	require.NotNil(t, renewed.LastHeartbeatAt)
+	require.NotNil(t, renewed.ExecutionDeadline)
+	require.Equal(t, fixture.now.Add(30*time.Second), *renewed.ExecutionDeadline)
+}
+
+func TestExpiredExecutionLeaseDurablyTimesOutTargetJobAndAuditOnce(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	published := fixture.now.Add(-time.Minute)
+	deadline := fixture.now.Add(-time.Second)
+	message.PublishedAt = &published
+	message.CommandStatus = CommandActive
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, "command.execution_timed_out", fixture.audit.events[0].Action)
+	require.NotEmpty(t, fixture.audit.events[0].DedupeKey)
 }
 
 type commandLifecycleFixture struct {
@@ -449,7 +557,7 @@ func (fixture *commandLifecycleFixture) unsignedEnvelope(t *testing.T, agentID s
 
 func (fixture *commandLifecycleFixture) unsignedEnvelopeWithLease(t *testing.T, agentID string, leaseSeconds uint32) []byte {
 	t.Helper()
-	encoded, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: agentID, LeaseSeconds: leaseSeconds, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+	encoded, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: agentID, LeaseSeconds: leaseSeconds, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}}})
 	require.NoError(t, err)
 	return encoded
 }
@@ -484,6 +592,7 @@ type memoryCommandPersistence struct {
 	prepared   map[string][]byte
 	markErrors []error
 	markCalls  int
+	expired    []OutboxMessage
 }
 
 func (store *memoryCommandPersistence) CreateWithOutbox(context.Context, Job, []OutboxMessage) error {
@@ -519,8 +628,22 @@ func (store *memoryCommandPersistence) Transition(_ context.Context, transition 
 	store.jobs[transition.JobID] = next
 	return next, nil
 }
-func (store *memoryCommandPersistence) RequestCancel(context.Context, platformscope.Scope, string, string, time.Time) (Job, error) {
-	return Job{}, errors.New("not implemented")
+func (store *memoryCommandPersistence) RequestCancel(ctx context.Context, scope platformscope.Scope, id, actor string, version int64, at time.Time) (Job, error) {
+	next, err := store.Transition(ctx, Transition{Scope: scope, JobID: id, CurrentVersion: version, To: StatusCancelling, Actor: actor, At: at})
+	if err != nil {
+		return Job{}, err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for commandID, message := range store.messages {
+		if message.Scope == scope && message.JobID == id {
+			requested := at.UTC()
+			message.CancellationRequestedAt = &requested
+			message.CancellationAvailableAt = &requested
+			store.messages[commandID] = message
+		}
+	}
+	return next, nil
 }
 func (store *memoryCommandPersistence) ClaimOutbox(context.Context, int, time.Time) ([]OutboxMessage, error) {
 	store.mu.Lock()
@@ -566,19 +689,111 @@ func (store *memoryCommandPersistence) LookupCommand(_ context.Context, id strin
 	}
 	return value, nil
 }
+func (store *memoryCommandPersistence) ClaimPendingCancellations(context.Context, int, time.Time) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for _, message := range store.messages {
+		if message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) {
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
+func (store *memoryCommandPersistence) DeferCancellation(_ context.Context, _ platformscope.Scope, id string, at time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message := store.messages[id]
+	message.CancellationAvailableAt = &at
+	store.messages[id] = message
+	return nil
+}
+func (store *memoryCommandPersistence) AcknowledgeCommand(_ context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time, deadline *time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.markCalls++
+	if len(store.markErrors) > 0 {
+		err := store.markErrors[0]
+		store.markErrors = store.markErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	message := store.messages[id]
+	message.CommandStatus = status
+	message.AcknowledgedAt = &at
+	if status == CommandActive {
+		message.LastHeartbeatAt = &at
+	}
+	message.ExecutionDeadline = deadline
+	message.PublishedAt = &at
+	store.messages[id] = message
+	store.published = append(store.published, publishedCommand{scope: scope, id: id})
+	return nil
+}
+func (store *memoryCommandPersistence) RenewCommandLease(_ context.Context, _ platformscope.Scope, id string, at, deadline time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message := store.messages[id]
+	message.LastHeartbeatAt = &at
+	message.ExecutionDeadline = &deadline
+	store.messages[id] = message
+	return nil
+}
+func (store *memoryCommandPersistence) ClaimExpiredCommands(context.Context, int, time.Time) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return append([]OutboxMessage(nil), store.expired...), nil
+}
+func (store *memoryCommandPersistence) MarkCommandTerminal(_ context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.markCalls++
+	if len(store.markErrors) > 0 {
+		err := store.markErrors[0]
+		store.markErrors = store.markErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	message := store.messages[id]
+	message.CommandStatus = status
+	message.PublishedAt = &at
+	message.ExecutionDeadline = nil
+	store.messages[id] = message
+	store.published = append(store.published, publishedCommand{scope: scope, id: id})
+	return nil
+}
+func (store *memoryCommandPersistence) PendingCancellationsForAgent(_ context.Context, agentID string, _ int) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for _, message := range store.messages {
+		if message.TargetID == agentID && message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) {
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
 func (store *memoryCommandPersistence) currentJob() Job {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return normalizeJobUTC(store.jobs["job-1"])
 }
 
-type recordingCommandDispatcher struct{ envelopes []*agentv1.CommandEnvelope }
+type recordingCommandDispatcher struct {
+	envelopes     []*agentv1.CommandEnvelope
+	cancellations []string
+}
 
 func (dispatcher *recordingCommandDispatcher) Dispatch(_ context.Context, _ string, envelope *agentv1.CommandEnvelope) error {
 	dispatcher.envelopes = append(dispatcher.envelopes, proto.Clone(envelope).(*agentv1.CommandEnvelope))
 	return nil
 }
-func (*recordingCommandDispatcher) Cancel(context.Context, string, string) error { return nil }
+func (dispatcher *recordingCommandDispatcher) Cancel(_ context.Context, agentID, commandID string) error {
+	dispatcher.cancellations = append(dispatcher.cancellations, agentID+"/"+commandID)
+	return nil
+}
 
 type recordingAudit struct {
 	events     []audit.Event

@@ -25,7 +25,8 @@ export const JobStatus = {
     Failed: 'failed',
     Cancelling: 'cancelling',
     Cancelled: 'cancelled',
-    TimedOut: 'timed_out'
+    TimedOut: 'timed_out',
+    UnknownDefaultOpenApi: '11184809'
 } as const;
 export type JobStatus = typeof JobStatus[keyof typeof JobStatus];
 

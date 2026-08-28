@@ -21,7 +21,13 @@ type Observer interface {
 	Heartbeat(context.Context, string, *agentv1.Heartbeat)
 	Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement)
 	Progress(context.Context, string, *agentv1.CommandProgress)
-	Result(context.Context, string, *agentv1.CommandResult)
+	Result(context.Context, string, *agentv1.CommandResult) (ResultPersistence, error)
+}
+
+type ResultPersistence struct {
+	CommandID  string
+	Persisted  bool
+	ReasonCode string
 }
 
 // NoopObserver is the safe pre-integration default for command business events.
@@ -31,7 +37,9 @@ func (NoopObserver) Connected(context.Context, SessionInfo)                     
 func (NoopObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
 func (NoopObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
 func (NoopObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
-func (NoopObserver) Result(context.Context, string, *agentv1.CommandResult)                {}
+func (NoopObserver) Result(_ context.Context, _ string, result *agentv1.CommandResult) (ResultPersistence, error) {
+	return ResultPersistence{CommandID: result.GetCommandId(), ReasonCode: "OBSERVER_UNAVAILABLE"}, nil
+}
 
 type Server struct {
 	agentv1.UnimplementedAgentControlServer
@@ -94,7 +102,9 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	if err := stream.Send(ack); err != nil {
 		return err
 	}
-	s.observer.Connected(sessionContext, sessionSnapshot(current))
+	if snapshot, ok := s.registry.snapshot(agentID, current); ok {
+		s.observer.Connected(sessionContext, snapshot)
+	}
 
 	receiveErrors := make(chan error, 1)
 	go func() {
@@ -154,21 +164,23 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		if typed.CommandResult == nil {
 			return status.Error(codes.InvalidArgument, "command result is required")
 		}
-		s.observer.Result(ctx, agentID, typed.CommandResult)
+		outcome, err := s.observer.Result(ctx, agentID, typed.CommandResult)
+		if err != nil {
+			outcome = ResultPersistence{CommandID: typed.CommandResult.GetCommandId(), ReasonCode: "PERSISTENCE_RETRY"}
+		}
+		if outcome.CommandID != typed.CommandResult.GetCommandId() {
+			return status.Error(codes.Internal, "result persistence outcome did not match command")
+		}
+		ack := &agentv1.CommandResultAcknowledgement{CommandId: outcome.CommandID, Persisted: outcome.Persisted, ReasonCode: outcome.ReasonCode}
+		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "result-ack-" + outcome.CommandID, Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: ack}}); err != nil {
+			return status.Error(codes.Unavailable, err.Error())
+		}
 	case *agentv1.AgentMessage_Inventory:
 		// Inventory is authenticated by this stream and consumed by the inventory service in a later task.
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}
 	return nil
-}
-
-func sessionSnapshot(current *session) SessionInfo {
-	leasing := make(map[string]time.Time, len(current.leases))
-	for commandID, deadline := range current.leases {
-		leasing[commandID] = deadline
-	}
-	return SessionInfo{AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing}
 }
 
 var _ agentv1.AgentControlServer = (*Server)(nil)

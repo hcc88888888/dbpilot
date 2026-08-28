@@ -2,5 +2,6 @@
   "supportsES6": true,
   "typescriptThreePlus": true,
   "useSingleRequestParameter": true,
+  "enumUnknownDefaultCase": true,
   "importFileExtension": ".js"
 }

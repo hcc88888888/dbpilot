@@ -61,3 +61,10 @@ func TestHMACDownloadSignerRejectsExpiredDescriptor(t *testing.T) {
 	_, err = signer.Verify(context.Background(), signed)
 	require.ErrorIs(t, err, ErrExpired)
 }
+
+func TestHMACDownloadSignerRejectsArtifactIDsOutsideContractAlphabet(t *testing.T) {
+	signer, err := NewHMACDownloadSigner("https://control.example/api/v1/artifact-downloads", "secret://control/download", database.StaticSecretResolver{"secret://control/download": []byte("0123456789abcdef0123456789abcdef")})
+	require.NoError(t, err)
+	_, err = signer.Sign(context.Background(), Artifact{ID: "artifact/with space", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, time.Minute)
+	require.ErrorIs(t, err, ErrInvalid)
+}

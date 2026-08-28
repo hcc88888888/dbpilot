@@ -42,23 +42,26 @@ func RequireScope(next ScopedHandler) http.Handler {
 			writeAPIError(writer, http.StatusBadRequest, "invalid_scope", "tenant and project are invalid")
 			return
 		}
-		if !principal.AllowsScope(platformScope) {
+		legacyPrincipal := principal.AlertPrincipal()
+		legacyScope := alert.Scope{TenantID: platformScope.TenantID, ProjectID: platformScope.ProjectID}
+		if !legacyPrincipal.Allows(legacyScope) {
 			writeAPIError(writer, http.StatusForbidden, "forbidden", "project access is forbidden")
 			return
 		}
-		scope := alert.Scope{TenantID: platformScope.TenantID, ProjectID: platformScope.ProjectID}
-		next(writer, request, scope, principal.AlertPrincipal())
+		next(writer, request, legacyScope, legacyPrincipal)
 	})
 }
 
 func authenticate(resolver PrincipalResolver, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if resolver == nil {
+			setBearerChallenge(writer, resolver)
 			writeAPIError(writer, http.StatusUnauthorized, "unauthenticated", "authentication is required")
 			return
 		}
 		principal, err := resolver.ResolvePrincipal(request)
 		if err != nil || strings.TrimSpace(principal.Subject) == "" {
+			setBearerChallenge(writer, resolver)
 			writeAPIError(writer, http.StatusUnauthorized, "unauthenticated", "authentication is required")
 			return
 		}
@@ -71,6 +74,9 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 		services.Now = time.Now
 	}
 	mux := http.NewServeMux()
+	if services.ArtifactContent != nil {
+		mux.Handle("GET /api/v1/artifact-downloads/{artifactID}", services.ArtifactContent)
+	}
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -177,7 +183,7 @@ func (response *bufferedResponse) Write(value []byte) (int, error) {
 
 func normalizeAPIErrors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if !strings.HasPrefix(request.URL.Path, "/api/v1") {
+		if !strings.HasPrefix(request.URL.Path, "/api/v1") || strings.HasPrefix(request.URL.Path, "/api/v1/artifact-downloads/") {
 			next.ServeHTTP(writer, request)
 			return
 		}

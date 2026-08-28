@@ -16,6 +16,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -96,6 +97,7 @@ type CommandLifecycleConfig struct {
 	Now                func() time.Time
 	NonceReader        io.Reader
 	OnError            func(error)
+	TargetAuthorizer   commandvalidation.TargetAuthorizer
 }
 
 // CommandLifecycle is both the periodic transactional-outbox worker and the
@@ -111,6 +113,7 @@ type CommandLifecycle struct {
 	now                func() time.Time
 	nonceReader        io.Reader
 	onError            func(error)
+	targetAuthorizer   commandvalidation.TargetAuthorizer
 }
 
 func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, error) {
@@ -136,6 +139,7 @@ func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, erro
 		dispatchRepository: config.DispatchRepository, jobs: config.Jobs, agents: config.Agents,
 		signer: config.Signer, audit: config.Audit, claimLimit: config.ClaimLimit,
 		now: config.Now, nonceReader: config.NonceReader, onError: config.OnError,
+		targetAuthorizer: config.TargetAuthorizer,
 	}, nil
 }
 
@@ -143,9 +147,17 @@ func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.
 	if lifecycle == nil || at.IsZero() {
 		return 0, errors.New("command lifecycle and dispatch time are required")
 	}
-	messages, err := lifecycle.dispatchRepository.ClaimOutbox(ctx, lifecycle.claimLimit, at.UTC())
+	at = at.UTC()
+	var maintenanceErrors []error
+	if err := lifecycle.dispatchCancellations(ctx, at); err != nil {
+		maintenanceErrors = append(maintenanceErrors, err)
+	}
+	if err := lifecycle.expireExecutions(ctx, at); err != nil {
+		maintenanceErrors = append(maintenanceErrors, err)
+	}
+	messages, err := lifecycle.dispatchRepository.ClaimOutbox(ctx, lifecycle.claimLimit, at)
 	if err != nil {
-		return 0, err
+		return 0, errors.Join(append(maintenanceErrors, err)...)
 	}
 	dispatched := 0
 	var dispatchErrors []error
@@ -159,11 +171,38 @@ func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.
 			dispatched++
 		}
 	}
-	return dispatched, errors.Join(dispatchErrors...)
+	return dispatched, errors.Join(append(maintenanceErrors, dispatchErrors...)...)
 }
 
 func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message OutboxMessage, at time.Time) (bool, error) {
-	unsigned, err := decodeUnsignedCommand(message)
+	current, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+	if err != nil {
+		return false, err
+	}
+	if current.Status == StatusCancelling || current.Status == StatusCancelled || message.CancellationRequestedAt != nil {
+		return false, lifecycle.cancelUndelivered(ctx, message, at)
+	}
+	if isTerminal(current.Status) {
+		if len(message.PreparedEnvelope) > 0 {
+			unsigned, decodeErr := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+			if decodeErr != nil {
+				return false, decodeErr
+			}
+			prepared, decodeErr := decodePreparedCommand(message, unsigned, message.PreparedEnvelope)
+			if decodeErr != nil {
+				return false, decodeErr
+			}
+			if !prepared.GetExpiresAt().AsTime().After(at) {
+				return false, lifecycle.expireDelivery(ctx, message, at)
+			}
+		}
+		event := lifecycle.auditEvent(current, message, "command.skipped_terminal_job", "success", map[string]any{"job_status": string(current.Status)}, at, "command.skipped_terminal_job:"+message.ID)
+		if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+			return false, err
+		}
+		return false, lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatusForJob(current.Status), at)
+	}
+	unsigned, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
 	if err != nil {
 		return false, err
 	}
@@ -207,6 +246,67 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 	return true, lifecycle.recordAudit(ctx, value, message, "command.dispatched", "success", map[string]any{"state": "dispatched"})
 }
 
+func (lifecycle *CommandLifecycle) dispatchCancellations(ctx context.Context, at time.Time) error {
+	messages, err := lifecycle.dispatchRepository.ClaimPendingCancellations(ctx, lifecycle.claimLimit, at)
+	if err != nil {
+		return err
+	}
+	var result []error
+	for _, message := range messages {
+		if message.PublishedAt == nil && (message.CommandStatus == "" || message.CommandStatus == CommandPending) {
+			if err := lifecycle.cancelUndelivered(ctx, message, at); err != nil {
+				result = append(result, fmt.Errorf("cancel undelivered command %q: %w", message.ID, err))
+			}
+			continue
+		}
+		if err := lifecycle.agents.Cancel(ctx, message.TargetID, message.ID); err != nil {
+			result = append(result, fmt.Errorf("dispatch command cancellation %q: %w", message.ID, err))
+		}
+		if err := lifecycle.dispatchRepository.DeferCancellation(ctx, message.Scope, message.ID, at.Add(DefaultCancellationRetry)); err != nil && !errors.Is(err, ErrNotFound) {
+			result = append(result, fmt.Errorf("defer command cancellation %q: %w", message.ID, err))
+		}
+	}
+	return errors.Join(result...)
+}
+
+func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
+	target := TargetResult{TargetID: message.TargetID, Status: TargetCancelled, ResultSummary: "cancelled before Agent execution", FinishedAt: timePointer(at)}
+	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
+	if err != nil {
+		return err
+	}
+	event := lifecycle.auditEvent(value, message, "command.cancelled_before_dispatch", "success", map[string]any{"reason": "job_cancellation"}, at, "command.cancelled_before_dispatch:"+message.ID)
+	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+		return err
+	}
+	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandCancelled, at)
+}
+
+func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time.Time) error {
+	messages, err := lifecycle.dispatchRepository.ClaimExpiredCommands(ctx, lifecycle.claimLimit, at)
+	if err != nil {
+		return err
+	}
+	var result []error
+	for _, message := range messages {
+		target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "execution lease expired", FinishedAt: timePointer(at)}
+		value, _, applyErr := lifecycle.applyTarget(ctx, message, target, at)
+		if applyErr != nil {
+			result = append(result, fmt.Errorf("expire command %q: %w", message.ID, applyErr))
+			continue
+		}
+		event := lifecycle.auditEvent(value, message, "command.execution_timed_out", "failure", map[string]any{"reason": "execution_deadline"}, at, "command.execution_timed_out:"+message.ID)
+		if _, recordErr := lifecycle.audit.RecordOnce(ctx, event); recordErr != nil {
+			result = append(result, fmt.Errorf("audit expired command %q: %w", message.ID, recordErr))
+			continue
+		}
+		if markErr := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); markErr != nil {
+			result = append(result, fmt.Errorf("terminalize expired command %q: %w", message.ID, markErr))
+		}
+	}
+	return errors.Join(result...)
+}
+
 func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "delivery deadline exceeded", FinishedAt: timePointer(at)}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
@@ -216,7 +316,7 @@ func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message O
 	if _, err := lifecycle.audit.RecordOnce(ctx, lifecycle.auditEvent(value, message, "command.delivery_timed_out", "failure", map[string]any{"reason": "delivery_deadline"}, at, "command.delivery_timed_out:"+message.ID)); err != nil {
 		return err
 	}
-	return lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, at)
+	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at)
 }
 
 func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvelope, stored []byte) (*agentv1.CommandEnvelope, error) {
@@ -247,7 +347,7 @@ func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvel
 	return envelope, nil
 }
 
-func decodeUnsignedCommand(message OutboxMessage) (*agentv1.CommandEnvelope, error) {
+func decodeUnsignedCommand(ctx context.Context, message OutboxMessage, authorizer commandvalidation.TargetAuthorizer) (*agentv1.CommandEnvelope, error) {
 	if message.Scope.Validate() != nil || strings.TrimSpace(message.ID) == "" || strings.TrimSpace(message.JobID) == "" || message.Type != commandOutboxType || strings.TrimSpace(message.TargetID) == "" || len(message.Payload) == 0 {
 		return nil, ErrInvalidCommandPayload
 	}
@@ -258,7 +358,10 @@ func decodeUnsignedCommand(message OutboxMessage) (*agentv1.CommandEnvelope, err
 	if envelope.GetCommandId() != "" || envelope.GetJobId() != "" || envelope.GetIssuedAt() != nil || envelope.GetExpiresAt() != nil || len(envelope.GetNonce()) != 0 || len(envelope.GetSignature()) != 0 {
 		return nil, ErrInvalidCommandPayload
 	}
-	if envelope.GetCommand() == nil || envelope.GetLeaseSeconds() == 0 || strings.TrimSpace(envelope.GetAgentId()) == "" || envelope.GetAgentId() != message.TargetID {
+	if envelope.GetCommand() == nil || envelope.GetLeaseSeconds() == 0 || envelope.GetLeaseSeconds() > commandvalidation.MaximumTimeoutSeconds || strings.TrimSpace(envelope.GetAgentId()) == "" || envelope.GetAgentId() != message.TargetID {
+		return nil, ErrInvalidCommandPayload
+	}
+	if err := commandvalidation.Validate(ctx, envelope, authorizer); err != nil {
 		return nil, ErrInvalidCommandPayload
 	}
 	return envelope, nil
@@ -286,27 +389,140 @@ func (lifecycle *CommandLifecycle) ensureDispatched(ctx context.Context, message
 	return Job{}, ErrConflict
 }
 
-func (lifecycle *CommandLifecycle) Connected(context.Context, agentcontrol.SessionInfo)   {}
-func (lifecycle *CommandLifecycle) Heartbeat(context.Context, string, *agentv1.Heartbeat) {}
+func (lifecycle *CommandLifecycle) Connected(ctx context.Context, session agentcontrol.SessionInfo) {
+	active := make([]string, 0, len(session.ActiveCommands))
+	for _, state := range session.ActiveCommands {
+		if state != nil && strings.TrimSpace(state.GetCommandId()) != "" && (state.GetState() == agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_ACCEPTED || state.GetState() == agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING) {
+			active = append(active, state.GetCommandId())
+		}
+	}
+	lifecycle.renewExecutionLeases(ctx, session.AgentID, active, lifecycle.currentTime())
+	messages, err := lifecycle.dispatchRepository.PendingCancellationsForAgent(ctx, session.AgentID, lifecycle.claimLimit)
+	if err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	for _, message := range messages {
+		if err := lifecycle.agents.Cancel(ctx, session.AgentID, message.ID); err != nil {
+			lifecycle.onError(err)
+		}
+	}
+}
+
+func (lifecycle *CommandLifecycle) Heartbeat(ctx context.Context, agentID string, heartbeat *agentv1.Heartbeat) {
+	if heartbeat == nil || heartbeat.GetAgentId() != agentID {
+		lifecycle.onError(ErrCommandAgentMismatch)
+		return
+	}
+	lifecycle.renewExecutionLeases(ctx, agentID, heartbeat.GetActiveCommandIds(), lifecycle.currentTime())
+}
+
+func (lifecycle *CommandLifecycle) renewExecutionLeases(ctx context.Context, agentID string, commandIDs []string, at time.Time) {
+	seen := make(map[string]struct{}, len(commandIDs))
+	for _, commandID := range commandIDs {
+		if strings.TrimSpace(commandID) == "" {
+			continue
+		}
+		if _, duplicate := seen[commandID]; duplicate {
+			continue
+		}
+		seen[commandID] = struct{}{}
+		message, err := lifecycle.dispatchRepository.LookupCommand(ctx, commandID)
+		if err != nil {
+			lifecycle.onError(err)
+			continue
+		}
+		if message.TargetID != agentID {
+			lifecycle.onError(ErrCommandAgentMismatch)
+			continue
+		}
+		envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+		if err != nil {
+			lifecycle.onError(err)
+			continue
+		}
+		value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if err != nil {
+			lifecycle.onError(err)
+			continue
+		}
+		deadline := executionDeadline(value, envelope.GetLeaseSeconds(), at)
+		if !deadline.After(at) {
+			continue
+		}
+		if err := lifecycle.dispatchRepository.RenewCommandLease(ctx, message.Scope, message.ID, at, deadline); err != nil && !errors.Is(err, ErrNotFound) {
+			lifecycle.onError(err)
+		}
+	}
+}
 
 func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID string, acknowledgement *agentv1.CommandAcknowledgement) {
 	if acknowledgement == nil || strings.TrimSpace(acknowledgement.GetCommandId()) == "" {
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
+	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, acknowledgement.GetCommandId())
+	if err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	if err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	if envelope.GetAgentId() != agentID || message.TargetID != agentID {
+		value, getErr := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if getErr != nil {
+			lifecycle.onError(getErr)
+			return
+		}
+		recordErr := lifecycle.recordAudit(ctx, value, message, "command.rejected", "failure", map[string]any{"reason": "agent_mismatch"})
+		lifecycle.onError(errors.Join(ErrCommandAgentMismatch, recordErr))
+		return
+	}
 	var target TargetResult
-	result := "success"
+	auditResult := "success"
+	commandStatus := CommandActive
+	at := lifecycle.currentTime()
 	switch acknowledgement.GetState() {
 	case agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE:
 		target = TargetResult{Status: TargetRunning}
 	case agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED:
-		target = TargetResult{Status: TargetFailed, ErrorSummary: acknowledgement.GetReasonCode(), FinishedAt: timePointer(lifecycle.currentTime())}
-		result = "failure"
+		target = TargetResult{Status: TargetFailed, ErrorSummary: acknowledgement.GetReasonCode(), FinishedAt: timePointer(at)}
+		auditResult = "failure"
+		commandStatus = CommandRejected
 	default:
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
-	lifecycle.observe(ctx, agentID, acknowledgement.GetCommandId(), "command.acknowledged", result, target, map[string]any{"state": acknowledgement.GetState().String()}, true)
+	target.TargetID = message.TargetID
+	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
+	if err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	detail := map[string]any{"state": "accepted"}
+	if commandStatus == CommandRejected {
+		detail = map[string]any{"state": "rejected", "reason_code": acknowledgement.GetReasonCode()}
+	}
+	event := lifecycle.auditEvent(value, message, "command.acknowledged", auditResult, detail, at, "command.acknowledged:"+message.ID)
+	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+		lifecycle.onError(err)
+		return
+	}
+	var deadline *time.Time
+	if commandStatus == CommandActive {
+		computed := executionDeadline(value, envelope.GetLeaseSeconds(), at)
+		if !computed.After(at) {
+			lifecycle.onError(ErrInvalidCommandPayload)
+			return
+		}
+		deadline = &computed
+	}
+	if err := lifecycle.dispatchRepository.AcknowledgeCommand(ctx, message.Scope, message.ID, commandStatus, at, deadline); err != nil {
+		lifecycle.onError(err)
+	}
 }
 
 func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string, progress *agentv1.CommandProgress) {
@@ -314,46 +530,77 @@ func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string,
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
-	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()}, false)
+	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()})
 }
 
-func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, result *agentv1.CommandResult) {
+func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, result *agentv1.CommandResult) (agentcontrol.ResultPersistence, error) {
 	if result == nil || strings.TrimSpace(result.GetCommandId()) == "" || len(result.GetSummary()) > maximumInlineResultSummary {
-		lifecycle.onError(ErrInvalidCommandPayload)
-		return
+		return agentcontrol.ResultPersistence{}, ErrInvalidCommandPayload
 	}
 	target := TargetResult{ResultSummary: result.GetSummary(), FinishedAt: timePointer(lifecycle.currentTime())}
 	auditResult := "success"
+	commandStatus := CommandSucceeded
 	switch result.GetState() {
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED:
 		target.Status = TargetSucceeded
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED:
 		target.Status, target.ErrorSummary, auditResult = TargetFailed, result.GetErrorCode(), "failure"
+		commandStatus = CommandFailed
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
 		target.Status, auditResult = TargetCancelled, "failure"
+		commandStatus = CommandCancelled
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT:
 		target.Status, auditResult = TargetTimedOut, "failure"
+		commandStatus = CommandTimedOut
 	default:
-		lifecycle.onError(ErrInvalidCommandPayload)
-		return
+		return agentcontrol.ResultPersistence{}, ErrInvalidCommandPayload
 	}
 	for _, reference := range result.GetArtifacts() {
 		if reference == nil || strings.TrimSpace(reference.GetArtifactId()) == "" || strings.TrimSpace(reference.GetKind()) == "" {
-			lifecycle.onError(ErrInvalidCommandPayload)
-			return
+			return agentcontrol.ResultPersistence{}, ErrInvalidCommandPayload
 		}
 		target.Artifacts = append(target.Artifacts, ArtifactReference{ArtifactID: reference.GetArtifactId(), Kind: reference.GetKind()})
 	}
-	lifecycle.observe(ctx, agentID, result.GetCommandId(), "command.result", auditResult, target, map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)}, false)
+	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, result.GetCommandId())
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	if envelope.GetAgentId() != agentID || message.TargetID != agentID {
+		recordErr := lifecycle.recordAudit(ctx, value, message, "command.rejected", "failure", map[string]any{"reason": "agent_mismatch"})
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, errors.Join(ErrCommandAgentMismatch, recordErr)
+	}
+	target.TargetID = message.TargetID
+	at := lifecycle.currentTime()
+	value, _, err = lifecycle.applyTarget(ctx, message, target, at)
+	if err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	detail := map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)}
+	event := lifecycle.auditEvent(value, message, "command.result", auditResult, detail, at, "command.result:"+message.ID)
+	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatus, at); err != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId()}, err
+	}
+	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
 }
 
-func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, commandID, action, result string, target TargetResult, detail map[string]any, publish bool) {
+func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, commandID, action, result string, target TargetResult, detail map[string]any) {
 	message, err := lifecycle.dispatchRepository.LookupCommand(ctx, commandID)
 	if err != nil {
 		lifecycle.onError(err)
 		return
 	}
-	envelope, err := decodeUnsignedCommand(message)
+	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
 	if err != nil {
 		lifecycle.onError(err)
 		return
@@ -367,12 +614,6 @@ func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, command
 		recordErr := lifecycle.recordAudit(ctx, value, message, "command.rejected", "failure", map[string]any{"reason": "agent_mismatch"})
 		lifecycle.onError(errors.Join(ErrCommandAgentMismatch, recordErr))
 		return
-	}
-	if publish {
-		if err := lifecycle.dispatchRepository.MarkOutboxPublished(ctx, message.Scope, message.ID, lifecycle.currentTime()); err != nil {
-			lifecycle.onError(err)
-			return
-		}
 	}
 	target.TargetID = message.TargetID
 	at := lifecycle.currentTime()
@@ -469,10 +710,10 @@ func (lifecycle *CommandLifecycle) finalize(ctx context.Context, candidate Job, 
 			return current, mutated, nil
 		}
 		to := StatusFailed
-		if current.Status == StatusCancelling {
-			to = StatusCancelled
-		} else if current.Progress.CompletedTargets > 0 {
+		if current.Progress.CompletedTargets > 0 {
 			to = StatusSucceeded
+		} else if allTargetsCancelled(current.TargetResults) {
+			to = StatusCancelled
 		} else if hasTimedOutTarget(current.TargetResults) {
 			to = StatusTimedOut
 		}
@@ -515,6 +756,39 @@ func hasTimedOutTarget(results []TargetResult) bool {
 		}
 	}
 	return false
+}
+
+func allTargetsCancelled(results []TargetResult) bool {
+	if len(results) == 0 {
+		return false
+	}
+	for _, result := range results {
+		if result.Status != TargetCancelled {
+			return false
+		}
+	}
+	return true
+}
+
+func executionDeadline(value Job, leaseSeconds uint32, at time.Time) time.Time {
+	deadline := at.UTC().Add(time.Duration(leaseSeconds) * time.Second)
+	if value.TimeoutAt != nil && value.TimeoutAt.Before(deadline) {
+		deadline = value.TimeoutAt.UTC()
+	}
+	return deadline
+}
+
+func commandStatusForJob(status Status) CommandStatus {
+	switch status {
+	case StatusSucceeded:
+		return CommandSucceeded
+	case StatusCancelled:
+		return CommandCancelled
+	case StatusTimedOut:
+		return CommandTimedOut
+	default:
+		return CommandFailed
+	}
 }
 
 func (lifecycle *CommandLifecycle) currentTime() time.Time { return lifecycle.now().UTC() }

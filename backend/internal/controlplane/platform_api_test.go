@@ -59,10 +59,13 @@ func TestGeneratedCancelUsesURLScopeAuthenticatedActorAndConditionalVersion(t *t
 		value.Version = 8
 		return value
 	}()}
+	audits := &recordingAuditService{}
 	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/jobs/job-1/actions/cancel", nil)
 	request.Header.Set("Idempotency-Key", "cancel-job-1")
 	request.Header.Set("If-Match", `"7"`)
-	response := servePlatformRequest(Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Now: func() time.Time { return time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC) }}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
+	request.Header.Set("X-Request-ID", "request-cancel-1")
+	request.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	response := servePlatformRequest(Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Now: func() time.Time { return time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC) }}, principalWith(platformTestScope, openapi.PermissionCancelJob), request)
 
 	require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
 	require.Equal(t, `"8"`, response.Header().Get("ETag"))
@@ -74,6 +77,14 @@ func TestGeneratedCancelUsesURLScopeAuthenticatedActorAndConditionalVersion(t *t
 	require.Equal(t, job.StatusCancelling, jobs.transitions[0].To)
 	require.Equal(t, "trusted-user", jobs.transitions[0].Actor)
 	require.Equal(t, time.Date(2026, 8, 28, 5, 0, 0, 0, time.UTC), jobs.transitions[0].At)
+	require.Equal(t, request.Header.Get("traceparent"), response.Header().Get("traceparent"))
+	require.Len(t, audits.records, 1)
+	require.Equal(t, audit.Event{
+		Scope: platformTestScope, Action: "job.cancel_requested", Actor: audit.Actor{Type: "user", ID: "trusted-user"},
+		Resource: audit.Resource{Type: "job", ID: "job-1"}, Result: "success", RequestID: "request-cancel-1",
+		TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", DedupeKey: audits.records[0].DedupeKey,
+		Detail: map[string]any{"operation_id": "cancelJob"},
+	}, audits.records[0])
 	requireOpenAPIResponse(t, request, response)
 }
 
@@ -94,7 +105,7 @@ func TestPlatformRequestValidationRejectsUnexpectedBodyQueryAndHeaderBeforeServi
 
 	t.Run("query maximum", func(t *testing.T) {
 		audits := &recordingAuditService{}
-		request := httptest.NewRequest(http.MethodGet, platformBasePath+"/audit-events?limit=501", nil)
+		request := httptest.NewRequest(http.MethodGet, platformBasePath+"/audit-events?limit=101", nil)
 
 		response := servePlatformRequest(Services{Audit: audits}, principalWith(platformTestScope, openapi.PermissionListAuditEvents), request)
 
@@ -251,7 +262,7 @@ func TestGeneratedIdempotencyKeyFingerprintCollisionReturnsConflict(t *testing.T
 		value.Version = 8
 		return value
 	}()}
-	services := Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	services := Services{Jobs: jobs, Audit: &recordingAuditService{}, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
 	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
 	first := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-job-1"))
 	require.Equal(t, http.StatusAccepted, first.Code, first.Body.String())
@@ -264,7 +275,7 @@ func TestGeneratedIdempotencyKeyFingerprintCollisionReturnsConflict(t *testing.T
 
 func TestGeneratedConcurrentDuplicateReturnsRetryableConflictWithoutSecondExecution(t *testing.T) {
 	jobs := newBlockingJobService()
-	services := Services{Jobs: jobs, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	services := Services{Jobs: jobs, Audit: &recordingAuditService{}, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
 	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
 	handler := NewHTTPHandler(services, platformStaticPrincipalResolver{principal: principal})
 	first := httptest.NewRecorder()
@@ -367,6 +378,7 @@ func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
 		getValue:      artifact.Artifact{ID: "artifact-1", Scope: platformTestScope, Kind: "inspection-report", ContentType: "application/json", SizeBytes: 37, Checksum: "sha256:abc", CreatedBy: "trusted-user", CreatedAt: created, ExpiresAt: &expires},
 		downloadValue: artifact.Download{URL: "https://downloads.example/artifact-1?signature=safe", ExpiresAt: created.Add(5 * time.Minute)},
 	}
+	actionAudits := &recordingAuditService{}
 
 	metadataRequest := httptest.NewRequest(http.MethodGet, platformBasePath+"/artifacts/artifact-1", nil)
 	metadataResponse := servePlatformRequest(Services{Artifacts: artifacts}, principalWith(platformTestScope, openapi.PermissionGetArtifact), metadataRequest)
@@ -377,11 +389,18 @@ func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
 
 	downloadRequest := httptest.NewRequest(http.MethodPost, platformBasePath+"/artifacts/artifact-1/actions/download", nil)
 	downloadRequest.Header.Set("Idempotency-Key", "download-artifact-1")
-	downloadResponse := servePlatformRequest(Services{Artifacts: artifacts, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), downloadRequest)
+	downloadRequest.Header.Set("X-Request-ID", "request-download-1")
+	downloadRequest.Header.Set("traceparent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01")
+	downloadResponse := servePlatformRequest(Services{Artifacts: artifacts, Audit: actionAudits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}, principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload), downloadRequest)
 	require.Equal(t, http.StatusOK, downloadResponse.Code, downloadResponse.Body.String())
 	require.Equal(t, platformTestScope, artifacts.downloadScope)
 	require.Equal(t, "artifact-1", artifacts.downloadID)
 	require.Equal(t, artifact.MaximumDownloadTTL, artifacts.downloadTTL)
+	require.Len(t, actionAudits.records, 1)
+	require.Equal(t, "artifact.download_authorized", actionAudits.records[0].Action)
+	require.Equal(t, audit.Resource{Type: "artifact", ID: "artifact-1"}, actionAudits.records[0].Resource)
+	require.Equal(t, "request-download-1", actionAudits.records[0].RequestID)
+	require.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", actionAudits.records[0].TraceID)
 	requireOpenAPIResponse(t, downloadRequest, downloadResponse)
 }
 
@@ -389,7 +408,7 @@ func TestGeneratedAuditListUsesOnlyURLScopeAndOpaqueCursor(t *testing.T) {
 	occurred := time.Date(2026, 8, 28, 4, 0, 0, 0, time.UTC)
 	audits := &recordingAuditService{page: audit.Page{Items: []audit.Event{{
 		ID: "audit-1", Scope: platformTestScope, OccurredAt: occurred, Action: "inspection.started",
-		Actor: audit.Actor{Type: "user", ID: "trusted-user"}, RequestID: "request-job-1", Detail: map[string]any{"result": "accepted"},
+		Actor: audit.Actor{Type: "user", ID: "trusted-user"}, Result: "success", RequestID: "request-job-1", CommandID: "command-1", Detail: map[string]any{"result": "accepted"},
 	}}, NextCursor: "next-cursor"}}
 	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/audit-events?cursor=opaque-cursor&limit=1", nil)
 	response := servePlatformRequest(Services{Audit: audits}, principalWith(platformTestScope, openapi.PermissionListAuditEvents), request)
@@ -397,7 +416,7 @@ func TestGeneratedAuditListUsesOnlyURLScopeAndOpaqueCursor(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	require.Equal(t, platformTestScope, audits.scope)
 	require.Equal(t, audit.ListQuery{Cursor: "opaque-cursor", Limit: 1}, audits.query)
-	require.JSONEq(t, `{"items":[{"id":"audit-1","occurred_at":"2026-08-28T04:00:00Z","action":"inspection.started","tenant_id":"tenant-a","project_id":"project-a","actor":{"type":"user","id":"trusted-user"},"request_id":"request-job-1","detail":{"result":"accepted"}}],"page":{"limit":1,"next_cursor":"next-cursor","has_more":true}}`, response.Body.String())
+	require.JSONEq(t, `{"items":[{"id":"audit-1","occurred_at":"2026-08-28T04:00:00Z","action":"inspection.started","tenant_id":"tenant-a","project_id":"project-a","actor":{"type":"user","id":"trusted-user"},"result":"success","request_id":"request-job-1","command_id":"command-1","detail":{"result":"accepted"}}],"page":{"limit":1,"next_cursor":"next-cursor","has_more":true}}`, response.Body.String())
 	requireOpenAPIResponse(t, request, response)
 }
 
@@ -520,6 +539,9 @@ func TestPlatformIdempotencyFingerprintBindsRequestInputsAndExcludesIdentityToke
 }
 
 func servePlatformRequest(services Services, principal Principal, request *http.Request) *httptest.ResponseRecorder {
+	if services.Audit == nil {
+		services.Audit = &recordingAuditService{}
+	}
 	response := httptest.NewRecorder()
 	NewHTTPHandler(services, platformStaticPrincipalResolver{principal: principal}).ServeHTTP(response, request)
 	return response
@@ -628,9 +650,34 @@ func (service *recordingJobService) Get(_ context.Context, scope platformscope.S
 	return service.getValue, service.getErr
 }
 
-func (service *recordingJobService) Transition(_ context.Context, transition job.Transition) (job.Job, error) {
+func (service *recordingJobService) RequestCancel(_ context.Context, scope platformscope.Scope, id, actor string, version int64, at time.Time) (job.Job, error) {
+	transition := job.Transition{Scope: scope, JobID: id, Actor: actor, CurrentVersion: version, To: job.StatusCancelling, At: at}
 	service.transitions = append(service.transitions, transition)
 	return service.transitionValue, service.transitionErr
+}
+
+func TestPlatformTraceparentRejectsMalformedInputAndGeneratesValidContext(t *testing.T) {
+	jobs := &recordingJobService{getValue: validPlatformJob()}
+	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/jobs/job-1", nil)
+	request.Header.Set("traceparent", "00-not-a-trace-secret-value")
+	response := servePlatformRequest(Services{Jobs: jobs}, principalWith(platformTestScope, openapi.PermissionGetJob), request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	generated := response.Header().Get("traceparent")
+	require.NotEqual(t, request.Header.Get("traceparent"), generated)
+	canonical, traceID := validTraceparent([]string{generated})
+	require.Equal(t, generated, canonical)
+	require.Len(t, traceID, 32)
+}
+
+func TestBearerUnauthorizedResponseAdvertisesBearerChallenge(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/jobs/job-1", nil)
+	request.Header.Set("Authorization", "Bearer expired-token")
+	response := httptest.NewRecorder()
+	NewHTTPHandler(Services{Jobs: &recordingJobService{}}, BearerPrincipalResolver{Verifier: &recordingTokenVerifier{err: errors.New("expired")}}).ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusUnauthorized, response.Code)
+	require.Equal(t, "Bearer", response.Header().Get("WWW-Authenticate"))
 }
 
 type recordingArtifactService struct {
@@ -659,11 +706,22 @@ func (service *recordingArtifactService) CreateDownload(_ context.Context, scope
 }
 
 type recordingAuditService struct {
-	page  audit.Page
-	err   error
-	scope platformscope.Scope
-	query audit.ListQuery
-	calls int
+	page    audit.Page
+	err     error
+	scope   platformscope.Scope
+	query   audit.ListQuery
+	calls   int
+	records []audit.Event
+}
+
+func (service *recordingAuditService) RecordOnce(_ context.Context, event audit.Event) (audit.Event, error) {
+	for _, existing := range service.records {
+		if existing.DedupeKey == event.DedupeKey {
+			return existing, nil
+		}
+	}
+	service.records = append(service.records, event)
+	return event, service.err
 }
 
 func (service *recordingAuditService) List(_ context.Context, scope platformscope.Scope, query audit.ListQuery) (audit.Page, error) {
@@ -792,7 +850,7 @@ func (service *blockingJobService) Get(context.Context, platformscope.Scope, str
 	return validPlatformJob(), nil
 }
 
-func (service *blockingJobService) Transition(_ context.Context, _ job.Transition) (job.Job, error) {
+func (service *blockingJobService) RequestCancel(_ context.Context, _ platformscope.Scope, _ string, _ string, _ int64, _ time.Time) (job.Job, error) {
 	service.mu.Lock()
 	service.count++
 	if service.count == 1 {

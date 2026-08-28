@@ -67,6 +67,34 @@ func TestCommandVerifierRejectsNonceReuseAcrossCommandIDsButAllowsCommandReplay(
 	require.ErrorIs(t, verifier.Verify(context.Background(), second), ErrCommandNonceReplay)
 }
 
+func TestCommandVerifierUsesSharedSemanticAndTargetAuthorization(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Unix(1_725_000_000, 0).UTC()
+	verifier, err := NewCommandVerifier("agent-a", publicKey, []string{"collect_now", "inspect_instance"})
+	require.NoError(t, err)
+	verifier.now = func() time.Time { return now }
+
+	invalid := signedCollectNowEnvelope(t, privateKey, "invalid", "agent-a", []byte("nonce-invalid"), now, now.Add(time.Minute))
+	invalid.GetCollectNow().CollectionKinds = nil
+	signEnvelope(t, privateKey, invalid)
+	require.ErrorIs(t, verifier.Verify(context.Background(), invalid), ErrInvalidCommandEnvelope)
+
+	instanceBound := signedInspectEnvelope(t, privateKey, "inspect", "agent-a", []byte("nonce-inspect"), now, now.Add(time.Minute))
+	require.ErrorIs(t, verifier.Verify(context.Background(), instanceBound), ErrCommandTargetUnauthorized)
+	verifier.SetTargetAuthorizer(staticTargetAuthorizer{allowed: true})
+	require.NoError(t, verifier.Verify(context.Background(), instanceBound))
+}
+
+type staticTargetAuthorizer struct{ allowed bool }
+
+func (authorizer staticTargetAuthorizer) AuthorizeTarget(context.Context, string, string) error {
+	if authorizer.allowed {
+		return nil
+	}
+	return ErrCommandTargetUnauthorized
+}
+
 func signedCollectNowEnvelope(t *testing.T, privateKey ed25519.PrivateKey, commandID, agentID string, nonce []byte, issuedAt, expiresAt time.Time) *agentv1.CommandEnvelope {
 	t.Helper()
 	envelope := &agentv1.CommandEnvelope{
@@ -83,7 +111,7 @@ func signedInspectEnvelope(t *testing.T, privateKey ed25519.PrivateKey, commandI
 	envelope := &agentv1.CommandEnvelope{
 		CommandId: commandID, JobId: "job-" + commandID, AgentId: agentID, Nonce: append([]byte(nil), nonce...),
 		IssuedAt: timestamppb.New(issuedAt), ExpiresAt: timestamppb.New(expiresAt), LeaseSeconds: 30,
-		Command: &agentv1.CommandEnvelope_InspectInstance{InspectInstance: &agentv1.InspectInstance{InstanceId: "instance-a"}},
+		Command: &agentv1.CommandEnvelope_InspectInstance{InspectInstance: &agentv1.InspectInstance{InstanceId: "instance-a", InspectionKinds: []string{"health"}}},
 	}
 	signEnvelope(t, privateKey, envelope)
 	return envelope

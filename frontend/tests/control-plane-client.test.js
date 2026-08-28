@@ -68,6 +68,29 @@ test('each request reads a fresh bearer token and assigns a request id', async (
   ]);
 });
 
+test('each request injects a valid W3C traceparent and never trusts malformed input', async () => {
+	const seen = [];
+	let calls = 0;
+	const supplied = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+	const scoped = createControlPlaneClient({
+		baseUrl: 'https://control.example',
+		getAccessToken: () => 'token',
+		requestIdFactory: () => 'req-trace',
+		traceparentFactory: () => (++calls === 1 ? supplied : '00-malformed-private-value'),
+		fetchImpl: async (_url, init) => {
+			seen.push(init.headers.traceparent);
+			return capabilityResponse();
+		},
+	}).forScope({ tenantId: 'tenant-a', projectId: 'project-a' });
+
+	await scoped.platform.getCapabilities();
+	await scoped.platform.getCapabilities();
+
+	assert.equal(seen[0], supplied);
+	assert.notEqual(seen[1], '00-malformed-private-value');
+	assert.match(seen[1], /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+});
+
 test('write request options propagate idempotency, entity tag, and abort signal', async () => {
   const seen = [];
   const controller = new AbortController();

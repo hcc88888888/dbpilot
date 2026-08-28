@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const breakingScript = join(repoRoot, 'scripts', 'contracts', 'breaking.ps1');
-const canonicalAgentContract = 'contracts/protobuf/dbpilot/agent/v1/command.proto';
+const canonicalAgentContract = 'contracts/protobuf/dbpilot';
+const canonicalAgentContractFile = `${canonicalAgentContract}/agent/v1/command.proto`;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -32,7 +33,7 @@ async function createBreakingFixture({ includeOriginMain, includeCanonicalContra
   await writeFile(join(root, 'buf.yaml'), 'version: v2\n');
 
   if (includeCanonicalContract) {
-    const contractPath = join(root, canonicalAgentContract);
+    const contractPath = join(root, canonicalAgentContractFile);
     await mkdir(dirname(contractPath), { recursive: true });
     await writeFile(contractPath, 'syntax = "proto3";\npackage dbpilot.agent.v1;\n');
   }
@@ -67,6 +68,12 @@ test('contract toolchain is pinned and generated output is tracked', async () =>
   assert.equal(pkg.devDependencies.typescript, '5.9.2');
   const ignore = await readFile('.gitignore', 'utf8');
   assert.doesNotMatch(ignore, /^backend\/gen\/$/m);
+	const generator = JSON.parse(await readFile('frontend/generated/api/openapi-generator-config.json', 'utf8'));
+	assert.equal(generator.enumUnknownDefaultCase, true);
+	const workflow = await readFile('.github/workflows/contracts.yml', 'utf8');
+	for (const requiredPath of ['buf.yaml', 'buf.gen.yaml', 'redocly.yaml', 'backend/api/openapi/**', 'deploy/contracts/**', 'frontend/generated/api/openapi-generator-config.json']) {
+		assert.match(workflow, new RegExp(`['"]${requiredPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`));
+	}
 });
 
 test('breaking check fails when origin/main is unavailable', async () => {
@@ -115,6 +122,7 @@ test('breaking check invokes the pinned Buf container when origin/main contains 
     assert.match(invocation, /^run --rm /);
     assert.match(invocation, /bufbuild\/buf:1\.57\.2 breaking \/workspace/);
     assert.match(invocation, /--against \/baseline/);
+		assert.doesNotMatch(invocation, /--path contracts\/protobuf\/dbpilot\/agent\/v1\/command\.proto/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

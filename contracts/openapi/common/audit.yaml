@@ -17,6 +17,7 @@ AuditEvent:
     - tenant_id
     - project_id
     - actor
+    - result
     - request_id
   properties:
     id:
@@ -32,10 +33,15 @@ AuditEvent:
       $ref: ./identifiers.yaml#/ProjectId
     actor:
       $ref: '#/AuditActor'
+    result:
+      type: string
+      minLength: 1
     source_resource:
       $ref: ./jobs.yaml#/ResourceReference
     job_id:
       $ref: ./identifiers.yaml#/JobId
+    command_id:
+      $ref: ./identifiers.yaml#/CommandId
     request_id:
       $ref: ./identifiers.yaml#/RequestId
     trace_id:

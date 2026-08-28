@@ -119,19 +119,41 @@ type Transition struct {
 }
 
 type OutboxMessage struct {
-	ID               string              `json:"id"`
-	Scope            platformscope.Scope `json:"scope"`
-	JobID            string              `json:"job_id"`
-	TargetID         string              `json:"target_id,omitempty"`
-	Type             string              `json:"type"`
-	Payload          []byte              `json:"payload"`
-	PreparedEnvelope []byte              `json:"-"`
-	AvailableAt      time.Time           `json:"available_at"`
-	CreatedAt        time.Time           `json:"created_at"`
-	LeasedUntil      *time.Time          `json:"leased_until,omitempty"`
-	PublishedAt      *time.Time          `json:"published_at,omitempty"`
-	Attempts         int                 `json:"attempts"`
+	ID                      string              `json:"id"`
+	Scope                   platformscope.Scope `json:"scope"`
+	JobID                   string              `json:"job_id"`
+	TargetID                string              `json:"target_id,omitempty"`
+	Type                    string              `json:"type"`
+	Payload                 []byte              `json:"payload"`
+	PreparedEnvelope        []byte              `json:"-"`
+	AvailableAt             time.Time           `json:"available_at"`
+	CreatedAt               time.Time           `json:"created_at"`
+	LeasedUntil             *time.Time          `json:"leased_until,omitempty"`
+	PublishedAt             *time.Time          `json:"published_at,omitempty"`
+	Attempts                int                 `json:"attempts"`
+	CommandStatus           CommandStatus       `json:"command_status"`
+	AcknowledgedAt          *time.Time          `json:"acknowledged_at,omitempty"`
+	ExecutionDeadline       *time.Time          `json:"execution_deadline,omitempty"`
+	LastHeartbeatAt         *time.Time          `json:"last_heartbeat_at,omitempty"`
+	RecoveryLeasedUntil     *time.Time          `json:"recovery_leased_until,omitempty"`
+	CancellationRequestedAt *time.Time          `json:"cancellation_requested_at,omitempty"`
+	CancellationReason      string              `json:"cancellation_reason,omitempty"`
+	CancellationAvailableAt *time.Time          `json:"cancellation_available_at,omitempty"`
+	CancellationLeasedUntil *time.Time          `json:"cancellation_leased_until,omitempty"`
+	CancellationAttempts    int                 `json:"cancellation_attempts"`
 }
+
+type CommandStatus string
+
+const (
+	CommandPending   CommandStatus = "pending"
+	CommandActive    CommandStatus = "active"
+	CommandSucceeded CommandStatus = "succeeded"
+	CommandFailed    CommandStatus = "failed"
+	CommandCancelled CommandStatus = "cancelled"
+	CommandTimedOut  CommandStatus = "timed_out"
+	CommandRejected  CommandStatus = "rejected"
+)
 
 func ApplyTransition(current Job, transition Transition) (Job, error) {
 	if transition.CurrentVersion != 0 && transition.CurrentVersion != current.Version {
@@ -295,13 +317,13 @@ func ValidateTargets(value Job) error {
 func allowedTransition(from, to Status) bool {
 	switch from {
 	case StatusQueued:
-		return to == StatusDispatched
+		return to == StatusDispatched || to == StatusCancelling
 	case StatusDispatched:
-		return to == StatusRunning
+		return to == StatusRunning || to == StatusCancelling
 	case StatusRunning:
 		return to == StatusRunning || to == StatusSucceeded || to == StatusFailed || to == StatusTimedOut || to == StatusCancelling
 	case StatusCancelling:
-		return to == StatusCancelling || to == StatusCancelled
+		return to == StatusCancelling || to == StatusSucceeded || to == StatusFailed || to == StatusCancelled || to == StatusTimedOut
 	default:
 		return false
 	}

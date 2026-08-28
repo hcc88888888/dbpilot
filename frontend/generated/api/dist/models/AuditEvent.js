@@ -29,6 +29,8 @@ export function instanceOfAuditEvent(value) {
         return false;
     if (!('actor' in value) || value['actor'] === undefined)
         return false;
+    if (!('result' in value) || value['result'] === undefined)
+        return false;
     if (!('requestId' in value) || value['requestId'] === undefined)
         return false;
     return true;
@@ -47,8 +49,10 @@ export function AuditEventFromJSONTyped(json, ignoreDiscriminator) {
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
         'actor': AuditActorFromJSON(json['actor']),
+        'result': json['result'],
         'sourceResource': json['source_resource'] == null ? undefined : ResourceReferenceFromJSON(json['source_resource']),
         'jobId': json['job_id'] == null ? undefined : json['job_id'],
+        'commandId': json['command_id'] == null ? undefined : json['command_id'],
         'requestId': json['request_id'],
         'traceId': json['trace_id'] == null ? undefined : json['trace_id'],
         'detail': json['detail'] == null ? undefined : json['detail'],
@@ -68,8 +72,10 @@ export function AuditEventToJSONTyped(value, ignoreDiscriminator = false) {
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],
         'actor': AuditActorToJSON(value['actor']),
+        'result': value['result'],
         'source_resource': ResourceReferenceToJSON(value['sourceResource']),
         'job_id': value['jobId'],
+        'command_id': value['commandId'],
         'request_id': value['requestId'],
         'trace_id': value['traceId'],
         'detail': value['detail'],

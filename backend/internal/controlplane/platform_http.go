@@ -69,11 +69,11 @@ func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func
 
 	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)))
 	secured := authenticatePlatform(registrar.resolver, requirePlatformScope(validated))
-	registrar.mux.Handle(pattern, withRequestID(registrar.validator.middleware(exactPlatformMethod(method, secured))))
+	registrar.mux.Handle(pattern, withRequestID(withTraceContext(registrar.validator.middleware(exactPlatformMethod(method, secured)))))
 	if firstPathRegistration {
-		registrar.mux.Handle(path, withRequestID(registrar.validator.middleware(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		registrar.mux.Handle(path, withRequestID(withTraceContext(registrar.validator.middleware(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			writePlatformMethodNotAllowed(writer, request, registrar.allowedMethods(path))
-		}))))
+		})))))
 	}
 }
 
@@ -137,17 +137,26 @@ func writePlatformMethodNotAllowed(writer http.ResponseWriter, request *http.Req
 func authenticatePlatform(resolver PrincipalResolver, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if resolver == nil {
+			setBearerChallenge(writer, resolver)
 			writePlatformProblem(writer, request, ErrUnauthenticated)
 			return
 		}
 		principal, err := resolver.ResolvePrincipal(request)
 		if err != nil || strings.TrimSpace(principal.Subject) == "" {
+			setBearerChallenge(writer, resolver)
 			writePlatformProblem(writer, request, ErrUnauthenticated)
 			return
 		}
 		ctx := context.WithValue(request.Context(), principalContextKey{}, principal)
 		next.ServeHTTP(writer, request.WithContext(ctx))
 	})
+}
+
+func setBearerChallenge(writer http.ResponseWriter, resolver PrincipalResolver) {
+	switch resolver.(type) {
+	case BearerPrincipalResolver, *BearerPrincipalResolver:
+		writer.Header().Set("WWW-Authenticate", "Bearer")
+	}
 }
 
 func requirePlatformScope(next http.Handler) http.Handler {

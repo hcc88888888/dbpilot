@@ -13,6 +13,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -31,17 +32,21 @@ type CommandExecutor interface {
 }
 
 type ExecutorRegistry struct {
-	mu        sync.RWMutex
-	executors map[CommandKind]CommandExecutor
+	mu               sync.RWMutex
+	executors        map[CommandKind]CommandExecutor
+	processExecutors map[string]CommandExecutor
 }
 
 func NewExecutorRegistry() *ExecutorRegistry {
-	return &ExecutorRegistry{executors: make(map[CommandKind]CommandExecutor)}
+	return &ExecutorRegistry{executors: make(map[CommandKind]CommandExecutor), processExecutors: make(map[string]CommandExecutor)}
 }
 
 func (r *ExecutorRegistry) Register(kind CommandKind, executor CommandExecutor) error {
 	if !knownCommandKind(kind) {
 		return fmt.Errorf("unknown command kind %q", kind)
+	}
+	if kind == CommandKindExecuteRegisteredProcess {
+		return errors.New("registered process executors must be bound to an exact process ID")
 	}
 	if executor == nil {
 		return errors.New("command executor is required")
@@ -55,12 +60,32 @@ func (r *ExecutorRegistry) Register(kind CommandKind, executor CommandExecutor) 
 	return nil
 }
 
+func (r *ExecutorRegistry) RegisterProcess(processID string, executor CommandExecutor) error {
+	if executor == nil {
+		return errors.New("command executor is required")
+	}
+	probe := &agentv1.CommandEnvelope{AgentId: "registry", Command: &agentv1.CommandEnvelope_ExecuteRegisteredProcess{ExecuteRegisteredProcess: &agentv1.ExecuteRegisteredProcess{ProcessId: processID}}}
+	if err := commandvalidation.Validate(context.Background(), probe, nil); err != nil {
+		return fmt.Errorf("invalid registered process ID: %w", err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.processExecutors[processID]; exists {
+		return fmt.Errorf("command executor already registered for process %q", processID)
+	}
+	r.processExecutors[processID] = executor
+	return nil
+}
+
 func (r *ExecutorRegistry) Capabilities() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	capabilities := make([]string, 0, len(r.executors))
 	for kind := range r.executors {
 		capabilities = append(capabilities, string(kind))
+	}
+	if len(r.processExecutors) > 0 {
+		capabilities = append(capabilities, string(CommandKindExecuteRegisteredProcess))
 	}
 	sort.Strings(capabilities)
 	return capabilities
@@ -73,6 +98,10 @@ func (r *ExecutorRegistry) executor(envelope *agentv1.CommandEnvelope) (CommandE
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if kind == CommandKindExecuteRegisteredProcess {
+		executor, exists := r.processExecutors[envelope.GetExecuteRegisteredProcess().GetProcessId()]
+		return executor, exists
+	}
 	executor, exists := r.executors[kind]
 	return executor, exists
 }
@@ -358,6 +387,16 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		if typed.CommandCancellation != nil {
 			c.cancelCommand(typed.CommandCancellation.GetCommandId())
 		}
+	case *agentv1.ServerMessage_CommandResultAcknowledgement:
+		acknowledgement := typed.CommandResultAcknowledgement
+		if acknowledgement == nil || strings.TrimSpace(acknowledgement.GetCommandId()) == "" {
+			return errors.New("command result acknowledgement is invalid")
+		}
+		if acknowledgement.GetPersisted() {
+			if err := c.journal.MarkReported(ctx, acknowledgement.GetCommandId(), c.now()); err != nil {
+				return &fatalControlError{err: fmt.Errorf("mark durably acknowledged command result reported: %w", err)}
+			}
+		}
 	case *agentv1.ServerMessage_PolicyUpdate, *agentv1.ServerMessage_FlowControlInstruction:
 		// Policy and flow-control consumers are independent runtime boundaries.
 	case *agentv1.ServerMessage_HelloAck:
@@ -425,10 +464,8 @@ func (c *ControlClient) execute(ctx context.Context, envelope *agentv1.CommandEn
 	}
 	if err := c.journal.Complete(context.Background(), envelope.GetCommandId(), result, c.now()); err != nil {
 		c.reportExecutionError(fmt.Errorf("persist terminal command result: %w", err))
-	} else if err := c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}}); err == nil {
-		if markErr := c.journal.MarkReported(context.Background(), envelope.GetCommandId(), c.now()); markErr != nil {
-			c.reportExecutionError(fmt.Errorf("mark terminal command result reported: %w", markErr))
-		}
+	} else {
+		_ = c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}})
 	}
 	c.runningMu.Lock()
 	delete(c.running, envelope.GetCommandId())
@@ -446,9 +483,6 @@ func (c *ControlClient) replayPendingResults(ctx context.Context, session *contr
 		}
 		if err := c.sendThroughSession(session, &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: entry.Result}}); err != nil {
 			return err
-		}
-		if err := c.journal.MarkReported(ctx, entry.CommandID, c.now()); err != nil {
-			return &fatalControlError{err: fmt.Errorf("mark replayed command result reported: %w", err)}
 		}
 	}
 	return nil
@@ -577,6 +611,8 @@ func commandRejectionReason(err error) string {
 		return "CAPABILITY_UNAVAILABLE"
 	case errors.Is(err, ErrCommandNonceReplay):
 		return "NONCE_REPLAY"
+	case errors.Is(err, ErrCommandTargetUnauthorized):
+		return "TARGET_UNAUTHORIZED"
 	default:
 		return "INVALID_COMMAND"
 	}

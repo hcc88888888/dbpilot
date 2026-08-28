@@ -51,7 +51,7 @@ func (api platformAPI) GetJob(ctx context.Context, request openapi.GetJobRequest
 }
 
 func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobRequestObject) (openapi.CancelJobResponseObject, error) {
-	if api.services.Jobs == nil || api.services.Idempotency == nil {
+	if api.services.Jobs == nil || api.services.Idempotency == nil || api.services.Audit == nil {
 		return nil, ErrServiceUnavailable
 	}
 	scope, principal, err := platformRequestIdentity(ctx)
@@ -85,10 +85,7 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if api.services.Now != nil {
 		now = api.services.Now
 	}
-	value, err := api.services.Jobs.Transition(ctx, job.Transition{
-		Scope: scope, JobID: request.JobId, CurrentVersion: version,
-		To: job.StatusCancelling, Actor: principal.Subject, At: now().UTC(),
-	})
+	value, err := api.services.Jobs.RequestCancel(ctx, scope, request.JobId, principal.Subject, version, now().UTC())
 	if errors.Is(err, job.ErrConflict) {
 		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
 			return nil, abortErr
@@ -105,6 +102,9 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	}
 	if value.ID != request.JobId || value.Scope != scope {
 		return nil, errors.New("job service returned an out-of-scope entity")
+	}
+	if _, err := api.services.Audit.RecordOnce(ctx, httpActionAuditEvent(ctx, scope, principal, "job.cancel_requested", "job", request.JobId, "success", "cancelJob", request.Params.IdempotencyKey)); err != nil {
+		return nil, err
 	}
 	response, err := openAPIJob(value)
 	if err != nil {
@@ -148,7 +148,7 @@ func (api platformAPI) GetArtifact(ctx context.Context, request openapi.GetArtif
 }
 
 func (api platformAPI) CreateArtifactDownload(ctx context.Context, request openapi.CreateArtifactDownloadRequestObject) (openapi.CreateArtifactDownloadResponseObject, error) {
-	if api.services.Artifacts == nil || api.services.Idempotency == nil {
+	if api.services.Artifacts == nil || api.services.Idempotency == nil || api.services.Audit == nil {
 		return nil, ErrServiceUnavailable
 	}
 	scope, principal, err := platformRequestIdentity(ctx)
@@ -181,6 +181,9 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 				return nil, abortErr
 			}
 		}
+		return nil, err
+	}
+	if _, err := api.services.Audit.RecordOnce(ctx, httpActionAuditEvent(ctx, scope, principal, "artifact.download_authorized", "artifact", request.ArtifactId, "success", "createArtifactDownload", request.Params.IdempotencyKey)); err != nil {
 		return nil, err
 	}
 	var headers *map[string]string
@@ -223,7 +226,7 @@ func (api platformAPI) ListAuditEvents(ctx context.Context, request openapi.List
 		query.Cursor = *request.Params.Cursor
 	}
 	if request.Params.Limit != nil {
-		if *request.Params.Limit < 1 || *request.Params.Limit > 500 {
+		if *request.Params.Limit < 1 || *request.Params.Limit > audit.MaximumListLimit {
 			return nil, ErrInvalidRequest
 		}
 		query.Limit = *request.Params.Limit
@@ -363,6 +366,17 @@ func jobTransitionFailedBeforeSideEffect(err error) bool {
 	return errors.Is(err, job.ErrNotFound) || errors.Is(err, job.ErrInvalidTransition)
 }
 
+func httpActionAuditEvent(ctx context.Context, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string) audit.Event {
+	digest := sha256.Sum256([]byte(scope.Key() + "\x00" + principal.Subject + "\x00" + operationID + "\x00" + resourceID + "\x00" + idempotencyKey))
+	return audit.Event{
+		Scope: scope, Action: action, Actor: audit.Actor{Type: "user", ID: principal.Subject},
+		Resource: audit.Resource{Type: resourceType, ID: resourceID}, Result: result,
+		RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx),
+		DedupeKey: "http.action:" + hex.EncodeToString(digest[:]),
+		Detail:    map[string]any{"operation_id": operationID},
+	}
+}
+
 func (response getJobOKResponse) VisitGetJobResponse(writer http.ResponseWriter) error {
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(response.Body); err != nil {
@@ -446,7 +460,7 @@ func openAPIAuditEvent(value audit.Event) openapi.AuditEvent {
 	response := openapi.AuditEvent{
 		Id: value.ID, OccurredAt: value.OccurredAt.UTC(), Action: value.Action,
 		TenantId: value.Scope.TenantID, ProjectId: value.Scope.ProjectID,
-		Actor: openapi.AuditActor{Type: value.Actor.Type, Id: value.Actor.ID}, RequestId: value.RequestID,
+		Actor: openapi.AuditActor{Type: value.Actor.Type, Id: value.Actor.ID}, Result: value.Result, RequestId: value.RequestID,
 	}
 	if value.Resource.Type != "" && value.Resource.ID != "" {
 		response.SourceResource = &openapi.ResourceReference{ResourceType: value.Resource.Type, ResourceId: value.Resource.ID}
@@ -454,6 +468,10 @@ func openAPIAuditEvent(value audit.Event) openapi.AuditEvent {
 	if value.JobID != "" {
 		jobID := openapi.JobId(value.JobID)
 		response.JobId = &jobID
+	}
+	if value.CommandID != "" {
+		commandID := openapi.CommandId(value.CommandID)
+		response.CommandId = &commandID
 	}
 	if value.TraceID != "" {
 		traceID := openapi.TraceId(value.TraceID)
@@ -472,7 +490,7 @@ func openAPIAuditEvent(value audit.Event) openapi.AuditEvent {
 func openAPICapability(value capability.Capability) openapi.Capability {
 	response := openapi.Capability{
 		Name: value.Name, Enabled: value.Enabled,
-		DatabaseTypes: append([]string(nil), value.DatabaseTypes...), AgentCapabilities: append([]string(nil), value.AgentCapabilities...),
+		DatabaseTypes: append([]string{}, value.DatabaseTypes...), AgentCapabilities: append([]string{}, value.AgentCapabilities...),
 		RequiredPermission: value.RequiredPermission,
 	}
 	if value.ReasonCode != "" {

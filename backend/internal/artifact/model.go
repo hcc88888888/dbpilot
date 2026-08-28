@@ -2,6 +2,7 @@ package artifact
 
 import (
 	"errors"
+	"regexp"
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -15,7 +16,12 @@ var (
 	ErrInvalid                  = errors.New("invalid artifact request")
 	ErrInvalidSignature         = errors.New("invalid artifact download signature")
 	ErrBeforeDownloadSideEffect = errors.New("artifact download failed before signer invocation")
+	ErrIntegrityMismatch        = errors.New("artifact content integrity mismatch")
 )
+
+var artifactIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+
+func validArtifactID(value string) bool { return artifactIDPattern.MatchString(value) }
 
 type ResourceReference struct {
 	ResourceType string `json:"resource_type"`

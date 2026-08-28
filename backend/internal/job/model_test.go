@@ -79,6 +79,45 @@ func TestTransitionAllowsCancellation(t *testing.T) {
 	require.Equal(t, finishedAt.UTC(), *current.FinishedAt)
 }
 
+func TestCancellationCanStartBeforeDispatchAndActualResultsChooseTerminalState(t *testing.T) {
+	created := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	for _, initial := range []Status{StatusQueued, StatusDispatched, StatusRunning} {
+		t.Run(string(initial), func(t *testing.T) {
+			current := runningJob()
+			current.Status = initial
+			current.Version = 1
+			current.TargetResults = []TargetResult{{TargetID: "db-1", Status: TargetQueued}}
+			current.Progress = Progress{TotalTargets: 1}
+			if initial == StatusQueued {
+				current.DispatchedAt, current.StartedAt = nil, nil
+			} else if initial == StatusDispatched {
+				current.StartedAt = nil
+			}
+			cancelling := requireTransition(t, current, Transition{To: StatusCancelling, Actor: "operator", At: created})
+			require.Equal(t, StatusCancelling, cancelling.Status)
+		})
+	}
+
+	tests := []struct {
+		name   string
+		target TargetStatus
+		to     Status
+	}{
+		{name: "too late success", target: TargetSucceeded, to: StatusSucceeded},
+		{name: "cancelled", target: TargetCancelled, to: StatusCancelled},
+		{name: "failed", target: TargetFailed, to: StatusFailed},
+		{name: "timed out", target: TargetTimedOut, to: StatusTimedOut},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			current := requireTransition(t, runningJob(), Transition{To: StatusCancelling, Actor: "operator", At: created})
+			current = requireTransition(t, current, Transition{To: StatusCancelling, Actor: "operator", At: created.Add(time.Second), TargetResults: []TargetResult{{TargetID: "db-1", Status: test.target}}})
+			current = requireTransition(t, current, Transition{To: test.to, At: created.Add(2 * time.Second)})
+			require.Equal(t, test.to, current.Status)
+		})
+	}
+}
+
 func TestCancellingSelfTransitionRequiresTargetEvidenceAndPreservesRequester(t *testing.T) {
 	current := runningJob()
 	cancelling, err := ApplyTransition(current, Transition{To: StatusCancelling, Actor: "operator-1", At: current.CreatedAt.Add(3 * time.Second)})

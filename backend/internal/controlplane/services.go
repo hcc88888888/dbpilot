@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
@@ -16,7 +17,7 @@ import (
 
 type JobService interface {
 	Get(context.Context, platformscope.Scope, string) (job.Job, error)
-	Transition(context.Context, job.Transition) (job.Job, error)
+	RequestCancel(context.Context, platformscope.Scope, string, string, int64, time.Time) (job.Job, error)
 }
 
 type ArtifactService interface {
@@ -26,6 +27,7 @@ type ArtifactService interface {
 
 type AuditService interface {
 	List(context.Context, platformscope.Scope, audit.ListQuery) (audit.Page, error)
+	RecordOnce(context.Context, audit.Event) (audit.Event, error)
 }
 
 type CapabilityService interface {
@@ -41,14 +43,15 @@ type IdempotencyService interface {
 // Services contains the dependencies made available to HTTP handlers.
 // Monitoring deliberately uses its storage-neutral QueryStore boundary.
 type Services struct {
-	Repository   alert.ControlPlaneRepository
-	Evaluator    EvaluatorHealthReader
-	Monitoring   monitoring.QueryStore
-	Jobs         JobService
-	Artifacts    ArtifactService
-	Audit        AuditService
-	Capabilities CapabilityService
-	Idempotency  IdempotencyService
+	Repository      alert.ControlPlaneRepository
+	Evaluator       EvaluatorHealthReader
+	Monitoring      monitoring.QueryStore
+	Jobs            JobService
+	Artifacts       ArtifactService
+	Audit           AuditService
+	Capabilities    CapabilityService
+	Idempotency     IdempotencyService
+	ArtifactContent http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated
 	// principal and never trusts this callback for user authorization.

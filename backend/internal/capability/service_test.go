@@ -67,6 +67,34 @@ func TestResolveSortsCapabilitiesAndAdvertisedSetsWithoutFrontendBranching(t *te
 	require.Equal(t, []string{"postgresql", "mysql", "mysql"}, catalog[0].DatabaseTypes, "resolver must be pure")
 }
 
+func TestFoundationCatalogIsNonemptyAndExplainsMissingAgentCapability(t *testing.T) {
+	catalog := FoundationCatalog()
+	require.NotEmpty(t, catalog)
+	input := Input{DeploymentFlags: FoundationDeploymentFlags(), Permissions: map[string]bool{
+		"platform.jobs.read": true, "platform.jobs.cancel": true, "platform.audit.read": true,
+		"platform.artifacts.read": true, "platform.capabilities.read": true,
+	}}
+	resolved := Resolve(catalog, input)
+	require.Len(t, resolved, len(catalog))
+	require.True(t, findCapability(resolved, "platform.jobs").Enabled)
+	require.True(t, findCapability(resolved, "platform.audit").Enabled)
+	require.True(t, findCapability(resolved, "platform.artifacts").Enabled)
+	require.False(t, findCapability(resolved, "agent.control").Enabled)
+	require.Equal(t, AgentUnsupported, findCapability(resolved, "agent.control").ReasonCode)
+
+	input.AgentCapabilities = map[string]bool{"collect_now": true}
+	require.True(t, findCapability(Resolve(catalog, input), "agent.control").Enabled)
+}
+
+func findCapability(values []Capability, name string) Capability {
+	for _, value := range values {
+		if value.Name == name {
+			return value
+		}
+	}
+	return Capability{}
+}
+
 func cloneInput(input Input) Input {
 	result := input
 	result.DeploymentFlags = cloneSet(input.DeploymentFlags)

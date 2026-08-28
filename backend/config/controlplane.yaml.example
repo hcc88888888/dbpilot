@@ -30,6 +30,11 @@ command:
   # Credential Reference resolving to one PKCS#8 PEM Ed25519 private key.
   # The matching PKIX public key is enrolled in each Agent control config.
   signing_private_key_ref: "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"
+artifact:
+  # Artifact metadata stores only paths relative to this root. The download
+  # route rejects traversal, symlink escape, size drift, and checksum drift.
+  storage_root: "/var/lib/dbpilot/artifacts"
+  signing_key_ref: "secret://controlplane/artifact-download"
 monitoring:
   maximum_instances: 200
   maximum_metrics: 50

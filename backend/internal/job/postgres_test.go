@@ -3,6 +3,7 @@ package job
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func TestCreateWithOutboxAcceptsUnsignedProtobufCommandPayload(t *testing.T) {
 	t.Cleanup(func() { _ = database.Close() })
 	repository := NewPostgresRepository(database)
 	value, messages := persistenceFixture()
-	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "db-1", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "db-1", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}}})
 	require.NoError(t, err)
 	messages = []OutboxMessage{{ID: "command-protobuf", Scope: value.Scope, JobID: value.ID, TargetID: "db-1", Type: commandOutboxType, Payload: payload, AvailableAt: value.CreatedAt, CreatedAt: value.CreatedAt}}
 
@@ -52,6 +53,48 @@ func TestCreateWithOutboxAcceptsUnsignedProtobufCommandPayload(t *testing.T) {
 
 	require.NoError(t, repository.CreateWithOutbox(context.Background(), value, messages))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCreateWithOutboxRejectsCallerOwnedDeliveryStateAndPoisonCommandsBeforeInsert(t *testing.T) {
+	value, validMessages := persistenceFixture()
+	valid := validMessages[0]
+	prepared := []byte("signed")
+	leased := value.CreatedAt.Add(time.Minute)
+	published := value.CreatedAt.Add(time.Second)
+	cases := map[string]OutboxMessage{
+		"prepared envelope": func() OutboxMessage { candidate := valid; candidate.PreparedEnvelope = prepared; return candidate }(),
+		"lease":             func() OutboxMessage { candidate := valid; candidate.LeasedUntil = &leased; return candidate }(),
+		"published":         func() OutboxMessage { candidate := valid; candidate.PublishedAt = &published; return candidate }(),
+		"attempts":          func() OutboxMessage { candidate := valid; candidate.Attempts = 1; return candidate }(),
+		"wrong type":        func() OutboxMessage { candidate := valid; candidate.Type = "agent.shell"; return candidate }(),
+		"foreign target":    func() OutboxMessage { candidate := valid; candidate.TargetID = "db-foreign"; return candidate }(),
+		"signed payload": func() OutboxMessage {
+			candidate := valid
+			candidate.Payload = mustUnsignedCollectPayload("db-1")
+			envelope := new(agentv1.CommandEnvelope)
+			require.NoError(t, proto.Unmarshal(candidate.Payload, envelope))
+			envelope.CommandId = "caller-command"
+			candidate.Payload, _ = proto.Marshal(envelope)
+			return candidate
+		}(),
+		"empty typed payload": func() OutboxMessage {
+			candidate := valid
+			candidate.Payload, _ = proto.Marshal(&agentv1.CommandEnvelope{AgentId: "db-1", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+			return candidate
+		}(),
+	}
+	for name, message := range cases {
+		t.Run(name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = database.Close() })
+			mock.ExpectBegin()
+			mock.ExpectRollback()
+			err = NewPostgresRepository(database).CreateWithOutbox(context.Background(), value, []OutboxMessage{message})
+			require.ErrorIs(t, err, ErrInvalidCommandPayload)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 func TestCreateWithOutboxRollsBackWhenAnOutboxInsertFails(t *testing.T) {
@@ -107,10 +150,10 @@ func TestClaimOutboxLeasesRowsWithSkipLockedInCreationOrder(t *testing.T) {
 	at := time.Date(2026, 8, 28, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
 	createdOne := at.Add(-2 * time.Minute)
 	createdTwo := at.Add(-time.Minute)
-	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "prepared_envelope", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
+	columns := strings.Split(outboxColumnsSQL, ", ")
 	rows := sqlmock.NewRows(columns).
-		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", []byte(`{"command_id":"command-1"}`), nil, createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1).
-		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", []byte(`{"command_id":"command-2"}`), nil, createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1)
+		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", mustUnsignedCollectPayload("db-1"), nil, createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0).
+		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", mustUnsignedCollectPayload("db-2"), nil, createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0)
 	mock.ExpectQuery("(?s)FOR UPDATE SKIP LOCKED.*SET lease_expires_at.*ORDER BY created_at, id").
 		WithArgs(at.UTC(), 2, at.UTC().Add(DefaultOutboxLease)).
 		WillReturnRows(rows)
@@ -246,6 +289,32 @@ func TestTransitionWrapsCommitFailureAsAmbiguous(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestRequestCancelAtomicallyPersistsVersionedJobAndCommandIntent(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	current := runningJob()
+	at := current.StartedAt.Add(time.Minute)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID).WillReturnRows(jobRows(current))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID).WillReturnRows(
+		sqlmock.NewRows([]string{"target_id", "status", "error_summary", "result_summary", "artifacts", "finished_at"}).AddRow("db-1", string(TargetRunning), "", "", []byte("[]"), nil),
+	)
+	mock.ExpectExec("UPDATE jobs SET").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE command_outbox SET cancellation_requested_at").
+		WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID, at.UTC(), "job cancellation requested").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	got, err := repository.RequestCancel(context.Background(), current.Scope, current.ID, "operator-1", current.Version, at)
+	require.NoError(t, err)
+	require.Equal(t, StatusCancelling, got.Status)
+	require.Equal(t, current.Version+1, got.Version)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestMarkOutboxPublishedReturnsNotFoundForUnknownMessage(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -289,10 +358,18 @@ func persistenceFixture() (Job, []OutboxMessage) {
 		RequestID: "req-1", TraceID: "trace-1",
 	}
 	messages := []OutboxMessage{
-		{ID: "msg-1", Scope: scope, JobID: job.ID, TargetID: "db-1", Type: "agent.command", Payload: []byte(`{"command_id":"command-1"}`), AvailableAt: created, CreatedAt: created},
-		{ID: "msg-2", Scope: scope, JobID: job.ID, TargetID: "db-2", Type: "agent.command", Payload: []byte(`{"command_id":"command-2"}`), AvailableAt: created, CreatedAt: created.Add(time.Second)},
+		{ID: "msg-1", Scope: scope, JobID: job.ID, TargetID: "db-1", Type: "agent.command", Payload: mustUnsignedCollectPayload("db-1"), AvailableAt: created, CreatedAt: created},
+		{ID: "msg-2", Scope: scope, JobID: job.ID, TargetID: "db-2", Type: "agent.command", Payload: mustUnsignedCollectPayload("db-2"), AvailableAt: created, CreatedAt: created.Add(time.Second)},
 	}
 	return job, messages
+}
+
+func mustUnsignedCollectPayload(agentID string) []byte {
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: agentID, LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}}})
+	if err != nil {
+		panic(err)
+	}
+	return payload
 }
 
 func expectJobInsert(mock sqlmock.Sqlmock, job Job) {
@@ -340,10 +417,10 @@ func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *test
 	value, messages := persistenceFixture()
 	message := messages[0]
 
-	columns := []string{"id", "tenant_id", "project_id", "job_id", "target_id", "message_type", "payload", "prepared_envelope", "available_at", "created_at", "lease_expires_at", "published_at", "attempts"}
+	columns := strings.Split(outboxColumnsSQL, ", ")
 	published := message.CreatedAt.Add(time.Minute)
 	mock.ExpectQuery("SELECT .* FROM command_outbox WHERE id = \\$1").WithArgs(message.ID).WillReturnRows(
-		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, nil, message.AvailableAt, message.CreatedAt, nil, published, 2),
+		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, nil, message.AvailableAt, message.CreatedAt, nil, published, 2, "active", published, published.Add(time.Minute), published, nil, nil, "", nil, nil, 0),
 	)
 
 	got, err := repository.LookupCommand(context.Background(), message.ID)

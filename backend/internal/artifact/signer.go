@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"net/http"
 	"net/url"
 	"path"
 	"strconv"
@@ -35,7 +36,7 @@ func NewHMACDownloadSigner(baseURL, keyRef string, resolver database.SecretResol
 }
 
 func (signer *HMACDownloadSigner) Sign(ctx context.Context, value Artifact, ttl time.Duration) (string, error) {
-	if signer == nil || signer.resolver == nil || ctx == nil || value.Scope.Validate() != nil || strings.TrimSpace(value.ID) == "" || ttl <= 0 {
+	if signer == nil || signer.resolver == nil || ctx == nil || value.Scope.Validate() != nil || !validArtifactID(value.ID) || ttl <= 0 {
 		return "", ErrInvalid
 	}
 	if ttl > MaximumDownloadTTL {
@@ -48,7 +49,7 @@ func (signer *HMACDownloadSigner) Sign(ctx context.Context, value Artifact, ttl 
 	}
 	signature := signatureFor(key, value.ID, value.Scope, expires)
 	result := *signer.baseURL
-	result.Path = path.Join(result.Path, url.PathEscape(value.ID))
+	result.Path = path.Join(result.Path, value.ID)
 	query := url.Values{}
 	query.Set("tenant_id", value.Scope.TenantID)
 	query.Set("project_id", value.Scope.ProjectID)
@@ -75,11 +76,11 @@ func (signer *HMACDownloadSigner) Verify(ctx context.Context, rawURL string) (Do
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	id, err := url.PathUnescape(escapedID)
-	if err != nil || strings.TrimSpace(id) == "" {
+	if err != nil || !validArtifactID(id) {
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	query := value.Query()
-	if len(query["tenant_id"]) != 1 || len(query["project_id"]) != 1 || len(query["expires"]) != 1 || len(query["signature"]) != 1 {
+	if len(query) != 4 || len(query["tenant_id"]) != 1 || len(query["project_id"]) != 1 || len(query["expires"]) != 1 || len(query["signature"]) != 1 {
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	scope := platformscope.Scope{TenantID: query.Get("tenant_id"), ProjectID: query.Get("project_id")}
@@ -107,6 +108,17 @@ func (signer *HMACDownloadSigner) Verify(ctx context.Context, rawURL string) (Do
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	return DownloadClaims{ArtifactID: id, Scope: scope, ExpiresAt: expires}, nil
+}
+
+func (signer *HMACDownloadSigner) VerifyRequest(ctx context.Context, request *http.Request) (DownloadClaims, error) {
+	if signer == nil || request == nil || request.URL == nil || request.Host != signer.baseURL.Host {
+		return DownloadClaims{}, ErrInvalidSignature
+	}
+	value := *signer.baseURL
+	value.Path = request.URL.Path
+	value.RawPath = request.URL.RawPath
+	value.RawQuery = request.URL.RawQuery
+	return signer.Verify(ctx, value.String())
 }
 
 func (signer *HMACDownloadSigner) key(ctx context.Context) ([]byte, error) {

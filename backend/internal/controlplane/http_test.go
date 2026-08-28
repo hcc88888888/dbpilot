@@ -23,6 +23,25 @@ func TestRuleCreateRejectsPrincipalOutsideProjectBeforeServiceCall(t *testing.T)
 	require.Zero(t, fixture.repository.calls)
 }
 
+func TestSignedArtifactContentRouteBypassesBearerAndResponseBuffering(t *testing.T) {
+	called := false
+	content := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		called = true
+		require.Equal(t, "artifact-1", request.PathValue("artifactID"))
+		writer.Header().Set("Content-Type", "application/octet-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte("artifact-bytes"))
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/artifact-downloads/artifact-1?signature=signed", nil)
+	response := httptest.NewRecorder()
+
+	NewHTTPHandler(Services{ArtifactContent: content}, nil).ServeHTTP(response, request)
+
+	require.True(t, called)
+	require.Equal(t, http.StatusOK, response.Code)
+	require.Equal(t, "artifact-bytes", response.Body.String())
+}
+
 func TestRuleResponsesSerializeLongDurationsAsLosslessStrings(t *testing.T) {
 	fixture := newHTTPFixture()
 	rule := fixture.repository.rules["rule-1"]

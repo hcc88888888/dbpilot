@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +167,13 @@ func TestJobCommandLifecycle(t *testing.T) {
 		seenCommands[event.CommandID] = true
 	}
 	require.Equal(t, map[string]bool{"command-a": true, "command-b": true}, seenCommands)
+	for _, commandID := range []string{"command-a", "command-b"} {
+		agentID := strings.Replace(commandID, "command-", "agent-", 1)
+		resultAck := streams[agentID].nextSent(t).GetCommandResultAcknowledgement()
+		require.NotNil(t, resultAck)
+		require.Equal(t, commandID, resultAck.GetCommandId())
+		require.True(t, resultAck.GetPersisted())
+	}
 	var publishedAfterAck int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE published_at IS NOT NULL").Scan(&publishedAfterAck))
 	require.Equal(t, 2, publishedAfterAck)
@@ -217,6 +225,64 @@ func TestJobCommandLifecycle(t *testing.T) {
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND dedupe_key = $3", scope.TenantID, scope.ProjectID, dedupeKey).Scan(&timeoutAuditCount))
 	require.True(t, publishedTimeout)
 	require.Equal(t, 1, timeoutAuditCount, "a published timeout command must have exactly one durable Audit event")
+
+	cancelCreated := timeoutCreated.Add(2 * time.Hour)
+	cancelJob := job.Job{
+		ID: "job-cancel-before-dispatch", Type: "contract.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
+		TargetResourceIDs: []string{"agent-a"}, InitiatedBy: "contract-test",
+		SourceResource: job.ResourceReference{ResourceType: "contract_test", ResourceID: "cancel-before-dispatch"},
+		IdempotencyKey: "contract-cancel-before-dispatch", Version: 1, Progress: job.Progress{TotalTargets: 1},
+		Artifacts: []job.ArtifactReference{}, CreatedAt: cancelCreated, RequestID: "request-cancel-before-dispatch", TraceID: "trace-cancel-before-dispatch",
+	}
+	cancelMessage := contractOutbox(t, cancelJob, "command-cancel-before-dispatch", "agent-a", cancelCreated)
+	require.NoError(t, repository.CreateWithOutbox(ctx, cancelJob, []job.OutboxMessage{cancelMessage}))
+	_, err = repository.RequestCancel(ctx, scope, cancelJob.ID, "operator", cancelJob.Version, cancelCreated.Add(time.Second))
+	require.NoError(t, err)
+	dispatched, err = lifecycle.DispatchPending(ctx, cancelCreated.Add(2*time.Second))
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	streams["agent-a"].requireNoSent(t)
+	cancelled, err := repository.Get(ctx, scope, cancelJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatusCancelled, cancelled.Status)
+	var cancellationRequested bool
+	var cancellationStatus string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT cancellation_requested_at IS NOT NULL, command_status FROM command_outbox WHERE id = $1", cancelMessage.ID).Scan(&cancellationRequested, &cancellationStatus))
+	require.True(t, cancellationRequested)
+	require.Equal(t, string(job.CommandCancelled), cancellationStatus)
+
+	recoveryCreated := cancelCreated.Add(time.Hour)
+	recoveryTimeout := recoveryCreated.Add(time.Hour)
+	recoveryJob := job.Job{
+		ID: "job-execution-recovery", Type: "contract.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
+		TargetResourceIDs: []string{"agent-a"}, InitiatedBy: "contract-test",
+		SourceResource: job.ResourceReference{ResourceType: "contract_test", ResourceID: "execution-recovery"},
+		IdempotencyKey: "contract-execution-recovery", Version: 1, Progress: job.Progress{TotalTargets: 1}, TimeoutAt: &recoveryTimeout,
+		Artifacts: []job.ArtifactReference{}, CreatedAt: recoveryCreated, RequestID: "request-execution-recovery", TraceID: "trace-execution-recovery",
+	}
+	recoveryMessage := contractOutbox(t, recoveryJob, "command-execution-recovery", "agent-a", recoveryCreated)
+	require.NoError(t, repository.CreateWithOutbox(ctx, recoveryJob, []job.OutboxMessage{recoveryMessage}))
+	dispatched, err = lifecycle.DispatchPending(ctx, recoveryCreated.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 1, dispatched)
+	require.Equal(t, recoveryMessage.ID, streams["agent-a"].nextSent(t).GetCommand().GetCommandId())
+	streams["agent-a"].push(contractAck(recoveryMessage.ID))
+	require.Eventually(t, func() bool {
+		var status string
+		var deadline sql.NullTime
+		queryErr := database.QueryRowContext(ctx, "SELECT command_status, execution_deadline_at FROM command_outbox WHERE id = $1", recoveryMessage.ID).Scan(&status, &deadline)
+		return queryErr == nil && status == string(job.CommandActive) && deadline.Valid
+	}, 5*time.Second, 20*time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
+	dispatched, err = lifecycle.DispatchPending(ctx, time.Now().UTC())
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	recovered, err := repository.Get(ctx, scope, recoveryJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatusTimedOut, recovered.Status)
+	var recoveryAuditCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE dedupe_key = $1", "command.execution_timed_out:"+recoveryMessage.ID).Scan(&recoveryAuditCount))
+	require.Equal(t, 1, recoveryAuditCount)
 }
 
 func contractDatabase(t *testing.T, rawDSN string) *sql.DB {

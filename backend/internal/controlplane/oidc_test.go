@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"dbpilot.local/platform/internal/alert"
@@ -81,12 +82,29 @@ func TestBearerPrincipalResolverMapsValidatedScopedPermissionGrants(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, "user-42", principal.Subject)
 	require.False(t, principal.PlatformAdmin)
-	require.Equal(t, map[string]struct{}{scopeA.Key(): {}, scopeB.Key(): {}}, principal.Projects)
+	require.Empty(t, principal.Projects, "platform grants must never imply legacy route membership")
 	require.Equal(t, map[string]map[string]struct{}{
 		scopeA.Key(): {"platform.jobs.read": {}, "platform.jobs.cancel": {}},
 		scopeB.Key(): {"platform.audit.read": {}},
 	}, principal.Grants)
 	require.Equal(t, []string{"valid-token"}, verifier.tokens)
+}
+
+func TestOIDCPlatformCapabilityGrantCannotMutateLegacyAlertConfiguration(t *testing.T) {
+	fixture := newHTTPFixture()
+	verifier := &recordingTokenVerifier{claims: OIDCClaims{Subject: "platform-only", Grants: []OIDCGrant{{
+		TenantID: fixture.scope.TenantID, ProjectID: fixture.scope.ProjectID, Permissions: []string{"platform.capabilities.read"},
+	}}}}
+	handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: healthyEvaluator{}}, BearerPrincipalResolver{Verifier: verifier})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/t1/projects/p1/rules", strings.NewReader(string(validRuleBody())))
+	request.Header.Set("Authorization", "Bearer capability-only")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusForbidden, response.Code)
+	require.Zero(t, fixture.repository.calls)
 }
 
 func TestBearerPrincipalResolverMapsPlatformAdminWithoutGrants(t *testing.T) {

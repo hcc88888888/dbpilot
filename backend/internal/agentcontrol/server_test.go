@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net/url"
 	"sync"
@@ -142,12 +143,49 @@ func TestConnectRoutesAgentEventsAndRenewsCommandLease(t *testing.T) {
 		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED}}},
 	)
 	require.Eventually(t, func() bool { return observer.counts() == [3]int{1, 1, 1} }, time.Second, time.Millisecond)
+	resultAck := stream.nextSent(t).GetCommandResultAcknowledgement()
+	require.NotNil(t, resultAck)
+	require.Equal(t, "command-a", resultAck.GetCommandId())
+	require.True(t, resultAck.GetPersisted())
 	snapshot, ok := registry.Session("agent-a")
 	require.True(t, ok)
 	require.Equal(t, now.Add(30*time.Second), snapshot.Leases["command-a"])
 
 	stream.closeReceive()
 	require.NoError(t, <-done)
+}
+
+func TestRegistrySessionSnapshotCopiesLeaseStateUnderLock(t *testing.T) {
+	now := time.Now().UTC()
+	registry := NewRegistry(2048)
+	registry.now = func() time.Time { return now }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, registry.register("agent-a", []string{"collect_now"}, nil, cancel))
+	current, ok := registry.liveSession("agent-a")
+	require.True(t, ok)
+
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		for index := 0; index < 1000; index++ {
+			commandID := fmt.Sprintf("command-%d", index)
+			_ = registry.Dispatch(ctx, "agent-a", &agentv1.CommandEnvelope{CommandId: commandID, AgentId: "agent-a", LeaseSeconds: 30, ExpiresAt: timestamppb.New(now.Add(time.Hour)), Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}}})
+			registry.renew("agent-a", &agentv1.Heartbeat{AgentId: "agent-a", ActiveCommandIds: []string{commandID}}, now)
+		}
+	}()
+	go func() {
+		defer wait.Done()
+		for index := 0; index < 1000; index++ {
+			snapshot, exists := registry.snapshot("agent-a", current)
+			require.True(t, exists)
+			for commandID := range snapshot.Leases {
+				delete(snapshot.Leases, commandID)
+			}
+		}
+	}()
+	wait.Wait()
 }
 
 func helloMessage(agentID, protocol string, capabilities ...string) *agentv1.AgentMessage {
@@ -262,10 +300,11 @@ func (o *recordingObserver) Progress(context.Context, string, *agentv1.CommandPr
 	defer o.mu.Unlock()
 	o.progress++
 }
-func (o *recordingObserver) Result(context.Context, string, *agentv1.CommandResult) {
+func (o *recordingObserver) Result(_ context.Context, _ string, result *agentv1.CommandResult) (ResultPersistence, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.results++
+	return ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
 }
 func (o *recordingObserver) counts() [3]int {
 	o.mu.Lock()

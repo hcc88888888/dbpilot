@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -29,7 +28,7 @@ func NewService(store Store, signer DownloadSigner) *Service {
 }
 
 func (service *Service) Get(ctx context.Context, scope platformscope.Scope, id string) (Artifact, error) {
-	if service == nil || service.store == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) {
+	if service == nil || service.store == nil || ctx == nil || scope.Validate() != nil || !validArtifactID(id) {
 		return Artifact{}, ErrInvalid
 	}
 	value, err := service.store.Get(ctx, scope, id)
