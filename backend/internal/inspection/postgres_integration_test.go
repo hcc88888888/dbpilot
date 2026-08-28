@@ -201,6 +201,45 @@ func TestPostgresIntegrationHistoricalRowsRejectMutationWhileLifecycleUpdatesRem
 	require.ErrorContains(t, err, "immutable")
 }
 
+func TestPostgresIntegrationTargetIdentityAndHistoricalRunDeletionAreGuarded(t *testing.T) {
+	// Break caught: direct SQL must not retarget a persisted command, replace a
+	// target snapshot, delete a TargetRun, or cascade-delete a historical Run.
+	ctx, database, repository, _ := openInspectionIntegration(t, "target-guards")
+	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-target-guards", ProjectID: "project-target-guards"}
+	seedInspectionItem(t, ctx, repository, scope, now)
+	run, targets, value, messages := liveRunFixture("target-guards", scope, now)
+	require.NoError(t, repository.CreateRunWithJob(ctx, run, targets, value, messages))
+
+	observed := now.Add(time.Second)
+	_, err := database.ExecContext(ctx, "UPDATE inspection_target_runs SET status = 'collecting', error_code = 'collection_pending', observed_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND run_id = $4 AND target_id = $5", observed, scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "UPDATE inspection_runs SET status = 'collecting', completed_target_count = 0, failed_target_count = 0, started_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = $4", observed, scope.TenantID, scope.ProjectID, run.ID)
+	require.NoError(t, err)
+	var targetStatus, errorCode, runStatus string
+	var observedAt time.Time
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT status, error_code, observed_at FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4", scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID).Scan(&targetStatus, &errorCode, &observedAt))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT status FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&runStatus))
+	require.Equal(t, []string{"collecting", "collection_pending", "collecting"}, []string{targetStatus, errorCode, runStatus})
+	require.Equal(t, observed, observedAt.UTC())
+
+	for name, statement := range map[string]string{
+		"target identity":  "UPDATE inspection_target_runs SET target_id = 'agent-other' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4",
+		"agent identity":   "UPDATE inspection_target_runs SET agent_id = 'agent-other' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4",
+		"command identity": "UPDATE inspection_target_runs SET command_id = 'command-other' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4",
+		"target snapshot":  "UPDATE inspection_target_runs SET target_snapshot = '{}'::jsonb WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := database.ExecContext(ctx, statement, scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID)
+			require.ErrorContains(t, err, "identity and snapshot are immutable")
+		})
+	}
+	_, err = database.ExecContext(ctx, "DELETE FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4", scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID)
+	require.ErrorContains(t, err, "target runs cannot be deleted")
+	_, err = database.ExecContext(ctx, "DELETE FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID)
+	require.ErrorContains(t, err, "inspection runs cannot be deleted")
+}
+
 func TestPostgresIntegrationRepositoryReadsStayInExactScope(t *testing.T) {
 	// Break caught: a parent-scoped API backed by an unscoped item, policy, run,
 	// or report query can disclose another project's inspection history.
@@ -365,7 +404,8 @@ func TestPostgresIntegrationPaginationUsesLimitPlusOneAndUniqueDescendingCursors
 	// Break caught: equal timestamps and multiple versions must cross page
 	// boundaries without duplication, omission, or a false More flag.
 	ctx, database, repository, _ := openInspectionIntegration(t, "pagination")
-	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 28, 8, 0, 0, 123456789, time.UTC)
+	databaseCreated := time.Date(2026, 8, 28, 8, 0, 0, 123457000, time.UTC)
 	scope := platformscope.Scope{TenantID: "tenant-pagination", ProjectID: "project-pagination"}
 	for version := 1; version <= 3; version++ {
 		require.NoError(t, repository.CreateItem(ctx, paginationItemFixture(scope, version, now)))
@@ -373,11 +413,13 @@ func TestPostgresIntegrationPaginationUsesLimitPlusOneAndUniqueDescendingCursors
 	itemFirst, err := repository.ListItems(ctx, scope, ItemFilter{CursorFilter: CursorFilter{Limit: 2}})
 	require.NoError(t, err)
 	require.Equal(t, []int{3, 2}, []int{itemFirst.Items[0].Version, itemFirst.Items[1].Version})
+	require.Equal(t, []time.Time{databaseCreated, databaseCreated}, []time.Time{itemFirst.Items[0].CreatedAt, itemFirst.Items[1].CreatedAt})
 	require.True(t, itemFirst.More)
 	require.NotEmpty(t, itemFirst.NextCursor)
 	itemSecond, err := repository.ListItems(ctx, scope, ItemFilter{CursorFilter: CursorFilter{Cursor: itemFirst.NextCursor, Limit: 2}})
 	require.NoError(t, err)
 	require.Equal(t, []int{1}, []int{itemSecond.Items[0].Version})
+	require.Equal(t, databaseCreated, itemSecond.Items[0].CreatedAt)
 	require.False(t, itemSecond.More)
 	require.Empty(t, itemSecond.NextCursor)
 

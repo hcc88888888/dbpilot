@@ -59,6 +59,12 @@ func TestMigrationAppliesThroughSharedRegistryExactlyOnce(t *testing.T) {
 	mock.ExpectExec("(?s)CREATE INDEX inspection_items_pagination_v2_idx.*ALTER TABLE inspection_reports.*created_at.*CREATE INDEX inspection_reports_pagination_v2_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0003_pagination_keys.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0004_target_run_guards.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE OR REPLACE FUNCTION guard_inspection_target_run_mutation.*inspection_target_runs_guard.*inspection_runs_delete_guard").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0004_target_run_guards.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -93,4 +99,28 @@ func TestMigrationAddsUniqueItemAndReportPaginationKeys(t *testing.T) {
 	require.Contains(t, schema, "inspection_items (tenant_id, project_id, created_at DESC, item_id DESC, version DESC)")
 	require.Contains(t, schema, "created_at TIMESTAMPTZ GENERATED ALWAYS AS (generated_at) STORED")
 	require.Contains(t, schema, "inspection_reports (tenant_id, project_id, created_at DESC, id DESC)")
+}
+
+func TestMigrationGuardsTargetIdentityAndHistoricalRunDeletion(t *testing.T) {
+	// Break caught: mutating or deleting a TargetRun rewrites command/target
+	// history, while deleting a Run can cascade that history away.
+	content, err := migrationFiles.ReadFile("migrations/0004_target_run_guards.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{
+		"inspection_target_runs_guard",
+		"inspection_runs_delete_guard",
+		"OLD.tenant_id IS DISTINCT FROM NEW.tenant_id",
+		"OLD.project_id IS DISTINCT FROM NEW.project_id",
+		"OLD.run_id IS DISTINCT FROM NEW.run_id",
+		"OLD.target_id IS DISTINCT FROM NEW.target_id",
+		"OLD.agent_id IS DISTINCT FROM NEW.agent_id",
+		"OLD.command_id IS DISTINCT FROM NEW.command_id",
+		"OLD.target_snapshot IS DISTINCT FROM NEW.target_snapshot",
+	} {
+		require.Contains(t, schema, required)
+	}
+	for _, mutable := range []string{"NEW.status", "NEW.error_code", "NEW.observed_at"} {
+		require.NotContains(t, schema, mutable, "TargetRun lifecycle column must remain mutable")
+	}
 }

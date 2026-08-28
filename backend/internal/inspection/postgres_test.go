@@ -58,27 +58,30 @@ func TestPostgresListItemsUsesVersionedTupleCursorWithoutSkippingEqualTimestamps
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
-	created := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	created := time.Date(2026, 8, 28, 8, 0, 0, 123456789, time.UTC)
+	databaseCreated := time.Date(2026, 8, 28, 8, 0, 0, 123457000, time.UTC)
 	items := make([]Item, 3)
 	for index, version := range []int{3, 2, 1} {
 		items[index] = builtinItem("host.cpu.utilization")
 		items[index].Scope, items[index].Version, items[index].CreatedAt = scope, version, created
 	}
-	mock.ExpectQuery("SELECT snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$3").
+	mock.ExpectQuery("SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$3").
 		WithArgs(scope.TenantID, scope.ProjectID, 3).
-		WillReturnRows(itemSnapshotRows(items...))
+		WillReturnRows(itemSnapshotRows(databaseCreated, items...))
 	repository := NewPostgresRepository(database, nil)
 	page, err := repository.ListItems(context.Background(), scope, ItemFilter{CursorFilter: CursorFilter{Limit: 2}})
 	require.NoError(t, err)
 	require.Equal(t, []int{3, 2}, []int{page.Items[0].Version, page.Items[1].Version})
+	require.Equal(t, []time.Time{databaseCreated, databaseCreated}, []time.Time{page.Items[0].CreatedAt, page.Items[1].CreatedAt})
 	require.True(t, page.More)
 	require.NotEmpty(t, page.NextCursor)
-	mock.ExpectQuery("SELECT snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, item_id, version\\) < \\(\\$3, \\$4, \\$5\\) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$6").
-		WithArgs(scope.TenantID, scope.ProjectID, created, items[1].ID, 2, 3).
-		WillReturnRows(itemSnapshotRows(items[2]))
+	mock.ExpectQuery("SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, item_id, version\\) < \\(\\$3, \\$4, \\$5\\) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$6").
+		WithArgs(scope.TenantID, scope.ProjectID, databaseCreated, items[1].ID, 2, 3).
+		WillReturnRows(itemSnapshotRows(databaseCreated, items[2]))
 	next, err := repository.ListItems(context.Background(), scope, ItemFilter{CursorFilter: CursorFilter{Cursor: page.NextCursor, Limit: 2}})
 	require.NoError(t, err)
 	require.Equal(t, []int{1}, []int{next.Items[0].Version})
+	require.Equal(t, databaseCreated, next.Items[0].CreatedAt)
 	require.False(t, next.More)
 	require.Empty(t, next.NextCursor)
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -354,11 +357,11 @@ func runRows(values ...Run) *sqlmock.Rows {
 	return rows
 }
 
-func itemSnapshotRows(values ...Item) *sqlmock.Rows {
-	rows := sqlmock.NewRows([]string{"snapshot"})
+func itemSnapshotRows(createdAt time.Time, values ...Item) *sqlmock.Rows {
+	rows := sqlmock.NewRows([]string{"created_at", "snapshot"})
 	for _, value := range values {
 		snapshot, _ := json.Marshal(value)
-		rows.AddRow(snapshot)
+		rows.AddRow(createdAt, snapshot)
 	}
 	return rows
 }

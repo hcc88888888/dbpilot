@@ -34,8 +34,8 @@ const selectRunSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE te
 const selectTargetRunsSQL = "SELECT target_snapshot FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id"
 const findingColumnsSQL = "id, run_id, target_id, item_id, item_version, level, observed_at, evidence, warning_threshold, critical_threshold, summary, recommendation"
 const selectFindingsSQL = "SELECT " + findingColumnsSQL + " FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id, item_id, item_version"
-const selectItemsSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $3"
-const selectItemsBeforeSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (created_at, item_id, version) < ($3, $4, $5) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $6"
+const selectItemsSQL = "SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $3"
+const selectItemsBeforeSQL = "SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (created_at, item_id, version) < ($3, $4, $5) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $6"
 const selectPolicySQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
 const selectPoliciesSQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3"
 const selectPoliciesBeforeSQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
@@ -446,7 +446,8 @@ func (repository *PostgresRepository) ListItems(ctx context.Context, scope platf
 	page := ItemPage{Items: make([]Item, 0)}
 	for rows.Next() {
 		var snapshot []byte
-		if err := rows.Scan(&snapshot); err != nil {
+		var createdAt time.Time
+		if err := rows.Scan(&createdAt, &snapshot); err != nil {
 			return ItemPage{}, fmt.Errorf("scan inspection item: %w", err)
 		}
 		var value Item
@@ -456,6 +457,7 @@ func (repository *PostgresRepository) ListItems(ctx context.Context, scope platf
 		if value.Scope != scope {
 			return ItemPage{}, ErrConflict
 		}
+		value.CreatedAt = createdAt.UTC()
 		page.Items = append(page.Items, value)
 	}
 	if err := rows.Err(); err != nil {
@@ -917,7 +919,7 @@ func itemVersionsQuery(scope platformscope.Scope, filter ItemFilter) (string, []
 		args = append(args, item.ItemID, item.Version)
 	}
 	args = append(args, filter.Limit)
-	query := fmt.Sprintf("SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (%s) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $%d", strings.Join(clauses, " OR "), len(args))
+	query := fmt.Sprintf("SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (%s) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $%d", strings.Join(clauses, " OR "), len(args))
 	return query, args, nil
 }
 
