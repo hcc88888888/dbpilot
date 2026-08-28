@@ -590,6 +590,13 @@ func (lifecycle *CommandLifecycle) startOrReplayCommandLocked(ctx context.Contex
 		if err != nil {
 			return err
 		}
+		prepared, err := decodePreparedCommand(message, unsigned, message.PreparedEnvelope)
+		if err != nil {
+			return err
+		}
+		if !prepared.GetExpiresAt().AsTime().UTC().After(at.UTC()) {
+			return lifecycle.expirePreparedEnvelopeLocked(ctx, message, prepared.GetExpiresAt().AsTime().UTC(), at.UTC())
+		}
 		value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
 		if err != nil {
 			return err
@@ -642,6 +649,28 @@ func (lifecycle *CommandLifecycle) startOrReplayCommandLocked(ctx context.Contex
 		return err
 	}
 	return lifecycle.dispatchRepository.MarkStartEnqueued(ctx, message.Scope, message.ID, message.ExecutionRevision, lifecycle.currentTime())
+}
+
+func (lifecycle *CommandLifecycle) expirePreparedEnvelopeLocked(ctx context.Context, message OutboxMessage, expiresAt, at time.Time) error {
+	if len(message.PrepareDigest) != sha256.Size || expiresAt.IsZero() || expiresAt.After(at) {
+		return ErrInvalidCommandPayload
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], message.PrepareDigest)
+	if err := lifecycle.dispatchRepository.FinalizeExpiredPrepared(ctx, message.Scope, message.ID, digest, expiresAt, at); err != nil {
+		if errors.Is(err, ErrConflict) {
+			return nil
+		}
+		return err
+	}
+	if err := lifecycle.agents.CancelPrepared(ctx, message.TargetID, message.ID, "prepared envelope expired"); err != nil {
+		lifecycle.onError(err)
+	}
+	terminal, err := lifecycle.dispatchRepository.LookupCommand(ctx, message.ID)
+	if err != nil {
+		return err
+	}
+	return lifecycle.repairTerminalAuditMessages(ctx, []OutboxMessage{terminal}, at)
 }
 
 func (lifecycle *CommandLifecycle) persistedCommandStart(ctx context.Context, message OutboxMessage) (*agentv1.CommandStart, []byte, error) {

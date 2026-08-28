@@ -155,6 +155,92 @@ func TestPreparedRecoveryTimesOutJobAndCommandWithoutStart(t *testing.T) {
 	require.Equal(t, "command.prepared_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
 }
 
+func TestPreparedEnvelopeExpiryPeriodicallyTerminalizesWithoutStartAndIsIdempotent(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-expired-periodic", "agent-a")
+	fixture.persistence.claimed = nil
+	expiredAt := fixture.agents.envelopes[0].GetExpiresAt().AsTime().Add(time.Second)
+
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), expiredAt)
+	require.NoError(t, err)
+	require.Empty(t, fixture.agents.starts, "an expired immutable Prepare envelope must never be authorized")
+	require.Equal(t, []string{"cancel-unfenced:" + message.ID}, fixture.agents.events)
+	first := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, first.Status)
+	require.Equal(t, TargetTimedOut, first.TargetResults[0].Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, "command.prepared_envelope_expired", fixture.audit.events[len(fixture.audit.events)-1].Action)
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), expiredAt.Add(DefaultOutboxLease))
+	require.NoError(t, err)
+	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Len(t, fixture.audit.events, 2, "RecordOnce must retain one dispatch Audit and one expiry Audit")
+	require.Equal(t, []string{"cancel-unfenced:" + message.ID}, fixture.agents.events)
+}
+
+func TestPreparedEnvelopeExpiryOnConnectedSessionNeverStartsExecutor(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-expired-connected", "agent-a")
+	fixture.persistence.claimed = nil
+	expiredAt := fixture.agents.envelopes[0].GetExpiresAt().AsTime().Add(time.Second)
+	fixture.lifecycle.now = func() time.Time { return expiredAt }
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED}}})
+
+	require.Empty(t, fixture.agents.starts)
+	require.Equal(t, []string{"cancel-unfenced:" + message.ID}, fixture.agents.events)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Empty(t, fixture.observerErrors())
+}
+
+func TestPreparedAcknowledgementAfterEnvelopeExpiryNeverAuthorizesStart(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, digest := fixture.persistPreparedCommand(t, "command-expired-ack", "agent-a")
+	expiredAt := fixture.agents.envelopes[0].GetExpiresAt().AsTime().Add(time.Second)
+	fixture.lifecycle.now = func() time.Time { return expiredAt }
+
+	start, err := fixture.lifecycle.Prepared(context.Background(), "agent-a", &agentv1.CommandPrepared{CommandId: message.ID, EnvelopeDigest: digest[:]})
+	require.NoError(t, err)
+	require.Nil(t, start)
+	require.Empty(t, fixture.agents.starts)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+}
+
+func TestPreparedEnvelopeExpiryAndCancellationHonorTheCommittedWinnerWithoutStart(t *testing.T) {
+	t.Run("cancellation commits first", func(t *testing.T) {
+		fixture := newSingleTargetCommandLifecycleFixture(t)
+		message, _ := fixture.persistPreparedCommand(t, "command-expiry-cancel-first", "agent-a")
+		current := fixture.persistence.currentJob()
+		_, err := fixture.persistence.RequestCancel(context.Background(), fixture.scope, current.ID, "operator", current.Version, fixture.now.Add(time.Second))
+		require.NoError(t, err)
+		expiredAt := fixture.agents.envelopes[0].GetExpiresAt().AsTime().Add(time.Second)
+		fixture.lifecycle.now = func() time.Time { return expiredAt }
+
+		fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED}}})
+
+		require.Empty(t, fixture.agents.starts)
+		require.Equal(t, StatusCancelled, fixture.persistence.currentJob().Status)
+		require.Equal(t, CommandCancelled, fixture.persistence.messages[message.ID].CommandStatus)
+	})
+
+	t.Run("expiry commits first", func(t *testing.T) {
+		fixture := newSingleTargetCommandLifecycleFixture(t)
+		message, _ := fixture.persistPreparedCommand(t, "command-expiry-first", "agent-a")
+		expiredAt := fixture.agents.envelopes[0].GetExpiresAt().AsTime().Add(time.Second)
+		_, err := fixture.lifecycle.DispatchPending(context.Background(), expiredAt)
+		require.NoError(t, err)
+		current := fixture.persistence.currentJob()
+		_, err = fixture.persistence.RequestCancel(context.Background(), fixture.scope, current.ID, "operator", current.Version, expiredAt.Add(time.Second))
+		require.ErrorIs(t, err, ErrInvalidTransition)
+		require.Empty(t, fixture.agents.starts)
+		require.Equal(t, StatusTimedOut, current.Status)
+		require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	})
+}
+
 func TestStartEnqueueMarkerFailureReplaysIdenticalPersistedStart(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	message, digest := fixture.persistPreparedCommand(t, "command-a", "agent-a")
@@ -1274,6 +1360,41 @@ func (store *memoryCommandPersistence) FinalizeExpiredExecution(_ context.Contex
 	message.TerminalAuditDetail = map[string]any{"reason": "execution_deadline"}
 	store.jobs[message.JobID] = next
 	store.messages[claim.CommandID] = message
+	return nil
+}
+func (store *memoryCommandPersistence) FinalizeExpiredPrepared(_ context.Context, scope platformscope.Scope, commandID string, expectedDigest [32]byte, expiresAt, at time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message, ok := store.messages[commandID]
+	if !ok || message.Scope != scope || expiresAt.After(at) || !bytes.Equal(message.PrepareDigest, expectedDigest[:]) {
+		return ErrConflict
+	}
+	current := store.jobs[message.JobID]
+	if message.Phase == CommandPhaseTimedOut {
+		target, found := targetFor(current.TargetResults, message.TargetID)
+		if found && target.Status == TargetTimedOut {
+			return nil
+		}
+		return ErrConflict
+	}
+	if message.Phase != CommandPhasePrepared {
+		return ErrConflict
+	}
+	next, err := timeoutMemoryJob(current, message, at)
+	if err != nil {
+		return err
+	}
+	message.Phase = CommandPhaseTimedOut
+	message.CommandStatus = CommandTimedOut
+	message.TerminalAt = timePointer(at.UTC())
+	message.LeasedUntil = nil
+	message.TerminalAuditPending = true
+	message.TerminalAuditDedupeKey = "command.prepared_envelope_expired:" + message.ID
+	message.TerminalAuditAction = "command.prepared_envelope_expired"
+	message.TerminalAuditResult = "failure"
+	message.TerminalAuditDetail = map[string]any{"reason": "prepare_envelope_expiry", "expires_at": expiresAt.UTC()}
+	store.jobs[message.JobID] = next
+	store.messages[commandID] = message
 	return nil
 }
 func timeoutMemoryJob(current Job, message OutboxMessage, at time.Time) (Job, error) {

@@ -388,6 +388,90 @@ func TestTimeoutFenceAtomicallyTerminalizesJobTargetAndCommand(t *testing.T) {
 	require.Equal(t, "command.execution_timed_out:"+message.ID, dedupe)
 }
 
+func TestPreparedExpiryAtomicallyTerminalizesJobTargetCommandAndAuditFence(t *testing.T) {
+	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, digest := createPreparedIntegrationCommand(t, ctx, repository, "prepared-expiry-atomic", now)
+	expiresAt := now.Add(time.Second)
+	terminalAt := expiresAt.Add(time.Millisecond)
+
+	require.NoError(t, repository.FinalizeExpiredPrepared(ctx, value.Scope, message.ID, digest, expiresAt, terminalAt))
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, storedJob.Status)
+	require.Equal(t, TargetTimedOut, storedJob.TargetResults[0].Status)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseTimedOut, storedCommand.Phase)
+	require.True(t, storedCommand.TerminalAuditPending)
+	require.Equal(t, "command.prepared_envelope_expired:"+message.ID, storedCommand.TerminalAuditDedupeKey)
+	version := storedJob.Version
+	require.NoError(t, repository.FinalizeExpiredPrepared(ctx, value.Scope, message.ID, digest, expiresAt, terminalAt.Add(time.Second)))
+	storedJob, err = repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, version, storedJob.Version, "exact expiry retry must not mutate the Job twice")
+	token := sha256.Sum256([]byte("must-not-start"))
+	_, err = repository.AuthorizeStart(ctx, value.Scope, message.ID, digest, token, []byte("must-not-start"), terminalAt.Add(time.Second), terminalAt.Add(time.Minute))
+	require.ErrorIs(t, err, ErrConflict)
+}
+
+func TestPreparedExpiryCommandWriteFailureRollsBackJobAndTarget(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, digest := createPreparedIntegrationCommand(t, ctx, repository, "prepared-expiry-rollback", now)
+	_, err := database.ExecContext(ctx, `
+		CREATE FUNCTION fail_prepared_expiry_command_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.command_phase = 'timed_out' THEN RAISE EXCEPTION 'injected prepared expiry failure'; END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER fail_prepared_expiry_command_update BEFORE UPDATE ON command_outbox
+		FOR EACH ROW EXECUTE FUNCTION fail_prepared_expiry_command_update();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = database.Exec(`DROP TRIGGER IF EXISTS fail_prepared_expiry_command_update ON command_outbox`)
+		_, _ = database.Exec(`DROP FUNCTION IF EXISTS fail_prepared_expiry_command_update()`)
+	})
+
+	require.ErrorContains(t, repository.FinalizeExpiredPrepared(ctx, value.Scope, message.ID, digest, now.Add(time.Second), now.Add(2*time.Second)), "injected prepared expiry failure")
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusQueued, storedJob.Status)
+	require.Empty(t, storedJob.TargetResults)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhasePrepared, storedCommand.Phase)
+}
+
+func TestPreparedExpiryAndCancellationTransactionsNeverPermitStart(t *testing.T) {
+	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, digest := createPreparedIntegrationCommand(t, ctx, repository, "prepared-expiry-cancel-race", now)
+	start := make(chan struct{})
+	expiryResult := make(chan error, 1)
+	cancelResult := make(chan error, 1)
+	go func() {
+		<-start
+		expiryResult <- repository.FinalizeExpiredPrepared(ctx, value.Scope, message.ID, digest, now.Add(time.Second), now.Add(2*time.Second))
+	}()
+	go func() {
+		<-start
+		_, err := repository.RequestCancel(ctx, value.Scope, value.ID, "operator", value.Version, now.Add(2*time.Second))
+		cancelResult <- err
+	}()
+	close(start)
+	require.NoError(t, <-expiryResult)
+	cancelErr := <-cancelResult
+	require.True(t, cancelErr == nil || errors.Is(cancelErr, ErrConflict) || errors.Is(cancelErr, ErrInvalidTransition), "cancellation must either commit before expiry or lose its version transition: %v", cancelErr)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseTimedOut, storedCommand.Phase)
+	token := sha256.Sum256([]byte("race-must-not-start"))
+	_, err = repository.AuthorizeStart(ctx, value.Scope, message.ID, digest, token, []byte("race-must-not-start"), now.Add(3*time.Second), now.Add(time.Minute))
+	require.ErrorIs(t, err, ErrConflict)
+}
+
 func TestTimeoutFenceCommandWriteFailureRollsBackJobAndTarget(t *testing.T) {
 	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
@@ -563,6 +647,15 @@ func createExpiredStartedCommand(t *testing.T, ctx context.Context, repository *
 	grant, err := repository.AuthorizeStart(ctx, value.Scope, message.ID, digest, tokenHash, []byte("ciphertext-"+suffix), now, now.Add(time.Second))
 	require.NoError(t, err)
 	return value, message, grant, token
+}
+
+func createPreparedIntegrationCommand(t *testing.T, ctx context.Context, repository *PostgresRepository, suffix string, now time.Time) (Job, OutboxMessage, [sha256.Size]byte) {
+	t.Helper()
+	value, message := integrationPersistenceFixture(suffix, platformscope.Scope{TenantID: "tenant-" + suffix, ProjectID: "project-" + suffix}, now.Add(-time.Minute))
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+	digest := sha256.Sum256([]byte("prepared-" + suffix))
+	require.NoError(t, repository.MarkPrepared(ctx, value.Scope, message.ID, digest, now))
+	return value, message, digest
 }
 
 func openTwoPhaseIntegrationRepository(t *testing.T) (context.Context, *sql.DB, *PostgresRepository) {

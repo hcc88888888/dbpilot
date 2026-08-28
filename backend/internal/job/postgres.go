@@ -945,6 +945,91 @@ func (repository *PostgresRepository) FinalizeExpiredExecution(ctx context.Conte
 	return nil
 }
 
+func (repository *PostgresRepository) FinalizeExpiredPrepared(ctx context.Context, scope platformscope.Scope, commandID string, expectedDigest [sha256.Size]byte, expiresAt, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || expiresAt.IsZero() || at.IsZero() || expiresAt.After(at) {
+		return ErrInvalidCommandPayload
+	}
+	expiresAt, at = expiresAt.UTC(), at.UTC()
+	var jobID string
+	if err := repository.db.QueryRowContext(ctx, `SELECT job_id FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND id = $3`, scope.TenantID, scope.ProjectID, commandID).Scan(&jobID); err != nil {
+		return classifyReadError("lookup expired prepared command", err)
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin expired prepared finalization: %w", err)
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	value, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, scope.TenantID, scope.ProjectID, jobID))
+	if err != nil {
+		return rollback(classifyReadError("lock Job for expired Prepare", err))
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, `SELECT `+outboxColumnsSQL+` FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE`, scope.TenantID, scope.ProjectID, commandID))
+	if err != nil {
+		return rollback(classifyReadError("lock expired prepared command", err))
+	}
+	if message.JobID != jobID || len(message.PrepareDigest) != sha256.Size || subtle.ConstantTimeCompare(message.PrepareDigest, expectedDigest[:]) != 1 {
+		return rollback(ErrConflict)
+	}
+	value.TargetResults, err = getTargetsFrom(ctx, tx, scope, jobID)
+	if err != nil {
+		return rollback(err)
+	}
+	value.TargetResourceIDs = make([]string, len(value.TargetResults))
+	for index := range value.TargetResults {
+		value.TargetResourceIDs[index] = value.TargetResults[index].TargetID
+	}
+	if message.Phase == CommandPhaseTimedOut {
+		target, found := targetFor(value.TargetResults, message.TargetID)
+		if !found || target.Status != TargetTimedOut {
+			return rollback(ErrConflict)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit duplicate expired prepared finalization: %w", err)
+		}
+		return nil
+	}
+	if message.Phase != CommandPhasePrepared {
+		return rollback(ErrConflict)
+	}
+	if _, err := timeoutJobTargetInTx(ctx, tx, value, message, at); err != nil {
+		return rollback(err)
+	}
+	auditDetail, err := json.Marshal(map[string]any{"reason": "prepare_envelope_expiry", "expires_at": expiresAt})
+	if err != nil {
+		return rollback(fmt.Errorf("marshal expired Prepare Audit detail: %w", err))
+	}
+	dedupeKey := "command.prepared_envelope_expired:" + message.ID
+	result, err := tx.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_phase = 'timed_out', command_status = 'timed_out', terminal_at = $1,
+			lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL,
+			cancellation_lease_expires_at = NULL,
+			terminal_audit_pending = TRUE, terminal_audit_dedupe_key = $5,
+			terminal_audit_action = 'command.prepared_envelope_expired', terminal_audit_result = 'failure',
+			terminal_audit_detail = $6, terminal_audit_lease_expires_at = NULL,
+			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL
+		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
+			AND command_phase = 'prepared' AND prepare_digest = $7
+	`, at, scope.TenantID, scope.ProjectID, commandID, dedupeKey, auditDetail, expectedDigest[:])
+	if err != nil {
+		return rollback(classifyWriteError("finalize expired prepared command", err))
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return rollback(fmt.Errorf("read expired prepared finalization result: %w", err))
+	}
+	if updated != 1 {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit expired prepared finalization: %w: %w", ErrAmbiguousCommit, err)
+	}
+	return nil
+}
+
 func timeoutJobTargetInTx(ctx context.Context, tx *sql.Tx, current Job, message OutboxMessage, at time.Time) (Job, error) {
 	if current.ID != message.JobID || current.Scope != message.Scope || !containsTarget(current.TargetResourceIDs, message.TargetID) {
 		return Job{}, ErrInvalidCommandPayload
