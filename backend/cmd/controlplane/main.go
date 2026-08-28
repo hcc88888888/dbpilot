@@ -344,10 +344,23 @@ func NewServer(config Config) (*Server, error) {
 		}
 		return nil, fmt.Errorf("configure artifact downloads: %w", err)
 	}
+	if err := artifactSigner.Ready(context.Background()); err != nil {
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("resolve artifact signing key: %w", err)
+	}
 	artifactService := artifact.NewService(artifact.NewPostgresStore(database), artifactSigner)
 	artifactContent := config.ArtifactDownloadHandler
 	if artifactContent == nil {
-		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, artifact.NewLocalBlobStore(config.Artifact.StorageRoot))
+		blobStore := artifact.NewLocalBlobStore(config.Artifact.StorageRoot)
+		if err := blobStore.Ready(); err != nil {
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("validate artifact storage root: %w", err)
+		}
+		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, blobStore)
 		if err != nil {
 			if ownsDatabase {
 				_ = database.Close()

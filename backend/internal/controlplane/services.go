@@ -35,8 +35,8 @@ type CapabilityService interface {
 }
 
 type IdempotencyService interface {
-	Begin(context.Context, idempotency.Key, string) (idempotency.Claim, error)
-	Complete(context.Context, idempotency.Key, string, string, idempotency.Response) (idempotency.Response, error)
+	Begin(context.Context, idempotency.Key, string, idempotency.ReconcileFunc) (idempotency.Claim, error)
+	Complete(context.Context, idempotency.Key, string, string, idempotency.Response, idempotency.ReconcileFunc) (idempotency.Response, error)
 	Abort(context.Context, idempotency.Key, string, string) error
 }
 

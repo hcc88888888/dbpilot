@@ -18,7 +18,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 	key := validKey()
 	fingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
 
-	claim, err := service.Begin(context.Background(), key, fingerprint)
+	claim, err := service.Begin(context.Background(), key, fingerprint, successfulReconcile)
 	require.NoError(t, err)
 	require.True(t, claim.Claimed)
 	require.Regexp(t, `^owner-[0-9a-f]{64}$`, claim.OwnerToken)
@@ -29,13 +29,13 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 		Header: http.Header{"Content-Type": {"application/json"}, "ETag": {`"8"`}, "Location": {"/jobs/job-1"}},
 		Body:   []byte(`{"id":"job-1","version":8}`),
 	}
-	completed, err := service.Complete(context.Background(), key, fingerprint, claim.OwnerToken, want)
+	completed, err := service.Complete(context.Background(), key, fingerprint, claim.OwnerToken, want, successfulReconcile)
 	require.NoError(t, err)
 	require.Equal(t, want, completed)
 
 	completed.Header.Set("ETag", `"mutated"`)
 	completed.Body[0] = '['
-	replay, err := service.Begin(context.Background(), key, fingerprint)
+	replay, err := service.Begin(context.Background(), key, fingerprint, successfulReconcile)
 	require.NoError(t, err)
 	require.False(t, replay.Claimed)
 	require.Empty(t, replay.OwnerToken)
@@ -43,7 +43,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 
 	replay.Response.Header.Set("ETag", `"mutated-again"`)
 	replay.Response.Body[0] = '['
-	replayAgain, err := service.Begin(context.Background(), key, fingerprint)
+	replayAgain, err := service.Begin(context.Background(), key, fingerprint, successfulReconcile)
 	require.NoError(t, err)
 	require.Equal(t, want, *replayAgain.Response)
 }
@@ -51,10 +51,10 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 func TestServiceRejectsSameKeyWithDifferentFingerprint(t *testing.T) {
 	service := NewService(newSynchronizedStore())
 	key := validKey()
-	_, err := service.Begin(context.Background(), key, "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59")
+	_, err := service.Begin(context.Background(), key, "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59", successfulReconcile)
 	require.NoError(t, err)
 
-	_, err = service.Begin(context.Background(), key, "sha256:70b9d78842924a3f00599c8298f0e6786ea68aa7b6ea5f5f74335c7d26d0579d")
+	_, err = service.Begin(context.Background(), key, "sha256:70b9d78842924a3f00599c8298f0e6786ea68aa7b6ea5f5f74335c7d26d0579d", successfulReconcile)
 	require.ErrorIs(t, err, ErrKeyConflict)
 }
 
@@ -71,7 +71,7 @@ func TestServiceAllowsOnlyOneConcurrentClaim(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			claim, err := service.Begin(context.Background(), key, fingerprint)
+			claim, err := service.Begin(context.Background(), key, fingerprint, successfulReconcile)
 			claims <- claim
 			results <- err
 		}()
@@ -115,22 +115,22 @@ func TestServiceRejectsInvalidKeysFingerprintsAndResponsesBeforeStore(t *testing
 		{Scope: key.Scope, Actor: key.Actor, OperationID: key.OperationID, IdempotencyKey: " "},
 	}
 	for _, invalid := range invalidKeys {
-		_, err := service.Begin(context.Background(), invalid, "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59")
+		_, err := service.Begin(context.Background(), invalid, "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59", successfulReconcile)
 		require.ErrorIs(t, err, ErrInvalid)
 	}
-	_, err := service.Begin(context.Background(), key, "not-a-fingerprint")
+	_, err := service.Begin(context.Background(), key, "not-a-fingerprint", successfulReconcile)
 	require.ErrorIs(t, err, ErrInvalid)
 	require.Zero(t, store.claimCalls)
 
 	validFingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
-	claim, err := service.Begin(context.Background(), key, validFingerprint)
+	claim, err := service.Begin(context.Background(), key, validFingerprint, successfulReconcile)
 	require.NoError(t, err)
 	for _, response := range []Response{
 		{Status: 99, Body: []byte(`{}`)},
 		{Status: 200, Body: []byte(`not-json`)},
 		{Status: 200, Header: http.Header{"X-Test": {"unsafe\r\nvalue"}}, Body: []byte(`{}`)},
 	} {
-		_, err := service.Complete(context.Background(), key, validFingerprint, claim.OwnerToken, response)
+		_, err := service.Complete(context.Background(), key, validFingerprint, claim.OwnerToken, response, successfulReconcile)
 		require.ErrorIs(t, err, ErrInvalid)
 	}
 	require.Zero(t, store.completeCalls)
@@ -142,6 +142,8 @@ func validKey() Key {
 		Actor: "operator-1", OperationID: "cancelJob", IdempotencyKey: "cancel-job-1",
 	}
 }
+
+func successfulReconcile(context.Context, Response) error { return nil }
 
 type synchronizedStore struct {
 	mu            sync.Mutex
@@ -169,7 +171,7 @@ func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint, o
 	record, ok := store.records[mapKey]
 	if !ok {
 		store.records[mapKey] = synchronizedRecord{fingerprint: fingerprint, owner: owner, state: StateProcessing}
-		return Claim{Claimed: true, OwnerToken: owner}, nil
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return Claim{}, ErrKeyConflict
@@ -178,10 +180,14 @@ func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint, o
 		return Claim{}, ErrInProgress
 	}
 	response := cloneResponse(record.response)
-	return Claim{Response: &response}, nil
+	ownerToken := record.owner
+	if record.state == StateCompleted {
+		ownerToken = ""
+	}
+	return Claim{OwnerToken: ownerToken, State: record.state, Response: &response}, nil
 }
 
-func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint, owner string, response Response, _ time.Time) (Response, error) {
+func (store *synchronizedStore) CommitSideEffect(_ context.Context, key Key, fingerprint, owner string, response Response, _ time.Time) (Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.completeCalls++
@@ -190,10 +196,36 @@ func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint
 	if record.fingerprint != fingerprint || record.owner != owner || record.state != StateProcessing {
 		return Response{}, ErrOwnershipConflict
 	}
-	record.state = StateCompleted
+	record.state = StateSideEffectCommitted
 	record.response = cloneResponse(response)
 	store.records[mapKey] = record
 	return cloneResponse(record.response), nil
+}
+
+func (store *synchronizedStore) MarkAudited(_ context.Context, key Key, fingerprint, owner string, _ time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record := store.records[mapKey]
+	if record.fingerprint != fingerprint || record.owner != owner || record.state != StateSideEffectCommitted {
+		return ErrOwnershipConflict
+	}
+	record.state = StateAudited
+	store.records[mapKey] = record
+	return nil
+}
+
+func (store *synchronizedStore) Complete(_ context.Context, key Key, fingerprint, owner string, response Response, _ time.Time) (Response, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record := store.records[mapKey]
+	if record.fingerprint != fingerprint || record.owner != owner || record.state != StateAudited {
+		return Response{}, ErrOwnershipConflict
+	}
+	record.state = StateCompleted
+	store.records[mapKey] = record
+	return cloneResponse(response), nil
 }
 
 func (store *synchronizedStore) Abort(_ context.Context, key Key, fingerprint, owner string) error {

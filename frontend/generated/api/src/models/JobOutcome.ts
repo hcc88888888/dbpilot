@@ -42,7 +42,10 @@ export function JobOutcomeFromJSON(json: any): JobOutcome {
 }
 
 export function JobOutcomeFromJSONTyped(json: any, ignoreDiscriminator: boolean): JobOutcome {
-    return json as JobOutcome;
+    if (instanceOfJobOutcome(json)) {
+        return json as JobOutcome;
+    }
+    return JobOutcome.UnknownDefaultOpenApi;
 }
 
 export function JobOutcomeToJSON(value?: JobOutcome | null): any {

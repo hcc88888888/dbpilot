@@ -126,34 +126,41 @@ type LocalBlobStore struct{ root string }
 
 func NewLocalBlobStore(root string) *LocalBlobStore { return &LocalBlobStore{root: root} }
 
+func (store *LocalBlobStore) Ready() error {
+	if store == nil || strings.TrimSpace(store.root) == "" {
+		return ErrInvalid
+	}
+	root, err := os.OpenRoot(store.root)
+	if err != nil {
+		return ErrInvalid
+	}
+	if err := root.Close(); err != nil {
+		return ErrInvalid
+	}
+	return nil
+}
+
 func (store *LocalBlobStore) Open(ctx context.Context, value Artifact) (ReadSeekCloser, error) {
 	if store == nil || ctx == nil || ctx.Err() != nil || strings.TrimSpace(store.root) == "" || strings.TrimSpace(value.StorageReference) == "" {
 		return nil, ErrInvalid
 	}
 	reference := filepath.FromSlash(value.StorageReference)
 	clean := filepath.Clean(reference)
-	if filepath.IsAbs(clean) || filepath.VolumeName(clean) != "" || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	if !filepath.IsLocal(reference) || clean != reference || clean == "." || strings.ContainsRune(reference, 0) {
 		return nil, ErrInvalid
 	}
-	root, err := filepath.Abs(store.root)
+	root, err := os.OpenRoot(store.root)
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		return nil, ErrInvalid
-	}
-	target, err := filepath.EvalSymlinks(filepath.Join(root, clean))
+	file, err := root.Open(clean)
+	closeErr := root.Close()
 	if err != nil {
 		return nil, ErrNotFound
 	}
-	relative, err := filepath.Rel(root, target)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+	if closeErr != nil {
+		_ = file.Close()
 		return nil, ErrInvalid
-	}
-	file, err := os.Open(target)
-	if err != nil {
-		return nil, ErrNotFound
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {

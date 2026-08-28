@@ -111,17 +111,23 @@ func TestRecordNormalizesEveryJSONSerializableShapeBeforeRedaction(t *testing.T)
 	}
 }
 
-func TestRecordRejectsPrivateKeysDSNsPEMAndCredentialConnectionURIsAtAnyDepth(t *testing.T) {
+func TestCredentialMaterialRejectsPrivateKeysDSNsPEMAndConnectionFormsAtAnyDepth(t *testing.T) {
 	tests := map[string]map[string]any{
-		"private_key key": {"nested": map[string]any{"private_key": "opaque"}},
-		"privatekey key":  {"items": []any{map[string]any{"privatekey": "opaque"}}},
-		"dsn key":         {"config": map[string]any{"dsn": "opaque"}},
-		"PEM block":       {"nested": map[string]any{"value": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}},
-		"MongoDB URI":     {"value": "mongodb://dbuser:dbpass@mongo.example/app"},
-		"MongoDB SRV URI": {"value": "mongodb+srv://dbuser:dbpass@mongo.example/app"},
-		"Neo4j URI":       {"value": "neo4j://graph:secret@graph.example"},
-		"Redis URI":       {"value": "redis://default:secret@cache.example/0"},
-		"generic URI":     {"value": "https://user:secret@database.example/connect"},
+		"private_key key":     {"nested": map[string]any{"private_key": "opaque"}},
+		"privatekey key":      {"items": []any{map[string]any{"privatekey": "opaque"}}},
+		"dsn key":             {"config": map[string]any{"dsn": "opaque"}},
+		"PEM block":           {"nested": map[string]any{"value": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}},
+		"DSA PEM block":       {"value": "-----BEGIN DSA PRIVATE KEY-----\nsecret\n-----END DSA PRIVATE KEY-----"},
+		"EC PEM block":        {"value": "-----BEGIN EC PRIVATE KEY-----\nsecret\n-----END EC PRIVATE KEY-----"},
+		"OpenSSH PEM block":   {"value": "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n-----END OPENSSH PRIVATE KEY-----"},
+		"generic PEM block":   {"value": "-----BEGIN VENDOR PRIVATE KEY-----\nsecret\n-----END VENDOR PRIVATE KEY-----"},
+		"Oracle Easy Connect": {"value": "scott/tiger@db.example:1521/ORCLPDB1"},
+		"Oracle descriptor":   {"value": "user=scott password=tiger connectString=db.example:1521/ORCLPDB1"},
+		"MongoDB URI":         {"value": "mongodb://dbuser:dbpass@mongo.example/app"},
+		"MongoDB SRV URI":     {"value": "mongodb+srv://dbuser:dbpass@mongo.example/app"},
+		"Neo4j URI":           {"value": "neo4j://graph:secret@graph.example"},
+		"Redis URI":           {"value": "redis://default:secret@cache.example/0"},
+		"generic URI":         {"value": "https://user:secret@database.example/connect"},
 	}
 	for name, detail := range tests {
 		t.Run(name, func(t *testing.T) {

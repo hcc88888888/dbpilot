@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -298,6 +299,60 @@ func TestGeneratedConcurrentDuplicateReturnsRetryableConflictWithoutSecondExecut
 	require.Equal(t, 1, jobs.calls())
 }
 
+func TestReconcileCancelAuditFailureFromStoredSideEffectWithoutSecondCancel(t *testing.T) {
+	jobs := &recordingJobService{transitionValue: func() job.Job {
+		value := validPlatformJob()
+		value.Status = job.StatusCancelling
+		value.Version = 8
+		return value
+	}()}
+	audits := &recordingAuditService{err: errors.New("audit unavailable")}
+	store := newHTTPIdempotencyStore()
+	services := Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+
+	first := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-audit-repair-1"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
+	require.Len(t, jobs.transitions, 1)
+	require.Equal(t, 1, audits.recordCalls)
+
+	audits.err = nil
+	retryRequest := newCancelRequest(`"7"`, "cancel-audit-repair-1")
+	retry := servePlatformRequest(services, principal, retryRequest)
+
+	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+	require.Equal(t, `"8"`, retry.Header().Get("ETag"))
+	require.Len(t, jobs.transitions, 1, "reconciliation must not repeat the cancellation")
+	require.Equal(t, 2, audits.recordCalls)
+	requireOpenAPIResponse(t, retryRequest, retry)
+}
+
+func TestReconcileArtifactAuditFailureFromStoredDescriptorWithoutSecondSigning(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadValue: artifact.Download{
+		URL:       "https://downloads.example/signed-once?signature=safe",
+		ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC),
+	}}
+	audits := &recordingAuditService{err: errors.New("audit unavailable")}
+	store := newHTTPIdempotencyStore()
+	services := Services{Artifacts: artifacts, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	first := servePlatformRequest(services, principal, newDownloadRequest("download-audit-repair-1"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+	require.Equal(t, 1, audits.recordCalls)
+
+	audits.err = nil
+	retryRequest := newDownloadRequest("download-audit-repair-1")
+	retry := servePlatformRequest(services, principal, retryRequest)
+
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.Contains(t, retry.Body.String(), "signed-once")
+	require.Equal(t, 1, artifacts.downloadCalls, "reconciliation must not sign a second descriptor")
+	require.Equal(t, 2, audits.recordCalls)
+	requireOpenAPIResponse(t, retryRequest, retry)
+}
+
 func TestAmbiguousJobCommitLeavesClaimProcessingAndRetryDoesNotTransitionAgain(t *testing.T) {
 	jobs := &recordingJobService{transitionErr: job.ErrAmbiguousCommit}
 	store := newHTTPIdempotencyStore()
@@ -402,6 +457,21 @@ func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
 	require.Equal(t, "request-download-1", actionAudits.records[0].RequestID)
 	require.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", actionAudits.records[0].TraceID)
 	requireOpenAPIResponse(t, downloadRequest, downloadResponse)
+}
+
+func TestSpecialArtifactIDRemainsValidAcrossMetadataRouteAndResponseContract(t *testing.T) {
+	id := "legacy/id with space?#%中文"
+	created := time.Date(2026, 8, 28, 4, 0, 0, 0, time.UTC)
+	artifacts := &recordingArtifactService{getValue: artifact.Artifact{
+		ID: id, Scope: platformTestScope, Kind: "inspection-report", ContentType: "application/json",
+		SizeBytes: 37, Checksum: "sha256:abc", CreatedAt: created,
+	}}
+	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/artifacts/"+url.PathEscape(id), nil)
+	response := servePlatformRequest(Services{Artifacts: artifacts}, principalWith(platformTestScope, openapi.PermissionGetArtifact), request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"id":"legacy/id with space?#%中文"`)
+	requireOpenAPIResponse(t, request, response)
 }
 
 func TestGeneratedAuditListUsesOnlyURLScopeAndOpaqueCursor(t *testing.T) {
@@ -706,15 +776,17 @@ func (service *recordingArtifactService) CreateDownload(_ context.Context, scope
 }
 
 type recordingAuditService struct {
-	page    audit.Page
-	err     error
-	scope   platformscope.Scope
-	query   audit.ListQuery
-	calls   int
-	records []audit.Event
+	page        audit.Page
+	err         error
+	scope       platformscope.Scope
+	query       audit.ListQuery
+	calls       int
+	recordCalls int
+	records     []audit.Event
 }
 
 func (service *recordingAuditService) RecordOnce(_ context.Context, event audit.Event) (audit.Event, error) {
+	service.recordCalls++
 	for _, existing := range service.records {
 		if existing.DedupeKey == event.DedupeKey {
 			return existing, nil
@@ -768,7 +840,7 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key,
 	if !exists {
 		store.records[mapKey] = httpIdempotencyRecord{fingerprint: fingerprint, owner: owner, state: idempotency.StateProcessing}
 		store.claimedOwners = append(store.claimedOwners, owner)
-		return idempotency.Claim{Claimed: true, OwnerToken: owner}, nil
+		return idempotency.Claim{Claimed: true, OwnerToken: owner, State: idempotency.StateProcessing}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return idempotency.Claim{}, idempotency.ErrKeyConflict
@@ -777,10 +849,14 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key,
 		return idempotency.Claim{}, idempotency.ErrInProgress
 	}
 	response := cloneIdempotencyResponse(record.response)
-	return idempotency.Claim{Response: &response}, nil
+	ownerToken := record.owner
+	if record.state == idempotency.StateCompleted {
+		ownerToken = ""
+	}
+	return idempotency.Claim{OwnerToken: ownerToken, State: record.state, Response: &response}, nil
 }
 
-func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
+func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.completeErr != nil {
@@ -791,10 +867,39 @@ func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.K
 	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateProcessing {
 		return idempotency.Response{}, idempotency.ErrOwnershipConflict
 	}
-	record.state = idempotency.StateCompleted
+	record.state = idempotency.StateSideEffectCommitted
 	record.response = cloneIdempotencyResponse(response)
 	store.records[mapKey] = record
 	return cloneIdempotencyResponse(record.response), nil
+}
+
+func (store *httpIdempotencyStore) MarkAudited(_ context.Context, key idempotency.Key, fingerprint, owner string, _ time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record, exists := store.records[mapKey]
+	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateSideEffectCommitted {
+		return idempotency.ErrOwnershipConflict
+	}
+	record.state = idempotency.StateAudited
+	store.records[mapKey] = record
+	return nil
+}
+
+func (store *httpIdempotencyStore) Complete(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.completeErr != nil {
+		return idempotency.Response{}, store.completeErr
+	}
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record, exists := store.records[mapKey]
+	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateAudited {
+		return idempotency.Response{}, idempotency.ErrOwnershipConflict
+	}
+	record.state = idempotency.StateCompleted
+	store.records[mapKey] = record
+	return cloneIdempotencyResponse(response), nil
 }
 
 func (store *httpIdempotencyStore) Abort(_ context.Context, key idempotency.Key, fingerprint, owner string) error {

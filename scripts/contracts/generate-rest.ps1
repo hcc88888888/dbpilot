@@ -89,6 +89,32 @@ try {
 
   foreach ($typescriptFile in Get-ChildItem -LiteralPath $sourceDirectory -Recurse -Filter '*.ts' -File) {
     $source = [IO.File]::ReadAllText($typescriptFile.FullName)
+
+    $openEnumMatches = [Text.RegularExpressions.Regex]::Matches(
+      $source,
+      "export const (?<name>[A-Za-z0-9_]+) = \{[\s\S]*?UnknownDefaultOpenApi: '11184809'[\s\S]*?\} as const;"
+    )
+    foreach ($openEnumMatch in $openEnumMatches) {
+      $enumName = $openEnumMatch.Groups['name'].Value
+      $escapedEnumName = [Text.RegularExpressions.Regex]::Escape($enumName)
+      $fromJSONPattern = [Text.RegularExpressions.Regex]::new(
+        "export function ${escapedEnumName}FromJSONTyped\(json: any, ignoreDiscriminator: boolean\): ${escapedEnumName} \{\r?\n    return json as ${escapedEnumName};\r?\n\}"
+      )
+      $replacement = @"
+export function ${enumName}FromJSONTyped(json: any, ignoreDiscriminator: boolean): ${enumName} {
+    if (instanceOf${enumName}(json)) {
+        return json as ${enumName};
+    }
+    return ${enumName}.UnknownDefaultOpenApi;
+}
+"@.TrimEnd()
+      $updated = $fromJSONPattern.Replace($source, $replacement, 1)
+      if ($updated -eq $source) {
+        throw "Open enum post-processing could not update ${enumName} in $($typescriptFile.FullName)"
+      }
+      $source = $updated
+    }
+
     $source = [Text.RegularExpressions.Regex]::Replace(
       $source,
       '[ \t]+(?=\r?$)',

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -279,15 +280,26 @@ func normalizeKey(key string) string {
 
 func containsCredentialMaterial(value string) bool {
 	normalized := strings.ToLower(value)
-	for _, marker := range []string{"password=", "passwd=", "token=", "credential=", "secret=", "authorization:", "bearer ", "secret://", "postgres://", "postgresql://", "mysql://", "-----begin private key-----", "-----begin encrypted private key-----", "-----begin rsa private key-----", "-----begin ec private key-----", "-----begin openssh private key-----"} {
+	for _, marker := range []string{"password=", "passwd=", "token=", "credential=", "secret=", "authorization:", "bearer ", "secret://", "postgres://", "postgresql://", "mysql://"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
 	}
-	return credentialURLPattern.MatchString(value)
+	if privateKeyPEMPattern.MatchString(value) || oracleEasyConnectPattern.MatchString(value) {
+		return true
+	}
+	for _, candidate := range connectionURLPattern.FindAllString(value, -1) {
+		parsed, err := url.Parse(candidate)
+		if err == nil && parsed.User != nil {
+			return true
+		}
+	}
+	return false
 }
 
-var credentialURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://(?:[^\s/@]+(?::[^\s/@]*)?|:[^\s/@]+)@`)
+var privateKeyPEMPattern = regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----`)
+var oracleEasyConnectPattern = regexp.MustCompile(`(?i)(?:^|[\s"'=])[^\s/@:]+/[^\s/@]+@(?:\[[0-9a-f:]+\]|[a-z0-9_.-]+)(?::[0-9]+)?/[a-z0-9_.-]+(?:$|[\s"'])`)
+var connectionURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
 
 func sqlSummary(statement string) string {
 	fields := strings.Fields(statement)

@@ -32,8 +32,10 @@ var ownerPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
 type State string
 
 const (
-	StateProcessing State = "processing"
-	StateCompleted  State = "completed"
+	StateProcessing          State = "processing"
+	StateSideEffectCommitted State = "side_effect_committed"
+	StateAudited             State = "audited"
+	StateCompleted           State = "completed"
 )
 
 type Key struct {
@@ -52,11 +54,16 @@ type Response struct {
 type Claim struct {
 	Claimed    bool
 	OwnerToken string
+	State      State
 	Response   *Response
 }
 
+type ReconcileFunc func(context.Context, Response) error
+
 type Store interface {
 	Claim(context.Context, Key, string, string, time.Time, time.Time) (Claim, error)
+	CommitSideEffect(context.Context, Key, string, string, Response, time.Time) (Response, error)
+	MarkAudited(context.Context, Key, string, string, time.Time) error
 	Complete(context.Context, Key, string, string, Response, time.Time) (Response, error)
 	Abort(context.Context, Key, string, string) error
 }
@@ -72,8 +79,8 @@ func NewService(store Store) *Service {
 	return &Service{store: store, now: time.Now, ttl: DefaultTTL, newOwner: newOwnerToken}
 }
 
-func (service *Service) Begin(ctx context.Context, key Key, fingerprint string) (Claim, error) {
-	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) {
+func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, reconcile ReconcileFunc) (Claim, error) {
+	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || reconcile == nil {
 		return Claim{}, ErrInvalid
 	}
 	now := service.currentTime()
@@ -93,31 +100,72 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string) 
 	if err != nil {
 		return Claim{}, err
 	}
-	if claim.Claimed == (claim.Response != nil) {
-		return Claim{}, ErrInvalid
-	}
 	if claim.Claimed {
-		if claim.OwnerToken != owner {
+		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil {
 			return Claim{}, ErrInvalid
 		}
-	} else if claim.OwnerToken != "" {
+		return claim, nil
+	}
+	if claim.Response == nil {
 		return Claim{}, ErrInvalid
 	}
-	if claim.Response != nil {
-		response := cloneResponse(*claim.Response)
-		if validateResponse(response) != nil {
+	response := cloneResponse(*claim.Response)
+	if validateResponse(response) != nil {
+		return Claim{}, ErrInvalid
+	}
+	claim.Response = &response
+	switch claim.State {
+	case StateCompleted:
+		if claim.OwnerToken != "" {
 			return Claim{}, ErrInvalid
 		}
-		claim.Response = &response
+		return claim, nil
+	case StateSideEffectCommitted:
+		if !ownerPattern.MatchString(claim.OwnerToken) {
+			return Claim{}, ErrInvalid
+		}
+		if err := reconcile(ctx, cloneResponse(response)); err != nil {
+			return Claim{}, err
+		}
+		if err := service.store.MarkAudited(ctx, key, fingerprint, claim.OwnerToken, service.currentTime()); err != nil {
+			return Claim{}, err
+		}
+	case StateAudited:
+		if !ownerPattern.MatchString(claim.OwnerToken) {
+			return Claim{}, ErrInvalid
+		}
+	default:
+		return Claim{}, ErrInvalid
 	}
-	return claim, nil
+	completed, err := service.store.Complete(ctx, key, fingerprint, claim.OwnerToken, response, service.currentTime())
+	if err != nil {
+		return Claim{}, err
+	}
+	if validateResponse(completed) != nil {
+		return Claim{}, ErrInvalid
+	}
+	completed = cloneResponse(completed)
+	return Claim{State: StateCompleted, Response: &completed}, nil
 }
 
-func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response) (Response, error) {
-	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil {
+func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response, reconcile ReconcileFunc) (Response, error) {
+	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || reconcile == nil {
 		return Response{}, ErrInvalid
 	}
-	completed, err := service.store.Complete(ctx, key, fingerprint, owner, cloneResponse(response), service.currentTime())
+	committed, err := service.store.CommitSideEffect(ctx, key, fingerprint, owner, cloneResponse(response), service.currentTime())
+	if err != nil {
+		return Response{}, err
+	}
+	if validateResponse(committed) != nil {
+		return Response{}, ErrInvalid
+	}
+	if err := reconcile(ctx, cloneResponse(committed)); err != nil {
+		return Response{}, err
+	}
+	if err := service.store.MarkAudited(ctx, key, fingerprint, owner, service.currentTime()); err != nil {
+		return Response{}, err
+	}
+	completed, err := service.store.Complete(ctx, key, fingerprint, owner, committed, service.currentTime())
 	if err != nil {
 		return Response{}, err
 	}

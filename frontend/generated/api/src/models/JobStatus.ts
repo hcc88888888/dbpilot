@@ -47,7 +47,10 @@ export function JobStatusFromJSON(json: any): JobStatus {
 }
 
 export function JobStatusFromJSONTyped(json: any, ignoreDiscriminator: boolean): JobStatus {
-    return json as JobStatus;
+    if (instanceOfJobStatus(json)) {
+        return json as JobStatus;
+    }
+    return JobStatus.UnknownDefaultOpenApi;
 }
 
 export function JobStatusToJSON(value?: JobStatus | null): any {

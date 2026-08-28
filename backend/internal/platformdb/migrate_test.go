@@ -38,6 +38,12 @@ func TestRunMigrationsAppliesArtifactAuditAndIdempotencySchemaThroughSharedRegis
 	mock.ExpectExec("(?s)ALTER TABLE audit_events.*dedupe_key.*CREATE UNIQUE INDEX.*audit_events_scope_dedupe_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("platformdb/migrations/0004_audit_dedupe.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0005_http_idempotency_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE idempotency_records.*side_effect_committed.*audited.*idempotency_records_response_phase_check").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("platformdb/migrations/0005_http_idempotency_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -64,6 +70,10 @@ func TestRunMigrationsSkipsAlreadyAppliedPlatformSchema(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0004_audit_dedupe.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0005_http_idempotency_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))

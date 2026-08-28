@@ -2,7 +2,9 @@ package artifact
 
 import (
 	"context"
+	"encoding/base64"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,9 +64,17 @@ func TestHMACDownloadSignerRejectsExpiredDescriptor(t *testing.T) {
 	require.ErrorIs(t, err, ErrExpired)
 }
 
-func TestHMACDownloadSignerRejectsArtifactIDsOutsideContractAlphabet(t *testing.T) {
+func TestSpecialArtifactIDRoundTripsThroughOneBase64URLPathSegment(t *testing.T) {
 	signer, err := NewHMACDownloadSigner("https://control.example/api/v1/artifact-downloads", "secret://control/download", database.StaticSecretResolver{"secret://control/download": []byte("0123456789abcdef0123456789abcdef")})
 	require.NoError(t, err)
-	_, err = signer.Sign(context.Background(), Artifact{ID: "artifact/with space", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, time.Minute)
-	require.ErrorIs(t, err, ErrInvalid)
+	id := "artifact/with space?#%中文"
+	signed, err := signer.Sign(context.Background(), Artifact{ID: id, Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, time.Minute)
+	require.NoError(t, err)
+	parsed, err := url.Parse(signed)
+	require.NoError(t, err)
+	require.True(t, strings.HasSuffix(parsed.EscapedPath(), "/"+base64.RawURLEncoding.EncodeToString([]byte(id))))
+
+	claims, err := signer.Verify(context.Background(), signed)
+	require.NoError(t, err)
+	require.Equal(t, id, claims.ArtifactID)
 }

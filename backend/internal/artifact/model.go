@@ -2,7 +2,7 @@ package artifact
 
 import (
 	"errors"
-	"regexp"
+	"strings"
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -19,9 +19,7 @@ var (
 	ErrIntegrityMismatch        = errors.New("artifact content integrity mismatch")
 )
 
-var artifactIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
-
-func validArtifactID(value string) bool { return artifactIDPattern.MatchString(value) }
+func validArtifactID(value string) bool { return strings.TrimSpace(value) != "" }
 
 type ResourceReference struct {
 	ResourceType string `json:"resource_type"`

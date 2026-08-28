@@ -70,7 +70,11 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint)
+	reconcile := func(callbackContext context.Context, _ idempotency.Response) error {
+		_, auditErr := api.services.Audit.RecordOnce(callbackContext, httpActionAuditEvent(callbackContext, scope, principal, "job.cancel_requested", "job", request.JobId, "success", "cancelJob", request.Params.IdempotencyKey))
+		return auditErr
+	}
+	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -103,9 +107,6 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if value.ID != request.JobId || value.Scope != scope {
 		return nil, errors.New("job service returned an out-of-scope entity")
 	}
-	if _, err := api.services.Audit.RecordOnce(ctx, httpActionAuditEvent(ctx, scope, principal, "job.cancel_requested", "job", request.JobId, "success", "cancelJob", request.Params.IdempotencyKey)); err != nil {
-		return nil, err
-	}
 	response, err := openAPIJob(value)
 	if err != nil {
 		return nil, err
@@ -118,7 +119,7 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	stored.Header.Set("Content-Type", "application/json")
 	stored.Header.Set("ETag", entityTag(value.Version))
 	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +164,11 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint)
+	reconcile := func(callbackContext context.Context, _ idempotency.Response) error {
+		_, auditErr := api.services.Audit.RecordOnce(callbackContext, httpActionAuditEvent(callbackContext, scope, principal, "artifact.download_authorized", "artifact", request.ArtifactId, "success", "createArtifactDownload", request.Params.IdempotencyKey))
+		return auditErr
+	}
+	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +188,6 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 		}
 		return nil, err
 	}
-	if _, err := api.services.Audit.RecordOnce(ctx, httpActionAuditEvent(ctx, scope, principal, "artifact.download_authorized", "artifact", request.ArtifactId, "success", "createArtifactDownload", request.Params.IdempotencyKey)); err != nil {
-		return nil, err
-	}
 	var headers *map[string]string
 	if len(value.Headers) > 0 {
 		copyHeaders := make(map[string]string, len(value.Headers))
@@ -203,7 +205,7 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	}
 	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
 	stored.Header.Set("Content-Type", "application/json")
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, reconcile)
 	if err != nil {
 		return nil, err
 	}

@@ -35,7 +35,10 @@ export function JobOutcomeFromJSON(json) {
     return JobOutcomeFromJSONTyped(json, false);
 }
 export function JobOutcomeFromJSONTyped(json, ignoreDiscriminator) {
-    return json;
+    if (instanceOfJobOutcome(json)) {
+        return json;
+    }
+    return JobOutcome.UnknownDefaultOpenApi;
 }
 export function JobOutcomeToJSON(value) {
     return value;

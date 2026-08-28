@@ -23,6 +23,7 @@ import (
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/controlplane"
+	platformdatabase "dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
 )
 
@@ -242,6 +243,32 @@ func TestNewServerWiresDurablePlatformIdempotency(t *testing.T) {
 	server, err := NewServer(validServerConfig())
 	require.NoError(t, err)
 	require.NotNil(t, server.idempotency)
+}
+
+func TestReadinessRejectsMissingArtifactRootAndSigningKeyAtConstruction(t *testing.T) {
+	t.Run("missing storage root", func(t *testing.T) {
+		config := validServerConfig()
+		config.ArtifactDownloadHandler = nil
+		config.Artifact.StorageRoot = filepath.Join(t.TempDir(), "missing")
+		config.ArtifactSecretResolver = platformdatabase.StaticSecretResolver{
+			config.Artifact.SigningKeyRef: bytes.Repeat([]byte{0x42}, 32),
+		}
+
+		server, err := NewServer(config)
+
+		require.Nil(t, server)
+		require.ErrorContains(t, err, "artifact")
+	})
+
+	t.Run("missing signing key", func(t *testing.T) {
+		config := validServerConfig()
+		config.ArtifactSecretResolver = platformdatabase.StaticSecretResolver{}
+
+		server, err := NewServer(config)
+
+		require.Nil(t, server)
+		require.ErrorContains(t, err, "artifact")
+	})
 }
 
 func TestNewServerRejectsMissingInvalidAndDuplicateEvaluationScopes(t *testing.T) {
@@ -477,6 +504,7 @@ func validServerConfig() Config {
 		EvaluationScopes:        []EvaluationScopeSettings{{TenantID: "tenant-a", ProjectID: "project-a"}},
 		CommandSigner:           testCommandSigner{},
 		Artifact:                ArtifactSettings{SigningKeyRef: "secret://controlplane/artifact-download"},
+		ArtifactSecretResolver:  platformdatabase.StaticSecretResolver{"secret://controlplane/artifact-download": bytes.Repeat([]byte{0x42}, 32)},
 		ArtifactDownloadHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 	}
 }

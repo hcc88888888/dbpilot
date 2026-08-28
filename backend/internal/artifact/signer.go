@@ -9,7 +9,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -49,7 +48,8 @@ func (signer *HMACDownloadSigner) Sign(ctx context.Context, value Artifact, ttl 
 	}
 	signature := signatureFor(key, value.ID, value.Scope, expires)
 	result := *signer.baseURL
-	result.Path = path.Join(result.Path, value.ID)
+	encodedID := base64.RawURLEncoding.EncodeToString([]byte(value.ID))
+	result.Path = strings.TrimSuffix(result.Path, "/") + "/" + encodedID
 	query := url.Values{}
 	query.Set("tenant_id", value.Scope.TenantID)
 	query.Set("project_id", value.Scope.ProjectID)
@@ -75,8 +75,9 @@ func (signer *HMACDownloadSigner) Verify(ctx context.Context, rawURL string) (Do
 	if escapedID == "" || strings.Contains(escapedID, "/") {
 		return DownloadClaims{}, ErrInvalidSignature
 	}
-	id, err := url.PathUnescape(escapedID)
-	if err != nil || !validArtifactID(id) {
+	decodedID, err := base64.RawURLEncoding.DecodeString(escapedID)
+	id := string(decodedID)
+	if err != nil || base64.RawURLEncoding.EncodeToString(decodedID) != escapedID || !validArtifactID(id) {
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	query := value.Query()
@@ -108,6 +109,14 @@ func (signer *HMACDownloadSigner) Verify(ctx context.Context, rawURL string) (Do
 		return DownloadClaims{}, ErrInvalidSignature
 	}
 	return DownloadClaims{ArtifactID: id, Scope: scope, ExpiresAt: expires}, nil
+}
+
+func (signer *HMACDownloadSigner) Ready(ctx context.Context) error {
+	if signer == nil || ctx == nil {
+		return ErrInvalid
+	}
+	_, err := signer.key(ctx)
+	return err
 }
 
 func (signer *HMACDownloadSigner) VerifyRequest(ctx context.Context, request *http.Request) (DownloadClaims, error) {
