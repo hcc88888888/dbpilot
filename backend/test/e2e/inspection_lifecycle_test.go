@@ -64,18 +64,24 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	scope := platformscope.Scope{TenantID: "tenant-inspection-e2e", ProjectID: "project-inspection-e2e"}
 	metricScope := alert.Scope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}
 	createdAt := time.Now().UTC().Truncate(time.Microsecond)
-	item := inspection.BuiltinHostItems()[0]
-	item.Scope = scope
-	item.Enabled = true
-	item.CreatedAt = createdAt
-	item.UpdatedAt = createdAt
+	items := inspection.BuiltinHostItems()
+	require.Len(t, items, 13)
+	versions := make([]inspection.PolicyItem, len(items))
 
 	jobRepository := job.NewPostgresRepository(database)
 	repository := inspection.NewPostgresRepository(database, jobRepository)
-	require.NoError(t, repository.CreateItem(ctx, item))
+	for index := range items {
+		items[index].Scope = scope
+		items[index].Enabled = true
+		items[index].CreatedAt = createdAt
+		items[index].UpdatedAt = createdAt
+		versions[index] = inspection.PolicyItem{ItemID: items[index].ID, Version: items[index].Version}
+		require.NoError(t, repository.CreateItem(ctx, items[index]))
+	}
+	cpuItem := items[0]
 	targets, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{
-		{Scope: scope, AgentID: "agent-a", DisplayName: "Primary host", Host: "db-a.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric}},
-		{Scope: scope, AgentID: "agent-b", DisplayName: "Standby host", Host: "db-b.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric}},
+		{Scope: scope, AgentID: "agent-a", DisplayName: "Primary host", Host: "db-a.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, TrustedProcessAllowlist: true},
+		{Scope: scope, AgentID: "agent-b", DisplayName: "Standby host", Host: "db-b.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, TrustedProcessAllowlist: true},
 	})
 	require.NoError(t, err)
 	var idCounter atomic.Int32
@@ -89,7 +95,7 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	}
 	request := inspection.CreateRunRequest{
 		Scope: scope, Selector: inspection.TargetSelector{AgentIDs: []string{"agent-a", "agent-b"}},
-		Items: []inspection.PolicyItem{{ItemID: item.ID, Version: item.Version}}, TargetTimeout: 20 * time.Second, MaxConcurrency: 2,
+		Items: versions, TargetTimeout: 20 * time.Second, MaxConcurrency: 2,
 		IdempotencyKey: "host-inspection-e2e", InitiatedBy: "operator-e2e", RequestID: "request-inspection-e2e",
 		TraceID: "11111111111111111111111111111111", Trigger: inspection.RunTriggerManual,
 	}
@@ -172,25 +178,50 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	metricStore := alert.NewPostgresRepository(database)
 	metricConsumer := controlplane.NewMetricConsumer(inspectionScopeResolver{"agent-a": metricScope}, metricStore)
 	ingestService := ingest.NewService(ingest.AllowAnyVerifiedAgent{}, ingest.NewMemoryDeduplicator(), metricConsumer)
-	wrongSourcePayload := inspectionMetricPayload(t, item.MetricRule.MetricName, 99, createdAt.Add(time.Microsecond), "unrelated-source")
+	wrongSourcePayload := inspectionMetricPayload(t, cpuItem.MetricRule.MetricName, 99, createdAt.Add(time.Microsecond), "unrelated-source")
 	wrongSourceAck, err := ingestService.PushMetricBatch(inspectionIngestPeerContext("agent-a"), metricBatch("inspection-wrong-source", "agent-a", "unrelated-source", wrongSourcePayload))
 	require.NoError(t, err)
 	require.True(t, wrongSourceAck.GetAccepted())
-	wrongSourceEvidence, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", []inspection.Item{item}, createdAt, createdAt.Add(10*time.Second), 16)
+	wrongSourceEvidence, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", items, createdAt, createdAt.Add(10*time.Second), 256)
 	require.NoError(t, err)
 	require.False(t, wrongSourceEvidence.Complete, "same-name metric from another source must not satisfy the host snapshot")
 
-	validPayload := inspectionMetricPayload(t, item.MetricRule.MetricName, 42, createdAt.Add(2*time.Microsecond), "inspection-host-snapshot")
+	incompleteAt := createdAt.Add(2 * time.Microsecond)
+	splitAt := createdAt.Add(3 * time.Microsecond)
+	coherentAt := createdAt.Add(4 * time.Microsecond)
+	incompleteValues := inspectionFullHostMetricValues()
+	delete(incompleteValues, "dbpilot.inspection.host.log.critical_count")
+	incompletePayload := inspectionMetricPayloadForValues(t, incompleteValues, incompleteAt, "inspection-host-snapshot")
+	incompleteAck, err := ingestService.PushMetricBatch(inspectionIngestPeerContext("agent-a"), metricBatch("inspection-incomplete-source", "agent-a", "inspection-host-snapshot", incompletePayload))
+	require.NoError(t, err)
+	require.True(t, incompleteAck.GetAccepted())
+	splitPayload := inspectionMetricPayloadForValues(t, map[string]float64{"dbpilot.inspection.host.log.critical_count": 0}, splitAt, "inspection-host-snapshot")
+	splitAck, err := ingestService.PushMetricBatch(inspectionIngestPeerContext("agent-a"), metricBatch("inspection-split-source", "agent-a", "inspection-host-snapshot", splitPayload))
+	require.NoError(t, err)
+	require.True(t, splitAck.GetAccepted())
+	splitEvidence, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", items, createdAt, createdAt.Add(10*time.Second), 256)
+	require.NoError(t, err)
+	require.False(t, splitEvidence.Complete, "required observations split across timestamps must not form one host snapshot")
+
+	validPayload := inspectionMetricPayloadForValues(t, inspectionFullHostMetricValues(), coherentAt, "inspection-host-snapshot")
 	validAck, err := ingestService.PushMetricBatch(inspectionIngestPeerContext("agent-a"), metricBatch("inspection-valid-source", "agent-a", "inspection-host-snapshot", validPayload))
 	require.NoError(t, err)
 	require.True(t, validAck.GetAccepted())
-	var acceptedAt time.Time
-	require.NoError(t, database.QueryRowContext(ctx, `SELECT accepted_at FROM metric_samples WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND labels->>'dbpilot_source_id'=$4`, scope.TenantID, scope.ProjectID, "agent-a", "inspection-host-snapshot").Scan(&acceptedAt))
+	var acceptedAt, maximumAcceptedAt time.Time
+	var coherentSamples int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT min(accepted_at), max(accepted_at), count(*) FROM metric_samples WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND labels->>'dbpilot_source_id'=$4 AND sampled_at=$5`, scope.TenantID, scope.ProjectID, "agent-a", "inspection-host-snapshot", coherentAt).Scan(&acceptedAt, &maximumAcceptedAt, &coherentSamples))
 	acceptedAt = acceptedAt.UTC()
+	maximumAcceptedAt = maximumAcceptedAt.UTC()
+	require.Equal(t, 18, coherentSamples)
+	require.Equal(t, acceptedAt, maximumAcceptedAt, "one atomic authenticated batch must share its server acceptance timestamp")
 	require.True(t, acceptedAt.After(createdAt))
-	tooEarly, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", []inspection.Item{item}, createdAt, acceptedAt.Add(-time.Microsecond), 16)
+	tooEarly, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", items, createdAt, acceptedAt.Add(-time.Microsecond), 256)
 	require.NoError(t, err)
 	require.False(t, tooEarly.Complete, "backdated data accepted after the server deadline must remain unusable")
+	completeEvidence, err := repository.LoadHostSnapshot(ctx, scope, "agent-a", items, createdAt, createdAt.Add(10*time.Second), 256)
+	require.NoError(t, err)
+	require.True(t, completeEvidence.Complete)
+	require.Equal(t, coherentAt, completeEvidence.SampledAt, "the newest complete coherent snapshot must win over incomplete/split distractors")
 
 	blobRoot := filepath.Join(t.TempDir(), "artifacts")
 	require.NoError(t, os.MkdirAll(blobRoot, 0o700))
@@ -211,9 +242,13 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	require.Equal(t, inspection.RunPartial, detail.Run.Status)
 	require.Equal(t, 1, detail.Run.CompletedTargetCount)
 	require.Equal(t, 1, detail.Run.FailedTargetCount)
-	require.Len(t, detail.Findings, 1)
-	require.Equal(t, inspection.LevelHealthy, detail.Findings[0].Level)
-	require.Equal(t, "42", detail.Findings[0].Evidence["value"])
+	require.Len(t, detail.Findings, 13)
+	for _, finding := range detail.Findings {
+		require.Equal(t, "agent-a", finding.TargetID)
+		require.NotEqual(t, inspection.LevelMissingData, finding.Level, finding.ItemID)
+		require.NotEqual(t, inspection.LevelUnsupported, finding.Level, finding.ItemID)
+	}
+	require.Equal(t, "12", inspectionFindingByItem(t, detail.Findings, "host.cpu.utilization").Evidence["value"])
 	require.Equal(t, map[string]inspection.TargetStatus{"agent-a": inspection.TargetSucceeded, "agent-b": inspection.TargetFailed}, inspectionTargetStatuses(detail.Targets))
 
 	report, err := repository.GetReport(ctx, scope, detail.Run.ReportID)
@@ -240,6 +275,8 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	require.Equal(t, []string{"application/json", "text/html; charset=utf-8"}, []string{artifactRows[0].ContentType, artifactRows[1].ContentType})
 	var document inspection.ReportDocument
 	require.NoError(t, json.Unmarshal(report.Snapshot, &document))
+	require.Len(t, document.Items, 13)
+	require.Len(t, document.Findings, 13)
 	require.Equal(t, run.JobID, document.References.JobID)
 	require.Equal(t, run.AuditCorrelation, document.References.AuditCorrelation)
 	require.ElementsMatch(t, []string{commands["agent-a"], commands["agent-b"]}, []string{document.References.Commands[0].CommandID, document.References.Commands[1].CommandID})
@@ -285,11 +322,11 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	processed, err = worker.Process(ctx, time.Now().UTC().Add(time.Second), 4)
 	require.NoError(t, err)
 	require.Zero(t, processed)
-	assertInspectionCompletionCounts(t, ctx, database, scope, run, 1, 1, 2, 1)
+	assertInspectionCompletionCounts(t, ctx, database, scope, run, 13, 1, 2, 1)
 	finalReport, err := repository.GetReport(ctx, scope, report.ID)
 	require.NoError(t, err)
 	require.Equal(t, report, finalReport, "completed report and Artifact references must be byte-for-byte stable on retry")
-	t.Logf("host inspection evidence: run=%s status=%s findings=1 reports=1 artifacts=2 accepted_at=%s commands=%s,%s", run.ID, detail.Run.Status, acceptedAt.Format(time.RFC3339Nano), commands["agent-a"], commands["agent-b"])
+	t.Logf("host inspection evidence: run=%s status=%s findings=13 reports=1 artifacts=2 accepted_at=%s commands=%s,%s", run.ID, detail.Run.Status, acceptedAt.Format(time.RFC3339Nano), commands["agent-a"], commands["agent-b"])
 }
 
 type inspectionScopeResolver map[string]alert.Scope
@@ -310,13 +347,56 @@ func inspectionIngestPeerContext(agentID string) context.Context {
 }
 
 func inspectionMetricPayload(t *testing.T, metric string, value float64, sampledAt time.Time, sourceID string) []byte {
+	return inspectionMetricPayloadForValues(t, map[string]float64{metric: value}, sampledAt, sourceID)
+}
+
+func inspectionMetricPayloadForValues(t *testing.T, values map[string]float64, sampledAt time.Time, sourceID string) []byte {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{"samples": []any{map[string]any{
-		"name": metric, "value": value, "sampled_at": sampledAt.UTC().Format(time.RFC3339Nano),
-		"labels": map[string]string{"instance": sourceID, "component": sourceID, "role": "collector", "host": "db-a.internal", "dbpilot_source_id": sourceID},
-	}}})
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	samples := make([]any, 0, len(names))
+	for _, name := range names {
+		samples = append(samples, map[string]any{
+			"name": name, "value": values[name], "sampled_at": sampledAt.UTC().Format(time.RFC3339Nano),
+			"labels": inspectionHostSnapshotLabels(sourceID),
+		})
+	}
+	payload, err := json.Marshal(map[string]any{"samples": samples})
 	require.NoError(t, err)
 	return payload
+}
+
+func inspectionHostSnapshotLabels(sourceID string) map[string]string {
+	return map[string]string{
+		"instance": "inspection-host-snapshot", "component": "inspection-host-snapshot",
+		"role": "collector", "host": "db-a", "dbpilot_source_id": sourceID,
+	}
+}
+
+func inspectionFullHostMetricValues() map[string]float64 {
+	return map[string]float64{
+		"system.cpu.utilization":                                       12,
+		"system.cpu.load_average.1m_per_cpu":                           0.5,
+		"system.memory.utilization":                                    22,
+		"system.swap.utilization":                                      3,
+		"system.filesystem.utilization":                                40,
+		"system.filesystem.inode_utilization":                          30,
+		"dbpilot.inspection.host.agent.heartbeat_age_seconds":          0,
+		"dbpilot.inspection.host.metric.age_seconds":                   0,
+		"dbpilot.inspection.host.spool.utilization":                    10,
+		"dbpilot.inspection.host.log.summary_available":                1,
+		"dbpilot.inspection.host.oom.count":                            0,
+		"dbpilot.inspection.host.time.synchronization_available":       1,
+		"dbpilot.inspection.host.time.synchronized":                    1,
+		"dbpilot.inspection.host.database.process_allowlist_available": 1,
+		"dbpilot.inspection.host.database.required_process_count":      2,
+		"dbpilot.inspection.host.log.warning_count":                    1,
+		"dbpilot.inspection.host.log.error_count":                      0,
+		"dbpilot.inspection.host.log.critical_count":                   0,
+	}
 }
 
 func metricBatch(batchID, agentID, sourceID string, payload []byte) *agentv1.MetricBatch {
@@ -330,6 +410,17 @@ func inspectionTargetStatuses(targets []inspection.TargetRun) map[string]inspect
 		result[target.TargetID] = target.Status
 	}
 	return result
+}
+
+func inspectionFindingByItem(t *testing.T, findings []inspection.Finding, itemID string) inspection.Finding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.ItemID == itemID {
+			return finding
+		}
+	}
+	t.Fatalf("inspection finding %q not found", itemID)
+	return inspection.Finding{}
 }
 
 func assertInspectionCreationCounts(t *testing.T, ctx context.Context, database interface {
