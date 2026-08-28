@@ -120,6 +120,8 @@ type StreamOpener func(context.Context) (ControlStream, error)
 type CommandJournal interface {
 	Prepare(context.Context, *agentv1.CommandEnvelope, time.Time) (bool, error)
 	AuthorizeStart(context.Context, string, []byte, uint64, time.Time) error
+	CancelPrepared(context.Context, string, time.Time) error
+	MarkInterrupted(context.Context, string, time.Time) error
 	Complete(context.Context, string, *agentv1.CommandResult, time.Time) error
 	Active(context.Context) ([]commandjournal.Entry, error)
 	PendingResults(context.Context) ([]commandjournal.Entry, error)
@@ -402,7 +404,9 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		if err := commandvalidation.ValidateCancellation(typed.CommandCancellation); err != nil {
 			return errors.New("command cancellation is invalid")
 		}
-		c.cancelCommand(typed.CommandCancellation)
+		if err := c.cancelCommand(ctx, typed.CommandCancellation); err != nil {
+			return err
+		}
 	case *agentv1.ServerMessage_CommandResultAcknowledgement:
 		acknowledgement := typed.CommandResultAcknowledgement
 		if err := commandvalidation.ValidateResultAcknowledgement(acknowledgement); err != nil {
@@ -476,11 +480,18 @@ func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context,
 	if !exists {
 		return errors.New("prepared command executor is unavailable")
 	}
-	if err := c.journal.AuthorizeStart(ctx, start.GetCommandId(), start.GetExecutionToken(), start.GetLeaseRevision(), c.now()); err != nil {
+	startDeadline := start.GetStartDeadline().AsTime().UTC()
+	if err := c.journal.AuthorizeStart(ctx, start.GetCommandId(), start.GetExecutionToken(), start.GetLeaseRevision(), startDeadline); err != nil {
+		if errors.Is(err, commandjournal.ErrStartDeadlineExceeded) {
+			return c.expireAuthorizedStart(ctx, start.GetCommandId())
+		}
 		if errors.Is(err, commandjournal.ErrInvalidTransition) {
 			return nil
 		}
 		return fmt.Errorf("authorize prepared command start: %w", err)
+	}
+	if !c.now().UTC().Before(startDeadline) {
+		return c.expireAuthorizedStart(ctx, start.GetCommandId())
 	}
 	executionContext, cancel := context.WithCancel(executionParent)
 	c.runningMu.Lock()
@@ -492,6 +503,30 @@ func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context,
 		defer cancel()
 		c.execute(executionContext, entry.Envelope, start.GetExecutionToken(), start.GetLeaseRevision(), executor)
 	}()
+	return nil
+}
+
+func (c *ControlClient) expireAuthorizedStart(ctx context.Context, commandID string) error {
+	if err := c.journal.MarkInterrupted(ctx, commandID, c.now()); err != nil {
+		if errors.Is(err, commandjournal.ErrInvalidTransition) {
+			if cancelErr := c.journal.CancelPrepared(ctx, commandID, c.now()); cancelErr == nil || errors.Is(cancelErr, commandjournal.ErrInvalidTransition) {
+				return nil
+			} else {
+				return fmt.Errorf("persist expired prepared command: %w", cancelErr)
+			}
+		}
+		return fmt.Errorf("persist interrupted command start: %w", err)
+	}
+	entry, err := c.journal.Get(ctx, commandID)
+	if err != nil {
+		return fmt.Errorf("load interrupted command result: %w", err)
+	}
+	if entry.Result == nil {
+		return errors.New("interrupted command result is unavailable")
+	}
+	if err := c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: entry.Result}}); err != nil && !errors.Is(err, ErrControlStreamDisconnected) {
+		return err
+	}
 	return nil
 }
 
@@ -602,14 +637,21 @@ func (r commandProgressReporter) Report(progress *agentv1.CommandProgress) error
 	return r.client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: progress}})
 }
 
-func (c *ControlClient) cancelCommand(cancellation *agentv1.CommandCancellation) {
+func (c *ControlClient) cancelCommand(ctx context.Context, cancellation *agentv1.CommandCancellation) error {
+	if len(cancellation.GetExecutionToken()) == 0 && cancellation.GetLeaseRevision() == 0 {
+		if err := c.journal.CancelPrepared(ctx, cancellation.GetCommandId(), c.now()); err != nil && !errors.Is(err, commandjournal.ErrInvalidTransition) && !errors.Is(err, commandjournal.ErrCommandNotFound) {
+			return fmt.Errorf("durably cancel prepared command: %w", err)
+		}
+		return nil
+	}
 	c.runningMu.Lock()
 	running, exists := c.running[cancellation.GetCommandId()]
 	c.runningMu.Unlock()
 	if !exists || !executionTokensEqual(running.executionToken, cancellation.GetExecutionToken()) || running.leaseRevision != cancellation.GetLeaseRevision() {
-		return
+		return nil
 	}
 	running.cancel()
+	return nil
 }
 
 func executionTokensEqual(left, right []byte) bool {

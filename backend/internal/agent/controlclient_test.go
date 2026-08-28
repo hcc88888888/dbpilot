@@ -128,6 +128,100 @@ func TestResultAckOnlyMarksMatchingDigestReported(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestStartDeadlineCrossingAfterJournalSyncDoesNotLaunchExecutor(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	realJournal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = realJournal.Close() })
+	journal := &blockingAuthorizeJournal{Journal: realJournal, authorized: make(chan struct{}), release: make(chan struct{})}
+	executor := &progressExecutor{events: &orderedEvents{}, calls: make(chan struct{}, 1)}
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, executor))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	deadline := now.Add(time.Minute)
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	verifier.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-deadline", "agent-a", []byte("nonce-deadline"), now, now.Add(time.Hour))}}
+	stream.receive <- commandStartMessage("command-deadline", testExecutionToken(0x73), 20, deadline)
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
+		Now: func() time.Time { return time.Unix(0, clock.Load()).UTC() },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+
+	select {
+	case <-journal.authorized:
+	case <-time.After(time.Second):
+		t.Fatal("journal authorization did not reach its durable sync boundary")
+	}
+	clock.Store(deadline.Add(time.Nanosecond).UnixNano())
+	close(journal.release)
+	select {
+	case <-executor.calls:
+		t.Fatal("executor launched after the Start deadline crossed during journal sync")
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Eventually(t, func() bool {
+		pending, pendingErr := realJournal.PendingResults(context.Background())
+		return pendingErr == nil && len(pending) == 1 && pending[0].Result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestSameSessionDuplicateAndMismatchedStartNeverReexecute(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	executor := &sameSessionBlockingExecutor{started: make(chan struct{}, 1)}
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, executor))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	verifier.now = func() time.Time { return now }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-duplicate-start", "agent-a", []byte("nonce-duplicate-start"), now, now.Add(time.Hour))}}
+	token := testExecutionToken(0x74)
+	start := commandStartMessage("command-duplicate-start", token, 21, now.Add(time.Minute))
+	stream.receive <- start
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start")
+	}
+
+	stream.receive <- start
+	time.Sleep(20 * time.Millisecond)
+	require.Equal(t, int32(1), executor.calls.Load(), "matching duplicate Start must not execute twice")
+	stream.receive <- commandStartMessage("command-duplicate-start", testExecutionToken(0x75), 22, now.Add(time.Minute))
+	time.Sleep(20 * time.Millisecond)
+	require.Equal(t, int32(1), executor.calls.Load(), "mismatched Start must not execute")
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -801,6 +895,21 @@ type failingCompleteJournal struct {
 	once           sync.Once
 }
 
+type blockingAuthorizeJournal struct {
+	commandjournal.Journal
+	authorized chan struct{}
+	release    chan struct{}
+}
+
+func (j *blockingAuthorizeJournal) AuthorizeStart(ctx context.Context, commandID string, token []byte, revision uint64, deadline time.Time) error {
+	if err := j.Journal.AuthorizeStart(ctx, commandID, token, revision, deadline); err != nil {
+		return err
+	}
+	close(j.authorized)
+	<-j.release
+	return nil
+}
+
 func (j *failingCompleteJournal) Complete(context.Context, string, *agentv1.CommandResult, time.Time) error {
 	j.once.Do(func() { close(j.completeCalled) })
 	return errors.New("journal disk failure")
@@ -908,6 +1017,21 @@ type shutdownCompletionExecutor struct{ started chan struct{} }
 
 func (e *shutdownCompletionExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ ProgressReporter) (*agentv1.CommandResult, error) {
 	close(e.started)
+	<-ctx.Done()
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED}, nil
+}
+
+type sameSessionBlockingExecutor struct {
+	calls   atomic.Int32
+	started chan struct{}
+}
+
+func (e *sameSessionBlockingExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ ProgressReporter) (*agentv1.CommandResult, error) {
+	e.calls.Add(1)
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
 	<-ctx.Done()
 	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED}, nil
 }

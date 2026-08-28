@@ -3,17 +3,23 @@ package agentcontrol
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
 	"net/url"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	agentruntime "dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/agent/commandjournal"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -118,6 +124,60 @@ func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.
 	require.ErrorIs(t, registry.Dispatch(context.Background(), "agent-a", collectNowEnvelope("command-d", "agent-a", now.Add(-time.Second))), ErrCommandExpired)
 	require.ErrorIs(t, registry.Dispatch(context.Background(), "agent-a", collectNowEnvelope("command-e", "agent-b", now.Add(time.Minute))), ErrAgentMismatch)
 	require.NotNil(t, sessionContext)
+}
+
+func TestRegistryCancelFlowsThroughStreamToPreparedAndRunningAgent(t *testing.T) {
+	t.Run("prepared command is durably cancelled without execution", func(t *testing.T) {
+		fixture := newAgentRegistryIntegrationFixture(t, NoopObserver{})
+		envelope := fixture.signedEnvelope(t, "command-prepared-cancel")
+		require.NoError(t, fixture.registry.Dispatch(context.Background(), "agent-a", envelope))
+		require.Eventually(t, func() bool {
+			entry, err := fixture.journal.Get(context.Background(), envelope.GetCommandId())
+			return err == nil && entry.State == commandjournal.StatePrepared
+		}, time.Second, time.Millisecond)
+
+		require.NoError(t, fixture.registry.Cancel(context.Background(), "agent-a", envelope.GetCommandId()))
+		require.Eventually(t, func() bool {
+			entry, err := fixture.journal.Get(context.Background(), envelope.GetCommandId())
+			return err == nil && entry.State == commandjournal.StateCancelled
+		}, time.Second, time.Millisecond)
+		require.Zero(t, fixture.executor.calls.Load())
+
+		lateStart := &agentv1.CommandStart{CommandId: envelope.GetCommandId(), ExecutionToken: testServerExecutionToken(0x61), LeaseRevision: 1, LeaseSeconds: 30, StartDeadline: timestamppb.New(time.Now().Add(time.Minute))}
+		require.NoError(t, fixture.registry.Start(context.Background(), "agent-a", lateStart))
+		time.Sleep(20 * time.Millisecond)
+		require.Zero(t, fixture.executor.calls.Load(), "durably cancelled Prepare must reject a later Start")
+	})
+
+	t.Run("running command receives exact fence and cancels executor", func(t *testing.T) {
+		token := testServerExecutionToken(0x62)
+		observer := &recordingObserver{connected: make(chan SessionInfo, 1), start: &agentv1.CommandStart{CommandId: "command-running-cancel", ExecutionToken: token, LeaseRevision: 7, LeaseSeconds: 30, StartDeadline: timestamppb.New(time.Now().Add(time.Minute))}}
+		fixture := newAgentRegistryIntegrationFixture(t, observer)
+		envelope := fixture.signedEnvelope(t, "command-running-cancel")
+		require.NoError(t, fixture.registry.Dispatch(context.Background(), "agent-a", envelope))
+		select {
+		case <-fixture.executor.started:
+		case <-time.After(time.Second):
+			t.Fatal("executor did not start")
+		}
+
+		require.NoError(t, fixture.registry.Cancel(context.Background(), "agent-a", envelope.GetCommandId()))
+		select {
+		case <-fixture.executor.cancelled:
+		case <-time.After(time.Second):
+			t.Fatal("fenced Registry cancellation did not reach executor")
+		}
+		require.Eventually(t, func() bool {
+			for _, message := range fixture.clientStream.receivedMessages() {
+				cancellation := message.GetCommandCancellation()
+				if cancellation != nil && cancellation.GetCommandId() == envelope.GetCommandId() {
+					return bytes.Equal(token, cancellation.GetExecutionToken()) && cancellation.GetLeaseRevision() == 7
+				}
+			}
+			return false
+		}, time.Second, time.Millisecond)
+		require.Equal(t, int32(1), fixture.executor.calls.Load())
+	})
 }
 
 func TestPreparedObserverPersistsBeforeServerSendsStart(t *testing.T) {
@@ -412,4 +472,129 @@ func (o *recordingObserver) counts() [3]int {
 
 func testServerExecutionToken(value byte) []byte {
 	return bytes.Repeat([]byte{value}, sha256.Size)
+}
+
+type agentRegistryIntegrationFixture struct {
+	registry     *Registry
+	journal      *commandjournal.BoltJournal
+	executor     *integrationCancellationExecutor
+	privateKey   ed25519.PrivateKey
+	clientStream *loopbackControlClientStream
+}
+
+func newAgentRegistryIntegrationFixture(t *testing.T, observer Observer) *agentRegistryIntegrationFixture {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	executor := &integrationCancellationExecutor{started: make(chan struct{}, 1), cancelled: make(chan struct{}, 1)}
+	executors := agentruntime.NewExecutorRegistry()
+	require.NoError(t, executors.Register(agentruntime.CommandKindCollectNow, executor))
+	verifier, err := agentruntime.NewCommandVerifier("agent-a", publicKey, executors.Capabilities())
+	require.NoError(t, err)
+	registry := NewRegistry(16)
+	serverStream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"))
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- NewServer(registry, observer).Connect(serverStream) }()
+	var clientStream *loopbackControlClientStream
+	client, err := agentruntime.NewControlClient(agentruntime.ControlClientConfig{
+		AgentID: "agent-a",
+		StreamOpener: func(ctx context.Context) (agentruntime.ControlStream, error) {
+			clientStream = &loopbackControlClientStream{ctx: ctx, server: serverStream}
+			return clientStream, nil
+		},
+		Journal: journal, Verifier: verifier, Executors: executors,
+		HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
+	})
+	require.NoError(t, err)
+	clientContext, cancelClient := context.WithCancel(context.Background())
+	clientDone := make(chan error, 1)
+	go func() { clientDone <- client.Run(clientContext) }()
+	require.Eventually(t, func() bool { _, connected := registry.Session("agent-a"); return connected }, time.Second, time.Millisecond)
+	t.Cleanup(func() {
+		cancelClient()
+		require.NoError(t, <-clientDone)
+		require.NoError(t, <-serverDone)
+		require.NoError(t, journal.Close())
+	})
+	return &agentRegistryIntegrationFixture{registry: registry, journal: journal, executor: executor, privateKey: privateKey, clientStream: clientStream}
+}
+
+func (fixture *agentRegistryIntegrationFixture) signedEnvelope(t *testing.T, commandID string) *agentv1.CommandEnvelope {
+	t.Helper()
+	now := time.Now().UTC()
+	envelope := &agentv1.CommandEnvelope{
+		CommandId: commandID, JobId: "job-" + commandID, AgentId: "agent-a", Nonce: []byte("nonce-" + commandID), LeaseSeconds: 30,
+		IssuedAt: timestamppb.New(now), ExpiresAt: timestamppb.New(now.Add(time.Hour)),
+		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"host"}}},
+	}
+	payload, err := agentruntime.CommandSigningBytes(envelope)
+	require.NoError(t, err)
+	envelope.Signature = ed25519.Sign(fixture.privateKey, payload)
+	return envelope
+}
+
+type loopbackControlClientStream struct {
+	ctx      context.Context
+	server   *testConnectStream
+	mu       sync.Mutex
+	received []*agentv1.ServerMessage
+}
+
+func (stream *loopbackControlClientStream) Send(message *agentv1.AgentMessage) error {
+	select {
+	case stream.server.receive <- proto.Clone(message).(*agentv1.AgentMessage):
+		return nil
+	case <-stream.ctx.Done():
+		return stream.ctx.Err()
+	}
+}
+
+func (stream *loopbackControlClientStream) Recv() (*agentv1.ServerMessage, error) {
+	select {
+	case message := <-stream.server.sent:
+		cloned := proto.Clone(message).(*agentv1.ServerMessage)
+		stream.mu.Lock()
+		stream.received = append(stream.received, cloned)
+		stream.mu.Unlock()
+		return cloned, nil
+	case <-stream.ctx.Done():
+		return nil, stream.ctx.Err()
+	}
+}
+
+func (stream *loopbackControlClientStream) CloseSend() error {
+	stream.server.closeReceive()
+	return nil
+}
+
+func (stream *loopbackControlClientStream) receivedMessages() []*agentv1.ServerMessage {
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	result := make([]*agentv1.ServerMessage, 0, len(stream.received))
+	for _, message := range stream.received {
+		result = append(result, proto.Clone(message).(*agentv1.ServerMessage))
+	}
+	return result
+}
+
+type integrationCancellationExecutor struct {
+	calls     atomic.Int32
+	started   chan struct{}
+	cancelled chan struct{}
+}
+
+func (executor *integrationCancellationExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ agentruntime.ProgressReporter) (*agentv1.CommandResult, error) {
+	executor.calls.Add(1)
+	select {
+	case executor.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case executor.cancelled <- struct{}{}:
+	default:
+	}
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED}, nil
 }

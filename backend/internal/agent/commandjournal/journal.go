@@ -22,14 +22,15 @@ var (
 	commandsBucket = []byte("commands")
 	metaBucket     = []byte("meta")
 
-	ErrInvalidEnvelope      = errors.New("command envelope is invalid")
-	ErrCommandNotFound      = errors.New("command journal entry was not found")
-	ErrCommandExpired       = errors.New("command has expired")
-	ErrInvalidTransition    = errors.New("invalid command journal state transition")
-	ErrCommandIDConflict    = errors.New("command ID is already bound to a different envelope")
-	ErrNonceReplay          = errors.New("command nonce is already reserved by a different envelope")
-	ErrStartMismatch        = errors.New("command start fence does not match the journal entry")
-	ErrResultDigestMismatch = errors.New("command result acknowledgement digest does not match")
+	ErrInvalidEnvelope       = errors.New("command envelope is invalid")
+	ErrCommandNotFound       = errors.New("command journal entry was not found")
+	ErrCommandExpired        = errors.New("command has expired")
+	ErrInvalidTransition     = errors.New("invalid command journal state transition")
+	ErrCommandIDConflict     = errors.New("command ID is already bound to a different envelope")
+	ErrNonceReplay           = errors.New("command nonce is already reserved by a different envelope")
+	ErrStartMismatch         = errors.New("command start fence does not match the journal entry")
+	ErrStartDeadlineExceeded = errors.New("command start deadline has expired")
+	ErrResultDigestMismatch  = errors.New("command result acknowledgement digest does not match")
 )
 
 type State string
@@ -40,6 +41,7 @@ const (
 	StateRunning         State = "running"
 	StateInterrupted     State = "interrupted"
 	StateCompleted       State = "completed"
+	StateCancelled       State = "cancelled"
 )
 
 // Entry is the recovery-safe view of one journaled command.
@@ -65,6 +67,7 @@ type Entry struct {
 type Journal interface {
 	Prepare(context.Context, *agentv1.CommandEnvelope, time.Time) (bool, error)
 	AuthorizeStart(context.Context, string, []byte, uint64, time.Time) error
+	CancelPrepared(context.Context, string, time.Time) error
 	MarkInterrupted(context.Context, string, time.Time) error
 	Complete(context.Context, string, *agentv1.CommandResult, time.Time) error
 	Active(context.Context) ([]Entry, error)
@@ -100,6 +103,7 @@ type nonceReservation struct {
 
 type BoltJournal struct {
 	database  *bbolt.DB
+	now       func() time.Time
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -123,7 +127,7 @@ func Open(path string) (*BoltJournal, error) {
 		_ = database.Close()
 		return nil, fmt.Errorf("harden command journal permissions: %w", err)
 	}
-	journal := &BoltJournal{database: database}
+	journal := &BoltJournal{database: database, now: time.Now}
 	if err := database.Update(func(transaction *bbolt.Tx) error {
 		if _, err := transaction.CreateBucketIfNotExists(commandsBucket); err != nil {
 			return err
@@ -221,14 +225,18 @@ func (j *BoltJournal) Prepare(ctx context.Context, envelope *agentv1.CommandEnve
 	return true, nil
 }
 
-func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, executionToken []byte, leaseRevision uint64, at time.Time) error {
-	if len(executionToken) != sha256.Size || leaseRevision == 0 || at.IsZero() {
+func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, executionToken []byte, leaseRevision uint64, startDeadline time.Time) error {
+	if len(executionToken) != sha256.Size || leaseRevision == 0 || startDeadline.IsZero() {
 		return ErrStartMismatch
 	}
 	if err := j.transition(ctx, commandID, func(entry *storedEntry) error {
+		now := j.now().UTC()
+		if !now.Before(startDeadline.UTC()) {
+			return ErrStartDeadlineExceeded
+		}
 		switch entry.State {
 		case StatePrepared:
-			if !at.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
+			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
 			}
 			tokenHash := sha256.Sum256(executionToken)
@@ -241,7 +249,7 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 			if !matchesFence(entry, executionToken, leaseRevision) {
 				return ErrStartMismatch
 			}
-			if !at.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
+			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
 			}
 			return nil
@@ -255,11 +263,30 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 		return err
 	}
 	return j.transition(ctx, commandID, func(entry *storedEntry) error {
+		now := j.now().UTC()
+		if !now.Before(startDeadline.UTC()) {
+			return ErrStartDeadlineExceeded
+		}
 		if entry.State != StateStartAuthorized || !matchesFence(entry, executionToken, leaseRevision) {
 			return ErrStartMismatch
 		}
 		entry.State = StateRunning
-		entry.StartedAtUnixNano = at.UTC().UnixNano()
+		entry.StartedAtUnixNano = now.UnixNano()
+		return nil
+	})
+}
+
+func (j *BoltJournal) CancelPrepared(ctx context.Context, commandID string, at time.Time) error {
+	return j.transition(ctx, commandID, func(entry *storedEntry) error {
+		if entry.State == StateCancelled {
+			return nil
+		}
+		if entry.State != StatePrepared {
+			return fmt.Errorf("%w: %s to cancelled", ErrInvalidTransition, entry.State)
+		}
+		entry.State = StateCancelled
+		entry.CompletedAtUnixNano = at.UTC().UnixNano()
+		entry.Envelope = nil
 		return nil
 	})
 }
@@ -269,24 +296,10 @@ func (j *BoltJournal) MarkInterrupted(ctx context.Context, commandID string, at 
 		if entry.State == StateInterrupted {
 			return nil
 		}
-		if entry.State != StateRunning || !validStoredFence(entry) {
+		if (entry.State != StateRunning && entry.State != StateStartAuthorized) || !validStoredFence(entry) {
 			return fmt.Errorf("%w: %s to interrupted", ErrInvalidTransition, entry.State)
 		}
-		result := &agentv1.CommandResult{
-			CommandId: entry.CommandID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED,
-			Summary: "command execution was interrupted by Agent restart", ErrorCode: "EXECUTION_INTERRUPTED",
-			ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision,
-		}
-		encodedResult, resultDigest, err := encodeResult(result)
-		if err != nil {
-			return err
-		}
-		entry.State = StateInterrupted
-		entry.InterruptedAtUnixNano = at.UTC().UnixNano()
-		entry.CompletedAtUnixNano = at.UTC().UnixNano()
-		entry.Result = encodedResult
-		entry.ResultDigestHex = hex.EncodeToString(resultDigest[:])
-		return nil
+		return setInterrupted(entry, at)
 	})
 }
 
@@ -360,26 +373,15 @@ func (j *BoltJournal) recoverRunning(at time.Time) error {
 			if err != nil {
 				return err
 			}
-			if entry.State != StateRunning {
+			if entry.State != StateRunning && entry.State != StateStartAuthorized {
 				return nil
 			}
 			if !validStoredFence(&entry) {
 				return errors.New("running command journal entry has an invalid execution fence")
 			}
-			result := &agentv1.CommandResult{
-				CommandId: entry.CommandID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED,
-				Summary: "command execution was interrupted by Agent restart", ErrorCode: "EXECUTION_INTERRUPTED",
-				ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision,
-			}
-			resultBytes, resultDigest, err := encodeResult(result)
-			if err != nil {
+			if err := setInterrupted(&entry, at); err != nil {
 				return err
 			}
-			entry.State = StateInterrupted
-			entry.InterruptedAtUnixNano = at.UTC().UnixNano()
-			entry.CompletedAtUnixNano = at.UTC().UnixNano()
-			entry.Result = resultBytes
-			entry.ResultDigestHex = hex.EncodeToString(resultDigest[:])
 			updated, err := json.Marshal(entry)
 			if err != nil {
 				return err
@@ -538,6 +540,24 @@ func encodeResult(result *agentv1.CommandResult) ([]byte, [sha256.Size]byte, err
 		return nil, [sha256.Size]byte{}, fmt.Errorf("marshal command result: %w", err)
 	}
 	return encoded, sha256.Sum256(encoded), nil
+}
+
+func setInterrupted(entry *storedEntry, at time.Time) error {
+	result := &agentv1.CommandResult{
+		CommandId: entry.CommandID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED,
+		Summary: "command execution was interrupted before a terminal result", ErrorCode: "EXECUTION_INTERRUPTED",
+		ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision,
+	}
+	encodedResult, resultDigest, err := encodeResult(result)
+	if err != nil {
+		return err
+	}
+	entry.State = StateInterrupted
+	entry.InterruptedAtUnixNano = at.UTC().UnixNano()
+	entry.CompletedAtUnixNano = at.UTC().UnixNano()
+	entry.Result = encodedResult
+	entry.ResultDigestHex = hex.EncodeToString(resultDigest[:])
+	return nil
 }
 
 func matchesFence(entry *storedEntry, executionToken []byte, leaseRevision uint64) bool {

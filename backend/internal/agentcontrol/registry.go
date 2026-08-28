@@ -258,7 +258,12 @@ func (r *Registry) Cancel(ctx context.Context, agentID, commandID string) error 
 		r.mu.RUnlock()
 		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
 	}
-	message := &agentv1.ServerMessage{MessageId: commandID, Message: &agentv1.ServerMessage_CommandCancellation{CommandCancellation: &agentv1.CommandCancellation{CommandId: commandID}}}
+	cancellation := &agentv1.CommandCancellation{CommandId: commandID}
+	if token := current.executionTokens[commandID]; len(token) == sha256.Size && current.leaseRevisions[commandID] > 0 {
+		cancellation.ExecutionToken = append([]byte(nil), token...)
+		cancellation.LeaseRevision = current.leaseRevisions[commandID]
+	}
+	message := &agentv1.ServerMessage{MessageId: commandID, Message: &agentv1.ServerMessage_CommandCancellation{CommandCancellation: cancellation}}
 	select {
 	case current.send <- message:
 		r.mu.RUnlock()

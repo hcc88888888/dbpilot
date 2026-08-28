@@ -61,18 +61,19 @@ func TestStartAuthorizesMatchingTokenAndRevisionOnce(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, prepared)
 	token := bytes.Repeat([]byte{0x2a}, sha256.Size)
+	journal.now = func() time.Time { return now.Add(time.Minute) }
 
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(time.Minute)))
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(30*time.Minute)))
 	entry, err := journal.Get(context.Background(), "command-start")
 	require.NoError(t, err)
 	require.Equal(t, StateRunning, entry.State)
 	require.Equal(t, token, entry.ExecutionToken)
 	require.Equal(t, uint64(9), entry.LeaseRevision)
-	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(2*time.Minute)), ErrInvalidTransition)
-	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", bytes.Repeat([]byte{0x3b}, sha256.Size), 9, now.Add(2*time.Minute)), ErrStartMismatch)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", token, 9, now.Add(30*time.Minute)), ErrInvalidTransition)
+	require.ErrorIs(t, journal.AuthorizeStart(context.Background(), "command-start", bytes.Repeat([]byte{0x3b}, sha256.Size), 9, now.Add(30*time.Minute)), ErrStartMismatch)
 }
 
-func TestStartAuthorizedReopenRequiresMatchingStartBeforeRunning(t *testing.T) {
+func TestStartAuthorizedReopenBecomesInterruptedAndRejectsLaterStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "commands.db")
 	now := time.Unix(1_725_000_000, 0).UTC()
 	token := bytes.Repeat([]byte{0x3c}, sha256.Size)
@@ -94,14 +95,38 @@ func TestStartAuthorizedReopenRequiresMatchingStartBeforeRunning(t *testing.T) {
 	reopened, err := Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
+	reopened.now = func() time.Time { return now }
 	entry, err := reopened.Get(context.Background(), "command-start-authorized")
 	require.NoError(t, err)
-	require.Equal(t, StateStartAuthorized, entry.State)
-	require.ErrorIs(t, reopened.AuthorizeStart(context.Background(), "command-start-authorized", bytes.Repeat([]byte{0x3d}, sha256.Size), 10, now.Add(time.Minute)), ErrStartMismatch)
-	require.NoError(t, reopened.AuthorizeStart(context.Background(), "command-start-authorized", token, 10, now.Add(time.Minute)))
-	entry, err = reopened.Get(context.Background(), "command-start-authorized")
+	require.Equal(t, StateInterrupted, entry.State)
+	pending, err := reopened.PendingResults(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, StateRunning, entry.State)
+	require.Len(t, pending, 1)
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED, pending[0].Result.GetState())
+	require.ErrorIs(t, reopened.AuthorizeStart(context.Background(), "command-start-authorized", bytes.Repeat([]byte{0x3d}, sha256.Size), 10, now.Add(time.Minute)), ErrStartMismatch)
+	require.ErrorIs(t, reopened.AuthorizeStart(context.Background(), "command-start-authorized", token, 10, now.Add(time.Minute)), ErrInvalidTransition)
+	pending, err = reopened.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "later Start must not create another interrupted result")
+}
+
+func TestStartDeadlineIsCheckedAtJournalTransactionTime(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	deadline := now.Add(time.Minute)
+	journal, err := Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	journal.now = func() time.Time { return deadline }
+	prepared, err := journal.Prepare(context.Background(), journalEnvelope("command-deadline", now.Add(time.Hour)), now)
+	require.NoError(t, err)
+	require.True(t, prepared)
+
+	err = journal.AuthorizeStart(context.Background(), "command-deadline", bytes.Repeat([]byte{0x4d}, sha256.Size), 12, deadline)
+
+	require.ErrorIs(t, err, ErrStartDeadlineExceeded)
+	entry, getErr := journal.Get(context.Background(), "command-deadline")
+	require.NoError(t, getErr)
+	require.Equal(t, StatePrepared, entry.State)
 }
 
 func TestInterruptedRunningReopenProducesOnePendingResultWithoutReexecution(t *testing.T) {
@@ -113,7 +138,8 @@ func TestInterruptedRunningReopenProducesOnePendingResultWithoutReexecution(t *t
 	prepared, err := journal.Prepare(context.Background(), journalEnvelope("command-interrupted", now.Add(time.Hour)), now)
 	require.NoError(t, err)
 	require.True(t, prepared)
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-interrupted", token, 11, now.Add(time.Minute)))
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-interrupted", token, 11, now.Add(30*time.Minute)))
 	require.NoError(t, journal.Close())
 
 	reopened, err := Open(path)
@@ -146,7 +172,8 @@ func TestResultAckRequiresMatchingPersistedResultDigest(t *testing.T) {
 	prepared, err := journal.Prepare(context.Background(), journalEnvelope("command-result-ack", now.Add(time.Hour)), now)
 	require.NoError(t, err)
 	require.True(t, prepared)
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-result-ack", token, 13, now.Add(time.Minute)))
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-result-ack", token, 13, now.Add(30*time.Minute)))
 	result := &agentv1.CommandResult{
 		CommandId: "command-result-ack", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED,
 		ExecutionToken: token, LeaseRevision: 13,
@@ -258,8 +285,9 @@ func TestJournalActiveReturnsOnlyAcceptedAndRunningCommands(t *testing.T) {
 	}
 	runningToken := bytes.Repeat([]byte{0x31}, sha256.Size)
 	completedToken := bytes.Repeat([]byte{0x32}, sha256.Size)
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "running", runningToken, 1, now.Add(time.Minute)))
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "completed", completedToken, 2, now.Add(time.Minute)))
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "running", runningToken, 1, now.Add(30*time.Minute)))
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "completed", completedToken, 2, now.Add(30*time.Minute)))
 	require.NoError(t, journal.Complete(context.Background(), "completed", &agentv1.CommandResult{CommandId: "completed", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "done", ExecutionToken: completedToken, LeaseRevision: 2}, now.Add(2*time.Minute)))
 
 	active, err := journal.Active(context.Background())
@@ -280,7 +308,8 @@ func TestJournalCompletedResultSurvivesCloseAndReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, accepted)
 	token := bytes.Repeat([]byte{0x33}, sha256.Size)
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-a", token, 3, now.Add(time.Minute)))
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-a", token, 3, now.Add(30*time.Minute)))
 	wantResult := &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "collected", ExecutionToken: token, LeaseRevision: 3}
 	require.NoError(t, journal.Complete(context.Background(), "command-a", wantResult, now.Add(2*time.Minute)))
 	require.NoError(t, journal.Close())
@@ -305,7 +334,8 @@ func TestJournalCompletedResultRemainsPendingUntilDurablyMarkedReported(t *testi
 	require.NoError(t, err)
 	require.True(t, accepted)
 	token := bytes.Repeat([]byte{0x34}, sha256.Size)
-	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-a", token, 4, now.Add(time.Minute)))
+	journal.now = func() time.Time { return now.Add(time.Minute) }
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-a", token, 4, now.Add(30*time.Minute)))
 	result := &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "done", ExecutionToken: token, LeaseRevision: 4}
 	require.NoError(t, journal.Complete(context.Background(), "command-a", result, now.Add(2*time.Minute)))
 	pending, err := journal.PendingResults(context.Background())
@@ -340,7 +370,8 @@ func TestJournalRejectsStartingExpiredCommand(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, accepted)
 
-	err = journal.AuthorizeStart(context.Background(), "command-a", bytes.Repeat([]byte{0x35}, sha256.Size), 5, expiresAt)
+	journal.now = func() time.Time { return expiresAt }
+	err = journal.AuthorizeStart(context.Background(), "command-a", bytes.Repeat([]byte{0x35}, sha256.Size), 5, expiresAt.Add(time.Minute))
 
 	require.ErrorIs(t, err, ErrCommandExpired)
 	entry, getErr := journal.Get(context.Background(), "command-a")
