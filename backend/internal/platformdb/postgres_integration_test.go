@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -84,7 +85,7 @@ func TestPlatformPostgresIntegration(t *testing.T) {
 	require.ErrorIs(t, err, artifact.ErrNotFound)
 }
 
-func TestHTTPIdempotencyMigrationPreservesCustomStateConstraint(t *testing.T) {
+func TestHTTPIdempotencyMigrationUpgradesLegacyRowsAndPreservesCustomStateConstraint(t *testing.T) {
 	if os.Getenv("DBPILOT_PLATFORM_POSTGRES_INTEGRATION") != "1" {
 		t.Skip("set DBPILOT_PLATFORM_POSTGRES_INTEGRATION=1 to run")
 	}
@@ -108,16 +109,65 @@ func TestHTTPIdempotencyMigrationPreservesCustomStateConstraint(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 	_, err = database.ExecContext(ctx, "CREATE TABLE dbpilot_schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
 	require.NoError(t, err)
+	require.NoError(t, applyMigration(ctx, database, "migrations/0001_platform_services.sql"))
 	require.NoError(t, applyMigration(ctx, database, "migrations/0002_idempotency.sql"))
 	require.NoError(t, applyMigration(ctx, database, "migrations/0003_idempotency_fencing.sql"))
+	require.NoError(t, applyMigration(ctx, database, "migrations/0004_audit_dedupe.sql"))
 	_, err = database.ExecContext(ctx, "ALTER TABLE idempotency_records ADD CONSTRAINT customer_state_policy CHECK (state <> 'customer_reserved')")
+	require.NoError(t, err)
+	created := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	expires := created.Add(24 * time.Hour)
+	processingOwner := "owner-1111111111111111111111111111111111111111111111111111111111111111"
+	completedOwner := "owner-2222222222222222222222222222222222222222222222222222222222222222"
+	processingFingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
+	completedFingerprint := "sha256:70b9d78842924a3f00599c8298f0e6786ea68aa7b6ea5f5f74335c7d26d0579d"
+	completedHeaders := `{"Content-Type":["application/json"],"ETag":["\"8\""]}`
+	completedBody := []byte(`{"id":"job-legacy","version":8}`)
+	_, err = database.ExecContext(ctx, "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $9)",
+		"tenant-upgrade", "project-upgrade", "operator-upgrade", "cancelJob", "legacy-processing", processingFingerprint, processingOwner, expires, created)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, response_status, response_headers, response_json, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'completed', $8, $9, $10, $11, $12, $12)",
+		"tenant-upgrade", "project-upgrade", "operator-upgrade", "cancelJob", "legacy-completed", completedFingerprint, completedOwner, http.StatusAccepted, completedHeaders, completedBody, expires, created)
 	require.NoError(t, err)
 
 	require.NoError(t, applyMigration(ctx, database, "migrations/0005_http_idempotency_reconciliation.sql"))
+	require.NoError(t, applyMigration(ctx, database, "migrations/0005_http_idempotency_reconciliation.sql"))
 
+	var rowCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2", "tenant-upgrade", "project-upgrade").Scan(&rowCount))
+	require.Equal(t, 2, rowCount)
+	var processingState, storedProcessingOwner, storedProcessingFingerprint string
+	var processingStatus int
+	var processingHeaders, processingResponse, processingAudit []byte
+	var processingExpiry time.Time
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT state, request_fingerprint, owner_token, response_status, response_headers, response_json, audit_event_json, expires_at FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND idempotency_key = $3", "tenant-upgrade", "project-upgrade", "legacy-processing").Scan(&processingState, &storedProcessingFingerprint, &storedProcessingOwner, &processingStatus, &processingHeaders, &processingResponse, &processingAudit, &processingExpiry))
+	require.Equal(t, "processing", processingState)
+	require.Equal(t, processingFingerprint, storedProcessingFingerprint)
+	require.Equal(t, processingOwner, storedProcessingOwner)
+	require.Zero(t, processingStatus)
+	require.JSONEq(t, `{}`, string(processingHeaders))
+	require.Nil(t, processingResponse)
+	require.Nil(t, processingAudit)
+	require.Equal(t, expires, processingExpiry.UTC())
+	var completedState, storedCompletedOwner, storedCompletedFingerprint string
+	var completedStatus int
+	var storedHeaders, storedBody, completedAudit []byte
+	var completedExpiry time.Time
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT state, request_fingerprint, owner_token, response_status, response_headers, response_json, audit_event_json, expires_at FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND idempotency_key = $3", "tenant-upgrade", "project-upgrade", "legacy-completed").Scan(&completedState, &storedCompletedFingerprint, &storedCompletedOwner, &completedStatus, &storedHeaders, &storedBody, &completedAudit, &completedExpiry))
+	require.Equal(t, "completed", completedState)
+	require.Equal(t, completedFingerprint, storedCompletedFingerprint)
+	require.Equal(t, completedOwner, storedCompletedOwner)
+	require.Equal(t, http.StatusAccepted, completedStatus)
+	require.JSONEq(t, completedHeaders, string(storedHeaders))
+	require.Equal(t, completedBody, storedBody)
+	require.Nil(t, completedAudit)
+	require.Equal(t, expires, completedExpiry.UTC())
 	var customConstraint int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'idempotency_records'::regclass AND conname = 'customer_state_policy'").Scan(&customConstraint))
 	require.Equal(t, 1, customConstraint)
+	var migrationCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM dbpilot_schema_migrations WHERE name = $1", "platformdb/migrations/0005_http_idempotency_reconciliation.sql").Scan(&migrationCount))
+	require.Equal(t, 1, migrationCount)
 }
 
 func openPlatformIntegrationDB(t *testing.T, ctx context.Context, dsn string) *sql.DB {
