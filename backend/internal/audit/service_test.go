@@ -113,25 +113,31 @@ func TestRecordNormalizesEveryJSONSerializableShapeBeforeRedaction(t *testing.T)
 
 func TestCredentialMaterialRejectsPrivateKeysDSNsPEMAndConnectionFormsAtAnyDepth(t *testing.T) {
 	tests := map[string]map[string]any{
-		"private_key key":     {"nested": map[string]any{"private_key": "opaque"}},
-		"privatekey key":      {"items": []any{map[string]any{"privatekey": "opaque"}}},
-		"dsn key":             {"config": map[string]any{"dsn": "opaque"}},
-		"PEM block":           {"nested": map[string]any{"value": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}},
-		"DSA PEM block":       {"value": "-----BEGIN DSA PRIVATE KEY-----\nsecret\n-----END DSA PRIVATE KEY-----"},
-		"EC PEM block":        {"value": "-----BEGIN EC PRIVATE KEY-----\nsecret\n-----END EC PRIVATE KEY-----"},
-		"OpenSSH PEM block":   {"value": "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n-----END OPENSSH PRIVATE KEY-----"},
-		"generic PEM block":   {"value": "-----BEGIN VENDOR PRIVATE KEY-----\nsecret\n-----END VENDOR PRIVATE KEY-----"},
-		"Oracle Easy Connect": {"value": "scott/tiger@db.example:1521/ORCLPDB1"},
-		"Oracle descriptor":   {"value": "user=scott password=tiger connectString=db.example:1521/ORCLPDB1"},
-		"Oracle ODBC":         {"value": "Driver={Oracle};UID=scott;PWD=tiger;DBQ=db.example:1521/ORCLPDB1"},
-		"Oracle ODBC spacing": {"nested": map[string]any{"typed": []string{"driver = {Oracle} ; uid = scott ; pwd = tiger ; dbq = ORCL"}}},
-		"Oracle JDBC thin":    {"value": "jdbc:oracle:thin:scott/tiger@db.example:1521/ORCL"},
-		"Oracle JDBC case":    {"nested": map[string]any{"value": "JDBC:ORACLE:THIN:SCOTT/TIGER@DB:1521/ORCL"}},
-		"MongoDB URI":         {"value": "mongodb://dbuser:dbpass@mongo.example/app"},
-		"MongoDB SRV URI":     {"value": "mongodb+srv://dbuser:dbpass@mongo.example/app"},
-		"Neo4j URI":           {"value": "neo4j://graph:secret@graph.example"},
-		"Redis URI":           {"value": "redis://default:secret@cache.example/0"},
-		"generic URI":         {"value": "https://user:secret@database.example/connect"},
+		"private_key key":            {"nested": map[string]any{"private_key": "opaque"}},
+		"privatekey key":             {"items": []any{map[string]any{"privatekey": "opaque"}}},
+		"dsn key":                    {"config": map[string]any{"dsn": "opaque"}},
+		"PEM block":                  {"nested": map[string]any{"value": "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"}},
+		"DSA PEM block":              {"value": "-----BEGIN DSA PRIVATE KEY-----\nsecret\n-----END DSA PRIVATE KEY-----"},
+		"EC PEM block":               {"value": "-----BEGIN EC PRIVATE KEY-----\nsecret\n-----END EC PRIVATE KEY-----"},
+		"OpenSSH PEM block":          {"value": "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n-----END OPENSSH PRIVATE KEY-----"},
+		"generic PEM block":          {"value": "-----BEGIN VENDOR PRIVATE KEY-----\nsecret\n-----END VENDOR PRIVATE KEY-----"},
+		"Oracle Easy Connect":        {"value": "scott/tiger@db.example:1521/ORCLPDB1"},
+		"Oracle descriptor":          {"value": "user=scott password=tiger connectString=db.example:1521/ORCLPDB1"},
+		"Oracle ODBC":                {"value": "Driver={Oracle};UID=scott;PWD=tiger;DBQ=db.example:1521/ORCLPDB1"},
+		"Oracle ODBC spacing":        {"nested": map[string]any{"typed": []string{"driver = {Oracle} ; uid = scott ; pwd = tiger ; dbq = ORCL"}}},
+		"Oracle JDBC thin":           {"value": "jdbc:oracle:thin:scott/tiger@db.example:1521/ORCL"},
+		"Oracle JDBC case":           {"nested": map[string]any{"value": "JDBC:ORACLE:THIN:SCOTT/TIGER@DB:1521/ORCL"}},
+		"MongoDB URI":                {"value": "mongodb://dbuser:dbpass@mongo.example/app"},
+		"MongoDB SRV URI":            {"value": "mongodb+srv://dbuser:dbpass@mongo.example/app"},
+		"Neo4j URI":                  {"value": "neo4j://graph:secret@graph.example"},
+		"Redis URI":                  {"value": "redis://default:secret@cache.example/0"},
+		"generic URI":                {"value": "https://user:secret@database.example/connect"},
+		"connection_uri key":         {"nested": map[string]any{"connection_uri": "Driver={PostgreSQL Unicode};Server=db.example;Database=app"}},
+		"connectionURI key":          {"items": []any{map[string]any{"connectionURI": "Server=db.example"}}},
+		"ODBC PWD neutral":           {"value": "Driver={PostgreSQL Unicode};UID=reporter;PWD=do-not-leak-pwd;Server=db.example;Database=app"},
+		"ODBC PASSWORD spaces":       {"nested": map[string]any{"value": "driver = {ODBC Driver 18 for SQL Server} ; uid = sa ; password = do-not-leak-password ; server = db.example"}},
+		"key value no semicolon":     {"value": "UID = reporter PASSWORD = do-not-leak-inline SERVER = db.example"},
+		"nested canonical JSON ODBC": {"payload": json.RawMessage(`{"connection":{"metadata":"Driver={PostgreSQL Unicode};Uid=reporter;Pwd=do-not-leak-json;Server=db.example"}}`)},
 	}
 	for name, detail := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -141,6 +147,23 @@ func TestCredentialMaterialRejectsPrivateKeysDSNsPEMAndConnectionFormsAtAnyDepth
 			require.ErrorIs(t, err, ErrSensitiveDetail)
 			require.NotContains(t, err.Error(), "secret")
 			require.NotContains(t, err.Error(), "dbpass")
+			require.NotContains(t, err.Error(), "do-not-leak")
+		})
+	}
+}
+
+func TestRecordPreservesSafeNoncredentialConnectionMetadata(t *testing.T) {
+	for name, metadata := range map[string]string{
+		"driver server database": "Driver={PostgreSQL Unicode};Server=db.example;Database=app;SSLMode=require",
+		"UID without password":   "UID=reporter;Server=db.example;Database=app",
+		"ordinary description":   "primary reporting connection in region east",
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := validEvent()
+			value.Detail = map[string]any{"connection_metadata": metadata}
+			got, err := NewService(&memoryStore{}).Record(context.Background(), value)
+			require.NoError(t, err)
+			require.Equal(t, metadata, got.Detail["connection_metadata"])
 		})
 	}
 }

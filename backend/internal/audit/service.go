@@ -243,7 +243,7 @@ func sanitizeValue(value any) (any, error) {
 
 func sensitiveKey(key string) bool {
 	normalized := normalizeKey(key)
-	for _, marker := range []string{"password", "passwd", "token", "credential", "secret", "authorization", "api_key", "private_key", "privatekey", "dsn"} {
+	for _, marker := range []string{"password", "passwd", "token", "credential", "secret", "authorization", "api_key", "private_key", "privatekey", "dsn", "connection_uri", "connectionuri"} {
 		if strings.Contains(normalized, marker) {
 			return true
 		}
@@ -285,7 +285,7 @@ func containsCredentialMaterial(value string) bool {
 			return true
 		}
 	}
-	if privateKeyPEMPattern.MatchString(value) || oracleEasyConnectPattern.MatchString(value) || containsOracleODBC(value) || containsOracleJDBC(value) {
+	if privateKeyPEMPattern.MatchString(value) || oracleEasyConnectPattern.MatchString(value) || keyValuePasswordPattern.MatchString(value) || containsOracleODBC(value) || containsOracleJDBC(value) {
 		return true
 	}
 	for _, candidate := range connectionURLPattern.FindAllString(value, -1) {
@@ -300,6 +300,7 @@ func containsCredentialMaterial(value string) bool {
 var privateKeyPEMPattern = regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----`)
 var oracleEasyConnectPattern = regexp.MustCompile(`(?i)(?:^|[\s"'=])[^\s/@:]+/[^\s/@]+@(?:\[[0-9a-f:]+\]|[a-z0-9_.-]+)(?::[0-9]+)?/[a-z0-9_.-]+(?:$|[\s"'])`)
 var connectionURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+var keyValuePasswordPattern = regexp.MustCompile(`(?i)(?:^|[;,\s])(?:pwd|password|passwd)\s*=\s*(?:\{[^}\r\n]+\}|"[^"\r\n]+"|'[^'\r\n]+'|[^;,\s\r\n]+)`)
 
 func containsOracleODBC(value string) bool {
 	fields := make(map[string]string)
