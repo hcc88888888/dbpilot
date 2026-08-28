@@ -27,6 +27,13 @@ allowed_log_roots:
   - /var/log
 file_collection_enabled: true
 
+# Trusted executable base names only. Entries are normalized case-insensitively,
+# matched exactly against running process names, and never executed.
+database_process_names:
+  - postgres
+  - mysqld
+  - mariadbd
+
 # Component credentials are resolved only at runtime. For the environment
 # provider, secret://hbase/reader maps to DBPILOT_SECRET_HBASE_READER.
 component_secrets:

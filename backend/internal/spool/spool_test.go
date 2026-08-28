@@ -401,6 +401,18 @@ func TestOpenRestoresReplacementBackupAfterInterruptedCompaction(t *testing.T) {
 	}
 }
 
+func TestStatsReportsActualDurableUsageAndCapacity(t *testing.T) {
+	store := openStore(t, spool.Limits{MaxBytes: 4096, SegmentBytes: 4096})
+	require.NoError(t, store.Append(context.Background(), spool.Log, batch("stats", 128, 1)))
+
+	stats, err := store.Stats()
+
+	require.NoError(t, err)
+	require.Equal(t, int64(4096), stats.MaxBytes)
+	require.Greater(t, stats.UsedBytes, int64(128), "durable usage includes the bounded record envelope")
+	require.Equal(t, 1, stats.PendingBatches)
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

@@ -47,6 +47,7 @@ type agentConfig struct {
 	DataDirectory         string                         `yaml:"data_directory"`
 	AllowedLogRoots       []string                       `yaml:"allowed_log_roots"`
 	FileCollectionEnabled bool                           `yaml:"file_collection_enabled"`
+	DatabaseProcessNames  []string                       `yaml:"database_process_names"`
 	Components            []database.ComponentDefinition `yaml:"components"`
 	ComponentSecrets      componentSecretConfig          `yaml:"component_secrets"`
 	ComponentCollection   componentCollectionConfig      `yaml:"component_collection"`
@@ -206,6 +207,10 @@ func loadConfig(path string) (agentConfig, error) {
 	if settings.ComponentCollection.IntervalSeconds < 0 || settings.ComponentCollection.RequestTimeoutSeconds < 0 || settings.ComponentCollection.MaxAttempts < 0 || settings.ComponentCollection.InitialBackoffMilliseconds < 0 || settings.ComponentCollection.MaxBackoffMilliseconds < 0 {
 		return agentConfig{}, errors.New("component_collection values must not be negative")
 	}
+	settings.DatabaseProcessNames, err = agent.NormalizeDatabaseProcessNames(settings.DatabaseProcessNames)
+	if err != nil {
+		return agentConfig{}, err
+	}
 	return settings, nil
 }
 
@@ -233,6 +238,11 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	client := telemetryv1.NewTelemetryIngestClient(connection)
 	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
+	logSummaries := telemetry.NewLogSummaryIndex()
+	hostCollector := &agent.HostSnapshotCollector{
+		AgentID: settings.AgentID, Store: store, Reader: agent.NewGopsutilHostReader(), Logs: logSummaries,
+		ProcessNames: settings.DatabaseProcessNames,
+	}
 	var dependencyCollector *agent.DependencyCollector
 	var componentCollector agent.ComponentCollector
 	if len(settings.Components) > 0 {
@@ -253,7 +263,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return err
 	}
 	defer journal.Close()
-	executors, err := configuredCommandExecutors(dependencyCollector)
+	executors, err := configuredCommandExecutors(hostCollector, dependencyCollector)
 	if err != nil {
 		_ = store.Close()
 		return err
@@ -274,7 +284,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		_ = store.Close()
 		return err
 	}
-	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
+	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store, logSummaries)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
 	serviceContext, cancelServices := context.WithCancel(ctx)
 	defer cancelServices()
 	results := make(chan error, 2)
@@ -292,12 +302,13 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	return nil
 }
 
-func configuredCommandExecutors(collector *agent.DependencyCollector) (*agent.ExecutorRegistry, error) {
+func configuredCommandExecutors(host agent.Collector, collector *agent.DependencyCollector) (*agent.ExecutorRegistry, error) {
 	executors := agent.NewExecutorRegistry()
-	if collector == nil {
+	coordinator := &agent.CollectionCoordinator{Host: host, Dependencies: agent.NewDependencyCollectionAdapter(collector)}
+	if !coordinator.Available() {
 		return executors, nil
 	}
-	executor, err := agent.NewCollectNowExecutor(collector)
+	executor, err := agent.NewCollectNowExecutor(coordinator)
 	if err != nil {
 		return nil, fmt.Errorf("configure CollectNow executor: %w", err)
 	}

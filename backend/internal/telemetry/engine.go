@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"sync"
 	"time"
 
@@ -62,12 +63,21 @@ type SpoolAppender interface {
 
 // EmbeddedBuilder instantiates only the receivers and processors in the
 // DBPilot catalog and routes their output to the local durable spool.
-type EmbeddedBuilder struct{ spool SpoolAppender }
+type EmbeddedBuilder struct {
+	spool       SpoolAppender
+	logObserver LogObserver
+}
 
-func NewEmbeddedBuilder(store SpoolAppender) EmbeddedBuilder { return EmbeddedBuilder{spool: store} }
+func NewEmbeddedBuilder(store SpoolAppender, observers ...LogObserver) EmbeddedBuilder {
+	var observer LogObserver
+	if len(observers) > 0 && !isNilLogObserver(observers[0]) {
+		observer = observers[0]
+	}
+	return EmbeddedBuilder{spool: store, logObserver: observer}
+}
 
 func (b EmbeddedBuilder) Build(ctx context.Context, cfg RuntimeConfig) (Candidate, error) {
-	if b.spool == nil {
+	if isNilSpoolAppender(b.spool) {
 		return nil, errors.New("embedded collector requires a spool")
 	}
 	if err := validateEmbeddedGraph(cfg); err != nil {
@@ -90,7 +100,7 @@ func (b EmbeddedBuilder) Build(ctx context.Context, cfg RuntimeConfig) (Candidat
 	if err := candidate.buildExtensions(ctx, cfg, catalog, settings); err != nil {
 		return nil, err
 	}
-	if err := candidate.buildPipelines(ctx, cfg, catalog, settings, b.spool); err != nil {
+	if err := candidate.buildPipelines(ctx, cfg, catalog, settings, b.spool, b.logObserver); err != nil {
 		_ = candidate.Stop(context.Background())
 		return nil, err
 	}
@@ -166,9 +176,9 @@ func (c *embeddedCandidate) buildExtensions(ctx context.Context, cfg RuntimeConf
 	return nil
 }
 
-func (c *embeddedCandidate) buildPipelines(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, store SpoolAppender) error {
+func (c *embeddedCandidate) buildPipelines(ctx context.Context, cfg RuntimeConfig, allowed *catalog, settings component.TelemetrySettings, store SpoolAppender, observer LogObserver) error {
 	exporter, _ := cfg.Exporter("dbpilot")
-	logNext, err := newSpoolLogsConsumer(store, exporter)
+	logNext, err := newSpoolLogsConsumer(store, exporter, observer)
 	if err != nil {
 		return err
 	}
@@ -424,14 +434,28 @@ func tagMetricsConsumer(next consumer.Metrics, attributes map[string]string) (co
 type spoolLogsConsumer struct {
 	store    SpoolAppender
 	exporter ExporterConfig
+	observer LogObserver
 }
 
-func newSpoolLogsConsumer(store SpoolAppender, exporter ExporterConfig) (consumer.Logs, error) {
-	c := &spoolLogsConsumer{store: store, exporter: exporter}
+func newSpoolLogsConsumer(store SpoolAppender, exporter ExporterConfig, observers ...LogObserver) (consumer.Logs, error) {
+	var observer LogObserver
+	if len(observers) > 0 && !isNilLogObserver(observers[0]) {
+		observer = observers[0]
+	}
+	c := &spoolLogsConsumer{store: store, exporter: exporter, observer: observer}
 	return consumer.NewLogs(c.ConsumeLogs)
 }
 
 func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) error {
+	if c.observer != nil {
+		observed := plog.NewLogs()
+		logs.CopyTo(observed)
+		if err := safelyObserveLogs(c.observer, ctx, observed); err != nil {
+			if health, ok := c.observer.(interface{ RecordObserverFailure() }); ok {
+				health.RecordObserverFailure()
+			}
+		}
+	}
 	for index := 0; index < logs.ResourceLogs().Len(); index++ {
 		one := plog.NewLogs()
 		logs.ResourceLogs().At(index).CopyTo(one.ResourceLogs().AppendEmpty())
@@ -451,6 +475,31 @@ func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) err
 		}
 	}
 	return nil
+}
+
+func safelyObserveLogs(observer LogObserver, ctx context.Context, logs plog.Logs) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("log observer panic")
+		}
+	}()
+	return observer.Observe(ctx, logs)
+}
+
+func isNilLogObserver(observer LogObserver) bool {
+	if observer == nil {
+		return true
+	}
+	value := reflect.ValueOf(observer)
+	return value.Kind() == reflect.Pointer && value.IsNil()
+}
+
+func isNilSpoolAppender(store SpoolAppender) bool {
+	if store == nil {
+		return true
+	}
+	value := reflect.ValueOf(store)
+	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
 type spoolMetricsConsumer struct {

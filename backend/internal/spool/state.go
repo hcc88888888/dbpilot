@@ -45,6 +45,13 @@ type Limits struct {
 	SegmentBytes int64
 }
 
+// Stats is a point-in-time view of the actual durable spool occupancy.
+type Stats struct {
+	UsedBytes      int64
+	MaxBytes       int64
+	PendingBatches int
+}
+
 // DataClass determines delivery and eviction behavior.
 type DataClass string
 
@@ -264,6 +271,19 @@ func (s *Store) HealthFindings() []string {
 	}
 	sort.Strings(values)
 	return values
+}
+
+func (s *Store) Stats() (Stats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return Stats{}, ErrClosed
+	}
+	stats := Stats{UsedBytes: s.usedBytes(), MaxBytes: s.limits.MaxBytes}
+	for _, entries := range s.entries {
+		stats.PendingBatches += len(entries)
+	}
+	return stats, nil
 }
 
 // RecordHealthFinding records a stable operational finding emitted by a

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,11 +15,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConfiguredCommandExecutorsAdvertiseCollectNowOnlyWithCollector(t *testing.T) {
-	var typedNil *agent.DependencyCollector
-	withoutCollector, err := configuredCommandExecutors(typedNil)
+func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testing.T) {
+	var typedNil *mainHostCollector
+	withoutCollector, err := configuredCommandExecutors(typedNil, nil)
 	require.NoError(t, err)
 	require.Empty(t, withoutCollector.Capabilities())
+
+	withHost, err := configuredCommandExecutors(&mainHostCollector{}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withHost.Capabilities())
 
 	store, err := spool.Open(t.TempDir(), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 64 << 10})
 	require.NoError(t, err)
@@ -33,10 +39,14 @@ func TestConfiguredCommandExecutorsAdvertiseCollectNowOnlyWithCollector(t *testi
 		Store:          store,
 	})
 	require.NoError(t, err)
-	withCollector, err := configuredCommandExecutors(collector)
+	withCollector, err := configuredCommandExecutors(&mainHostCollector{}, collector)
 	require.NoError(t, err)
 	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withCollector.Capabilities())
 }
+
+type mainHostCollector struct{}
+
+func (*mainHostCollector) Collect(context.Context, agent.CollectionRequest) error { return nil }
 
 func TestLoadConfigRejectsRelativePrivateAndDataPaths(t *testing.T) {
 	path := writeConfig(t, `
@@ -137,6 +147,50 @@ components:
 	require.NoError(t, err)
 	require.Equal(t, database.HBaseComponent, config.Components[0].Kind)
 	require.Equal(t, 15*time.Second, config.ComponentCollection.interval())
+}
+
+func TestLoadConfigNormalizesTrustedDatabaseProcessNames(t *testing.T) {
+	dir := t.TempDir()
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(dir, 0o700))
+	}
+	ca, cert, key := writeSecret(t, dir, "ca.pem"), writeSecret(t, dir, "agent.pem"), writeSecret(t, dir, "key.pem")
+	policyKey, policyFile := writeSecret(t, dir, "policy.pem"), writeSecret(t, dir, "policy.json")
+	body := "agent_id: agent-a\nserver_address: ingest.example:9443\nca_file: " + filepath.ToSlash(ca) + "\ncert_file: " + filepath.ToSlash(cert) + "\nkey_file: " + filepath.ToSlash(key) + "\npolicy_public_key_file: " + filepath.ToSlash(policyKey) + "\npolicy_file: " + filepath.ToSlash(policyFile) + "\ndata_directory: " + filepath.ToSlash(dir) + "\ndatabase_process_names: [Postgres, mysqld, postgres]\n"
+
+	config, err := loadConfig(writeConfig(t, body))
+
+	require.NoError(t, err)
+	require.Equal(t, []string{"mysqld", "postgres"}, config.DatabaseProcessNames)
+}
+
+func TestLoadConfigRejectsUntrustedDatabaseProcessNames(t *testing.T) {
+	dir := t.TempDir()
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(dir, 0o700))
+	}
+	ca, cert, key := writeSecret(t, dir, "ca.pem"), writeSecret(t, dir, "agent.pem"), writeSecret(t, dir, "key.pem")
+	policyKey, policyFile := writeSecret(t, dir, "policy.pem"), writeSecret(t, dir, "policy.json")
+	base := "agent_id: agent-a\nserver_address: ingest.example:9443\nca_file: " + filepath.ToSlash(ca) + "\ncert_file: " + filepath.ToSlash(cert) + "\nkey_file: " + filepath.ToSlash(key) + "\npolicy_public_key_file: " + filepath.ToSlash(policyKey) + "\npolicy_file: " + filepath.ToSlash(policyFile) + "\ndata_directory: " + filepath.ToSlash(dir) + "\n"
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "path", value: "database_process_names: ['../../bin/postgres']\n"},
+		{name: "too many", value: func() string {
+			result := "database_process_names:\n"
+			for index := 0; index < agent.MaxDatabaseProcessNames+1; index++ {
+				result += fmt.Sprintf("  - process-%d\n", index)
+			}
+			return result
+		}()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadConfig(writeConfig(t, base+test.value))
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestLoadConfigRejectsUnsupportedComponentSecretProvider(t *testing.T) {

@@ -16,13 +16,14 @@ func TestCollectNowExecutorValidatesAndCollectsExactlyOnce(t *testing.T) {
 	require.NoError(t, err)
 	envelope := &agentv1.CommandEnvelope{
 		AgentId: "agent-a",
-		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}},
+		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"HOST", "host"}}},
 	}
 
 	result, err := executor.Execute(context.Background(), envelope, nil)
 
 	require.NoError(t, err)
 	require.Equal(t, int32(1), collector.calls)
+	require.Equal(t, CollectionRequest{Kinds: []string{"host"}}, collector.request)
 	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, result.GetState())
 	require.Equal(t, "dependency telemetry collection completed", result.GetSummary())
 	require.Empty(t, result.GetArtifacts(), "CollectNow stores telemetry in the spool and must not invent an Artifact ID")
@@ -35,7 +36,7 @@ func TestCollectNowExecutorRejectsTargetsBeforeCollection(t *testing.T) {
 	envelope := &agentv1.CommandEnvelope{
 		AgentId: "agent-a",
 		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{
-			CollectionKinds: []string{"health"}, InstanceIds: []string{"instance-a"},
+			CollectionKinds: []string{"host"}, InstanceIds: []string{"instance-a"},
 		}},
 	}
 
@@ -68,7 +69,7 @@ func TestCollectNowExecutorReturnsFixedFailureWithoutCollectorErrorLeakage(t *te
 	require.NoError(t, err)
 	envelope := &agentv1.CommandEnvelope{
 		AgentId: "agent-a",
-		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"health"}}},
+		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"host"}}},
 	}
 
 	result, err := executor.Execute(context.Background(), envelope, nil)
@@ -84,11 +85,13 @@ func TestCollectNowExecutorReturnsFixedFailureWithoutCollectorErrorLeakage(t *te
 }
 
 type recordingCollectNowCollector struct {
-	calls int32
-	err   error
+	calls   int32
+	request CollectionRequest
+	err     error
 }
 
-func (collector *recordingCollectNowCollector) CollectOnce(context.Context) error {
+func (collector *recordingCollectNowCollector) Collect(_ context.Context, request CollectionRequest) error {
 	collector.calls++
+	collector.request = request
 	return collector.err
 }

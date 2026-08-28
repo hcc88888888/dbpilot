@@ -8,18 +8,12 @@ import (
 	"dbpilot.local/platform/internal/commandvalidation"
 )
 
-// CollectNowCollector is the configured, trusted collection boundary exposed
-// to the typed command executor. DependencyCollector implements it.
-type CollectNowCollector interface {
-	CollectOnce(context.Context) error
-}
-
 // CollectNowExecutor maps one validated CollectNow command to exactly one
-// dependency collection. Collection payloads remain in the telemetry spool;
+// selected collection. Collection payloads remain in the telemetry spool;
 // command results expose only fixed status text and never collector errors.
-type CollectNowExecutor struct{ collector CollectNowCollector }
+type CollectNowExecutor struct{ collector Collector }
 
-func NewCollectNowExecutor(collector CollectNowCollector) (*CollectNowExecutor, error) {
+func NewCollectNowExecutor(collector Collector) (*CollectNowExecutor, error) {
 	if isNilDependencyBoundary(collector) {
 		return nil, errors.New("CollectNow collector is required")
 	}
@@ -36,7 +30,14 @@ func (executor *CollectNowExecutor) Execute(ctx context.Context, envelope *agent
 	if envelope.GetCollectNow() == nil {
 		return nil, commandvalidation.ErrInvalidCommand
 	}
-	if err := executor.collector.CollectOnce(ctx); err != nil {
+	request, err := normalizeCollectionRequest(CollectionRequest{
+		Kinds:       envelope.GetCollectNow().GetCollectionKinds(),
+		InstanceIDs: envelope.GetCollectNow().GetInstanceIds(),
+	})
+	if err == nil {
+		err = executor.collector.Collect(ctx, request)
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}

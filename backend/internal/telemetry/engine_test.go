@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/policy"
+	"dbpilot.local/platform/internal/spool"
 	"dbpilot.local/platform/internal/telemetry"
 	"github.com/stretchr/testify/require"
 )
@@ -29,6 +30,20 @@ func TestApplyActivatesFirstHealthyCandidate(t *testing.T) {
 	require.Equal(t, 1, candidate.HealthyCalls())
 	require.False(t, candidate.Stopped())
 }
+
+func TestEmbeddedBuilderRejectsTypedNilSpool(t *testing.T) {
+	var store *typedNilSpoolAppender
+	cfg, err := telemetry.Compile(policyVersion(1), telemetry.NewCatalog())
+	require.NoError(t, err)
+
+	_, err = telemetry.NewEmbeddedBuilder(store).Build(context.Background(), cfg)
+
+	require.ErrorContains(t, err, "requires a spool")
+}
+
+type typedNilSpoolAppender struct{}
+
+func (*typedNilSpoolAppender) Append(context.Context, spool.DataClass, spool.Batch) error { return nil }
 
 func TestApplyRejectsBuildFailureWithoutAnActivePipeline(t *testing.T) {
 	builder := newFakeBuilder()
