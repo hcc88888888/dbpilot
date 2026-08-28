@@ -17,12 +17,13 @@ import (
 
 type JobService interface {
 	Get(context.Context, platformscope.Scope, string) (job.Job, error)
-	RequestCancel(context.Context, platformscope.Scope, string, string, int64, time.Time) (job.Job, error)
+	RequestCancelWithSnapshot(context.Context, platformscope.Scope, string, string, int64, time.Time, job.CancellationSnapshotInput) (job.Job, error)
+	GetCancellationSnapshot(context.Context, platformscope.Scope, string, job.CancellationSnapshotKey) (job.CancellationSnapshot, error)
 }
 
 type ArtifactService interface {
 	Get(context.Context, platformscope.Scope, string) (artifact.Artifact, error)
-	CreateDownload(context.Context, platformscope.Scope, string, time.Duration) (artifact.Download, error)
+	CreateDownloadAt(context.Context, platformscope.Scope, string, time.Time, time.Duration) (artifact.Download, error)
 }
 
 type AuditService interface {
@@ -36,6 +37,7 @@ type CapabilityService interface {
 
 type IdempotencyService interface {
 	Begin(context.Context, idempotency.Key, string, idempotency.ReconcileFunc) (idempotency.Claim, error)
+	BeginRecoverable(context.Context, idempotency.Key, string, []byte, idempotency.ReconcileFunc, idempotency.RecoverProcessingFunc) (idempotency.Claim, error)
 	Complete(context.Context, idempotency.Key, string, string, idempotency.Response, []byte, idempotency.ReconcileFunc) (idempotency.Response, error)
 	Abort(context.Context, idempotency.Key, string, string) error
 }

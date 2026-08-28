@@ -367,6 +367,94 @@ func TestReconcileArtifactAuditFailureFromStoredDescriptorWithoutSecondSigning(t
 	requireOpenAPIResponse(t, retryRequest, retry)
 }
 
+func TestCancelCommitSideEffectGapReconcilesDurableSnapshotWithoutSecondCancellation(t *testing.T) {
+	jobs := &recordingJobService{transitionValue: func() job.Job {
+		value := validPlatformJob()
+		value.Status = job.StatusCancelling
+		value.Version = 8
+		return value
+	}()}
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("crash before idempotency side-effect commit")
+	services := Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(store), Now: func() time.Time {
+		return time.Date(2026, 8, 28, 5, 0, 0, 123456789, time.UTC)
+	}}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+
+	firstRequest := newCancelRequest(`"7"`, "cancel-commit-gap-1")
+	firstRequest.Header.Set("X-Request-ID", "request-original-cancel-gap")
+	firstRequest.Header.Set("traceparent", "00-10101010101010101010101010101010-2020202020202020-01")
+	first := servePlatformRequest(services, principal, firstRequest)
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", "request-original-cancel-gap")
+	require.Len(t, jobs.transitions, 1)
+	require.Zero(t, audits.recordCalls)
+	require.NotNil(t, store.attemptedResponse)
+
+	collisionRequest := newCancelRequest(`"6"`, "cancel-commit-gap-1")
+	collision := servePlatformRequest(services, principal, collisionRequest)
+	requireProblem(t, collision, http.StatusConflict, "idempotency_conflict", collision.Header().Get("X-Request-ID"))
+	require.Len(t, jobs.transitions, 1)
+
+	store.completeErr = nil
+	retryRequest := newCancelRequest(`"7"`, "cancel-commit-gap-1")
+	retryRequest.Header.Set("X-Request-ID", "request-retry-cancel-gap")
+	retryRequest.Header.Set("traceparent", "00-30303030303030303030303030303030-4040404040404040-01")
+	retry := servePlatformRequest(services, principal, retryRequest)
+
+	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+	require.Equal(t, store.attemptedResponse.Body, retry.Body.Bytes())
+	require.Equal(t, store.attemptedResponse.Header.Get("ETag"), retry.Header().Get("ETag"))
+	require.Equal(t, store.attemptedResponse.Header.Get("Location"), retry.Header().Get("Location"))
+	require.Len(t, jobs.transitions, 1, "bare-processing repair must not repeat RequestCancel")
+	require.Equal(t, 1, audits.recordCalls)
+	require.Equal(t, "request-original-cancel-gap", audits.records[0].RequestID)
+	require.Equal(t, "10101010101010101010101010101010", audits.records[0].TraceID)
+}
+
+func TestArtifactCommitSideEffectGapReconstructsExactDescriptorFromOriginalClaim(t *testing.T) {
+	artifacts := &recordingArtifactService{downloadValue: artifact.Download{
+		URL:       "https://downloads.example/deterministic?expires=1787893500&signature=safe",
+		ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC),
+	}}
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("crash before descriptor commit")
+	services := Services{Artifacts: artifacts, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
+
+	firstRequest := newDownloadRequest("download-commit-gap-1")
+	firstRequest.Header.Set("X-Request-ID", "request-original-download-gap")
+	firstRequest.Header.Set("traceparent", "00-50505050505050505050505050505050-6060606060606060-01")
+	first := servePlatformRequest(services, principal, firstRequest)
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", "request-original-download-gap")
+	require.Equal(t, 1, artifacts.downloadCalls)
+	require.Zero(t, audits.recordCalls)
+	require.NotNil(t, store.attemptedResponse)
+
+	collisionRequest := httptest.NewRequest(http.MethodPost, platformBasePath+"/artifacts/artifact-2/actions/download", nil)
+	collisionRequest.Header.Set("Idempotency-Key", "download-commit-gap-1")
+	collision := servePlatformRequest(services, principal, collisionRequest)
+	requireProblem(t, collision, http.StatusConflict, "idempotency_conflict", collision.Header().Get("X-Request-ID"))
+	require.Equal(t, 1, artifacts.downloadCalls)
+
+	store.completeErr = nil
+	retryRequest := newDownloadRequest("download-commit-gap-1")
+	retryRequest.Header.Set("X-Request-ID", "request-retry-download-gap")
+	retryRequest.Header.Set("traceparent", "00-70707070707070707070707070707070-8080808080808080-01")
+	retry := servePlatformRequest(services, principal, retryRequest)
+
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.Equal(t, store.attemptedResponse.Body, retry.Body.Bytes())
+	require.Equal(t, 2, artifacts.downloadCalls, "local signing may be deterministically reconstructed after a crash")
+	require.Len(t, artifacts.downloadIssuedAt, 2)
+	require.False(t, artifacts.downloadIssuedAt[0].IsZero())
+	require.Equal(t, artifacts.downloadIssuedAt[0], artifacts.downloadIssuedAt[1], "retry must reuse the persisted claim creation timestamp")
+	require.Equal(t, 1, audits.recordCalls)
+	require.Equal(t, "request-original-download-gap", audits.records[0].RequestID)
+	require.Equal(t, "50505050505050505050505050505050", audits.records[0].TraceID)
+}
+
 func TestReconcileMarkAuditedFailureUsesOriginalAuditIdentity(t *testing.T) {
 	jobs := &recordingJobService{transitionValue: func() job.Job {
 		value := validPlatformJob()
@@ -465,7 +553,7 @@ func TestAmbiguousJobCommitLeavesClaimProcessingAndRetryDoesNotTransitionAgain(t
 	require.Len(t, jobs.transitions, 1)
 }
 
-func TestDownloadCompleteFailureLeavesClaimProcessingAndRetryDoesNotResign(t *testing.T) {
+func TestDownloadCommitFailureLeavesRecoverableProcessingAndRetryReconstructs(t *testing.T) {
 	artifacts := &recordingArtifactService{downloadValue: artifact.Download{
 		URL:       "https://downloads.example/artifact-1?signature=safe",
 		ExpiresAt: time.Date(2026, 8, 28, 5, 5, 0, 0, time.UTC),
@@ -480,9 +568,10 @@ func TestDownloadCompleteFailureLeavesClaimProcessingAndRetryDoesNotResign(t *te
 	require.Equal(t, 1, artifacts.downloadCalls)
 	require.Zero(t, store.abortCalls)
 
+	store.completeErr = nil
 	retry := servePlatformRequest(services, principal, newDownloadRequest("download-complete-failure-1"))
-	requireProblem(t, retry, http.StatusConflict, "idempotency_in_progress", retry.Header().Get("X-Request-ID"))
-	require.Equal(t, 1, artifacts.downloadCalls)
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.Equal(t, 2, artifacts.downloadCalls)
 }
 
 func TestDownloadSafePreSideEffectFailureAbortsByOwnerAndCanRetry(t *testing.T) {
@@ -507,7 +596,7 @@ func TestDownloadSafePreSideEffectFailureAbortsByOwnerAndCanRetry(t *testing.T) 
 	require.NotEqual(t, store.claimedOwners[0], store.claimedOwners[1])
 }
 
-func TestDownloadUnknownServiceErrorLeavesClaimProcessing(t *testing.T) {
+func TestDownloadUnknownLocalSigningErrorIsRetriedFromProcessingClaim(t *testing.T) {
 	artifacts := &recordingArtifactService{downloadErr: errors.New("signer outcome unknown")}
 	store := newHTTPIdempotencyStore()
 	services := Services{Artifacts: artifacts, Idempotency: idempotency.NewService(store)}
@@ -518,8 +607,8 @@ func TestDownloadUnknownServiceErrorLeavesClaimProcessing(t *testing.T) {
 	require.Zero(t, store.abortCalls)
 
 	retry := servePlatformRequest(services, principal, newDownloadRequest("download-unknown-1"))
-	requireProblem(t, retry, http.StatusConflict, "idempotency_in_progress", retry.Header().Get("X-Request-ID"))
-	require.Equal(t, 1, artifacts.downloadCalls)
+	requireProblem(t, retry, http.StatusInternalServerError, "internal_error", retry.Header().Get("X-Request-ID"))
+	require.Equal(t, 2, artifacts.downloadCalls)
 }
 
 func TestGeneratedArtifactMetadataAndDownloadDescriptor(t *testing.T) {
@@ -808,6 +897,7 @@ type recordingJobService struct {
 	transitionValue job.Job
 	transitionErr   error
 	transitions     []job.Transition
+	cancelSnapshot  *job.CancellationSnapshot
 }
 
 func (service *recordingJobService) Get(_ context.Context, scope platformscope.Scope, id string) (job.Job, error) {
@@ -816,10 +906,24 @@ func (service *recordingJobService) Get(_ context.Context, scope platformscope.S
 	return service.getValue, service.getErr
 }
 
-func (service *recordingJobService) RequestCancel(_ context.Context, scope platformscope.Scope, id, actor string, version int64, at time.Time) (job.Job, error) {
+func (service *recordingJobService) RequestCancelWithSnapshot(_ context.Context, scope platformscope.Scope, id, actor string, version int64, at time.Time, input job.CancellationSnapshotInput) (job.Job, error) {
 	transition := job.Transition{Scope: scope, JobID: id, Actor: actor, CurrentVersion: version, To: job.StatusCancelling, At: at}
 	service.transitions = append(service.transitions, transition)
+	if service.transitionErr == nil {
+		service.cancelSnapshot = &job.CancellationSnapshot{
+			Scope: scope, JobID: id, Key: input.Key, OwnerToken: input.OwnerToken,
+			CurrentVersion: version, Job: service.transitionValue,
+			AuditEventJSON: append([]byte(nil), input.AuditEventJSON...), CreatedAt: at.UTC(),
+		}
+	}
 	return service.transitionValue, service.transitionErr
+}
+
+func (service *recordingJobService) GetCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, key job.CancellationSnapshotKey) (job.CancellationSnapshot, error) {
+	if service.cancelSnapshot == nil || service.cancelSnapshot.Scope != scope || service.cancelSnapshot.JobID != id || service.cancelSnapshot.Key != key {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.cancelSnapshot, nil
 }
 
 func TestPlatformTraceparentRejectsMalformedInputAndGeneratesValidContext(t *testing.T) {
@@ -847,16 +951,17 @@ func TestBearerUnauthorizedResponseAdvertisesBearerChallenge(t *testing.T) {
 }
 
 type recordingArtifactService struct {
-	getCalls      int
-	getValue      artifact.Artifact
-	getErr        error
-	getScope      platformscope.Scope
-	downloadValue artifact.Download
-	downloadErr   error
-	downloadScope platformscope.Scope
-	downloadID    string
-	downloadTTL   time.Duration
-	downloadCalls int
+	getCalls         int
+	getValue         artifact.Artifact
+	getErr           error
+	getScope         platformscope.Scope
+	downloadValue    artifact.Download
+	downloadErr      error
+	downloadScope    platformscope.Scope
+	downloadID       string
+	downloadTTL      time.Duration
+	downloadCalls    int
+	downloadIssuedAt []time.Time
 }
 
 func (service *recordingArtifactService) Get(_ context.Context, scope platformscope.Scope, _ string) (artifact.Artifact, error) {
@@ -865,9 +970,10 @@ func (service *recordingArtifactService) Get(_ context.Context, scope platformsc
 	return service.getValue, service.getErr
 }
 
-func (service *recordingArtifactService) CreateDownload(_ context.Context, scope platformscope.Scope, id string, ttl time.Duration) (artifact.Download, error) {
+func (service *recordingArtifactService) CreateDownloadAt(_ context.Context, scope platformscope.Scope, id string, issuedAt time.Time, ttl time.Duration) (artifact.Download, error) {
 	service.downloadScope, service.downloadID, service.downloadTTL = scope, id, ttl
 	service.downloadCalls++
+	service.downloadIssuedAt = append(service.downloadIssuedAt, issuedAt.UTC())
 	return service.downloadValue, service.downloadErr
 }
 
@@ -912,13 +1018,14 @@ func (service *recordingCapabilityService) Resolve(input capability.Input) []cap
 }
 
 type httpIdempotencyStore struct {
-	mu             sync.Mutex
-	records        map[string]httpIdempotencyRecord
-	completeErr    error
-	markAuditedErr error
-	abortCalls     int
-	claimedOwners  []string
-	abortedOwners  []string
+	mu                sync.Mutex
+	records           map[string]httpIdempotencyRecord
+	completeErr       error
+	markAuditedErr    error
+	abortCalls        int
+	claimedOwners     []string
+	abortedOwners     []string
+	attemptedResponse *idempotency.Response
 }
 
 type httpIdempotencyRecord struct {
@@ -927,26 +1034,32 @@ type httpIdempotencyRecord struct {
 	state          idempotency.State
 	response       idempotency.Response
 	reconciliation []byte
+	createdAt      time.Time
 }
 
 func newHTTPIdempotencyStore() *httpIdempotencyStore {
 	return &httpIdempotencyStore{records: make(map[string]httpIdempotencyRecord)}
 }
 
-func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key, fingerprint, owner string, _, _ time.Time) (idempotency.Claim, error) {
+func (store *httpIdempotencyStore) Claim(_ context.Context, request idempotency.ClaimRequest) (idempotency.Claim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	key, fingerprint, owner := request.Key, request.Fingerprint, request.OwnerToken
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, exists := store.records[mapKey]
 	if !exists {
-		store.records[mapKey] = httpIdempotencyRecord{fingerprint: fingerprint, owner: owner, state: idempotency.StateProcessing}
+		record = httpIdempotencyRecord{fingerprint: fingerprint, owner: owner, state: idempotency.StateProcessing, reconciliation: append([]byte(nil), request.Reconciliation...), createdAt: request.Now.UTC()}
+		store.records[mapKey] = record
 		store.claimedOwners = append(store.claimedOwners, owner)
-		return idempotency.Claim{Claimed: true, OwnerToken: owner, State: idempotency.StateProcessing}, nil
+		return idempotency.Claim{Claimed: true, OwnerToken: owner, State: idempotency.StateProcessing, CreatedAt: record.createdAt, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return idempotency.Claim{}, idempotency.ErrKeyConflict
 	}
 	if record.state == idempotency.StateProcessing {
+		if request.RecoverProcessing {
+			return idempotency.Claim{OwnerToken: record.owner, State: record.state, CreatedAt: record.createdAt, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
+		}
 		return idempotency.Claim{}, idempotency.ErrInProgress
 	}
 	response := cloneIdempotencyResponse(record.response)
@@ -962,6 +1075,8 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key,
 func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, _ time.Time) (idempotency.Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	attempted := cloneIdempotencyResponse(response)
+	store.attemptedResponse = &attempted
 	if store.completeErr != nil {
 		return idempotency.Response{}, store.completeErr
 	}
@@ -1038,7 +1153,7 @@ func (service *sequencedArtifactService) Get(context.Context, platformscope.Scop
 	return artifact.Artifact{}, nil
 }
 
-func (service *sequencedArtifactService) CreateDownload(context.Context, platformscope.Scope, string, time.Duration) (artifact.Download, error) {
+func (service *sequencedArtifactService) CreateDownloadAt(context.Context, platformscope.Scope, string, time.Time, time.Duration) (artifact.Download, error) {
 	index := service.calls
 	service.calls++
 	if index < len(service.errors) && service.errors[index] != nil {
@@ -1048,10 +1163,11 @@ func (service *sequencedArtifactService) CreateDownload(context.Context, platfor
 }
 
 type blockingJobService struct {
-	mu      sync.Mutex
-	count   int
-	started chan struct{}
-	proceed chan struct{}
+	mu       sync.Mutex
+	count    int
+	started  chan struct{}
+	proceed  chan struct{}
+	snapshot *job.CancellationSnapshot
 }
 
 func newBlockingJobService() *blockingJobService {
@@ -1062,7 +1178,7 @@ func (service *blockingJobService) Get(context.Context, platformscope.Scope, str
 	return validPlatformJob(), nil
 }
 
-func (service *blockingJobService) RequestCancel(_ context.Context, _ platformscope.Scope, _ string, _ string, _ int64, _ time.Time) (job.Job, error) {
+func (service *blockingJobService) RequestCancelWithSnapshot(_ context.Context, scope platformscope.Scope, id, actor string, version int64, at time.Time, input job.CancellationSnapshotInput) (job.Job, error) {
 	service.mu.Lock()
 	service.count++
 	if service.count == 1 {
@@ -1073,7 +1189,19 @@ func (service *blockingJobService) RequestCancel(_ context.Context, _ platformsc
 	value := validPlatformJob()
 	value.Status = job.StatusCancelling
 	value.Version = 8
+	service.mu.Lock()
+	service.snapshot = &job.CancellationSnapshot{Scope: scope, JobID: id, Key: input.Key, OwnerToken: input.OwnerToken, CurrentVersion: version, Job: value, AuditEventJSON: append([]byte(nil), input.AuditEventJSON...), CreatedAt: at.UTC()}
+	service.mu.Unlock()
 	return value, nil
+}
+
+func (service *blockingJobService) GetCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, key job.CancellationSnapshotKey) (job.CancellationSnapshot, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.snapshot == nil || service.snapshot.Scope != scope || service.snapshot.JobID != id || service.snapshot.Key != key {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.snapshot, nil
 }
 
 func (service *blockingJobService) calls() int {

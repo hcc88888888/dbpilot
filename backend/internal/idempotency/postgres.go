@@ -10,9 +10,9 @@ import (
 	"time"
 )
 
-const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $9) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
-const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = NULL, expires_at = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND state = 'completed' AND expires_at <= $4"
-const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json, audit_event_json FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
+const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, audit_event_json, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $10, $10) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
+const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = $3, expires_at = $4, created_at = $5, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND state = 'completed' AND expires_at <= $5"
+const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json, audit_event_json, created_at FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
 const commitSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, audit_event_json = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND request_fingerprint = $11 AND owner_token = $12 AND state = 'processing'"
 const markAuditedSQL = "UPDATE idempotency_records SET state = 'audited', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'side_effect_committed'"
 const completeClaimSQL = "UPDATE idempotency_records SET state = 'completed', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'audited'"
@@ -24,11 +24,17 @@ func NewPostgresStore(database *sql.DB) *PostgresStore {
 	return &PostgresStore{database: database}
 }
 
-func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, owner string, now, expires time.Time) (Claim, error) {
-	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || now.IsZero() || !expires.After(now) {
+func (store *PostgresStore) Claim(ctx context.Context, request ClaimRequest) (Claim, error) {
+	key, fingerprint, owner := request.Key, request.Fingerprint, request.OwnerToken
+	now, expires := request.Now, request.ExpiresAt
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || now.IsZero() || !expires.After(now) || len(request.Reconciliation) > maximumReconciliationBytes || len(request.Reconciliation) != 0 && validateReconciliation(request.Reconciliation) != nil {
 		return Claim{}, ErrInvalid
 	}
 	now, expires = now.UTC(), expires.UTC()
+	var reconciliation any
+	if len(request.Reconciliation) != 0 {
+		reconciliation = string(request.Reconciliation)
+	}
 	transaction, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
 		return Claim{}, fmt.Errorf("begin idempotency claim: %w", err)
@@ -37,7 +43,7 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 		_ = transaction.Rollback()
 		return Claim{}, cause
 	}
-	inserted, err := transaction.ExecContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, expires, now)
+	inserted, err := transaction.ExecContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, reconciliation, expires, now)
 	if err != nil {
 		return rollback(fmt.Errorf("insert idempotency claim: %w", err))
 	}
@@ -49,9 +55,9 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit idempotency claim: %w", err)
 		}
-		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing}, nil
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: now, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
 	}
-	reclaimed, err := transaction.ExecContext(ctx, reclaimExpiredCompletedSQL, fingerprint, owner, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey)
+	reclaimed, err := transaction.ExecContext(ctx, reclaimExpiredCompletedSQL, fingerprint, owner, reconciliation, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey)
 	if err != nil {
 		return rollback(fmt.Errorf("reclaim expired idempotency key: %w", err))
 	}
@@ -63,7 +69,7 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit reclaimed idempotency key: %w", err)
 		}
-		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing}, nil
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: now, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
 	}
 	record, err := scanClaim(transaction.QueryRowContext(ctx, selectRecordSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey))
 	if err != nil {
@@ -80,7 +86,10 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 	}
 	switch record.state {
 	case StateProcessing:
-		return Claim{}, ErrInProgress
+		if !request.RecoverProcessing {
+			return Claim{}, ErrInProgress
+		}
+		return Claim{OwnerToken: record.owner, State: record.state, CreatedAt: record.createdAt.UTC(), Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	case StateSideEffectCommitted, StateAudited:
 		response := cloneResponse(record.response)
 		return Claim{OwnerToken: record.owner, State: record.state, Response: &response, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
@@ -175,13 +184,18 @@ type storedClaim struct {
 	state          State
 	response       Response
 	reconciliation []byte
+	createdAt      time.Time
 }
 
 func scanClaim(scanner interface{ Scan(...any) error }) (storedClaim, error) {
 	var value storedClaim
 	var headerJSON []byte
-	if err := scanner.Scan(&value.fingerprint, &value.owner, &value.state, &value.response.Status, &headerJSON, &value.response.Body, &value.reconciliation); err != nil {
+	if err := scanner.Scan(&value.fingerprint, &value.owner, &value.state, &value.response.Status, &headerJSON, &value.response.Body, &value.reconciliation, &value.createdAt); err != nil {
 		return storedClaim{}, err
+	}
+	value.createdAt = value.createdAt.UTC()
+	if value.createdAt.IsZero() {
+		return storedClaim{}, ErrInvalid
 	}
 	if value.state == StateSideEffectCommitted || value.state == StateAudited || value.state == StateCompleted {
 		var storedHeader http.Header

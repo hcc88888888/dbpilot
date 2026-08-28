@@ -2,7 +2,9 @@ package job
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +314,61 @@ func TestRequestCancelAtomicallyPersistsVersionedJobAndCommandIntent(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, StatusCancelling, got.Status)
 	require.Equal(t, current.Version+1, got.Version)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRequestCancelSnapshotCommitsExactCorrelationAndResponseInputsInSameTransaction(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	current := runningJob()
+	at := current.StartedAt.Add(time.Minute)
+	key := CancellationSnapshotKey{
+		Actor: "operator-1", OperationID: "cancelJob", IdempotencyKey: "cancel-http-1",
+		RequestFingerprint: "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59",
+		IfMatch:            `"` + strconv.FormatInt(current.Version, 10) + `"`,
+	}
+	input := CancellationSnapshotInput{
+		Key: key, OwnerToken: "owner-1111111111111111111111111111111111111111111111111111111111111111",
+		AuditEventJSON: []byte(`{"request_id":"request-original","trace_id":"trace-original"}`),
+	}
+	next, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusCancelling, Actor: key.Actor, At: at})
+	require.NoError(t, err)
+	encodedNext, err := json.Marshal(next)
+	require.NoError(t, err)
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT .* FROM jobs").WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID).WillReturnRows(jobRows(current))
+	mock.ExpectQuery("SELECT target_id.*FROM job_targets").WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID).WillReturnRows(
+		sqlmock.NewRows([]string{"target_id", "status", "error_summary", "result_summary", "artifacts", "finished_at"}).AddRow("db-1", string(TargetRunning), "", "", []byte("[]"), nil),
+	)
+	mock.ExpectExec("UPDATE jobs SET").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE command_outbox SET cancellation_requested_at").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("INSERT INTO job_cancellation_snapshots").WithArgs(
+		current.Scope.TenantID, current.Scope.ProjectID, current.ID, key.Actor, key.OperationID,
+		key.IdempotencyKey, key.RequestFingerprint, input.OwnerToken, key.IfMatch, current.Version,
+		sqlmock.AnyArg(), input.AuditEventJSON, at.UTC(),
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	got, err := repository.RequestCancelWithSnapshot(context.Background(), current.Scope, current.ID, key.Actor, current.Version, at, input)
+	require.NoError(t, err)
+	require.Equal(t, next, got)
+
+	mock.ExpectQuery("SELECT actor, operation_id, idempotency_key").WithArgs(
+		current.Scope.TenantID, current.Scope.ProjectID, current.ID, key.Actor, key.OperationID,
+		key.IdempotencyKey, key.RequestFingerprint, key.IfMatch,
+	).WillReturnRows(sqlmock.NewRows([]string{
+		"actor", "operation_id", "idempotency_key", "request_fingerprint", "owner_token", "if_match",
+		"current_version", "job_snapshot", "audit_event_json", "created_at",
+	}).AddRow(key.Actor, key.OperationID, key.IdempotencyKey, key.RequestFingerprint, input.OwnerToken, key.IfMatch, current.Version, encodedNext, input.AuditEventJSON, at.UTC()))
+
+	snapshot, err := repository.GetCancellationSnapshot(context.Background(), current.Scope, current.ID, key)
+	require.NoError(t, err)
+	require.Equal(t, next, snapshot.Job)
+	require.Equal(t, input.AuditEventJSON, snapshot.AuditEventJSON)
+	require.Equal(t, input.OwnerToken, snapshot.OwnerToken)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

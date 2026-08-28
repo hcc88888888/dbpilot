@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -51,6 +52,11 @@ const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM co
 const preparedCommandsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND command_phase IN ('prepared', 'start_authorized') ORDER BY prepared_at, created_at, id LIMIT $2"
 const pendingTerminalAuditsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND terminal_audit_pending ORDER BY terminal_at, id LIMIT $2"
 const markTerminalAuditRecordedSQL = "UPDATE command_outbox SET terminal_audit_pending = FALSE, terminal_audit_lease_expires_at = NULL, terminal_audit_recorded_at = COALESCE(terminal_audit_recorded_at, $1) WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND terminal_audit_dedupe_key = $5"
+const insertCancellationSnapshotSQL = "INSERT INTO job_cancellation_snapshots (tenant_id, project_id, job_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, if_match, current_version, job_snapshot, audit_event_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
+const selectCancellationSnapshotSQL = "SELECT actor, operation_id, idempotency_key, request_fingerprint, owner_token, if_match, current_version, job_snapshot, audit_event_json, created_at FROM job_cancellation_snapshots WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND if_match = $8"
+
+var cancellationFingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var cancellationOwnerPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
 
 type PostgresRepository struct {
 	db               *sql.DB
@@ -247,6 +253,17 @@ func transitionInTx(ctx context.Context, tx *sql.Tx, transition Transition) (Job
 }
 
 func (repository *PostgresRepository) RequestCancel(ctx context.Context, scope platformscope.Scope, id, actor string, currentVersion int64, at time.Time) (Job, error) {
+	return repository.requestCancel(ctx, scope, id, actor, currentVersion, at, nil)
+}
+
+func (repository *PostgresRepository) RequestCancelWithSnapshot(ctx context.Context, scope platformscope.Scope, id, actor string, currentVersion int64, at time.Time, snapshot CancellationSnapshotInput) (Job, error) {
+	if validateCancellationSnapshotInput(actor, currentVersion, snapshot) != nil {
+		return Job{}, ErrInvalidTransition
+	}
+	return repository.requestCancel(ctx, scope, id, actor, currentVersion, at, &snapshot)
+}
+
+func (repository *PostgresRepository) requestCancel(ctx context.Context, scope platformscope.Scope, id, actor string, currentVersion int64, at time.Time, snapshot *CancellationSnapshotInput) (Job, error) {
 	if repository == nil || repository.db == nil || scope.Validate() != nil || strings.TrimSpace(id) == "" || strings.TrimSpace(actor) == "" || currentVersion < 1 || at.IsZero() {
 		return Job{}, ErrInvalidTransition
 	}
@@ -263,10 +280,73 @@ func (repository *PostgresRepository) RequestCancel(ctx context.Context, scope p
 		_ = tx.Rollback()
 		return Job{}, classifyWriteError("persist command cancellation intent", err)
 	}
+	if snapshot != nil {
+		encodedJob, marshalErr := json.Marshal(next)
+		if marshalErr != nil {
+			_ = tx.Rollback()
+			return Job{}, fmt.Errorf("marshal cancellation response snapshot: %w", marshalErr)
+		}
+		_, snapshotErr := tx.ExecContext(ctx, insertCancellationSnapshotSQL,
+			scope.TenantID, scope.ProjectID, id, snapshot.Key.Actor, snapshot.Key.OperationID,
+			snapshot.Key.IdempotencyKey, snapshot.Key.RequestFingerprint, snapshot.OwnerToken,
+			snapshot.Key.IfMatch, currentVersion, encodedJob, snapshot.AuditEventJSON, at.UTC(),
+		)
+		if snapshotErr != nil {
+			_ = tx.Rollback()
+			return Job{}, classifyWriteError("persist cancellation response snapshot", snapshotErr)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, fmt.Errorf("commit job cancellation: %w: %w", ErrAmbiguousCommit, err)
 	}
 	return next, nil
+}
+
+func (repository *PostgresRepository) GetCancellationSnapshot(ctx context.Context, scope platformscope.Scope, jobID string, key CancellationSnapshotKey) (CancellationSnapshot, error) {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || validateCancellationSnapshotKey(key) != nil {
+		return CancellationSnapshot{}, ErrNotFound
+	}
+	value := CancellationSnapshot{Scope: scope, JobID: jobID}
+	var encodedJob []byte
+	err := repository.db.QueryRowContext(ctx, selectCancellationSnapshotSQL,
+		scope.TenantID, scope.ProjectID, jobID, key.Actor, key.OperationID,
+		key.IdempotencyKey, key.RequestFingerprint, key.IfMatch,
+	).Scan(
+		&value.Key.Actor, &value.Key.OperationID, &value.Key.IdempotencyKey,
+		&value.Key.RequestFingerprint, &value.OwnerToken, &value.Key.IfMatch,
+		&value.CurrentVersion, &encodedJob, &value.AuditEventJSON, &value.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CancellationSnapshot{}, ErrNotFound
+	}
+	if err != nil {
+		return CancellationSnapshot{}, fmt.Errorf("read cancellation response snapshot: %w", err)
+	}
+	if json.Unmarshal(encodedJob, &value.Job) != nil || value.Key != key || value.Job.Scope != scope || value.Job.ID != jobID || value.Job.Status != StatusCancelling || value.Job.Version != value.CurrentVersion+1 || value.Job.CancelRequestedBy != key.Actor || value.Job.CancelRequestedAt == nil || !cancellationOwnerPattern.MatchString(value.OwnerToken) || !json.Valid(value.AuditEventJSON) || value.CreatedAt.IsZero() || ValidateTargets(value.Job) != nil {
+		return CancellationSnapshot{}, ErrInvalidTransition
+	}
+	value.CreatedAt = value.CreatedAt.UTC()
+	value.AuditEventJSON = append([]byte(nil), value.AuditEventJSON...)
+	return value, nil
+}
+
+func validateCancellationSnapshotInput(actor string, currentVersion int64, input CancellationSnapshotInput) error {
+	if input.Key.Actor != actor || input.OwnerToken == "" || !cancellationOwnerPattern.MatchString(input.OwnerToken) || !json.Valid(input.AuditEventJSON) || input.Key.IfMatch != fmt.Sprintf("\"%d\"", currentVersion) {
+		return ErrInvalidTransition
+	}
+	return validateCancellationSnapshotKey(input.Key)
+}
+
+func validateCancellationSnapshotKey(key CancellationSnapshotKey) error {
+	for _, value := range []string{key.Actor, key.OperationID, key.IdempotencyKey, key.IfMatch} {
+		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\t") {
+			return ErrInvalidTransition
+		}
+	}
+	if !cancellationFingerprintPattern.MatchString(key.RequestFingerprint) {
+		return ErrInvalidTransition
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) ClaimOutbox(ctx context.Context, limit int, at time.Time) ([]OutboxMessage, error) {

@@ -118,6 +118,35 @@ type Transition struct {
 	At             time.Time
 }
 
+// CancellationSnapshotKey binds an HTTP cancellation retry to the exact
+// authenticated request that won the Job cancellation transaction.
+type CancellationSnapshotKey struct {
+	Actor              string
+	OperationID        string
+	IdempotencyKey     string
+	RequestFingerprint string
+	IfMatch            string
+}
+
+type CancellationSnapshotInput struct {
+	Key            CancellationSnapshotKey
+	OwnerToken     string
+	AuditEventJSON []byte
+}
+
+// CancellationSnapshot contains immutable response inputs and the original
+// audit payload. The idempotency owner remains a fence, not a reclaim token.
+type CancellationSnapshot struct {
+	Scope          platformscope.Scope
+	JobID          string
+	Key            CancellationSnapshotKey
+	OwnerToken     string
+	CurrentVersion int64
+	Job            Job
+	AuditEventJSON []byte
+	CreatedAt      time.Time
+}
+
 type OutboxMessage struct {
 	ID                       string              `json:"id"`
 	Scope                    platformscope.Scope `json:"scope"`

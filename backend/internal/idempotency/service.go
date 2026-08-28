@@ -56,14 +56,36 @@ type Claim struct {
 	Claimed        bool
 	OwnerToken     string
 	State          State
+	CreatedAt      time.Time
 	Response       *Response
 	Reconciliation []byte
 }
 
 type ReconcileFunc func(context.Context, Response, []byte) error
 
+// ProcessingClaim is the immutable fence exposed only to an operation-specific
+// recovery callback. Possessing it does not reclaim or replace an unknown
+// processing owner.
+type ProcessingClaim struct {
+	OwnerToken     string
+	CreatedAt      time.Time
+	Reconciliation []byte
+}
+
+type RecoverProcessingFunc func(context.Context, ProcessingClaim) (Response, error)
+
+type ClaimRequest struct {
+	Key               Key
+	Fingerprint       string
+	OwnerToken        string
+	Reconciliation    []byte
+	RecoverProcessing bool
+	Now               time.Time
+	ExpiresAt         time.Time
+}
+
 type Store interface {
-	Claim(context.Context, Key, string, string, time.Time, time.Time) (Claim, error)
+	Claim(context.Context, ClaimRequest) (Claim, error)
 	CommitSideEffect(context.Context, Key, string, string, Response, []byte, time.Time) (Response, error)
 	MarkAudited(context.Context, Key, string, string, time.Time) error
 	Complete(context.Context, Key, string, string, Response, time.Time) (Response, error)
@@ -82,6 +104,20 @@ func NewService(store Store) *Service {
 }
 
 func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, reconcile ReconcileFunc) (Claim, error) {
+	return service.begin(ctx, key, fingerprint, nil, reconcile, nil)
+}
+
+// BeginRecoverable persists the original reconciliation payload with the
+// claim. An exact retry may repair a processing row only through recover;
+// legacy/unknown processing rows without that payload remain fenced.
+func (service *Service) BeginRecoverable(ctx context.Context, key Key, fingerprint string, reconciliation []byte, reconcile ReconcileFunc, recover RecoverProcessingFunc) (Claim, error) {
+	if validateReconciliation(reconciliation) != nil || recover == nil {
+		return Claim{}, ErrInvalid
+	}
+	return service.begin(ctx, key, fingerprint, reconciliation, reconcile, recover)
+}
+
+func (service *Service) begin(ctx context.Context, key Key, fingerprint string, reconciliation []byte, reconcile ReconcileFunc, recover RecoverProcessingFunc) (Claim, error) {
 	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || reconcile == nil {
 		return Claim{}, ErrInvalid
 	}
@@ -98,15 +134,38 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 	if err != nil || !ownerPattern.MatchString(owner) {
 		return Claim{}, ErrInvalid
 	}
-	claim, err := service.store.Claim(ctx, key, fingerprint, owner, now, now.Add(ttl))
+	claim, err := service.store.Claim(ctx, ClaimRequest{
+		Key: key, Fingerprint: fingerprint, OwnerToken: owner,
+		Reconciliation: append([]byte(nil), reconciliation...), RecoverProcessing: recover != nil,
+		Now: now, ExpiresAt: now.Add(ttl),
+	})
 	if err != nil {
 		return Claim{}, err
 	}
 	if claim.Claimed {
-		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil || claim.Reconciliation != nil {
+		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil || claim.CreatedAt.IsZero() || !claim.CreatedAt.Equal(now) || !bytesEqual(claim.Reconciliation, reconciliation) {
 			return Claim{}, ErrInvalid
 		}
+		claim.Reconciliation = append([]byte(nil), claim.Reconciliation...)
 		return claim, nil
+	}
+	if claim.State == StateProcessing {
+		storedReconciliation := append([]byte(nil), claim.Reconciliation...)
+		if recover == nil {
+			return Claim{}, ErrInProgress
+		}
+		if !ownerPattern.MatchString(claim.OwnerToken) || claim.CreatedAt.IsZero() || validateReconciliation(storedReconciliation) != nil {
+			return Claim{}, ErrInProgress
+		}
+		response, recoverErr := recover(ctx, ProcessingClaim{OwnerToken: claim.OwnerToken, CreatedAt: claim.CreatedAt.UTC(), Reconciliation: storedReconciliation})
+		if recoverErr != nil {
+			return Claim{}, recoverErr
+		}
+		completed, completeErr := service.Complete(ctx, key, fingerprint, claim.OwnerToken, response, storedReconciliation, reconcile)
+		if completeErr != nil {
+			return Claim{}, completeErr
+		}
+		return Claim{State: StateCompleted, CreatedAt: claim.CreatedAt.UTC(), Response: &completed}, nil
 	}
 	if claim.Response == nil {
 		return Claim{}, ErrInvalid
@@ -116,7 +175,7 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 		return Claim{}, ErrInvalid
 	}
 	claim.Response = &response
-	reconciliation := append([]byte(nil), claim.Reconciliation...)
+	phaseReconciliation := append([]byte(nil), claim.Reconciliation...)
 	switch claim.State {
 	case StateCompleted:
 		if claim.OwnerToken != "" || claim.Reconciliation != nil {
@@ -124,17 +183,17 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 		}
 		return claim, nil
 	case StateSideEffectCommitted:
-		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(reconciliation) != nil {
+		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(phaseReconciliation) != nil {
 			return Claim{}, ErrInvalid
 		}
-		if err := reconcile(ctx, cloneResponse(response), append([]byte(nil), reconciliation...)); err != nil {
+		if err := reconcile(ctx, cloneResponse(response), append([]byte(nil), phaseReconciliation...)); err != nil {
 			return Claim{}, err
 		}
 		if err := service.store.MarkAudited(ctx, key, fingerprint, claim.OwnerToken, service.currentTime()); err != nil {
 			return Claim{}, err
 		}
 	case StateAudited:
-		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(reconciliation) != nil {
+		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(phaseReconciliation) != nil {
 			return Claim{}, ErrInvalid
 		}
 	default:
@@ -149,6 +208,18 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 	}
 	completed = cloneResponse(completed)
 	return Claim{State: StateCompleted, Response: &completed}, nil
+}
+
+func bytesEqual(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response, reconciliation []byte, reconcile ReconcileFunc) (Response, error) {

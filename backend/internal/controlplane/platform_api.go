@@ -75,7 +75,23 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
+	snapshotKey := job.CancellationSnapshotKey{
+		Actor: principal.Subject, OperationID: key.OperationID, IdempotencyKey: key.IdempotencyKey,
+		RequestFingerprint: fingerprint, IfMatch: request.Params.IfMatch,
+	}
+	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		snapshot, snapshotErr := api.services.Jobs.GetCancellationSnapshot(recoveryContext, scope, request.JobId, snapshotKey)
+		if errors.Is(snapshotErr, job.ErrNotFound) {
+			return idempotency.Response{}, idempotency.ErrInProgress
+		}
+		if snapshotErr != nil {
+			return idempotency.Response{}, snapshotErr
+		}
+		if snapshot.OwnerToken != processing.OwnerToken || !equalCanonicalJSON(snapshot.AuditEventJSON, processing.Reconciliation) || snapshot.CurrentVersion != version {
+			return idempotency.Response{}, errors.New("stored cancellation response snapshot is invalid")
+		}
+		return storedCancellationResponse(snapshot.Job, scope, request.JobId)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +106,9 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if api.services.Now != nil {
 		now = api.services.Now
 	}
-	value, err := api.services.Jobs.RequestCancel(ctx, scope, request.JobId, principal.Subject, version, now().UTC())
+	value, err := api.services.Jobs.RequestCancelWithSnapshot(ctx, scope, request.JobId, principal.Subject, version, now().UTC(), job.CancellationSnapshotInput{
+		Key: snapshotKey, OwnerToken: owner, AuditEventJSON: append([]byte(nil), auditPayload...),
+	})
 	if errors.Is(err, job.ErrConflict) {
 		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
 			return nil, abortErr
@@ -108,18 +126,10 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if value.ID != request.JobId || value.Scope != scope {
 		return nil, errors.New("job service returned an out-of-scope entity")
 	}
-	response, err := openAPIJob(value)
+	stored, err := storedCancellationResponse(value, scope, request.JobId)
 	if err != nil {
 		return nil, err
 	}
-	responseBody, err := json.Marshal(response)
-	if err != nil {
-		return nil, err
-	}
-	stored := idempotency.Response{Status: http.StatusAccepted, Header: make(http.Header), Body: responseBody}
-	stored.Header.Set("Content-Type", "application/json")
-	stored.Header.Set("ETag", entityTag(value.Version))
-	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
 	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, auditPayload, reconcile)
 	if err != nil {
 		return nil, err
@@ -169,7 +179,13 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
+	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		value, recoveryErr := api.services.Artifacts.CreateDownloadAt(recoveryContext, scope, request.ArtifactId, processing.CreatedAt, artifact.MaximumDownloadTTL)
+		if recoveryErr != nil {
+			return idempotency.Response{}, recoveryErr
+		}
+		return storedArtifactDownloadResponse(value)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -180,7 +196,7 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 		return artifactDownloadIdempotentResponse{response: *claim.Response}, nil
 	}
 	owner := claim.OwnerToken
-	value, err := api.services.Artifacts.CreateDownload(ctx, scope, request.ArtifactId, artifact.MaximumDownloadTTL)
+	value, err := api.services.Artifacts.CreateDownloadAt(ctx, scope, request.ArtifactId, claim.CreatedAt, artifact.MaximumDownloadTTL)
 	if err != nil {
 		if errors.Is(err, artifact.ErrBeforeDownloadSideEffect) {
 			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
@@ -189,23 +205,10 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 		}
 		return nil, err
 	}
-	var headers *map[string]string
-	if len(value.Headers) > 0 {
-		copyHeaders := make(map[string]string, len(value.Headers))
-		for name, headerValue := range value.Headers {
-			copyHeaders[name] = headerValue
-		}
-		headers = &copyHeaders
-	}
-	descriptor := openapi.DownloadDescriptor{
-		Url: value.URL, ExpiresAt: value.ExpiresAt.UTC(), Headers: headers,
-	}
-	responseBody, err := json.Marshal(descriptor)
+	stored, err := storedArtifactDownloadResponse(value)
 	if err != nil {
 		return nil, err
 	}
-	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
-	stored.Header.Set("Content-Type", "application/json")
 	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, auditPayload, reconcile)
 	if err != nil {
 		return nil, err
@@ -348,6 +351,49 @@ func writeIdempotencyResponse(writer http.ResponseWriter, response idempotency.R
 	writer.WriteHeader(response.Status)
 	_, err := writer.Write(response.Body)
 	return err
+}
+
+func storedCancellationResponse(value job.Job, scope platformscope.Scope, requestJobID string) (idempotency.Response, error) {
+	if value.ID != requestJobID || value.Scope != scope || value.Status != job.StatusCancelling {
+		return idempotency.Response{}, errors.New("stored cancellation Job snapshot is invalid")
+	}
+	response, err := openAPIJob(value)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	responseBody, err := json.Marshal(response)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	stored := idempotency.Response{Status: http.StatusAccepted, Header: make(http.Header), Body: responseBody}
+	stored.Header.Set("Content-Type", "application/json")
+	stored.Header.Set("ETag", entityTag(value.Version))
+	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
+	return stored, nil
+}
+
+func storedArtifactDownloadResponse(value artifact.Download) (idempotency.Response, error) {
+	var headers *map[string]string
+	if len(value.Headers) > 0 {
+		copyHeaders := make(map[string]string, len(value.Headers))
+		for name, headerValue := range value.Headers {
+			copyHeaders[name] = headerValue
+		}
+		headers = &copyHeaders
+	}
+	descriptor := openapi.DownloadDescriptor{Url: value.URL, ExpiresAt: value.ExpiresAt.UTC(), Headers: headers}
+	responseBody, err := json.Marshal(descriptor)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
+	stored.Header.Set("Content-Type", "application/json")
+	return stored, nil
+}
+
+func equalCanonicalJSON(left, right []byte) bool {
+	var leftValue, rightValue any
+	return json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil && reflect.DeepEqual(leftValue, rightValue)
 }
 
 func platformIdempotencyFingerprint(ctx context.Context, operationID, resourceID, ifMatch string) (string, error) {

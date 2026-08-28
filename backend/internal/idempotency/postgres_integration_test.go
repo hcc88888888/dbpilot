@@ -56,12 +56,12 @@ func TestPostgresClaimFencingIntegration(t *testing.T) {
 	ownerTwo := "owner-2222222222222222222222222222222222222222222222222222222222222222"
 	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
 
-	claim, err := store.Claim(ctx, key, fingerprint, ownerOne, now, now.Add(time.Hour))
+	claim, err := store.Claim(ctx, idempotency.ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: ownerOne, Now: now, ExpiresAt: now.Add(time.Hour)})
 	require.NoError(t, err)
 	require.True(t, claim.Claimed)
 	require.Equal(t, ownerOne, claim.OwnerToken)
 
-	claim, err = store.Claim(ctx, key, fingerprint, ownerTwo, now.Add(48*time.Hour), now.Add(49*time.Hour))
+	claim, err = store.Claim(ctx, idempotency.ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: ownerTwo, Now: now.Add(48 * time.Hour), ExpiresAt: now.Add(49 * time.Hour)})
 	require.ErrorIs(t, err, idempotency.ErrInProgress, "processing must not be reclaimed after expiry")
 	require.False(t, claim.Claimed)
 

@@ -44,6 +44,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*command_phase.*recovery_revision.*command_outbox_expired_execution_v2_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0005_two_phase_execution.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0006_cancellation_response_snapshot.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE TABLE job_cancellation_snapshots.*request_fingerprint.*owner_token.*job_snapshot.*audit_event_json.*job_cancellation_snapshots_correlation_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0006_cancellation_response_snapshot.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -82,4 +88,9 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	}
 	require.Contains(t, string(twoPhase), "WHERE command_status = 'active'")
 	require.Contains(t, string(twoPhase), "execution_deadline_at = LEAST")
+	cancellationSnapshot, err := migrationFiles.ReadFile("migrations/0006_cancellation_response_snapshot.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"job_cancellation_snapshots", "request_fingerprint", "owner_token", "if_match", "current_version", "job_snapshot", "audit_event_json", "job_cancellation_snapshots_correlation_idx"} {
+		require.Contains(t, string(cancellationSnapshot), required)
+	}
 }

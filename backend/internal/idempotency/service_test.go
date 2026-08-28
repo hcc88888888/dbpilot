@@ -136,6 +136,54 @@ func TestServiceRejectsInvalidKeysFingerprintsAndResponsesBeforeStore(t *testing
 	require.Zero(t, store.completeCalls)
 }
 
+func TestBeginRecoverableUsesPersistedOwnerCreationTimeAndOriginalReconciliation(t *testing.T) {
+	store := newSynchronizedStore()
+	service := NewService(store)
+	createdAt := time.Date(2026, 8, 28, 8, 0, 0, 123456789, time.UTC)
+	service.now = func() time.Time { return createdAt }
+	service.newOwner = func() (string, error) {
+		return "owner-1111111111111111111111111111111111111111111111111111111111111111", nil
+	}
+	key := validKey()
+	fingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
+	original := []byte(`{"request_id":"request-original","trace_id":"trace-original"}`)
+	claim, err := service.BeginRecoverable(context.Background(), key, fingerprint, original, successfulReconcile, func(context.Context, ProcessingClaim) (Response, error) {
+		t.Fatal("new claim must not invoke processing recovery")
+		return Response{}, nil
+	})
+	require.NoError(t, err)
+	require.True(t, claim.Claimed)
+	require.Equal(t, createdAt, claim.CreatedAt)
+
+	response := Response{Status: http.StatusAccepted, Header: http.Header{"ETag": {`"8"`}}, Body: []byte(`{"id":"job-1"}`)}
+	service.now = func() time.Time { return createdAt.Add(time.Hour) }
+	recovered, err := service.BeginRecoverable(context.Background(), key, fingerprint, []byte(`{"request_id":"request-retry","trace_id":"trace-retry"}`), successfulReconcile, func(_ context.Context, processing ProcessingClaim) (Response, error) {
+		require.Equal(t, claim.OwnerToken, processing.OwnerToken)
+		require.Equal(t, createdAt, processing.CreatedAt)
+		require.JSONEq(t, string(original), string(processing.Reconciliation))
+		return response, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, StateCompleted, recovered.State)
+	require.Equal(t, response.Body, recovered.Response.Body)
+}
+
+func TestBeginRecoverableNeverReclaimsUnknownProcessingWithoutPersistedContext(t *testing.T) {
+	store := newSynchronizedStore()
+	service := NewService(store)
+	key := validKey()
+	fingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
+	_, err := service.Begin(context.Background(), key, fingerprint, successfulReconcile)
+	require.NoError(t, err)
+	called := false
+	_, err = service.BeginRecoverable(context.Background(), key, fingerprint, reconciliationFixture(), successfulReconcile, func(context.Context, ProcessingClaim) (Response, error) {
+		called = true
+		return Response{}, nil
+	})
+	require.ErrorIs(t, err, ErrInProgress)
+	require.False(t, called)
+}
+
 func validKey() Key {
 	return Key{
 		Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"},
@@ -160,26 +208,32 @@ type synchronizedRecord struct {
 	state          State
 	response       Response
 	reconciliation []byte
+	createdAt      time.Time
 }
 
 func newSynchronizedStore() *synchronizedStore {
 	return &synchronizedStore{records: make(map[string]synchronizedRecord)}
 }
 
-func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint, owner string, _, _ time.Time) (Claim, error) {
+func (store *synchronizedStore) Claim(_ context.Context, request ClaimRequest) (Claim, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	key, fingerprint, owner := request.Key, request.Fingerprint, request.OwnerToken
 	store.claimCalls++
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, ok := store.records[mapKey]
 	if !ok {
-		store.records[mapKey] = synchronizedRecord{fingerprint: fingerprint, owner: owner, state: StateProcessing}
-		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing}, nil
+		record = synchronizedRecord{fingerprint: fingerprint, owner: owner, state: StateProcessing, reconciliation: append([]byte(nil), request.Reconciliation...), createdAt: request.Now.UTC()}
+		store.records[mapKey] = record
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: record.createdAt, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	}
 	if record.fingerprint != fingerprint {
 		return Claim{}, ErrKeyConflict
 	}
 	if record.state == StateProcessing {
+		if request.RecoverProcessing {
+			return Claim{OwnerToken: record.owner, State: record.state, CreatedAt: record.createdAt, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
+		}
 		return Claim{}, ErrInProgress
 	}
 	response := cloneResponse(record.response)

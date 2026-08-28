@@ -44,6 +44,12 @@ func TestRunMigrationsAppliesArtifactAuditAndIdempotencySchemaThroughSharedRegis
 	mock.ExpectExec("(?s)ALTER TABLE idempotency_records.*ADD COLUMN audit_event_json.*DROP CONSTRAINT IF EXISTS idempotency_records_state_check.*DROP CONSTRAINT IF EXISTS idempotency_records_check1.*side_effect_committed.*audited.*idempotency_records_response_phase_check").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("platformdb/migrations/0005_http_idempotency_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0006_processing_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE idempotency_records.*DROP CONSTRAINT idempotency_records_response_phase_check.*state = 'processing'.*response_json IS NULL.*side_effect_committed").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("platformdb/migrations/0006_processing_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -74,6 +80,10 @@ func TestRunMigrationsSkipsAlreadyAppliedPlatformSchema(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0005_http_idempotency_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("platformdb/migrations/0006_processing_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
 	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))

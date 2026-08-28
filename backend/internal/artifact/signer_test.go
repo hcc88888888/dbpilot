@@ -20,7 +20,7 @@ func TestHMACDownloadSignerBindsArtifactScopeAndExpiry(t *testing.T) {
 	signer.now = func() time.Time { return now }
 	artifact := Artifact{ID: "artifact-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}
 
-	signed, err := signer.Sign(context.Background(), artifact, time.Minute)
+	signed, err := signer.Sign(context.Background(), artifact, now.Add(time.Minute))
 	require.NoError(t, err)
 	claims, err := signer.Verify(context.Background(), signed)
 	require.NoError(t, err)
@@ -56,7 +56,7 @@ func TestHMACDownloadSignerRejectsExpiredDescriptor(t *testing.T) {
 	signer, err := NewHMACDownloadSigner("/api/v1/artifacts", "secret://control/download", database.StaticSecretResolver{"secret://control/download": []byte("0123456789abcdef0123456789abcdef")})
 	require.NoError(t, err)
 	signer.now = func() time.Time { return now }
-	signed, err := signer.Sign(context.Background(), Artifact{ID: "artifact-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, time.Minute)
+	signed, err := signer.Sign(context.Background(), Artifact{ID: "artifact-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, now.Add(time.Minute))
 	require.NoError(t, err)
 	signer.now = func() time.Time { return now.Add(2 * time.Minute) }
 
@@ -67,8 +67,9 @@ func TestHMACDownloadSignerRejectsExpiredDescriptor(t *testing.T) {
 func TestSpecialArtifactIDRoundTripsThroughOneBase64URLPathSegment(t *testing.T) {
 	signer, err := NewHMACDownloadSigner("https://control.example/api/v1/artifact-downloads", "secret://control/download", database.StaticSecretResolver{"secret://control/download": []byte("0123456789abcdef0123456789abcdef")})
 	require.NoError(t, err)
+	now := time.Now().UTC()
 	id := "artifact/with space?#%中文"
-	signed, err := signer.Sign(context.Background(), Artifact{ID: id, Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, time.Minute)
+	signed, err := signer.Sign(context.Background(), Artifact{ID: id, Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}}, now.Add(time.Minute))
 	require.NoError(t, err)
 	parsed, err := url.Parse(signed)
 	require.NoError(t, err)

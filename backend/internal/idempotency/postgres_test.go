@@ -23,11 +23,11 @@ func TestPostgresStoreAtomicallyClaimsNewOrExpiredCompletedKeys(t *testing.T) {
 		database, mock := newIdempotencySQLMock(t)
 		mock.ExpectBegin()
 		mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).
-			WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, expires, now).
+			WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, nil, expires, now).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 
-		claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
+		claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
 		require.NoError(t, err)
 		require.True(t, claim.Claimed)
 		require.Equal(t, owner, claim.OwnerToken)
@@ -39,11 +39,11 @@ func TestPostgresStoreAtomicallyClaimsNewOrExpiredCompletedKeys(t *testing.T) {
 		mock.ExpectBegin()
 		mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).
-			WithArgs(fingerprint, owner, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
+			WithArgs(fingerprint, owner, nil, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 		mock.ExpectCommit()
 
-		claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
+		claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
 		require.NoError(t, err)
 		require.True(t, claim.Claimed)
 		require.Equal(t, owner, claim.OwnerToken)
@@ -82,11 +82,11 @@ func TestPostgresStoreReplaysCompletedAndClassifiesDuplicateClaims(t *testing.T)
 			mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 			mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
 				WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
-				WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json"}).
-					AddRow(test.storedFingerprint, owner, test.state, http.StatusAccepted, responseHeaders, responseBody, reconciliation))
+				WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json", "created_at"}).
+					AddRow(test.storedFingerprint, owner, test.state, http.StatusAccepted, responseHeaders, responseBody, reconciliation, now))
 			mock.ExpectCommit()
 
-			claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
+			claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
 			if test.wantErr != nil {
 				require.ErrorIs(t, err, test.wantErr)
 			} else {
@@ -117,11 +117,11 @@ func TestPostgresStoreNeverReclaimsExpiredProcessingClaim(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
-		WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json"}).
-			AddRow(fingerprint, owner, StateProcessing, 0, []byte(`{}`), nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json", "created_at"}).
+			AddRow(fingerprint, owner, StateProcessing, 0, []byte(`{}`), nil, nil, now))
 	mock.ExpectCommit()
 
-	claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
+	claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
 	require.ErrorIs(t, err, ErrInProgress)
 	require.False(t, claim.Claimed)
 	require.NoError(t, mock.ExpectationsWereMet())

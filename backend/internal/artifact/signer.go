@@ -34,14 +34,11 @@ func NewHMACDownloadSigner(baseURL, keyRef string, resolver database.SecretResol
 	return &HMACDownloadSigner{baseURL: &copyURL, keyRef: keyRef, resolver: resolver, now: time.Now}, nil
 }
 
-func (signer *HMACDownloadSigner) Sign(ctx context.Context, value Artifact, ttl time.Duration) (string, error) {
-	if signer == nil || signer.resolver == nil || ctx == nil || value.Scope.Validate() != nil || !validArtifactID(value.ID) || ttl <= 0 {
+func (signer *HMACDownloadSigner) Sign(ctx context.Context, value Artifact, expires time.Time) (string, error) {
+	if signer == nil || signer.resolver == nil || ctx == nil || value.Scope.Validate() != nil || !validArtifactID(value.ID) || expires.IsZero() {
 		return "", ErrInvalid
 	}
-	if ttl > MaximumDownloadTTL {
-		ttl = MaximumDownloadTTL
-	}
-	expires := signer.currentTime().Add(ttl).Truncate(time.Second)
+	expires = expires.UTC().Truncate(time.Second)
 	key, err := signer.key(ctx)
 	if err != nil {
 		return "", err

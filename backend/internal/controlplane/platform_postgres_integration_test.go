@@ -108,8 +108,8 @@ type markAuditedErrorStore struct {
 	fail  bool
 }
 
-func (store *markAuditedErrorStore) Claim(ctx context.Context, key idempotency.Key, fingerprint, owner string, now, expires time.Time) (idempotency.Claim, error) {
-	return store.inner.Claim(ctx, key, fingerprint, owner, now, expires)
+func (store *markAuditedErrorStore) Claim(ctx context.Context, request idempotency.ClaimRequest) (idempotency.Claim, error) {
+	return store.inner.Claim(ctx, request)
 }
 
 func (store *markAuditedErrorStore) CommitSideEffect(ctx context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, at time.Time) (idempotency.Response, error) {

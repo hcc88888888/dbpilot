@@ -14,7 +14,7 @@ type Store interface {
 }
 
 type DownloadSigner interface {
-	Sign(context.Context, Artifact, time.Duration) (string, error)
+	Sign(context.Context, Artifact, time.Time) (string, error)
 }
 
 type Service struct {
@@ -46,31 +46,40 @@ func (service *Service) Get(ctx context.Context, scope platformscope.Scope, id s
 }
 
 func (service *Service) CreateDownload(ctx context.Context, scope platformscope.Scope, id string, ttl time.Duration) (Download, error) {
-	if service == nil || service.signer == nil || ttl <= 0 {
+	return service.CreateDownloadAt(ctx, scope, id, service.currentTime(), ttl)
+}
+
+// CreateDownloadAt makes descriptor creation deterministic for an idempotency
+// claim. A retry may use an already-expired issuedAt and still reconstruct the
+// exact original descriptor; Verify remains responsible for current expiry.
+func (service *Service) CreateDownloadAt(ctx context.Context, scope platformscope.Scope, id string, issuedAt time.Time, ttl time.Duration) (Download, error) {
+	if service == nil || service.signer == nil || issuedAt.IsZero() || ttl <= 0 {
 		return Download{}, beforeDownloadSideEffect(ErrInvalid)
 	}
 	value, err := service.Get(ctx, scope, id)
 	if err != nil {
 		return Download{}, beforeDownloadSideEffect(err)
 	}
-	now := service.currentTime()
-	if value.ExpiresAt != nil && !value.ExpiresAt.After(now) {
+	issuedAt = issuedAt.UTC()
+	if value.ExpiresAt != nil && !value.ExpiresAt.After(issuedAt) {
 		return Download{}, beforeDownloadSideEffect(ErrExpired)
 	}
 	if ttl > MaximumDownloadTTL {
 		ttl = MaximumDownloadTTL
 	}
-	if value.ExpiresAt != nil && now.Add(ttl).After(*value.ExpiresAt) {
-		ttl = value.ExpiresAt.Sub(now)
+	expiresAt := issuedAt.Add(ttl)
+	if value.ExpiresAt != nil && expiresAt.After(*value.ExpiresAt) {
+		expiresAt = value.ExpiresAt.UTC()
 	}
-	if ttl <= 0 {
+	expiresAt = expiresAt.Truncate(time.Second)
+	if !expiresAt.After(issuedAt) {
 		return Download{}, beforeDownloadSideEffect(ErrExpired)
 	}
-	signed, err := service.signer.Sign(ctx, value, ttl)
+	signed, err := service.signer.Sign(ctx, value, expiresAt)
 	if err != nil {
 		return Download{}, err
 	}
-	return Download{URL: signed, ExpiresAt: now.Add(ttl).UTC()}, nil
+	return Download{URL: signed, ExpiresAt: expiresAt}, nil
 }
 
 func beforeDownloadSideEffect(err error) error {

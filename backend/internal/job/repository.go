@@ -16,6 +16,13 @@ type Repository interface {
 	RequestCancel(context.Context, platformscope.Scope, string, string, int64, time.Time) (Job, error)
 }
 
+// CancellationSnapshotRepository is the HTTP-specific transactional boundary
+// used to repair a cancellation whose idempotency row was left processing.
+type CancellationSnapshotRepository interface {
+	RequestCancelWithSnapshot(context.Context, platformscope.Scope, string, string, int64, time.Time, CancellationSnapshotInput) (Job, error)
+	GetCancellationSnapshot(context.Context, platformscope.Scope, string, CancellationSnapshotKey) (CancellationSnapshot, error)
+}
+
 // DispatchRepository is the explicitly privileged, cross-scope persistence
 // boundary used only by the internal command dispatcher. ClaimOutbox may claim
 // work globally, but every returned message carries its immutable Scope and all

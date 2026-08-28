@@ -33,7 +33,8 @@ func TestDownloadHandlerVerifiesClaimsAndStreamsExactLocalArtifact(t *testing.T)
 	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
 	handler, err := NewDownloadHandler(service, signer, blobs)
 	require.NoError(t, err)
-	signed, err := signer.Sign(context.Background(), metadata, time.Minute)
+	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	signed, err := signer.Sign(context.Background(), metadata, now.Add(time.Minute))
 	require.NoError(t, err)
 	request := httptest.NewRequest(http.MethodGet, signed, nil)
 	response := httptest.NewRecorder()
@@ -58,13 +59,14 @@ func TestDownloadHandlerRejectsUnsafeReferenceAndIntegrityMismatchWithoutLeaking
 	}
 	for name, metadata := range tests {
 		t.Run(name, func(t *testing.T) {
+			now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
 			signer := testDownloadSigner(t, scope, metadata)
 			service := NewService(staticStore{artifact: metadata}, signer)
 			blobs := NewLocalBlobStore(root)
 			t.Cleanup(func() { require.NoError(t, blobs.Close()) })
 			handler, err := NewDownloadHandler(service, signer, blobs)
 			require.NoError(t, err)
-			signed, err := signer.Sign(context.Background(), metadata, time.Minute)
+			signed, err := signer.Sign(context.Background(), metadata, now.Add(time.Minute))
 			require.NoError(t, err)
 			response := httptest.NewRecorder()
 
