@@ -39,6 +39,8 @@ type CreateRunRequest struct {
 	ScheduledFor   *time.Time
 	OccurrenceKey  string
 	PolicySnapshot *Policy
+	pinnedItems    []Item
+	pinnedTargets  []TargetRun
 }
 
 type Service struct {
@@ -84,6 +86,7 @@ func (service *Service) RetryRun(ctx context.Context, scope platformscope.Scope,
 		RetryOfRunID: runID, Selector: TargetSelector{AgentIDs: agentIDs}, Items: items,
 		TargetTimeout: timeout, MaxConcurrency: maxConcurrency, IdempotencyKey: idempotencyKey,
 		InitiatedBy: actor, RequestID: "retry-" + idempotencyKey, Trigger: RunTriggerRetry,
+		PolicySnapshot: clonePolicy(detail.Run.PolicySnapshot), pinnedItems: cloneItems(detail.Run.ItemSnapshot), pinnedTargets: cloneTargetRuns(detail.Targets),
 	}, nil)
 }
 
@@ -128,11 +131,7 @@ func (service *Service) createRun(ctx context.Context, request CreateRunRequest,
 	if err := service.validateCreateRequest(ctx, request); err != nil {
 		return Run{}, err
 	}
-	targets, err := service.Targets.Resolve(ctx, request.Scope, request.Selector)
-	if err != nil {
-		return Run{}, err
-	}
-	items, err := service.snapshotItems(ctx, request.Scope, request.Items)
+	items, targetTemplates, err := service.snapshotRunInputs(ctx, request)
 	if err != nil {
 		return Run{}, err
 	}
@@ -149,19 +148,21 @@ func (service *Service) createRun(ctx context.Context, request CreateRunRequest,
 	if trigger == "" {
 		trigger = RunTriggerManual
 	}
-	targetRuns := make([]TargetRun, len(targets))
-	jobTargets := make([]string, len(targets))
-	messages := make([]job.OutboxMessage, len(targets))
-	for index, target := range targets {
+	targetRuns := make([]TargetRun, len(targetTemplates))
+	jobTargets := make([]string, len(targetTemplates))
+	messages := make([]job.OutboxMessage, len(targetTemplates))
+	for index, template := range targetTemplates {
 		commandID, err := service.newID()
 		if err != nil {
 			return Run{}, err
 		}
-		targetRuns[index] = TargetRun{
-			TargetID: target.AgentID, AgentID: target.AgentID, CommandID: commandID,
-			DisplayName: target.DisplayName, Host: target.Host, Labels: cloneLabels(target.Labels), Status: TargetPending,
-			AdvertisedSources: append([]SourceType(nil), target.AdvertisedSources...), Capabilities: append([]string(nil), target.Capabilities...), TrustedProcessAllowlist: target.TrustedProcessAllowlist,
-		}
+		target := cloneTargetRun(template)
+		target.CommandID = commandID
+		target.Status = TargetPending
+		target.ErrorCode = ""
+		target.ObservedAt = time.Time{}
+		target.Observations = nil
+		targetRuns[index] = target
 		jobTargets[index] = target.AgentID
 		payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(&agentv1.CommandEnvelope{
 			AgentId: target.AgentID, LeaseSeconds: 60,
@@ -198,6 +199,44 @@ func (service *Service) createRun(ctx context.Context, request CreateRunRequest,
 		return Run{}, err
 	}
 	return run, nil
+}
+
+func (service *Service) snapshotRunInputs(ctx context.Context, request CreateRunRequest) ([]Item, []TargetRun, error) {
+	if len(request.pinnedItems) > 0 || len(request.pinnedTargets) > 0 {
+		if len(request.pinnedItems) == 0 || len(request.pinnedTargets) == 0 {
+			return nil, nil, ErrInvalid
+		}
+		items := cloneItems(request.pinnedItems)
+		for _, item := range items {
+			if item.Validate() != nil || (item.Scope != (platformscope.Scope{}) && item.Scope != request.Scope) {
+				return nil, nil, ErrInvalid
+			}
+		}
+		targets := cloneTargetRuns(request.pinnedTargets)
+		for _, target := range targets {
+			if target.Validate() != nil {
+				return nil, nil, ErrInvalid
+			}
+		}
+		return items, targets, nil
+	}
+	targets, err := service.Targets.Resolve(ctx, request.Scope, request.Selector)
+	if err != nil {
+		return nil, nil, err
+	}
+	items, err := service.snapshotItems(ctx, request.Scope, request.Items)
+	if err != nil {
+		return nil, nil, err
+	}
+	templates := make([]TargetRun, len(targets))
+	for index, target := range targets {
+		templates[index] = TargetRun{
+			TargetID: target.AgentID, AgentID: target.AgentID,
+			DisplayName: target.DisplayName, Host: target.Host, Labels: cloneLabels(target.Labels), Status: TargetPending,
+			AdvertisedSources: append([]SourceType(nil), target.AdvertisedSources...), Capabilities: append([]string(nil), target.Capabilities...), TrustedProcessAllowlist: target.TrustedProcessAllowlist,
+		}
+	}
+	return items, templates, nil
 }
 
 func (service *Service) validateCreateRequest(ctx context.Context, request CreateRunRequest) error {
@@ -259,10 +298,11 @@ func (service *Service) snapshotItems(ctx context.Context, scope platformscope.S
 }
 
 func NextScheduledOccurrence(schedule Schedule, after time.Time) (time.Time, error) {
-	if len(strings.Fields(schedule.Cron)) != 5 || strings.TrimSpace(schedule.Timezone) == "" || after.IsZero() {
+	zone := strings.TrimSpace(schedule.Timezone)
+	if len(strings.Fields(schedule.Cron)) != 5 || zone == "" || strings.EqualFold(zone, "Local") || after.IsZero() {
 		return time.Time{}, ErrInvalidSchedule
 	}
-	location, err := time.LoadLocation(schedule.Timezone)
+	location, err := time.LoadLocation(zone)
 	if err != nil {
 		return time.Time{}, ErrInvalidSchedule
 	}
@@ -314,11 +354,34 @@ func clonePolicy(value *Policy) *Policy {
 	}
 	cloned := *value
 	cloned.Claim = nil
+	if value.Schedule != nil {
+		schedule := *value.Schedule
+		cloned.Schedule = &schedule
+	}
 	cloned.Items = append([]PolicyItem(nil), value.Items...)
 	cloned.Selector.AgentIDs = append([]string(nil), value.Selector.AgentIDs...)
 	cloned.Selector.Labels = cloneLabels(value.Selector.Labels)
 	cloned.NextRunAt = utcCopy(value.NextRunAt)
 	return &cloned
+}
+
+func cloneTargetRuns(values []TargetRun) []TargetRun {
+	result := make([]TargetRun, len(values))
+	for index, value := range values {
+		result[index] = cloneTargetRun(value)
+	}
+	return result
+}
+
+func cloneTargetRun(value TargetRun) TargetRun {
+	value.Labels = cloneLabels(value.Labels)
+	value.AdvertisedSources = append([]SourceType(nil), value.AdvertisedSources...)
+	value.Capabilities = append([]string(nil), value.Capabilities...)
+	value.Observations = append([]Observation(nil), value.Observations...)
+	for index := range value.Observations {
+		value.Observations[index].Labels = cloneLabels(value.Observations[index].Labels)
+	}
+	return value
 }
 
 func utcCopy(value *time.Time) *time.Time {

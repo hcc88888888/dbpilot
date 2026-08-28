@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -33,16 +34,16 @@ const selectRunSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE te
 const selectTargetRunsSQL = "SELECT target_snapshot FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id"
 const findingColumnsSQL = "id, run_id, target_id, item_id, item_version, level, observed_at, evidence, warning_threshold, critical_threshold, summary, recommendation"
 const selectFindingsSQL = "SELECT " + findingColumnsSQL + " FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id, item_id, item_version"
-const selectItemsSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, item_id DESC LIMIT $3"
-const selectItemsBeforeSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (created_at, item_id) < ($3, $4) ORDER BY created_at DESC, item_id DESC LIMIT $5"
+const selectItemsSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $3"
+const selectItemsBeforeSQL = "SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (created_at, item_id, version) < ($3, $4, $5) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $6"
 const selectPolicySQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
 const selectPoliciesSQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3"
 const selectPoliciesBeforeSQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
 const selectRunsSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3"
-const reportColumnsSQL = "tenant_id, project_id, id, run_id, policy_id, status, summary, snapshot, artifacts, generated_at"
+const reportColumnsSQL = "tenant_id, project_id, id, run_id, policy_id, status, summary, snapshot, artifacts, generated_at, created_at"
 const selectReportSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
-const selectReportsSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 ORDER BY generated_at DESC, id DESC LIMIT $3"
-const selectReportsBeforeSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND (generated_at, id) < ($3, $4) ORDER BY generated_at DESC, id DESC LIMIT $5"
+const selectReportsSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3"
+const selectReportsBeforeSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
 
 type jobCreator interface {
 	CreateInTx(context.Context, *sql.Tx, job.Job, []job.OutboxMessage) error
@@ -61,12 +62,15 @@ func (repository *PostgresRepository) ListRuns(ctx context.Context, scope platfo
 	if err := validateList(ctx, repository, scope, filter.CursorFilter); err != nil {
 		return RunPage{}, ErrInvalid
 	}
+	cursor, hasCursor, err := resolveInspectionCursor(scope, filter.CursorFilter, false)
+	if err != nil {
+		return RunPage{}, err
+	}
 	var rows *sql.Rows
-	var err error
-	if filter.Before.IsZero() {
-		rows, err = repository.database.QueryContext(ctx, selectRunsSQL, scope.TenantID, scope.ProjectID, filter.Limit)
+	if !hasCursor {
+		rows, err = repository.database.QueryContext(ctx, selectRunsSQL, scope.TenantID, scope.ProjectID, filter.Limit+1)
 	} else {
-		rows, err = repository.database.QueryContext(ctx, selectRunsBeforeSQL, scope.TenantID, scope.ProjectID, filter.Before.UTC(), filter.BeforeID, filter.Limit)
+		rows, err = repository.database.QueryContext(ctx, selectRunsBeforeSQL, scope.TenantID, scope.ProjectID, cursor.CreatedAt, cursor.ID, filter.Limit+1)
 	}
 	if err != nil {
 		return RunPage{}, fmt.Errorf("list inspection runs: %w", err)
@@ -80,7 +84,19 @@ func (repository *PostgresRepository) ListRuns(ctx context.Context, scope platfo
 		}
 		page.Items = append(page.Items, value)
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return RunPage{}, err
+	}
+	if len(page.Items) > filter.Limit {
+		page.Items = page.Items[:filter.Limit]
+		page.More = true
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor, err = encodeInspectionCursor(inspectionCursor{Scope: scope, CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return RunPage{}, err
+		}
+	}
+	return page, nil
 }
 
 func (repository *PostgresRepository) UpdatePolicy(ctx context.Context, value Policy, currentVersion int64) (Policy, error) {
@@ -165,10 +181,63 @@ func (repository *PostgresRepository) ClaimDuePolicies(ctx context.Context, now 
 }
 
 func validateList(ctx context.Context, repository *PostgresRepository, scope platformscope.Scope, filter CursorFilter) error {
-	if ctx == nil || repository == nil || repository.database == nil || scope.Validate() != nil || filter.Limit < 1 || filter.Limit > 101 || filter.Before.IsZero() != (filter.BeforeID == "") {
+	if ctx == nil || repository == nil || repository.database == nil || scope.Validate() != nil || filter.Limit < 1 || filter.Limit > 100 {
 		return ErrInvalid
 	}
 	return nil
+}
+
+type inspectionCursor struct {
+	Scope     platformscope.Scope `json:"scope"`
+	CreatedAt time.Time           `json:"created_at"`
+	ID        string              `json:"id"`
+	Version   int                 `json:"version,omitempty"`
+}
+
+func resolveInspectionCursor(scope platformscope.Scope, filter CursorFilter, versioned bool) (inspectionCursor, bool, error) {
+	if filter.Cursor != "" {
+		if !filter.Before.IsZero() || filter.BeforeID != "" || filter.BeforeVersion != 0 {
+			return inspectionCursor{}, false, ErrInvalid
+		}
+		decoded, err := decodeInspectionCursor(filter.Cursor)
+		if err != nil || decoded.Scope != scope || !isUTC(decoded.CreatedAt) || !validID(decoded.ID) || (versioned && decoded.Version < 1) || (!versioned && decoded.Version != 0) {
+			return inspectionCursor{}, false, ErrInvalid
+		}
+		return decoded, true, nil
+	}
+	if filter.Before.IsZero() {
+		if filter.BeforeID != "" || filter.BeforeVersion != 0 {
+			return inspectionCursor{}, false, ErrInvalid
+		}
+		return inspectionCursor{}, false, nil
+	}
+	if !validID(filter.BeforeID) || (versioned && filter.BeforeVersion < 1) || (!versioned && filter.BeforeVersion != 0) {
+		return inspectionCursor{}, false, ErrInvalid
+	}
+	return inspectionCursor{Scope: scope, CreatedAt: filter.Before.UTC(), ID: filter.BeforeID, Version: filter.BeforeVersion}, true, nil
+}
+
+func encodeInspectionCursor(value inspectionCursor) (string, error) {
+	if value.Scope.Validate() != nil || !isUTC(value.CreatedAt) || !validID(value.ID) || value.Version < 0 {
+		return "", ErrInvalid
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+func decodeInspectionCursor(value string) (inspectionCursor, error) {
+	encoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return inspectionCursor{}, err
+	}
+	var cursor inspectionCursor
+	if err := json.Unmarshal(encoded, &cursor); err != nil {
+		return inspectionCursor{}, err
+	}
+	return cursor, nil
 }
 
 func validatePolicy(value Policy) error {
@@ -344,21 +413,31 @@ func (repository *PostgresRepository) CreateItem(ctx context.Context, value Item
 	return nil
 }
 func (repository *PostgresRepository) ListItems(ctx context.Context, scope platformscope.Scope, filter ItemFilter) (ItemPage, error) {
-	if err := validateList(ctx, repository, scope, filter.CursorFilter); err != nil {
-		return ItemPage{}, ErrInvalid
-	}
 	var rows *sql.Rows
 	var err error
+	paginated := len(filter.Versions) == 0
 	if len(filter.Versions) > 0 {
+		if ctx == nil || repository == nil || repository.database == nil || scope.Validate() != nil {
+			return ItemPage{}, ErrInvalid
+		}
 		query, args, buildErr := itemVersionsQuery(scope, filter)
 		if buildErr != nil {
 			return ItemPage{}, buildErr
 		}
 		rows, err = repository.database.QueryContext(ctx, query, args...)
-	} else if filter.Before.IsZero() {
-		rows, err = repository.database.QueryContext(ctx, selectItemsSQL, scope.TenantID, scope.ProjectID, filter.Limit)
 	} else {
-		rows, err = repository.database.QueryContext(ctx, selectItemsBeforeSQL, scope.TenantID, scope.ProjectID, filter.Before.UTC(), filter.BeforeID, filter.Limit)
+		if err := validateList(ctx, repository, scope, filter.CursorFilter); err != nil {
+			return ItemPage{}, ErrInvalid
+		}
+		cursor, hasCursor, cursorErr := resolveInspectionCursor(scope, filter.CursorFilter, true)
+		if cursorErr != nil {
+			return ItemPage{}, cursorErr
+		}
+		if !hasCursor {
+			rows, err = repository.database.QueryContext(ctx, selectItemsSQL, scope.TenantID, scope.ProjectID, filter.Limit+1)
+		} else {
+			rows, err = repository.database.QueryContext(ctx, selectItemsBeforeSQL, scope.TenantID, scope.ProjectID, cursor.CreatedAt, cursor.ID, cursor.Version, filter.Limit+1)
+		}
 	}
 	if err != nil {
 		return ItemPage{}, fmt.Errorf("list inspection items: %w", err)
@@ -379,7 +458,19 @@ func (repository *PostgresRepository) ListItems(ctx context.Context, scope platf
 		}
 		page.Items = append(page.Items, value)
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return ItemPage{}, err
+	}
+	if paginated && len(page.Items) > filter.Limit {
+		page.Items = page.Items[:filter.Limit]
+		page.More = true
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor, err = encodeInspectionCursor(inspectionCursor{Scope: scope, CreatedAt: last.CreatedAt, ID: last.ID, Version: last.Version})
+		if err != nil {
+			return ItemPage{}, err
+		}
+	}
+	return page, nil
 }
 func (repository *PostgresRepository) CreatePolicy(ctx context.Context, value Policy) error {
 	if repository == nil || repository.database == nil || ctx == nil || validatePolicy(value) != nil {
@@ -414,12 +505,15 @@ func (repository *PostgresRepository) ListPolicies(ctx context.Context, scope pl
 	if err := validateList(ctx, repository, scope, filter.CursorFilter); err != nil {
 		return PolicyPage{}, ErrInvalid
 	}
+	cursor, hasCursor, err := resolveInspectionCursor(scope, filter.CursorFilter, false)
+	if err != nil {
+		return PolicyPage{}, err
+	}
 	var rows *sql.Rows
-	var err error
-	if filter.Before.IsZero() {
-		rows, err = repository.database.QueryContext(ctx, selectPoliciesSQL, scope.TenantID, scope.ProjectID, filter.Limit)
+	if !hasCursor {
+		rows, err = repository.database.QueryContext(ctx, selectPoliciesSQL, scope.TenantID, scope.ProjectID, filter.Limit+1)
 	} else {
-		rows, err = repository.database.QueryContext(ctx, selectPoliciesBeforeSQL, scope.TenantID, scope.ProjectID, filter.Before.UTC(), filter.BeforeID, filter.Limit)
+		rows, err = repository.database.QueryContext(ctx, selectPoliciesBeforeSQL, scope.TenantID, scope.ProjectID, cursor.CreatedAt, cursor.ID, filter.Limit+1)
 	}
 	if err != nil {
 		return PolicyPage{}, fmt.Errorf("list inspection policies: %w", err)
@@ -433,7 +527,19 @@ func (repository *PostgresRepository) ListPolicies(ctx context.Context, scope pl
 		}
 		page.Items = append(page.Items, value)
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return PolicyPage{}, err
+	}
+	if len(page.Items) > filter.Limit {
+		page.Items = page.Items[:filter.Limit]
+		page.More = true
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor, err = encodeInspectionCursor(inspectionCursor{Scope: scope, CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return PolicyPage{}, err
+		}
+	}
+	return page, nil
 }
 func (repository *PostgresRepository) GetPolicy(ctx context.Context, scope platformscope.Scope, id string) (Policy, error) {
 	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validID(id) {
@@ -584,12 +690,15 @@ func (repository *PostgresRepository) ListReports(ctx context.Context, scope pla
 	if err := validateList(ctx, repository, scope, filter.CursorFilter); err != nil {
 		return ReportPage{}, ErrInvalid
 	}
+	cursor, hasCursor, err := resolveInspectionCursor(scope, filter.CursorFilter, false)
+	if err != nil {
+		return ReportPage{}, err
+	}
 	var rows *sql.Rows
-	var err error
-	if filter.Before.IsZero() {
-		rows, err = repository.database.QueryContext(ctx, selectReportsSQL, scope.TenantID, scope.ProjectID, filter.Limit)
+	if !hasCursor {
+		rows, err = repository.database.QueryContext(ctx, selectReportsSQL, scope.TenantID, scope.ProjectID, filter.Limit+1)
 	} else {
-		rows, err = repository.database.QueryContext(ctx, selectReportsBeforeSQL, scope.TenantID, scope.ProjectID, filter.Before.UTC(), filter.BeforeID, filter.Limit)
+		rows, err = repository.database.QueryContext(ctx, selectReportsBeforeSQL, scope.TenantID, scope.ProjectID, cursor.CreatedAt, cursor.ID, filter.Limit+1)
 	}
 	if err != nil {
 		return ReportPage{}, fmt.Errorf("list inspection reports: %w", err)
@@ -603,7 +712,19 @@ func (repository *PostgresRepository) ListReports(ctx context.Context, scope pla
 		}
 		page.Items = append(page.Items, value)
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return ReportPage{}, err
+	}
+	if len(page.Items) > filter.Limit {
+		page.Items = page.Items[:filter.Limit]
+		page.More = true
+		last := page.Items[len(page.Items)-1]
+		page.NextCursor, err = encodeInspectionCursor(inspectionCursor{Scope: scope, CreatedAt: last.CreatedAt, ID: last.ID})
+		if err != nil {
+			return ReportPage{}, err
+		}
+	}
+	return page, nil
 }
 
 func validateStoredItem(value Item) error {
@@ -776,7 +897,7 @@ func (repository *PostgresRepository) getFindings(ctx context.Context, scope pla
 }
 
 func itemVersionsQuery(scope platformscope.Scope, filter ItemFilter) (string, []any, error) {
-	if len(filter.Versions) > maxSnapshotItems || !filter.Before.IsZero() {
+	if len(filter.Versions) == 0 || len(filter.Versions) > maxSnapshotItems || filter.Limit < 1 || filter.Limit > maxSnapshotItems+1 || filter.Cursor != "" || !filter.Before.IsZero() || filter.BeforeID != "" || filter.BeforeVersion != 0 {
 		return "", nil, ErrInvalid
 	}
 	clauses := make([]string, len(filter.Versions))
@@ -796,7 +917,7 @@ func itemVersionsQuery(scope platformscope.Scope, filter ItemFilter) (string, []
 		args = append(args, item.ItemID, item.Version)
 	}
 	args = append(args, filter.Limit)
-	query := fmt.Sprintf("SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (%s) ORDER BY created_at DESC, item_id DESC LIMIT $%d", strings.Join(clauses, " OR "), len(args))
+	query := fmt.Sprintf("SELECT snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND (%s) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $%d", strings.Join(clauses, " OR "), len(args))
 	return query, args, nil
 }
 
@@ -806,7 +927,7 @@ func scanReport(scanner interface{ Scan(...any) error }) (ReportSnapshot, error)
 	var artifacts []byte
 	if err := scanner.Scan(
 		&value.Scope.TenantID, &value.Scope.ProjectID, &value.ID, &value.RunID, &policyID,
-		&value.Status, &value.Summary, &value.Snapshot, &artifacts, &value.GeneratedAt,
+		&value.Status, &value.Summary, &value.Snapshot, &artifacts, &value.GeneratedAt, &value.CreatedAt,
 	); err != nil {
 		return ReportSnapshot{}, err
 	}
@@ -816,5 +937,6 @@ func scanReport(scanner interface{ Scan(...any) error }) (ReportSnapshot, error)
 		return ReportSnapshot{}, fmt.Errorf("decode inspection report artifacts: %w", err)
 	}
 	value.GeneratedAt = value.GeneratedAt.UTC()
+	value.CreatedAt = value.CreatedAt.UTC()
 	return value, nil
 }

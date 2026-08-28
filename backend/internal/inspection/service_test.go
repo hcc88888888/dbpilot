@@ -55,6 +55,9 @@ func TestScheduleParserRejectsDescriptorsSecondsAndImplicitOrInvalidZones(t *tes
 		{Cron: "0 0 2 * * *", Timezone: "UTC"},
 		{Cron: "0 2 * * *", Timezone: ""},
 		{Cron: "0 2 * * *", Timezone: "Mars/Olympus"},
+		{Cron: "0 2 * * *", Timezone: "Local"},
+		{Cron: "0 2 * * *", Timezone: "local"},
+		{Cron: "0 2 * * *", Timezone: "LOCAL"},
 	} {
 		_, err := NextScheduledOccurrence(schedule, time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC))
 		require.ErrorIs(t, err, ErrInvalidSchedule)
@@ -62,6 +65,11 @@ func TestScheduleParserRejectsDescriptorsSecondsAndImplicitOrInvalidZones(t *tes
 	next, err := NextScheduledOccurrence(Schedule{Cron: "0 2 * * *", Timezone: "Asia/Shanghai"}, time.Date(2026, 8, 28, 0, 30, 0, 0, time.UTC))
 	require.NoError(t, err)
 	require.Equal(t, time.Date(2026, 8, 28, 18, 0, 0, 0, time.UTC), next)
+	for _, zone := range []string{"UTC", "Asia/Shanghai", "Etc/GMT+5"} {
+		next, err := NextScheduledOccurrence(Schedule{Cron: "0 2 * * *", Timezone: zone}, time.Date(2026, 8, 28, 0, 30, 0, 0, time.UTC))
+		require.NoError(t, err, zone)
+		require.Equal(t, time.UTC, next.Location(), zone)
+	}
 }
 
 func TestRetryRunRequiresFailedOrPartialAndCreatesFreshIdentity(t *testing.T) {
@@ -84,6 +92,47 @@ func TestRetryRunRequiresFailedOrPartialAndCreatesFreshIdentity(t *testing.T) {
 	fixture.repository.detail.Run.Status = RunCompleted
 	_, err = fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "another-key", "operator-2")
 	require.ErrorIs(t, err, ErrRunNotRetryable)
+}
+
+func TestRetryRunDeepClonesOriginalScheduledPolicyItemAndTargetSnapshots(t *testing.T) {
+	// Break caught: reconstructing a retry from the current Policy, item store,
+	// or configured inventory changes the historical operation being retried.
+	fixture := newServiceFixture(t)
+	policy := policyFixture()
+	policy.Scope = fixture.scope
+	policy.Name = "original scheduled policy"
+	item := builtinItem("host.cpu.utilization")
+	item.Scope, item.Enabled, item.CreatedAt, item.UpdatedAt = fixture.scope, true, fixture.now, fixture.now
+	target := TargetRun{
+		TargetID: "agent-a", AgentID: "agent-a", CommandID: "command-old", Status: TargetFailed,
+		DisplayName: "Original Agent", Host: "original.example", Labels: map[string]string{"environment": "original"},
+		Capabilities: []string{"host.metrics"}, AdvertisedSources: []SourceType{SourceMetric},
+	}
+	fixture.repository.detail = RunDetail{Run: Run{
+		Scope: fixture.scope, ID: "run-old", PolicyID: policy.ID, PolicyVersion: policy.Version,
+		JobID: "job-old", Status: RunPartial, Trigger: RunTriggerScheduled,
+		PolicySnapshot: &policy, ItemSnapshot: []Item{item}, TargetCount: 1, CreatedAt: fixture.now,
+	}, Targets: []TargetRun{target}}
+
+	run, err := fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "retry-snapshot-key", "operator-2")
+	require.NoError(t, err)
+	require.Equal(t, RunTriggerRetry, run.Trigger)
+	require.Equal(t, "run-old", run.RetryOfRunID)
+	require.NotEqual(t, "job-old", run.JobID)
+	require.NotEqual(t, "command-old", fixture.repository.targets[0].CommandID)
+	require.NotNil(t, run.PolicySnapshot)
+	require.Equal(t, "original scheduled policy", run.PolicySnapshot.Name)
+	require.Equal(t, fixture.scope, run.ItemSnapshot[0].Scope)
+	require.True(t, run.ItemSnapshot[0].Enabled)
+	require.Equal(t, "original.example", fixture.repository.targets[0].Host)
+	require.Equal(t, "original", fixture.repository.targets[0].Labels["environment"])
+
+	fixture.repository.detail.Run.PolicySnapshot.Name = "later policy"
+	fixture.repository.detail.Run.ItemSnapshot[0].MetricRule.WarningThreshold = 1
+	fixture.repository.detail.Targets[0].Labels["environment"] = "later"
+	require.Equal(t, "original scheduled policy", fixture.repository.run.PolicySnapshot.Name)
+	require.Equal(t, float64(80), fixture.repository.run.ItemSnapshot[0].MetricRule.WarningThreshold)
+	require.Equal(t, "original", fixture.repository.targets[0].Labels["environment"])
 }
 
 func TestScheduleDueUsesClaimAwareCreationAndAdvancesFromClaimedOccurrence(t *testing.T) {

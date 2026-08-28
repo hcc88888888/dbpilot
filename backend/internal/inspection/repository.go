@@ -107,12 +107,15 @@ type ReportSnapshot struct {
 	Snapshot    []byte                  `json:"snapshot"`
 	Artifacts   []job.ArtifactReference `json:"artifacts"`
 	GeneratedAt time.Time               `json:"generated_at"`
+	CreatedAt   time.Time               `json:"-"`
 }
 
 type CursorFilter struct {
-	Before   time.Time
-	BeforeID string
-	Limit    int
+	Cursor        string
+	Before        time.Time
+	BeforeID      string
+	BeforeVersion int
+	Limit         int
 }
 
 type ItemFilter struct {
@@ -124,23 +127,27 @@ type RunFilter struct{ CursorFilter }
 type ReportFilter struct{ CursorFilter }
 
 type ItemPage struct {
-	Items []Item
-	More  bool
+	Items      []Item
+	More       bool
+	NextCursor string
 }
 
 type PolicyPage struct {
-	Items []Policy
-	More  bool
+	Items      []Policy
+	More       bool
+	NextCursor string
 }
 
 type RunPage struct {
-	Items []Run
-	More  bool
+	Items      []Run
+	More       bool
+	NextCursor string
 }
 
 type ReportPage struct {
-	Items []ReportSnapshot
-	More  bool
+	Items      []ReportSnapshot
+	More       bool
+	NextCursor string
 }
 
 type RunDetail struct {

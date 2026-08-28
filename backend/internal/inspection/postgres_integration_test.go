@@ -164,6 +164,43 @@ func TestInspectionReportRowsAreImmutableInPostgres(t *testing.T) {
 	require.ErrorContains(t, err, "immutable")
 }
 
+func TestPostgresIntegrationHistoricalRowsRejectMutationWhileLifecycleUpdatesRemainPossible(t *testing.T) {
+	// Break caught: direct SQL must not rewrite item/finding decisions or Run
+	// identity/snapshots, but workers still need to advance Run/Target status.
+	ctx, database, repository, _ := openInspectionIntegration(t, "history-guards")
+	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-history", ProjectID: "project-history"}
+	item := seedInspectionItem(t, ctx, repository, scope, now)
+	run, targets, value, messages := liveRunFixture("history", scope, now)
+	require.NoError(t, repository.CreateRunWithJob(ctx, run, targets, value, messages))
+
+	_, err := database.ExecContext(ctx, "UPDATE inspection_target_runs SET status = 'collecting' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4", scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "UPDATE inspection_runs SET status = 'collecting', started_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = $4", now.Add(time.Second), scope.TenantID, scope.ProjectID, run.ID)
+	require.NoError(t, err)
+	var targetStatus, runStatus string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT status FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4", scope.TenantID, scope.ProjectID, run.ID, targets[0].TargetID).Scan(&targetStatus))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT status FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&runStatus))
+	require.Equal(t, []string{"collecting", "collecting"}, []string{targetStatus, runStatus})
+
+	_, err = database.ExecContext(ctx, "UPDATE inspection_items SET enabled = FALSE WHERE tenant_id = $1 AND project_id = $2 AND item_id = $3 AND version = $4", scope.TenantID, scope.ProjectID, item.ID, item.Version)
+	require.ErrorContains(t, err, "immutable")
+	_, err = database.ExecContext(ctx, "DELETE FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 AND item_id = $3 AND version = $4", scope.TenantID, scope.ProjectID, item.ID, item.Version)
+	require.ErrorContains(t, err, "immutable")
+
+	_, err = database.ExecContext(ctx, "INSERT INTO inspection_findings (tenant_id, project_id, id, run_id, target_id, item_id, item_version, level, observed_at, evidence) VALUES ($1, $2, $3, $4, $5, $6, $7, 'healthy', $8, '{}'::jsonb)", scope.TenantID, scope.ProjectID, "finding-history", run.ID, targets[0].TargetID, item.ID, item.Version, now)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "UPDATE inspection_findings SET level = 'critical' WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, "finding-history")
+	require.ErrorContains(t, err, "immutable")
+	_, err = database.ExecContext(ctx, "DELETE FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, "finding-history")
+	require.ErrorContains(t, err, "immutable")
+
+	_, err = database.ExecContext(ctx, "UPDATE inspection_runs SET item_snapshot = '[]'::jsonb WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID)
+	require.ErrorContains(t, err, "immutable")
+	_, err = database.ExecContext(ctx, "UPDATE inspection_runs SET policy_snapshot = '{}'::jsonb WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID)
+	require.ErrorContains(t, err, "immutable")
+}
+
 func TestPostgresIntegrationRepositoryReadsStayInExactScope(t *testing.T) {
 	// Break caught: a parent-scoped API backed by an unscoped item, policy, run,
 	// or report query can disclose another project's inspection history.
@@ -262,6 +299,132 @@ func TestPostgresIntegrationServiceCreatesOneRunTargetJobAndUnsignedOutbox(t *te
 	}, envelope))
 }
 
+func TestPostgresIntegrationRetryRunPreservesOriginalScheduledSnapshots(t *testing.T) {
+	// Break caught: a retry issued after policy/inventory changes must repeat the
+	// original pinned operation, not silently adopt the latest configuration.
+	ctx, database, repository, _ := openInspectionIntegration(t, "retry-snapshot")
+	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-retry", ProjectID: "project-retry"}
+	seedInspectionItem(t, ctx, repository, scope, now)
+	policy := livePolicyFixture("policy-retry", scope, now.Add(-time.Minute), now)
+	policy.Name = "original scheduled policy"
+	require.NoError(t, repository.CreatePolicy(ctx, policy))
+	originalResolver, err := NewConfiguredTargetResolver([]HostTarget{{
+		Scope: scope, AgentID: "agent-1", DisplayName: "Original Agent", Host: "original.example",
+		Labels: map[string]string{"environment": "original"}, Capabilities: []string{"host.metrics"}, AdvertisedSources: []SourceType{SourceMetric},
+	}})
+	require.NoError(t, err)
+	originalIDs := []string{"run-original", "job-original", "command-original"}
+	originalService := &Service{
+		Repository: repository, Targets: originalResolver, Now: func() time.Time { return now },
+		NewID:      func() (string, error) { id := originalIDs[0]; originalIDs = originalIDs[1:]; return id, nil },
+		ClaimLimit: 1, ClaimLease: time.Minute,
+	}
+	count, err := originalService.ScheduleDue(ctx, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+	original, err := repository.GetRun(ctx, scope, "run-original")
+	require.NoError(t, err)
+	require.NotNil(t, original.Run.PolicySnapshot)
+	require.Equal(t, "original scheduled policy", original.Run.PolicySnapshot.Name)
+
+	current, err := repository.GetPolicy(ctx, scope, policy.ID)
+	require.NoError(t, err)
+	current.Name = "later policy"
+	current.UpdatedAt = now.Add(time.Second)
+	_, err = repository.UpdatePolicy(ctx, current, current.Version)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, "UPDATE inspection_runs SET status = 'failed', finished_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = $4", now.Add(time.Minute), scope.TenantID, scope.ProjectID, original.Run.ID)
+	require.NoError(t, err)
+
+	changedResolver, err := NewConfiguredTargetResolver([]HostTarget{{
+		Scope: scope, AgentID: "agent-1", DisplayName: "Changed Agent", Host: "changed.example",
+		Labels: map[string]string{"environment": "changed"}, Capabilities: []string{"changed.capability"}, AdvertisedSources: []SourceType{SourceMetadata},
+	}})
+	require.NoError(t, err)
+	retryIDs := []string{"run-retry", "job-retry", "command-retry"}
+	retryService := &Service{
+		Repository: repository, Targets: changedResolver, Now: func() time.Time { return now.Add(2 * time.Minute) },
+		NewID: func() (string, error) { id := retryIDs[0]; retryIDs = retryIDs[1:]; return id, nil },
+	}
+	retry, err := retryService.RetryRun(ctx, scope, original.Run.ID, "retry-snapshot-key", "operator-2")
+	require.NoError(t, err)
+	require.Equal(t, "run-original", retry.RetryOfRunID)
+	require.NotEqual(t, original.Run.JobID, retry.JobID)
+	require.NotNil(t, retry.PolicySnapshot)
+	require.Equal(t, "original scheduled policy", retry.PolicySnapshot.Name)
+	retryDetail, err := repository.GetRun(ctx, scope, retry.ID)
+	require.NoError(t, err)
+	require.Equal(t, original.Run.ItemSnapshot, retryDetail.Run.ItemSnapshot)
+	require.NotEqual(t, original.Targets[0].CommandID, retryDetail.Targets[0].CommandID)
+	require.Equal(t, "original.example", retryDetail.Targets[0].Host)
+	require.Equal(t, "original", retryDetail.Targets[0].Labels["environment"])
+}
+
+func TestPostgresIntegrationPaginationUsesLimitPlusOneAndUniqueDescendingCursors(t *testing.T) {
+	// Break caught: equal timestamps and multiple versions must cross page
+	// boundaries without duplication, omission, or a false More flag.
+	ctx, database, repository, _ := openInspectionIntegration(t, "pagination")
+	now := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-pagination", ProjectID: "project-pagination"}
+	for version := 1; version <= 3; version++ {
+		require.NoError(t, repository.CreateItem(ctx, paginationItemFixture(scope, version, now)))
+	}
+	itemFirst, err := repository.ListItems(ctx, scope, ItemFilter{CursorFilter: CursorFilter{Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []int{3, 2}, []int{itemFirst.Items[0].Version, itemFirst.Items[1].Version})
+	require.True(t, itemFirst.More)
+	require.NotEmpty(t, itemFirst.NextCursor)
+	itemSecond, err := repository.ListItems(ctx, scope, ItemFilter{CursorFilter: CursorFilter{Cursor: itemFirst.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []int{1}, []int{itemSecond.Items[0].Version})
+	require.False(t, itemSecond.More)
+	require.Empty(t, itemSecond.NextCursor)
+
+	for _, id := range []string{"policy-c", "policy-b", "policy-a"} {
+		policy := livePolicyFixture(id, scope, now.Add(time.Hour), now)
+		policy.Items = []PolicyItem{{ItemID: "custom.pagination.utilization", Version: 1}}
+		require.NoError(t, repository.CreatePolicy(ctx, policy))
+	}
+	policyFirst, err := repository.ListPolicies(ctx, scope, PolicyFilter{CursorFilter: CursorFilter{Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"policy-c", "policy-b"}, []string{policyFirst.Items[0].ID, policyFirst.Items[1].ID})
+	require.True(t, policyFirst.More)
+	policySecond, err := repository.ListPolicies(ctx, scope, PolicyFilter{CursorFilter: CursorFilter{Cursor: policyFirst.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"policy-a"}, []string{policySecond.Items[0].ID})
+	require.False(t, policySecond.More)
+
+	runsByID := make(map[string]Run)
+	for _, suffix := range []string{"page-c", "page-b", "page-a"} {
+		run, targets, value, messages := liveRunFixture(suffix, scope, now)
+		require.NoError(t, repository.CreateRunWithJob(ctx, run, targets, value, messages))
+		runsByID[run.ID] = run
+	}
+	runFirst, err := repository.ListRuns(ctx, scope, RunFilter{CursorFilter: CursorFilter{Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"run-page-c", "run-page-b"}, []string{runFirst.Items[0].ID, runFirst.Items[1].ID})
+	require.True(t, runFirst.More)
+	runSecond, err := repository.ListRuns(ctx, scope, RunFilter{CursorFilter: CursorFilter{Cursor: runFirst.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"run-page-a"}, []string{runSecond.Items[0].ID})
+	require.False(t, runSecond.More)
+
+	for _, suffix := range []string{"c", "b", "a"} {
+		run := runsByID["run-page-"+suffix]
+		_, err := database.ExecContext(ctx, "INSERT INTO inspection_reports (tenant_id, project_id, id, run_id, status, summary, snapshot, artifacts, generated_at) VALUES ($1, $2, $3, $4, 'completed', 'stable', '{}'::jsonb, '[]'::jsonb, $5)", scope.TenantID, scope.ProjectID, "report-"+suffix, run.ID, now)
+		require.NoError(t, err)
+	}
+	reportFirst, err := repository.ListReports(ctx, scope, ReportFilter{CursorFilter: CursorFilter{Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"report-c", "report-b"}, []string{reportFirst.Items[0].ID, reportFirst.Items[1].ID})
+	require.True(t, reportFirst.More)
+	reportSecond, err := repository.ListReports(ctx, scope, ReportFilter{CursorFilter: CursorFilter{Cursor: reportFirst.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"report-a"}, []string{reportSecond.Items[0].ID})
+	require.False(t, reportSecond.More)
+}
+
 func openInspectionIntegration(t *testing.T, suffix string) (context.Context, *sql.DB, *PostgresRepository, *job.PostgresRepository) {
 	t.Helper()
 	if os.Getenv("DBPILOT_CONTRACT_E2E") != "1" {
@@ -319,6 +482,15 @@ func livePolicyFixture(id string, scope platformscope.Scope, occurrence, now tim
 		Schedule: &Schedule{Cron: "* * * * *", Timezone: "UTC"}, NextRunAt: &occurrence,
 		Items: []PolicyItem{{ItemID: "host.cpu.utilization", Version: 1}}, Selector: TargetSelector{AgentIDs: []string{"agent-1"}},
 		TargetTimeout: time.Minute, MaxConcurrency: 1, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func paginationItemFixture(scope platformscope.Scope, version int, now time.Time) Item {
+	return Item{
+		Scope: scope, ID: "custom.pagination.utilization", Version: version, Name: "Pagination item", Category: "host",
+		ScopeType: ScopeHost, SourceType: SourceMetric, Enabled: true,
+		MetricRule:       &MetricRule{MetricName: "system.pagination.utilization", Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: AggregationLatest, Operator: OperatorGTE, WarningThreshold: 80, CriticalThreshold: 90},
+		EvidenceSelector: []string{"value"}, CreatedAt: now, UpdatedAt: now,
 	}
 }
 

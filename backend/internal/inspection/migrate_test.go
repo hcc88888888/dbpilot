@@ -47,7 +47,50 @@ func TestMigrationAppliesThroughSharedRegistryExactlyOnce(t *testing.T) {
 	mock.ExpectExec("(?s)CREATE TABLE inspection_items.*CREATE TABLE inspection_reports").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0001_host_inspection.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0002_history_guards.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE OR REPLACE FUNCTION reject_inspection_history_mutation.*inspection_items_immutable.*inspection_findings_immutable.*inspection_runs_immutable_fields").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0002_history_guards.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0003_pagination_keys.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE INDEX inspection_items_pagination_v2_idx.*ALTER TABLE inspection_reports.*created_at.*CREATE INDEX inspection_reports_pagination_v2_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0003_pagination_keys.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMigrationAddsHistoricalMutationGuardsWithoutBlockingLifecycleColumns(t *testing.T) {
+	// Break caught: application-level conventions alone cannot prevent direct
+	// SQL from rewriting item/finding history or immutable Run snapshots.
+	content, err := migrationFiles.ReadFile("migrations/0002_history_guards.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{
+		"inspection_items_immutable",
+		"inspection_findings_immutable",
+		"inspection_runs_immutable_fields",
+		"OLD.policy_snapshot IS DISTINCT FROM NEW.policy_snapshot",
+		"OLD.item_snapshot IS DISTINCT FROM NEW.item_snapshot",
+	} {
+		require.Contains(t, schema, required)
+	}
+	for _, mutable := range []string{"NEW.status", "NEW.completed_target_count", "NEW.failed_target_count", "NEW.report_id", "NEW.started_at", "NEW.finished_at"} {
+		require.NotContains(t, schema, mutable, "lifecycle column must not be part of the immutable-field comparison")
+	}
+}
+
+func TestMigrationAddsUniqueItemAndReportPaginationKeys(t *testing.T) {
+	// Break caught: a non-unique item cursor or report ordering without a
+	// persisted created_at key can skip equal-time rows across pages.
+	content, err := migrationFiles.ReadFile("migrations/0003_pagination_keys.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	require.Contains(t, schema, "inspection_items (tenant_id, project_id, created_at DESC, item_id DESC, version DESC)")
+	require.Contains(t, schema, "created_at TIMESTAMPTZ GENERATED ALWAYS AS (generated_at) STORED")
+	require.Contains(t, schema, "inspection_reports (tenant_id, project_id, created_at DESC, id DESC)")
 }

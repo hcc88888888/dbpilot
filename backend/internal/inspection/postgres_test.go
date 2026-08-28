@@ -22,14 +22,65 @@ func TestPostgresListRunsUsesExactScopeAndDescendingTupleCursor(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
-	before := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
-	mock.ExpectQuery("SELECT .* FROM inspection_runs WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, id\\) < \\(\\$3, \\$4\\) ORDER BY created_at DESC, id DESC LIMIT \\$5").
-		WithArgs(scope.TenantID, scope.ProjectID, before, "run-9", 11).
-		WillReturnRows(sqlmock.NewRows(runColumnNames()))
+	created := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	first, _, _, _ := runPersistenceFixture()
+	first.ID, first.JobID, first.IdempotencyKey, first.CreatedAt = "run-c", "job-c", "key-c", created
+	second := first
+	second.ID, second.JobID, second.IdempotencyKey = "run-b", "job-b", "key-b"
+	third := first
+	third.ID, third.JobID, third.IdempotencyKey = "run-a", "job-a", "key-a"
+	mock.ExpectQuery("SELECT .* FROM inspection_runs WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at DESC, id DESC LIMIT \\$3").
+		WithArgs(scope.TenantID, scope.ProjectID, 3).
+		WillReturnRows(runRows(first, second, third))
 
-	page, err := NewPostgresRepository(database, nil).ListRuns(context.Background(), scope, RunFilter{Before: before, BeforeID: "run-9", Limit: 11})
+	repository := NewPostgresRepository(database, nil)
+	page, err := repository.ListRuns(context.Background(), scope, RunFilter{CursorFilter: CursorFilter{Limit: 2}})
 	require.NoError(t, err)
-	require.Empty(t, page.Items)
+	require.Equal(t, []string{"run-c", "run-b"}, []string{page.Items[0].ID, page.Items[1].ID})
+	require.True(t, page.More)
+	require.NotEmpty(t, page.NextCursor)
+	mock.ExpectQuery("SELECT .* FROM inspection_runs WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, id\\) < \\(\\$3, \\$4\\) ORDER BY created_at DESC, id DESC LIMIT \\$5").
+		WithArgs(scope.TenantID, scope.ProjectID, created, "run-b", 3).
+		WillReturnRows(sqlmock.NewRows(runColumnNames()))
+	next, err := repository.ListRuns(context.Background(), scope, RunFilter{CursorFilter: CursorFilter{Cursor: page.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.False(t, next.More)
+	require.Empty(t, next.NextCursor)
+	_, err = repository.ListRuns(context.Background(), platformscope.Scope{TenantID: scope.TenantID, ProjectID: "project-other"}, RunFilter{CursorFilter: CursorFilter{Cursor: page.NextCursor, Limit: 2}})
+	require.ErrorIs(t, err, ErrInvalid)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresListItemsUsesVersionedTupleCursorWithoutSkippingEqualTimestamps(t *testing.T) {
+	// Break caught: a cursor without item version repeats or skips rows when
+	// multiple versions share the same item ID and creation timestamp.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	created := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	items := make([]Item, 3)
+	for index, version := range []int{3, 2, 1} {
+		items[index] = builtinItem("host.cpu.utilization")
+		items[index].Scope, items[index].Version, items[index].CreatedAt = scope, version, created
+	}
+	mock.ExpectQuery("SELECT snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$3").
+		WithArgs(scope.TenantID, scope.ProjectID, 3).
+		WillReturnRows(itemSnapshotRows(items...))
+	repository := NewPostgresRepository(database, nil)
+	page, err := repository.ListItems(context.Background(), scope, ItemFilter{CursorFilter: CursorFilter{Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []int{3, 2}, []int{page.Items[0].Version, page.Items[1].Version})
+	require.True(t, page.More)
+	require.NotEmpty(t, page.NextCursor)
+	mock.ExpectQuery("SELECT snapshot FROM inspection_items WHERE tenant_id = \\$1 AND project_id = \\$2 AND \\(created_at, item_id, version\\) < \\(\\$3, \\$4, \\$5\\) ORDER BY created_at DESC, item_id DESC, version DESC LIMIT \\$6").
+		WithArgs(scope.TenantID, scope.ProjectID, created, items[1].ID, 2, 3).
+		WillReturnRows(itemSnapshotRows(items[2]))
+	next, err := repository.ListItems(context.Background(), scope, ItemFilter{CursorFilter: CursorFilter{Cursor: page.NextCursor, Limit: 2}})
+	require.NoError(t, err)
+	require.Equal(t, []int{1}, []int{next.Items[0].Version})
+	require.False(t, next.More)
+	require.Empty(t, next.NextCursor)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -288,15 +339,28 @@ func runPersistenceFixture() (Run, []TargetRun, job.Job, []job.OutboxMessage) {
 	return run, targets, value, messages
 }
 
-func runRows(value Run) *sqlmock.Rows {
-	policySnapshot, _ := json.Marshal(value.PolicySnapshot)
-	itemSnapshot, _ := json.Marshal(value.ItemSnapshot)
-	return sqlmock.NewRows(runColumnNames()).AddRow(
-		value.Scope.TenantID, value.Scope.ProjectID, value.ID, nullableString(value.PolicyID), nullableInt64(value.PolicyVersion), nullableString(value.RetryOfRunID), value.JobID,
-		value.Status, value.Trigger, nullableString(value.OccurrenceKey), nullableTimeValue(value.ScheduledFor), policySnapshot, itemSnapshot,
-		value.TargetCount, value.CompletedTargetCount, value.FailedTargetCount, nullableString(value.ReportID), value.AuditCorrelation, nullableString(value.IdempotencyKey),
-		value.InitiatedBy, value.RequestID, value.TraceID, nullableTimeValue(value.StartedAt), nullableTimeValue(value.FinishedAt), value.CreatedAt,
-	)
+func runRows(values ...Run) *sqlmock.Rows {
+	rows := sqlmock.NewRows(runColumnNames())
+	for _, value := range values {
+		policySnapshot, _ := json.Marshal(value.PolicySnapshot)
+		itemSnapshot, _ := json.Marshal(value.ItemSnapshot)
+		rows.AddRow(
+			value.Scope.TenantID, value.Scope.ProjectID, value.ID, nullableString(value.PolicyID), nullableInt64(value.PolicyVersion), nullableString(value.RetryOfRunID), value.JobID,
+			value.Status, value.Trigger, nullableString(value.OccurrenceKey), nullableTimeValue(value.ScheduledFor), policySnapshot, itemSnapshot,
+			value.TargetCount, value.CompletedTargetCount, value.FailedTargetCount, nullableString(value.ReportID), value.AuditCorrelation, nullableString(value.IdempotencyKey),
+			value.InitiatedBy, value.RequestID, value.TraceID, nullableTimeValue(value.StartedAt), nullableTimeValue(value.FinishedAt), value.CreatedAt,
+		)
+	}
+	return rows
+}
+
+func itemSnapshotRows(values ...Item) *sqlmock.Rows {
+	rows := sqlmock.NewRows([]string{"snapshot"})
+	for _, value := range values {
+		snapshot, _ := json.Marshal(value)
+		rows.AddRow(snapshot)
+	}
+	return rows
 }
 
 func nullableString(value string) any {
