@@ -69,6 +69,8 @@ components:
       $ref: ./common/inspection.yaml#/InspectionScopeType
     InspectionSourceType:
       $ref: ./common/inspection.yaml#/InspectionSourceType
+    CustomInspectionItemSourceType:
+      $ref: ./common/inspection.yaml#/CustomInspectionItemSourceType
     InspectionMetricWindow:
       $ref: ./common/inspection.yaml#/InspectionMetricWindow
     InspectionMetricAggregation:

@@ -12,6 +12,7 @@ models/CapabilitySet.ts
 models/CreateInspectionItemRequest.ts
 models/CreateInspectionPolicyRequest.ts
 models/CreateInspectionRunRequest.ts
+models/CustomInspectionItemSourceType.ts
 models/DownloadDescriptor.ts
 models/FieldError.ts
 models/InspectionConnectivity.ts

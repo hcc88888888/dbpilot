@@ -12,7 +12,7 @@
 import type { InspectionEvidenceSelector } from './InspectionEvidenceSelector.js';
 import type { InspectionMetricRule } from './InspectionMetricRule.js';
 import type { InspectionScopeType } from './InspectionScopeType.js';
-import type { InspectionSourceType } from './InspectionSourceType.js';
+import type { CustomInspectionItemSourceType } from './CustomInspectionItemSourceType.js';
 /**
  *
  * @export
@@ -46,10 +46,10 @@ export interface CreateInspectionItemRequest {
     scopeType: InspectionScopeType;
     /**
      *
-     * @type {InspectionSourceType}
+     * @type {CustomInspectionItemSourceType}
      * @memberof CreateInspectionItemRequest
      */
-    sourceType: InspectionSourceType;
+    sourceType: CustomInspectionItemSourceType;
     /**
      *
      * @type {Array<string>}
@@ -61,13 +61,13 @@ export interface CreateInspectionItemRequest {
      * @type {InspectionMetricRule}
      * @memberof CreateInspectionItemRequest
      */
-    metricRule?: InspectionMetricRule;
+    metricRule: InspectionMetricRule;
     /**
      *
      * @type {InspectionEvidenceSelector}
      * @memberof CreateInspectionItemRequest
      */
-    evidenceSelector?: InspectionEvidenceSelector;
+    evidenceSelector: InspectionEvidenceSelector;
     /**
      *
      * @type {string}

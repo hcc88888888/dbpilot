@@ -14,7 +14,7 @@
 import { InspectionEvidenceSelectorFromJSON, InspectionEvidenceSelectorToJSON, } from './InspectionEvidenceSelector.js';
 import { InspectionMetricRuleFromJSON, InspectionMetricRuleToJSON, } from './InspectionMetricRule.js';
 import { InspectionScopeTypeFromJSON, InspectionScopeTypeToJSON, } from './InspectionScopeType.js';
-import { InspectionSourceTypeFromJSON, InspectionSourceTypeToJSON, } from './InspectionSourceType.js';
+import { CustomInspectionItemSourceTypeFromJSON, CustomInspectionItemSourceTypeToJSON, } from './CustomInspectionItemSourceType.js';
 /**
  * Check if a given object implements the CreateInspectionItemRequest interface.
  */
@@ -28,6 +28,10 @@ export function instanceOfCreateInspectionItemRequest(value) {
     if (!('scopeType' in value) || value['scopeType'] === undefined)
         return false;
     if (!('sourceType' in value) || value['sourceType'] === undefined)
+        return false;
+    if (!('metricRule' in value) || value['metricRule'] === undefined)
+        return false;
+    if (!('evidenceSelector' in value) || value['evidenceSelector'] === undefined)
         return false;
     if (!('recommendationTemplate' in value) || value['recommendationTemplate'] === undefined)
         return false;
@@ -46,10 +50,10 @@ export function CreateInspectionItemRequestFromJSONTyped(json, ignoreDiscriminat
         'description': json['description'],
         'category': json['category'],
         'scopeType': InspectionScopeTypeFromJSON(json['scope_type']),
-        'sourceType': InspectionSourceTypeFromJSON(json['source_type']),
+        'sourceType': CustomInspectionItemSourceTypeFromJSON(json['source_type']),
         'requiredCapabilities': json['required_capabilities'] == null ? undefined : json['required_capabilities'],
-        'metricRule': json['metric_rule'] == null ? undefined : InspectionMetricRuleFromJSON(json['metric_rule']),
-        'evidenceSelector': json['evidence_selector'] == null ? undefined : InspectionEvidenceSelectorFromJSON(json['evidence_selector']),
+        'metricRule': InspectionMetricRuleFromJSON(json['metric_rule']),
+        'evidenceSelector': InspectionEvidenceSelectorFromJSON(json['evidence_selector']),
         'recommendationTemplate': json['recommendation_template'],
         'documentationUrl': json['documentation_url'] == null ? undefined : json['documentation_url'],
     };
@@ -67,7 +71,7 @@ export function CreateInspectionItemRequestToJSONTyped(value, ignoreDiscriminato
         'description': value['description'],
         'category': value['category'],
         'scope_type': InspectionScopeTypeToJSON(value['scopeType']),
-        'source_type': InspectionSourceTypeToJSON(value['sourceType']),
+        'source_type': CustomInspectionItemSourceTypeToJSON(value['sourceType']),
         'required_capabilities': value['requiredCapabilities'],
         'metric_rule': InspectionMetricRuleToJSON(value['metricRule']),
         'evidence_selector': InspectionEvidenceSelectorToJSON(value['evidenceSelector']),

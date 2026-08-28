@@ -8,6 +8,7 @@ export * from './CapabilitySet.js';
 export * from './CreateInspectionItemRequest.js';
 export * from './CreateInspectionPolicyRequest.js';
 export * from './CreateInspectionRunRequest.js';
+export * from './CustomInspectionItemSourceType.js';
 export * from './DownloadDescriptor.js';
 export * from './FieldError.js';
 export * from './InspectionConnectivity.js';

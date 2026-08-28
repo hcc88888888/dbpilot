@@ -174,7 +174,7 @@ test('inspection DTOs bound host data, status vocabularies, and public examples'
   }
 });
 
-test('host inspection item source variants reject executable evidence and ambiguous rule shapes', async () => {
+test('custom inspection items are host metric rules while catalog responses retain built-in source variants', async () => {
   const document = await bundleContract();
   const ajv = validationContext(document);
   const validateRequest = ajv.getSchema('https://dbpilot.local/openapi.json#/components/schemas/CreateInspectionItemRequest');
@@ -192,26 +192,29 @@ test('host inspection item source variants reject executable evidence and ambigu
   const metric = inspectionItemRequest('metric', metricRule);
   const metadata = inspectionItemRequest('metadata', evidenceSelector);
   const logSummary = inspectionItemRequest('log_summary', evidenceSelector);
+  const customMetric = inspectionItemRequest('metric', { ...metricRule, ...evidenceSelector });
 
-  for (const value of [metric, metadata, logSummary]) {
-    assert.equal(validateRequest(value), true, ajv.errorsText(validateRequest.errors));
-  }
-  const item = {
-    ...metric,
-    id: 'host-cpu-utilization', version: 1, system: true, enabled: true,
-    created_at: '2026-08-28T08:00:00Z', updated_at: '2026-08-28T08:00:00Z',
-  };
-  assert.equal(validateItem(item), true, ajv.errorsText(validateItem.errors));
-
+  assert.equal(validateRequest(customMetric), true, ajv.errorsText(validateRequest.errors));
   for (const invalid of [
-    inspectionItemRequest('metric', {}),
-    inspectionItemRequest('metric', { ...metricRule, ...evidenceSelector }),
-    inspectionItemRequest('metadata', {}),
-    inspectionItemRequest('metadata', { ...metricRule, ...evidenceSelector }),
-    inspectionItemRequest('log_summary', { evidence_selector: { fields: ['SELECT * FROM users'] } }),
-    inspectionItemRequest('log_summary', { evidence_selector: { fields: ['rm -rf /'] } }),
+    metric,
+    inspectionItemRequest('metric', evidenceSelector),
+    metadata,
+    logSummary,
+    inspectionItemRequest('probe', { ...metricRule, ...evidenceSelector }),
+    { ...customMetric, scope_type: 'database' },
+    { ...customMetric, probe_rule: { probe_template_id: 'host-shell' } },
+    { ...customMetric, expression: 'SELECT * FROM sensitive_table' },
   ]) {
-    assert.equal(validateRequest(invalid), false, 'invalid source-specific item configuration is rejected');
+    assert.equal(validateRequest(invalid), false, 'custom creation accepts only host metric rules with bounded evidence');
+  }
+
+  for (const source of [metric, metadata, logSummary]) {
+    const item = {
+      ...source,
+      id: `builtin-${source.source_type}`, version: 1, system: true, enabled: true,
+      created_at: '2026-08-28T08:00:00Z', updated_at: '2026-08-28T08:00:00Z',
+    };
+    assert.equal(validateItem(item), true, `${source.source_type}: ${ajv.errorsText(validateItem.errors)}`);
   }
 });
 

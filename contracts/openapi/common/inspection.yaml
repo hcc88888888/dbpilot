@@ -7,6 +7,9 @@ InspectionScopeType:
 InspectionSourceType:
   type: string
   enum: [metric, metadata, log_summary]
+CustomInspectionItemSourceType:
+  type: string
+  enum: [metric]
 InspectionMetricWindow:
   type: string
   enum: [5m, 15m, 1h]
@@ -196,7 +199,7 @@ InspectionItemPage:
 CreateInspectionItemRequest:
   type: object
   additionalProperties: false
-  required: [name, description, category, scope_type, source_type, recommendation_template]
+  required: [name, description, category, scope_type, source_type, metric_rule, evidence_selector, recommendation_template]
   properties:
     name:
       type: string
@@ -212,7 +215,7 @@ CreateInspectionItemRequest:
     scope_type:
       $ref: '#/InspectionScopeType'
     source_type:
-      $ref: '#/InspectionSourceType'
+      $ref: '#/CustomInspectionItemSourceType'
     required_capabilities:
       type: array
       maxItems: 64
@@ -231,30 +234,6 @@ CreateInspectionItemRequest:
       type: string
       format: uri
       maxLength: 2048
-  allOf:
-    - if:
-        properties:
-          source_type:
-            const: metric
-        required: [source_type]
-      then:
-        properties:
-          metric_rule: {}
-          evidence_selector: {}
-        required: [metric_rule]
-        not:
-          properties:
-            evidence_selector: {}
-          required: [evidence_selector]
-      else:
-        properties:
-          metric_rule: {}
-          evidence_selector: {}
-        required: [evidence_selector]
-        not:
-          properties:
-            metric_rule: {}
-          required: [metric_rule]
 InspectionPolicyItem:
   type: object
   additionalProperties: false
