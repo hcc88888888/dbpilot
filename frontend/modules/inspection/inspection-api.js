@@ -24,7 +24,13 @@ export function createInspectionApi({ baseUrl = '', available = true, controlPla
     createItem: (scope, value, key, signal) => write(scope, 'createInspectionItem', { idempotencyKey: key, createInspectionItemRequest: value }, { idempotencyKey: key, signal }),
     listTargets: (scope, page = {}, signal) => read(scope, 'listInspectionTargets', pageParams(page), signal),
     listPolicies: (scope, page = {}, signal) => read(scope, 'listInspectionPolicies', pageParams(page), signal),
-    getPolicy: async (scope, id, signal) => withETag(await read(scope, 'getInspectionPolicy', { policyId: requiredID(id) }, signal)),
+    async getPolicy(scope, id, signal) {
+      const boundary = scoped(scope);
+      const response = await boundary.inspection.getInspectionPolicyRaw({ policyId: requiredID(id) }, boundary.requestOptions({ signal }));
+      const etag = response?.raw?.headers?.get?.('ETag');
+      if (!etag) throw Object.assign(new Error('policy ETag unavailable'), { kind: 'unavailable' });
+      return { ...normalize(await response.value(), 'control-plane'), etag };
+    },
     createPolicy: (scope, value, key, signal) => write(scope, 'createInspectionPolicy', { idempotencyKey: key, createInspectionPolicyRequest: value }, { idempotencyKey: key, signal }),
     updatePolicy: (scope, id, value, etag, key, signal) => write(scope, 'updateInspectionPolicy', { policyId: requiredID(id), idempotencyKey: key, ifMatch: etag, updateInspectionPolicyRequest: value }, { idempotencyKey: key, etag, signal }),
     runPolicy: (scope, id, key, signal) => write(scope, 'runInspectionPolicy', { policyId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
@@ -90,6 +96,5 @@ function requiredID(value) {
   if (!id) throw Object.assign(new Error('invalid id'), { kind: 'validation' });
   return id;
 }
-function withETag(value) { return { ...value, etag: `"${Number(value?.version) || 1}"` }; }
 
 if (typeof window !== 'undefined') window.DBPilotInspectionApi = { create: createInspectionApi };

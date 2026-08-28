@@ -20,6 +20,7 @@ type JobService interface {
 	Get(context.Context, platformscope.Scope, string) (job.Job, error)
 	RequestCancelWithSnapshot(context.Context, platformscope.Scope, string, string, int64, time.Time, job.CancellationSnapshotInput) (job.Job, error)
 	GetCancellationSnapshot(context.Context, platformscope.Scope, string, job.CancellationSnapshotKey) (job.CancellationSnapshot, error)
+	FindCancellationSnapshot(context.Context, platformscope.Scope, string, job.CancellationSnapshotCorrelation) (job.CancellationSnapshot, error)
 }
 
 type ArtifactService interface {

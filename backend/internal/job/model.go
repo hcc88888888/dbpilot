@@ -128,6 +128,15 @@ type CancellationSnapshotKey struct {
 	IfMatch            string
 }
 
+// CancellationSnapshotCorrelation identifies the immutable authenticated
+// cancellation request without depending on the Job's mutable version.
+type CancellationSnapshotCorrelation struct {
+	Actor              string
+	OperationID        string
+	IdempotencyKey     string
+	RequestFingerprint string
+}
+
 type CancellationSnapshotInput struct {
 	Key            CancellationSnapshotKey
 	OwnerToken     string

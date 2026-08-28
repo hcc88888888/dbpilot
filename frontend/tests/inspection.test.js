@@ -68,13 +68,27 @@ test('inspection api normalizes generated Date fields without losing timestamps'
   assert.equal(page.items[0].created_at, '2026-08-29T08:00:00.000Z');
 });
 
-test('overview renders explicit health levels, partial state, and source label', () => {
+test('getPolicy reads the exact ETag from the generated raw response', async () => {
+  const seen = [];
+  const signal = new AbortController().signal;
+  const client = { forScope: () => ({
+    inspection: { getInspectionPolicyRaw(parameters, options) { seen.push({ parameters, options }); return Promise.resolve({ raw: { headers: new Headers({ ETag: '"17"' }) }, value: async () => ({ id: 'policy-1', version: 17, name: 'Daily' }) }); } },
+    requestOptions: (value) => ({ requestOptions: value }),
+  }) };
+  const api = createInspectionApi({ baseUrl: 'https://control.example', controlPlaneClient: client });
+  const policy = await api.getPolicy({ tenantId: 't', projectId: 'p' }, 'policy-1', signal);
+  assert.equal(policy.etag, '"17"');
+  assert.deepEqual(seen[0].parameters, { policyId: 'policy-1' });
+  assert.deepEqual(seen[0].options, { requestOptions: { signal } });
+});
+
+test('overview renders explicit health levels and partial state', () => {
   const markup = renderInspectionOverviewMarkup({
     source: 'control-plane', target_count: 4, online_target_count: 3,
     finding_level_counts: { healthy: 8, warning: 2, critical: 1, unsupported: 3, missing_data: 4 },
     latest_run_status_counts: { completed: 2, partial: 1, failed: 1 },
   });
-  for (const expected of ['健康', '警告', '严重', '不支持', '数据缺失', '部分完成', '控制面服务']) assert.match(markup, new RegExp(expected));
+  for (const expected of ['健康', '警告', '严重', '不支持', '数据缺失', '部分完成']) assert.match(markup, new RegExp(expected));
 });
 
 test('policy form exposes accessible target and item selection and escapes names', () => {
@@ -89,6 +103,67 @@ test('policy form exposes accessible target and item selection and escapes names
   assert.match(markup, /data-inspection-policy-run="policy-1"/);
   assert.doesNotMatch(markup, /<img src=x/);
   assert.match(markup, /&lt;img src=x/);
+});
+
+test('policy edit form is prefilled and retains the server ETag', () => {
+  const markup = renderInspectionPolicyMarkup({
+    policies: [{ id: 'policy-1', name: 'Daily', version: 3, enabled: true, target_ids: ['agent-1'], item_versions: [{ item_id: 'cpu', version: 1 }] }],
+    targets: [{ agent_id: 'agent-1', display_name: 'Primary DB', host: 'db-1.example' }],
+    items: [{ id: 'cpu', version: 1, name: 'CPU utilization' }],
+    editing_policy: { id: 'policy-1', name: 'Daily', enabled: true, etag: '"3"', labels: { role: 'database' }, target_ids: ['agent-1'], item_versions: [{ item_id: 'cpu', version: 1 }], target_timeout_seconds: 120, max_concurrency: 4, schedule: { cron: '0 2 * * *', timezone: 'Asia/Shanghai' } },
+  }, { manage: true, execute: true });
+  assert.match(markup, /data-inspection-policy-edit="policy-1"/);
+  assert.match(markup, /value="Daily"/);
+  assert.match(markup, /value="0 2 \* \* \*"/);
+  assert.match(markup, /name="enabled" checked/);
+  assert.match(markup, /name="target_timeout_seconds"[^>]*value="120"/);
+  assert.match(markup, /name="max_concurrency"[^>]*value="4"/);
+  assert.match(markup, /data-inspection-policy-etag="&quot;3&quot;"/);
+  assert.match(markup, /value="agent-1" checked/);
+  assert.match(markup, /value="cpu:1" checked/);
+});
+
+test('policy editing updates with exact ETag and refreshes instead of overwriting on 412', async () => {
+  const calls = [];
+  const toasts = [];
+  let conflict = false;
+  const api = {
+    async listPolicies() { calls.push({ method: 'list' }); return { source: 'control-plane', items: [{ id: 'policy-1', name: 'Daily', version: 3 }] }; },
+    async listTargets() { return { source: 'control-plane', items: [] }; },
+    async listItems() { return { source: 'control-plane', items: [] }; },
+    async getPolicy(scope, id, signal) { calls.push({ method: 'get', scope: { ...scope }, id, signal }); return { id, name: 'Daily', enabled: true, target_ids: [], item_versions: [], etag: '"3"' }; },
+    async updatePolicy(scope, id, value, etag, key, signal) { calls.push({ method: 'update', scope: { ...scope }, id, value, etag, key, signal }); if (conflict) throw { kind: 'conflict', status: 412 }; return { id, version: 4 }; },
+  };
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' }, permissions: { view: true, manage: true }, onToast: (value) => toasts.push(value) });
+  center.open('policies');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await center.editPolicy('policy-1');
+  await center.savePolicy({ name: 'Updated', enabled: true, target_ids: [], item_versions: [] });
+  const update = calls.find((call) => call.method === 'update');
+  assert.equal(update.etag, '"3"');
+  assert.match(update.key, /^policy-update-/);
+
+  await center.editPolicy('policy-1');
+  conflict = true;
+  const listsBefore = calls.filter((call) => call.method === 'list').length;
+  await center.savePolicy({ name: 'Stale', enabled: true, target_ids: [], item_versions: [] });
+  assert.equal(calls.filter((call) => call.method === 'update').length, 2);
+  assert.equal(calls.filter((call) => call.method === 'list').length > listsBefore, true);
+  assert.equal(toasts.at(-1), '策略已被其他操作者更新，已刷新最新版本');
+});
+
+test('scope change aborts an in-flight policy edit load', async () => {
+  let editSignal;
+  const api = {
+    async getOverview() { return { source: 'control-plane' }; },
+    getPolicy(_scope, _id, signal) { editSignal = signal; return new Promise(() => {}); },
+  };
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' }, permissions: { view: true, manage: true } });
+  center.editPolicy('policy-1');
+  center.setScope({ tenantId: 't2', projectId: 'p2' });
+  assert.equal(editSignal.aborted, true);
 });
 
 test('run detail renders progress, partial unsupported missing data and permission-gated actions safely', () => {
@@ -141,4 +216,28 @@ test('missing inspection view permission fails closed before loading data', () =
   center.open('overview');
   assert.equal(calls, 0);
   assert.match(root.innerHTML, /没有该项目的巡检查看权限/);
+});
+
+test('shared inspection shell labels demo source in every view', async () => {
+  const root = { innerHTML: '', addEventListener() {} };
+  const page = { source: 'demo', items: [] };
+  const api = {
+    async getOverview() { return { source: 'demo', finding_level_counts: {}, latest_run_status_counts: {} }; },
+    async listPolicies() { return page; }, async listTargets() { return page; }, async listItems() { return page; },
+    async listRuns() { return page; }, async getRun() { return { source: 'demo', id: 'run-1', status: 'partial', target_count: 1 }; },
+    async getReport() { return { source: 'demo', id: 'report-1', run_id: 'run-1', status: 'completed', findings: [] }; },
+  };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 'demo', projectId: 'production' }, permissions: { view: true } });
+  for (const openView of [
+    () => center.open('overview'),
+    () => center.open('policies'),
+    () => center.open('runs'),
+    () => center.openRun('run-1'),
+    () => center.openReport('report-1'),
+  ]) {
+    openView();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.match(root.innerHTML, /ins-shell-source demo/);
+    assert.match(root.innerHTML, /演示数据 · 非生产/);
+  }
 });

@@ -464,14 +464,20 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     const stats = overview?.stats ?? {};
     const recent = Array.isArray(overview?.recent_reports) ? overview.recent_reports : [];
     const inspectionOnly = overview?.source === 'control-plane';
+    const inspectionStats = inspectionOnly ? `<div class="rpt-stats">
+      ${statCard('近期加载', stats.recent_loaded_count ?? recent.length, 'week')}
+      ${statCard('近期就绪', stats.recent_ready_count ?? 0, 'pending')}
+      ${statCard('文件格式', 'HTML / JSON', 'template')}
+      ${statCard('近期样本成功率', formatSuccessRate(stats.recent_sample_success_rate), 'rate')}
+    </div><p class="rpt-muted">仅展示最近 ${Number(stats.sample_limit) || 5} 条${stats.sample_has_more ? '，后续仍有更多报告' : ''}；该样本不代表完整周期统计。</p>` : '';
     return `<div class="rpt-overview">
     <div class="rpt-section-head"><div><h3>报告概览</h3><p>${inspectionOnly ? '真实巡检报告由巡检执行自动生成并不可变。' : '报告生成、分发与模板使用情况的整体视图。'}</p></div>${!inspectionOnly && state.permissions.manage === true ? '<button class="rpt-btn-primary" data-reports-generate>立即生成报告</button>' : ''}</div>
-    <div class="rpt-stats">
+    ${inspectionOnly ? inspectionStats : `<div class="rpt-stats">
       ${statCard('本周生成', stats.generated_this_week ?? 0, 'week')}
-      ${inspectionOnly ? statCard('最近报告', recent.length, 'pending') : statCard('待发送', stats.pending_send ?? 0, 'pending')}
-      ${inspectionOnly ? statCard('文件格式', 'HTML / JSON', 'template') : statCard('报告模板', stats.template_count ?? 0, 'template')}
+      ${statCard('待发送', stats.pending_send ?? 0, 'pending')}
+      ${statCard('报告模板', stats.template_count ?? 0, 'template')}
       ${statCard('生成成功率', formatSuccessRate(stats.success_rate), 'rate')}
-    </div>
+    </div>`}
     <article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">RECENT REPORTS</span><h3>最近报告</h3></div><button class="rpt-link-btn" data-reports-view="reports">查看全部 →</button></div>${renderRecentReportRows(recent)}</article>
   </div>`;
   }
@@ -639,6 +645,7 @@ function formatReportLabel(value) {
 }
 
 function formatSuccessRate(value) {
+  if (value == null) return '—';
   const number = Number(value);
   if (!Number.isFinite(number)) return '—';
   return `${number}%`;

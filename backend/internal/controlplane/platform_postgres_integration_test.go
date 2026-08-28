@@ -264,6 +264,10 @@ func (service *countingCancellationJobService) GetCancellationSnapshot(ctx conte
 	return service.inner.GetCancellationSnapshot(ctx, scope, id, key)
 }
 
+func (service *countingCancellationJobService) FindCancellationSnapshot(ctx context.Context, scope platformscope.Scope, id string, correlation job.CancellationSnapshotCorrelation) (job.CancellationSnapshot, error) {
+	return service.inner.FindCancellationSnapshot(ctx, scope, id, correlation)
+}
+
 func (store *markAuditedErrorStore) Claim(ctx context.Context, request idempotency.ClaimRequest) (idempotency.Claim, error) {
 	return store.inner.Claim(ctx, request)
 }

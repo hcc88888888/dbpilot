@@ -54,6 +54,7 @@ const pendingTerminalAuditsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM c
 const markTerminalAuditRecordedSQL = "UPDATE command_outbox SET terminal_audit_pending = FALSE, terminal_audit_lease_expires_at = NULL, terminal_audit_recorded_at = COALESCE(terminal_audit_recorded_at, $1) WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND terminal_audit_dedupe_key = $5"
 const insertCancellationSnapshotSQL = "INSERT INTO job_cancellation_snapshots (tenant_id, project_id, job_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, if_match, current_version, job_snapshot, audit_event_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
 const selectCancellationSnapshotSQL = "SELECT actor, operation_id, idempotency_key, request_fingerprint, owner_token, if_match, current_version, job_snapshot, audit_event_json, created_at FROM job_cancellation_snapshots WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND if_match = $8"
+const findCancellationSnapshotSQL = "SELECT job_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, if_match, current_version, job_snapshot, audit_event_json, created_at FROM job_cancellation_snapshots WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7"
 
 var cancellationFingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var cancellationOwnerPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
@@ -330,6 +331,34 @@ func (repository *PostgresRepository) GetCancellationSnapshot(ctx context.Contex
 	return value, nil
 }
 
+func (repository *PostgresRepository) FindCancellationSnapshot(ctx context.Context, scope platformscope.Scope, jobID string, correlation CancellationSnapshotCorrelation) (CancellationSnapshot, error) {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || validateCancellationSnapshotCorrelation(correlation) != nil {
+		return CancellationSnapshot{}, ErrNotFound
+	}
+	value := CancellationSnapshot{Scope: scope}
+	var encodedJob []byte
+	err := repository.db.QueryRowContext(ctx, findCancellationSnapshotSQL,
+		scope.TenantID, scope.ProjectID, jobID, correlation.Actor, correlation.OperationID,
+		correlation.IdempotencyKey, correlation.RequestFingerprint,
+	).Scan(
+		&value.JobID, &value.Key.Actor, &value.Key.OperationID, &value.Key.IdempotencyKey,
+		&value.Key.RequestFingerprint, &value.OwnerToken, &value.Key.IfMatch,
+		&value.CurrentVersion, &encodedJob, &value.AuditEventJSON, &value.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CancellationSnapshot{}, ErrNotFound
+	}
+	if err != nil {
+		return CancellationSnapshot{}, fmt.Errorf("find cancellation response snapshot: %w", err)
+	}
+	if value.JobID != jobID || value.Key.Actor != correlation.Actor || value.Key.OperationID != correlation.OperationID || value.Key.IdempotencyKey != correlation.IdempotencyKey || value.Key.RequestFingerprint != correlation.RequestFingerprint || json.Unmarshal(encodedJob, &value.Job) != nil || validateCancellationSnapshotKey(value.Key) != nil || value.Job.Scope != scope || value.Job.ID != jobID || value.Job.Status != StatusCancelling || value.Job.Version != value.CurrentVersion+1 || value.Job.CancelRequestedBy != correlation.Actor || value.Job.CancelRequestedAt == nil || !cancellationOwnerPattern.MatchString(value.OwnerToken) || !json.Valid(value.AuditEventJSON) || value.CreatedAt.IsZero() || ValidateTargets(value.Job) != nil {
+		return CancellationSnapshot{}, ErrInvalidTransition
+	}
+	value.CreatedAt = value.CreatedAt.UTC()
+	value.AuditEventJSON = append([]byte(nil), value.AuditEventJSON...)
+	return value, nil
+}
+
 func validateCancellationSnapshotInput(actor string, currentVersion int64, input CancellationSnapshotInput) error {
 	if input.Key.Actor != actor || input.OwnerToken == "" || !cancellationOwnerPattern.MatchString(input.OwnerToken) || !json.Valid(input.AuditEventJSON) || input.Key.IfMatch != fmt.Sprintf("\"%d\"", currentVersion) {
 		return ErrInvalidTransition
@@ -344,6 +373,18 @@ func validateCancellationSnapshotKey(key CancellationSnapshotKey) error {
 		}
 	}
 	if !cancellationFingerprintPattern.MatchString(key.RequestFingerprint) {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
+func validateCancellationSnapshotCorrelation(correlation CancellationSnapshotCorrelation) error {
+	for _, value := range []string{correlation.Actor, correlation.OperationID, correlation.IdempotencyKey} {
+		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\t") {
+			return ErrInvalidTransition
+		}
+	}
+	if !cancellationFingerprintPattern.MatchString(correlation.RequestFingerprint) {
 		return ErrInvalidTransition
 	}
 	return nil

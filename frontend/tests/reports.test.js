@@ -330,3 +330,29 @@ test('configured inspection report center hides unsupported generation and templ
   assert.doesNotMatch(root.innerHTML, /data-reports-generate/);
   assert.match(root.innerHTML, /HTML \/ JSON/);
 });
+
+test('configured report overview exposes bounded recent-sample statistics, never weekly totals', async () => {
+  const items = [
+    { id: 'r1', run_id: 'run-1', status: 'completed', summary: 'healthy=1', generated_at: '2020-01-01T00:00:00Z', artifacts: [] },
+    { id: 'r2', run_id: 'run-2', status: 'completed', summary: 'warning=1', generated_at: '2020-01-02T00:00:00Z', artifacts: [] },
+    { id: 'r3', run_id: 'run-3', status: 'failed', summary: 'failed', generated_at: '2020-01-03T00:00:00Z', artifacts: [] },
+    { id: 'r4', run_id: 'run-4', status: 'generating', summary: '', generated_at: '2020-01-04T00:00:00Z', artifacts: [] },
+    { id: 'r5', run_id: 'run-5', status: 'completed', summary: 'healthy=1', generated_at: '2020-01-05T00:00:00Z', artifacts: [] },
+  ];
+  const client = { forScope: () => ({ inspection: { listInspectionReports: () => Promise.resolve({ items, page: { limit: 5, hasMore: true, nextCursor: 'more' } }) }, requestOptions: (value) => value }) };
+  const api = createReportsApi({ baseUrl: 'https://control.example', controlPlaneClient: client });
+  const overview = await api.getOverview({ tenantId: 't', projectId: 'p' });
+  assert.deepEqual(overview.stats, { recent_loaded_count: 5, recent_ready_count: 3, recent_sample_success_rate: 75, sample_limit: 5, sample_has_more: true });
+  assert.equal('generated_this_week' in overview.stats, false);
+  assert.equal('success_rate' in overview.stats, false);
+
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createReportsCenter({ root, api: { async getOverview() { return overview; } }, scope: { tenantId: 't', projectId: 'p' } });
+  center.open('overview');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(root.innerHTML, /近期加载/);
+  assert.match(root.innerHTML, /近期就绪/);
+  assert.match(root.innerHTML, /近期样本成功率/);
+  assert.match(root.innerHTML, /仅展示最近 5 条/);
+  assert.doesNotMatch(root.innerHTML, /本周生成|生成成功率/);
+});

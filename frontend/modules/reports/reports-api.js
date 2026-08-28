@@ -54,7 +54,9 @@ function createInspectionReportsAdapter(client) {
       const ready = items.filter((item) => item.status === 'ready').length;
       const failed = items.filter((item) => item.status === 'failed').length;
       const completed = ready + failed;
-      return { source: 'control-plane', scope: cleanScope(scope), stats: { generated_this_week: items.length, pending_send: 0, template_count: 0, success_rate: completed ? Math.round(ready / completed * 1000) / 10 : 100 }, recent_reports: items };
+      const sampleLimit = Number(response?.page?.limit) || 5;
+      const sampleHasMore = response?.page?.hasMore === true || response?.page?.has_more === true;
+      return { source: 'control-plane', scope: cleanScope(scope), stats: { recent_loaded_count: items.length, recent_ready_count: ready, recent_sample_success_rate: completed ? Math.round(ready / completed * 1000) / 10 : null, sample_limit: sampleLimit, sample_has_more: sampleHasMore }, recent_reports: items };
     },
     async listReports(scope, filters = {}, signal) {
       if (filters.type && filters.type !== 'inspection') return { source: 'control-plane', scope: cleanScope(scope), items: [], nextCursor: null };

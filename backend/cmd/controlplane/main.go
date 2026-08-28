@@ -928,6 +928,7 @@ func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.H
 	for index := range targets {
 		targets[index].Connectivity = "offline"
 		targets[index].Capabilities = []string{}
+		targets[index].AdvertisedSources = []inspection.SourceType{}
 		if resolver.registry == nil {
 			continue
 		}
@@ -937,6 +938,12 @@ func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.H
 		}
 		targets[index].Connectivity = "online"
 		targets[index].Capabilities = append([]string(nil), session.Capabilities...)
+		for _, capability := range session.Capabilities {
+			if capability == "collect_now" {
+				targets[index].AdvertisedSources = []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}
+				break
+			}
+		}
 	}
 	return targets
 }

@@ -187,6 +187,45 @@ func TestInspectionCreateItemIdempotencyReplaysOneDeterministicResourceAndAudit(
 	require.Equal(t, 1, repository.creates)
 }
 
+func TestInspectionCancelCrashRetryUsesImmutableSnapshotCorrelation(t *testing.T) {
+	now := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
+	run := inspection.Run{Scope: platformTestScope, ID: "run-1", JobID: "job-1", Status: inspection.RunCollecting, Trigger: inspection.RunTriggerManual, ItemSnapshot: []inspection.Item{}, TargetCount: 1, AuditCorrelation: "inspection-run:run-1", InitiatedBy: "trusted-user", RequestID: "request-run-1", CreatedAt: now.Add(-time.Minute)}
+	repository := &applicationInspectionRepository{items: map[string]inspection.Item{}, runDetail: inspection.RunDetail{Run: run}}
+	current := validPlatformJob()
+	current.ID, current.Scope, current.Status, current.Version = "job-1", platformTestScope, job.StatusRunning, 7
+	cancelled := current
+	cancelled.Status, cancelled.Version = job.StatusCancelling, 8
+	jobs := &inspectionCancellationJobService{current: current, cancelled: cancelled}
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("crash after cancellation transaction")
+	application := &inspectionApplicationService{repository: repository, jobs: jobs, audit: audits, idempotency: idempotency.NewService(store), now: func() time.Time { return now }}
+	services := Services{Inspection: application}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelInspectionRun)
+	request := func() *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/inspection-runs/run-1/cancel", nil)
+		value.Header.Set("Idempotency-Key", "cancel-run-crash")
+		value.Header.Set("X-Request-ID", "request-cancel-run")
+		return value
+	}
+
+	first := servePlatformRequest(services, principal, request())
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", "request-cancel-run")
+	require.Equal(t, 1, jobs.cancelCalls)
+	require.Zero(t, audits.recordCalls)
+
+	store.completeErr = nil
+	retry := servePlatformRequest(services, principal, request())
+	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+	require.Equal(t, 1, jobs.cancelCalls, "exact crash retry must recover without a second cancellation")
+	require.Equal(t, 1, jobs.findCalls)
+	require.Equal(t, 1, audits.recordCalls)
+	replay := servePlatformRequest(services, principal, request())
+	require.Equal(t, retry.Body.Bytes(), replay.Body.Bytes())
+	require.Equal(t, 1, jobs.cancelCalls)
+	require.Equal(t, 1, audits.recordCalls)
+}
+
 type inspectionServiceCall struct {
 	operation, actor, key, id string
 	scope                     platformscope.Scope
@@ -307,8 +346,9 @@ func validInspectionRunBody() string {
 func timePointer(value time.Time) *time.Time { return &value }
 
 type applicationInspectionRepository struct {
-	items   map[string]inspection.Item
-	creates int
+	items     map[string]inspection.Item
+	creates   int
+	runDetail inspection.RunDetail
 }
 
 func (repository *applicationInspectionRepository) CreateItem(_ context.Context, value inspection.Item) error {
@@ -350,8 +390,11 @@ func (*applicationInspectionRepository) CreateRunWithJob(context.Context, inspec
 func (*applicationInspectionRepository) CreateClaimedRunWithJob(context.Context, inspection.Policy, inspection.Run, []inspection.TargetRun, job.Job, []job.OutboxMessage) (inspection.Run, error) {
 	return inspection.Run{}, nil
 }
-func (*applicationInspectionRepository) GetRun(context.Context, platformscope.Scope, string) (inspection.RunDetail, error) {
-	return inspection.RunDetail{}, inspection.ErrNotFound
+func (repository *applicationInspectionRepository) GetRun(_ context.Context, scope platformscope.Scope, id string) (inspection.RunDetail, error) {
+	if repository.runDetail.Run.Scope != scope || repository.runDetail.Run.ID != id {
+		return inspection.RunDetail{}, inspection.ErrNotFound
+	}
+	return repository.runDetail, nil
 }
 func (*applicationInspectionRepository) GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (inspection.Run, error) {
 	return inspection.Run{}, inspection.ErrNotFound
@@ -364,4 +407,35 @@ func (*applicationInspectionRepository) GetReport(context.Context, platformscope
 }
 func (*applicationInspectionRepository) ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error) {
 	return inspection.ReportPage{}, nil
+}
+
+type inspectionCancellationJobService struct {
+	current     job.Job
+	cancelled   job.Job
+	snapshot    *job.CancellationSnapshot
+	cancelCalls int
+	findCalls   int
+}
+
+func (service *inspectionCancellationJobService) Get(context.Context, platformscope.Scope, string) (job.Job, error) {
+	return service.current, nil
+}
+func (service *inspectionCancellationJobService) RequestCancelWithSnapshot(_ context.Context, scope platformscope.Scope, id, _ string, version int64, at time.Time, input job.CancellationSnapshotInput) (job.Job, error) {
+	service.cancelCalls++
+	service.snapshot = &job.CancellationSnapshot{Scope: scope, JobID: id, Key: input.Key, OwnerToken: input.OwnerToken, CurrentVersion: version, Job: service.cancelled, AuditEventJSON: append([]byte(nil), input.AuditEventJSON...), CreatedAt: at.UTC()}
+	service.current = service.cancelled
+	return service.cancelled, nil
+}
+func (service *inspectionCancellationJobService) GetCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, key job.CancellationSnapshotKey) (job.CancellationSnapshot, error) {
+	if service.snapshot == nil || service.snapshot.Scope != scope || service.snapshot.JobID != id || service.snapshot.Key != key {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.snapshot, nil
+}
+func (service *inspectionCancellationJobService) FindCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, correlation job.CancellationSnapshotCorrelation) (job.CancellationSnapshot, error) {
+	service.findCalls++
+	if service.snapshot == nil || service.snapshot.Scope != scope || service.snapshot.JobID != id || service.snapshot.Key.Actor != correlation.Actor || service.snapshot.Key.OperationID != correlation.OperationID || service.snapshot.Key.IdempotencyKey != correlation.IdempotencyKey || service.snapshot.Key.RequestFingerprint != correlation.RequestFingerprint {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.snapshot, nil
 }

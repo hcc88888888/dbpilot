@@ -493,12 +493,67 @@ func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabiliti
 	require.NoError(t, err)
 	require.Equal(t, "offline", offline[0].Connectivity)
 	require.Empty(t, offline[0].Capabilities)
+	require.Empty(t, offline[0].AdvertisedSources)
+
+	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"host.inspect"}}
+	withoutCollectNow, err := resolver.List(context.Background(), scope)
+	require.NoError(t, err)
+	require.Equal(t, "online", withoutCollectNow[0].Connectivity)
+	require.Empty(t, withoutCollectNow[0].AdvertisedSources)
 
 	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "host.inspect"}}
 	online, err := resolver.List(context.Background(), scope)
 	require.NoError(t, err)
 	require.Equal(t, "online", online[0].Connectivity)
 	require.Equal(t, []string{"collect_now", "host.inspect"}, online[0].Capabilities)
+	require.Equal(t, []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, online[0].AdvertisedSources)
+}
+
+func TestLiveInspectionResolverCreateRunEvaluatorKeepsCollectNowSources(t *testing.T) {
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	now := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	configured, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "Primary", Host: "db-1.example", Labels: map[string]string{"role": "database"}, Connectivity: "unknown", Capabilities: []string{}}})
+	require.NoError(t, err)
+	registry := &staticInspectionSessionRegistry{sessions: map[string]agentcontrol.SessionInfo{"agent-1": {AgentID: "agent-1", Capabilities: []string{"collect_now"}}}}
+	resolver := liveInspectionTargetResolver{configured: configured, registry: registry}
+	selected := make([]inspection.Item, 0, 3)
+	for _, item := range inspection.BuiltinHostItems() {
+		if item.ID == "host.cpu.utilization" || item.ID == "host.oom.evidence" || item.ID == "host.log.error_summary" {
+			item.Scope, item.Enabled, item.CreatedAt, item.UpdatedAt = scope, true, now, now
+			selected = append(selected, item)
+		}
+	}
+	require.Len(t, selected, 3)
+	repository := &inspectionWorkflowRepository{items: selected}
+	ids := []string{"run-1", "job-1", "command-1"}
+	service := &inspection.Service{Repository: repository, Targets: resolver, Now: func() time.Time { return now }, NewID: func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }}
+	versions := make([]inspection.PolicyItem, len(selected))
+	for index, item := range selected {
+		versions[index] = inspection.PolicyItem{ItemID: item.ID, Version: item.Version}
+	}
+	run, err := service.CreateRun(context.Background(), inspection.CreateRunRequest{Scope: scope, Selector: inspection.TargetSelector{AgentIDs: []string{"agent-1"}}, Items: versions, TargetTimeout: time.Minute, MaxConcurrency: 1, IdempotencyKey: "run-key", InitiatedBy: "operator", RequestID: "request-1", Trigger: inspection.RunTriggerManual})
+	require.NoError(t, err)
+	require.Equal(t, []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, repository.targets[0].AdvertisedSources)
+
+	observedAt := now.Add(-time.Minute)
+	target := repository.targets[0]
+	target.Observations = []inspection.Observation{
+		{ID: "oom-1", TargetID: target.TargetID, Name: "dbpilot.inspection.host.oom.count", SourceType: inspection.SourceMetadata, Labels: map[string]string{}, Value: 0, ObservedAt: observedAt},
+		{ID: "warn-1", TargetID: target.TargetID, Name: "dbpilot.inspection.host.log.warning_count", SourceType: inspection.SourceLogSummary, Labels: map[string]string{}, Value: 0, ObservedAt: observedAt},
+		{ID: "error-1", TargetID: target.TargetID, Name: "dbpilot.inspection.host.log.error_count", SourceType: inspection.SourceLogSummary, Labels: map[string]string{}, Value: 0, ObservedAt: observedAt},
+		{ID: "critical-1", TargetID: target.TargetID, Name: "dbpilot.inspection.host.log.critical_count", SourceType: inspection.SourceLogSummary, Labels: map[string]string{}, Value: 0, ObservedAt: observedAt},
+	}
+	evaluator := &inspection.Evaluator{
+		Evidence: inspectionEvidenceStore{samples: []inspection.Observation{{ID: "cpu-1", TargetID: target.TargetID, Name: "system.cpu.utilization", SourceType: inspection.SourceMetric, Labels: map[string]string{}, Value: 20, ObservedAt: now}}},
+		Now:      func() time.Time { return now },
+	}
+	findings, err := evaluator.EvaluateTarget(context.Background(), inspection.RunSnapshot{ID: run.ID, Scope: scope, CreatedAt: run.CreatedAt, Items: run.ItemSnapshot, Targets: []inspection.TargetRun{target}}, target)
+	require.NoError(t, err)
+	require.Len(t, findings, 3)
+	for _, finding := range findings {
+		require.NotEqual(t, inspection.LevelUnsupported, finding.Level, finding.ItemID)
+		require.NotEqual(t, inspection.LevelMissingData, finding.Level, finding.ItemID)
+	}
 }
 
 type staticInspectionSessionRegistry struct {
@@ -508,6 +563,69 @@ type staticInspectionSessionRegistry struct {
 func (registry *staticInspectionSessionRegistry) Session(agentID string) (agentcontrol.SessionInfo, bool) {
 	value, ok := registry.sessions[agentID]
 	return value, ok
+}
+
+type inspectionEvidenceStore struct{ samples []inspection.Observation }
+
+func (store inspectionEvidenceStore) Samples(context.Context, platformscope.Scope, string, []string, time.Time, time.Time, int) ([]inspection.Observation, error) {
+	return append([]inspection.Observation(nil), store.samples...), nil
+}
+
+type inspectionWorkflowRepository struct {
+	items   []inspection.Item
+	targets []inspection.TargetRun
+}
+
+func (*inspectionWorkflowRepository) CreateItem(context.Context, inspection.Item) error { return nil }
+func (repository *inspectionWorkflowRepository) ListItems(_ context.Context, _ platformscope.Scope, filter inspection.ItemFilter) (inspection.ItemPage, error) {
+	wanted := map[string]struct{}{}
+	for _, version := range filter.Versions {
+		wanted[fmt.Sprintf("%s:%d", version.ItemID, version.Version)] = struct{}{}
+	}
+	page := inspection.ItemPage{}
+	for _, item := range repository.items {
+		if _, ok := wanted[fmt.Sprintf("%s:%d", item.ID, item.Version)]; ok {
+			page.Items = append(page.Items, item)
+		}
+	}
+	return page, nil
+}
+func (*inspectionWorkflowRepository) CreatePolicy(context.Context, inspection.Policy) error {
+	return nil
+}
+func (*inspectionWorkflowRepository) ListPolicies(context.Context, platformscope.Scope, inspection.PolicyFilter) (inspection.PolicyPage, error) {
+	return inspection.PolicyPage{}, nil
+}
+func (*inspectionWorkflowRepository) GetPolicy(context.Context, platformscope.Scope, string) (inspection.Policy, error) {
+	return inspection.Policy{}, inspection.ErrNotFound
+}
+func (*inspectionWorkflowRepository) UpdatePolicy(context.Context, inspection.Policy, int64) (inspection.Policy, error) {
+	return inspection.Policy{}, inspection.ErrNotFound
+}
+func (*inspectionWorkflowRepository) ClaimDuePolicies(context.Context, time.Time, int, time.Duration) ([]inspection.Policy, error) {
+	return nil, nil
+}
+func (repository *inspectionWorkflowRepository) CreateRunWithJob(_ context.Context, _ inspection.Run, targets []inspection.TargetRun, _ job.Job, _ []job.OutboxMessage) error {
+	repository.targets = append([]inspection.TargetRun(nil), targets...)
+	return nil
+}
+func (*inspectionWorkflowRepository) CreateClaimedRunWithJob(context.Context, inspection.Policy, inspection.Run, []inspection.TargetRun, job.Job, []job.OutboxMessage) (inspection.Run, error) {
+	return inspection.Run{}, nil
+}
+func (*inspectionWorkflowRepository) GetRun(context.Context, platformscope.Scope, string) (inspection.RunDetail, error) {
+	return inspection.RunDetail{}, inspection.ErrNotFound
+}
+func (*inspectionWorkflowRepository) GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (inspection.Run, error) {
+	return inspection.Run{}, inspection.ErrNotFound
+}
+func (*inspectionWorkflowRepository) ListRuns(context.Context, platformscope.Scope, inspection.RunFilter) (inspection.RunPage, error) {
+	return inspection.RunPage{}, nil
+}
+func (*inspectionWorkflowRepository) GetReport(context.Context, platformscope.Scope, string) (inspection.ReportSnapshot, error) {
+	return inspection.ReportSnapshot{}, inspection.ErrNotFound
+}
+func (*inspectionWorkflowRepository) ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error) {
+	return inspection.ReportPage{}, nil
 }
 
 type memoryInspectionCatalog struct {

@@ -926,6 +926,13 @@ func (service *recordingJobService) GetCancellationSnapshot(_ context.Context, s
 	return *service.cancelSnapshot, nil
 }
 
+func (service *recordingJobService) FindCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, correlation job.CancellationSnapshotCorrelation) (job.CancellationSnapshot, error) {
+	if service.cancelSnapshot == nil || service.cancelSnapshot.Scope != scope || service.cancelSnapshot.JobID != id || service.cancelSnapshot.Key.Actor != correlation.Actor || service.cancelSnapshot.Key.OperationID != correlation.OperationID || service.cancelSnapshot.Key.IdempotencyKey != correlation.IdempotencyKey || service.cancelSnapshot.Key.RequestFingerprint != correlation.RequestFingerprint {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.cancelSnapshot, nil
+}
+
 func TestPlatformTraceparentRejectsMalformedInputAndGeneratesValidContext(t *testing.T) {
 	jobs := &recordingJobService{getValue: validPlatformJob()}
 	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/jobs/job-1", nil)
@@ -1199,6 +1206,15 @@ func (service *blockingJobService) GetCancellationSnapshot(_ context.Context, sc
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	if service.snapshot == nil || service.snapshot.Scope != scope || service.snapshot.JobID != id || service.snapshot.Key != key {
+		return job.CancellationSnapshot{}, job.ErrNotFound
+	}
+	return *service.snapshot, nil
+}
+
+func (service *blockingJobService) FindCancellationSnapshot(_ context.Context, scope platformscope.Scope, id string, correlation job.CancellationSnapshotCorrelation) (job.CancellationSnapshot, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if service.snapshot == nil || service.snapshot.Scope != scope || service.snapshot.JobID != id || service.snapshot.Key.Actor != correlation.Actor || service.snapshot.Key.OperationID != correlation.OperationID || service.snapshot.Key.IdempotencyKey != correlation.IdempotencyKey || service.snapshot.Key.RequestFingerprint != correlation.RequestFingerprint {
 		return job.CancellationSnapshot{}, job.ErrNotFound
 	}
 	return *service.snapshot, nil

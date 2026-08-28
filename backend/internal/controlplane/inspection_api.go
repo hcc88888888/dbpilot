@@ -983,16 +983,17 @@ func (service *inspectionApplicationService) CancelRun(ctx context.Context, scop
 		return inspection.Run{}, err
 	}
 	idemKey := idempotency.Key{Scope: scope, Actor: actor, OperationID: operation, IdempotencyKey: key}
+	correlation := job.CancellationSnapshotCorrelation{Actor: actor, OperationID: operation, IdempotencyKey: key, RequestFingerprint: fingerprint}
 	snapshotKey := job.CancellationSnapshotKey{Actor: actor, OperationID: operation, IdempotencyKey: key, RequestFingerprint: fingerprint, IfMatch: entityTag(value.Version)}
 	claim, err := service.idempotency.BeginRecoverable(ctx, idemKey, fingerprint, auditJSON, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
-		snapshot, snapshotErr := service.jobs.GetCancellationSnapshot(recoveryContext, scope, detail.Run.JobID, snapshotKey)
+		snapshot, snapshotErr := service.jobs.FindCancellationSnapshot(recoveryContext, scope, detail.Run.JobID, correlation)
 		if errors.Is(snapshotErr, job.ErrNotFound) {
 			return idempotency.Response{}, idempotency.ErrInProgress
 		}
 		if snapshotErr != nil {
 			return idempotency.Response{}, snapshotErr
 		}
-		if snapshot.OwnerToken != processing.OwnerToken || !equalCanonicalJSON(snapshot.AuditEventJSON, processing.Reconciliation) {
+		if snapshot.OwnerToken != processing.OwnerToken || snapshot.JobID != detail.Run.JobID || snapshot.Key.Actor != correlation.Actor || snapshot.Key.OperationID != correlation.OperationID || snapshot.Key.IdempotencyKey != correlation.IdempotencyKey || snapshot.Key.RequestFingerprint != correlation.RequestFingerprint || snapshot.Key.IfMatch != entityTag(snapshot.CurrentVersion) || !equalCanonicalJSON(snapshot.AuditEventJSON, processing.Reconciliation) {
 			return idempotency.Response{}, errors.New("inspection cancellation snapshot is invalid")
 		}
 		current, currentErr := service.repository.GetRun(recoveryContext, scope, id)

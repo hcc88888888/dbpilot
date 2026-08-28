@@ -372,6 +372,32 @@ func TestRequestCancelSnapshotCommitsExactCorrelationAndResponseInputsInSameTran
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestFindCancellationSnapshotUsesImmutableCorrelationWithoutIfMatch(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	repository := NewPostgresRepository(database)
+	current := runningJob()
+	at := current.StartedAt.Add(time.Minute)
+	key := CancellationSnapshotKey{Actor: "operator-1", OperationID: "CancelInspectionRun", IdempotencyKey: "cancel-run-1", RequestFingerprint: "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59", IfMatch: `"` + strconv.FormatInt(current.Version, 10) + `"`}
+	correlation := CancellationSnapshotCorrelation{Actor: key.Actor, OperationID: key.OperationID, IdempotencyKey: key.IdempotencyKey, RequestFingerprint: key.RequestFingerprint}
+	next, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusCancelling, Actor: key.Actor, At: at})
+	require.NoError(t, err)
+	encoded, err := json.Marshal(next)
+	require.NoError(t, err)
+	auditJSON := []byte(`{"request_id":"request-original"}`)
+	owner := "owner-1111111111111111111111111111111111111111111111111111111111111111"
+	mock.ExpectQuery("SELECT job_id, actor, operation_id, idempotency_key").WithArgs(current.Scope.TenantID, current.Scope.ProjectID, current.ID, correlation.Actor, correlation.OperationID, correlation.IdempotencyKey, correlation.RequestFingerprint).WillReturnRows(sqlmock.NewRows([]string{"job_id", "actor", "operation_id", "idempotency_key", "request_fingerprint", "owner_token", "if_match", "current_version", "job_snapshot", "audit_event_json", "created_at"}).AddRow(current.ID, key.Actor, key.OperationID, key.IdempotencyKey, key.RequestFingerprint, owner, key.IfMatch, current.Version, encoded, auditJSON, at.UTC()))
+
+	snapshot, err := repository.FindCancellationSnapshot(context.Background(), current.Scope, current.ID, correlation)
+	require.NoError(t, err)
+	require.Equal(t, key, snapshot.Key)
+	require.Equal(t, current.Version, snapshot.CurrentVersion)
+	require.Equal(t, next, snapshot.Job)
+	require.Equal(t, auditJSON, snapshot.AuditEventJSON)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestMarkOutboxPublishedReturnsNotFoundForUnknownMessage(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)

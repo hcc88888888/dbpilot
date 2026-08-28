@@ -17,8 +17,7 @@ export function inspectionFailureMessage(error, subject = '巡检数据') {
 export function renderInspectionOverviewMarkup(value = {}) {
   const levels = value.finding_level_counts ?? {};
   const runs = value.latest_run_status_counts ?? {};
-  return `<div class="ins-source ${safe(value.source)}">${sourceLabel(value.source)}</div>
-    <div class="ins-overview-grid">
+  return `<div class="ins-overview-grid">
       ${overviewCard('主机目标', value.target_count ?? 0, `${value.online_target_count ?? 0} 台在线`, 'targets')}
       ${overviewCard('健康', levels.healthy ?? 0, '检查项正常', 'healthy')}
       ${overviewCard('警告', levels.warning ?? 0, '需要关注', 'warning')}
@@ -36,15 +35,20 @@ export function renderInspectionPolicyMarkup(value = {}, permissions = {}) {
   const policies = Array.isArray(value.policies) ? value.policies : [];
   const targets = Array.isArray(value.targets) ? value.targets : [];
   const items = Array.isArray(value.items) ? value.items : [];
-  const form = permissions.manage === true ? `<form class="ins-panel ins-policy-form" data-inspection-policy-form>
-    <div class="ins-panel-head"><div><span class="ins-kicker">POLICY</span><h3>创建巡检策略</h3></div></div>
-    <label>策略名称<input name="name" required maxlength="120" autocomplete="off"></label>
-    <fieldset aria-label="巡检目标"><legend>巡检目标</legend>${targets.map((target) => `<label class="ins-check"><input type="checkbox" name="target_id" value="${safe(target.agent_id)}"><span><b>${safe(target.display_name)}</b><small>${safe(target.host)}</small></span></label>`).join('') || '<p class="ins-empty">暂无可用目标</p>'}</fieldset>
-    <fieldset aria-label="巡检项"><legend>巡检项</legend>${items.map((item) => `<label class="ins-check"><input type="checkbox" name="item_version" value="${safe(item.id)}:${Number(item.version)}"><span><b>${safe(item.name)}</b><small>${safe(item.category)} · v${Number(item.version)}</small></span></label>`).join('') || '<p class="ins-empty">暂无可用巡检项</p>'}</fieldset>
-    <div class="ins-form-grid"><label>Cron 表达式<input name="cron" placeholder="0 2 * * *"></label><label>时区<input name="timezone" value="Asia/Shanghai"></label></div>
-    <button type="submit" class="ins-primary" data-inspection-policy-save>保存策略</button>
+  const editing = value.editing_policy ?? null;
+  const selectedTargets = new Set(editing?.target_ids ?? []);
+  const selectedItems = new Set((editing?.item_versions ?? []).map((item) => `${item.item_id}:${Number(item.version)}`));
+  const form = permissions.manage === true ? `<form class="ins-panel ins-policy-form" data-inspection-policy-form ${editing ? `data-inspection-policy-id="${safe(editing.id)}" data-inspection-policy-etag="${safe(editing.etag)}"` : ''}>
+    <div class="ins-panel-head"><div><span class="ins-kicker">POLICY</span><h3>${editing ? '编辑巡检策略' : '创建巡检策略'}</h3></div>${editing ? '<button type="button" class="ins-link" data-inspection-policy-edit-cancel>取消编辑</button>' : ''}</div>
+    <label>策略名称<input name="name" required maxlength="120" autocomplete="off" value="${safe(editing?.name ?? '')}"></label>
+    <label class="ins-check"><input type="checkbox" name="enabled"${editing?.enabled !== false ? ' checked' : ''}><span><b>启用策略</b></span></label>
+    <fieldset aria-label="巡检目标"><legend>巡检目标</legend>${targets.map((target) => `<label class="ins-check"><input type="checkbox" name="target_id" value="${safe(target.agent_id)}"${selectedTargets.has(target.agent_id) ? ' checked' : ''}><span><b>${safe(target.display_name)}</b><small>${safe(target.host)}</small></span></label>`).join('') || '<p class="ins-empty">暂无可用目标</p>'}</fieldset>
+    <fieldset aria-label="巡检项"><legend>巡检项</legend>${items.map((item) => { const key = `${item.id}:${Number(item.version)}`; return `<label class="ins-check"><input type="checkbox" name="item_version" value="${safe(key)}"${selectedItems.has(key) ? ' checked' : ''}><span><b>${safe(item.name)}</b><small>${safe(item.category)} · v${Number(item.version)}</small></span></label>`; }).join('') || '<p class="ins-empty">暂无可用巡检项</p>'}</fieldset>
+    <div class="ins-form-grid"><label>Cron 表达式<input name="cron" placeholder="0 2 * * *" value="${safe(editing?.schedule?.cron ?? '')}"></label><label>时区<input name="timezone" value="${safe(editing?.schedule?.timezone ?? 'Asia/Shanghai')}"></label></div>
+    <div class="ins-form-grid"><label>目标超时（秒）<input type="number" name="target_timeout_seconds" min="1" max="3600" value="${Number(editing?.target_timeout_seconds ?? 60)}"></label><label>最大并发<input type="number" name="max_concurrency" min="1" max="1000" value="${Number(editing?.max_concurrency ?? 10)}"></label></div>
+    <button type="submit" class="ins-primary" data-inspection-policy-save>${editing ? '更新策略' : '保存策略'}</button>
   </form>` : '';
-  const list = policies.length ? policies.map((policy) => `<article class="ins-policy-row"><div><span class="ins-state ${policy.enabled ? 'enabled' : 'disabled'}">${policy.enabled ? '已启用' : '已停用'}</span><h3>${safe(policy.name)}</h3><p>v${Number(policy.version)} · ${policy.target_ids?.length ?? 0} 个目标 · ${policy.item_versions?.length ?? 0} 个巡检项</p></div><div class="ins-row-actions">${permissions.execute === true ? `<button type="button" class="ins-primary" data-inspection-policy-run="${safe(policy.id)}">立即执行</button>` : ''}</div></article>`).join('') : '<div class="ins-empty"><h3>暂无巡检策略</h3><p>创建策略后可按计划调度或立即执行。</p></div>';
+  const list = policies.length ? policies.map((policy) => `<article class="ins-policy-row"><div><span class="ins-state ${policy.enabled ? 'enabled' : 'disabled'}">${policy.enabled ? '已启用' : '已停用'}</span><h3>${safe(policy.name)}</h3><p>v${Number(policy.version)} · ${policy.target_ids?.length ?? 0} 个目标 · ${policy.item_versions?.length ?? 0} 个巡检项</p></div><div class="ins-row-actions">${permissions.manage === true ? `<button type="button" class="ins-secondary" data-inspection-policy-edit="${safe(policy.id)}">编辑</button>` : ''}${permissions.execute === true ? `<button type="button" class="ins-primary" data-inspection-policy-run="${safe(policy.id)}">立即执行</button>` : ''}</div></article>`).join('') : '<div class="ins-empty"><h3>暂无巡检策略</h3><p>创建策略后可按计划调度或立即执行。</p></div>';
   return `<div class="ins-policy-layout"><section class="ins-panel"><div class="ins-panel-head"><div><span class="ins-kicker">POLICIES</span><h3>巡检策略</h3></div></div>${list}</section>${form}</div>`;
 }
 
@@ -77,16 +81,18 @@ export function renderInspectionReportMarkup(report = {}) {
 export function createInspectionCenter({ root, api, scope, permissions = {}, onToast = () => {} } = {}) {
   if (!root || typeof root.addEventListener !== 'function') throw new TypeError('inspection root is required');
   if (!api) throw new TypeError('inspection api is required');
-  const state = { view: 'overview', scope: normalizeScope(scope), permissions: { view: permissions.view !== false, manage: permissions.manage === true, execute: permissions.execute === true }, loading: false, error: null, data: null, selectedReport: null };
+  const state = { view: 'overview', scope: normalizeScope(scope), permissions: { view: permissions.view !== false, manage: permissions.manage === true, execute: permissions.execute === true }, loading: false, error: null, data: null, selectedReport: null, editingPolicy: null };
   let active = null;
   let version = 0;
 
   root.addEventListener('click', (event) => {
-    const target = event.target?.closest?.('[data-inspection-view],[data-inspection-retry-load],[data-inspection-policy-run],[data-inspection-run],[data-inspection-report],[data-inspection-cancel],[data-inspection-retry],[data-inspection-report-download]');
+    const target = event.target?.closest?.('[data-inspection-view],[data-inspection-retry-load],[data-inspection-policy-run],[data-inspection-policy-edit],[data-inspection-policy-edit-cancel],[data-inspection-run],[data-inspection-report],[data-inspection-cancel],[data-inspection-retry],[data-inspection-report-download]');
     if (!target) return;
     if (target.dataset.inspectionView) open(target.dataset.inspectionView);
     else if (target.hasAttribute('data-inspection-retry-load')) reload();
     else if (target.dataset.inspectionPolicyRun) action(() => api.runPolicy(state.scope, target.dataset.inspectionPolicyRun, newKey('policy-run')), '巡检已开始');
+    else if (target.dataset.inspectionPolicyEdit) editPolicy(target.dataset.inspectionPolicyEdit);
+    else if (target.hasAttribute('data-inspection-policy-edit-cancel')) cancelPolicyEdit();
     else if (target.dataset.inspectionRun) openRun(target.dataset.inspectionRun);
     else if (target.dataset.inspectionReport) openReport(target.dataset.inspectionReport);
     else if (target.dataset.inspectionCancel) action(() => api.cancelRun(state.scope, target.dataset.inspectionCancel, newKey('cancel')), '已提交取消请求');
@@ -101,13 +107,14 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     const targets = data.getAll('target_id').map(String);
     const items = data.getAll('item_version').map((value) => { const [item_id, raw] = String(value).split(':'); return { item_id, version: Number(raw) }; });
     const cron = String(data.get('cron') ?? '').trim();
-    const value = { name: String(data.get('name') ?? '').trim(), enabled: true, target_ids: targets, labels: {}, item_versions: items, target_timeout_seconds: 60, max_concurrency: 10, ...(cron ? { schedule: { cron, timezone: String(data.get('timezone') ?? '').trim() } } : {}) };
+    const value = { name: String(data.get('name') ?? '').trim(), enabled: data.get('enabled') === 'on', target_ids: targets, labels: { ...(state.editingPolicy?.labels ?? {}) }, item_versions: items, target_timeout_seconds: Number(data.get('target_timeout_seconds')), max_concurrency: Number(data.get('max_concurrency')), ...(cron ? { schedule: { cron, timezone: String(data.get('timezone') ?? '').trim() } } : {}) };
     if (!value.name || !targets.length || !items.length) { onToast('请填写策略名称并选择目标与巡检项'); return; }
-    action(() => api.createPolicy(state.scope, value, newKey('policy')), '巡检策略已创建');
+    if (state.editingPolicy) savePolicy(value);
+    else action(() => api.createPolicy(state.scope, value, newKey('policy')), '巡检策略已创建');
   });
 
-  function open(view = 'overview') { state.view = VIEWS.has(view) ? view : 'overview'; if (state.view !== 'report-detail') state.selectedReport = null; reload(); }
-  function setScope(next) { active?.abort(); state.scope = normalizeScope(next); state.view = 'overview'; state.data = null; state.selectedReport = null; reload(); }
+  function open(view = 'overview') { state.view = VIEWS.has(view) ? view : 'overview'; if (state.view !== 'report-detail') state.selectedReport = null; if (state.view !== 'policies') state.editingPolicy = null; reload(); }
+  function setScope(next) { active?.abort(); state.scope = normalizeScope(next); state.view = 'overview'; state.data = null; state.selectedReport = null; state.editingPolicy = null; reload(); }
   function openRun(id) { state.view = 'runs'; state.data = { selectedRunId: String(id) }; reload(); }
   function openReport(id) { state.view = 'report-detail'; state.selectedReport = String(id); state.data = null; reload(); }
   async function reload() {
@@ -126,7 +133,7 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
       let value;
       if (state.view === 'policies') {
         const [policies, targets, items] = await Promise.all([api.listPolicies(state.scope, { limit: 100 }, controller.signal), api.listTargets(state.scope, { limit: 100 }, controller.signal), api.listItems(state.scope, { limit: 100 }, controller.signal)]);
-        value = { source: policies.source, policies: policies.items ?? [], targets: targets.items ?? [], items: items.items ?? [] };
+        value = { source: policies.source, policies: policies.items ?? [], targets: targets.items ?? [], items: items.items ?? [], editing_policy: state.editingPolicy };
       } else if (state.view === 'runs') {
         const selected = state.data?.selectedRunId;
         value = selected ? await api.getRun(state.scope, selected, controller.signal) : await api.listRuns(state.scope, { limit: 50 }, controller.signal);
@@ -139,13 +146,62 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
       state.loading = false; state.error = error; state.data = null; render();
     }
   }
+  async function editPolicy(id) {
+    if (!state.permissions.manage) return;
+    active?.abort();
+    const controller = new AbortController(); active = controller; const current = ++version;
+    state.loading = true; state.error = null; render();
+    try {
+      const policy = await api.getPolicy(state.scope, String(id), controller.signal);
+      if (controller.signal.aborted || current !== version) return;
+      state.editingPolicy = policy;
+      state.data = { ...(state.data ?? {}), editing_policy: policy };
+      state.loading = false;
+      render();
+      return policy;
+    } catch (error) {
+      if (error?.name === 'AbortError' || controller.signal.aborted || current !== version) return;
+      state.loading = false;
+      state.error = error;
+      render();
+    }
+  }
+  function cancelPolicyEdit() {
+    state.editingPolicy = null;
+    if (state.data) state.data = { ...state.data, editing_policy: null };
+    render();
+  }
+  async function savePolicy(value) {
+    const editing = state.editingPolicy;
+    if (!editing || !state.permissions.manage) return;
+    active?.abort();
+    const controller = new AbortController(); active = controller; const current = ++version;
+    try {
+      await api.updatePolicy(state.scope, editing.id, value, editing.etag, newKey('policy-update'), controller.signal);
+      if (controller.signal.aborted || current !== version) return;
+      state.editingPolicy = null;
+      onToast('巡检策略已更新');
+      await reload();
+    } catch (error) {
+      if (error?.name === 'AbortError' || controller.signal.aborted || current !== version) return;
+      if (error?.status === 412 || error?.code === 'precondition_failed') {
+        state.editingPolicy = null;
+        onToast('策略已被其他操作者更新，已刷新最新版本');
+        await reload();
+        return;
+      }
+      onToast(inspectionFailureMessage(error, '策略'));
+    }
+  }
   function action(callback, message) { Promise.resolve().then(callback).then(() => { onToast(message); reload(); }).catch((error) => onToast(inspectionFailureMessage(error, '操作'))); }
   function download(id) { action(async () => { const descriptor = await api.downloadReport(state.scope, id, newKey('download')); if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer'); }, '报告下载已授权'); }
   function render() {
+    const source = state.data?.source;
+    const sourceBadge = source ? `<span class="ins-shell-source ${safe(source)}">${safe(sourceLabel(source))}</span>` : '';
     const body = state.error ? `<div class="ins-state-page error" role="alert"><h3>巡检数据加载失败</h3><p>${safe(inspectionFailureMessage(state.error))}</p><button type="button" class="ins-primary" data-inspection-retry-load>重试</button></div>`
       : state.loading && !state.data ? '<div class="ins-state-page" role="status"><span class="ins-spinner"></span><h3>正在加载巡检数据</h3></div>'
         : renderView();
-    root.innerHTML = `<section class="inspection-center"><header class="ins-hero"><div><span class="eyebrow">DBPILOT · HOST INSPECTION</span><h2>主机巡检</h2><p>统一策略、证据、执行进度与不可变报告。</p></div><span class="ins-scope">${safe(state.scope.tenantId)} / ${safe(state.scope.projectId)}</span></header><nav class="ins-tabs" aria-label="主机巡检视图"><button data-inspection-view="overview" class="${state.view === 'overview' ? 'active' : ''}">巡检概览</button><button data-inspection-view="policies" class="${state.view === 'policies' ? 'active' : ''}">巡检策略</button><button data-inspection-view="runs" class="${state.view === 'runs' ? 'active' : ''}">执行记录</button></nav>${state.loading && state.data ? '<div class="ins-refresh" role="status">正在刷新…</div>' : ''}${body}</section>`;
+    root.innerHTML = `<section class="inspection-center"><header class="ins-hero"><div><span class="eyebrow">DBPILOT · HOST INSPECTION</span><h2>主机巡检</h2><p>统一策略、证据、执行进度与不可变报告。</p></div><div class="ins-hero-meta">${sourceBadge}<span class="ins-scope">${safe(state.scope.tenantId)} / ${safe(state.scope.projectId)}</span></div></header><nav class="ins-tabs" aria-label="主机巡检视图"><button data-inspection-view="overview" class="${state.view === 'overview' ? 'active' : ''}">巡检概览</button><button data-inspection-view="policies" class="${state.view === 'policies' ? 'active' : ''}">巡检策略</button><button data-inspection-view="runs" class="${state.view === 'runs' ? 'active' : ''}">执行记录</button></nav>${state.loading && state.data ? '<div class="ins-refresh" role="status">正在刷新…</div>' : ''}${body}</section>`;
   }
   function renderView() {
     if (state.view === 'policies') return renderInspectionPolicyMarkup(state.data ?? {}, state.permissions);
@@ -157,7 +213,7 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     }
     return renderInspectionOverviewMarkup(state.data ?? {});
   }
-  return { open, setScope, reload };
+  return { open, setScope, reload, editPolicy, savePolicy, openRun, openReport };
 }
 
 function overviewCard(label, value, note, tone) { return `<article class="ins-overview-card ${tone}"><span>${label}</span><strong>${Number(value)}</strong><p>${note}</p></article>`; }

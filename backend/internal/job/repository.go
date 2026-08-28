@@ -21,6 +21,7 @@ type Repository interface {
 type CancellationSnapshotRepository interface {
 	RequestCancelWithSnapshot(context.Context, platformscope.Scope, string, string, int64, time.Time, CancellationSnapshotInput) (Job, error)
 	GetCancellationSnapshot(context.Context, platformscope.Scope, string, CancellationSnapshotKey) (CancellationSnapshot, error)
+	FindCancellationSnapshot(context.Context, platformscope.Scope, string, CancellationSnapshotCorrelation) (CancellationSnapshot, error)
 }
 
 // DispatchRepository is the explicitly privileged, cross-scope persistence
