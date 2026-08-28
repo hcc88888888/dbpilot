@@ -15,7 +15,6 @@
  */
 export declare const InspectionScopeType: {
     readonly Host: "host";
-    readonly Database: "database";
     readonly UnknownDefaultOpenApi: "11184809";
 };
 export type InspectionScopeType = typeof InspectionScopeType[keyof typeof InspectionScopeType];

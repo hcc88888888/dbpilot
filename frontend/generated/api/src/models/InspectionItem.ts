@@ -13,6 +13,13 @@
  */
 
 import { mapValues } from '../runtime.js';
+import type { InspectionEvidenceSelector } from './InspectionEvidenceSelector.js';
+import {
+    InspectionEvidenceSelectorFromJSON,
+    InspectionEvidenceSelectorFromJSONTyped,
+    InspectionEvidenceSelectorToJSON,
+    InspectionEvidenceSelectorToJSONTyped,
+} from './InspectionEvidenceSelector.js';
 import type { InspectionMetricRule } from './InspectionMetricRule.js';
 import {
     InspectionMetricRuleFromJSON,
@@ -20,13 +27,6 @@ import {
     InspectionMetricRuleToJSON,
     InspectionMetricRuleToJSONTyped,
 } from './InspectionMetricRule.js';
-import type { InspectionProbeRule } from './InspectionProbeRule.js';
-import {
-    InspectionProbeRuleFromJSON,
-    InspectionProbeRuleFromJSONTyped,
-    InspectionProbeRuleToJSON,
-    InspectionProbeRuleToJSONTyped,
-} from './InspectionProbeRule.js';
 import type { InspectionScopeType } from './InspectionScopeType.js';
 import {
     InspectionScopeTypeFromJSON,
@@ -96,12 +96,6 @@ export interface InspectionItem {
      * @type {Array<string>}
      * @memberof InspectionItem
      */
-    databaseTypes?: Array<string>;
-    /**
-     *
-     * @type {Array<string>}
-     * @memberof InspectionItem
-     */
     requiredCapabilities?: Array<string>;
     /**
      *
@@ -111,16 +105,10 @@ export interface InspectionItem {
     metricRule?: InspectionMetricRule;
     /**
      *
-     * @type {InspectionProbeRule}
+     * @type {InspectionEvidenceSelector}
      * @memberof InspectionItem
      */
-    probeRule?: InspectionProbeRule;
-    /**
-     *
-     * @type {string}
-     * @memberof InspectionItem
-     */
-    evidenceSelector: string;
+    evidenceSelector?: InspectionEvidenceSelector;
     /**
      *
      * @type {string}
@@ -172,7 +160,6 @@ export function instanceOfInspectionItem(value: object): value is InspectionItem
     if (!('category' in value) || value['category'] === undefined) return false;
     if (!('scopeType' in value) || value['scopeType'] === undefined) return false;
     if (!('sourceType' in value) || value['sourceType'] === undefined) return false;
-    if (!('evidenceSelector' in value) || value['evidenceSelector'] === undefined) return false;
     if (!('recommendationTemplate' in value) || value['recommendationTemplate'] === undefined) return false;
     if (!('system' in value) || value['system'] === undefined) return false;
     if (!('enabled' in value) || value['enabled'] === undefined) return false;
@@ -199,11 +186,9 @@ export function InspectionItemFromJSONTyped(json: any, ignoreDiscriminator: bool
         'category': json['category'],
         'scopeType': InspectionScopeTypeFromJSON(json['scope_type']),
         'sourceType': InspectionSourceTypeFromJSON(json['source_type']),
-        'databaseTypes': json['database_types'] == null ? undefined : json['database_types'],
         'requiredCapabilities': json['required_capabilities'] == null ? undefined : json['required_capabilities'],
         'metricRule': json['metric_rule'] == null ? undefined : InspectionMetricRuleFromJSON(json['metric_rule']),
-        'probeRule': json['probe_rule'] == null ? undefined : InspectionProbeRuleFromJSON(json['probe_rule']),
-        'evidenceSelector': json['evidence_selector'],
+        'evidenceSelector': json['evidence_selector'] == null ? undefined : InspectionEvidenceSelectorFromJSON(json['evidence_selector']),
         'recommendationTemplate': json['recommendation_template'],
         'documentationUrl': json['documentation_url'] == null ? undefined : json['documentation_url'],
         'system': json['system'],
@@ -232,11 +217,9 @@ export function InspectionItemToJSONTyped(value?: InspectionItem | null, ignoreD
         'category': value['category'],
         'scope_type': InspectionScopeTypeToJSON(value['scopeType']),
         'source_type': InspectionSourceTypeToJSON(value['sourceType']),
-        'database_types': value['databaseTypes'],
         'required_capabilities': value['requiredCapabilities'],
         'metric_rule': InspectionMetricRuleToJSON(value['metricRule']),
-        'probe_rule': InspectionProbeRuleToJSON(value['probeRule']),
-        'evidence_selector': value['evidenceSelector'],
+        'evidence_selector': InspectionEvidenceSelectorToJSON(value['evidenceSelector']),
         'recommendation_template': value['recommendationTemplate'],
         'documentation_url': value['documentationUrl'],
         'system': value['system'],

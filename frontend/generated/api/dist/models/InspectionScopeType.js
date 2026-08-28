@@ -17,7 +17,6 @@
  */
 export const InspectionScopeType = {
     Host: 'host',
-    Database: 'database',
     UnknownDefaultOpenApi: '11184809'
 };
 export function instanceOfInspectionScopeType(value) {

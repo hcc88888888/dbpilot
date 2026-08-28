@@ -53,6 +53,36 @@ function resolveComponentSchema(document, schema) {
   return document.components.schemas[name];
 }
 
+function hasTimeZone(name) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: name });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function validationContext(document) {
+  const ajv = new Ajv({ allErrors: true, strict: false });
+  addFormats(ajv);
+  ajv.addFormat('iana-timezone', { type: 'string', validate: hasTimeZone });
+  document.$id = 'https://dbpilot.local/openapi.json';
+  ajv.addSchema(document);
+  return ajv;
+}
+
+function inspectionItemRequest(sourceType, sourceRule) {
+  return {
+    name: 'Host item',
+    description: 'Host-only inspection item.',
+    category: 'capacity',
+    scope_type: 'host',
+    source_type: sourceType,
+    recommendation_template: 'Take the documented host action.',
+    ...sourceRule,
+  };
+}
+
 test('inspection operations protect reads and writes with the documented permissions and concurrency headers', async () => {
   const document = await bundleContract();
   const operations = allOperations(document);
@@ -112,19 +142,24 @@ test('inspection DTOs bound host data, status vocabularies, and public examples'
   assert.deepEqual(resolveComponentSchema(document, schemas.InspectionMetricRule.properties.operator).enum, ['gt', 'gte', 'lt', 'lte']);
   assert.equal(schemas.CreateInspectionRunRequest.properties.target_ids.maxItems, 10000);
   assert.equal(schemas.InspectionPolicy.properties.item_versions.maxItems, 200);
-  assert.equal(schemas.InspectionItem.properties.evidence_selector.maxLength, 65536);
+  assert.deepEqual(schemas.InspectionScopeType.enum, ['host']);
+  assert.deepEqual(schemas.InspectionSourceType.enum, ['metric', 'metadata', 'log_summary']);
+  assert.equal(schemas.InspectionProbeRule, undefined);
+  assert.equal(schemas.InspectionItem.properties.database_types, undefined);
+  assert.equal(schemas.CreateInspectionItemRequest.properties.database_types, undefined);
+  assert.equal(schemas.InspectionEvidenceSelector.additionalProperties, false);
+  assert.equal(schemas.InspectionEvidenceSelector.properties.fields.maxItems, 16);
+  assert.equal(schemas.InspectionEvidenceSelector.properties.fields.uniqueItems, true);
+  assert.equal(schemas.InspectionEvidenceSelector.properties.fields.items.pattern, '^[a-z][a-z0-9_.]{1,127}$');
   assert.equal(schemas.InspectionPolicy.properties.name.maxLength, 120);
   assert.equal(schemas.InspectionSchedule.properties.cron.pattern, '^(?:[^\\s]+\\s+){4}[^\\s]+$');
   assert.equal(schemas.InspectionSchedule.properties.timezone.format, 'iana-timezone');
+  assert.equal(schemas.InspectionSchedule.properties.timezone.pattern, '^[A-Za-z][A-Za-z0-9._+/-]{0,127}$');
 
   const targetProperties = Object.keys(schemas.InspectionTarget.properties).sort();
   assert.deepEqual(targetProperties, ['agent_id', 'capabilities', 'connectivity', 'display_name', 'host', 'labels']);
 
-  const ajv = new Ajv({ allErrors: true, strict: false });
-  addFormats(ajv);
-  ajv.addFormat('iana-timezone', /^[A-Za-z_]+(?:\/[A-Za-z_+-]+)+$/);
-  document.$id = 'https://dbpilot.local/openapi.json';
-  ajv.addSchema(document);
+  const ajv = validationContext(document);
   const examples = [
     ['items.json', 'InspectionItemPage'],
     ['policy.json', 'InspectionPolicy'],
@@ -137,4 +172,71 @@ test('inspection DTOs bound host data, status vocabularies, and public examples'
     assert.ok(validate, `${schemaName} schema is available for ${fileName}`);
     assert.equal(validate(value), true, `${fileName}: ${ajv.errorsText(validate.errors)}`);
   }
+});
+
+test('host inspection item source variants reject executable evidence and ambiguous rule shapes', async () => {
+  const document = await bundleContract();
+  const ajv = validationContext(document);
+  const validateRequest = ajv.getSchema('https://dbpilot.local/openapi.json#/components/schemas/CreateInspectionItemRequest');
+  const validateItem = ajv.getSchema('https://dbpilot.local/openapi.json#/components/schemas/InspectionItem');
+  assert.ok(validateRequest);
+  assert.ok(validateItem);
+
+  const metricRule = {
+    metric_rule: {
+      metric_name: 'host.cpu.utilization', window: '15m', aggregation: 'avg', operator: 'gte',
+      warning_threshold: 75, critical_threshold: 90,
+    },
+  };
+  const evidenceSelector = { evidence_selector: { fields: ['host.cpu.utilization'] } };
+  const metric = inspectionItemRequest('metric', metricRule);
+  const metadata = inspectionItemRequest('metadata', evidenceSelector);
+  const logSummary = inspectionItemRequest('log_summary', evidenceSelector);
+
+  for (const value of [metric, metadata, logSummary]) {
+    assert.equal(validateRequest(value), true, ajv.errorsText(validateRequest.errors));
+  }
+  const item = {
+    ...metric,
+    id: 'host-cpu-utilization', version: 1, system: true, enabled: true,
+    created_at: '2026-08-28T08:00:00Z', updated_at: '2026-08-28T08:00:00Z',
+  };
+  assert.equal(validateItem(item), true, ajv.errorsText(validateItem.errors));
+
+  for (const invalid of [
+    inspectionItemRequest('metric', {}),
+    inspectionItemRequest('metric', { ...metricRule, ...evidenceSelector }),
+    inspectionItemRequest('metadata', {}),
+    inspectionItemRequest('metadata', { ...metricRule, ...evidenceSelector }),
+    inspectionItemRequest('log_summary', { evidence_selector: { fields: ['SELECT * FROM users'] } }),
+    inspectionItemRequest('log_summary', { evidence_selector: { fields: ['rm -rf /'] } }),
+  ]) {
+    assert.equal(validateRequest(invalid), false, 'invalid source-specific item configuration is rejected');
+  }
+});
+
+test('inspection schedules use TZDB-recognized IANA names and overview maps reject unknown status keys', async () => {
+  const document = await bundleContract();
+  const ajv = validationContext(document);
+  const validateSchedule = ajv.getSchema('https://dbpilot.local/openapi.json#/components/schemas/InspectionSchedule');
+  const validateOverview = ajv.getSchema('https://dbpilot.local/openapi.json#/components/schemas/InspectionOverview');
+  assert.ok(validateSchedule);
+  assert.ok(validateOverview);
+
+  for (const timezone of ['UTC', 'Asia/Shanghai', 'Etc/GMT+5']) {
+    assert.equal(hasTimeZone(timezone), true, `${timezone} exists in Node ICU`);
+    assert.equal(validateSchedule({ cron: '0 */6 * * *', timezone }), true, ajv.errorsText(validateSchedule.errors));
+  }
+  assert.equal(hasTimeZone('Foo/Bar'), false, 'Foo/Bar is absent from Node ICU');
+  assert.equal(validateSchedule({ cron: '0 */6 * * *', timezone: 'Foo/Bar' }), false);
+
+  const overview = {
+    target_count: 2,
+    online_target_count: 2,
+    latest_run_status_counts: { queued: 1, partial: 1 },
+    finding_level_counts: { healthy: 4, warning: 1 },
+  };
+  assert.equal(validateOverview(overview), true, ajv.errorsText(validateOverview.errors));
+  assert.equal(validateOverview({ ...overview, latest_run_status_counts: { queued: 1, future_status: 1 } }), false);
+  assert.equal(validateOverview({ ...overview, finding_level_counts: { healthy: 1, future_level: 1 } }), false);
 });

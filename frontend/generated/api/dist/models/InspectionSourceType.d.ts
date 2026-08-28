@@ -17,7 +17,6 @@ export declare const InspectionSourceType: {
     readonly Metric: "metric";
     readonly Metadata: "metadata";
     readonly LogSummary: "log_summary";
-    readonly Probe: "probe";
     readonly UnknownDefaultOpenApi: "11184809";
 };
 export type InspectionSourceType = typeof InspectionSourceType[keyof typeof InspectionSourceType];

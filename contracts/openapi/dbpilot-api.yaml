@@ -87,8 +87,8 @@ components:
       $ref: ./common/inspection.yaml#/InspectionTargetPage
     InspectionMetricRule:
       $ref: ./common/inspection.yaml#/InspectionMetricRule
-    InspectionProbeRule:
-      $ref: ./common/inspection.yaml#/InspectionProbeRule
+    InspectionEvidenceSelector:
+      $ref: ./common/inspection.yaml#/InspectionEvidenceSelector
     InspectionItem:
       $ref: ./common/inspection.yaml#/InspectionItem
     InspectionItemPage:

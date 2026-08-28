@@ -15,6 +15,7 @@ models/CreateInspectionRunRequest.ts
 models/DownloadDescriptor.ts
 models/FieldError.ts
 models/InspectionConnectivity.ts
+models/InspectionEvidenceSelector.ts
 models/InspectionFinding.ts
 models/InspectionFindingLevel.ts
 models/InspectionItem.ts
@@ -24,10 +25,11 @@ models/InspectionMetricOperator.ts
 models/InspectionMetricRule.ts
 models/InspectionMetricWindow.ts
 models/InspectionOverview.ts
+models/InspectionOverviewFindingLevelCounts.ts
+models/InspectionOverviewLatestRunStatusCounts.ts
 models/InspectionPolicy.ts
 models/InspectionPolicyItem.ts
 models/InspectionPolicyPage.ts
-models/InspectionProbeRule.ts
 models/InspectionReport.ts
 models/InspectionReportPage.ts
 models/InspectionReportStatus.ts

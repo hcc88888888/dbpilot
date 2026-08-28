@@ -11,6 +11,8 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import { InspectionOverviewFindingLevelCountsFromJSON, InspectionOverviewFindingLevelCountsToJSON, } from './InspectionOverviewFindingLevelCounts.js';
+import { InspectionOverviewLatestRunStatusCountsFromJSON, InspectionOverviewLatestRunStatusCountsToJSON, } from './InspectionOverviewLatestRunStatusCounts.js';
 /**
  * Check if a given object implements the InspectionOverview interface.
  */
@@ -36,8 +38,8 @@ export function InspectionOverviewFromJSONTyped(json, ignoreDiscriminator) {
         ...json,
         'targetCount': json['target_count'],
         'onlineTargetCount': json['online_target_count'],
-        'latestRunStatusCounts': json['latest_run_status_counts'],
-        'findingLevelCounts': json['finding_level_counts'],
+        'latestRunStatusCounts': InspectionOverviewLatestRunStatusCountsFromJSON(json['latest_run_status_counts']),
+        'findingLevelCounts': InspectionOverviewFindingLevelCountsFromJSON(json['finding_level_counts']),
     };
 }
 export function InspectionOverviewToJSON(json) {
@@ -51,7 +53,7 @@ export function InspectionOverviewToJSONTyped(value, ignoreDiscriminator = false
         ...value,
         'target_count': value['targetCount'],
         'online_target_count': value['onlineTargetCount'],
-        'latest_run_status_counts': value['latestRunStatusCounts'],
-        'finding_level_counts': value['findingLevelCounts'],
+        'latest_run_status_counts': InspectionOverviewLatestRunStatusCountsToJSON(value['latestRunStatusCounts']),
+        'finding_level_counts': InspectionOverviewFindingLevelCountsToJSON(value['findingLevelCounts']),
     };
 }

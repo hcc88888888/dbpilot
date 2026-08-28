@@ -9,6 +9,8 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import type { InspectionOverviewFindingLevelCounts } from './InspectionOverviewFindingLevelCounts.js';
+import type { InspectionOverviewLatestRunStatusCounts } from './InspectionOverviewLatestRunStatusCounts.js';
 /**
  *
  * @export
@@ -30,20 +32,16 @@ export interface InspectionOverview {
     onlineTargetCount: number;
     /**
      *
-     * @type {{ [key: string]: number; }}
+     * @type {InspectionOverviewLatestRunStatusCounts}
      * @memberof InspectionOverview
      */
-    latestRunStatusCounts: {
-        [key: string]: number;
-    };
+    latestRunStatusCounts: InspectionOverviewLatestRunStatusCounts;
     /**
      *
-     * @type {{ [key: string]: number; }}
+     * @type {InspectionOverviewFindingLevelCounts}
      * @memberof InspectionOverview
      */
-    findingLevelCounts: {
-        [key: string]: number;
-    };
+    findingLevelCounts: InspectionOverviewFindingLevelCounts;
 }
 /**
  * Check if a given object implements the InspectionOverview interface.

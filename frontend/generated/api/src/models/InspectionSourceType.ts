@@ -21,7 +21,6 @@ export const InspectionSourceType = {
     Metric: 'metric',
     Metadata: 'metadata',
     LogSummary: 'log_summary',
-    Probe: 'probe',
     UnknownDefaultOpenApi: '11184809'
 } as const;
 export type InspectionSourceType = typeof InspectionSourceType[keyof typeof InspectionSourceType];

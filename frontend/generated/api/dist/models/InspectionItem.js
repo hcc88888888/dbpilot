@@ -11,8 +11,8 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import { InspectionEvidenceSelectorFromJSON, InspectionEvidenceSelectorToJSON, } from './InspectionEvidenceSelector.js';
 import { InspectionMetricRuleFromJSON, InspectionMetricRuleToJSON, } from './InspectionMetricRule.js';
-import { InspectionProbeRuleFromJSON, InspectionProbeRuleToJSON, } from './InspectionProbeRule.js';
 import { InspectionScopeTypeFromJSON, InspectionScopeTypeToJSON, } from './InspectionScopeType.js';
 import { InspectionSourceTypeFromJSON, InspectionSourceTypeToJSON, } from './InspectionSourceType.js';
 /**
@@ -32,8 +32,6 @@ export function instanceOfInspectionItem(value) {
     if (!('scopeType' in value) || value['scopeType'] === undefined)
         return false;
     if (!('sourceType' in value) || value['sourceType'] === undefined)
-        return false;
-    if (!('evidenceSelector' in value) || value['evidenceSelector'] === undefined)
         return false;
     if (!('recommendationTemplate' in value) || value['recommendationTemplate'] === undefined)
         return false;
@@ -63,11 +61,9 @@ export function InspectionItemFromJSONTyped(json, ignoreDiscriminator) {
         'category': json['category'],
         'scopeType': InspectionScopeTypeFromJSON(json['scope_type']),
         'sourceType': InspectionSourceTypeFromJSON(json['source_type']),
-        'databaseTypes': json['database_types'] == null ? undefined : json['database_types'],
         'requiredCapabilities': json['required_capabilities'] == null ? undefined : json['required_capabilities'],
         'metricRule': json['metric_rule'] == null ? undefined : InspectionMetricRuleFromJSON(json['metric_rule']),
-        'probeRule': json['probe_rule'] == null ? undefined : InspectionProbeRuleFromJSON(json['probe_rule']),
-        'evidenceSelector': json['evidence_selector'],
+        'evidenceSelector': json['evidence_selector'] == null ? undefined : InspectionEvidenceSelectorFromJSON(json['evidence_selector']),
         'recommendationTemplate': json['recommendation_template'],
         'documentationUrl': json['documentation_url'] == null ? undefined : json['documentation_url'],
         'system': json['system'],
@@ -92,11 +88,9 @@ export function InspectionItemToJSONTyped(value, ignoreDiscriminator = false) {
         'category': value['category'],
         'scope_type': InspectionScopeTypeToJSON(value['scopeType']),
         'source_type': InspectionSourceTypeToJSON(value['sourceType']),
-        'database_types': value['databaseTypes'],
         'required_capabilities': value['requiredCapabilities'],
         'metric_rule': InspectionMetricRuleToJSON(value['metricRule']),
-        'probe_rule': InspectionProbeRuleToJSON(value['probeRule']),
-        'evidence_selector': value['evidenceSelector'],
+        'evidence_selector': InspectionEvidenceSelectorToJSON(value['evidenceSelector']),
         'recommendation_template': value['recommendationTemplate'],
         'documentation_url': value['documentationUrl'],
         'system': value['system'],

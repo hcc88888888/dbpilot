@@ -19,7 +19,6 @@
  */
 export const InspectionScopeType = {
     Host: 'host',
-    Database: 'database',
     UnknownDefaultOpenApi: '11184809'
 } as const;
 export type InspectionScopeType = typeof InspectionScopeType[keyof typeof InspectionScopeType];

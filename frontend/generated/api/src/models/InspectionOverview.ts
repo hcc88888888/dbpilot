@@ -13,6 +13,21 @@
  */
 
 import { mapValues } from '../runtime.js';
+import type { InspectionOverviewFindingLevelCounts } from './InspectionOverviewFindingLevelCounts.js';
+import {
+    InspectionOverviewFindingLevelCountsFromJSON,
+    InspectionOverviewFindingLevelCountsFromJSONTyped,
+    InspectionOverviewFindingLevelCountsToJSON,
+    InspectionOverviewFindingLevelCountsToJSONTyped,
+} from './InspectionOverviewFindingLevelCounts.js';
+import type { InspectionOverviewLatestRunStatusCounts } from './InspectionOverviewLatestRunStatusCounts.js';
+import {
+    InspectionOverviewLatestRunStatusCountsFromJSON,
+    InspectionOverviewLatestRunStatusCountsFromJSONTyped,
+    InspectionOverviewLatestRunStatusCountsToJSON,
+    InspectionOverviewLatestRunStatusCountsToJSONTyped,
+} from './InspectionOverviewLatestRunStatusCounts.js';
+
 /**
  *
  * @export
@@ -34,16 +49,16 @@ export interface InspectionOverview {
     onlineTargetCount: number;
     /**
      *
-     * @type {{ [key: string]: number; }}
+     * @type {InspectionOverviewLatestRunStatusCounts}
      * @memberof InspectionOverview
      */
-    latestRunStatusCounts: { [key: string]: number; };
+    latestRunStatusCounts: InspectionOverviewLatestRunStatusCounts;
     /**
      *
-     * @type {{ [key: string]: number; }}
+     * @type {InspectionOverviewFindingLevelCounts}
      * @memberof InspectionOverview
      */
-    findingLevelCounts: { [key: string]: number; };
+    findingLevelCounts: InspectionOverviewFindingLevelCounts;
 }
 
 /**
@@ -70,8 +85,8 @@ export function InspectionOverviewFromJSONTyped(json: any, ignoreDiscriminator: 
             ...json,
         'targetCount': json['target_count'],
         'onlineTargetCount': json['online_target_count'],
-        'latestRunStatusCounts': json['latest_run_status_counts'],
-        'findingLevelCounts': json['finding_level_counts'],
+        'latestRunStatusCounts': InspectionOverviewLatestRunStatusCountsFromJSON(json['latest_run_status_counts']),
+        'findingLevelCounts': InspectionOverviewFindingLevelCountsFromJSON(json['finding_level_counts']),
     };
 }
 
@@ -89,7 +104,7 @@ export function InspectionOverviewToJSONTyped(value?: InspectionOverview | null,
             ...value,
         'target_count': value['targetCount'],
         'online_target_count': value['onlineTargetCount'],
-        'latest_run_status_counts': value['latestRunStatusCounts'],
-        'finding_level_counts': value['findingLevelCounts'],
+        'latest_run_status_counts': InspectionOverviewLatestRunStatusCountsToJSON(value['latestRunStatusCounts']),
+        'finding_level_counts': InspectionOverviewFindingLevelCountsToJSON(value['findingLevelCounts']),
     };
 }

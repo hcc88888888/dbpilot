@@ -18,7 +18,6 @@
         "warning_threshold": 75,
         "critical_threshold": 90
       },
-      "evidence_selector": "host.cpu.utilization",
       "recommendation_template": "Reduce host CPU contention or scale the workload.",
       "system": true,
       "enabled": true,

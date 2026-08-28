@@ -19,7 +19,6 @@ export const InspectionSourceType = {
     Metric: 'metric',
     Metadata: 'metadata',
     LogSummary: 'log_summary',
-    Probe: 'probe',
     UnknownDefaultOpenApi: '11184809'
 };
 export function instanceOfInspectionSourceType(value) {

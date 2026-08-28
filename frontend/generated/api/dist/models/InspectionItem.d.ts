@@ -9,8 +9,8 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import type { InspectionEvidenceSelector } from './InspectionEvidenceSelector.js';
 import type { InspectionMetricRule } from './InspectionMetricRule.js';
-import type { InspectionProbeRule } from './InspectionProbeRule.js';
 import type { InspectionScopeType } from './InspectionScopeType.js';
 import type { InspectionSourceType } from './InspectionSourceType.js';
 /**
@@ -67,12 +67,6 @@ export interface InspectionItem {
      * @type {Array<string>}
      * @memberof InspectionItem
      */
-    databaseTypes?: Array<string>;
-    /**
-     *
-     * @type {Array<string>}
-     * @memberof InspectionItem
-     */
     requiredCapabilities?: Array<string>;
     /**
      *
@@ -82,16 +76,10 @@ export interface InspectionItem {
     metricRule?: InspectionMetricRule;
     /**
      *
-     * @type {InspectionProbeRule}
+     * @type {InspectionEvidenceSelector}
      * @memberof InspectionItem
      */
-    probeRule?: InspectionProbeRule;
-    /**
-     *
-     * @type {string}
-     * @memberof InspectionItem
-     */
-    evidenceSelector: string;
+    evidenceSelector?: InspectionEvidenceSelector;
     /**
      *
      * @type {string}
