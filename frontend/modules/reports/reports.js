@@ -94,7 +94,8 @@ export function renderReportDetailMarkup(report = {}, permissions = {}) {
   const email = report.email ?? {};
   const recipients = Array.isArray(email.recipients) ? email.recipients : [];
   const sent = Boolean(email.sent_at);
-  const canSendEmail = permissions.manage === true && !sent;
+  const inspectionArtifact = report.inspection_artifact === true;
+  const canSendEmail = permissions.manage === true && !sent && !inspectionArtifact;
   return `<div class="rpt-detail-head">
       <button class="rpt-back" data-reports-view="reports">← 报告列表</button>
       <span class="rpt-tag ${safeText(report.status)}">${safeText(reportStatusLabel(report.status))}</span>
@@ -104,7 +105,7 @@ export function renderReportDetailMarkup(report = {}, permissions = {}) {
     <div class="rpt-meta-grid">${metaItem('报告编号', report.id)}${metaItem('报告类型', reportTypeLabel(report.type))}${metaItem('所属实例', report.instance_name || report.instance_id || '—')}${metaItem('创建人', report.created_by || '—')}${metaItem('生成时间', formatReportTime(report.generated_at || report.created_at))}${metaItem('文件格式', formatReportLabel(report.format))}${metaItem('文件大小', report.size_kb ? `${report.size_kb} KB` : '—')}</div>
     ${report.failure ? `<div class="rpt-alert">${safeText(report.failure)}</div>` : ''}
     <article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">HIGHLIGHTS</span><h3>报告要点</h3></div><span class="rpt-issue-count ${issues > 0 ? 'danger' : ''}">问题数 ${issues}</span></div>${highlights.length ? `<ul class="rpt-highlights">${highlights.map((item) => `<li>${safeText(item)}</li>`).join('')}</ul>` : '<p class="rpt-muted">暂无要点。</p>'}</article>
-    <article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">DISTRIBUTION</span><h3>邮件分发</h3></div></div>${sent ? `<p class="rpt-muted">已于 ${safeText(formatReportTime(email.sent_at))} 发送给：</p><ul class="rpt-recipients">${recipients.map((item) => `<li>${safeText(item)}</li>`).join('')}</ul>` : `<p class="rpt-muted">尚未发送邮件。</p>${canSendEmail ? `<button class="rpt-btn-primary" data-reports-email="${safeText(report.id)}">发送邮件</button>` : ''}`}</article>`;
+    ${inspectionArtifact ? '<article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">IMMUTABLE ARTIFACT</span><h3>巡检报告文件</h3></div></div><p class="rpt-muted">真实巡检报告仅提供经过授权的 HTML / JSON 下载。</p></article>' : `<article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">DISTRIBUTION</span><h3>邮件分发</h3></div></div>${sent ? `<p class="rpt-muted">已于 ${safeText(formatReportTime(email.sent_at))} 发送给：</p><ul class="rpt-recipients">${recipients.map((item) => `<li>${safeText(item)}</li>`).join('')}</ul>` : `<p class="rpt-muted">尚未发送邮件。</p>${canSendEmail ? `<button class="rpt-btn-primary" data-reports-email="${safeText(report.id)}">发送邮件</button>` : ''}`}</article>`}`;
 }
 
 export function createReportsCenter({ root, api, scope, permissions = {}, onToast = () => {} } = {}) {
@@ -130,6 +131,8 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
   };
   let activeRequest = null;
   let requestVersion = 0;
+  let reportCursor = null;
+  let reportCursorHistory = [];
 
   root.addEventListener('click', (event) => {
     const target = event.target;
@@ -155,7 +158,7 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     } else if (match.dataset.reportsEmail) {
       openEmailModal(match.dataset.reportsEmail);
     } else if (match.dataset.reportsDownload) {
-      onToast(`报告 ${match.dataset.reportsDownload} 的下载已开始`);
+      handleDownload(match.dataset.reportsDownload);
     } else if (match.hasAttribute('data-reports-template-new')) {
       openTemplateForm(null);
     } else if (match.dataset.reportsTemplateEdit) {
@@ -171,7 +174,9 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     const target = event.target;
     if (!target?.dataset?.reportsFilter) return;
     state.filters[target.dataset.reportsFilter] = target.value;
-    if (target.dataset.reportsFilter !== 'query') state.filters.page = 1;
+    reportCursor = null;
+    reportCursorHistory = [];
+    state.filters.page = 1;
     reload();
   });
 
@@ -212,6 +217,8 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     state.reports = null;
     state.templates = null;
     state.filters = { type: '', status: '', query: '', page: 1 };
+    reportCursor = null;
+    reportCursorHistory = [];
     state.modal = null;
     reload();
   }
@@ -235,8 +242,16 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
   }
 
   function handlePager(direction) {
-    const next = direction === 'next' ? state.filters.page + 1 : Math.max(1, state.filters.page - 1);
-    state.filters.page = next;
+    if (direction === 'next') {
+      if (!state.reports?.nextCursor) return;
+      reportCursorHistory.push(reportCursor);
+      reportCursor = state.reports.nextCursor;
+      state.filters.page += 1;
+    } else {
+      if (state.filters.page <= 1) return;
+      reportCursor = reportCursorHistory.pop() ?? null;
+      state.filters.page = Math.max(1, state.filters.page - 1);
+    }
     reload();
   }
 
@@ -346,6 +361,20 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     onToast(reportsFailureMessage(error, '报告'));
   }
 
+  function handleDownload(id) {
+    if (typeof api.downloadReport !== 'function') {
+      onToast('当前报告暂不支持下载');
+      return;
+    }
+    const key = `report-download-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+    api.downloadReport(state.scope, id, key)
+      .then((descriptor) => {
+        if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer');
+        onToast(`报告 ${id} 的下载已开始`);
+      })
+      .catch((error) => handleActionError(error));
+  }
+
   async function reload() {
     abortActive();
     const controller = new AbortController();
@@ -371,8 +400,7 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
 
   function loadViewData(signal) {
     if (state.view === 'reports') {
-      const offset = (state.filters.page - 1) * REPORT_PAGE_SIZE;
-      return api.listReports(state.scope, buildReportFilters([['type', state.filters.type], ['status', state.filters.status], ['query', state.filters.query], ['offset', offset], ['limit', REPORT_PAGE_SIZE]]), signal);
+      return api.listReports(state.scope, buildReportFilters([['type', state.filters.type], ['status', state.filters.status], ['query', state.filters.query], ['cursor', reportCursor], ['limit', REPORT_PAGE_SIZE]]), signal);
     }
     if (state.view === 'report-detail') return api.getReport(state.scope, state.selectedReportId, signal);
     if (state.view === 'templates') return api.listTemplates(state.scope, signal);
@@ -398,6 +426,7 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
 
   function renderWorkbench() {
     const source = state.source ? `<span class="rpt-source ${safeText(state.source)}">${safeText(reportsSourceLabel(state.source))}</span>` : '';
+    const inspectionOnly = state.source === 'control-plane';
     const body = state.error
       ? renderReportsError(state.error)
       : state.loading && !hasData()
@@ -410,8 +439,8 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
               ? renderTemplatesView(state.templates ?? {})
               : renderOverviewView(state.overview ?? {});
     return `<section class="rpt-center">
-    <div class="rpt-hero"><div><span class="eyebrow">DBPILOT · REPORT CENTER</span><h2>报告中心</h2><p>统一管理巡检与运维报告，按模板生成、下载并邮件分发。</p></div><div class="rpt-hero-meta">${source}<span class="rpt-scope">${safeText(state.scope.tenantId)} / ${safeText(state.scope.projectId)}</span></div></div>
-    <div class="rpt-toolbar"><nav class="rpt-tabs" aria-label="报告视图"><button class="${state.view === 'overview' ? 'active' : ''}" data-reports-view="overview">报告概览</button><button class="${state.view === 'reports' || state.view === 'report-detail' ? 'active' : ''}" data-reports-view="reports">报告列表</button><button class="${state.view === 'templates' ? 'active' : ''}" data-reports-view="templates">模板管理</button></nav>${state.view === 'reports' && state.permissions.manage === true ? '<button class="rpt-btn-primary" data-reports-generate>＋ 生成报告</button>' : ''}</div>
+    <div class="rpt-hero"><div><span class="eyebrow">DBPILOT · REPORT CENTER</span><h2>报告中心</h2><p>${inspectionOnly ? '统一管理不可变巡检报告与 HTML / JSON 授权下载。' : '统一管理巡检与运维报告，按模板生成、下载并邮件分发。'}</p></div><div class="rpt-hero-meta">${source}<span class="rpt-scope">${safeText(state.scope.tenantId)} / ${safeText(state.scope.projectId)}</span></div></div>
+    <div class="rpt-toolbar"><nav class="rpt-tabs" aria-label="报告视图"><button class="${state.view === 'overview' ? 'active' : ''}" data-reports-view="overview">报告概览</button><button class="${state.view === 'reports' || state.view === 'report-detail' ? 'active' : ''}" data-reports-view="reports">报告列表</button>${inspectionOnly ? '' : `<button class="${state.view === 'templates' ? 'active' : ''}" data-reports-view="templates">模板管理</button>`}</nav>${!inspectionOnly && state.view === 'reports' && state.permissions.manage === true ? '<button class="rpt-btn-primary" data-reports-generate>＋ 生成报告</button>' : ''}</div>
     ${state.loading && hasData() ? '<div class="rpt-progress" role="status">正在刷新…</div>' : ''}
     ${body}
     ${renderModal()}
@@ -434,12 +463,13 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
   function renderOverviewView(overview = {}) {
     const stats = overview?.stats ?? {};
     const recent = Array.isArray(overview?.recent_reports) ? overview.recent_reports : [];
+    const inspectionOnly = overview?.source === 'control-plane';
     return `<div class="rpt-overview">
-    <div class="rpt-section-head"><div><h3>报告概览</h3><p>报告生成、分发与模板使用情况的整体视图。</p></div>${state.permissions.manage === true ? '<button class="rpt-btn-primary" data-reports-generate>立即生成报告</button>' : ''}</div>
+    <div class="rpt-section-head"><div><h3>报告概览</h3><p>${inspectionOnly ? '真实巡检报告由巡检执行自动生成并不可变。' : '报告生成、分发与模板使用情况的整体视图。'}</p></div>${!inspectionOnly && state.permissions.manage === true ? '<button class="rpt-btn-primary" data-reports-generate>立即生成报告</button>' : ''}</div>
     <div class="rpt-stats">
       ${statCard('本周生成', stats.generated_this_week ?? 0, 'week')}
-      ${statCard('待发送', stats.pending_send ?? 0, 'pending')}
-      ${statCard('报告模板', stats.template_count ?? 0, 'template')}
+      ${inspectionOnly ? statCard('最近报告', recent.length, 'pending') : statCard('待发送', stats.pending_send ?? 0, 'pending')}
+      ${inspectionOnly ? statCard('文件格式', 'HTML / JSON', 'template') : statCard('报告模板', stats.template_count ?? 0, 'template')}
       ${statCard('生成成功率', formatSuccessRate(stats.success_rate), 'rate')}
     </div>
     <article class="rpt-panel"><div class="rpt-panel-head"><div><span class="rpt-kicker">RECENT REPORTS</span><h3>最近报告</h3></div><button class="rpt-link-btn" data-reports-view="reports">查看全部 →</button></div>${renderRecentReportRows(recent)}</article>
@@ -447,12 +477,13 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
   }
 
   function renderReportsView(response = {}) {
+    const inspectionOnly = response?.source === 'control-plane';
     return `<div class="rpt-reports">
-    <div class="rpt-section-head"><div><h3>报告列表</h3><p>按类型、状态与关键字筛选报告，进入详情完成下载与邮件分发。</p></div><div class="rpt-filters">
+    <div class="rpt-section-head"><div><h3>报告列表</h3><p>${inspectionOnly ? '查看不可变巡检报告并创建短时效下载授权。' : '按类型、状态与关键字筛选报告，进入详情完成下载与邮件分发。'}</p></div>${inspectionOnly ? '' : `<div class="rpt-filters">
       <label>类型<select class="rpt-select" data-reports-filter="type"><option value="">全部</option>${typeOptions(state.filters.type)}</select></label>
       <label>状态<select class="rpt-select" data-reports-filter="status"><option value="">全部</option>${statusOptions(state.filters.status)}</select></label>
       <label>搜索<input class="rpt-input" type="search" data-reports-filter="query" value="${safeText(state.filters.query)}" placeholder="标题 / 编号 / 实例"></label>
-    </div></div>
+    </div>`}</div>
     <article class="rpt-panel rpt-table-wrap">${renderReportListMarkup(response, state.filters, state.permissions)}</article>
   </div>`;
   }
@@ -547,7 +578,7 @@ function reportActions(report, manage) {
   if (report.status === 'ready' || report.status === 'sent') {
     actions.push(`<button class="rpt-link-btn" data-reports-download="${safeText(report.id)}">下载</button>`);
   }
-  if (report.status === 'ready' && manage) {
+  if (report.status === 'ready' && manage && report.inspection_artifact !== true) {
     actions.push(`<button class="rpt-link-btn" data-reports-email="${safeText(report.id)}">发送邮件</button>`);
   }
   return actions.join('');
@@ -604,7 +635,7 @@ function statusOptions(selected) {
 }
 
 function formatReportLabel(value) {
-  return { pdf: 'PDF', word: 'Word' }[value] ?? (value ? String(value) : '—');
+  return { pdf: 'PDF', word: 'Word', 'html/json': 'HTML / JSON' }[value] ?? (value ? String(value) : '—');
 }
 
 function formatSuccessRate(value) {

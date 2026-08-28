@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/alert"
@@ -71,15 +72,11 @@ func (Authorizer) Require(principal Principal, scope platformscope.Scope, permis
 }
 
 func permissionForStrictOperation(operationID string) (string, bool) {
-	permissions := map[string]string{
-		"GetArtifact":            openapi.PermissionGetArtifact,
-		"CreateArtifactDownload": openapi.PermissionCreateArtifactDownload,
-		"ListAuditEvents":        openapi.PermissionListAuditEvents,
-		"GetCapabilities":        openapi.PermissionGetCapabilities,
-		"GetJob":                 openapi.PermissionGetJob,
-		"CancelJob":              openapi.PermissionCancelJob,
+	if operationID == "" {
+		return "", false
 	}
-	permission, ok := permissions[operationID]
+	generatedID := strings.ToLower(operationID[:1]) + operationID[1:]
+	permission, ok := openapi.OperationPermissions[generatedID]
 	return permission, ok
 }
 

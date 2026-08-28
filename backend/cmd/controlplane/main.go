@@ -33,6 +33,7 @@ import (
 	platformdatabase "dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/ingest"
+	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformdb"
@@ -57,8 +58,11 @@ type ListenerConfig struct {
 }
 
 type AgentAssignment struct {
-	TenantID  string `yaml:"tenant_id"`
-	ProjectID string `yaml:"project_id"`
+	TenantID    string            `yaml:"tenant_id"`
+	ProjectID   string            `yaml:"project_id"`
+	DisplayName string            `yaml:"display_name"`
+	Host        string            `yaml:"host"`
+	Labels      map[string]string `yaml:"labels,omitempty"`
 }
 
 type EvaluationScopeSettings struct {
@@ -145,32 +149,36 @@ type Config struct {
 }
 
 type Server struct {
-	config           Config
-	database         *sql.DB
-	ownsDatabase     bool
-	repository       *alert.PostgresRepository
-	evaluator        *alert.Evaluator
-	dispatcher       *alert.Dispatcher
-	httpServer       *http.Server
-	grpcServer       *grpc.Server
-	httpTLS          *tls.Config
-	grpcTLS          *tls.Config
-	ping             func(context.Context) error
-	migrate          func(context.Context) error
-	listen           func(string, string) (net.Listener, error)
-	scopes           []alert.Scope
-	ready            *atomic.Bool
-	evaluateScope    func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents       func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch         func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue         func(context.Context, time.Time) error
-	agentRegistry    *agentcontrol.Registry
-	commandObserver  agentcontrol.Observer
-	commandLifecycle *job.CommandLifecycle
-	dispatchCommands func(context.Context, time.Time) error
-	idempotency      *idempotency.Service
-	artifactBlobs    *artifact.LocalBlobStore
-	workers          sync.WaitGroup
+	config              Config
+	database            *sql.DB
+	ownsDatabase        bool
+	repository          *alert.PostgresRepository
+	evaluator           *alert.Evaluator
+	dispatcher          *alert.Dispatcher
+	httpServer          *http.Server
+	grpcServer          *grpc.Server
+	httpTLS             *tls.Config
+	grpcTLS             *tls.Config
+	ping                func(context.Context) error
+	migrate             func(context.Context) error
+	listen              func(string, string) (net.Listener, error)
+	scopes              []alert.Scope
+	ready               *atomic.Bool
+	evaluateScope       func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents          func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch            func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue            func(context.Context, time.Time) error
+	agentRegistry       *agentcontrol.Registry
+	commandObserver     agentcontrol.Observer
+	commandLifecycle    *job.CommandLifecycle
+	dispatchCommands    func(context.Context, time.Time) error
+	idempotency         *idempotency.Service
+	artifactBlobs       *artifact.LocalBlobStore
+	inspectionService   *inspection.Service
+	inspectionWorker    *inspection.Worker
+	scheduleInspections func(context.Context, time.Time) error
+	processInspections  func(context.Context, time.Time) error
+	workers             sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -329,6 +337,12 @@ func NewServer(config Config) (*Server, error) {
 			func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
 			func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
 			func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
+			func(ctx context.Context) error {
+				if err := inspection.RunMigrations(ctx, database); err != nil {
+					return err
+				}
+				return seedInspectionCatalog(ctx, inspection.NewPostgresRepository(database, nil), configuredScopes(config), time.Now().UTC())
+			},
 		)
 	}
 	listen := config.Listen
@@ -357,7 +371,6 @@ func NewServer(config Config) (*Server, error) {
 		}
 		return nil, fmt.Errorf("resolve artifact signing key: %w", err)
 	}
-	artifactService := artifact.NewService(artifact.NewPostgresStore(database), artifactSigner)
 	artifactContent := config.ArtifactDownloadHandler
 	var artifactBlobs *artifact.LocalBlobStore
 	if artifactContent == nil {
@@ -369,6 +382,14 @@ func NewServer(config Config) (*Server, error) {
 			return nil, fmt.Errorf("validate artifact storage root: %w", err)
 		}
 		artifactBlobs = blobStore
+	}
+	artifactStore := artifact.NewPostgresStore(database)
+	if artifactBlobs != nil {
+		artifactStore = artifact.NewPostgresStore(database, artifactBlobs)
+	}
+	artifactService := artifact.NewService(artifactStore, artifactSigner)
+	if artifactContent == nil {
+		blobStore := artifactBlobs
 		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, blobStore)
 		if err != nil {
 			_ = blobStore.Close()
@@ -382,6 +403,29 @@ func NewServer(config Config) (*Server, error) {
 	if agentRegistry == nil {
 		agentRegistry = agentcontrol.NewRegistry(64)
 	}
+	inspectionTargets, err := inspection.NewConfiguredTargetResolver(configuredInspectionTargets(config.Agents))
+	if err != nil {
+		if artifactBlobs != nil {
+			_ = artifactBlobs.Close()
+		}
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("configure inspection targets: %w", err)
+	}
+	inspectionRepository := inspection.NewPostgresRepository(database, jobRepository)
+	inspectionService := &inspection.Service{Repository: inspectionRepository, Targets: inspectionTargets}
+	inspectionWorker := &inspection.Worker{Runs: inspectionRepository, Jobs: jobRepository, Evaluator: &inspection.Evaluator{Evidence: inspectionRepository}, Artifacts: artifactStore, Audit: auditService}
+	inspectionApplication, err := controlplane.NewInspectionApplicationService(inspectionRepository, inspectionService, inspectionTargets, jobRepository, artifactService, auditService, idempotencyService, time.Now)
+	if err != nil {
+		if artifactBlobs != nil {
+			_ = artifactBlobs.Close()
+		}
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("configure inspection application: %w", err)
+	}
 	services := controlplane.Services{
 		Repository: repository, Evaluator: evaluator,
 		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
@@ -390,7 +434,7 @@ func NewServer(config Config) (*Server, error) {
 		CapabilityInput: func(_ context.Context, scope platformscope.Scope) capability.Input {
 			return foundationCapabilityInput(scope, config.Agents, agentRegistry)
 		},
-		Idempotency: idempotencyService,
+		Idempotency: idempotencyService, Inspection: inspectionApplication,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
@@ -423,7 +467,17 @@ func NewServer(config Config) (*Server, error) {
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
-	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs}, nil
+	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
+		inspectionService: inspectionService, inspectionWorker: inspectionWorker,
+		scheduleInspections: func(ctx context.Context, at time.Time) error {
+			_, err := inspectionService.ScheduleDue(ctx, at.UTC())
+			return err
+		},
+		processInspections: func(ctx context.Context, at time.Time) error {
+			_, err := inspectionWorker.Process(ctx, at.UTC(), 10)
+			return err
+		},
+	}, nil
 }
 
 func validateConfig(config Config) error {
@@ -499,9 +553,12 @@ func validateConfig(config Config) error {
 		}
 	}
 	for id, assignment := range config.Agents {
-		if strings.TrimSpace(id) == "" || (alert.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}).Validate() != nil {
+		if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || (alert.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}).Validate() != nil || assignment.DisplayName == "" || assignment.DisplayName != strings.TrimSpace(assignment.DisplayName) || assignment.Host == "" || assignment.Host != strings.TrimSpace(assignment.Host) {
 			return errors.New("agents contains an invalid assignment")
 		}
+	}
+	if _, err := inspection.NewConfiguredTargetResolver(configuredInspectionTargets(config.Agents)); err != nil {
+		return errors.New("agents contains invalid inspection target metadata")
 	}
 	seenScopes := make(map[string]struct{}, len(config.EvaluationScopes))
 	for _, configured := range config.EvaluationScopes {
@@ -705,7 +762,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(3)
+	server.workers.Add(5)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -717,6 +774,22 @@ func (server *Server) startLoops(ctx context.Context) {
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, time.Second, func(at time.Time) { _ = server.dispatchCommands(ctx, at) })
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, 30*time.Second, func(at time.Time) {
+			if err := server.scheduleInspections(ctx, at); err != nil && ctx.Err() == nil {
+				log.Printf("inspection scheduler pass failed: %v", err)
+			}
+		})
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, time.Second, func(at time.Time) {
+			if err := server.processInspections(ctx, at); err != nil && ctx.Err() == nil {
+				log.Printf("inspection worker pass failed: %v", err)
+			}
+		})
 	}()
 }
 
@@ -805,6 +878,56 @@ func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configu
 		result[id] = alert.Scope{TenantID: a.TenantID, ProjectID: a.ProjectID}
 	}
 	return result
+}
+
+func configuredInspectionTargets(assignments map[string]AgentAssignment) []inspection.HostTarget {
+	result := make([]inspection.HostTarget, 0, len(assignments))
+	for id, assignment := range assignments {
+		result = append(result, inspection.HostTarget{
+			Scope:   platformscope.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID},
+			AgentID: id, DisplayName: assignment.DisplayName, Host: assignment.Host,
+			Labels: assignment.Labels, Connectivity: "unknown", Capabilities: []string{}, AdvertisedSources: []inspection.SourceType{},
+		})
+	}
+	return result
+}
+
+type inspectionCatalogStore interface {
+	CreateItem(context.Context, inspection.Item) error
+	ListItems(context.Context, platformscope.Scope, inspection.ItemFilter) (inspection.ItemPage, error)
+}
+
+func seedInspectionCatalog(ctx context.Context, store inspectionCatalogStore, scopes []alert.Scope, now time.Time) error {
+	if ctx == nil || store == nil || now.IsZero() || now.Location() != time.UTC {
+		return errors.New("inspection catalog seed input is invalid")
+	}
+	for _, configured := range scopes {
+		scope := platformscope.Scope{TenantID: configured.TenantID, ProjectID: configured.ProjectID}
+		if scope.Validate() != nil {
+			return errors.New("inspection catalog scope is invalid")
+		}
+		for _, item := range inspection.BuiltinHostItems() {
+			filter := inspection.ItemFilter{CursorFilter: inspection.CursorFilter{Limit: 2}, Versions: []inspection.PolicyItem{{ItemID: item.ID, Version: item.Version}}}
+			page, err := store.ListItems(ctx, scope, filter)
+			if err != nil {
+				return fmt.Errorf("list inspection catalog item: %w", err)
+			}
+			if len(page.Items) == 1 && page.Items[0].ID == item.ID && page.Items[0].Version == item.Version && page.Items[0].Scope == scope {
+				continue
+			}
+			if len(page.Items) != 0 {
+				return errors.New("inspection catalog item is inconsistent")
+			}
+			item.Scope, item.Enabled, item.CreatedAt, item.UpdatedAt = scope, true, now, now
+			if err := store.CreateItem(ctx, item); err != nil {
+				page, readErr := store.ListItems(ctx, scope, filter)
+				if readErr != nil || len(page.Items) != 1 || page.Items[0].ID != item.ID || page.Items[0].Version != item.Version || page.Items[0].Scope != scope {
+					return fmt.Errorf("create inspection catalog item: %w", err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func configuredScopes(config Config) []alert.Scope {

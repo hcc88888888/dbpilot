@@ -53,6 +53,11 @@ agents:
   "spiffe-agent-id":
     tenant_id: "tenant-1"
     project_id: "project-1"
+    display_name: "Production database host"
+    host: "db-1.example.com"
+    labels:
+      role: "database"
+      environment: "production"
 
 # Optional. SMTP passwords remain env:// Secret references stored on policies;
 # they are resolved only for a delivery and never serialized by the API.

@@ -10,6 +10,7 @@ import (
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/idempotency"
+	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
@@ -42,6 +43,44 @@ type IdempotencyService interface {
 	Abort(context.Context, idempotency.Key, string, string) error
 }
 
+// InspectionOverview is the storage-neutral aggregate returned by the host
+// inspection application boundary.
+type InspectionOverview struct {
+	TargetCount        int
+	OnlineTargetCount  int
+	RunStatusCounts    map[inspection.RunStatus]int
+	FindingLevelCounts map[inspection.FindingLevel]int
+}
+
+type InspectionTargetPage struct {
+	Items      []inspection.HostTarget
+	More       bool
+	NextCursor string
+}
+
+// InspectionService owns inspection orchestration and durable write
+// semantics. The HTTP layer only supplies authenticated scope and actor data,
+// validates transport preconditions, and maps the domain values to OpenAPI.
+type InspectionService interface {
+	ListItems(context.Context, platformscope.Scope, inspection.ItemFilter) (inspection.ItemPage, error)
+	CreateItem(context.Context, platformscope.Scope, string, string, inspection.Item) (inspection.Item, error)
+	GetOverview(context.Context, platformscope.Scope) (InspectionOverview, error)
+	ListPolicies(context.Context, platformscope.Scope, inspection.PolicyFilter) (inspection.PolicyPage, error)
+	CreatePolicy(context.Context, platformscope.Scope, string, string, inspection.Policy) (inspection.Policy, error)
+	GetPolicy(context.Context, platformscope.Scope, string) (inspection.Policy, error)
+	UpdatePolicy(context.Context, platformscope.Scope, string, string, string, int64, inspection.Policy) (inspection.Policy, error)
+	RunPolicy(context.Context, platformscope.Scope, string, string, string) (inspection.Run, error)
+	ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error)
+	GetReport(context.Context, platformscope.Scope, string) (inspection.ReportSnapshot, error)
+	CreateReportDownload(context.Context, platformscope.Scope, string, string, string) (artifact.Download, error)
+	ListRuns(context.Context, platformscope.Scope, inspection.RunFilter) (inspection.RunPage, error)
+	CreateRun(context.Context, inspection.CreateRunRequest) (inspection.Run, error)
+	GetRun(context.Context, platformscope.Scope, string) (inspection.RunDetail, error)
+	CancelRun(context.Context, platformscope.Scope, string, string, string) (inspection.Run, error)
+	RetryRun(context.Context, platformscope.Scope, string, string, string) (inspection.Run, error)
+	ListTargets(context.Context, platformscope.Scope, inspection.CursorFilter) (InspectionTargetPage, error)
+}
+
 // Services contains the dependencies made available to HTTP handlers.
 // Monitoring deliberately uses its storage-neutral QueryStore boundary.
 type Services struct {
@@ -53,6 +92,7 @@ type Services struct {
 	Audit           AuditService
 	Capabilities    CapabilityService
 	Idempotency     IdempotencyService
+	Inspection      InspectionService
 	ArtifactContent http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated

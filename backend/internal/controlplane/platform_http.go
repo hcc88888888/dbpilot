@@ -230,8 +230,15 @@ func (validator platformResponseValidator) requestMiddleware(next http.Handler) 
 			Request: request, PathParams: pathParameters, Route: route,
 			Options: &openapi3filter.Options{
 				AuthenticationFunc:                openapi3filter.NoopAuthenticationFunc,
-				RejectWhenRequestBodyNotSpecified: true,
+				RejectWhenRequestBodyNotSpecified: false,
 			},
+		}
+		// kin-openapi v0.142 rejects every non-empty body when
+		// RejectWhenRequestBodyNotSpecified is enabled, including operations
+		// that declare a request body. Enforce the intended condition here.
+		if route.Operation.RequestBody == nil && request.ContentLength > 0 {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
 		}
 		if err := openapi3filter.ValidateRequest(request.Context(), input); err != nil {
 			writePlatformProblem(writer, request, ErrInvalidRequest)

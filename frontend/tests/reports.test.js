@@ -256,7 +256,7 @@ test('http adapter maps report routes to scoped control-plane paths', async () =
   });
   const scope = { tenantId: 't1', projectId: 'p1' };
   await api.listReports(scope, { type: 'inspection', status: 'ready', offset: 0, limit: 10 });
-  assert.equal(seen[0], 'https://control.example/api/v1/tenants/t1/projects/p1/reports?type=inspection&status=ready&offset=0&limit=10');
+  assert.equal(seen[0], 'https://control.example/api/v1/tenants/t1/projects/p1/inspection-reports?limit=10');
 });
 
 test('http DTO normalization strips secrets recursively', async () => {
@@ -264,16 +264,69 @@ test('http DTO normalization strips secrets recursively', async () => {
     baseUrl: 'https://control.example',
     fetchImpl: async () => new Response(JSON.stringify({
       items: [{
-        id: 'RPT-1', title: '巡检报告', type: 'inspection', status: 'ready',
-        instance_name: '订单主库 MySQL', format: 'pdf', generated_at: '2026-08-28T08:06:12Z',
+        id: 'inspection-report-run-1', run_id: 'run-1', status: 'completed', summary: 'healthy=1', generated_at: '2026-08-28T08:06:12Z',
+        artifacts: [{ artifact_id: 'inspection-report-run-1.html', kind: 'inspection-report' }],
         password: 'unsafe', connection_string: 'postgres://unsafe', audit: { actor: 'unsafe' },
-        email: { recipients: ['a@example.com'], sent_at: '' },
       }],
+      page: { limit: 50, has_more: false },
     })),
   });
   const page = await api.listReports({ tenantId: 't', projectId: 'p' }, {});
   const encoded = JSON.stringify(page);
   assert.equal(encoded.includes('unsafe'), false);
-  assert.equal(page.items[0].email.recipients[0], 'a@example.com');
+  assert.equal(page.items[0].inspection_artifact, true);
   assert.equal('password' in page.items[0], false);
+});
+
+test('configured report center maps real inspection reports through the generated scoped client', async () => {
+  const calls = [];
+  const options = [];
+  const client = {
+    forScope(scope) {
+      calls.push({ method: 'scope', scope });
+      return {
+        inspection: {
+          listInspectionReports(value, requestOptions) { calls.push({ method: 'list', value, requestOptions }); return Promise.resolve({ items: [{ id: 'inspection-report-run-1', run_id: 'run-1', status: 'completed', summary: 'warning=1', generated_at: '2026-08-29T08:00:00Z', artifacts: [{ artifact_id: 'inspection-report-run-1.html', kind: 'inspection-report' }] }], page: { limit: 10, has_more: false } }); },
+          getInspectionReport(value, requestOptions) { calls.push({ method: 'get', value, requestOptions }); return Promise.resolve({ id: value.reportId, run_id: 'run-1', status: 'completed', artifacts: [] }); },
+          createInspectionReportDownload(value, requestOptions) { calls.push({ method: 'download', value, requestOptions }); return Promise.resolve({ url: 'https://control.example/download', expires_at: '2026-08-29T08:05:00Z' }); },
+        },
+        requestOptions(value) { options.push(value); return { options: value }; },
+      };
+    },
+  };
+  const api = createReportsApi({ baseUrl: 'https://control.example', controlPlaneClient: client });
+  const scope = { tenantId: 'tenant-a', projectId: 'project-a' };
+  const signal = new AbortController().signal;
+  const page = await api.listReports(scope, { limit: 10 }, signal);
+  const detail = await api.getReport(scope, 'inspection-report-run-1', signal);
+  const download = await api.downloadReport(scope, 'inspection-report-run-1', 'download-key', signal);
+
+  assert.equal(page.items[0].inspection_artifact, true);
+  assert.equal(page.items[0].format, 'html/json');
+  assert.equal(detail.inspection_artifact, true);
+  assert.equal(download.url, 'https://control.example/download');
+  assert.deepEqual(calls.find((call) => call.method === 'list').value, { limit: 10 });
+  assert.deepEqual(calls.find((call) => call.method === 'download').value, { reportId: 'inspection-report-run-1', idempotencyKey: 'download-key' });
+  assert.deepEqual(options.at(-1), { idempotencyKey: 'download-key', signal });
+});
+
+test('real inspection report detail removes PDF Word and email actions', () => {
+  const markup = renderReportDetailMarkup({
+    id: 'inspection-report-run-1', title: '主机巡检报告', type: 'inspection', status: 'ready', format: 'html/json', inspection_artifact: true,
+    generated_at: '2026-08-29T08:00:00Z', highlights: ['warning=1'], issues_count: 1,
+  }, { manage: true });
+  assert.match(markup, /HTML \/ JSON/);
+  assert.match(markup, /data-reports-download/);
+  assert.doesNotMatch(markup, /PDF|Word|data-reports-email|邮件分发/);
+});
+
+test('configured inspection report center hides unsupported generation and template workflows', async () => {
+  const root = { innerHTML: '', addEventListener() {} };
+  const api = { async getOverview() { return { source: 'control-plane', stats: {}, recent_reports: [] }; } };
+  const center = createReportsCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' }, permissions: { manage: true } });
+  center.open('overview');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.doesNotMatch(root.innerHTML, /data-reports-view="templates"/);
+  assert.doesNotMatch(root.innerHTML, /data-reports-generate/);
+  assert.match(root.innerHTML, /HTML \/ JSON/);
 });

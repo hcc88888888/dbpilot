@@ -1,3 +1,5 @@
+import { createControlPlaneClient } from '../../shared/control-plane-client.js';
+
 const REPORTS_ERRORS = {
   unauthorized: '登录状态已失效，请重新登录',
   forbidden: '当前账号没有该项目的操作权限',
@@ -23,86 +25,61 @@ const DEMO_INSTANCES = {
  * URL selects the real control-plane API; otherwise the adapter supplies
  * explicitly marked, safe local demo data.
  */
-export function createReportsApi({ baseUrl = '', fetchImpl = globalThis.fetch, available = true } = {}) {
+export function createReportsApi({ baseUrl = '', fetchImpl = globalThis.fetch, available = true, controlPlaneClient } = {}) {
   if (!available) return createUnavailableAdapter();
   if (!baseUrl) return createDemoAdapter();
   if (typeof fetchImpl !== 'function') throw reportsFailure('network');
 
-  const base = baseUrl.replace(/\/+$/, '');
-  const request = async (scope, path, init = {}, signal) => {
-    const safeScope = cleanScope(scope);
-    const prefix = `/api/v1/tenants/${encodeURIComponent(safeScope.tenantId)}/projects/${encodeURIComponent(safeScope.projectId)}`;
-    let response;
-    try {
-      response = await fetchImpl(`${base}${prefix}${path}`, { ...init, signal });
-    } catch (error) {
-      if (error?.name === 'AbortError') throw error;
-      if (error && REPORTS_ERRORS[error.kind]) throw error;
-      throw reportsFailure('network');
-    }
-    if (!response?.ok) throw failureForStatus(response?.status);
-    if (response.status === 204) return undefined;
-    try {
-      return await response.json();
-    } catch {
-      throw reportsFailure('unavailable', response.status);
-    }
-  };
-
-  return createHttpAdapter(request);
+  return createInspectionReportsAdapter(controlPlaneClient ?? createControlPlaneClient({ baseUrl, fetchImpl }));
 }
 
-function createHttpAdapter(request) {
+function createInspectionReportsAdapter(client) {
+  const boundary = (scope) => client.forScope(cleanScope(scope));
+  const read = async (scope, method, parameters, signal) => {
+    const scoped = boundary(scope);
+    const options = scoped.requestOptions({ signal });
+    try {
+      return parameters === undefined
+        ? await scoped.inspection[method](options)
+        : await scoped.inspection[method](parameters, options);
+    } catch (error) {
+      if (error?.name === 'AbortError' || error?.kind) throw error;
+      throw reportsFailure('network');
+    }
+  };
   return {
     async getOverview(scope, signal) {
-      const [reports, templates] = await Promise.all([
-        request(scope, '/reports', {}, signal),
-        request(scope, '/templates', {}, signal),
-      ]);
-      return normalizeOverview({ reports, templates }, scope);
+      const response = await read(scope, 'listInspectionReports', { limit: 5 }, signal);
+      const items = inspectionReportItems(response).map(mapInspectionReport);
+      const ready = items.filter((item) => item.status === 'ready').length;
+      const failed = items.filter((item) => item.status === 'failed').length;
+      const completed = ready + failed;
+      return { source: 'control-plane', scope: cleanScope(scope), stats: { generated_this_week: items.length, pending_send: 0, template_count: 0, success_rate: completed ? Math.round(ready / completed * 1000) / 10 : 100 }, recent_reports: items };
     },
-
     async listReports(scope, filters = {}, signal) {
-      const page = reportsPage(filters);
-      const query = reportQuery({ ...filters, offset: page.offset, limit: page.limit });
-      return normalizeReportList(await request(scope, `/reports${query}`, {}, signal), scope, page);
+      if (filters.type && filters.type !== 'inspection') return { source: 'control-plane', scope: cleanScope(scope), items: [], nextCursor: null };
+      const parameters = {};
+      if (filters.cursor) parameters.cursor = String(filters.cursor);
+      if (Number.isInteger(filters.limit)) parameters.limit = filters.limit;
+      const response = await read(scope, 'listInspectionReports', parameters, signal);
+      return { source: 'control-plane', scope: cleanScope(scope), items: inspectionReportItems(response).map(mapInspectionReport), nextCursor: response?.page?.nextCursor ?? response?.page?.next_cursor ?? null };
     },
-
     async getReport(scope, id, signal) {
-      if (id == null || String(id).trim() === '') return Promise.reject(reportsFailure('validation'));
-      return normalizeEntity(await request(scope, `/reports/${encodeURIComponent(String(id))}`, {}, signal), scope);
+      const value = await read(scope, 'getInspectionReport', { reportId: requiredReportID(id) }, signal);
+      return { ...mapInspectionReport(value), source: 'control-plane', scope: cleanScope(scope) };
     },
-
-    async generateReport(scope, value, signal) {
-      const payload = pickDTO(value, ['type', 'instance_id', 'template_id']);
-      if (!payload.type || !payload.instance_id) return Promise.reject(reportsFailure('validation'));
-      return normalizeEntity(await request(scope, '/reports', jsonRequest('POST', payload), signal), scope);
+    async downloadReport(scope, id, idempotencyKey, signal) {
+      const scoped = boundary(scope);
+      return scoped.inspection.createInspectionReportDownload(
+        { reportId: requiredReportID(id), idempotencyKey },
+        scoped.requestOptions({ idempotencyKey, signal }),
+      );
     },
-
-    async sendReportEmail(scope, id, value, signal) {
-      if (id == null || String(id).trim() === '') return Promise.reject(reportsFailure('validation'));
-      const recipients = emailRecipients(value);
-      if (!recipients.length) return Promise.reject(reportsFailure('validation'));
-      return normalizeEntity(await request(scope, `/reports/${encodeURIComponent(String(id))}/email`, jsonRequest('POST', { recipients }), signal), scope);
-    },
-
-    async listTemplates(scope, signal) {
-      return normalizeList(await request(scope, '/templates', {}, signal), scope);
-    },
-
-    async saveTemplate(scope, value, signal) {
-      const id = String(value?.id ?? '').trim();
-      const payload = pickTemplateFields(value);
-      if (id) {
-        return normalizeEntity(await request(scope, `/templates/${encodeURIComponent(id)}`, jsonRequest('PUT', payload), signal), scope);
-      }
-      return normalizeEntity(await request(scope, '/templates', jsonRequest('POST', payload), signal), scope);
-    },
-
-    async setTemplateEnabled(scope, id, enabled, signal) {
-      if (id == null || String(id).trim() === '') return Promise.reject(reportsFailure('validation'));
-      return normalizeEntity(await request(scope, `/templates/${encodeURIComponent(String(id))}/enable`, jsonRequest('POST', { enabled: Boolean(enabled) }), signal), scope);
-    },
+    async listTemplates(scope) { return { source: 'control-plane', scope: cleanScope(scope), items: [], nextCursor: null }; },
+    async generateReport() { throw reportsFailure('unavailable'); },
+    async sendReportEmail() { throw reportsFailure('unavailable'); },
+    async saveTemplate() { throw reportsFailure('unavailable'); },
+    async setTemplateEnabled() { throw reportsFailure('unavailable'); },
   };
 }
 
@@ -112,6 +89,7 @@ function createUnavailableAdapter() {
     getOverview: unavailable,
     listReports: unavailable,
     getReport: unavailable,
+    downloadReport: unavailable,
     generateReport: unavailable,
     sendReportEmail: unavailable,
     listTemplates: unavailable,
@@ -140,6 +118,12 @@ function createDemoAdapter() {
       const report = store.reports.find((item) => item.id === id);
       if (!report) throw reportsFailure('not-found');
       return { ...redactDTO(report), source: 'demo', scope: cleanScope(scope) };
+    },
+
+    async downloadReport(scope, id) {
+      const report = store.reports.find((item) => item.id === id);
+      if (!report) throw reportsFailure('not-found');
+      return { source: 'demo', scope: cleanScope(scope), url: `#demo-report-${encodeURIComponent(id)}`, expires_at: new Date(Date.now() + 300000).toISOString() };
     },
 
     async generateReport(scope, value) {
@@ -259,50 +243,6 @@ function normalizeDemoOverview(store, scope) {
   };
 }
 
-function normalizeOverview(response = {}, scope) {
-  const rawReports = Array.isArray(response.reports) ? response.reports : Array.isArray(response.items) ? response.items : [];
-  const templates = Array.isArray(response.templates) ? response.templates : [];
-  const reports = rawReports.map((item) => ({ ...redactDTO(item), source: 'control-plane' }));
-  const now = Date.now();
-  const weekMs = 7 * 24 * 60 * 60 * 1000;
-  const generatedThisWeek = response.stats?.generated_this_week ?? reports.filter((item) => {
-    const at = Date.parse(item.created_at);
-    return Number.isFinite(at) && now - at <= weekMs;
-  }).length;
-  const pendingSend = response.stats?.pending_send ?? reports.filter((item) => item.status === 'ready').length;
-  const templateCount = response.stats?.template_count ?? templates.length;
-  const finished = reports.filter((item) => item.status === 'ready' || item.status === 'sent' || item.status === 'failed');
-  const successRate = response.stats?.success_rate ?? (finished.length ? Math.round(finished.filter((item) => item.status !== 'failed').length / finished.length * 1000) / 10 : 100);
-  const recent = Array.isArray(response.recent_reports) ? response.recent_reports : reports.slice().sort(byCreatedDesc).slice(0, 5);
-  return {
-    source: 'control-plane',
-    scope: cleanScope(scope),
-    stats: { generated_this_week: generatedThisWeek, pending_send: pendingSend, template_count: templateCount, success_rate: successRate },
-    recent_reports: recent.map((item) => ({ ...redactDTO(item), source: 'control-plane' })),
-  };
-}
-
-function normalizeList(response, scope) {
-  const rawItems = Array.isArray(response) ? response : Array.isArray(response?.items) ? response.items : [];
-  const items = rawItems.map((item) => ({ ...redactDTO(item), source: 'control-plane' }));
-  return { source: 'control-plane', scope: cleanScope(scope), items, nextCursor: null };
-}
-
-function normalizeReportList(response, scope, page) {
-  const rawItems = Array.isArray(response) ? response : Array.isArray(response?.items) ? response.items : [];
-  const items = rawItems.map((item) => ({ ...redactDTO(item), source: 'control-plane' }));
-  const offset = page?.offset ?? 0;
-  const limit = page?.limit ?? 10;
-  const nextOffset = Number(response?.next_offset);
-  const hasMore = Number.isInteger(nextOffset) ? nextOffset > 0 : rawItems.length === limit;
-  const nextCursor = hasMore ? `offset:${offset + rawItems.length}` : null;
-  return { source: 'control-plane', scope: cleanScope(scope), items, nextCursor };
-}
-
-function normalizeEntity(response, scope) {
-  return { ...redactDTO(response), source: 'control-plane', scope: cleanScope(scope) };
-}
-
 function redactDTO(value) {
   if (Array.isArray(value)) return value.map((item) => redactDTO(item));
   if (!value || typeof value !== 'object') return value;
@@ -335,7 +275,8 @@ function filterReportItems(items, filters = {}) {
 
 function reportsPage(filters) {
   const limit = boundedLimit(filters?.limit ?? 10);
-  const offset = Math.max(0, Number(filters?.offset) || 0);
+  const cursorOffset = /^offset:(\d+)$/.exec(String(filters?.cursor ?? ''));
+  const offset = cursorOffset ? Number(cursorOffset[1]) : Math.max(0, Number(filters?.offset) || 0);
   return { limit, offset };
 }
 
@@ -343,17 +284,6 @@ function boundedLimit(value) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 1 || number > 100) return 10;
   return number;
-}
-
-function reportQuery(filters = {}) {
-  const query = [];
-  for (const key of ['type', 'status', 'query']) {
-    const value = String(filters?.[key] ?? '').trim();
-    if (value) query.push(`${key}=${encodeURIComponent(value)}`);
-  }
-  if (filters?.offset != null) query.push(`offset=${Number(filters.offset)}`);
-  if (filters?.limit != null) query.push(`limit=${Number(filters.limit)}`);
-  return query.length ? `?${query.join('&')}` : '';
 }
 
 function pickTemplateFields(value) {
@@ -369,10 +299,6 @@ function emailRecipients(value) {
   const raw = value?.recipients;
   if (Array.isArray(raw)) return raw.map((item) => String(item ?? '').trim()).filter(Boolean);
   return String(raw ?? '').split(',').map((item) => item.trim()).filter(Boolean);
-}
-
-function jsonRequest(method, body) {
-  return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }
 
 function cleanScope(scope) {
@@ -394,17 +320,45 @@ function demoDate(date) {
 
 const VALID_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function failureForStatus(status) {
-  if (status === 401) return reportsFailure('unauthorized', status);
-  if (status === 403) return reportsFailure('forbidden', status);
-  if (status === 404) return reportsFailure('not-found', status);
-  if (status === 409) return reportsFailure('conflict', status);
-  if (status === 400 || status === 413 || status === 415 || status === 422) return reportsFailure('validation', status);
-  return reportsFailure('unavailable', status);
-}
-
 function reportsFailure(kind, status) {
   return status == null ? { kind, message: REPORTS_ERRORS[kind] } : { kind, message: REPORTS_ERRORS[kind], status };
+}
+
+function inspectionReportItems(response) {
+  if (Array.isArray(response)) return response;
+  return Array.isArray(response?.items) ? response.items : [];
+}
+
+function mapInspectionReport(value = {}) {
+  const id = String(value.id ?? '');
+  const runId = String(value.runId ?? value.run_id ?? '');
+  const rawStatus = String(value.status ?? '');
+  const status = rawStatus === 'completed' ? 'ready' : rawStatus === 'failed' ? 'failed' : 'generating';
+  const summary = String(value.summary ?? '');
+  const findings = Array.isArray(value.findings) ? value.findings : [];
+  const highlights = findings.length ? findings.map((finding) => String(finding.summary ?? '')).filter(Boolean) : summary ? [summary] : [];
+  const issues = findings.length
+    ? findings.filter((finding) => !['healthy'].includes(String(finding.level ?? ''))).length
+    : ['warning', 'critical', 'unsupported', 'missing_data'].reduce((total, level) => total + summaryCount(summary, level), 0);
+  const generatedAt = value.generatedAt ?? value.generated_at ?? '';
+  const artifacts = Array.isArray(value.artifacts) ? value.artifacts.map((item) => ({ artifact_id: item.artifactId ?? item.artifact_id ?? '', kind: item.kind ?? '' })) : [];
+  return {
+    id, run_id: runId, title: `主机巡检报告 · ${runId || id}`, type: 'inspection', status,
+    instance_id: '', instance_name: '主机巡检目标', created_by: 'inspection-worker', created_at: generatedAt, generated_at: generatedAt,
+    format: 'html/json', size_kb: 0, failure: rawStatus === 'failed' ? summary : '', highlights, issues_count: issues,
+    inspection_artifact: true, artifacts, findings: redactDTO(findings), source: 'control-plane',
+  };
+}
+
+function summaryCount(summary, level) {
+  const match = new RegExp(`(?:^|\\s)${level}=(\\d+)(?:\\s|$)`).exec(summary);
+  return match ? Number(match[1]) : 0;
+}
+
+function requiredReportID(value) {
+  const id = String(value ?? '').trim();
+  if (!id) throw reportsFailure('validation');
+  return id;
 }
 
 if (typeof window !== 'undefined') {

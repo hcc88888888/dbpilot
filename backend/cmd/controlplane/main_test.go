@@ -25,7 +25,9 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,6 +37,9 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, 15*time.Second, config.EvaluationEvery)
 	require.Equal(t, time.Minute, config.RetryEvery)
 	require.Contains(t, config.Agents, "spiffe-agent-id")
+	require.Equal(t, "Production database host", config.Agents["spiffe-agent-id"].DisplayName)
+	require.Equal(t, "db-1.example.com", config.Agents["spiffe-agent-id"].Host)
+	require.Equal(t, map[string]string{"role": "database", "environment": "production"}, config.Agents["spiffe-agent-id"].Labels)
 	require.Equal(t, "oidc", config.Identity.Mode)
 	require.Equal(t, "https://identity.example.com", config.Identity.Issuer)
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
@@ -418,10 +423,11 @@ func TestMigrationSequenceRunsAlertJobAndPlatformStepsInOrder(t *testing.T) {
 		func(context.Context) error { order = append(order, "alert"); return nil },
 		func(context.Context) error { order = append(order, "job"); return nil },
 		func(context.Context) error { order = append(order, "platform"); return nil },
+		func(context.Context) error { order = append(order, "inspection"); return nil },
 	)
 
 	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "inspection"}, order)
 
 	want := errors.New("job migration failed")
 	order = nil
@@ -429,9 +435,71 @@ func TestMigrationSequenceRunsAlertJobAndPlatformStepsInOrder(t *testing.T) {
 		func(context.Context) error { order = append(order, "alert"); return nil },
 		func(context.Context) error { order = append(order, "job"); return want },
 		func(context.Context) error { order = append(order, "platform"); return nil },
+		func(context.Context) error { order = append(order, "inspection"); return nil },
 	)
 	require.ErrorIs(t, migrate(context.Background()), want)
 	require.Equal(t, []string{"alert", "job"}, order)
+}
+
+func TestConfigRequiresValidatedInspectionTargetMetadata(t *testing.T) {
+	valid := AgentAssignment{TenantID: "tenant-a", ProjectID: "project-a", DisplayName: "Primary DB host", Host: "db-1.example", Labels: map[string]string{"role": "database"}}
+	tests := map[string]AgentAssignment{
+		"missing display name": {TenantID: valid.TenantID, ProjectID: valid.ProjectID, Host: valid.Host, Labels: valid.Labels},
+		"missing host":         {TenantID: valid.TenantID, ProjectID: valid.ProjectID, DisplayName: valid.DisplayName, Labels: valid.Labels},
+		"invalid label":        {TenantID: valid.TenantID, ProjectID: valid.ProjectID, DisplayName: valid.DisplayName, Host: valid.Host, Labels: map[string]string{"bad key": "database"}},
+	}
+	for name, assignment := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := validServerConfig()
+			config.Agents = map[string]AgentAssignment{"agent-1": assignment}
+			server, err := NewServer(config)
+			require.Nil(t, server)
+			require.ErrorContains(t, err, "agent")
+		})
+	}
+	config := validServerConfig()
+	config.Agents = map[string]AgentAssignment{"agent-1": valid}
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server.inspectionService)
+	require.NotNil(t, server.inspectionWorker)
+}
+
+func TestInspectionCatalogSeedIsScopedAndIdempotent(t *testing.T) {
+	store := &memoryInspectionCatalog{items: map[string]inspection.Item{}}
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	scopes := []alert.Scope{{TenantID: "tenant-a", ProjectID: "project-a"}, {TenantID: "tenant-b", ProjectID: "project-b"}}
+	require.NoError(t, seedInspectionCatalog(context.Background(), store, scopes, now))
+	require.Len(t, store.items, len(inspection.BuiltinHostItems())*2)
+	for _, item := range store.items {
+		require.NotEmpty(t, item.Scope.TenantID)
+		require.True(t, item.Enabled)
+		require.Equal(t, now, item.CreatedAt)
+		require.Equal(t, now, item.UpdatedAt)
+	}
+	created := store.creates
+	require.NoError(t, seedInspectionCatalog(context.Background(), store, scopes, now.Add(time.Hour)))
+	require.Equal(t, created, store.creates, "restart must not create a second catalog version")
+}
+
+type memoryInspectionCatalog struct {
+	items   map[string]inspection.Item
+	creates int
+}
+
+func (store *memoryInspectionCatalog) CreateItem(_ context.Context, value inspection.Item) error {
+	store.creates++
+	store.items[value.Scope.Key()+"\x00"+value.ID] = value
+	return nil
+}
+func (store *memoryInspectionCatalog) ListItems(_ context.Context, scope platformscope.Scope, filter inspection.ItemFilter) (inspection.ItemPage, error) {
+	result := inspection.ItemPage{}
+	for _, requested := range filter.Versions {
+		if value, ok := store.items[scope.Key()+"\x00"+requested.ItemID]; ok && value.Version == requested.Version {
+			result.Items = append(result.Items, value)
+		}
+	}
+	return result, nil
 }
 
 func TestRunCanceledContextReturnsWithoutMigrationOrListeners(t *testing.T) {
@@ -540,6 +608,39 @@ func TestRunCancellationWaitsForWorkersToExit(t *testing.T) {
 	default:
 		t.Fatal("Run returned before evaluator worker exited")
 	}
+}
+
+func TestRunCancellationWaitsForInspectionSchedulerAndWorker(t *testing.T) {
+	config := validServerConfig()
+	listeners := []*blockingListener{newBlockingListener(), newBlockingListener()}
+	next := 0
+	config.Ping = func(context.Context) error { return nil }
+	config.Migrate = func(context.Context) error { return nil }
+	config.Listen = func(string, string) (net.Listener, error) { listener := listeners[next]; next++; return listener, nil }
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	started := make(chan string, 2)
+	exited := make(chan string, 2)
+	server.scheduleInspections = func(ctx context.Context, _ time.Time) error {
+		started <- "scheduler"
+		<-ctx.Done()
+		exited <- "scheduler"
+		return ctx.Err()
+	}
+	server.processInspections = func(ctx context.Context, _ time.Time) error {
+		started <- "worker"
+		<-ctx.Done()
+		exited <- "worker"
+		return ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	require.ElementsMatch(t, []string{"scheduler", "worker"}, []string{<-started, <-started})
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.ElementsMatch(t, []string{"scheduler", "worker"}, []string{<-exited, <-exited})
 }
 
 func validServerConfig() Config {
