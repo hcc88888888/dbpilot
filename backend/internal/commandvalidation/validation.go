@@ -95,7 +95,17 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 // ValidateStart enforces the execution fence and bounded authorization window
 // that must be durable before an Agent may invoke an executor.
 func ValidateStart(start *agentv1.CommandStart, at time.Time) error {
-	if start == nil || !validIdentifier(start.GetCommandId()) || len(start.GetExecutionToken()) != sha256.Size || start.GetLeaseRevision() == 0 || start.GetLeaseSeconds() == 0 || start.GetLeaseSeconds() > MaximumTimeoutSeconds || start.GetStartDeadline() == nil || !start.GetStartDeadline().IsValid() || !start.GetStartDeadline().AsTime().After(at.UTC()) {
+	if err := ValidateStartShape(start); err != nil || !start.GetStartDeadline().AsTime().After(at.UTC()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+// ValidateStartShape validates immutable wire structure without applying
+// freshness. Agent ingress defers deadline classification to its durable
+// journal so running duplicates can be identified before expiry handling.
+func ValidateStartShape(start *agentv1.CommandStart) error {
+	if start == nil || !validIdentifier(start.GetCommandId()) || len(start.GetExecutionToken()) != sha256.Size || start.GetLeaseRevision() == 0 || start.GetLeaseSeconds() == 0 || start.GetLeaseSeconds() > MaximumTimeoutSeconds || start.GetStartDeadline() == nil || !start.GetStartDeadline().IsValid() {
 		return ErrInvalidCommand
 	}
 	return nil

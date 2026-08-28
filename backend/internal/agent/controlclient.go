@@ -466,7 +466,7 @@ func (c *ControlClient) handleCommand(ctx, executionParent context.Context, enve
 }
 
 func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context, start *agentv1.CommandStart) error {
-	if err := commandvalidation.ValidateStart(start, c.now()); err != nil {
+	if err := commandvalidation.ValidateStartShape(start); err != nil {
 		return errors.New("command start is invalid")
 	}
 	entry, err := c.journal.Get(ctx, start.GetCommandId())

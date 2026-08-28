@@ -231,6 +231,7 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 	if len(executionToken) != sha256.Size || leaseRevision == 0 || startDeadline.IsZero() {
 		return ErrStartMismatch
 	}
+	expired := false
 	if err := j.transition(ctx, commandID, func(entry *storedEntry) error {
 		now := j.now().UTC()
 		switch entry.State {
@@ -240,9 +241,6 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 			}
 			return ErrStartConflict
 		case StatePrepared:
-			if !now.Before(startDeadline.UTC()) {
-				return ErrStartDeadlineExceeded
-			}
 			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
 			}
@@ -251,13 +249,18 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 			entry.ExecutionToken = append([]byte(nil), executionToken...)
 			entry.ExecutionTokenHashHex = hex.EncodeToString(tokenHash[:])
 			entry.LeaseRevision = leaseRevision
+			if !now.Before(startDeadline.UTC()) {
+				expired = true
+				return setInterrupted(entry, now)
+			}
 			return nil
 		case StateStartAuthorized:
 			if !matchesFence(entry, executionToken, leaseRevision) {
 				return ErrStartConflict
 			}
 			if !now.Before(startDeadline.UTC()) {
-				return ErrStartDeadlineExceeded
+				expired = true
+				return setInterrupted(entry, now)
 			}
 			if !now.Before(time.Unix(0, entry.ExpiresAtUnixNano)) {
 				return ErrCommandExpired
@@ -272,7 +275,10 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 	}); err != nil {
 		return err
 	}
-	return j.transition(ctx, commandID, func(entry *storedEntry) error {
+	if expired {
+		return ErrStartDeadlineExceeded
+	}
+	if err := j.transition(ctx, commandID, func(entry *storedEntry) error {
 		now := j.now().UTC()
 		switch entry.State {
 		case StateRunning:
@@ -285,7 +291,8 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 				return ErrStartConflict
 			}
 			if !now.Before(startDeadline.UTC()) {
-				return ErrStartDeadlineExceeded
+				expired = true
+				return setInterrupted(entry, now)
 			}
 		default:
 			if !matchesFence(entry, executionToken, leaseRevision) {
@@ -296,7 +303,13 @@ func (j *BoltJournal) AuthorizeStart(ctx context.Context, commandID string, exec
 		entry.State = StateRunning
 		entry.StartedAtUnixNano = now.UnixNano()
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	if expired {
+		return ErrStartDeadlineExceeded
+	}
+	return nil
 }
 
 func (j *BoltJournal) CancelPrepared(ctx context.Context, commandID string, at time.Time) error {

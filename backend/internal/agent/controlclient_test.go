@@ -180,6 +180,47 @@ func TestStartDeadlineCrossingAfterJournalSyncDoesNotLaunchExecutor(t *testing.T
 	require.NoError(t, <-done)
 }
 
+func TestExpiredPreparedStartPersistsInterruptedResultWithoutExecution(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	executor := &progressExecutor{events: &orderedEvents{}, calls: make(chan struct{}, 1)}
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, executor))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	deadline := now.Add(-time.Second)
+	verifier.now = func() time.Time { return now }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-expired-prepared", "agent-a", []byte("nonce-expired-prepared"), now.Add(-time.Minute), now.Add(time.Hour))}}
+	stream.receive <- commandStartMessage("command-expired-prepared", testExecutionToken(0x78), 25, deadline)
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		pending, pendingErr := journal.PendingResults(context.Background())
+		return pendingErr == nil && len(pending) == 1 && pending[0].State == commandjournal.StateInterrupted && pending[0].Result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED
+	}, time.Second, time.Millisecond)
+	select {
+	case <-executor.calls:
+		t.Fatal("expired prepared Start invoked executor")
+	default:
+	}
+	require.NoError(t, client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a"}}}))
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestSameSessionDuplicateAndMismatchedStartNeverReexecute(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -228,17 +269,19 @@ func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
 		name     string
 		token    byte
 		revision uint64
+		wantErr  error
 	}{
-		{name: "exact fence is idempotent", token: 0x76, revision: 23},
-		{name: "mismatched fence is ignored", token: 0x77, revision: 24},
+		{name: "exact fence is idempotent", token: 0x76, revision: 23, wantErr: commandjournal.ErrAlreadyRunning},
+		{name: "mismatched fence is ignored", token: 0x77, revision: 24, wantErr: commandjournal.ErrStartConflict},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 			require.NoError(t, err)
-			journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+			realJournal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
 			require.NoError(t, err)
-			t.Cleanup(func() { _ = journal.Close() })
+			t.Cleanup(func() { _ = realJournal.Close() })
+			journal := &observingAuthorizeJournal{Journal: realJournal, outcomes: make(chan error, 2)}
 			executor := &lateDuplicateBlockingExecutor{started: make(chan struct{}, 1), release: make(chan struct{})}
 			registry := NewExecutorRegistry()
 			require.NoError(t, registry.Register(CommandKindCollectNow, executor))
@@ -247,6 +290,8 @@ func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
 			now := time.Now().UTC()
 			deadline := now.Add(250 * time.Millisecond)
 			verifier.now = func() time.Time { return now }
+			var clock atomic.Int64
+			clock.Store(now.UnixNano())
 			stream := newFakeControlStream()
 			stream.receive <- helloAckMessage()
 			commandID := "command-late-duplicate-" + strings.ReplaceAll(test.name, " ", "-")
@@ -255,7 +300,8 @@ func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
 			stream.receive <- commandStartMessage(commandID, originalToken, 23, deadline)
 			client, err := NewControlClient(ControlClientConfig{
 				AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
-				Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+				Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
+				Now: func() time.Time { return time.Unix(0, clock.Load()).UTC() },
 			})
 			require.NoError(t, err)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -266,13 +312,21 @@ func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("executor did not start")
 			}
+			require.NoError(t, <-journal.outcomes)
 			if wait := time.Until(deadline.Add(time.Millisecond)); wait > 0 {
 				time.Sleep(wait)
 			}
+			clock.Store(deadline.Add(time.Nanosecond).UnixNano())
 
 			stream.receive <- commandStartMessage(commandID, testExecutionToken(test.token), test.revision, deadline)
+			select {
+			case outcome := <-journal.outcomes:
+				require.ErrorIs(t, outcome, test.wantErr)
+			case <-time.After(time.Second):
+				t.Fatal("late duplicate Start was rejected before journal state classification")
+			}
 			require.Eventually(t, func() bool {
-				entry, getErr := journal.Get(context.Background(), commandID)
+				entry, getErr := realJournal.Get(context.Background(), commandID)
 				return getErr == nil && entry.State == commandjournal.StateRunning
 			}, time.Second, time.Millisecond)
 			require.Equal(t, int32(1), executor.calls.Load())
@@ -280,7 +334,7 @@ func TestLateDuplicateStartDoesNotCorruptActiveExecution(t *testing.T) {
 
 			close(executor.release)
 			require.Eventually(t, func() bool {
-				entry, getErr := journal.Get(context.Background(), commandID)
+				entry, getErr := realJournal.Get(context.Background(), commandID)
 				return getErr == nil && entry.State == commandjournal.StateCompleted && entry.Result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
 			}, time.Second, time.Millisecond)
 			require.Equal(t, int32(1), executor.calls.Load())
@@ -967,6 +1021,17 @@ type blockingAuthorizeJournal struct {
 	commandjournal.Journal
 	authorized chan struct{}
 	release    chan struct{}
+}
+
+type observingAuthorizeJournal struct {
+	commandjournal.Journal
+	outcomes chan error
+}
+
+func (j *observingAuthorizeJournal) AuthorizeStart(ctx context.Context, commandID string, token []byte, revision uint64, deadline time.Time) error {
+	err := j.Journal.AuthorizeStart(ctx, commandID, token, revision, deadline)
+	j.outcomes <- err
+	return err
 }
 
 func (j *blockingAuthorizeJournal) AuthorizeStart(ctx context.Context, commandID string, token []byte, revision uint64, deadline time.Time) error {

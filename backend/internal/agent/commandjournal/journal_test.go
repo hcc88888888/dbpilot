@@ -126,7 +126,11 @@ func TestStartDeadlineIsCheckedAtJournalTransactionTime(t *testing.T) {
 	require.ErrorIs(t, err, ErrStartDeadlineExceeded)
 	entry, getErr := journal.Get(context.Background(), "command-deadline")
 	require.NoError(t, getErr)
-	require.Equal(t, StatePrepared, entry.State)
+	require.Equal(t, StateInterrupted, entry.State)
+	pending, pendingErr := journal.PendingResults(context.Background())
+	require.NoError(t, pendingErr)
+	require.Len(t, pending, 1)
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED, pending[0].Result.GetState())
 }
 
 func TestRunningStartChecksFenceBeforeExpiredDeadlineWithoutMutation(t *testing.T) {

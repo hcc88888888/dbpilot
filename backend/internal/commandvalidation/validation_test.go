@@ -36,6 +36,20 @@ func TestStartValidationRequiresFencingTokenRevisionLeaseAndFutureDeadline(t *te
 	}
 }
 
+func TestStartShapeAllowsExpiredDeadlineButRejectsMalformedStructure(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	expired := &agentv1.CommandStart{
+		CommandId: "command-expired", ExecutionToken: make([]byte, sha256.Size), LeaseRevision: 2,
+		LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(-time.Second)),
+	}
+	require.NoError(t, ValidateStartShape(expired))
+	require.ErrorIs(t, ValidateStart(expired, now), ErrInvalidCommand)
+
+	malformed := proto.Clone(expired).(*agentv1.CommandStart)
+	malformed.ExecutionToken = []byte("short")
+	require.ErrorIs(t, ValidateStartShape(malformed), ErrInvalidCommand)
+}
+
 func TestValidateExecuteSQLRequiresCompleteReviewedPayloadAndOwnership(t *testing.T) {
 	digest := sha256.Sum256([]byte("select 1"))
 	envelope := &agentv1.CommandEnvelope{
