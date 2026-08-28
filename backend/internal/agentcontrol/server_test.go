@@ -216,6 +216,22 @@ func TestPreparedObserverPersistsBeforeServerSendsStart(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestReplayStartAllowsExactExpiredPersistedFence(t *testing.T) {
+	registry := NewRegistry(2)
+	now := time.Date(2026, 8, 28, 13, 0, 0, 0, time.UTC)
+	registry.now = func() time.Time { return now }
+	require.NoError(t, registry.register("agent-a", []string{"collect_now"}, nil, func() {}))
+	start := &agentv1.CommandStart{
+		CommandId: "command-replay", ExecutionToken: bytes.Repeat([]byte{0x71}, sha256.Size), LeaseRevision: 1,
+		LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(-time.Second)),
+	}
+	require.Error(t, registry.Start(context.Background(), "agent-a", start), "fresh Start must retain deadline validation")
+	require.NoError(t, registry.ReplayStart(context.Background(), "agent-a", start))
+	session, ok := registry.liveSession("agent-a")
+	require.True(t, ok)
+	require.True(t, proto.Equal(start, (<-session.send).GetCommandStart()))
+}
+
 func TestResultAckIsPersistedOnlyForMatchingObserverDigest(t *testing.T) {
 	now := time.Unix(1_725_000_000, 0).UTC()
 	registry := NewRegistry(4)

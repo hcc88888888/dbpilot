@@ -1,22 +1,153 @@
 package job
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestTwoPhaseLegacyActiveUpgradeRepairsJobAndAuditWithoutReexecution(t *testing.T) {
+	ctx, database := openUnmigratedJobIntegrationDatabase(t)
+	resetJobIntegrationSchema(t, ctx, database)
+	applyJobMigrationFiles(t, ctx, database, "0001_jobs_outbox.sql", "0002_command_payload_bytea.sql", "0003_prepared_command_envelope.sql", "0004_command_execution_recovery.sql")
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message := integrationPersistenceFixture("legacy-active", platformscope.Scope{TenantID: "tenant-legacy", ProjectID: "project-legacy"}, now.Add(-5*time.Minute))
+	repository := NewPostgresRepository(database)
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+	_, err := database.ExecContext(ctx, `UPDATE jobs SET status = 'running', version = 2, dispatched_at = $1, started_at = $1 WHERE id = $2`, now.Add(-4*time.Minute), value.ID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `UPDATE job_targets SET status = 'running' WHERE job_id = $1 AND target_id = $2`, value.ID, message.TargetID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `UPDATE command_outbox SET published_at = $1, command_status = 'active', acknowledged_at = $1, execution_deadline_at = $2, execution_last_heartbeat_at = $1 WHERE id = $3`, now.Add(-4*time.Minute), now.Add(time.Hour), message.ID)
+	require.NoError(t, err)
+
+	applyJobMigrationFiles(t, ctx, database, "0005_two_phase_execution.sql")
+	upgradedAt := time.Now().UTC()
+	stored, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseRunning, stored.Phase)
+	require.Equal(t, uint64(1), stored.ExecutionRevision)
+	require.Equal(t, uint64(1), stored.RecoveryRevision)
+	require.NotNil(t, stored.ExecutionDeadline)
+	require.False(t, stored.ExecutionDeadline.After(upgradedAt), "legacy active work must become immediately claimable")
+	require.Len(t, stored.ExecutionTokenHash, sha256.Size)
+	require.NotEmpty(t, stored.ExecutionTokenCiphertext)
+
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x65}, 32))
+	require.NoError(t, err)
+	auditService := audit.NewService(audit.NewPostgresStore(database))
+	agents := &recordingCommandDispatcher{}
+	lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: repository, Jobs: repository, Agents: agents, Signer: signer,
+		Audit: auditService, TokenProtector: protector, ClaimLimit: 4,
+	})
+	require.NoError(t, err)
+	_, err = lifecycle.DispatchPending(ctx, now.Add(time.Second))
+	require.NoError(t, err)
+	repaired, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, repaired.Status)
+	require.Equal(t, TargetTimedOut, repaired.TargetResults[0].Status)
+	stored, err = repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseTimedOut, stored.Phase)
+	require.Empty(t, agents.starts, "legacy active work must never be replayed")
+	var evidence int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id = $1 AND action = 'command.execution_timed_out'`, message.ID).Scan(&evidence))
+	require.Equal(t, 1, evidence)
+}
+
+func TestTwoPhasePreparedRecoveryReplaysOrphanFromPostgres(t *testing.T) {
+	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message := integrationPersistenceFixture("prepared-recovery", platformscope.Scope{TenantID: "tenant-recovery", ProjectID: "project-recovery"}, now.Add(-time.Minute))
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x66}, 32))
+	require.NoError(t, err)
+	agents := &recordingCommandDispatcher{}
+	lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: repository, Jobs: repository, Agents: agents, Signer: signer,
+		Audit: &recordingAudit{}, TokenProtector: protector, ClaimLimit: 4, Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	_, err = lifecycle.DispatchPending(ctx, now)
+	require.NoError(t, err)
+	require.Len(t, agents.envelopes, 1)
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(agents.envelopes[0])
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	require.NoError(t, repository.MarkPrepared(ctx, value.Scope, message.ID, digest, now))
+
+	_, err = lifecycle.DispatchPending(ctx, now.Add(time.Second))
+	require.NoError(t, err)
+	require.Len(t, agents.starts, 1)
+	stored, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseStartAuthorized, stored.Phase)
+	require.Equal(t, agents.starts[0].GetLeaseRevision(), stored.ExecutionRevision)
+}
+
+func openUnmigratedJobIntegrationDatabase(t *testing.T) (context.Context, *sql.DB) {
+	t.Helper()
+	if os.Getenv("DBPILOT_JOB_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_JOB_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_JOB_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_JOB_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	database, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	require.NoError(t, database.PingContext(ctx))
+	return ctx, database
+}
+
+func applyJobMigrationFiles(t *testing.T, ctx context.Context, database *sql.DB, names ...string) {
+	t.Helper()
+	_, err := database.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS dbpilot_schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+	require.NoError(t, err)
+	for _, name := range names {
+		content, readErr := migrationFiles.ReadFile("migrations/" + name)
+		require.NoError(t, readErr)
+		body := strings.TrimSpace(string(content))
+		body = strings.TrimSpace(strings.TrimPrefix(body, "BEGIN;"))
+		body = strings.TrimSpace(strings.TrimSuffix(body, "COMMIT;"))
+		_, err = database.ExecContext(ctx, body)
+		require.NoError(t, err)
+		_, err = database.ExecContext(ctx, "INSERT INTO dbpilot_schema_migrations (name) VALUES ($1)", "job/migrations/"+name)
+		require.NoError(t, err)
+	}
+}
 
 func TestStartCancelRaceCancelCommitPreventsStart(t *testing.T) {
 	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
@@ -99,7 +230,7 @@ func TestStartCancelRaceConcurrentTransactionsHaveOneStartDecision(t *testing.T)
 	}
 }
 
-func TestStartCancelRaceCancellationWaitsForStartEnqueueMarker(t *testing.T) {
+func TestStartCancelRaceStartEnqueueMarkerIsDiagnosticOnly(t *testing.T) {
 	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
 	now := time.Date(2026, 8, 28, 12, 17, 0, 0, time.UTC)
 	value, message := integrationPersistenceFixture("enqueue-marker", platformscope.Scope{TenantID: "tenant-race", ProjectID: "project-race"}, now.Add(-time.Minute))
@@ -114,13 +245,14 @@ func TestStartCancelRaceCancellationWaitsForStartEnqueueMarker(t *testing.T) {
 
 	claimed, err := repository.ClaimPendingCancellations(ctx, 1, now.Add(3*time.Second))
 	require.NoError(t, err)
-	require.Empty(t, claimed, "Cancel must not be enqueued before the committed Start")
-	require.NoError(t, repository.MarkStartEnqueued(ctx, value.Scope, message.ID, grant.ExecutionRevision, now.Add(4*time.Second)))
-	claimed, err = repository.ClaimPendingCancellations(ctx, 1, now.Add(5*time.Second))
-	require.NoError(t, err)
-	require.Len(t, claimed, 1)
+	require.Len(t, claimed, 1, "recovery must not depend on diagnostic Start enqueue evidence")
+	require.Nil(t, claimed[0].StartEnqueuedAt)
 	require.Equal(t, CommandPhaseCancelling, claimed[0].Phase)
 	require.Equal(t, []byte("ciphertext-enqueue-marker"), claimed[0].ExecutionTokenCiphertext)
+	require.NoError(t, repository.MarkStartEnqueued(ctx, value.Scope, message.ID, grant.ExecutionRevision, now.Add(4*time.Second)))
+	stored, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored.StartEnqueuedAt)
 }
 
 func TestLeaseFenceHeartbeatInvalidatesTimeoutClaim(t *testing.T) {

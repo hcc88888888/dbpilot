@@ -14,6 +14,24 @@ ALTER TABLE command_outbox
     ADD COLUMN terminal_result_digest BYTEA,
     ADD COLUMN terminal_at TIMESTAMPTZ;
 
+-- Commands that were active under the single-phase 0004 schema cannot be
+-- safely resumed because no execution token existed. Give them an
+-- unforgeable synthetic fence and an immediate recovery deadline so the
+-- timeout worker records durable Job/Audit evidence without reexecution.
+UPDATE command_outbox
+SET command_phase = 'running',
+    prepare_digest = decode(repeat('00', 32), 'hex'),
+    prepared_at = COALESCE(acknowledged_at, published_at, created_at),
+    execution_token_hash = decode(repeat('00', 32), 'hex'),
+    execution_token_ciphertext = decode('00', 'hex'),
+    execution_revision = 1,
+    recovery_revision = 1,
+    start_deadline_at = CURRENT_TIMESTAMP,
+    start_enqueued_at = published_at,
+    execution_deadline_at = LEAST(COALESCE(execution_deadline_at, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP),
+    execution_last_heartbeat_at = COALESCE(execution_last_heartbeat_at, acknowledged_at, published_at, created_at)
+WHERE command_status = 'active';
+
 UPDATE command_outbox
 SET command_phase = command_status,
     terminal_at = COALESCE(acknowledged_at, published_at, created_at)
@@ -85,13 +103,14 @@ CREATE INDEX command_outbox_prepared_idx
     ON command_outbox (prepared_at, created_at, id)
     WHERE command_phase = 'prepared' AND cancellation_requested_at IS NULL;
 
+CREATE INDEX command_outbox_prepared_recovery_idx
+    ON command_outbox (lease_expires_at, prepared_at, created_at, id)
+    WHERE command_phase IN ('prepared', 'start_authorized');
+
 CREATE INDEX command_outbox_pending_cancellation_v2_idx
     ON command_outbox (cancellation_available_at, cancellation_lease_expires_at, created_at, id)
     WHERE cancellation_requested_at IS NOT NULL
-      AND (
-          command_phase IN ('pending', 'preparing', 'prepared')
-          OR (command_phase IN ('start_authorized', 'running', 'cancelling') AND start_enqueued_at IS NOT NULL)
-      );
+      AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling');
 
 CREATE INDEX command_outbox_expired_execution_v2_idx
     ON command_outbox (execution_deadline_at, recovery_claimed_deadline, recovery_claimed_revision, created_at, id)

@@ -224,6 +224,23 @@ func (r *Registry) Start(ctx context.Context, agentID string, start *agentv1.Com
 	if err := commandvalidation.ValidateStart(start, r.now()); err != nil {
 		return &dispatchError{err: ErrInvalidCommand}
 	}
+	return r.enqueueStart(agentID, start)
+}
+
+// ReplayStart re-enqueues an already persisted fence. Shape validation is
+// intentional: the Agent journal classifies an exact late replay by its
+// durable state and never starts expired prepared work.
+func (r *Registry) ReplayStart(ctx context.Context, agentID string, start *agentv1.CommandStart) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := commandvalidation.ValidateStartShape(start); err != nil {
+		return &dispatchError{err: ErrInvalidCommand}
+	}
+	return r.enqueueStart(agentID, start)
+}
+
+func (r *Registry) enqueueStart(agentID string, start *agentv1.CommandStart) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current, exists := r.sessions[agentID]
@@ -264,6 +281,24 @@ func (r *Registry) Cancel(ctx context.Context, agentID, commandID string) error 
 		cancellation.LeaseRevision = current.leaseRevisions[commandID]
 	}
 	err := enqueueCancellation(current, commandID, cancellation)
+	r.mu.RUnlock()
+	return err
+}
+
+func (r *Registry) CancelPrepared(ctx context.Context, agentID, commandID, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(commandID) == "" {
+		return &dispatchError{err: ErrInvalidCommand}
+	}
+	r.mu.RLock()
+	current, exists := r.sessions[agentID]
+	if !exists {
+		r.mu.RUnlock()
+		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
+	}
+	err := enqueueCancellation(current, commandID, &agentv1.CommandCancellation{CommandId: commandID, Reason: reason})
 	r.mu.RUnlock()
 	return err
 }
@@ -355,6 +390,8 @@ var _ Dispatcher = (*Registry)(nil)
 type Dispatcher interface {
 	Dispatch(context.Context, string, *agentv1.CommandEnvelope) error
 	Start(context.Context, string, *agentv1.CommandStart) error
+	ReplayStart(context.Context, string, *agentv1.CommandStart) error
 	Cancel(context.Context, string, string) error
+	CancelPrepared(context.Context, string, string, string) error
 	CancelExecution(context.Context, string, string, []byte, uint64, string) error
 }

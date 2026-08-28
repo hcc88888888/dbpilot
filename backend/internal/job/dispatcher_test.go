@@ -124,6 +124,191 @@ func TestTwoPhaseCancelBeforePreparedPreventsStartDispatch(t *testing.T) {
 	require.Empty(t, fixture.agents.starts, "a cancellation transaction that commits first must prevent Start")
 }
 
+func TestPreparedRecoveryPeriodicallyAuthorizesAndReplaysStart(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-a", "agent-a")
+	fixture.persistence.claimed = nil
+
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(time.Second))
+	require.NoError(t, err)
+	require.Len(t, fixture.agents.starts, 1)
+	require.Equal(t, message.ID, fixture.agents.starts[0].GetCommandId())
+	require.Equal(t, CommandPhaseStartAuthorized, fixture.persistence.messages[message.ID].Phase)
+}
+
+func TestPreparedRecoveryTimesOutJobAndCommandWithoutStart(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-a", "agent-a")
+	fixture.persistence.claimed = nil
+	value := fixture.persistence.currentJob()
+	timeout := fixture.now.Add(-time.Second)
+	value.TimeoutAt = &timeout
+	fixture.persistence.jobs[value.ID] = value
+
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	require.Empty(t, fixture.agents.starts)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, "command.prepared_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+}
+
+func TestStartEnqueueMarkerFailureReplaysIdenticalPersistedStart(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, digest := fixture.persistPreparedCommand(t, "command-a", "agent-a")
+	fixture.persistence.claimed = nil
+	fixture.persistence.markStartErrors = []error{errors.New("marker unavailable"), nil}
+
+	_, err := fixture.lifecycle.Prepared(context.Background(), "agent-a", &agentv1.CommandPrepared{CommandId: message.ID, EnvelopeDigest: digest[:]})
+	require.ErrorContains(t, err, "marker unavailable")
+	require.Len(t, fixture.agents.starts, 1)
+	require.Nil(t, fixture.persistence.messages[message.ID].StartEnqueuedAt)
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(time.Second))
+	require.NoError(t, err)
+	require.Len(t, fixture.agents.starts, 2)
+	require.True(t, proto.Equal(fixture.agents.starts[0], fixture.agents.starts[1]))
+	require.NotNil(t, fixture.persistence.messages[message.ID].StartEnqueuedAt)
+}
+
+func TestTimeoutRepairPersistsJobAndAuditBeforeCommandFinalization(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	deadline := fixture.now.Add(-time.Second)
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	fixture.persistence.finalizeErrors = []error{errors.New("terminal write unavailable"), nil}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.ErrorContains(t, err, "terminal write unavailable")
+	first := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, first.Status)
+	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Len(t, fixture.audit.events, 1)
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultOutboxLease+time.Second))
+	require.NoError(t, err)
+	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Len(t, fixture.audit.events, 1, "timeout retry must use the same RecordOnce evidence")
+}
+
+func TestTimeoutAuditFailureLeavesCommandClaimableForIdempotentRepair(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	deadline := fixture.now.Add(-time.Second)
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	fixture.audit.onceErrors = []error{errors.New("audit unavailable"), nil}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.ErrorContains(t, err, "audit unavailable")
+	first := fixture.persistence.currentJob()
+	require.Equal(t, StatusTimedOut, first.Status)
+	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Empty(t, fixture.audit.events)
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultOutboxLease+time.Second))
+	require.NoError(t, err)
+	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Len(t, fixture.audit.events, 1)
+}
+
+func TestLegacyAcceptedAcknowledgementCannotInvalidateTimeoutClaim(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	deadline := fixture.now.Add(-time.Second)
+	message.Phase = CommandPhaseStartAuthorized
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+	claims, err := fixture.persistence.ClaimExpiredExecution(context.Background(), 1, fixture.now)
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	before := fixture.persistence.messages[message.ID]
+
+	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: message.ID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
+	after := fixture.persistence.messages[message.ID]
+	require.Equal(t, before.ExecutionDeadline, after.ExecutionDeadline)
+	require.Equal(t, before.RecoveryRevision, after.RecoveryRevision)
+	require.Equal(t, before.RecoveryClaimToken, after.RecoveryClaimToken)
+	require.Equal(t, before.RecoveryClaimedRevision, after.RecoveryClaimedRevision)
+	require.Equal(t, "command.acknowledgement_ignored", fixture.audit.events[0].Action)
+	require.NoError(t, fixture.persistence.FinalizeExpiredExecution(context.Background(), claims[0], fixture.now.Add(time.Second)))
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+}
+
+func TestPreparedRecoveryRunsOnConnectedSession(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-a", "agent-a")
+	fixture.persistence.claimed = nil
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED}}})
+	require.Len(t, fixture.agents.starts, 1)
+	require.Equal(t, message.ID, fixture.agents.starts[0].GetCommandId())
+}
+
+func TestConnectedPreparedCancellationUsesUnfencedCancelAndTerminalizes(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message, _ := fixture.persistPreparedCommand(t, "command-a", "agent-a")
+	fixture.persistence.claimed = nil
+	current := fixture.persistence.currentJob()
+	_, err := fixture.persistence.RequestCancel(context.Background(), fixture.scope, current.ID, "operator", current.Version, fixture.now.Add(time.Second))
+	require.NoError(t, err)
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED}}})
+	require.Empty(t, fixture.agents.starts)
+	require.Equal(t, []string{"cancel-unfenced:" + message.ID}, fixture.agents.events)
+	require.Equal(t, StatusCancelled, fixture.persistence.currentJob().Status)
+	require.Equal(t, CommandCancelled, fixture.persistence.messages[message.ID].CommandStatus)
+}
+
+func TestConnectedStartAuthorizedCancellationReplaysStartBeforeFencedCancelWithoutMarker(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	message.Phase = CommandPhaseStartAuthorized
+	message.StartEnqueuedAt = nil
+	fixture.persistence.messages[message.ID] = message
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+	_, err = fixture.persistence.RequestCancel(context.Background(), fixture.scope, current.ID, "operator", current.Version, fixture.now.Add(time.Second))
+	require.NoError(t, err)
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a", ActiveCommands: []*agentv1.CommandRecoveryState{{CommandId: message.ID, State: agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_START_AUTHORIZED, ExecutionToken: token, LeaseRevision: 1}}})
+	require.Equal(t, []string{"start:" + message.ID, "cancel:" + message.ID}, fixture.agents.events)
+	require.NotNil(t, fixture.persistence.messages[message.ID].StartEnqueuedAt)
+}
+
 func TestResultFenceContradictoryLateResultReturnsNonRetryableConflict(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	token := bytes.Repeat([]byte{0x5a}, sha256.Size)
@@ -382,25 +567,25 @@ func TestExpiredDeliveryFinishesSucceededPartialWhenAnotherTargetSucceeded(t *te
 	require.Equal(t, Progress{TotalTargets: 2, CompletedTargets: 1, FailedTargets: 1}, got.Progress)
 }
 
-func TestAcknowledgementPersistsJobAndAuditBeforePublicationAndRetriesMarker(t *testing.T) {
+func TestAcceptedAcknowledgementIsIdempotentEvidenceOnly(t *testing.T) {
 	fixture := newCommandLifecycleFixture(t)
 	fixture.persistence.messages["command-a"] = fixture.message(t, "command-a", "agent-a")
 	fixture.persistence.jobs[fixture.value.ID] = transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
-	fixture.persistence.markErrors = []error{errors.New("publication unavailable"), nil}
 	before := fixture.persistence.currentJob()
 
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
-	require.Greater(t, fixture.persistence.currentJob().Version, before.Version)
-	require.Equal(t, TargetRunning, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, before.Version, fixture.persistence.currentJob().Version)
+	require.Empty(t, fixture.persistence.currentJob().TargetResults)
 	require.Empty(t, fixture.persistence.published)
 	require.Len(t, fixture.audit.events, 1)
-	require.Len(t, fixture.observerErrors(), 1)
+	require.Equal(t, "command.acknowledgement_ignored", fixture.audit.events[0].Action)
+	require.Empty(t, fixture.observerErrors())
 
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE})
-	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
-	require.Equal(t, TargetRunning, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Empty(t, fixture.persistence.published)
+	require.Empty(t, fixture.persistence.currentJob().TargetResults)
 	require.Len(t, fixture.audit.events, 1)
-	require.Equal(t, 2, fixture.persistence.markCalls)
+	require.Zero(t, fixture.persistence.markCalls)
 }
 
 func TestRejectedAcknowledgementDurablyTerminalizesTargetBeforePublication(t *testing.T) {
@@ -415,7 +600,7 @@ func TestRejectedAcknowledgementDurablyTerminalizesTargetBeforePublication(t *te
 	require.Equal(t, "failure", fixture.audit.events[0].Result)
 }
 
-func TestAcceptedAcknowledgementPersistsExecutionDeadlineBoundedByJobTimeout(t *testing.T) {
+func TestAcceptedAcknowledgementCannotCreateExecutionFenceOrDeadline(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	timeout := fixture.now.Add(10 * time.Second)
 	value := fixture.value
@@ -427,10 +612,10 @@ func TestAcceptedAcknowledgementPersistsExecutionDeadlineBoundedByJobTimeout(t *
 	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: message.ID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED})
 
 	stored := fixture.persistence.messages[message.ID]
-	require.Equal(t, CommandActive, stored.CommandStatus)
-	require.NotNil(t, stored.ExecutionDeadline)
-	require.Equal(t, timeout, *stored.ExecutionDeadline)
-	require.Equal(t, fixture.now, *stored.LastHeartbeatAt)
+	require.Empty(t, stored.CommandStatus)
+	require.Nil(t, stored.ExecutionDeadline)
+	require.Nil(t, stored.LastHeartbeatAt)
+	require.Zero(t, stored.ExecutionRevision)
 }
 
 func TestDispatchPendingRejectsPayloadAuthorityAndAgentMismatchWithoutPublishing(t *testing.T) {
@@ -621,7 +806,10 @@ func TestExpiredExecutionLeaseDurablyTimesOutTargetJobAndAuditOnce(t *testing.T)
 	published := fixture.now.Add(-time.Minute)
 	deadline := fixture.now.Add(-time.Second)
 	message.PublishedAt = &published
-	message.CommandStatus = CommandActive
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	message.PublishedAt = &published
 	message.ExecutionDeadline = &deadline
 	fixture.persistence.messages[message.ID] = message
 	fixture.persistence.expired = []OutboxMessage{message}
@@ -711,6 +899,27 @@ func (fixture *commandLifecycleFixture) messageWithLease(t *testing.T, id, agent
 	return OutboxMessage{ID: id, Scope: fixture.scope, JobID: fixture.value.ID, TargetID: agentID, Type: commandOutboxType, Payload: fixture.unsignedEnvelopeWithLease(t, agentID, leaseSeconds), AvailableAt: fixture.now, CreatedAt: fixture.now}
 }
 
+func (fixture *commandLifecycleFixture) persistPreparedCommand(t *testing.T, id, agentID string) (OutboxMessage, [sha256.Size]byte) {
+	t.Helper()
+	message := fixture.message(t, id, agentID)
+	fixture.persistence.claimed = []OutboxMessage{message}
+	_, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+	require.NoError(t, err)
+	require.NotEmpty(t, fixture.agents.envelopes)
+	envelope := fixture.agents.envelopes[len(fixture.agents.envelopes)-1]
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	message.PreparedEnvelope = encoded
+	message.Phase = CommandPhasePrepared
+	message.CommandStatus = CommandPending
+	message.PrepareDigest = append([]byte(nil), digest[:]...)
+	message.PreparedAt = timePointer(fixture.now)
+	message.PublishedAt = timePointer(fixture.now)
+	fixture.persistence.messages[id] = message
+	return message, digest
+}
+
 func (fixture *commandLifecycleFixture) fenceMessage(t *testing.T, id string) []byte {
 	t.Helper()
 	message, ok := fixture.persistence.messages[id]
@@ -745,17 +954,19 @@ type publishedCommand struct {
 }
 
 type memoryCommandPersistence struct {
-	mu         sync.Mutex
-	jobs       map[string]Job
-	messages   map[string]OutboxMessage
-	claimed    []OutboxMessage
-	published  []publishedCommand
-	lookups    int
-	conflicts  int
-	prepared   map[string][]byte
-	markErrors []error
-	markCalls  int
-	expired    []OutboxMessage
+	mu              sync.Mutex
+	jobs            map[string]Job
+	messages        map[string]OutboxMessage
+	claimed         []OutboxMessage
+	published       []publishedCommand
+	lookups         int
+	conflicts       int
+	prepared        map[string][]byte
+	markErrors      []error
+	markCalls       int
+	expired         []OutboxMessage
+	markStartErrors []error
+	finalizeErrors  []error
 }
 
 func (store *memoryCommandPersistence) CreateWithOutbox(context.Context, Job, []OutboxMessage) error {
@@ -910,6 +1121,13 @@ func (store *memoryCommandPersistence) AuthorizeStart(_ context.Context, scope p
 func (store *memoryCommandPersistence) MarkStartEnqueued(_ context.Context, scope platformscope.Scope, id string, executionRevision uint64, at time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if len(store.markStartErrors) > 0 {
+		err := store.markStartErrors[0]
+		store.markStartErrors = store.markStartErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
 	message, ok := store.messages[id]
 	if !ok || message.Scope != scope || message.ExecutionRevision != executionRevision {
 		return ErrConflict
@@ -962,6 +1180,13 @@ func (store *memoryCommandPersistence) ClaimExpiredExecution(_ context.Context, 
 func (store *memoryCommandPersistence) FinalizeExpiredExecution(_ context.Context, claim RecoveryClaim, at time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if len(store.finalizeErrors) > 0 {
+		err := store.finalizeErrors[0]
+		store.finalizeErrors = store.finalizeErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
 	message := store.messages[claim.CommandID]
 	if message.ExecutionDeadline == nil || message.RecoveryClaimedDeadline == nil || !bytes.Equal(message.RecoveryClaimToken, claim.ClaimToken[:]) || !message.ExecutionDeadline.Equal(claim.ClaimedDeadline) || message.RecoveryRevision != claim.ClaimedRecoveryRevision || message.RecoveryClaimedRevision != claim.ClaimedRecoveryRevision {
 		return ErrConflict
@@ -1028,9 +1253,25 @@ func (store *memoryCommandPersistence) ClaimPendingCancellations(context.Context
 	defer store.mu.Unlock()
 	var result []OutboxMessage
 	for _, message := range store.messages {
-		preStart := message.Phase == "" || message.Phase == CommandPhasePending || message.Phase == CommandPhasePreparing || message.Phase == CommandPhasePrepared
-		startedAndEnqueued := (message.Phase == CommandPhaseStartAuthorized || message.Phase == CommandPhaseRunning || message.Phase == CommandPhaseCancelling) && message.StartEnqueuedAt != nil
-		if message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) && (preStart || startedAndEnqueued) {
+		if message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) {
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
+func (store *memoryCommandPersistence) ClaimPreparedCommands(_ context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for id, message := range store.messages {
+		if len(result) >= limit {
+			break
+		}
+		if (message.Phase == CommandPhasePrepared || message.Phase == CommandPhaseStartAuthorized) && (message.LeasedUntil == nil || !message.LeasedUntil.After(at)) {
+			leasedUntil := at.Add(DefaultOutboxLease)
+			message.LeasedUntil = &leasedUntil
+			message.Attempts++
+			store.messages[id] = message
 			result = append(result, message)
 		}
 	}
@@ -1047,6 +1288,9 @@ func (store *memoryCommandPersistence) DeferCancellation(_ context.Context, _ pl
 func (store *memoryCommandPersistence) AcknowledgeCommand(_ context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time, deadline *time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if status == CommandActive {
+		return nil
+	}
 	store.markCalls++
 	if len(store.markErrors) > 0 {
 		err := store.markErrors[0]
@@ -1108,9 +1352,21 @@ func (store *memoryCommandPersistence) PendingCancellationsForAgent(_ context.Co
 	defer store.mu.Unlock()
 	var result []OutboxMessage
 	for _, message := range store.messages {
-		preStart := message.Phase == "" || message.Phase == CommandPhasePending || message.Phase == CommandPhasePreparing || message.Phase == CommandPhasePrepared
-		startedAndEnqueued := (message.Phase == CommandPhaseStartAuthorized || message.Phase == CommandPhaseRunning || message.Phase == CommandPhaseCancelling) && message.StartEnqueuedAt != nil
-		if message.TargetID == agentID && message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) && (preStart || startedAndEnqueued) {
+		if message.TargetID == agentID && message.CancellationRequestedAt != nil && !terminalCommandStatus(message.CommandStatus) {
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
+func (store *memoryCommandPersistence) PreparedCommandsForAgent(_ context.Context, agentID string, limit int) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for _, message := range store.messages {
+		if len(result) >= limit {
+			break
+		}
+		if message.TargetID == agentID && (message.Phase == CommandPhasePrepared || message.Phase == CommandPhaseStartAuthorized) {
 			result = append(result, message)
 		}
 	}
@@ -1127,6 +1383,7 @@ type recordingCommandDispatcher struct {
 	starts              []*agentv1.CommandStart
 	cancellations       []string
 	fencedCancellations []recordedCancellation
+	events              []string
 }
 
 type recordedCancellation struct {
@@ -1157,15 +1414,26 @@ func (dispatcher *recordingCommandDispatcher) Dispatch(_ context.Context, _ stri
 }
 func (dispatcher *recordingCommandDispatcher) Start(_ context.Context, _ string, start *agentv1.CommandStart) error {
 	dispatcher.starts = append(dispatcher.starts, proto.Clone(start).(*agentv1.CommandStart))
+	dispatcher.events = append(dispatcher.events, "start:"+start.GetCommandId())
 	return nil
+}
+func (dispatcher *recordingCommandDispatcher) ReplayStart(ctx context.Context, agentID string, start *agentv1.CommandStart) error {
+	return dispatcher.Start(ctx, agentID, start)
 }
 func (dispatcher *recordingCommandDispatcher) Cancel(_ context.Context, agentID, commandID string) error {
 	dispatcher.cancellations = append(dispatcher.cancellations, agentID+"/"+commandID)
+	dispatcher.events = append(dispatcher.events, "cancel-unfenced:"+commandID)
+	return nil
+}
+func (dispatcher *recordingCommandDispatcher) CancelPrepared(_ context.Context, agentID, commandID, _ string) error {
+	dispatcher.cancellations = append(dispatcher.cancellations, agentID+"/"+commandID)
+	dispatcher.events = append(dispatcher.events, "cancel-unfenced:"+commandID)
 	return nil
 }
 func (dispatcher *recordingCommandDispatcher) CancelExecution(_ context.Context, agentID, commandID string, token []byte, executionRevision uint64, reason string) error {
 	dispatcher.cancellations = append(dispatcher.cancellations, agentID+"/"+commandID)
 	dispatcher.fencedCancellations = append(dispatcher.fencedCancellations, recordedCancellation{agentID: agentID, commandID: commandID, token: append([]byte(nil), token...), executionRevision: executionRevision, reason: reason})
+	dispatcher.events = append(dispatcher.events, "cancel:"+commandID)
 	return nil
 }
 

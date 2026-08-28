@@ -26,6 +26,7 @@ import (
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -71,7 +72,8 @@ func TestJobCommandLifecycle(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	controlServer := agentcontrol.NewServer(registry, lifecycle)
+	resultErrors := make(chan error, 16)
+	controlServer := agentcontrol.NewServer(registry, &resultErrorObserver{CommandLifecycle: lifecycle, errors: resultErrors})
 	streams := map[string]*contractAgentStream{}
 	for _, agentID := range []string{"agent-a", "agent-b"} {
 		stream := newContractAgentStream(contractPeerContext(agentID), contractHello(agentID))
@@ -156,11 +158,38 @@ func TestJobCommandLifecycle(t *testing.T) {
 	)
 
 	var completed job.Job
-	require.Eventually(t, func() bool {
+	completedInTime := assert.EventuallyWithT(t, func(collect *assert.CollectT) {
 		var getErr error
 		completed, getErr = repository.Get(ctx, scope, value.ID)
-		return getErr == nil && completed.Status == job.StatusSucceeded
+		assert.NoError(collect, getErr)
+		assert.Equal(collect, job.StatusSucceeded, completed.Status)
+		if len(completed.TargetResults) == 2 {
+			assert.Equal(collect, job.TargetSucceeded, completed.TargetResults[0].Status)
+			assert.Equal(collect, job.TargetFailed, completed.TargetResults[1].Status)
+		} else {
+			assert.Len(collect, completed.TargetResults, 2)
+		}
 	}, 10*time.Second, 20*time.Millisecond)
+	if !completedInTime {
+		rows, queryErr := database.QueryContext(ctx, "SELECT id, command_phase, command_status FROM command_outbox WHERE job_id = $1 ORDER BY id", value.ID)
+		require.NoError(t, queryErr)
+		defer rows.Close()
+		var commands []string
+		for rows.Next() {
+			var id, phase, status string
+			require.NoError(t, rows.Scan(&id, &phase, &status))
+			commands = append(commands, id+":"+phase+":"+status)
+		}
+		var persistenceErrors []error
+		for {
+			select {
+			case resultErr := <-resultErrors:
+				persistenceErrors = append(persistenceErrors, resultErr)
+			default:
+				t.Fatalf("lifecycle stalled: job=%+v commands=%v result_errors=%v", completed, commands, persistenceErrors)
+			}
+		}
+	}
 	require.Equal(t, job.OutcomePartial, completed.Outcome)
 	require.Equal(t, 1, completed.Progress.CompletedTargets)
 	require.Equal(t, 1, completed.Progress.FailedTargets)
@@ -217,6 +246,9 @@ func TestJobCommandLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	_, err = lifecycle.DispatchPending(ctx, time.Now().UTC())
 	require.NoError(t, err)
+	raceReplay := streams["agent-a"].nextSent(t).GetCommandStart()
+	require.NotNil(t, raceReplay)
+	require.True(t, proto.Equal(raceStart, raceReplay), "cancellation must replay the exact persisted Start fence first")
 	raceCancellation := streams["agent-a"].nextSent(t).GetCommandCancellation()
 	require.NotNil(t, raceCancellation)
 	require.Equal(t, raceStart.GetExecutionToken(), raceCancellation.GetExecutionToken())
@@ -488,3 +520,16 @@ func (stream *contractAgentStream) RecvMsg(message any) error {
 }
 
 var _ grpc.BidiStreamingServer[agentv1.AgentMessage, agentv1.ServerMessage] = (*contractAgentStream)(nil)
+
+type resultErrorObserver struct {
+	*job.CommandLifecycle
+	errors chan error
+}
+
+func (observer *resultErrorObserver) Result(ctx context.Context, agentID string, result *agentv1.CommandResult) (agentcontrol.ResultPersistence, error) {
+	outcome, err := observer.CommandLifecycle.Result(ctx, agentID, result)
+	if err != nil {
+		observer.errors <- err
+	}
+	return outcome, err
+}

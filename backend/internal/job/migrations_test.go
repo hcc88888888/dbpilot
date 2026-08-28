@@ -77,7 +77,9 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	}
 	twoPhase, err := migrationFiles.ReadFile("migrations/0005_two_phase_execution.sql")
 	require.NoError(t, err)
-	for _, required := range []string{"command_phase", "prepare_digest", "execution_token_ciphertext", "execution_token_hash", "execution_revision", "recovery_revision", "start_deadline_at", "start_enqueued_at", "recovery_claim_token", "recovery_claimed_deadline", "recovery_claimed_revision", "terminal_result_digest", "terminal_at", "command_outbox_prepared_idx", "command_outbox_pending_cancellation_v2_idx", "command_outbox_expired_execution_v2_idx"} {
+	for _, required := range []string{"command_phase", "prepare_digest", "execution_token_ciphertext", "execution_token_hash", "execution_revision", "recovery_revision", "start_deadline_at", "start_enqueued_at", "recovery_claim_token", "recovery_claimed_deadline", "recovery_claimed_revision", "terminal_result_digest", "terminal_at", "command_outbox_prepared_idx", "command_outbox_prepared_recovery_idx", "command_outbox_pending_cancellation_v2_idx", "command_outbox_expired_execution_v2_idx"} {
 		require.Contains(t, string(twoPhase), required)
 	}
+	require.Contains(t, string(twoPhase), "WHERE command_status = 'active'")
+	require.Contains(t, string(twoPhase), "execution_deadline_at = LEAST")
 }

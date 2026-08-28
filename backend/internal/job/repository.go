@@ -24,6 +24,8 @@ type DispatchRepository interface {
 	ClaimOutbox(context.Context, int, time.Time) ([]OutboxMessage, error)
 	LookupCommand(context.Context, string) (OutboxMessage, error)
 	PrepareCommandEnvelope(context.Context, platformscope.Scope, string, []byte) ([]byte, error)
+	ClaimPreparedCommands(context.Context, int, time.Time) ([]OutboxMessage, error)
+	PreparedCommandsForAgent(context.Context, string, int) ([]OutboxMessage, error)
 	MarkPrepared(context.Context, platformscope.Scope, string, [32]byte, time.Time) error
 	AuthorizeStart(context.Context, platformscope.Scope, string, [32]byte, [32]byte, []byte, time.Time, time.Time) (StartGrant, error)
 	MarkStartEnqueued(context.Context, platformscope.Scope, string, uint64, time.Time) error

@@ -31,20 +31,23 @@ const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id,
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
 const insertOutboxSQL = "INSERT INTO command_outbox (id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
 const selectJobSQL = "SELECT " + jobColumnsSQL + " FROM jobs WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
+const selectJobForUpdateSQL = selectJobSQL + " FOR UPDATE"
 const selectTargetsSQL = "SELECT target_id, status, error_summary, result_summary, artifacts, finished_at FROM job_targets WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY target_id"
 const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, completed_targets = $4, failed_targets = $5, skipped_targets = $6, error_summary = $7, result_summary = $8, artifacts = $9, dispatched_at = $10, started_at = $11, finished_at = $12, cancel_requested_by = $13, cancel_requested_at = $14 WHERE tenant_id = $15 AND project_id = $16 AND id = $17 AND version = $18"
 const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND cancellation_requested_at IS NULL AND command_status = 'pending' AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
+const claimPreparedCommandsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE command_phase IN ('prepared', 'start_authorized') AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY prepared_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY prepared_at, created_at, id"
 const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4"
 const selectOutboxByIDSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE id = $1"
 const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4), command_phase = CASE WHEN command_phase = 'pending' THEN 'preparing' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing') RETURNING prepared_envelope"
 const requestCommandCancellationSQL = "UPDATE command_outbox SET cancellation_requested_at = COALESCE(cancellation_requested_at, $4), cancellation_reason = CASE WHEN cancellation_requested_at IS NULL THEN $5 ELSE cancellation_reason END, cancellation_available_at = COALESCE(cancellation_available_at, $4), lease_expires_at = NULL, command_phase = CASE WHEN command_phase IN ('start_authorized', 'running', 'cancelling') THEN 'cancelling' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND command_status IN ('pending', 'active')"
-const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND (command_phase IN ('pending', 'preparing', 'prepared') OR (command_phase IN ('start_authorized', 'running', 'cancelling') AND start_enqueued_at IS NOT NULL)) AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
+const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling') AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
 const deferCancellationSQL = "UPDATE command_outbox SET cancellation_available_at = $1, cancellation_lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND cancellation_requested_at IS NOT NULL AND command_status IN ('pending', 'active')"
 const acknowledgeCommandSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL, command_status = $2, command_phase = CASE WHEN $2 = 'active' THEN CASE WHEN command_phase = 'cancelling' THEN 'cancelling' ELSE 'running' END ELSE 'rejected' END, acknowledged_at = COALESCE(acknowledged_at, $1), execution_deadline_at = $3, execution_last_heartbeat_at = CASE WHEN $2 = 'active' THEN $1 ELSE execution_last_heartbeat_at END, start_enqueued_at = CASE WHEN $2 = 'active' THEN COALESCE(start_enqueued_at, $1) ELSE start_enqueued_at END, terminal_at = CASE WHEN $2 = 'rejected' THEN $1 ELSE terminal_at END WHERE tenant_id = $4 AND project_id = $5 AND id = $6 AND command_status IN ('pending', 'active', 'rejected') AND (($2 = 'active' AND command_phase IN ('start_authorized', 'running', 'cancelling')) OR ($2 = 'rejected' AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'rejected')))"
 const renewCommandLeaseSQL = "UPDATE command_outbox SET execution_last_heartbeat_at = $1, execution_deadline_at = $2, recovery_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND command_status = 'active'"
 const claimExpiredCommandsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NOT NULL AND command_status IN ('pending', 'active') AND execution_deadline_at IS NOT NULL AND execution_deadline_at <= $1 AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at <= $1) ORDER BY execution_deadline_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET recovery_lease_expires_at = $3 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY execution_deadline_at, id"
 const markCommandTerminalSQL = "UPDATE command_outbox SET command_status = $1, command_phase = $1, terminal_at = COALESCE(terminal_at, $2), published_at = COALESCE(published_at, $2), lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL, recovery_claim_token = NULL, recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND (command_status IN ('pending', 'active', 'rejected') OR command_status = $1)"
-const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND cancellation_requested_at IS NOT NULL AND (command_phase IN ('pending', 'preparing', 'prepared') OR (command_phase IN ('start_authorized', 'running', 'cancelling') AND start_enqueued_at IS NOT NULL)) ORDER BY created_at, id LIMIT $2"
+const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND cancellation_requested_at IS NOT NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling') ORDER BY created_at, id LIMIT $2"
+const preparedCommandsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND command_phase IN ('prepared', 'start_authorized') ORDER BY prepared_at, created_at, id LIMIT $2"
 
 type PostgresRepository struct {
 	db               *sql.DB
@@ -187,7 +190,7 @@ func (repository *PostgresRepository) Transition(ctx context.Context, transition
 }
 
 func transitionInTx(ctx context.Context, tx *sql.Tx, transition Transition) (Job, error) {
-	current, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL, transition.Scope.TenantID, transition.Scope.ProjectID, transition.JobID))
+	current, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, transition.Scope.TenantID, transition.Scope.ProjectID, transition.JobID))
 	if err != nil {
 		return Job{}, classifyReadError("get job for transition", err)
 	}
@@ -318,6 +321,10 @@ func (repository *PostgresRepository) ClaimPendingCancellations(ctx context.Cont
 	return repository.claimCommands(ctx, claimCancellationSQL, "claim pending cancellations", limit, at)
 }
 
+func (repository *PostgresRepository) ClaimPreparedCommands(ctx context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
+	return repository.claimCommands(ctx, claimPreparedCommandsSQL, "claim prepared commands", limit, at)
+}
+
 func (repository *PostgresRepository) ClaimExpiredCommands(ctx context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
 	return repository.claimCommands(ctx, claimExpiredCommandsSQL, "claim expired commands", limit, at)
 }
@@ -354,10 +361,22 @@ func (repository *PostgresRepository) DeferCancellation(ctx context.Context, sco
 }
 
 func (repository *PostgresRepository) AcknowledgeCommand(ctx context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time, deadline *time.Time) error {
+	if repository == nil || repository.db == nil {
+		return errors.New("job PostgreSQL repository is unavailable")
+	}
+	if ctx == nil || scope.Validate() != nil || strings.TrimSpace(id) == "" {
+		return ErrInvalidCommandPayload
+	}
 	if status != CommandActive && status != CommandRejected {
 		return ErrInvalidCommandPayload
 	}
-	if (status == CommandActive) != (deadline != nil) || at.IsZero() {
+	if at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	if status == CommandActive {
+		return nil
+	}
+	if deadline != nil {
 		return ErrInvalidCommandPayload
 	}
 	var deadlineValue any
@@ -395,6 +414,26 @@ func (repository *PostgresRepository) PendingCancellationsForAgent(ctx context.C
 		message, err := scanOutbox(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan pending Agent cancellation: %w", err)
+		}
+		result = append(result, message)
+	}
+	return result, rows.Err()
+}
+
+func (repository *PostgresRepository) PreparedCommandsForAgent(ctx context.Context, agentID string, limit int) ([]OutboxMessage, error) {
+	if repository == nil || repository.db == nil || ctx == nil || strings.TrimSpace(agentID) == "" || limit <= 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	rows, err := repository.db.QueryContext(ctx, preparedCommandsForAgentSQL, agentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list prepared Agent commands: %w", err)
+	}
+	defer rows.Close()
+	result := make([]OutboxMessage, 0, limit)
+	for rows.Next() {
+		message, err := scanOutbox(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan prepared Agent command: %w", err)
 		}
 		result = append(result, message)
 	}
