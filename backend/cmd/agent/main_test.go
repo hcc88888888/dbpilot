@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,23 +9,34 @@ import (
 
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/require"
 )
 
 func TestConfiguredCommandExecutorsAdvertiseCollectNowOnlyWithCollector(t *testing.T) {
-	withoutCollector, err := configuredCommandExecutors(nil)
+	var typedNil *agent.DependencyCollector
+	withoutCollector, err := configuredCommandExecutors(typedNil)
 	require.NoError(t, err)
 	require.Empty(t, withoutCollector.Capabilities())
 
-	collector := &configuredCollectNowCollector{}
+	store, err := spool.Open(t.TempDir(), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 64 << 10})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	collector, err := agent.NewDependencyCollector(agent.DependencyCollectorConfig{
+		AgentID: "agent-a",
+		Definitions: []database.ComponentDefinition{{
+			ID: "hdfs-a", Kind: database.HDFSComponent,
+			Endpoints: []database.Endpoint{{URL: "http://127.0.0.1:9870/jmx", Role: "namenode"}},
+			SecretRef: "secret://hdfs/reader",
+		}},
+		SecretResolver: database.StaticSecretResolver{"secret://hdfs/reader": []byte("runtime-only")},
+		Store:          store,
+	})
+	require.NoError(t, err)
 	withCollector, err := configuredCommandExecutors(collector)
 	require.NoError(t, err)
 	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withCollector.Capabilities())
 }
-
-type configuredCollectNowCollector struct{}
-
-func (*configuredCollectNowCollector) CollectOnce(context.Context) error { return nil }
 
 func TestLoadConfigRejectsRelativePrivateAndDataPaths(t *testing.T) {
 	path := writeConfig(t, `

@@ -292,7 +292,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	return nil
 }
 
-func configuredCommandExecutors(collector agent.CollectNowCollector) (*agent.ExecutorRegistry, error) {
+func configuredCommandExecutors(collector *agent.DependencyCollector) (*agent.ExecutorRegistry, error) {
 	executors := agent.NewExecutorRegistry()
 	if collector == nil {
 		return executors, nil
