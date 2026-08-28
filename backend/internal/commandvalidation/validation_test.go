@@ -4,11 +4,37 @@ import (
 	"context"
 	"crypto/sha256"
 	"testing"
+	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestStartValidationRequiresFencingTokenRevisionLeaseAndFutureDeadline(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	valid := &agentv1.CommandStart{
+		CommandId: "command-a", ExecutionToken: make([]byte, sha256.Size), LeaseRevision: 7,
+		LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(time.Minute)),
+	}
+	require.NoError(t, ValidateStart(valid, now))
+
+	tests := map[string]func(*agentv1.CommandStart){
+		"blank command ID": func(start *agentv1.CommandStart) { start.CommandId = " " },
+		"short token":      func(start *agentv1.CommandStart) { start.ExecutionToken = []byte("short") },
+		"zero revision":    func(start *agentv1.CommandStart) { start.LeaseRevision = 0 },
+		"zero lease":       func(start *agentv1.CommandStart) { start.LeaseSeconds = 0 },
+		"expired deadline": func(start *agentv1.CommandStart) { start.StartDeadline = timestamppb.New(now) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := proto.Clone(valid).(*agentv1.CommandStart)
+			mutate(candidate)
+			require.ErrorIs(t, ValidateStart(candidate, now), ErrInvalidCommand)
+		})
+	}
+}
 
 func TestValidateExecuteSQLRequiresCompleteReviewedPayloadAndOwnership(t *testing.T) {
 	digest := sha256.Sum256([]byte("select 1"))

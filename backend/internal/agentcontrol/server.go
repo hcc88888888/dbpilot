@@ -2,6 +2,7 @@ package agentcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -25,9 +28,15 @@ type Observer interface {
 }
 
 type ResultPersistence struct {
-	CommandID  string
-	Persisted  bool
-	ReasonCode string
+	CommandID    string
+	ResultDigest []byte
+	Persisted    bool
+	Retryable    bool
+	ReasonCode   string
+}
+
+type PreparedObserver interface {
+	Prepared(context.Context, string, *agentv1.CommandPrepared) (*agentv1.CommandStart, error)
 }
 
 // NoopObserver is the safe pre-integration default for command business events.
@@ -36,7 +45,10 @@ type NoopObserver struct{}
 func (NoopObserver) Connected(context.Context, SessionInfo)                                {}
 func (NoopObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
 func (NoopObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
-func (NoopObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
+func (NoopObserver) Prepared(context.Context, string, *agentv1.CommandPrepared) (*agentv1.CommandStart, error) {
+	return nil, nil
+}
+func (NoopObserver) Progress(context.Context, string, *agentv1.CommandProgress) {}
 func (NoopObserver) Result(_ context.Context, _ string, result *agentv1.CommandResult) (ResultPersistence, error) {
 	return ResultPersistence{CommandID: result.GetCommandId(), ReasonCode: "OBSERVER_UNAVAILABLE"}, nil
 }
@@ -155,23 +167,57 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 			return status.Error(codes.InvalidArgument, "command acknowledgement is required")
 		}
 		s.observer.Acknowledged(ctx, agentID, typed.CommandAcknowledgement)
+	case *agentv1.AgentMessage_CommandPrepared:
+		if err := commandvalidation.ValidatePrepared(typed.CommandPrepared); err != nil {
+			return status.Error(codes.InvalidArgument, "command prepared message is invalid")
+		}
+		preparedObserver, ok := s.observer.(PreparedObserver)
+		if !ok {
+			return status.Error(codes.FailedPrecondition, "command prepared observer is unavailable")
+		}
+		start, err := preparedObserver.Prepared(ctx, agentID, typed.CommandPrepared)
+		if err != nil {
+			return status.Error(codes.Unavailable, err.Error())
+		}
+		if start == nil {
+			break
+		}
+		if start.GetCommandId() != typed.CommandPrepared.GetCommandId() {
+			return status.Error(codes.Internal, "prepared command start did not match command")
+		}
+		if err := s.registry.Start(ctx, agentID, start); err != nil {
+			return status.Error(codes.Unavailable, err.Error())
+		}
 	case *agentv1.AgentMessage_CommandProgress:
-		if typed.CommandProgress == nil {
-			return status.Error(codes.InvalidArgument, "command progress is required")
+		if err := commandvalidation.ValidateProgress(typed.CommandProgress); err != nil {
+			return status.Error(codes.InvalidArgument, "command progress is invalid")
 		}
 		s.observer.Progress(ctx, agentID, typed.CommandProgress)
 	case *agentv1.AgentMessage_CommandResult:
-		if typed.CommandResult == nil {
-			return status.Error(codes.InvalidArgument, "command result is required")
+		if err := commandvalidation.ValidateResult(typed.CommandResult); err != nil {
+			return status.Error(codes.InvalidArgument, "command result is invalid")
 		}
+		encodedResult, err := proto.MarshalOptions{Deterministic: true}.Marshal(typed.CommandResult)
+		if err != nil {
+			return status.Error(codes.Internal, "command result digest failed")
+		}
+		resultDigest := sha256.Sum256(encodedResult)
 		outcome, err := s.observer.Result(ctx, agentID, typed.CommandResult)
 		if err != nil {
-			outcome = ResultPersistence{CommandID: typed.CommandResult.GetCommandId(), ReasonCode: "PERSISTENCE_RETRY"}
+			outcome = ResultPersistence{CommandID: typed.CommandResult.GetCommandId(), ResultDigest: resultDigest[:], Retryable: true, ReasonCode: "PERSISTENCE_RETRY"}
 		}
 		if outcome.CommandID != typed.CommandResult.GetCommandId() {
 			return status.Error(codes.Internal, "result persistence outcome did not match command")
 		}
-		ack := &agentv1.CommandResultAcknowledgement{CommandId: outcome.CommandID, Persisted: outcome.Persisted, ReasonCode: outcome.ReasonCode}
+		digestMatches := len(outcome.ResultDigest) == sha256.Size && subtle.ConstantTimeCompare(outcome.ResultDigest, resultDigest[:]) == 1
+		persisted := outcome.Persisted && digestMatches
+		retryable := outcome.Retryable && !persisted
+		reasonCode := outcome.ReasonCode
+		if !digestMatches {
+			retryable = false
+			reasonCode = "RESULT_DIGEST_MISMATCH"
+		}
+		ack := &agentv1.CommandResultAcknowledgement{CommandId: outcome.CommandID, ResultDigest: resultDigest[:], Persisted: persisted, Retryable: retryable, ReasonCode: reasonCode}
 		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "result-ack-" + outcome.CommandID, Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: ack}}); err != nil {
 			return status.Error(codes.Unavailable, err.Error())
 		}

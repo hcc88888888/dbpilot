@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"path/filepath"
@@ -32,6 +34,100 @@ func TestExecutorRegistryGatesRegisteredProcessIDs(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestPrepareDoesNotExecuteUntilMatchingStart(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	executor := &progressExecutor{events: &orderedEvents{}, calls: make(chan struct{}, 2)}
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, executor))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	verifier.now = func() time.Time { return now }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	command := signedCollectNowEnvelope(t, privateKey, "command-prepare", "agent-a", []byte("nonce-prepare"), now, now.Add(time.Minute))
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: command}}
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+
+	require.Eventually(t, func() bool { return countPrepared(stream.sentMessages()) == 1 }, time.Second, time.Millisecond)
+	select {
+	case <-executor.calls:
+		t.Fatal("Prepare invoked executor before CommandStart")
+	case <-time.After(50 * time.Millisecond):
+	}
+	token := bytes.Repeat([]byte{0x61}, sha256.Size)
+	stream.receive <- commandStartMessage("command-prepare", token, 17, now.Add(30*time.Second))
+	select {
+	case <-executor.calls:
+	case <-time.After(time.Second):
+		t.Fatal("matching CommandStart did not invoke executor")
+	}
+	require.Eventually(t, func() bool {
+		for _, message := range stream.sentMessages() {
+			if result := message.GetCommandResult(); result != nil {
+				return bytes.Equal(token, result.GetExecutionToken()) && result.GetLeaseRevision() == 17
+			}
+		}
+		return false
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestResultAckOnlyMarksMatchingDigestReported(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = journal.Close() })
+	registry := NewExecutorRegistry()
+	require.NoError(t, registry.Register(CommandKindCollectNow, immediateExecutor{}))
+	verifier, err := NewCommandVerifier("agent-a", publicKey, registry.Capabilities())
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	verifier.now = func() time.Time { return now }
+	stream := newFakeControlStream()
+	stream.receive <- helloAckMessage()
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-result-ack", "agent-a", []byte("nonce-result-ack"), now, now.Add(time.Minute))}}
+	token := bytes.Repeat([]byte{0x72}, sha256.Size)
+	stream.receive <- commandStartMessage("command-result-ack", token, 19, now.Add(30*time.Second))
+	client, err := NewControlClient(ControlClientConfig{
+		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
+		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour, Now: func() time.Time { return now },
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	require.Eventually(t, func() bool { return countResults(stream.sentMessages()) == 1 }, time.Second, time.Millisecond)
+	entry, err := journal.Get(context.Background(), "command-result-ack")
+	require.NoError(t, err)
+	wrong := sha256.Sum256([]byte("wrong"))
+	stream.receive <- resultAckMessage("command-result-ack", wrong[:], true, false, "")
+	time.Sleep(20 * time.Millisecond)
+	pending, err := journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	stream.receive <- resultAckMessage("command-result-ack", entry.ResultDigest[:], true, false, "")
+	require.Eventually(t, func() bool {
+		pending, pendingErr := journal.PendingResults(context.Background())
+		return pendingErr == nil && len(pending) == 0
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -39,10 +135,10 @@ func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = journal.Close() })
 	now := time.Now().UTC()
-	accepted, err := journal.Accept(context.Background(), &agentv1.CommandEnvelope{
+	accepted, err := journal.Prepare(context.Background(), &agentv1.CommandEnvelope{
 		CommandId: "recover-me", AgentId: "agent-a", Nonce: []byte("recover-nonce"), ExpiresAt: timestamp(now.Add(time.Hour)),
 		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}},
-	})
+	}, now)
 	require.NoError(t, err)
 	require.True(t, accepted)
 
@@ -94,6 +190,7 @@ func TestControlClientReconnectKeepsInFlightExecutorAlive(t *testing.T) {
 	first.receive <- helloAckMessage()
 	second.receive <- helloAckMessage()
 	first.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	first.receive <- commandStartMessage("command-a", testExecutionToken(0x01), 1, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{first, second}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Millisecond,
@@ -203,6 +300,7 @@ func TestControlClientDurablyAcknowledgesExecutesReportsAndDeduplicates(t *testi
 	command := signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: command}}
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: command}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x02), 2, now.Add(30*time.Second))
 	opener := &sequenceStreamOpener{streams: []ControlStream{stream}}
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: opener.Open, Journal: journal, Verifier: verifier, Executors: registry,
@@ -215,19 +313,17 @@ func TestControlClientDurablyAcknowledgesExecutesReportsAndDeduplicates(t *testi
 
 	require.Eventually(t, func() bool {
 		messages := stream.sentMessages()
-		return countAcknowledgements(messages, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED) == 1 &&
-			countAcknowledgements(messages, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE) == 1 &&
-			countProgress(messages) == 1 && countResults(messages) == 1
+		return countPrepared(messages) == 2 && countProgress(messages) == 1 && countResults(messages) == 1
 	}, 2*time.Second, time.Millisecond)
 	require.Equal(t, 1, len(executor.calls), "a replayed command ID must not execute twice")
-	require.Less(t, events.index("accept:command-a"), events.index("ack:accepted"))
+	require.Less(t, events.index("prepare:command-a"), events.index("prepared:command-a"))
 	entry, err := realJournal.Get(context.Background(), "command-a")
 	require.NoError(t, err)
 	require.Equal(t, commandjournal.StateCompleted, entry.State)
 	pending, err := realJournal.PendingResults(context.Background())
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "a successful stream send is not a durability acknowledgement")
-	stream.receive <- resultAckMessage("command-a", true, "")
+	stream.receive <- resultAckMessage("command-a", entry.ResultDigest[:], true, false, "")
 	require.Eventually(t, func() bool {
 		pending, pendingErr := realJournal.PendingResults(context.Background())
 		return pendingErr == nil && len(pending) == 0
@@ -259,6 +355,7 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 		return nil
 	}
 	first.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	first.receive <- commandStartMessage("command-a", testExecutionToken(0x03), 3, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{first, second}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Millisecond,
@@ -273,25 +370,27 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 	pending, err := journal.PendingResults(context.Background())
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "reconnect send must remain pending without server durability acknowledgement")
-	second.receive <- resultAckMessage("command-a", false, "PERSISTENCE_RETRY")
+	entry, err := journal.Get(context.Background(), "command-a")
+	require.NoError(t, err)
+	second.receive <- resultAckMessage("command-a", entry.ResultDigest[:], false, true, "PERSISTENCE_RETRY")
 	time.Sleep(20 * time.Millisecond)
 	pending, err = journal.PendingResults(context.Background())
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "negative/retryable acknowledgement must keep the result pending")
-	second.receive <- resultAckMessage("command-a", true, "")
+	second.receive <- resultAckMessage("command-a", entry.ResultDigest[:], true, false, "")
 	require.Eventually(t, func() bool {
 		pending, pendingErr := journal.PendingResults(context.Background())
 		return pendingErr == nil && len(pending) == 0
 	}, time.Second, time.Millisecond)
-	entry, err := journal.Get(context.Background(), "command-a")
+	entry, err = journal.Get(context.Background(), "command-a")
 	require.NoError(t, err)
 	require.False(t, entry.ReportedAt.IsZero())
 	cancel()
 	require.NoError(t, <-done)
 }
 
-func resultAckMessage(commandID string, persisted bool, reason string) *agentv1.ServerMessage {
-	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: &agentv1.CommandResultAcknowledgement{CommandId: commandID, Persisted: persisted, ReasonCode: reason}}}
+func resultAckMessage(commandID string, resultDigest []byte, persisted, retryable bool, reason string) *agentv1.ServerMessage {
+	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandResultAcknowledgement{CommandResultAcknowledgement: &agentv1.CommandResultAcknowledgement{CommandId: commandID, ResultDigest: resultDigest, Persisted: persisted, Retryable: retryable, ReasonCode: reason}}}
 }
 
 func TestControlClientSurfacesTerminalResultPersistenceFailure(t *testing.T) {
@@ -310,6 +409,7 @@ func TestControlClientSurfacesTerminalResultPersistenceFailure(t *testing.T) {
 	stream := newFakeControlStream()
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x04), 4, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Millisecond,
@@ -388,6 +488,7 @@ func TestControlClientRejectsCommandIDCollisionWithoutDuplicateAck(t *testing.T)
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: first}}
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: collision}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x05), 5, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
@@ -399,12 +500,11 @@ func TestControlClientRejectsCommandIDCollisionWithoutDuplicateAck(t *testing.T)
 
 	require.Eventually(t, func() bool {
 		messages := stream.sentMessages()
-		return countAcknowledgements(messages, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED) == 1 &&
-			countAcknowledgements(messages, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED) == 1
+		return countPrepared(messages) == 1 && countAcknowledgements(messages, agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED) == 1
 	}, time.Second, time.Millisecond)
 	require.Zero(t, countAcknowledgements(stream.sentMessages(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE))
 	require.Equal(t, "COMMAND_ID_CONFLICT", acknowledgementReason(stream.sentMessages(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED))
-	require.Equal(t, 1, len(executor.calls))
+	require.Eventually(t, func() bool { return len(executor.calls) == 1 }, time.Second, time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
 }
@@ -425,6 +525,8 @@ func TestControlClientCancellationCancelsExecutorContext(t *testing.T) {
 	stream := newFakeControlStream()
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	token := testExecutionToken(0x06)
+	stream.receive <- commandStartMessage("command-a", token, 6, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
@@ -438,7 +540,7 @@ func TestControlClientCancellationCancelsExecutorContext(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("executor did not start")
 	}
-	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandCancellation{CommandCancellation: &agentv1.CommandCancellation{CommandId: "command-a"}}}
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandCancellation{CommandCancellation: &agentv1.CommandCancellation{CommandId: "command-a", ExecutionToken: token, LeaseRevision: 6}}}
 	select {
 	case <-executor.cancelled:
 	case <-time.After(time.Second):
@@ -465,6 +567,7 @@ func TestControlClientReleasesExecutorContextAfterCompletion(t *testing.T) {
 	stream := newFakeControlStream()
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x07), 7, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
@@ -501,6 +604,7 @@ func TestControlClientShutdownJoinsExecutorBeforeReturning(t *testing.T) {
 	stream := newFakeControlStream()
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x08), 8, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
@@ -542,6 +646,7 @@ func TestControlClientShutdownSurfacesCompletionFailureFromJoinedExecutor(t *tes
 	stream := newFakeControlStream()
 	stream.receive <- helloAckMessage()
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_Command{Command: signedCollectNowEnvelope(t, privateKey, "command-a", "agent-a", []byte("nonce-a"), now, now.Add(time.Minute))}}
+	stream.receive <- commandStartMessage("command-a", testExecutionToken(0x09), 9, now.Add(30*time.Second))
 	client, err := NewControlClient(ControlClientConfig{
 		AgentID: "agent-a", StreamOpener: (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open,
 		Journal: journal, Verifier: verifier, Executors: registry, HeartbeatInterval: time.Hour, ReconnectBackoff: time.Hour,
@@ -626,6 +731,9 @@ func (s *fakeControlStream) Send(message *agentv1.AgentMessage) error {
 	s.mu.Lock()
 	s.sent = append(s.sent, message)
 	s.mu.Unlock()
+	if prepared := message.GetCommandPrepared(); prepared != nil && s.events != nil {
+		s.events.add("prepared:" + prepared.GetCommandId())
+	}
 	if acknowledgement := message.GetCommandAcknowledgement(); acknowledgement != nil && s.events != nil {
 		if acknowledgement.GetState() == agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED {
 			s.events.add("ack:accepted")
@@ -698,12 +806,12 @@ func (j *failingCompleteJournal) Complete(context.Context, string, *agentv1.Comm
 	return errors.New("journal disk failure")
 }
 
-func (j *recordingCommandJournal) Accept(ctx context.Context, envelope *agentv1.CommandEnvelope) (bool, error) {
-	accepted, err := j.Journal.Accept(ctx, envelope)
-	if accepted && err == nil {
-		j.events.add("accept:" + envelope.GetCommandId())
+func (j *recordingCommandJournal) Prepare(ctx context.Context, envelope *agentv1.CommandEnvelope, at time.Time) (bool, error) {
+	prepared, err := j.Journal.Prepare(ctx, envelope, at)
+	if prepared && err == nil {
+		j.events.add("prepare:" + envelope.GetCommandId())
 	}
-	return accepted, err
+	return prepared, err
 }
 
 type orderedEvents struct {
@@ -838,4 +946,24 @@ func countResults(messages []*agentv1.AgentMessage) int {
 		}
 	}
 	return count
+}
+
+func countPrepared(messages []*agentv1.AgentMessage) int {
+	count := 0
+	for _, message := range messages {
+		if message.GetCommandPrepared() != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func commandStartMessage(commandID string, token []byte, revision uint64, deadline time.Time) *agentv1.ServerMessage {
+	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CommandStart{CommandStart: &agentv1.CommandStart{
+		CommandId: commandID, ExecutionToken: token, LeaseRevision: revision, LeaseSeconds: 30, StartDeadline: timestamppb.New(deadline),
+	}}}
+}
+
+func testExecutionToken(value byte) []byte {
+	return bytes.Repeat([]byte{value}, sha256.Size)
 }

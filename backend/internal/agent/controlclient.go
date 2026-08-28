@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"runtime"
@@ -14,6 +16,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	"dbpilot.local/platform/internal/commandvalidation"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -115,12 +118,13 @@ type ControlStream interface {
 type StreamOpener func(context.Context) (ControlStream, error)
 
 type CommandJournal interface {
-	Accept(context.Context, *agentv1.CommandEnvelope) (bool, error)
-	Start(context.Context, string, time.Time) error
+	Prepare(context.Context, *agentv1.CommandEnvelope, time.Time) (bool, error)
+	AuthorizeStart(context.Context, string, []byte, uint64, time.Time) error
 	Complete(context.Context, string, *agentv1.CommandResult, time.Time) error
 	Active(context.Context) ([]commandjournal.Entry, error)
 	PendingResults(context.Context) ([]commandjournal.Entry, error)
-	MarkReported(context.Context, string, time.Time) error
+	MarkReported(context.Context, string, [sha256.Size]byte, time.Time) error
+	Get(context.Context, string) (commandjournal.Entry, error)
 }
 
 type ControlClientConfig struct {
@@ -156,7 +160,7 @@ type ControlClient struct {
 	session         *controlSession
 	sendMu          sync.Mutex
 	runningMu       sync.Mutex
-	running         map[string]context.CancelFunc
+	running         map[string]runningCommand
 	executorWait    sync.WaitGroup
 	messageSequence atomic.Uint64
 	executionErrors chan error
@@ -165,6 +169,12 @@ type ControlClient struct {
 type controlSendRequest struct {
 	message *agentv1.AgentMessage
 	result  chan error
+}
+
+type runningCommand struct {
+	cancel         context.CancelFunc
+	executionToken []byte
+	leaseRevision  uint64
 }
 
 type controlSession struct {
@@ -198,7 +208,7 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		verifier: config.Verifier, executors: config.Executors,
 		heartbeatInterval: boundedDuration(config.HeartbeatInterval, 30*time.Second, 10*time.Millisecond, 5*time.Minute),
 		reconnectBackoff:  boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
-		now:               config.Now, running: make(map[string]context.CancelFunc),
+		now:               config.Now, running: make(map[string]runningCommand),
 		executionErrors: make(chan error, 1),
 	}, nil
 }
@@ -258,11 +268,14 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	}
 	recovery := make([]*agentv1.CommandRecoveryState, 0, len(active))
 	for _, entry := range active {
-		state := agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_ACCEPTED
-		if entry.State == commandjournal.StateRunning {
+		state := agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED
+		switch entry.State {
+		case commandjournal.StateStartAuthorized:
+			state = agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_START_AUTHORIZED
+		case commandjournal.StateRunning:
 			state = agentv1.CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING
 		}
-		recovery = append(recovery, &agentv1.CommandRecoveryState{CommandId: entry.CommandID, State: state})
+		recovery = append(recovery, &agentv1.CommandRecoveryState{CommandId: entry.CommandID, State: state, ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision})
 	}
 	hello := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Hello{Hello: &agentv1.Hello{
 		ProtocolVersion: ControlProtocolVersion, AgentId: c.agentID, AgentVersion: c.agentVersion,
@@ -383,17 +396,25 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 	switch typed := message.GetMessage().(type) {
 	case *agentv1.ServerMessage_Command:
 		return c.handleCommand(ctx, executionParent, typed.Command)
+	case *agentv1.ServerMessage_CommandStart:
+		return c.handleCommandStart(ctx, executionParent, typed.CommandStart)
 	case *agentv1.ServerMessage_CommandCancellation:
-		if typed.CommandCancellation != nil {
-			c.cancelCommand(typed.CommandCancellation.GetCommandId())
+		if err := commandvalidation.ValidateCancellation(typed.CommandCancellation); err != nil {
+			return errors.New("command cancellation is invalid")
 		}
+		c.cancelCommand(typed.CommandCancellation)
 	case *agentv1.ServerMessage_CommandResultAcknowledgement:
 		acknowledgement := typed.CommandResultAcknowledgement
-		if acknowledgement == nil || strings.TrimSpace(acknowledgement.GetCommandId()) == "" {
+		if err := commandvalidation.ValidateResultAcknowledgement(acknowledgement); err != nil {
 			return errors.New("command result acknowledgement is invalid")
 		}
-		if acknowledgement.GetPersisted() {
-			if err := c.journal.MarkReported(ctx, acknowledgement.GetCommandId(), c.now()); err != nil {
+		if acknowledgement.GetPersisted() && !acknowledgement.GetRetryable() {
+			var digest [sha256.Size]byte
+			copy(digest[:], acknowledgement.GetResultDigest())
+			if err := c.journal.MarkReported(ctx, acknowledgement.GetCommandId(), digest, c.now()); err != nil {
+				if errors.Is(err, commandjournal.ErrResultDigestMismatch) {
+					return nil
+				}
 				return &fatalControlError{err: fmt.Errorf("mark durably acknowledged command result reported: %w", err)}
 			}
 		}
@@ -411,11 +432,11 @@ func (c *ControlClient) handleCommand(ctx, executionParent context.Context, enve
 	if err := c.verifier.Verify(ctx, envelope); err != nil {
 		return c.sendAcknowledgement(envelopeID(envelope), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, commandRejectionReason(err))
 	}
-	executor, exists := c.executors.executor(envelope)
+	_, exists := c.executors.executor(envelope)
 	if !exists {
 		return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, "CAPABILITY_UNAVAILABLE")
 	}
-	accepted, err := c.journal.Accept(ctx, envelope)
+	prepared, err := c.journal.Prepare(ctx, envelope, c.now())
 	if err != nil {
 		if errors.Is(err, commandjournal.ErrCommandIDConflict) {
 			return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, "COMMAND_ID_CONFLICT")
@@ -423,35 +444,66 @@ func (c *ControlClient) handleCommand(ctx, executionParent context.Context, enve
 		if errors.Is(err, commandjournal.ErrNonceReplay) {
 			return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, "NONCE_REPLAY")
 		}
-		return fmt.Errorf("durably accept command: %w", err)
+		return fmt.Errorf("durably prepare command: %w", err)
 	}
-	if !accepted {
-		return c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE, "")
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("marshal prepared command envelope: %w", err)
 	}
-	if err := c.journal.Start(ctx, envelope.GetCommandId(), c.now()); err != nil {
-		return fmt.Errorf("start accepted command: %w", err)
+	digest := sha256.Sum256(encoded)
+	if !prepared {
+		entry, getErr := c.journal.Get(ctx, envelope.GetCommandId())
+		if getErr != nil {
+			return fmt.Errorf("load duplicate prepared command: %w", getErr)
+		}
+		digest = entry.EnvelopeDigest
+	}
+	return c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandPrepared{CommandPrepared: &agentv1.CommandPrepared{CommandId: envelope.GetCommandId(), EnvelopeDigest: digest[:]}}})
+}
+
+func (c *ControlClient) handleCommandStart(ctx, executionParent context.Context, start *agentv1.CommandStart) error {
+	if err := commandvalidation.ValidateStart(start, c.now()); err != nil {
+		return errors.New("command start is invalid")
+	}
+	entry, err := c.journal.Get(ctx, start.GetCommandId())
+	if err != nil {
+		return fmt.Errorf("load prepared command: %w", err)
+	}
+	if entry.Envelope == nil {
+		return errors.New("prepared command envelope is unavailable")
+	}
+	executor, exists := c.executors.executor(entry.Envelope)
+	if !exists {
+		return errors.New("prepared command executor is unavailable")
+	}
+	if err := c.journal.AuthorizeStart(ctx, start.GetCommandId(), start.GetExecutionToken(), start.GetLeaseRevision(), c.now()); err != nil {
+		if errors.Is(err, commandjournal.ErrInvalidTransition) {
+			return nil
+		}
+		return fmt.Errorf("authorize prepared command start: %w", err)
 	}
 	executionContext, cancel := context.WithCancel(executionParent)
 	c.runningMu.Lock()
-	c.running[envelope.GetCommandId()] = cancel
+	c.running[start.GetCommandId()] = runningCommand{cancel: cancel, executionToken: append([]byte(nil), start.GetExecutionToken()...), leaseRevision: start.GetLeaseRevision()}
 	c.runningMu.Unlock()
-	ackErr := c.sendAcknowledgement(envelope.GetCommandId(), agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED, "")
 	c.executorWait.Add(1)
 	go func() {
 		defer c.executorWait.Done()
 		defer cancel()
-		c.execute(executionContext, envelope, executor)
+		c.execute(executionContext, entry.Envelope, start.GetExecutionToken(), start.GetLeaseRevision(), executor)
 	}()
-	return ackErr
+	return nil
 }
 
-func (c *ControlClient) execute(ctx context.Context, envelope *agentv1.CommandEnvelope, executor CommandExecutor) {
-	reporter := commandProgressReporter{client: c, commandID: envelope.GetCommandId()}
+func (c *ControlClient) execute(ctx context.Context, envelope *agentv1.CommandEnvelope, executionToken []byte, leaseRevision uint64, executor CommandExecutor) {
+	reporter := commandProgressReporter{client: c, commandID: envelope.GetCommandId(), executionToken: append([]byte(nil), executionToken...), leaseRevision: leaseRevision}
 	result, executionErr := executor.Execute(ctx, envelope, reporter)
 	if result == nil {
 		result = &agentv1.CommandResult{CommandId: envelope.GetCommandId()}
 	}
 	result.CommandId = envelope.GetCommandId()
+	result.ExecutionToken = append([]byte(nil), executionToken...)
+	result.LeaseRevision = leaseRevision
 	if executionErr != nil || result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_UNSPECIFIED {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED
@@ -497,13 +549,20 @@ func (c *ControlClient) reportExecutionError(err error) {
 
 func (c *ControlClient) sendHeartbeat(session *controlSession) error {
 	c.runningMu.Lock()
-	active := make([]string, 0, len(c.running))
-	for commandID := range c.running {
-		active = append(active, commandID)
+	activeIDs := make([]string, 0, len(c.running))
+	activeByID := make(map[string]runningCommand, len(c.running))
+	for commandID, running := range c.running {
+		activeIDs = append(activeIDs, commandID)
+		activeByID[commandID] = runningCommand{executionToken: append([]byte(nil), running.executionToken...), leaseRevision: running.leaseRevision}
 	}
 	c.runningMu.Unlock()
-	sort.Strings(active)
-	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: c.agentID, RunningCommands: uint32(len(active)), ActiveCommandIds: active}}}
+	sort.Strings(activeIDs)
+	active := make([]*agentv1.ActiveCommand, 0, len(activeIDs))
+	for _, commandID := range activeIDs {
+		running := activeByID[commandID]
+		active = append(active, &agentv1.ActiveCommand{CommandId: commandID, ExecutionToken: running.executionToken, LeaseRevision: running.leaseRevision})
+	}
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: c.agentID, RunningCommands: uint32(len(active)), ActiveCommandIds: activeIDs, ActiveCommands: active}}}
 	return c.sendThroughSession(session, message)
 }
 
@@ -512,8 +571,10 @@ func (c *ControlClient) sendAcknowledgement(commandID string, state agentv1.Comm
 }
 
 type commandProgressReporter struct {
-	client    *ControlClient
-	commandID string
+	client         *ControlClient
+	commandID      string
+	executionToken []byte
+	leaseRevision  uint64
 }
 
 func (r commandProgressReporter) Report(progress *agentv1.CommandProgress) error {
@@ -526,23 +587,40 @@ func (r commandProgressReporter) Report(progress *agentv1.CommandProgress) error
 	if progress.GetCommandId() != r.commandID {
 		return errors.New("command progress ID does not match execution")
 	}
+	if len(progress.GetExecutionToken()) == 0 {
+		progress.ExecutionToken = append([]byte(nil), r.executionToken...)
+	}
+	if !executionTokensEqual(progress.GetExecutionToken(), r.executionToken) {
+		return errors.New("command progress token does not match execution")
+	}
+	if progress.GetLeaseRevision() == 0 {
+		progress.LeaseRevision = r.leaseRevision
+	}
+	if progress.GetLeaseRevision() != r.leaseRevision {
+		return errors.New("command progress revision does not match execution")
+	}
 	return r.client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: progress}})
 }
 
-func (c *ControlClient) cancelCommand(commandID string) {
+func (c *ControlClient) cancelCommand(cancellation *agentv1.CommandCancellation) {
 	c.runningMu.Lock()
-	cancel := c.running[commandID]
+	running, exists := c.running[cancellation.GetCommandId()]
 	c.runningMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if !exists || !executionTokensEqual(running.executionToken, cancellation.GetExecutionToken()) || running.leaseRevision != cancellation.GetLeaseRevision() {
+		return
 	}
+	running.cancel()
+}
+
+func executionTokensEqual(left, right []byte) bool {
+	return len(left) == sha256.Size && len(right) == sha256.Size && subtle.ConstantTimeCompare(left, right) == 1
 }
 
 func (c *ControlClient) cancelAll() {
 	c.runningMu.Lock()
 	cancellations := make([]context.CancelFunc, 0, len(c.running))
-	for _, cancel := range c.running {
-		cancellations = append(cancellations, cancel)
+	for _, running := range c.running {
+		cancellations = append(cancellations, running.cancel)
 	}
 	c.runningMu.Unlock()
 	for _, cancel := range cancellations {

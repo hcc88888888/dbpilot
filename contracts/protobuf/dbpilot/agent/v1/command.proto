@@ -24,6 +24,7 @@ message AgentMessage {
     CommandAcknowledgement command_acknowledgement = 23;
     CommandProgress command_progress = 24;
     CommandResult command_result = 25;
+    CommandPrepared command_prepared = 26;
   }
 }
 
@@ -39,6 +40,7 @@ message ServerMessage {
     CommandCancellation command_cancellation = 23;
     FlowControlInstruction flow_control_instruction = 24;
     CommandResultAcknowledgement command_result_acknowledgement = 25;
+    CommandStart command_start = 26;
   }
 }
 
@@ -65,6 +67,13 @@ message Heartbeat {
   uint32 queued_commands = 3;
   uint32 running_commands = 4;
   repeated string active_command_ids = 5;
+  repeated ActiveCommand active_commands = 6;
+}
+
+message ActiveCommand {
+  string command_id = 1;
+  bytes execution_token = 2;
+  uint64 lease_revision = 3;
 }
 
 message CommandEnvelope {
@@ -110,6 +119,8 @@ message ExecuteSQL {
 message CommandRecoveryState {
   string command_id = 1;
   CommandExecutionState state = 2;
+  bytes execution_token = 3;
+  uint64 lease_revision = 4;
 }
 
 enum CommandExecutionState {
@@ -117,6 +128,9 @@ enum CommandExecutionState {
   COMMAND_EXECUTION_STATE_ACCEPTED = 1;
   COMMAND_EXECUTION_STATE_RUNNING = 2;
   COMMAND_EXECUTION_STATE_COMPLETED = 3;
+  COMMAND_EXECUTION_STATE_PREPARED = 4;
+  COMMAND_EXECUTION_STATE_START_AUTHORIZED = 5;
+  COMMAND_EXECUTION_STATE_INTERRUPTED = 6;
 }
 
 enum TransactionPolicy {
@@ -142,6 +156,11 @@ message CommandAcknowledgement {
   string reason_code = 3;
 }
 
+message CommandPrepared {
+  string command_id = 1;
+  bytes envelope_digest = 2;
+}
+
 enum CommandAcknowledgementState {
   COMMAND_ACKNOWLEDGEMENT_STATE_UNSPECIFIED = 0;
   COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED = 1;
@@ -154,6 +173,8 @@ message CommandProgress {
   uint32 percent = 2;
   string stage = 3;
   string message = 4;
+  bytes execution_token = 5;
+  uint64 lease_revision = 6;
 }
 
 message CommandResult {
@@ -162,6 +183,16 @@ message CommandResult {
   string summary = 3;
   repeated ArtifactReference artifacts = 4;
   string error_code = 5;
+  bytes execution_token = 6;
+  uint64 lease_revision = 7;
+}
+
+message CommandStart {
+  string command_id = 1;
+  bytes execution_token = 2;
+  uint64 lease_revision = 3;
+  uint32 lease_seconds = 4;
+  google.protobuf.Timestamp start_deadline = 5;
 }
 
 // Sent only after the control plane durably applies the terminal result and
@@ -170,6 +201,8 @@ message CommandResultAcknowledgement {
   string command_id = 1;
   bool persisted = 2;
   string reason_code = 3;
+  bytes result_digest = 4;
+  bool retryable = 5;
 }
 
 enum CommandResultState {
@@ -178,6 +211,7 @@ enum CommandResultState {
   COMMAND_RESULT_STATE_FAILED = 2;
   COMMAND_RESULT_STATE_CANCELLED = 3;
   COMMAND_RESULT_STATE_TIMED_OUT = 4;
+  COMMAND_RESULT_STATE_INTERRUPTED = 5;
 }
 
 message ArtifactReference {
@@ -191,6 +225,8 @@ message ArtifactReference {
 message CommandCancellation {
   string command_id = 1;
   string reason = 2;
+  bytes execution_token = 3;
+  uint64 lease_revision = 4;
 }
 
 message FlowControlInstruction {

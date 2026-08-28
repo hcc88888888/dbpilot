@@ -25,10 +25,13 @@ const (
 type CommandExecutionState int32
 
 const (
-	CommandExecutionState_COMMAND_EXECUTION_STATE_UNSPECIFIED CommandExecutionState = 0
-	CommandExecutionState_COMMAND_EXECUTION_STATE_ACCEPTED    CommandExecutionState = 1
-	CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING     CommandExecutionState = 2
-	CommandExecutionState_COMMAND_EXECUTION_STATE_COMPLETED   CommandExecutionState = 3
+	CommandExecutionState_COMMAND_EXECUTION_STATE_UNSPECIFIED      CommandExecutionState = 0
+	CommandExecutionState_COMMAND_EXECUTION_STATE_ACCEPTED         CommandExecutionState = 1
+	CommandExecutionState_COMMAND_EXECUTION_STATE_RUNNING          CommandExecutionState = 2
+	CommandExecutionState_COMMAND_EXECUTION_STATE_COMPLETED        CommandExecutionState = 3
+	CommandExecutionState_COMMAND_EXECUTION_STATE_PREPARED         CommandExecutionState = 4
+	CommandExecutionState_COMMAND_EXECUTION_STATE_START_AUTHORIZED CommandExecutionState = 5
+	CommandExecutionState_COMMAND_EXECUTION_STATE_INTERRUPTED      CommandExecutionState = 6
 )
 
 // Enum value maps for CommandExecutionState.
@@ -38,12 +41,18 @@ var (
 		1: "COMMAND_EXECUTION_STATE_ACCEPTED",
 		2: "COMMAND_EXECUTION_STATE_RUNNING",
 		3: "COMMAND_EXECUTION_STATE_COMPLETED",
+		4: "COMMAND_EXECUTION_STATE_PREPARED",
+		5: "COMMAND_EXECUTION_STATE_START_AUTHORIZED",
+		6: "COMMAND_EXECUTION_STATE_INTERRUPTED",
 	}
 	CommandExecutionState_value = map[string]int32{
-		"COMMAND_EXECUTION_STATE_UNSPECIFIED": 0,
-		"COMMAND_EXECUTION_STATE_ACCEPTED":    1,
-		"COMMAND_EXECUTION_STATE_RUNNING":     2,
-		"COMMAND_EXECUTION_STATE_COMPLETED":   3,
+		"COMMAND_EXECUTION_STATE_UNSPECIFIED":      0,
+		"COMMAND_EXECUTION_STATE_ACCEPTED":         1,
+		"COMMAND_EXECUTION_STATE_RUNNING":          2,
+		"COMMAND_EXECUTION_STATE_COMPLETED":        3,
+		"COMMAND_EXECUTION_STATE_PREPARED":         4,
+		"COMMAND_EXECUTION_STATE_START_AUTHORIZED": 5,
+		"COMMAND_EXECUTION_STATE_INTERRUPTED":      6,
 	}
 )
 
@@ -186,6 +195,7 @@ const (
 	CommandResultState_COMMAND_RESULT_STATE_FAILED      CommandResultState = 2
 	CommandResultState_COMMAND_RESULT_STATE_CANCELLED   CommandResultState = 3
 	CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT   CommandResultState = 4
+	CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED CommandResultState = 5
 )
 
 // Enum value maps for CommandResultState.
@@ -196,6 +206,7 @@ var (
 		2: "COMMAND_RESULT_STATE_FAILED",
 		3: "COMMAND_RESULT_STATE_CANCELLED",
 		4: "COMMAND_RESULT_STATE_TIMED_OUT",
+		5: "COMMAND_RESULT_STATE_INTERRUPTED",
 	}
 	CommandResultState_value = map[string]int32{
 		"COMMAND_RESULT_STATE_UNSPECIFIED": 0,
@@ -203,6 +214,7 @@ var (
 		"COMMAND_RESULT_STATE_FAILED":      2,
 		"COMMAND_RESULT_STATE_CANCELLED":   3,
 		"COMMAND_RESULT_STATE_TIMED_OUT":   4,
+		"COMMAND_RESULT_STATE_INTERRUPTED": 5,
 	}
 )
 
@@ -245,6 +257,7 @@ type AgentMessage struct {
 	//	*AgentMessage_CommandAcknowledgement
 	//	*AgentMessage_CommandProgress
 	//	*AgentMessage_CommandResult
+	//	*AgentMessage_CommandPrepared
 	Message       isAgentMessage_Message `protobuf_oneof:"message"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -355,6 +368,15 @@ func (x *AgentMessage) GetCommandResult() *CommandResult {
 	return nil
 }
 
+func (x *AgentMessage) GetCommandPrepared() *CommandPrepared {
+	if x != nil {
+		if x, ok := x.Message.(*AgentMessage_CommandPrepared); ok {
+			return x.CommandPrepared
+		}
+	}
+	return nil
+}
+
 type isAgentMessage_Message interface {
 	isAgentMessage_Message()
 }
@@ -383,6 +405,10 @@ type AgentMessage_CommandResult struct {
 	CommandResult *CommandResult `protobuf:"bytes,25,opt,name=command_result,json=commandResult,proto3,oneof"`
 }
 
+type AgentMessage_CommandPrepared struct {
+	CommandPrepared *CommandPrepared `protobuf:"bytes,26,opt,name=command_prepared,json=commandPrepared,proto3,oneof"`
+}
+
 func (*AgentMessage_Hello) isAgentMessage_Message() {}
 
 func (*AgentMessage_Heartbeat) isAgentMessage_Message() {}
@@ -394,6 +420,8 @@ func (*AgentMessage_CommandAcknowledgement) isAgentMessage_Message() {}
 func (*AgentMessage_CommandProgress) isAgentMessage_Message() {}
 
 func (*AgentMessage_CommandResult) isAgentMessage_Message() {}
+
+func (*AgentMessage_CommandPrepared) isAgentMessage_Message() {}
 
 type ServerMessage struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
@@ -407,6 +435,7 @@ type ServerMessage struct {
 	//	*ServerMessage_CommandCancellation
 	//	*ServerMessage_FlowControlInstruction
 	//	*ServerMessage_CommandResultAcknowledgement
+	//	*ServerMessage_CommandStart
 	Message       isServerMessage_Message `protobuf_oneof:"message"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -517,6 +546,15 @@ func (x *ServerMessage) GetCommandResultAcknowledgement() *CommandResultAcknowle
 	return nil
 }
 
+func (x *ServerMessage) GetCommandStart() *CommandStart {
+	if x != nil {
+		if x, ok := x.Message.(*ServerMessage_CommandStart); ok {
+			return x.CommandStart
+		}
+	}
+	return nil
+}
+
 type isServerMessage_Message interface {
 	isServerMessage_Message()
 }
@@ -545,6 +583,10 @@ type ServerMessage_CommandResultAcknowledgement struct {
 	CommandResultAcknowledgement *CommandResultAcknowledgement `protobuf:"bytes,25,opt,name=command_result_acknowledgement,json=commandResultAcknowledgement,proto3,oneof"`
 }
 
+type ServerMessage_CommandStart struct {
+	CommandStart *CommandStart `protobuf:"bytes,26,opt,name=command_start,json=commandStart,proto3,oneof"`
+}
+
 func (*ServerMessage_HelloAck) isServerMessage_Message() {}
 
 func (*ServerMessage_PolicyUpdate) isServerMessage_Message() {}
@@ -556,6 +598,8 @@ func (*ServerMessage_CommandCancellation) isServerMessage_Message() {}
 func (*ServerMessage_FlowControlInstruction) isServerMessage_Message() {}
 
 func (*ServerMessage_CommandResultAcknowledgement) isServerMessage_Message() {}
+
+func (*ServerMessage_CommandStart) isServerMessage_Message() {}
 
 type Hello struct {
 	state            protoimpl.MessageState  `protogen:"open.v1"`
@@ -724,6 +768,7 @@ type Heartbeat struct {
 	QueuedCommands   uint32                 `protobuf:"varint,3,opt,name=queued_commands,json=queuedCommands,proto3" json:"queued_commands,omitempty"`
 	RunningCommands  uint32                 `protobuf:"varint,4,opt,name=running_commands,json=runningCommands,proto3" json:"running_commands,omitempty"`
 	ActiveCommandIds []string               `protobuf:"bytes,5,rep,name=active_command_ids,json=activeCommandIds,proto3" json:"active_command_ids,omitempty"`
+	ActiveCommands   []*ActiveCommand       `protobuf:"bytes,6,rep,name=active_commands,json=activeCommands,proto3" json:"active_commands,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -793,6 +838,73 @@ func (x *Heartbeat) GetActiveCommandIds() []string {
 	return nil
 }
 
+func (x *Heartbeat) GetActiveCommands() []*ActiveCommand {
+	if x != nil {
+		return x.ActiveCommands
+	}
+	return nil
+}
+
+type ActiveCommand struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,2,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,3,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ActiveCommand) Reset() {
+	*x = ActiveCommand{}
+	mi := &file_agent_v1_command_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ActiveCommand) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ActiveCommand) ProtoMessage() {}
+
+func (x *ActiveCommand) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ActiveCommand.ProtoReflect.Descriptor instead.
+func (*ActiveCommand) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ActiveCommand) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *ActiveCommand) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *ActiveCommand) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
 type CommandEnvelope struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
 	CommandId    string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
@@ -817,7 +929,7 @@ type CommandEnvelope struct {
 
 func (x *CommandEnvelope) Reset() {
 	*x = CommandEnvelope{}
-	mi := &file_agent_v1_command_proto_msgTypes[5]
+	mi := &file_agent_v1_command_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -829,7 +941,7 @@ func (x *CommandEnvelope) String() string {
 func (*CommandEnvelope) ProtoMessage() {}
 
 func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[5]
+	mi := &file_agent_v1_command_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -842,7 +954,7 @@ func (x *CommandEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandEnvelope.ProtoReflect.Descriptor instead.
 func (*CommandEnvelope) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{5}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *CommandEnvelope) GetCommandId() string {
@@ -997,7 +1109,7 @@ type CollectNow struct {
 
 func (x *CollectNow) Reset() {
 	*x = CollectNow{}
-	mi := &file_agent_v1_command_proto_msgTypes[6]
+	mi := &file_agent_v1_command_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1009,7 +1121,7 @@ func (x *CollectNow) String() string {
 func (*CollectNow) ProtoMessage() {}
 
 func (x *CollectNow) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[6]
+	mi := &file_agent_v1_command_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1022,7 +1134,7 @@ func (x *CollectNow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectNow.ProtoReflect.Descriptor instead.
 func (*CollectNow) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{6}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *CollectNow) GetCollectionKinds() []string {
@@ -1049,7 +1161,7 @@ type InspectInstance struct {
 
 func (x *InspectInstance) Reset() {
 	*x = InspectInstance{}
-	mi := &file_agent_v1_command_proto_msgTypes[7]
+	mi := &file_agent_v1_command_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1061,7 +1173,7 @@ func (x *InspectInstance) String() string {
 func (*InspectInstance) ProtoMessage() {}
 
 func (x *InspectInstance) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[7]
+	mi := &file_agent_v1_command_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1074,7 +1186,7 @@ func (x *InspectInstance) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectInstance.ProtoReflect.Descriptor instead.
 func (*InspectInstance) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{7}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *InspectInstance) GetInstanceId() string {
@@ -1106,7 +1218,7 @@ type ExecuteSQL struct {
 
 func (x *ExecuteSQL) Reset() {
 	*x = ExecuteSQL{}
-	mi := &file_agent_v1_command_proto_msgTypes[8]
+	mi := &file_agent_v1_command_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1118,7 +1230,7 @@ func (x *ExecuteSQL) String() string {
 func (*ExecuteSQL) ProtoMessage() {}
 
 func (x *ExecuteSQL) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[8]
+	mi := &file_agent_v1_command_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1131,7 +1243,7 @@ func (x *ExecuteSQL) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteSQL.ProtoReflect.Descriptor instead.
 func (*ExecuteSQL) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{8}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ExecuteSQL) GetInstanceId() string {
@@ -1177,16 +1289,18 @@ func (x *ExecuteSQL) GetTimeoutSeconds() uint32 {
 }
 
 type CommandRecoveryState struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	State         CommandExecutionState  `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandExecutionState" json:"state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	State          CommandExecutionState  `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandExecutionState" json:"state,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,3,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,4,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CommandRecoveryState) Reset() {
 	*x = CommandRecoveryState{}
-	mi := &file_agent_v1_command_proto_msgTypes[9]
+	mi := &file_agent_v1_command_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1198,7 +1312,7 @@ func (x *CommandRecoveryState) String() string {
 func (*CommandRecoveryState) ProtoMessage() {}
 
 func (x *CommandRecoveryState) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[9]
+	mi := &file_agent_v1_command_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1211,7 +1325,7 @@ func (x *CommandRecoveryState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandRecoveryState.ProtoReflect.Descriptor instead.
 func (*CommandRecoveryState) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{9}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *CommandRecoveryState) GetCommandId() string {
@@ -1228,6 +1342,20 @@ func (x *CommandRecoveryState) GetState() CommandExecutionState {
 	return CommandExecutionState_COMMAND_EXECUTION_STATE_UNSPECIFIED
 }
 
+func (x *CommandRecoveryState) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *CommandRecoveryState) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
 type ExecuteRegisteredProcess struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ProcessId     string                 `protobuf:"bytes,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
@@ -1238,7 +1366,7 @@ type ExecuteRegisteredProcess struct {
 
 func (x *ExecuteRegisteredProcess) Reset() {
 	*x = ExecuteRegisteredProcess{}
-	mi := &file_agent_v1_command_proto_msgTypes[10]
+	mi := &file_agent_v1_command_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1250,7 +1378,7 @@ func (x *ExecuteRegisteredProcess) String() string {
 func (*ExecuteRegisteredProcess) ProtoMessage() {}
 
 func (x *ExecuteRegisteredProcess) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[10]
+	mi := &file_agent_v1_command_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1263,7 +1391,7 @@ func (x *ExecuteRegisteredProcess) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteRegisteredProcess.ProtoReflect.Descriptor instead.
 func (*ExecuteRegisteredProcess) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{10}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ExecuteRegisteredProcess) GetProcessId() string {
@@ -1290,7 +1418,7 @@ type CollectDiagnostic struct {
 
 func (x *CollectDiagnostic) Reset() {
 	*x = CollectDiagnostic{}
-	mi := &file_agent_v1_command_proto_msgTypes[11]
+	mi := &file_agent_v1_command_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1302,7 +1430,7 @@ func (x *CollectDiagnostic) String() string {
 func (*CollectDiagnostic) ProtoMessage() {}
 
 func (x *CollectDiagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[11]
+	mi := &file_agent_v1_command_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1315,7 +1443,7 @@ func (x *CollectDiagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectDiagnostic.ProtoReflect.Descriptor instead.
 func (*CollectDiagnostic) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{11}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CollectDiagnostic) GetInstanceId() string {
@@ -1343,7 +1471,7 @@ type CommandAcknowledgement struct {
 
 func (x *CommandAcknowledgement) Reset() {
 	*x = CommandAcknowledgement{}
-	mi := &file_agent_v1_command_proto_msgTypes[12]
+	mi := &file_agent_v1_command_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1355,7 +1483,7 @@ func (x *CommandAcknowledgement) String() string {
 func (*CommandAcknowledgement) ProtoMessage() {}
 
 func (x *CommandAcknowledgement) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[12]
+	mi := &file_agent_v1_command_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1368,7 +1496,7 @@ func (x *CommandAcknowledgement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandAcknowledgement.ProtoReflect.Descriptor instead.
 func (*CommandAcknowledgement) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{12}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CommandAcknowledgement) GetCommandId() string {
@@ -1392,19 +1520,73 @@ func (x *CommandAcknowledgement) GetReasonCode() string {
 	return ""
 }
 
+type CommandPrepared struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	EnvelopeDigest []byte                 `protobuf:"bytes,2,opt,name=envelope_digest,json=envelopeDigest,proto3" json:"envelope_digest,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CommandPrepared) Reset() {
+	*x = CommandPrepared{}
+	mi := &file_agent_v1_command_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandPrepared) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandPrepared) ProtoMessage() {}
+
+func (x *CommandPrepared) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandPrepared.ProtoReflect.Descriptor instead.
+func (*CommandPrepared) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *CommandPrepared) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *CommandPrepared) GetEnvelopeDigest() []byte {
+	if x != nil {
+		return x.EnvelopeDigest
+	}
+	return nil
+}
+
 type CommandProgress struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	Percent       uint32                 `protobuf:"varint,2,opt,name=percent,proto3" json:"percent,omitempty"`
-	Stage         string                 `protobuf:"bytes,3,opt,name=stage,proto3" json:"stage,omitempty"`
-	Message       string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	Percent        uint32                 `protobuf:"varint,2,opt,name=percent,proto3" json:"percent,omitempty"`
+	Stage          string                 `protobuf:"bytes,3,opt,name=stage,proto3" json:"stage,omitempty"`
+	Message        string                 `protobuf:"bytes,4,opt,name=message,proto3" json:"message,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,5,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,6,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CommandProgress) Reset() {
 	*x = CommandProgress{}
-	mi := &file_agent_v1_command_proto_msgTypes[13]
+	mi := &file_agent_v1_command_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1416,7 +1598,7 @@ func (x *CommandProgress) String() string {
 func (*CommandProgress) ProtoMessage() {}
 
 func (x *CommandProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[13]
+	mi := &file_agent_v1_command_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1429,7 +1611,7 @@ func (x *CommandProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandProgress.ProtoReflect.Descriptor instead.
 func (*CommandProgress) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{13}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *CommandProgress) GetCommandId() string {
@@ -1460,20 +1642,36 @@ func (x *CommandProgress) GetMessage() string {
 	return ""
 }
 
+func (x *CommandProgress) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *CommandProgress) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
 type CommandResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	State         CommandResultState     `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandResultState" json:"state,omitempty"`
-	Summary       string                 `protobuf:"bytes,3,opt,name=summary,proto3" json:"summary,omitempty"`
-	Artifacts     []*ArtifactReference   `protobuf:"bytes,4,rep,name=artifacts,proto3" json:"artifacts,omitempty"`
-	ErrorCode     string                 `protobuf:"bytes,5,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	State          CommandResultState     `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandResultState" json:"state,omitempty"`
+	Summary        string                 `protobuf:"bytes,3,opt,name=summary,proto3" json:"summary,omitempty"`
+	Artifacts      []*ArtifactReference   `protobuf:"bytes,4,rep,name=artifacts,proto3" json:"artifacts,omitempty"`
+	ErrorCode      string                 `protobuf:"bytes,5,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,6,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,7,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CommandResult) Reset() {
 	*x = CommandResult{}
-	mi := &file_agent_v1_command_proto_msgTypes[14]
+	mi := &file_agent_v1_command_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1485,7 +1683,7 @@ func (x *CommandResult) String() string {
 func (*CommandResult) ProtoMessage() {}
 
 func (x *CommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[14]
+	mi := &file_agent_v1_command_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1498,7 +1696,7 @@ func (x *CommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
 func (*CommandResult) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{14}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CommandResult) GetCommandId() string {
@@ -1536,6 +1734,96 @@ func (x *CommandResult) GetErrorCode() string {
 	return ""
 }
 
+func (x *CommandResult) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *CommandResult) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
+type CommandStart struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,2,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,3,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	LeaseSeconds   uint32                 `protobuf:"varint,4,opt,name=lease_seconds,json=leaseSeconds,proto3" json:"lease_seconds,omitempty"`
+	StartDeadline  *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=start_deadline,json=startDeadline,proto3" json:"start_deadline,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *CommandStart) Reset() {
+	*x = CommandStart{}
+	mi := &file_agent_v1_command_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandStart) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandStart) ProtoMessage() {}
+
+func (x *CommandStart) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandStart.ProtoReflect.Descriptor instead.
+func (*CommandStart) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CommandStart) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *CommandStart) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *CommandStart) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
+func (x *CommandStart) GetLeaseSeconds() uint32 {
+	if x != nil {
+		return x.LeaseSeconds
+	}
+	return 0
+}
+
+func (x *CommandStart) GetStartDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartDeadline
+	}
+	return nil
+}
+
 // Sent only after the control plane durably applies the terminal result and
 // its idempotent audit evidence. Agents retain results until persisted=true.
 type CommandResultAcknowledgement struct {
@@ -1543,13 +1831,15 @@ type CommandResultAcknowledgement struct {
 	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	Persisted     bool                   `protobuf:"varint,2,opt,name=persisted,proto3" json:"persisted,omitempty"`
 	ReasonCode    string                 `protobuf:"bytes,3,opt,name=reason_code,json=reasonCode,proto3" json:"reason_code,omitempty"`
+	ResultDigest  []byte                 `protobuf:"bytes,4,opt,name=result_digest,json=resultDigest,proto3" json:"result_digest,omitempty"`
+	Retryable     bool                   `protobuf:"varint,5,opt,name=retryable,proto3" json:"retryable,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CommandResultAcknowledgement) Reset() {
 	*x = CommandResultAcknowledgement{}
-	mi := &file_agent_v1_command_proto_msgTypes[15]
+	mi := &file_agent_v1_command_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1561,7 +1851,7 @@ func (x *CommandResultAcknowledgement) String() string {
 func (*CommandResultAcknowledgement) ProtoMessage() {}
 
 func (x *CommandResultAcknowledgement) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[15]
+	mi := &file_agent_v1_command_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1574,7 +1864,7 @@ func (x *CommandResultAcknowledgement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResultAcknowledgement.ProtoReflect.Descriptor instead.
 func (*CommandResultAcknowledgement) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{15}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *CommandResultAcknowledgement) GetCommandId() string {
@@ -1598,6 +1888,20 @@ func (x *CommandResultAcknowledgement) GetReasonCode() string {
 	return ""
 }
 
+func (x *CommandResultAcknowledgement) GetResultDigest() []byte {
+	if x != nil {
+		return x.ResultDigest
+	}
+	return nil
+}
+
+func (x *CommandResultAcknowledgement) GetRetryable() bool {
+	if x != nil {
+		return x.Retryable
+	}
+	return false
+}
+
 type ArtifactReference struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ArtifactId    string                 `protobuf:"bytes,1,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
@@ -1611,7 +1915,7 @@ type ArtifactReference struct {
 
 func (x *ArtifactReference) Reset() {
 	*x = ArtifactReference{}
-	mi := &file_agent_v1_command_proto_msgTypes[16]
+	mi := &file_agent_v1_command_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1623,7 +1927,7 @@ func (x *ArtifactReference) String() string {
 func (*ArtifactReference) ProtoMessage() {}
 
 func (x *ArtifactReference) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[16]
+	mi := &file_agent_v1_command_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1636,7 +1940,7 @@ func (x *ArtifactReference) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactReference.ProtoReflect.Descriptor instead.
 func (*ArtifactReference) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ArtifactReference) GetArtifactId() string {
@@ -1675,16 +1979,18 @@ func (x *ArtifactReference) GetChecksum() []byte {
 }
 
 type CommandCancellation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CommandId     string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	Reason         string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	ExecutionToken []byte                 `protobuf:"bytes,3,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision  uint64                 `protobuf:"varint,4,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CommandCancellation) Reset() {
 	*x = CommandCancellation{}
-	mi := &file_agent_v1_command_proto_msgTypes[17]
+	mi := &file_agent_v1_command_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1696,7 +2002,7 @@ func (x *CommandCancellation) String() string {
 func (*CommandCancellation) ProtoMessage() {}
 
 func (x *CommandCancellation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[17]
+	mi := &file_agent_v1_command_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1709,7 +2015,7 @@ func (x *CommandCancellation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandCancellation.ProtoReflect.Descriptor instead.
 func (*CommandCancellation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{17}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CommandCancellation) GetCommandId() string {
@@ -1726,6 +2032,20 @@ func (x *CommandCancellation) GetReason() string {
 	return ""
 }
 
+func (x *CommandCancellation) GetExecutionToken() []byte {
+	if x != nil {
+		return x.ExecutionToken
+	}
+	return nil
+}
+
+func (x *CommandCancellation) GetLeaseRevision() uint64 {
+	if x != nil {
+		return x.LeaseRevision
+	}
+	return 0
+}
+
 type FlowControlInstruction struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	MaxInFlightCommands      uint32                 `protobuf:"varint,1,opt,name=max_in_flight_commands,json=maxInFlightCommands,proto3" json:"max_in_flight_commands,omitempty"`
@@ -1737,7 +2057,7 @@ type FlowControlInstruction struct {
 
 func (x *FlowControlInstruction) Reset() {
 	*x = FlowControlInstruction{}
-	mi := &file_agent_v1_command_proto_msgTypes[18]
+	mi := &file_agent_v1_command_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1749,7 +2069,7 @@ func (x *FlowControlInstruction) String() string {
 func (*FlowControlInstruction) ProtoMessage() {}
 
 func (x *FlowControlInstruction) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[18]
+	mi := &file_agent_v1_command_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1762,7 +2082,7 @@ func (x *FlowControlInstruction) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlowControlInstruction.ProtoReflect.Descriptor instead.
 func (*FlowControlInstruction) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{18}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *FlowControlInstruction) GetMaxInFlightCommands() uint32 {
@@ -1790,7 +2110,7 @@ var File_agent_v1_command_proto protoreflect.FileDescriptor
 
 const file_agent_v1_command_proto_rawDesc = "" +
 	"\n" +
-	"\x16agent/v1/command.proto\x12\x10dbpilot.agent.v1\x1a\x18agent/v1/inventory.proto\x1a\x15agent/v1/policy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9d\x04\n" +
+	"\x16agent/v1/command.proto\x12\x10dbpilot.agent.v1\x1a\x18agent/v1/inventory.proto\x1a\x15agent/v1/policy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xed\x04\n" +
 	"\fAgentMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x123\n" +
@@ -1800,8 +2120,9 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\tinventory\x18\x16 \x01(\v2\x1b.dbpilot.agent.v1.InventoryH\x00R\tinventory\x12c\n" +
 	"\x17command_acknowledgement\x18\x17 \x01(\v2(.dbpilot.agent.v1.CommandAcknowledgementH\x00R\x16commandAcknowledgement\x12N\n" +
 	"\x10command_progress\x18\x18 \x01(\v2!.dbpilot.agent.v1.CommandProgressH\x00R\x0fcommandProgress\x12H\n" +
-	"\x0ecommand_result\x18\x19 \x01(\v2\x1f.dbpilot.agent.v1.CommandResultH\x00R\rcommandResultB\t\n" +
-	"\amessageJ\x04\b\x03\x10\x14\"\xef\x04\n" +
+	"\x0ecommand_result\x18\x19 \x01(\v2\x1f.dbpilot.agent.v1.CommandResultH\x00R\rcommandResult\x12N\n" +
+	"\x10command_prepared\x18\x1a \x01(\v2!.dbpilot.agent.v1.CommandPreparedH\x00R\x0fcommandPreparedB\t\n" +
+	"\amessageJ\x04\b\x03\x10\x14\"\xb6\x05\n" +
 	"\rServerMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x123\n" +
@@ -1811,7 +2132,8 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\acommand\x18\x16 \x01(\v2!.dbpilot.agent.v1.CommandEnvelopeH\x00R\acommand\x12Z\n" +
 	"\x14command_cancellation\x18\x17 \x01(\v2%.dbpilot.agent.v1.CommandCancellationH\x00R\x13commandCancellation\x12d\n" +
 	"\x18flow_control_instruction\x18\x18 \x01(\v2(.dbpilot.agent.v1.FlowControlInstructionH\x00R\x16flowControlInstruction\x12v\n" +
-	"\x1ecommand_result_acknowledgement\x18\x19 \x01(\v2..dbpilot.agent.v1.CommandResultAcknowledgementH\x00R\x1ccommandResultAcknowledgementB\t\n" +
+	"\x1ecommand_result_acknowledgement\x18\x19 \x01(\v2..dbpilot.agent.v1.CommandResultAcknowledgementH\x00R\x1ccommandResultAcknowledgement\x12E\n" +
+	"\rcommand_start\x18\x1a \x01(\v2\x1e.dbpilot.agent.v1.CommandStartH\x00R\fcommandStartB\t\n" +
 	"\amessageJ\x04\b\x03\x10\x14\"\xe3\x02\n" +
 	"\x05Hello\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12\x19\n" +
@@ -1826,13 +2148,19 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12\"\n" +
 	"\fcapabilities\x18\x02 \x03(\tR\fcapabilities\x12;\n" +
 	"\vserver_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"serverTime\"\xcf\x01\n" +
+	"serverTime\"\x99\x02\n" +
 	"\tHeartbeat\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12%\n" +
 	"\x0epolicy_version\x18\x02 \x01(\x03R\rpolicyVersion\x12'\n" +
 	"\x0fqueued_commands\x18\x03 \x01(\rR\x0equeuedCommands\x12)\n" +
 	"\x10running_commands\x18\x04 \x01(\rR\x0frunningCommands\x12,\n" +
-	"\x12active_command_ids\x18\x05 \x03(\tR\x10activeCommandIds\"\xd4\x05\n" +
+	"\x12active_command_ids\x18\x05 \x03(\tR\x10activeCommandIds\x12H\n" +
+	"\x0factive_commands\x18\x06 \x03(\v2\x1f.dbpilot.agent.v1.ActiveCommandR\x0eactiveCommands\"~\n" +
+	"\rActiveCommand\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\tR\tcommandId\x12'\n" +
+	"\x0fexecution_token\x18\x02 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\x03 \x01(\x04R\rleaseRevision\"\xd4\x05\n" +
 	"\x0fCommandEnvelope\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x15\n" +
@@ -1869,11 +2197,13 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\n" +
 	"sql_digest\x18\x04 \x01(\fR\tsqlDigest\x12R\n" +
 	"\x12transaction_policy\x18\x05 \x01(\x0e2#.dbpilot.agent.v1.TransactionPolicyR\x11transactionPolicy\x12'\n" +
-	"\x0ftimeout_seconds\x18\x06 \x01(\rR\x0etimeoutSeconds\"t\n" +
+	"\x0ftimeout_seconds\x18\x06 \x01(\rR\x0etimeoutSeconds\"\xc4\x01\n" +
 	"\x14CommandRecoveryState\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12=\n" +
-	"\x05state\x18\x02 \x01(\x0e2'.dbpilot.agent.v1.CommandExecutionStateR\x05state\"\xd4\x01\n" +
+	"\x05state\x18\x02 \x01(\x0e2'.dbpilot.agent.v1.CommandExecutionStateR\x05state\x12'\n" +
+	"\x0fexecution_token\x18\x03 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\x04 \x01(\x04R\rleaseRevision\"\xd4\x01\n" +
 	"\x18ExecuteRegisteredProcess\x12\x1d\n" +
 	"\n" +
 	"process_id\x18\x01 \x01(\tR\tprocessId\x12Z\n" +
@@ -1892,13 +2222,19 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12C\n" +
 	"\x05state\x18\x02 \x01(\x0e2-.dbpilot.agent.v1.CommandAcknowledgementStateR\x05state\x12\x1f\n" +
 	"\vreason_code\x18\x03 \x01(\tR\n" +
-	"reasonCode\"z\n" +
+	"reasonCode\"Y\n" +
+	"\x0fCommandPrepared\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\tR\tcommandId\x12'\n" +
+	"\x0fenvelope_digest\x18\x02 \x01(\fR\x0eenvelopeDigest\"\xca\x01\n" +
 	"\x0fCommandProgress\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x18\n" +
 	"\apercent\x18\x02 \x01(\rR\apercent\x12\x14\n" +
 	"\x05stage\x18\x03 \x01(\tR\x05stage\x12\x18\n" +
-	"\amessage\x18\x04 \x01(\tR\amessage\"\xe6\x01\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\x12'\n" +
+	"\x0fexecution_token\x18\x05 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\x06 \x01(\x04R\rleaseRevision\"\xb6\x02\n" +
 	"\rCommandResult\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12:\n" +
@@ -1906,13 +2242,24 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\asummary\x18\x03 \x01(\tR\asummary\x12A\n" +
 	"\tartifacts\x18\x04 \x03(\v2#.dbpilot.agent.v1.ArtifactReferenceR\tartifacts\x12\x1d\n" +
 	"\n" +
-	"error_code\x18\x05 \x01(\tR\terrorCode\"|\n" +
+	"error_code\x18\x05 \x01(\tR\terrorCode\x12'\n" +
+	"\x0fexecution_token\x18\x06 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\a \x01(\x04R\rleaseRevision\"\xe5\x01\n" +
+	"\fCommandStart\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x01 \x01(\tR\tcommandId\x12'\n" +
+	"\x0fexecution_token\x18\x02 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\x03 \x01(\x04R\rleaseRevision\x12#\n" +
+	"\rlease_seconds\x18\x04 \x01(\rR\fleaseSeconds\x12A\n" +
+	"\x0estart_deadline\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\rstartDeadline\"\xbf\x01\n" +
 	"\x1cCommandResultAcknowledgement\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x1c\n" +
 	"\tpersisted\x18\x02 \x01(\bR\tpersisted\x12\x1f\n" +
 	"\vreason_code\x18\x03 \x01(\tR\n" +
-	"reasonCode\"\xa6\x01\n" +
+	"reasonCode\x12#\n" +
+	"\rresult_digest\x18\x04 \x01(\fR\fresultDigest\x12\x1c\n" +
+	"\tretryable\x18\x05 \x01(\bR\tretryable\"\xa6\x01\n" +
 	"\x11ArtifactReference\x12\x1f\n" +
 	"\vartifact_id\x18\x01 \x01(\tR\n" +
 	"artifactId\x12\x12\n" +
@@ -1920,20 +2267,25 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\fcontent_type\x18\x03 \x01(\tR\vcontentType\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x04 \x01(\x04R\tsizeBytes\x12\x1a\n" +
-	"\bchecksum\x18\x05 \x01(\fR\bchecksum\"L\n" +
+	"\bchecksum\x18\x05 \x01(\fR\bchecksum\"\x9c\x01\n" +
 	"\x13CommandCancellation\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xbb\x01\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12'\n" +
+	"\x0fexecution_token\x18\x03 \x01(\fR\x0eexecutionToken\x12%\n" +
+	"\x0elease_revision\x18\x04 \x01(\x04R\rleaseRevision\"\xbb\x01\n" +
 	"\x16FlowControlInstruction\x123\n" +
 	"\x16max_in_flight_commands\x18\x01 \x01(\rR\x13maxInFlightCommands\x12<\n" +
 	"\x1aheartbeat_interval_seconds\x18\x02 \x01(\rR\x18heartbeatIntervalSeconds\x12.\n" +
-	"\x13retry_after_seconds\x18\x03 \x01(\rR\x11retryAfterSeconds*\xb2\x01\n" +
+	"\x13retry_after_seconds\x18\x03 \x01(\rR\x11retryAfterSeconds*\xaf\x02\n" +
 	"\x15CommandExecutionState\x12'\n" +
 	"#COMMAND_EXECUTION_STATE_UNSPECIFIED\x10\x00\x12$\n" +
 	" COMMAND_EXECUTION_STATE_ACCEPTED\x10\x01\x12#\n" +
 	"\x1fCOMMAND_EXECUTION_STATE_RUNNING\x10\x02\x12%\n" +
-	"!COMMAND_EXECUTION_STATE_COMPLETED\x10\x03*\x9e\x01\n" +
+	"!COMMAND_EXECUTION_STATE_COMPLETED\x10\x03\x12$\n" +
+	" COMMAND_EXECUTION_STATE_PREPARED\x10\x04\x12,\n" +
+	"(COMMAND_EXECUTION_STATE_START_AUTHORIZED\x10\x05\x12'\n" +
+	"#COMMAND_EXECUTION_STATE_INTERRUPTED\x10\x06*\x9e\x01\n" +
 	"\x11TransactionPolicy\x12\"\n" +
 	"\x1eTRANSACTION_POLICY_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bTRANSACTION_POLICY_REQUIRED\x10\x01\x12 \n" +
@@ -1943,13 +2295,14 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	")COMMAND_ACKNOWLEDGEMENT_STATE_UNSPECIFIED\x10\x00\x12*\n" +
 	"&COMMAND_ACKNOWLEDGEMENT_STATE_ACCEPTED\x10\x01\x12*\n" +
 	"&COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED\x10\x02\x12+\n" +
-	"'COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE\x10\x03*\xc7\x01\n" +
+	"'COMMAND_ACKNOWLEDGEMENT_STATE_DUPLICATE\x10\x03*\xed\x01\n" +
 	"\x12CommandResultState\x12$\n" +
 	" COMMAND_RESULT_STATE_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eCOMMAND_RESULT_STATE_SUCCEEDED\x10\x01\x12\x1f\n" +
 	"\x1bCOMMAND_RESULT_STATE_FAILED\x10\x02\x12\"\n" +
 	"\x1eCOMMAND_RESULT_STATE_CANCELLED\x10\x03\x12\"\n" +
-	"\x1eCOMMAND_RESULT_STATE_TIMED_OUT\x10\x042^\n" +
+	"\x1eCOMMAND_RESULT_STATE_TIMED_OUT\x10\x04\x12$\n" +
+	" COMMAND_RESULT_STATE_INTERRUPTED\x10\x052^\n" +
 	"\fAgentControl\x12N\n" +
 	"\aConnect\x12\x1e.dbpilot.agent.v1.AgentMessage\x1a\x1f.dbpilot.agent.v1.ServerMessage(\x010\x01B-Z+dbpilot.local/platform/gen/agent/v1;agentv1b\x06proto3"
 
@@ -1966,7 +2319,7 @@ func file_agent_v1_command_proto_rawDescGZIP() []byte {
 }
 
 var file_agent_v1_command_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_agent_v1_command_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_agent_v1_command_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_agent_v1_command_proto_goTypes = []any{
 	(CommandExecutionState)(0),           // 0: dbpilot.agent.v1.CommandExecutionState
 	(TransactionPolicy)(0),               // 1: dbpilot.agent.v1.TransactionPolicy
@@ -1977,62 +2330,69 @@ var file_agent_v1_command_proto_goTypes = []any{
 	(*Hello)(nil),                        // 6: dbpilot.agent.v1.Hello
 	(*HelloAck)(nil),                     // 7: dbpilot.agent.v1.HelloAck
 	(*Heartbeat)(nil),                    // 8: dbpilot.agent.v1.Heartbeat
-	(*CommandEnvelope)(nil),              // 9: dbpilot.agent.v1.CommandEnvelope
-	(*CollectNow)(nil),                   // 10: dbpilot.agent.v1.CollectNow
-	(*InspectInstance)(nil),              // 11: dbpilot.agent.v1.InspectInstance
-	(*ExecuteSQL)(nil),                   // 12: dbpilot.agent.v1.ExecuteSQL
-	(*CommandRecoveryState)(nil),         // 13: dbpilot.agent.v1.CommandRecoveryState
-	(*ExecuteRegisteredProcess)(nil),     // 14: dbpilot.agent.v1.ExecuteRegisteredProcess
-	(*CollectDiagnostic)(nil),            // 15: dbpilot.agent.v1.CollectDiagnostic
-	(*CommandAcknowledgement)(nil),       // 16: dbpilot.agent.v1.CommandAcknowledgement
-	(*CommandProgress)(nil),              // 17: dbpilot.agent.v1.CommandProgress
-	(*CommandResult)(nil),                // 18: dbpilot.agent.v1.CommandResult
-	(*CommandResultAcknowledgement)(nil), // 19: dbpilot.agent.v1.CommandResultAcknowledgement
-	(*ArtifactReference)(nil),            // 20: dbpilot.agent.v1.ArtifactReference
-	(*CommandCancellation)(nil),          // 21: dbpilot.agent.v1.CommandCancellation
-	(*FlowControlInstruction)(nil),       // 22: dbpilot.agent.v1.FlowControlInstruction
-	nil,                                  // 23: dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
-	(*timestamppb.Timestamp)(nil),        // 24: google.protobuf.Timestamp
-	(*Inventory)(nil),                    // 25: dbpilot.agent.v1.Inventory
-	(*PolicyUpdate)(nil),                 // 26: dbpilot.agent.v1.PolicyUpdate
+	(*ActiveCommand)(nil),                // 9: dbpilot.agent.v1.ActiveCommand
+	(*CommandEnvelope)(nil),              // 10: dbpilot.agent.v1.CommandEnvelope
+	(*CollectNow)(nil),                   // 11: dbpilot.agent.v1.CollectNow
+	(*InspectInstance)(nil),              // 12: dbpilot.agent.v1.InspectInstance
+	(*ExecuteSQL)(nil),                   // 13: dbpilot.agent.v1.ExecuteSQL
+	(*CommandRecoveryState)(nil),         // 14: dbpilot.agent.v1.CommandRecoveryState
+	(*ExecuteRegisteredProcess)(nil),     // 15: dbpilot.agent.v1.ExecuteRegisteredProcess
+	(*CollectDiagnostic)(nil),            // 16: dbpilot.agent.v1.CollectDiagnostic
+	(*CommandAcknowledgement)(nil),       // 17: dbpilot.agent.v1.CommandAcknowledgement
+	(*CommandPrepared)(nil),              // 18: dbpilot.agent.v1.CommandPrepared
+	(*CommandProgress)(nil),              // 19: dbpilot.agent.v1.CommandProgress
+	(*CommandResult)(nil),                // 20: dbpilot.agent.v1.CommandResult
+	(*CommandStart)(nil),                 // 21: dbpilot.agent.v1.CommandStart
+	(*CommandResultAcknowledgement)(nil), // 22: dbpilot.agent.v1.CommandResultAcknowledgement
+	(*ArtifactReference)(nil),            // 23: dbpilot.agent.v1.ArtifactReference
+	(*CommandCancellation)(nil),          // 24: dbpilot.agent.v1.CommandCancellation
+	(*FlowControlInstruction)(nil),       // 25: dbpilot.agent.v1.FlowControlInstruction
+	nil,                                  // 26: dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
+	(*timestamppb.Timestamp)(nil),        // 27: google.protobuf.Timestamp
+	(*Inventory)(nil),                    // 28: dbpilot.agent.v1.Inventory
+	(*PolicyUpdate)(nil),                 // 29: dbpilot.agent.v1.PolicyUpdate
 }
 var file_agent_v1_command_proto_depIdxs = []int32{
-	24, // 0: dbpilot.agent.v1.AgentMessage.sent_at:type_name -> google.protobuf.Timestamp
+	27, // 0: dbpilot.agent.v1.AgentMessage.sent_at:type_name -> google.protobuf.Timestamp
 	6,  // 1: dbpilot.agent.v1.AgentMessage.hello:type_name -> dbpilot.agent.v1.Hello
 	8,  // 2: dbpilot.agent.v1.AgentMessage.heartbeat:type_name -> dbpilot.agent.v1.Heartbeat
-	25, // 3: dbpilot.agent.v1.AgentMessage.inventory:type_name -> dbpilot.agent.v1.Inventory
-	16, // 4: dbpilot.agent.v1.AgentMessage.command_acknowledgement:type_name -> dbpilot.agent.v1.CommandAcknowledgement
-	17, // 5: dbpilot.agent.v1.AgentMessage.command_progress:type_name -> dbpilot.agent.v1.CommandProgress
-	18, // 6: dbpilot.agent.v1.AgentMessage.command_result:type_name -> dbpilot.agent.v1.CommandResult
-	24, // 7: dbpilot.agent.v1.ServerMessage.sent_at:type_name -> google.protobuf.Timestamp
-	7,  // 8: dbpilot.agent.v1.ServerMessage.hello_ack:type_name -> dbpilot.agent.v1.HelloAck
-	26, // 9: dbpilot.agent.v1.ServerMessage.policy_update:type_name -> dbpilot.agent.v1.PolicyUpdate
-	9,  // 10: dbpilot.agent.v1.ServerMessage.command:type_name -> dbpilot.agent.v1.CommandEnvelope
-	21, // 11: dbpilot.agent.v1.ServerMessage.command_cancellation:type_name -> dbpilot.agent.v1.CommandCancellation
-	22, // 12: dbpilot.agent.v1.ServerMessage.flow_control_instruction:type_name -> dbpilot.agent.v1.FlowControlInstruction
-	19, // 13: dbpilot.agent.v1.ServerMessage.command_result_acknowledgement:type_name -> dbpilot.agent.v1.CommandResultAcknowledgement
-	13, // 14: dbpilot.agent.v1.Hello.active_commands:type_name -> dbpilot.agent.v1.CommandRecoveryState
-	24, // 15: dbpilot.agent.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
-	24, // 16: dbpilot.agent.v1.CommandEnvelope.issued_at:type_name -> google.protobuf.Timestamp
-	24, // 17: dbpilot.agent.v1.CommandEnvelope.expires_at:type_name -> google.protobuf.Timestamp
-	10, // 18: dbpilot.agent.v1.CommandEnvelope.collect_now:type_name -> dbpilot.agent.v1.CollectNow
-	11, // 19: dbpilot.agent.v1.CommandEnvelope.inspect_instance:type_name -> dbpilot.agent.v1.InspectInstance
-	12, // 20: dbpilot.agent.v1.CommandEnvelope.execute_sql:type_name -> dbpilot.agent.v1.ExecuteSQL
-	14, // 21: dbpilot.agent.v1.CommandEnvelope.execute_registered_process:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess
-	15, // 22: dbpilot.agent.v1.CommandEnvelope.collect_diagnostic:type_name -> dbpilot.agent.v1.CollectDiagnostic
-	1,  // 23: dbpilot.agent.v1.ExecuteSQL.transaction_policy:type_name -> dbpilot.agent.v1.TransactionPolicy
-	0,  // 24: dbpilot.agent.v1.CommandRecoveryState.state:type_name -> dbpilot.agent.v1.CommandExecutionState
-	23, // 25: dbpilot.agent.v1.ExecuteRegisteredProcess.parameters:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
-	2,  // 26: dbpilot.agent.v1.CommandAcknowledgement.state:type_name -> dbpilot.agent.v1.CommandAcknowledgementState
-	3,  // 27: dbpilot.agent.v1.CommandResult.state:type_name -> dbpilot.agent.v1.CommandResultState
-	20, // 28: dbpilot.agent.v1.CommandResult.artifacts:type_name -> dbpilot.agent.v1.ArtifactReference
-	4,  // 29: dbpilot.agent.v1.AgentControl.Connect:input_type -> dbpilot.agent.v1.AgentMessage
-	5,  // 30: dbpilot.agent.v1.AgentControl.Connect:output_type -> dbpilot.agent.v1.ServerMessage
-	30, // [30:31] is the sub-list for method output_type
-	29, // [29:30] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	28, // 3: dbpilot.agent.v1.AgentMessage.inventory:type_name -> dbpilot.agent.v1.Inventory
+	17, // 4: dbpilot.agent.v1.AgentMessage.command_acknowledgement:type_name -> dbpilot.agent.v1.CommandAcknowledgement
+	19, // 5: dbpilot.agent.v1.AgentMessage.command_progress:type_name -> dbpilot.agent.v1.CommandProgress
+	20, // 6: dbpilot.agent.v1.AgentMessage.command_result:type_name -> dbpilot.agent.v1.CommandResult
+	18, // 7: dbpilot.agent.v1.AgentMessage.command_prepared:type_name -> dbpilot.agent.v1.CommandPrepared
+	27, // 8: dbpilot.agent.v1.ServerMessage.sent_at:type_name -> google.protobuf.Timestamp
+	7,  // 9: dbpilot.agent.v1.ServerMessage.hello_ack:type_name -> dbpilot.agent.v1.HelloAck
+	29, // 10: dbpilot.agent.v1.ServerMessage.policy_update:type_name -> dbpilot.agent.v1.PolicyUpdate
+	10, // 11: dbpilot.agent.v1.ServerMessage.command:type_name -> dbpilot.agent.v1.CommandEnvelope
+	24, // 12: dbpilot.agent.v1.ServerMessage.command_cancellation:type_name -> dbpilot.agent.v1.CommandCancellation
+	25, // 13: dbpilot.agent.v1.ServerMessage.flow_control_instruction:type_name -> dbpilot.agent.v1.FlowControlInstruction
+	22, // 14: dbpilot.agent.v1.ServerMessage.command_result_acknowledgement:type_name -> dbpilot.agent.v1.CommandResultAcknowledgement
+	21, // 15: dbpilot.agent.v1.ServerMessage.command_start:type_name -> dbpilot.agent.v1.CommandStart
+	14, // 16: dbpilot.agent.v1.Hello.active_commands:type_name -> dbpilot.agent.v1.CommandRecoveryState
+	27, // 17: dbpilot.agent.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
+	9,  // 18: dbpilot.agent.v1.Heartbeat.active_commands:type_name -> dbpilot.agent.v1.ActiveCommand
+	27, // 19: dbpilot.agent.v1.CommandEnvelope.issued_at:type_name -> google.protobuf.Timestamp
+	27, // 20: dbpilot.agent.v1.CommandEnvelope.expires_at:type_name -> google.protobuf.Timestamp
+	11, // 21: dbpilot.agent.v1.CommandEnvelope.collect_now:type_name -> dbpilot.agent.v1.CollectNow
+	12, // 22: dbpilot.agent.v1.CommandEnvelope.inspect_instance:type_name -> dbpilot.agent.v1.InspectInstance
+	13, // 23: dbpilot.agent.v1.CommandEnvelope.execute_sql:type_name -> dbpilot.agent.v1.ExecuteSQL
+	15, // 24: dbpilot.agent.v1.CommandEnvelope.execute_registered_process:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess
+	16, // 25: dbpilot.agent.v1.CommandEnvelope.collect_diagnostic:type_name -> dbpilot.agent.v1.CollectDiagnostic
+	1,  // 26: dbpilot.agent.v1.ExecuteSQL.transaction_policy:type_name -> dbpilot.agent.v1.TransactionPolicy
+	0,  // 27: dbpilot.agent.v1.CommandRecoveryState.state:type_name -> dbpilot.agent.v1.CommandExecutionState
+	26, // 28: dbpilot.agent.v1.ExecuteRegisteredProcess.parameters:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
+	2,  // 29: dbpilot.agent.v1.CommandAcknowledgement.state:type_name -> dbpilot.agent.v1.CommandAcknowledgementState
+	3,  // 30: dbpilot.agent.v1.CommandResult.state:type_name -> dbpilot.agent.v1.CommandResultState
+	23, // 31: dbpilot.agent.v1.CommandResult.artifacts:type_name -> dbpilot.agent.v1.ArtifactReference
+	27, // 32: dbpilot.agent.v1.CommandStart.start_deadline:type_name -> google.protobuf.Timestamp
+	4,  // 33: dbpilot.agent.v1.AgentControl.Connect:input_type -> dbpilot.agent.v1.AgentMessage
+	5,  // 34: dbpilot.agent.v1.AgentControl.Connect:output_type -> dbpilot.agent.v1.ServerMessage
+	34, // [34:35] is the sub-list for method output_type
+	33, // [33:34] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_command_proto_init() }
@@ -2049,6 +2409,7 @@ func file_agent_v1_command_proto_init() {
 		(*AgentMessage_CommandAcknowledgement)(nil),
 		(*AgentMessage_CommandProgress)(nil),
 		(*AgentMessage_CommandResult)(nil),
+		(*AgentMessage_CommandPrepared)(nil),
 	}
 	file_agent_v1_command_proto_msgTypes[1].OneofWrappers = []any{
 		(*ServerMessage_HelloAck)(nil),
@@ -2057,8 +2418,9 @@ func file_agent_v1_command_proto_init() {
 		(*ServerMessage_CommandCancellation)(nil),
 		(*ServerMessage_FlowControlInstruction)(nil),
 		(*ServerMessage_CommandResultAcknowledgement)(nil),
+		(*ServerMessage_CommandStart)(nil),
 	}
-	file_agent_v1_command_proto_msgTypes[5].OneofWrappers = []any{
+	file_agent_v1_command_proto_msgTypes[6].OneofWrappers = []any{
 		(*CommandEnvelope_CollectNow)(nil),
 		(*CommandEnvelope_InspectInstance)(nil),
 		(*CommandEnvelope_ExecuteSql)(nil),
@@ -2071,7 +2433,7 @@ func file_agent_v1_command_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_command_proto_rawDesc), len(file_agent_v1_command_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   20,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -1,7 +1,9 @@
 package agentcontrol
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -118,11 +120,82 @@ func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.
 	require.NotNil(t, sessionContext)
 }
 
+func TestPreparedObserverPersistsBeforeServerSendsStart(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	token := bytes.Repeat([]byte{0x41}, sha256.Size)
+	registry := NewRegistry(4)
+	registry.now = func() time.Time { return now }
+	observer := &recordingObserver{connected: make(chan SessionInfo, 1), prepared: make(chan *agentv1.CommandPrepared, 1)}
+	observer.start = &agentv1.CommandStart{CommandId: "command-a", ExecutionToken: token, LeaseRevision: 3, LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(time.Minute))}
+	server := NewServer(registry, observer)
+	server.now = func() time.Time { return now }
+	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
+	done := make(chan error, 1)
+	go func() { done <- server.Connect(stream) }()
+	_ = stream.nextSent(t)
+	<-observer.connected
+
+	digest := sha256.Sum256([]byte("envelope"))
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandPrepared{CommandPrepared: &agentv1.CommandPrepared{CommandId: "command-a", EnvelopeDigest: digest[:]}}})
+	prepared := <-observer.prepared
+	require.Equal(t, digest[:], prepared.GetEnvelopeDigest())
+	var start *agentv1.CommandStart
+	select {
+	case message := <-stream.sent:
+		start = message.GetCommandStart()
+	case connectErr := <-done:
+		t.Fatalf("server ended before CommandStart: %v", connectErr)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CommandStart")
+	}
+	require.NotNil(t, start)
+	require.Equal(t, token, start.GetExecutionToken())
+	require.Equal(t, uint64(3), start.GetLeaseRevision())
+
+	stream.closeReceive()
+	require.NoError(t, <-done)
+}
+
+func TestResultAckIsPersistedOnlyForMatchingObserverDigest(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	registry := NewRegistry(4)
+	observer := &recordingObserver{connected: make(chan SessionInfo, 1)}
+	server := NewServer(registry, observer)
+	server.now = func() time.Time { return now }
+	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
+	done := make(chan error, 1)
+	go func() { done <- server.Connect(stream) }()
+	_ = stream.nextSent(t)
+	<-observer.connected
+
+	result := &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: bytes.Repeat([]byte{0x42}, sha256.Size), LeaseRevision: 5}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(result)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	observer.resultDigest = digest[:]
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}})
+	ack := stream.nextSent(t).GetCommandResultAcknowledgement()
+	require.True(t, ack.GetPersisted())
+	require.Equal(t, digest[:], ack.GetResultDigest())
+	require.False(t, ack.GetRetryable())
+
+	observer.resultDigest = bytes.Repeat([]byte{0xff}, sha256.Size)
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: result}})
+	ack = stream.nextSent(t).GetCommandResultAcknowledgement()
+	require.False(t, ack.GetPersisted())
+	require.Equal(t, "RESULT_DIGEST_MISMATCH", ack.GetReasonCode())
+
+	stream.closeReceive()
+	require.NoError(t, <-done)
+}
+
 func TestConnectRoutesAgentEventsAndRenewsCommandLease(t *testing.T) {
 	now := time.Unix(1_725_000_000, 0).UTC()
+	token := testServerExecutionToken(0x31)
 	registry := NewRegistry(2)
 	registry.now = func() time.Time { return now }
 	observer := &recordingObserver{connected: make(chan SessionInfo, 1)}
+	observer.start = &agentv1.CommandStart{CommandId: "command-a", ExecutionToken: token, LeaseRevision: 1, LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(time.Minute))}
 	server := NewServer(registry, observer)
 	server.now = func() time.Time { return now }
 	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
@@ -136,11 +209,14 @@ func TestConnectRoutesAgentEventsAndRenewsCommandLease(t *testing.T) {
 		ExpiresAt: timestamppb.New(now.Add(time.Minute)), Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{}},
 	}))
 	require.Equal(t, "command-a", stream.nextSent(t).GetCommand().GetCommandId())
+	prepareDigest := sha256.Sum256([]byte("command-a-envelope"))
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandPrepared{CommandPrepared: &agentv1.CommandPrepared{CommandId: "command-a", EnvelopeDigest: prepareDigest[:]}}})
+	require.Equal(t, "command-a", stream.nextSent(t).GetCommandStart().GetCommandId())
 	stream.push(
-		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a", ActiveCommandIds: []string{"command-a"}}}},
+		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a", ActiveCommandIds: []string{"command-a"}, ActiveCommands: []*agentv1.ActiveCommand{{CommandId: "command-a", ExecutionToken: token, LeaseRevision: 1}}}}},
 		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandAcknowledgement{CommandAcknowledgement: &agentv1.CommandAcknowledgement{CommandId: "command-a"}}},
-		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: "command-a", Percent: 50}}},
-		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED}}},
+		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: "command-a", Percent: 50, ExecutionToken: token, LeaseRevision: 1}}},
+		&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: token, LeaseRevision: 1}}},
 	)
 	require.Eventually(t, func() bool { return observer.counts() == [3]int{1, 1, 1} }, time.Second, time.Millisecond)
 	resultAck := stream.nextSent(t).GetCommandResultAcknowledgement()
@@ -164,6 +240,7 @@ func TestRegistrySessionSnapshotCopiesLeaseStateUnderLock(t *testing.T) {
 	require.NoError(t, registry.register("agent-a", []string{"collect_now"}, nil, cancel))
 	current, ok := registry.liveSession("agent-a")
 	require.True(t, ok)
+	require.NoError(t, registry.Start(ctx, "agent-a", &agentv1.CommandStart{CommandId: "command-seed", ExecutionToken: testServerExecutionToken(0x51), LeaseRevision: 1, LeaseSeconds: 30, StartDeadline: timestamppb.New(now.Add(time.Hour))}))
 
 	var wait sync.WaitGroup
 	wait.Add(2)
@@ -182,6 +259,9 @@ func TestRegistrySessionSnapshotCopiesLeaseStateUnderLock(t *testing.T) {
 			require.True(t, exists)
 			for commandID := range snapshot.Leases {
 				delete(snapshot.Leases, commandID)
+			}
+			for commandID := range snapshot.LeaseRevisions {
+				delete(snapshot.LeaseRevisions, commandID)
 			}
 		}
 	}()
@@ -281,15 +361,27 @@ func (s *testConnectStream) RecvMsg(message any) error {
 var _ grpc.BidiStreamingServer[agentv1.AgentMessage, agentv1.ServerMessage] = (*testConnectStream)(nil)
 
 type recordingObserver struct {
-	connected chan SessionInfo
-	mu        sync.Mutex
-	acks      int
-	progress  int
-	results   int
+	connected    chan SessionInfo
+	mu           sync.Mutex
+	acks         int
+	progress     int
+	results      int
+	prepared     chan *agentv1.CommandPrepared
+	start        *agentv1.CommandStart
+	resultDigest []byte
 }
 
 func (o *recordingObserver) Connected(_ context.Context, session SessionInfo)      { o.connected <- session }
 func (o *recordingObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat) {}
+func (o *recordingObserver) Prepared(_ context.Context, _ string, prepared *agentv1.CommandPrepared) (*agentv1.CommandStart, error) {
+	if o.prepared != nil {
+		o.prepared <- proto.Clone(prepared).(*agentv1.CommandPrepared)
+	}
+	if o.start == nil {
+		return nil, nil
+	}
+	return proto.Clone(o.start).(*agentv1.CommandStart), nil
+}
 func (o *recordingObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -304,10 +396,20 @@ func (o *recordingObserver) Result(_ context.Context, _ string, result *agentv1.
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.results++
-	return ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
+	digest := append([]byte(nil), o.resultDigest...)
+	if len(digest) == 0 {
+		encoded, _ := proto.MarshalOptions{Deterministic: true}.Marshal(result)
+		value := sha256.Sum256(encoded)
+		digest = value[:]
+	}
+	return ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: digest, Persisted: true}, nil
 }
 func (o *recordingObserver) counts() [3]int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return [3]int{o.acks, o.progress, o.results}
+}
+
+func testServerExecutionToken(value byte) []byte {
+	return bytes.Repeat([]byte{value}, sha256.Size)
 }

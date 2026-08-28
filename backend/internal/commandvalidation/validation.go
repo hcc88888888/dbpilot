@@ -8,6 +8,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
@@ -89,6 +90,69 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	}
 	return nil
+}
+
+// ValidateStart enforces the execution fence and bounded authorization window
+// that must be durable before an Agent may invoke an executor.
+func ValidateStart(start *agentv1.CommandStart, at time.Time) error {
+	if start == nil || !validIdentifier(start.GetCommandId()) || len(start.GetExecutionToken()) != sha256.Size || start.GetLeaseRevision() == 0 || start.GetLeaseSeconds() == 0 || start.GetLeaseSeconds() > MaximumTimeoutSeconds || start.GetStartDeadline() == nil || !start.GetStartDeadline().IsValid() || !start.GetStartDeadline().AsTime().After(at.UTC()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+func ValidatePrepared(prepared *agentv1.CommandPrepared) error {
+	if prepared == nil || !validIdentifier(prepared.GetCommandId()) || len(prepared.GetEnvelopeDigest()) != sha256.Size {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+func ValidateProgress(progress *agentv1.CommandProgress) error {
+	if progress == nil || progress.GetPercent() > 100 || !validExecutionFence(progress.GetCommandId(), progress.GetExecutionToken(), progress.GetLeaseRevision()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+func ValidateResult(result *agentv1.CommandResult) error {
+	if result == nil || !validExecutionFence(result.GetCommandId(), result.GetExecutionToken(), result.GetLeaseRevision()) {
+		return ErrInvalidCommand
+	}
+	switch result.GetState() {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED,
+		agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED,
+		agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED,
+		agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT,
+		agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return nil
+	default:
+		return ErrInvalidCommand
+	}
+}
+
+func ValidateCancellation(cancellation *agentv1.CommandCancellation) error {
+	if cancellation == nil || !validIdentifier(cancellation.GetCommandId()) {
+		return ErrInvalidCommand
+	}
+	if len(cancellation.GetExecutionToken()) == 0 && cancellation.GetLeaseRevision() == 0 {
+		return nil
+	}
+	if !validExecutionFence(cancellation.GetCommandId(), cancellation.GetExecutionToken(), cancellation.GetLeaseRevision()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+func ValidateResultAcknowledgement(acknowledgement *agentv1.CommandResultAcknowledgement) error {
+	if acknowledgement == nil || !validIdentifier(acknowledgement.GetCommandId()) || len(acknowledgement.GetResultDigest()) != sha256.Size || (acknowledgement.GetPersisted() && acknowledgement.GetRetryable()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
+func validExecutionFence(commandID string, executionToken []byte, leaseRevision uint64) bool {
+	return validIdentifier(commandID) && len(executionToken) == sha256.Size && leaseRevision > 0
 }
 
 func validTransactionPolicy(value agentv1.TransactionPolicy) bool {

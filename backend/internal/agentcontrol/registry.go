@@ -2,6 +2,8 @@ package agentcontrol
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/commandvalidation"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -38,15 +41,17 @@ func IsRetryableDispatchError(err error) bool {
 }
 
 type session struct {
-	agentID        string
-	capabilities   map[string]struct{}
-	capabilityList []string
-	active         []*agentv1.CommandRecoveryState
-	send           chan *agentv1.ServerMessage
-	cancel         context.CancelFunc
-	lastHeartbeat  time.Time
-	leaseDurations map[string]time.Duration
-	leases         map[string]time.Time
+	agentID         string
+	capabilities    map[string]struct{}
+	capabilityList  []string
+	active          []*agentv1.CommandRecoveryState
+	send            chan *agentv1.ServerMessage
+	cancel          context.CancelFunc
+	lastHeartbeat   time.Time
+	leaseDurations  map[string]time.Duration
+	leases          map[string]time.Time
+	executionTokens map[string][]byte
+	leaseRevisions  map[string]uint64
 }
 
 // SessionInfo is a defensive snapshot of an authenticated live Agent session.
@@ -56,6 +61,7 @@ type SessionInfo struct {
 	ActiveCommands []*agentv1.CommandRecoveryState
 	LastHeartbeat  time.Time
 	Leases         map[string]time.Time
+	LeaseRevisions map[string]uint64
 }
 
 // Registry owns the single live session for each Agent and is the command Dispatcher.
@@ -96,6 +102,7 @@ func (r *Registry) register(agentID string, capabilities []string, active []*age
 		agentID: agentID, capabilities: capabilitySet, capabilityList: capabilityList,
 		active: cloneRecoveryStates(active), send: make(chan *agentv1.ServerMessage, r.queueCapacity), cancel: cancel,
 		leaseDurations: make(map[string]time.Duration), leases: make(map[string]time.Time),
+		executionTokens: make(map[string][]byte), leaseRevisions: make(map[string]uint64),
 	}
 	return nil
 }
@@ -128,9 +135,13 @@ func (r *Registry) Session(agentID string) (SessionInfo, bool) {
 	for commandID, deadline := range current.leases {
 		leases[commandID] = deadline
 	}
+	revisions := make(map[string]uint64, len(current.leaseRevisions))
+	for commandID, revision := range current.leaseRevisions {
+		revisions[commandID] = revision
+	}
 	return SessionInfo{
 		AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...),
-		ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leases,
+		ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leases, LeaseRevisions: revisions,
 	}, true
 }
 
@@ -145,7 +156,11 @@ func (r *Registry) snapshot(agentID string, expected *session) (SessionInfo, boo
 	for commandID, deadline := range current.leases {
 		leasing[commandID] = deadline
 	}
-	return SessionInfo{AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing}, true
+	revisions := make(map[string]uint64, len(current.leaseRevisions))
+	for commandID, revision := range current.leaseRevisions {
+		revisions[commandID] = revision
+	}
+	return SessionInfo{AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing, LeaseRevisions: revisions}, true
 }
 
 func (r *Registry) enqueue(agentID string, message *agentv1.ServerMessage) error {
@@ -194,10 +209,36 @@ func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agent
 	message := &agentv1.ServerMessage{MessageId: cloned.GetCommandId(), Message: &agentv1.ServerMessage_Command{Command: cloned}}
 	select {
 	case current.send <- message:
-		if lease := time.Duration(cloned.GetLeaseSeconds()) * time.Second; lease > 0 {
-			current.leaseDurations[cloned.GetCommandId()] = lease
-			current.leases[cloned.GetCommandId()] = r.now().Add(lease)
-		}
+		return nil
+	default:
+		return &dispatchError{err: ErrSessionQueueFull, retryable: true}
+	}
+}
+
+// Start dispatches the persisted execution fence after the observer has
+// authorized it. Prepare delivery never creates an execution lease.
+func (r *Registry) Start(ctx context.Context, agentID string, start *agentv1.CommandStart) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := commandvalidation.ValidateStart(start, r.now()); err != nil {
+		return &dispatchError{err: ErrInvalidCommand}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, exists := r.sessions[agentID]
+	if !exists {
+		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
+	}
+	cloned := proto.Clone(start).(*agentv1.CommandStart)
+	message := &agentv1.ServerMessage{MessageId: "start-" + cloned.GetCommandId(), Message: &agentv1.ServerMessage_CommandStart{CommandStart: cloned}}
+	select {
+	case current.send <- message:
+		current.executionTokens[cloned.GetCommandId()] = append([]byte(nil), cloned.GetExecutionToken()...)
+		current.leaseRevisions[cloned.GetCommandId()] = cloned.GetLeaseRevision()
+		lease := time.Duration(cloned.GetLeaseSeconds()) * time.Second
+		current.leaseDurations[cloned.GetCommandId()] = lease
+		current.leases[cloned.GetCommandId()] = r.now().Add(lease)
 		return nil
 	default:
 		return &dispatchError{err: ErrSessionQueueFull, retryable: true}
@@ -236,11 +277,18 @@ func (r *Registry) renew(agentID string, heartbeat *agentv1.Heartbeat, at time.T
 		return
 	}
 	current.lastHeartbeat = at
-	for _, commandID := range heartbeat.GetActiveCommandIds() {
-		if lease := current.leaseDurations[commandID]; lease > 0 {
-			current.leases[commandID] = at.Add(lease)
+	for _, active := range heartbeat.GetActiveCommands() {
+		if active == nil || !matchingExecutionToken(current.executionTokens[active.GetCommandId()], active.GetExecutionToken()) || current.leaseRevisions[active.GetCommandId()] != active.GetLeaseRevision() {
+			continue
+		}
+		if lease := current.leaseDurations[active.GetCommandId()]; lease > 0 {
+			current.leases[active.GetCommandId()] = at.Add(lease)
 		}
 	}
+}
+
+func matchingExecutionToken(left, right []byte) bool {
+	return len(left) == sha256.Size && len(right) == sha256.Size && subtle.ConstantTimeCompare(left, right) == 1
 }
 
 func commandCapability(envelope *agentv1.CommandEnvelope) (string, bool) {

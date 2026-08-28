@@ -105,10 +105,10 @@ func TestDispatchRetryUsesByteIdenticalPreparedEnvelopeAndJournalDeduplicates(t 
 	journal, err := commandjournal.Open(filepath.Join(t.TempDir(), "commands.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, journal.Close()) })
-	accepted, err := journal.Accept(context.Background(), fixture.agents.envelopes[0])
+	accepted, err := journal.Prepare(context.Background(), fixture.agents.envelopes[0], fixture.now)
 	require.NoError(t, err)
 	require.True(t, accepted)
-	accepted, err = journal.Accept(context.Background(), fixture.agents.envelopes[1])
+	accepted, err = journal.Prepare(context.Background(), fixture.agents.envelopes[1], fixture.now)
 	require.NoError(t, err)
 	require.False(t, accepted, "the retry must be a command_id duplicate, not an envelope digest conflict")
 }
