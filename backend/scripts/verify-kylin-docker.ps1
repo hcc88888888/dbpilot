@@ -200,6 +200,9 @@ evaluation_scopes:
     project_id: "project-smoke"
 command:
   signing_private_key_ref: "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY"
+artifact:
+  storage_root: "/runtime/data/artifacts"
+  signing_key_ref: "secret://controlplane/artifact-download"
 '@
     [System.IO.File]::WriteAllText((Join-Path $fixtureDirectory 'controlplane.yaml'), $controlplaneConfig, [Text.UTF8Encoding]::new($false))
 
@@ -260,6 +263,7 @@ test "$controlplane_status" -ne 0
 grep 'database readiness' /runtime/controlplane-startup.log >/dev/null
 printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s journal=opened policy=parsed\n' "${ID}" "${VERSION_ID:-unknown}" "$arch"
 '@
+    $smoke = $smoke.Replace("`r`n", "`n").Replace("`r", "`n")
     $encodedSmoke = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($smoke))
     Invoke-Docker @('exec', '-e', "DBPILOT_EXPECTED_ARCH=$Architecture", $container, '/bin/sh', '-c', "echo $encodedSmoke | base64 -d | /bin/sh")
 }
