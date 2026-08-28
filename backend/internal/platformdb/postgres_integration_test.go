@@ -84,6 +84,42 @@ func TestPlatformPostgresIntegration(t *testing.T) {
 	require.ErrorIs(t, err, artifact.ErrNotFound)
 }
 
+func TestHTTPIdempotencyMigrationPreservesCustomStateConstraint(t *testing.T) {
+	if os.Getenv("DBPILOT_PLATFORM_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_PLATFORM_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_PLATFORM_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_PLATFORM_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin := openPlatformIntegrationDB(t, ctx, dsn)
+	schema := fmt.Sprintf("platform_migration_upgrade_%d", time.Now().UnixNano())
+	quotedSchema := pq.QuoteIdentifier(schema)
+	_, err := admin.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := admin.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS "+quotedSchema+" CASCADE")
+		require.NoError(t, cleanupErr)
+		require.NoError(t, admin.Close())
+	})
+	database := openPlatformIntegrationDB(t, ctx, platformIntegrationDSN(t, dsn, schema))
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	_, err = database.ExecContext(ctx, "CREATE TABLE dbpilot_schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+	require.NoError(t, err)
+	require.NoError(t, applyMigration(ctx, database, "migrations/0002_idempotency.sql"))
+	require.NoError(t, applyMigration(ctx, database, "migrations/0003_idempotency_fencing.sql"))
+	_, err = database.ExecContext(ctx, "ALTER TABLE idempotency_records ADD CONSTRAINT customer_state_policy CHECK (state <> 'customer_reserved')")
+	require.NoError(t, err)
+
+	require.NoError(t, applyMigration(ctx, database, "migrations/0005_http_idempotency_reconciliation.sql"))
+
+	var customConstraint int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'idempotency_records'::regclass AND conname = 'customer_state_policy'").Scan(&customConstraint))
+	require.Equal(t, 1, customConstraint)
+}
+
 func openPlatformIntegrationDB(t *testing.T, ctx context.Context, dsn string) *sql.DB {
 	t.Helper()
 	database, err := sql.Open("postgres", dsn)

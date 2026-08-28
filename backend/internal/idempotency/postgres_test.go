@@ -59,6 +59,7 @@ func TestPostgresStoreReplaysCompletedAndClassifiesDuplicateClaims(t *testing.T)
 	owner := "owner-1111111111111111111111111111111111111111111111111111111111111111"
 	responseHeaders := []byte(`{"Content-Type":["application/json"],"ETag":["\"8\""]}`)
 	responseBody := []byte(`{"id":"job-1","version":8}`)
+	reconciliation := []byte(`{"audit":"original"}`)
 
 	for _, test := range []struct {
 		name              string
@@ -81,8 +82,8 @@ func TestPostgresStoreReplaysCompletedAndClassifiesDuplicateClaims(t *testing.T)
 			mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 			mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
 				WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
-				WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json"}).
-					AddRow(test.storedFingerprint, owner, test.state, http.StatusAccepted, responseHeaders, responseBody))
+				WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json"}).
+					AddRow(test.storedFingerprint, owner, test.state, http.StatusAccepted, responseHeaders, responseBody, reconciliation))
 			mock.ExpectCommit()
 
 			claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
@@ -116,8 +117,8 @@ func TestPostgresStoreNeverReclaimsExpiredProcessingClaim(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
-		WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json"}).
-			AddRow(fingerprint, owner, StateProcessing, 0, []byte(`{}`), nil))
+		WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json"}).
+			AddRow(fingerprint, owner, StateProcessing, 0, []byte(`{}`), nil, nil))
 	mock.ExpectCommit()
 
 	claim, err := NewPostgresStore(database).Claim(context.Background(), key, fingerprint, owner, now, expires)
@@ -132,13 +133,14 @@ func TestPostgresStoreAdvancesSideEffectAuditAndCompletionByOwner(t *testing.T) 
 	fingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
 	owner := "owner-1111111111111111111111111111111111111111111111111111111111111111"
 	response := Response{Status: http.StatusAccepted, Header: http.Header{"ETag": {`"8"`}}, Body: []byte(`{"id":"job-1"}`)}
+	reconciliation := []byte(`{"audit":"original"}`)
 
 	database, mock := newIdempotencySQLMock(t)
 	mock.ExpectExec(regexp.QuoteMeta(commitSideEffectSQL)).
-		WithArgs(response.Status, `{"ETag":["\"8\""]}`, response.Body, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner).
+		WithArgs(response.Status, `{"ETag":["\"8\""]}`, response.Body, string(reconciliation), now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	committed, err := NewPostgresStore(database).CommitSideEffect(context.Background(), key, fingerprint, owner, response, now)
+	committed, err := NewPostgresStore(database).CommitSideEffect(context.Background(), key, fingerprint, owner, response, reconciliation, now)
 	require.NoError(t, err)
 	require.Equal(t, response, committed)
 
@@ -167,10 +169,11 @@ func TestPostgresStoreRejectsStaleOwnerCompleteAndAbort(t *testing.T) {
 	fingerprint := "sha256:0a9896a42ff3a8f7c9edfe3c97cc1e9d2b6bc06122f89876a49ea3bc4cc51b59"
 	staleOwner := "owner-1111111111111111111111111111111111111111111111111111111111111111"
 	response := Response{Status: http.StatusAccepted, Header: http.Header{"ETag": {`"8"`}}, Body: []byte(`{"id":"job-1"}`)}
+	reconciliation := []byte(`{"audit":"original"}`)
 
 	database, mock := newIdempotencySQLMock(t)
 	mock.ExpectExec(regexp.QuoteMeta(commitSideEffectSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
-	_, err := NewPostgresStore(database).CommitSideEffect(context.Background(), key, fingerprint, staleOwner, response, now)
+	_, err := NewPostgresStore(database).CommitSideEffect(context.Background(), key, fingerprint, staleOwner, response, reconciliation, now)
 	require.ErrorIs(t, err, ErrOwnershipConflict)
 
 	mock.ExpectExec(regexp.QuoteMeta(markAuditedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))

@@ -72,7 +72,8 @@ func TestPostgresClaimFencingIntegration(t *testing.T) {
 	require.Equal(t, int64(1), updated)
 
 	response := idempotency.Response{Status: http.StatusAccepted, Header: http.Header{"ETag": {`"8"`}}, Body: []byte(`{"id":"job-1","version":8}`)}
-	_, err = store.CommitSideEffect(ctx, key, fingerprint, ownerOne, response, now.Add(48*time.Hour))
+	reconciliation := []byte(`{"audit":"original"}`)
+	_, err = store.CommitSideEffect(ctx, key, fingerprint, ownerOne, response, reconciliation, now.Add(48*time.Hour))
 	require.ErrorIs(t, err, idempotency.ErrOwnershipConflict)
 	err = store.Abort(ctx, key, fingerprint, ownerOne)
 	require.ErrorIs(t, err, idempotency.ErrOwnershipConflict)
@@ -82,7 +83,7 @@ func TestPostgresClaimFencingIntegration(t *testing.T) {
 	require.Equal(t, ownerTwo, storedOwner)
 	require.Equal(t, string(idempotency.StateProcessing), state)
 
-	committed, err := store.CommitSideEffect(ctx, key, fingerprint, ownerTwo, response, now.Add(48*time.Hour))
+	committed, err := store.CommitSideEffect(ctx, key, fingerprint, ownerTwo, response, reconciliation, now.Add(48*time.Hour))
 	require.NoError(t, err)
 	require.Equal(t, response, committed)
 	require.NoError(t, store.MarkAudited(ctx, key, fingerprint, ownerTwo, now.Add(48*time.Hour)))

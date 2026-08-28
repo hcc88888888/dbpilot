@@ -311,19 +311,26 @@ func TestReconcileCancelAuditFailureFromStoredSideEffectWithoutSecondCancel(t *t
 	services := Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(store)}
 	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
 
-	first := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-audit-repair-1"))
+	firstRequest := newCancelRequest(`"7"`, "cancel-audit-repair-1")
+	firstRequest.Header.Set("X-Request-ID", "request-original-cancel")
+	firstRequest.Header.Set("traceparent", "00-11111111111111111111111111111111-2222222222222222-01")
+	first := servePlatformRequest(services, principal, firstRequest)
 	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
 	require.Len(t, jobs.transitions, 1)
 	require.Equal(t, 1, audits.recordCalls)
 
 	audits.err = nil
 	retryRequest := newCancelRequest(`"7"`, "cancel-audit-repair-1")
+	retryRequest.Header.Set("X-Request-ID", "request-retry-cancel")
+	retryRequest.Header.Set("traceparent", "00-33333333333333333333333333333333-4444444444444444-01")
 	retry := servePlatformRequest(services, principal, retryRequest)
 
 	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
 	require.Equal(t, `"8"`, retry.Header().Get("ETag"))
 	require.Len(t, jobs.transitions, 1, "reconciliation must not repeat the cancellation")
 	require.Equal(t, 2, audits.recordCalls)
+	require.Equal(t, "request-original-cancel", audits.records[0].RequestID)
+	require.Equal(t, "11111111111111111111111111111111", audits.records[0].TraceID)
 	requireOpenAPIResponse(t, retryRequest, retry)
 }
 
@@ -337,20 +344,109 @@ func TestReconcileArtifactAuditFailureFromStoredDescriptorWithoutSecondSigning(t
 	services := Services{Artifacts: artifacts, Audit: audits, Idempotency: idempotency.NewService(store)}
 	principal := principalWith(platformTestScope, openapi.PermissionCreateArtifactDownload)
 
-	first := servePlatformRequest(services, principal, newDownloadRequest("download-audit-repair-1"))
+	firstRequest := newDownloadRequest("download-audit-repair-1")
+	firstRequest.Header.Set("X-Request-ID", "request-original-download")
+	firstRequest.Header.Set("traceparent", "00-55555555555555555555555555555555-6666666666666666-01")
+	first := servePlatformRequest(services, principal, firstRequest)
 	requireProblem(t, first, http.StatusInternalServerError, "internal_error", first.Header().Get("X-Request-ID"))
 	require.Equal(t, 1, artifacts.downloadCalls)
 	require.Equal(t, 1, audits.recordCalls)
 
 	audits.err = nil
 	retryRequest := newDownloadRequest("download-audit-repair-1")
+	retryRequest.Header.Set("X-Request-ID", "request-retry-download")
+	retryRequest.Header.Set("traceparent", "00-77777777777777777777777777777777-8888888888888888-01")
 	retry := servePlatformRequest(services, principal, retryRequest)
 
 	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
 	require.Contains(t, retry.Body.String(), "signed-once")
 	require.Equal(t, 1, artifacts.downloadCalls, "reconciliation must not sign a second descriptor")
 	require.Equal(t, 2, audits.recordCalls)
+	require.Equal(t, "request-original-download", audits.records[0].RequestID)
+	require.Equal(t, "55555555555555555555555555555555", audits.records[0].TraceID)
 	requireOpenAPIResponse(t, retryRequest, retry)
+}
+
+func TestReconcileMarkAuditedFailureUsesOriginalAuditIdentity(t *testing.T) {
+	jobs := &recordingJobService{transitionValue: func() job.Job {
+		value := validPlatformJob()
+		value.Status = job.StatusCancelling
+		value.Version = 8
+		return value
+	}()}
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.markAuditedErr = errors.New("idempotency audit phase unavailable")
+	services := Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+
+	firstRequest := newCancelRequest(`"7"`, "cancel-mark-audited-repair-1")
+	firstRequest.Header.Set("X-Request-ID", "request-original-mark")
+	firstRequest.Header.Set("traceparent", "00-99999999999999999999999999999999-aaaaaaaaaaaaaaaa-01")
+	first := servePlatformRequest(services, principal, firstRequest)
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", "request-original-mark")
+	require.Len(t, jobs.transitions, 1)
+	require.Len(t, audits.records, 1)
+
+	store.markAuditedErr = nil
+	retryRequest := newCancelRequest(`"7"`, "cancel-mark-audited-repair-1")
+	retryRequest.Header.Set("X-Request-ID", "request-retry-mark")
+	retryRequest.Header.Set("traceparent", "00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cccccccccccccccc-01")
+	retry := servePlatformRequest(services, principal, retryRequest)
+
+	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+	require.Len(t, jobs.transitions, 1)
+	require.Len(t, audits.records, 1)
+	require.Equal(t, "request-original-mark", audits.records[0].RequestID)
+	require.Equal(t, "99999999999999999999999999999999", audits.records[0].TraceID)
+}
+
+func TestReconcileRejectsTamperedStoredAuditSemantics(t *testing.T) {
+	mutations := map[string]func(map[string]any){
+		"scope": func(value map[string]any) {
+			value["scope"] = map[string]any{"tenant_id": "other", "project_id": "project-a"}
+		},
+		"action": func(value map[string]any) { value["action"] = "job.deleted" },
+		"actor":  func(value map[string]any) { value["actor"] = map[string]any{"type": "user", "id": "other"} },
+		"resource": func(value map[string]any) {
+			value["resource"] = map[string]any{"resource_type": "job", "resource_id": "other"}
+		},
+		"result":     func(value map[string]any) { value["result"] = "failure" },
+		"dedupe key": func(value map[string]any) { value["dedupe_key"] = "http.action:tampered" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			jobs := &recordingJobService{transitionValue: func() job.Job {
+				value := validPlatformJob()
+				value.Status = job.StatusCancelling
+				value.Version = 8
+				return value
+			}()}
+			audits := &recordingAuditService{err: errors.New("audit unavailable")}
+			store := newHTTPIdempotencyStore()
+			services := Services{Jobs: jobs, Audit: audits, Idempotency: idempotency.NewService(store)}
+			principal := principalWith(platformTestScope, openapi.PermissionCancelJob)
+			firstRequest := newCancelRequest(`"7"`, "cancel-tampered-audit-1")
+			firstRequest.Header.Set("X-Request-ID", "request-tampered-original")
+			firstRequest.Header.Set("traceparent", "00-dddddddddddddddddddddddddddddddd-eeeeeeeeeeeeeeee-01")
+			first := servePlatformRequest(services, principal, firstRequest)
+			require.Equal(t, http.StatusInternalServerError, first.Code)
+
+			mapKey := platformTestScope.Key() + "\x00" + principal.Subject + "\x00cancelJob\x00cancel-tampered-audit-1"
+			record := store.records[mapKey]
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(record.reconciliation, &payload))
+			mutate(payload)
+			record.reconciliation, _ = json.Marshal(payload)
+			store.records[mapKey] = record
+			audits.err = nil
+			retry := servePlatformRequest(services, principal, newCancelRequest(`"7"`, "cancel-tampered-audit-1"))
+
+			require.Equal(t, http.StatusInternalServerError, retry.Code)
+			require.Len(t, jobs.transitions, 1)
+			require.Equal(t, 1, audits.recordCalls, "invalid stored audit data must be rejected before RecordOnce")
+		})
+	}
 }
 
 func TestAmbiguousJobCommitLeavesClaimProcessingAndRetryDoesNotTransitionAgain(t *testing.T) {
@@ -789,6 +885,9 @@ func (service *recordingAuditService) RecordOnce(_ context.Context, event audit.
 	service.recordCalls++
 	for _, existing := range service.records {
 		if existing.DedupeKey == event.DedupeKey {
+			if existing.RequestID != event.RequestID || existing.TraceID != event.TraceID {
+				return audit.Event{}, audit.ErrDedupeConflict
+			}
 			return existing, nil
 		}
 	}
@@ -813,19 +912,21 @@ func (service *recordingCapabilityService) Resolve(input capability.Input) []cap
 }
 
 type httpIdempotencyStore struct {
-	mu            sync.Mutex
-	records       map[string]httpIdempotencyRecord
-	completeErr   error
-	abortCalls    int
-	claimedOwners []string
-	abortedOwners []string
+	mu             sync.Mutex
+	records        map[string]httpIdempotencyRecord
+	completeErr    error
+	markAuditedErr error
+	abortCalls     int
+	claimedOwners  []string
+	abortedOwners  []string
 }
 
 type httpIdempotencyRecord struct {
-	fingerprint string
-	owner       string
-	state       idempotency.State
-	response    idempotency.Response
+	fingerprint    string
+	owner          string
+	state          idempotency.State
+	response       idempotency.Response
+	reconciliation []byte
 }
 
 func newHTTPIdempotencyStore() *httpIdempotencyStore {
@@ -850,13 +951,15 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, key idempotency.Key,
 	}
 	response := cloneIdempotencyResponse(record.response)
 	ownerToken := record.owner
+	reconciliation := append([]byte(nil), record.reconciliation...)
 	if record.state == idempotency.StateCompleted {
 		ownerToken = ""
+		reconciliation = nil
 	}
-	return idempotency.Claim{OwnerToken: ownerToken, State: record.state, Response: &response}, nil
+	return idempotency.Claim{OwnerToken: ownerToken, State: record.state, Response: &response, Reconciliation: reconciliation}, nil
 }
 
-func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, _ time.Time) (idempotency.Response, error) {
+func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, _ time.Time) (idempotency.Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.completeErr != nil {
@@ -869,6 +972,7 @@ func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idemp
 	}
 	record.state = idempotency.StateSideEffectCommitted
 	record.response = cloneIdempotencyResponse(response)
+	record.reconciliation = append([]byte(nil), reconciliation...)
 	store.records[mapKey] = record
 	return cloneIdempotencyResponse(record.response), nil
 }
@@ -876,6 +980,9 @@ func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idemp
 func (store *httpIdempotencyStore) MarkAudited(_ context.Context, key idempotency.Key, fingerprint, owner string, _ time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.markAuditedErr != nil {
+		return store.markAuditedErr
+	}
 	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
 	record, exists := store.records[mapKey]
 	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateSideEffectCommitted {

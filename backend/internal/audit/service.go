@@ -285,7 +285,7 @@ func containsCredentialMaterial(value string) bool {
 			return true
 		}
 	}
-	if privateKeyPEMPattern.MatchString(value) || oracleEasyConnectPattern.MatchString(value) {
+	if privateKeyPEMPattern.MatchString(value) || oracleEasyConnectPattern.MatchString(value) || containsOracleODBC(value) || containsOracleJDBC(value) {
 		return true
 	}
 	for _, candidate := range connectionURLPattern.FindAllString(value, -1) {
@@ -300,6 +300,34 @@ func containsCredentialMaterial(value string) bool {
 var privateKeyPEMPattern = regexp.MustCompile(`(?i)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----`)
 var oracleEasyConnectPattern = regexp.MustCompile(`(?i)(?:^|[\s"'=])[^\s/@:]+/[^\s/@]+@(?:\[[0-9a-f:]+\]|[a-z0-9_.-]+)(?::[0-9]+)?/[a-z0-9_.-]+(?:$|[\s"'])`)
 var connectionURLPattern = regexp.MustCompile(`(?i)[a-z][a-z0-9+.-]*://[^\s"'<>]+`)
+
+func containsOracleODBC(value string) bool {
+	fields := make(map[string]string)
+	for _, part := range strings.Split(value, ";") {
+		pair := strings.SplitN(part, "=", 2)
+		if len(pair) != 2 {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(pair[0]))] = strings.TrimSpace(pair[1])
+	}
+	driver := strings.ToLower(strings.Trim(fields["driver"], "{} \t"))
+	return strings.Contains(driver, "oracle") && fields["uid"] != "" && fields["pwd"] != ""
+}
+
+func containsOracleJDBC(value string) bool {
+	const prefix = "jdbc:oracle:thin:"
+	start := strings.Index(strings.ToLower(value), prefix)
+	if start < 0 {
+		return false
+	}
+	credentialsAndAddress := strings.TrimSpace(value[start+len(prefix):])
+	at := strings.Index(credentialsAndAddress, "@")
+	if at <= 0 {
+		return false
+	}
+	credentials := strings.SplitN(credentialsAndAddress[:at], "/", 2)
+	return len(credentials) == 2 && strings.TrimSpace(credentials[0]) != "" && strings.TrimSpace(credentials[1]) != ""
+}
 
 func sqlSummary(statement string) string {
 	fields := strings.Fields(statement)

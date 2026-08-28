@@ -29,7 +29,7 @@ func TestServiceClaimsCompletesAndReplaysExactResponse(t *testing.T) {
 		Header: http.Header{"Content-Type": {"application/json"}, "ETag": {`"8"`}, "Location": {"/jobs/job-1"}},
 		Body:   []byte(`{"id":"job-1","version":8}`),
 	}
-	completed, err := service.Complete(context.Background(), key, fingerprint, claim.OwnerToken, want, successfulReconcile)
+	completed, err := service.Complete(context.Background(), key, fingerprint, claim.OwnerToken, want, reconciliationFixture(), successfulReconcile)
 	require.NoError(t, err)
 	require.Equal(t, want, completed)
 
@@ -130,7 +130,7 @@ func TestServiceRejectsInvalidKeysFingerprintsAndResponsesBeforeStore(t *testing
 		{Status: 200, Body: []byte(`not-json`)},
 		{Status: 200, Header: http.Header{"X-Test": {"unsafe\r\nvalue"}}, Body: []byte(`{}`)},
 	} {
-		_, err := service.Complete(context.Background(), key, validFingerprint, claim.OwnerToken, response, successfulReconcile)
+		_, err := service.Complete(context.Background(), key, validFingerprint, claim.OwnerToken, response, reconciliationFixture(), successfulReconcile)
 		require.ErrorIs(t, err, ErrInvalid)
 	}
 	require.Zero(t, store.completeCalls)
@@ -143,7 +143,9 @@ func validKey() Key {
 	}
 }
 
-func successfulReconcile(context.Context, Response) error { return nil }
+func successfulReconcile(context.Context, Response, []byte) error { return nil }
+
+func reconciliationFixture() []byte { return []byte(`{"audit":"fixture"}`) }
 
 type synchronizedStore struct {
 	mu            sync.Mutex
@@ -153,10 +155,11 @@ type synchronizedStore struct {
 }
 
 type synchronizedRecord struct {
-	fingerprint string
-	owner       string
-	state       State
-	response    Response
+	fingerprint    string
+	owner          string
+	state          State
+	response       Response
+	reconciliation []byte
 }
 
 func newSynchronizedStore() *synchronizedStore {
@@ -181,13 +184,15 @@ func (store *synchronizedStore) Claim(_ context.Context, key Key, fingerprint, o
 	}
 	response := cloneResponse(record.response)
 	ownerToken := record.owner
+	reconciliation := append([]byte(nil), record.reconciliation...)
 	if record.state == StateCompleted {
 		ownerToken = ""
+		reconciliation = nil
 	}
-	return Claim{OwnerToken: ownerToken, State: record.state, Response: &response}, nil
+	return Claim{OwnerToken: ownerToken, State: record.state, Response: &response, Reconciliation: reconciliation}, nil
 }
 
-func (store *synchronizedStore) CommitSideEffect(_ context.Context, key Key, fingerprint, owner string, response Response, _ time.Time) (Response, error) {
+func (store *synchronizedStore) CommitSideEffect(_ context.Context, key Key, fingerprint, owner string, response Response, reconciliation []byte, _ time.Time) (Response, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.completeCalls++
@@ -198,6 +203,7 @@ func (store *synchronizedStore) CommitSideEffect(_ context.Context, key Key, fin
 	}
 	record.state = StateSideEffectCommitted
 	record.response = cloneResponse(response)
+	record.reconciliation = append([]byte(nil), reconciliation...)
 	store.records[mapKey] = record
 	return cloneResponse(record.response), nil
 }

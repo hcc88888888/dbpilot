@@ -22,6 +22,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
@@ -416,6 +417,24 @@ func TestRunCanceledContextReturnsWithoutMigrationOrListeners(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, migrations)
 	require.Zero(t, listens)
+}
+
+func TestRunCanceledContextClosesRetainedArtifactRoot(t *testing.T) {
+	config := validServerConfig()
+	config.ArtifactDownloadHandler = nil
+	config.Artifact.StorageRoot = t.TempDir()
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server.artifactBlobs)
+	root := server.artifactBlobs
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = server.Run(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = root.Open(context.Background(), artifact.Artifact{StorageReference: "missing.bin"})
+	require.ErrorIs(t, err, artifact.ErrInvalid)
 }
 
 func TestRunClosesFirstListenerWhenSecondBindFails(t *testing.T) {

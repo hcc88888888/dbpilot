@@ -11,9 +11,9 @@ import (
 )
 
 const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $9) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
-const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, expires_at = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND state = 'completed' AND expires_at <= $4"
-const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
-const commitSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND request_fingerprint = $10 AND owner_token = $11 AND state = 'processing'"
+const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = NULL, expires_at = $3, updated_at = $4 WHERE tenant_id = $5 AND project_id = $6 AND actor = $7 AND operation_id = $8 AND idempotency_key = $9 AND state = 'completed' AND expires_at <= $4"
+const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json, audit_event_json FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
+const commitSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, audit_event_json = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND request_fingerprint = $11 AND owner_token = $12 AND state = 'processing'"
 const markAuditedSQL = "UPDATE idempotency_records SET state = 'audited', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'side_effect_committed'"
 const completeClaimSQL = "UPDATE idempotency_records SET state = 'completed', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'audited'"
 const abortClaimSQL = "DELETE FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5 AND request_fingerprint = $6 AND owner_token = $7 AND state = 'processing'"
@@ -83,7 +83,7 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 		return Claim{}, ErrInProgress
 	case StateSideEffectCommitted, StateAudited:
 		response := cloneResponse(record.response)
-		return Claim{OwnerToken: record.owner, State: record.state, Response: &response}, nil
+		return Claim{OwnerToken: record.owner, State: record.state, Response: &response, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	case StateCompleted:
 		response := cloneResponse(record.response)
 		return Claim{State: StateCompleted, Response: &response}, nil
@@ -92,8 +92,8 @@ func (store *PostgresStore) Claim(ctx context.Context, key Key, fingerprint, own
 	}
 }
 
-func (store *PostgresStore) CommitSideEffect(ctx context.Context, key Key, fingerprint, owner string, response Response, at time.Time) (Response, error) {
-	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || at.IsZero() {
+func (store *PostgresStore) CommitSideEffect(ctx context.Context, key Key, fingerprint, owner string, response Response, reconciliation []byte, at time.Time) (Response, error) {
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || validateReconciliation(reconciliation) != nil || at.IsZero() {
 		return Response{}, ErrInvalid
 	}
 	headerJSON, err := json.Marshal(response.Header)
@@ -101,7 +101,7 @@ func (store *PostgresStore) CommitSideEffect(ctx context.Context, key Key, finge
 		return Response{}, ErrInvalid
 	}
 	at = at.UTC()
-	result, err := store.database.ExecContext(ctx, commitSideEffectSQL, response.Status, string(headerJSON), response.Body, at, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner)
+	result, err := store.database.ExecContext(ctx, commitSideEffectSQL, response.Status, string(headerJSON), response.Body, string(reconciliation), at, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner)
 	if err != nil {
 		return Response{}, fmt.Errorf("commit idempotency side effect: %w", err)
 	}
@@ -170,16 +170,17 @@ func (store *PostgresStore) Abort(ctx context.Context, key Key, fingerprint, own
 }
 
 type storedClaim struct {
-	fingerprint string
-	owner       string
-	state       State
-	response    Response
+	fingerprint    string
+	owner          string
+	state          State
+	response       Response
+	reconciliation []byte
 }
 
 func scanClaim(scanner interface{ Scan(...any) error }) (storedClaim, error) {
 	var value storedClaim
 	var headerJSON []byte
-	if err := scanner.Scan(&value.fingerprint, &value.owner, &value.state, &value.response.Status, &headerJSON, &value.response.Body); err != nil {
+	if err := scanner.Scan(&value.fingerprint, &value.owner, &value.state, &value.response.Status, &headerJSON, &value.response.Body, &value.reconciliation); err != nil {
 		return storedClaim{}, err
 	}
 	if value.state == StateSideEffectCommitted || value.state == StateAudited || value.state == StateCompleted {
@@ -194,6 +195,9 @@ func scanClaim(scanner interface{ Scan(...any) error }) (storedClaim, error) {
 			}
 		}
 		if validateResponse(value.response) != nil {
+			return storedClaim{}, ErrInvalid
+		}
+		if value.state != StateCompleted && validateReconciliation(value.reconciliation) != nil {
 			return storedClaim{}, ErrInvalid
 		}
 	}

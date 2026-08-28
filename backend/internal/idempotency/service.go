@@ -17,6 +17,7 @@ import (
 )
 
 const DefaultTTL = 24 * time.Hour
+const maximumReconciliationBytes = 64 << 10
 
 var (
 	ErrInvalid           = errors.New("invalid idempotency request")
@@ -52,17 +53,18 @@ type Response struct {
 }
 
 type Claim struct {
-	Claimed    bool
-	OwnerToken string
-	State      State
-	Response   *Response
+	Claimed        bool
+	OwnerToken     string
+	State          State
+	Response       *Response
+	Reconciliation []byte
 }
 
-type ReconcileFunc func(context.Context, Response) error
+type ReconcileFunc func(context.Context, Response, []byte) error
 
 type Store interface {
 	Claim(context.Context, Key, string, string, time.Time, time.Time) (Claim, error)
-	CommitSideEffect(context.Context, Key, string, string, Response, time.Time) (Response, error)
+	CommitSideEffect(context.Context, Key, string, string, Response, []byte, time.Time) (Response, error)
 	MarkAudited(context.Context, Key, string, string, time.Time) error
 	Complete(context.Context, Key, string, string, Response, time.Time) (Response, error)
 	Abort(context.Context, Key, string, string) error
@@ -101,7 +103,7 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 		return Claim{}, err
 	}
 	if claim.Claimed {
-		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil {
+		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil || claim.Reconciliation != nil {
 			return Claim{}, ErrInvalid
 		}
 		return claim, nil
@@ -114,24 +116,25 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 		return Claim{}, ErrInvalid
 	}
 	claim.Response = &response
+	reconciliation := append([]byte(nil), claim.Reconciliation...)
 	switch claim.State {
 	case StateCompleted:
-		if claim.OwnerToken != "" {
+		if claim.OwnerToken != "" || claim.Reconciliation != nil {
 			return Claim{}, ErrInvalid
 		}
 		return claim, nil
 	case StateSideEffectCommitted:
-		if !ownerPattern.MatchString(claim.OwnerToken) {
+		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(reconciliation) != nil {
 			return Claim{}, ErrInvalid
 		}
-		if err := reconcile(ctx, cloneResponse(response)); err != nil {
+		if err := reconcile(ctx, cloneResponse(response), append([]byte(nil), reconciliation...)); err != nil {
 			return Claim{}, err
 		}
 		if err := service.store.MarkAudited(ctx, key, fingerprint, claim.OwnerToken, service.currentTime()); err != nil {
 			return Claim{}, err
 		}
 	case StateAudited:
-		if !ownerPattern.MatchString(claim.OwnerToken) {
+		if !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(reconciliation) != nil {
 			return Claim{}, ErrInvalid
 		}
 	default:
@@ -148,18 +151,19 @@ func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, 
 	return Claim{State: StateCompleted, Response: &completed}, nil
 }
 
-func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response, reconcile ReconcileFunc) (Response, error) {
-	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || reconcile == nil {
+func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owner string, response Response, reconciliation []byte, reconcile ReconcileFunc) (Response, error) {
+	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || validateReconciliation(reconciliation) != nil || reconcile == nil {
 		return Response{}, ErrInvalid
 	}
-	committed, err := service.store.CommitSideEffect(ctx, key, fingerprint, owner, cloneResponse(response), service.currentTime())
+	reconciliation = append([]byte(nil), reconciliation...)
+	committed, err := service.store.CommitSideEffect(ctx, key, fingerprint, owner, cloneResponse(response), reconciliation, service.currentTime())
 	if err != nil {
 		return Response{}, err
 	}
 	if validateResponse(committed) != nil {
 		return Response{}, ErrInvalid
 	}
-	if err := reconcile(ctx, cloneResponse(committed)); err != nil {
+	if err := reconcile(ctx, cloneResponse(committed), append([]byte(nil), reconciliation...)); err != nil {
 		return Response{}, err
 	}
 	if err := service.store.MarkAudited(ctx, key, fingerprint, owner, service.currentTime()); err != nil {
@@ -173,6 +177,13 @@ func (service *Service) Complete(ctx context.Context, key Key, fingerprint, owne
 		return Response{}, ErrInvalid
 	}
 	return cloneResponse(completed), nil
+}
+
+func validateReconciliation(value []byte) error {
+	if len(value) == 0 || len(value) > maximumReconciliationBytes || !json.Valid(value) {
+		return ErrInvalid
+	}
+	return nil
 }
 
 func (service *Service) Abort(ctx context.Context, key Key, fingerprint, owner string) error {

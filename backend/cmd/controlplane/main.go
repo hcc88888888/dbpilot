@@ -167,6 +167,7 @@ type Server struct {
 	commandLifecycle *job.CommandLifecycle
 	dispatchCommands func(context.Context, time.Time) error
 	idempotency      *idempotency.Service
+	artifactBlobs    *artifact.LocalBlobStore
 	workers          sync.WaitGroup
 }
 
@@ -352,6 +353,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 	artifactService := artifact.NewService(artifact.NewPostgresStore(database), artifactSigner)
 	artifactContent := config.ArtifactDownloadHandler
+	var artifactBlobs *artifact.LocalBlobStore
 	if artifactContent == nil {
 		blobStore := artifact.NewLocalBlobStore(config.Artifact.StorageRoot)
 		if err := blobStore.Ready(); err != nil {
@@ -360,8 +362,10 @@ func NewServer(config Config) (*Server, error) {
 			}
 			return nil, fmt.Errorf("validate artifact storage root: %w", err)
 		}
+		artifactBlobs = blobStore
 		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, blobStore)
 		if err != nil {
+			_ = blobStore.Close()
 			if ownsDatabase {
 				_ = database.Close()
 			}
@@ -397,6 +401,9 @@ func NewServer(config Config) (*Server, error) {
 		OnError:          func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
+		if artifactBlobs != nil {
+			_ = artifactBlobs.Close()
+		}
 		if ownsDatabase {
 			_ = database.Close()
 		}
@@ -410,7 +417,7 @@ func NewServer(config Config) (*Server, error) {
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
-	}, idempotency: idempotencyService}, nil
+	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs}, nil
 }
 
 func validateConfig(config Config) error {
@@ -600,26 +607,26 @@ func (server *Server) Run(ctx context.Context) error {
 		return errors.New("control-plane server is nil")
 	}
 	if err := ctx.Err(); err != nil {
-		server.closeDatabase()
+		server.closeResources()
 		return err
 	}
 	if err := server.ping(ctx); err != nil {
-		server.closeDatabase()
+		server.closeResources()
 		return fmt.Errorf("database readiness: %w", err)
 	}
 	if err := server.migrate(ctx); err != nil {
-		server.closeDatabase()
+		server.closeResources()
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	httpListener, err := server.listen("tcp", server.config.HTTP.Address)
 	if err != nil {
-		server.closeDatabase()
+		server.closeResources()
 		return fmt.Errorf("listen HTTP: %w", err)
 	}
 	grpcListener, err := server.listen("tcp", server.config.GRPC.Address)
 	if err != nil {
 		_ = httpListener.Close()
-		server.closeDatabase()
+		server.closeResources()
 		return fmt.Errorf("listen gRPC: %w", err)
 	}
 	httpTLSListener := tls.NewListener(httpListener, server.httpTLS.Clone())
@@ -635,7 +642,7 @@ func (server *Server) Run(ctx context.Context) error {
 		cancel()
 		server.stop(httpTLSListener, grpcListener)
 		workerErr := server.waitWorkers()
-		server.closeDatabase()
+		server.closeResources()
 		if workerErr != nil {
 			return workerErr
 		}
@@ -644,7 +651,7 @@ func (server *Server) Run(ctx context.Context) error {
 		cancel()
 		server.stop(httpTLSListener, grpcListener)
 		workerErr := server.waitWorkers()
-		server.closeDatabase()
+		server.closeResources()
 		if workerErr != nil {
 			return workerErr
 		}
@@ -670,6 +677,14 @@ func (server *Server) closeDatabase() {
 		_ = server.database.Close()
 		server.ownsDatabase = false
 	}
+}
+
+func (server *Server) closeResources() {
+	if server.artifactBlobs != nil {
+		_ = server.artifactBlobs.Close()
+		server.artifactBlobs = nil
+	}
+	server.closeDatabase()
 }
 
 func (server *Server) startLoops(ctx context.Context) {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -70,9 +71,9 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	if err != nil {
 		return nil, err
 	}
-	reconcile := func(callbackContext context.Context, _ idempotency.Response) error {
-		_, auditErr := api.services.Audit.RecordOnce(callbackContext, httpActionAuditEvent(callbackContext, scope, principal, "job.cancel_requested", "job", request.JobId, "success", "cancelJob", request.Params.IdempotencyKey))
-		return auditErr
+	auditPayload, reconcile, err := httpActionAuditReconciliation(ctx, api.services.Audit, scope, principal, "job.cancel_requested", "job", request.JobId, "success", "cancelJob", request.Params.IdempotencyKey)
+	if err != nil {
+		return nil, err
 	}
 	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
 	if err != nil {
@@ -119,7 +120,7 @@ func (api platformAPI) CancelJob(ctx context.Context, request openapi.CancelJobR
 	stored.Header.Set("Content-Type", "application/json")
 	stored.Header.Set("ETag", entityTag(value.Version))
 	stored.Header.Set("Location", "/api/v1/tenants/"+url.PathEscape(scope.TenantID)+"/projects/"+url.PathEscape(scope.ProjectID)+"/jobs/"+url.PathEscape(value.ID))
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, reconcile)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, auditPayload, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -164,9 +165,9 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	if err != nil {
 		return nil, err
 	}
-	reconcile := func(callbackContext context.Context, _ idempotency.Response) error {
-		_, auditErr := api.services.Audit.RecordOnce(callbackContext, httpActionAuditEvent(callbackContext, scope, principal, "artifact.download_authorized", "artifact", request.ArtifactId, "success", "createArtifactDownload", request.Params.IdempotencyKey))
-		return auditErr
+	auditPayload, reconcile, err := httpActionAuditReconciliation(ctx, api.services.Audit, scope, principal, "artifact.download_authorized", "artifact", request.ArtifactId, "success", "createArtifactDownload", request.Params.IdempotencyKey)
+	if err != nil {
+		return nil, err
 	}
 	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, reconcile)
 	if err != nil {
@@ -205,7 +206,7 @@ func (api platformAPI) CreateArtifactDownload(ctx context.Context, request opena
 	}
 	stored := idempotency.Response{Status: http.StatusOK, Header: make(http.Header), Body: responseBody}
 	stored.Header.Set("Content-Type", "application/json")
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, reconcile)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, owner, stored, auditPayload, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +378,48 @@ func httpActionAuditEvent(ctx context.Context, scope platformscope.Scope, princi
 		DedupeKey: "http.action:" + hex.EncodeToString(digest[:]),
 		Detail:    map[string]any{"operation_id": operationID},
 	}
+}
+
+type httpActionAuditPayload struct {
+	Scope     platformscope.Scope `json:"scope"`
+	Action    string              `json:"action"`
+	Actor     audit.Actor         `json:"actor"`
+	Resource  audit.Resource      `json:"resource"`
+	Result    string              `json:"result"`
+	RequestID string              `json:"request_id"`
+	TraceID   string              `json:"trace_id,omitempty"`
+	DedupeKey string              `json:"dedupe_key"`
+	Detail    map[string]any      `json:"detail"`
+}
+
+func httpActionAuditReconciliation(ctx context.Context, service AuditService, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string) ([]byte, idempotency.ReconcileFunc, error) {
+	expected := httpActionAuditEvent(ctx, scope, principal, action, resourceType, resourceID, result, operationID, idempotencyKey)
+	payload := httpActionAuditPayload{
+		Scope: expected.Scope, Action: expected.Action, Actor: expected.Actor, Resource: expected.Resource,
+		Result: expected.Result, RequestID: expected.RequestID, TraceID: expected.TraceID,
+		DedupeKey: expected.DedupeKey, Detail: expected.Detail,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	reconcile := func(callbackContext context.Context, _ idempotency.Response, storedJSON []byte) error {
+		var stored httpActionAuditPayload
+		if json.Unmarshal(storedJSON, &stored) != nil || stored.Scope != expected.Scope || stored.Action != expected.Action || stored.Actor != expected.Actor || stored.Resource != expected.Resource || stored.Result != expected.Result || stored.DedupeKey != expected.DedupeKey || !reflect.DeepEqual(stored.Detail, expected.Detail) || !canonicalAuditIdentity(stored.RequestID) || stored.TraceID != "" && !canonicalAuditIdentity(stored.TraceID) {
+			return errors.New("stored HTTP audit payload is invalid")
+		}
+		_, recordErr := service.RecordOnce(callbackContext, audit.Event{
+			Scope: stored.Scope, Action: stored.Action, Actor: stored.Actor, Resource: stored.Resource,
+			Result: stored.Result, RequestID: stored.RequestID, TraceID: stored.TraceID,
+			DedupeKey: stored.DedupeKey, Detail: stored.Detail,
+		})
+		return recordErr
+	}
+	return encoded, reconcile, nil
+}
+
+func canonicalAuditIdentity(value string) bool {
+	return value != "" && value == strings.TrimSpace(value) && !strings.ContainsAny(value, "\r\n\t")
 }
 
 func (response getJobOKResponse) VisitGetJobResponse(writer http.ResponseWriter) error {

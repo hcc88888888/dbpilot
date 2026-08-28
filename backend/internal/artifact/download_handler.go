@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"dbpilot.local/platform/internal/platformscope"
 )
@@ -122,26 +123,55 @@ func equalBytes(first, second []byte) bool {
 	return different == 0
 }
 
-type LocalBlobStore struct{ root string }
+type LocalBlobStore struct {
+	rootPath string
+	mu       sync.RWMutex
+	root     *os.Root
+	closed   bool
+}
 
-func NewLocalBlobStore(root string) *LocalBlobStore { return &LocalBlobStore{root: root} }
+func NewLocalBlobStore(root string) *LocalBlobStore { return &LocalBlobStore{rootPath: root} }
 
 func (store *LocalBlobStore) Ready() error {
-	if store == nil || strings.TrimSpace(store.root) == "" {
+	if store == nil || strings.TrimSpace(store.rootPath) == "" {
 		return ErrInvalid
 	}
-	root, err := os.OpenRoot(store.root)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return ErrInvalid
+	}
+	if store.root != nil {
+		return nil
+	}
+	root, err := os.OpenRoot(store.rootPath)
 	if err != nil {
 		return ErrInvalid
 	}
-	if err := root.Close(); err != nil {
-		return ErrInvalid
-	}
+	store.root = root
 	return nil
 }
 
+func (store *LocalBlobStore) Close() error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return nil
+	}
+	store.closed = true
+	if store.root == nil {
+		return nil
+	}
+	err := store.root.Close()
+	store.root = nil
+	return err
+}
+
 func (store *LocalBlobStore) Open(ctx context.Context, value Artifact) (ReadSeekCloser, error) {
-	if store == nil || ctx == nil || ctx.Err() != nil || strings.TrimSpace(store.root) == "" || strings.TrimSpace(value.StorageReference) == "" {
+	if store == nil || ctx == nil || ctx.Err() != nil || strings.TrimSpace(store.rootPath) == "" || strings.TrimSpace(value.StorageReference) == "" {
 		return nil, ErrInvalid
 	}
 	reference := filepath.FromSlash(value.StorageReference)
@@ -149,18 +179,17 @@ func (store *LocalBlobStore) Open(ctx context.Context, value Artifact) (ReadSeek
 	if !filepath.IsLocal(reference) || clean != reference || clean == "." || strings.ContainsRune(reference, 0) {
 		return nil, ErrInvalid
 	}
-	root, err := os.OpenRoot(store.root)
-	if err != nil {
+	if err := store.Ready(); err != nil {
 		return nil, ErrInvalid
 	}
-	file, err := root.Open(clean)
-	closeErr := root.Close()
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.closed || store.root == nil {
+		return nil, ErrInvalid
+	}
+	file, err := store.root.Open(clean)
 	if err != nil {
 		return nil, ErrNotFound
-	}
-	if closeErr != nil {
-		_ = file.Close()
-		return nil, ErrInvalid
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {

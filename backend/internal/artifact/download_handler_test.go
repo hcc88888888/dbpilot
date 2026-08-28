@@ -29,7 +29,9 @@ func TestDownloadHandlerVerifiesClaimsAndStreamsExactLocalArtifact(t *testing.T)
 	metadata := Artifact{ID: "artifact-1", Scope: scope, Kind: "report", ContentType: "application/octet-stream", SizeBytes: int64(len(payload)), Checksum: fmt.Sprintf("sha256:%x", digest), CreatedAt: time.Now().UTC(), StorageReference: "tenant-a/artifact-1.bin"}
 	signer := testDownloadSigner(t, scope, metadata)
 	service := NewService(staticStore{artifact: metadata}, signer)
-	handler, err := NewDownloadHandler(service, signer, NewLocalBlobStore(root))
+	blobs := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
+	handler, err := NewDownloadHandler(service, signer, blobs)
 	require.NoError(t, err)
 	signed, err := signer.Sign(context.Background(), metadata, time.Minute)
 	require.NoError(t, err)
@@ -58,7 +60,9 @@ func TestDownloadHandlerRejectsUnsafeReferenceAndIntegrityMismatchWithoutLeaking
 		t.Run(name, func(t *testing.T) {
 			signer := testDownloadSigner(t, scope, metadata)
 			service := NewService(staticStore{artifact: metadata}, signer)
-			handler, err := NewDownloadHandler(service, signer, NewLocalBlobStore(root))
+			blobs := NewLocalBlobStore(root)
+			t.Cleanup(func() { require.NoError(t, blobs.Close()) })
+			handler, err := NewDownloadHandler(service, signer, blobs)
 			require.NoError(t, err)
 			signed, err := signer.Sign(context.Background(), metadata, time.Minute)
 			require.NoError(t, err)
@@ -89,6 +93,7 @@ func TestSymlinkSwapCannotEscapeLocalRoot(t *testing.T) {
 		t.Skipf("directory links unavailable: %v", err)
 	}
 	store := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	metadata := Artifact{StorageReference: filepath.Join("current", "payload.bin")}
 	done := make(chan struct{})
 	swaps := make(chan int, 1)
@@ -116,6 +121,40 @@ func TestSymlinkSwapCannotEscapeLocalRoot(t *testing.T) {
 	}
 	<-done
 	require.Positive(t, <-swaps, "the test must execute at least one link swap")
+}
+
+func TestReadyRootReplacementNeverReadsReplacementDirectory(t *testing.T) {
+	parent := t.TempDir()
+	configuredRoot := filepath.Join(parent, "artifacts")
+	originalRoot := filepath.Join(parent, "original-artifacts")
+	require.NoError(t, os.Mkdir(configuredRoot, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(configuredRoot, "payload.bin"), []byte("original"), 0o600))
+	store := NewLocalBlobStore(configuredRoot)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.Ready())
+
+	if err := os.Rename(configuredRoot, originalRoot); err != nil {
+		reader, openErr := store.Open(context.Background(), Artifact{StorageReference: "payload.bin"})
+		require.NoError(t, openErr)
+		payload, readErr := io.ReadAll(reader)
+		_ = reader.Close()
+		require.NoError(t, readErr)
+		require.Equal(t, "original", string(payload))
+		return
+	}
+	require.NoError(t, os.Mkdir(configuredRoot, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(configuredRoot, "payload.bin"), []byte("replacement-secret"), 0o600))
+
+	reader, err := store.Open(context.Background(), Artifact{StorageReference: "payload.bin"})
+	if err != nil {
+		require.ErrorIs(t, err, ErrInvalid)
+		return
+	}
+	payload, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	require.NoError(t, readErr)
+	require.Equal(t, "original", string(payload))
+	require.NotEqual(t, "replacement-secret", string(payload))
 }
 
 func createTestDirectoryLink(target, link string) error {
