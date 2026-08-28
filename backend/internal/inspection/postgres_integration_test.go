@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
@@ -286,6 +288,85 @@ func TestPostgresIntegrationReportFinalizationCrashRepairsAuditWithoutRepeatingW
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&findings))
 	require.Equal(t, []int{1, 1}, []int{reports, findings}, "Audit repair must not repeat evaluation or reporting")
 	t.Logf("crash repair evidence: run=%s reports=%d findings=%d audit_pending=%t audit_events_replayed=%d", run.ID, reports, findings, pending, len(recordedAudit.events))
+}
+
+func TestPostgresIntegrationFullBuiltinCatalogHydratesOneAcceptedHostSnapshot(t *testing.T) {
+	// Break caught: the worker must reconstruct every built-in metadata/log
+	// Observation from the same accepted host snapshot, not just metric rules.
+	ctx, database, repository, _ := openInspectionIntegration(t, "full-host-snapshot")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	createdAt := now.Add(-2 * time.Second)
+	sampledAt := now.Add(-time.Second)
+	deadline := now.Add(30 * time.Second)
+	scope := platformscope.Scope{TenantID: "tenant-full-snapshot", ProjectID: "project-full-snapshot"}
+	agentID := "agent-full-snapshot"
+	samples := fullBuiltinHostSamples(scope, agentID, sampledAt)
+	accepted, err := alert.NewPostgresRepository(database).AppendBatch(ctx, agentID, "batch-full-snapshot", samples)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	items := BuiltinHostItems()
+	evidence, err := repository.LoadHostSnapshot(ctx, scope, agentID, items, createdAt, deadline, maxTargetObservations)
+	require.NoError(t, err)
+	require.True(t, evidence.Complete)
+	target := TargetRun{
+		TargetID: agentID, AgentID: agentID, CommandID: "command-full-snapshot", Status: TargetEvaluating,
+		DisplayName: "Full snapshot", Host: "db-a", AdvertisedSources: []SourceType{SourceMetric, SourceMetadata, SourceLogSummary},
+		TrustedProcessAllowlist: true, ObservedAt: evidence.SampledAt, Observations: evidence.Observations,
+	}
+	snapshot := RunSnapshot{ID: "run-full-snapshot", Scope: scope, CreatedAt: createdAt, Items: items, Targets: []TargetRun{target}}
+	findings, err := (&Evaluator{Evidence: repository, Now: func() time.Time { return deadline }}).EvaluateTarget(ctx, snapshot, target)
+	require.NoError(t, err)
+	require.Len(t, findings, len(items))
+	for _, finding := range findings {
+		require.NotEqual(t, LevelMissingData, finding.Level, finding.ItemID)
+		require.NotEqual(t, LevelUnsupported, finding.Level, finding.ItemID)
+	}
+	require.Equal(t, LevelWarning, findingByItem(t, findings, "host.log.error_summary").Level)
+	t.Logf("full host snapshot evidence: samples=%d hydrated=%d findings=%d sampled_at=%s", len(samples), len(evidence.Observations), len(findings), evidence.SampledAt.Format(time.RFC3339Nano))
+}
+
+func TestPostgresIntegrationEvidenceFenceRejectsUnrelatedWrongSourceAndLateBackdatedSamples(t *testing.T) {
+	// Break caught: source identity, Run sample fence, and server accepted_at are
+	// independent requirements; satisfying only one must remain missing_data.
+	ctx, database, repository, _ := openInspectionIntegration(t, "evidence-fence")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	scope := platformscope.Scope{TenantID: "tenant-evidence-fence", ProjectID: "project-evidence-fence"}
+	item := builtinItem("host.cpu.utilization")
+	baseLabels := hostSnapshotLabels("inspection-host-snapshot")
+
+	createdAt := now.Add(-time.Second)
+	deadline := now.Add(30 * time.Second)
+	unrelated := []alert.MetricSample{
+		hostMetricSample(scope, "agent-unrelated", "dbpilot.inspection.host.marker", 1, now, baseLabels),
+		hostMetricSample(scope, "agent-unrelated", item.MetricRule.MetricName, 12, createdAt.Add(-time.Second), baseLabels),
+	}
+	accepted, err := alert.NewPostgresRepository(database).AppendBatch(ctx, "agent-unrelated", "batch-unrelated", unrelated)
+	require.NoError(t, err)
+	require.True(t, accepted)
+	evidence, err := repository.LoadHostSnapshot(ctx, scope, "agent-unrelated", []Item{item}, createdAt, deadline, 32)
+	require.NoError(t, err)
+	require.False(t, evidence.Complete, "fresh unrelated source metric plus stale required metric must not satisfy completeness")
+
+	wrongLabels := hostSnapshotLabels("other-source")
+	wrongSource := hostMetricSample(scope, "agent-wrong-source", item.MetricRule.MetricName, 99, now, wrongLabels)
+	accepted, err = alert.NewPostgresRepository(database).AppendBatch(ctx, "agent-wrong-source", "batch-wrong-source", []alert.MetricSample{wrongSource})
+	require.NoError(t, err)
+	require.True(t, accepted)
+	observations, err := repository.Samples(ctx, scope, "agent-wrong-source", []string{item.MetricRule.MetricName}, createdAt, deadline, 32)
+	require.NoError(t, err)
+	require.Empty(t, observations, "same-name metric from a different source must not evaluate")
+	require.Equal(t, LevelMissingData, evaluatePersistedMetric(t, ctx, repository, scope, "agent-wrong-source", item, createdAt, now).Level)
+
+	lateCreatedAt := now.Add(-10 * time.Second)
+	lateDeadline := now.Add(-2 * time.Second)
+	lateSample := hostMetricSample(scope, "agent-late", item.MetricRule.MetricName, 99, now.Add(-5*time.Second), baseLabels)
+	accepted, err = alert.NewPostgresRepository(database).AppendBatch(ctx, "agent-late", "batch-late", []alert.MetricSample{lateSample})
+	require.NoError(t, err)
+	require.True(t, accepted)
+	observations, err = repository.Samples(ctx, scope, "agent-late", []string{item.MetricRule.MetricName}, lateCreatedAt, lateDeadline, 32)
+	require.NoError(t, err)
+	require.Empty(t, observations, "late-ingested backdated metric must fail the accepted_at deadline")
+	require.Equal(t, LevelMissingData, evaluatePersistedMetric(t, ctx, repository, scope, "agent-late", item, lateCreatedAt, lateDeadline).Level)
 }
 
 func TestPostgresIntegrationHistoricalRowsRejectMutationWhileLifecycleUpdatesRemainPossible(t *testing.T) {
@@ -619,6 +700,7 @@ func openInspectionIntegration(t *testing.T, suffix string) (context.Context, *s
 	t.Cleanup(func() { _ = database.Close() })
 	require.NoError(t, database.PingContext(ctx))
 	require.NoError(t, job.RunMigrations(ctx, database))
+	require.NoError(t, alert.RunMigrations(ctx, database))
 	require.NoError(t, RunMigrations(ctx, database))
 	jobs := job.NewPostgresRepository(database)
 	return ctx, database, NewPostgresRepository(database, jobs), jobs
@@ -695,4 +777,71 @@ func makeScheduled(run *Run, value *job.Job, policy Policy) {
 	run.PolicySnapshot = clonePolicy(&policy)
 	run.IdempotencyKey = run.OccurrenceKey
 	value.IdempotencyKey = run.OccurrenceKey
+}
+
+func fullBuiltinHostSamples(scope platformscope.Scope, agentID string, sampledAt time.Time) []alert.MetricSample {
+	values := map[string]float64{
+		"system.cpu.utilization":                                       12,
+		"system.cpu.load_average.1m_per_cpu":                           0.5,
+		"system.memory.utilization":                                    22,
+		"system.swap.utilization":                                      3,
+		"system.filesystem.utilization":                                40,
+		"system.filesystem.inode_utilization":                          30,
+		"dbpilot.inspection.host.agent.heartbeat_age_seconds":          0,
+		"dbpilot.inspection.host.metric.age_seconds":                   0,
+		"dbpilot.inspection.host.spool.utilization":                    10,
+		"dbpilot.inspection.host.log.summary_available":                1,
+		"dbpilot.inspection.host.oom.count":                            0,
+		"dbpilot.inspection.host.time.synchronization_available":       1,
+		"dbpilot.inspection.host.time.synchronized":                    1,
+		"dbpilot.inspection.host.database.process_allowlist_available": 1,
+		"dbpilot.inspection.host.database.required_process_count":      2,
+		"dbpilot.inspection.host.log.warning_count":                    1,
+		"dbpilot.inspection.host.log.error_count":                      0,
+		"dbpilot.inspection.host.log.critical_count":                   0,
+	}
+	labels := hostSnapshotLabels(hostSnapshotSourceID)
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]alert.MetricSample, 0, len(names))
+	for _, name := range names {
+		result = append(result, hostMetricSample(scope, agentID, name, values[name], sampledAt, labels))
+	}
+	return result
+}
+
+func hostMetricSample(scope platformscope.Scope, agentID, name string, value float64, sampledAt time.Time, labels map[string]string) alert.MetricSample {
+	cloned := make(map[string]string, len(labels))
+	for key, item := range labels {
+		cloned[key] = item
+	}
+	return alert.MetricSample{Scope: alert.Scope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}, AgentID: agentID, Name: name, Labels: cloned, Value: value, SampledAt: sampledAt}
+}
+
+func hostSnapshotLabels(source string) map[string]string {
+	return map[string]string{"instance": "inspection-host-snapshot", "component": "inspection-host-snapshot", "role": "collector", "host": "db-a", "dbpilot_source_id": source}
+}
+
+func findingByItem(t *testing.T, findings []Finding, itemID string) Finding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.ItemID == itemID {
+			return finding
+		}
+	}
+	t.Fatalf("finding %q not found", itemID)
+	return Finding{}
+}
+
+func evaluatePersistedMetric(t *testing.T, ctx context.Context, repository *PostgresRepository, scope platformscope.Scope, agentID string, item Item, createdAt, evaluationAt time.Time) Finding {
+	t.Helper()
+	target := TargetRun{TargetID: agentID, AgentID: agentID, Status: TargetEvaluating, AdvertisedSources: []SourceType{SourceMetric}}
+	snapshot := RunSnapshot{ID: "run-" + agentID, Scope: scope, CreatedAt: createdAt.UTC(), Items: []Item{item}, Targets: []TargetRun{target}}
+	findings, err := (&Evaluator{Evidence: repository, Now: func() time.Time { return evaluationAt.UTC() }}).EvaluateTarget(ctx, snapshot, target)
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	return findings[0]
 }

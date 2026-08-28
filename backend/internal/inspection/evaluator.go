@@ -89,6 +89,9 @@ func (e *Evaluator) evaluateMetric(ctx context.Context, snapshot RunSnapshot, ta
 		return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": rule.MetricName, "samples": "0"}), nil
 	}
 	from := now.Add(-rule.Window)
+	if snapshot.CreatedAt.After(from) {
+		from = snapshot.CreatedAt.UTC()
+	}
 	observations, err := e.Evidence.Samples(ctx, snapshot.Scope, target.TargetID, []string{rule.MetricName}, from, now, maxEvidenceSamples)
 	if err != nil {
 		return Finding{}, err

@@ -8,16 +8,40 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
+	"github.com/stretchr/testify/require"
 )
 
 type memoryEvidenceStore struct {
 	observations []Observation
 	limit        int
+	from         time.Time
+	to           time.Time
 }
 
-func (s *memoryEvidenceStore) Samples(_ context.Context, _ platformscope.Scope, _ string, _ []string, _, _ time.Time, limit int) ([]Observation, error) {
+func (s *memoryEvidenceStore) Samples(_ context.Context, _ platformscope.Scope, _ string, _ []string, from, to time.Time, limit int) ([]Observation, error) {
 	s.limit = limit
+	s.from = from
+	s.to = to
 	return append([]Observation(nil), s.observations...), nil
+}
+
+func TestEvaluatorClampsMetricWindowToRunCreatedAt(t *testing.T) {
+	// Break caught: a long item window must never reach behind the immutable
+	// Run fence and reuse telemetry collected for an earlier inspection.
+	now := testTime().Add(time.Minute)
+	snapshot := metricSnapshot(AggregationLatest)
+	snapshot.CreatedAt = testTime()
+	snapshot.Items[0].MetricRule.Window = time.Hour
+	store := &memoryEvidenceStore{observations: []Observation{
+		metricObservation("before-run", "target-1", "system.filesystem.utilization", 99, snapshot.CreatedAt.Add(-time.Second)),
+		metricObservation("after-run", "target-1", "system.filesystem.utilization", 12, snapshot.CreatedAt.Add(time.Second)),
+	}}
+
+	findings, err := (&Evaluator{Evidence: store, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+
+	require.NoError(t, err)
+	require.Equal(t, snapshot.CreatedAt, store.from)
+	require.Equal(t, LevelHealthy, findings[0].Level)
 }
 
 func TestEvaluatorClassifiesFilesystemThresholdEquality(t *testing.T) {
@@ -57,6 +81,7 @@ func TestEvaluatorAggregatesSortedMetricSeries(t *testing.T) {
 				metricObservation("a", "target-1", "system.filesystem.utilization", 2, now.Add(-2*time.Minute)),
 			}}
 			snapshot := metricSnapshot(tc.aggregation)
+			snapshot.CreatedAt = now.Add(-5 * time.Minute)
 			snapshot.Items[0].MetricRule.WarningThreshold = 5
 			snapshot.Items[0].MetricRule.CriticalThreshold = 9
 			findings, err := (&Evaluator{Evidence: store, Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())

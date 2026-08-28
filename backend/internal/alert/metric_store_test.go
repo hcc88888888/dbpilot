@@ -67,13 +67,13 @@ func TestMetricStoreAppendUsesScopedSeriesIdentityAndCanonicalLabels(t *testing.
 		SampledAt: sampledAt,
 	}
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at, accepted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ON CONFLICT DO NOTHING")).
 		WithArgs("t1", "p1", "agent-a", "db.connections", agentSeriesFingerprint("agent-a", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT INTO monitoring_instances").
 		WithArgs("t1", "p1", "db-1", "agent-a", "", "db-a", canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), int64(time.Minute), sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at, accepted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ON CONFLICT DO NOTHING")).
 		WithArgs("t1", "p1", "agent-b", "db.connections", agentSeriesFingerprint("agent-b", sample.Labels), canonicalJSON(`{"component":"postgres","host":"db-a","instance":"db-1","role":"primary"}`), 12.0, sampledAt).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT INTO monitoring_instances").

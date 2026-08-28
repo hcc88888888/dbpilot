@@ -127,10 +127,11 @@ func equalBytes(first, second []byte) bool {
 }
 
 type LocalBlobStore struct {
-	rootPath string
-	mu       sync.RWMutex
-	root     *os.Root
-	closed   bool
+	rootPath      string
+	mu            sync.RWMutex
+	root          *os.Root
+	closed        bool
+	syncDirectory func(*os.Root, string) error
 }
 
 func NewLocalBlobStore(root string) *LocalBlobStore { return &LocalBlobStore{rootPath: root} }
@@ -234,10 +235,16 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 		if !matches {
 			return "", ErrIntegrityMismatch
 		}
+		if err := store.syncRetainedDirectory(directory); err != nil {
+			return "", safeBlobError("sync directory", err)
+		}
 		return filepath.ToSlash(reference), nil
 	}
 	if err := store.root.MkdirAll(directory, 0o700); err != nil {
 		return "", safeBlobError("create directory", err)
+	}
+	if err := store.syncRetainedDirectory("."); err != nil {
+		return "", safeBlobError("sync root directory", err)
 	}
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
@@ -283,30 +290,54 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 		if !matches {
 			return "", ErrIntegrityMismatch
 		}
+		if err := store.syncRetainedDirectory(directory); err != nil {
+			return "", safeBlobError("sync directory", err)
+		}
 		return filepath.ToSlash(reference), nil
 	}
-	if err := store.root.Rename(temporary, reference); err != nil {
+	if err := store.root.Link(temporary, reference); err != nil {
 		_ = store.root.Remove(temporary)
-		if matches, exists, inspectErr := rootBlobMatches(store.root, reference, contents); inspectErr == nil && exists && matches {
+		matches, exists, inspectErr := rootBlobMatches(store.root, reference, contents)
+		if inspectErr != nil {
+			return "", safeBlobError("inspect collision", inspectErr)
+		}
+		if exists {
+			if !matches {
+				return "", ErrIntegrityMismatch
+			}
+			if syncErr := store.syncRetainedDirectory(directory); syncErr != nil {
+				return "", safeBlobError("sync directory", syncErr)
+			}
 			return filepath.ToSlash(reference), nil
 		}
 		return "", safeBlobError("publish", err)
 	}
-	if runtime.GOOS != "windows" {
-		directoryFile, err := store.root.Open(directory)
-		if err != nil {
-			return "", safeBlobError("open directory", err)
-		}
-		syncErr := directoryFile.Sync()
-		closeErr := directoryFile.Close()
-		if syncErr != nil {
-			return "", safeBlobError("sync directory", syncErr)
-		}
-		if closeErr != nil {
-			return "", safeBlobError("close directory", closeErr)
-		}
+	if err := store.root.Remove(temporary); err != nil {
+		return "", safeBlobError("remove temporary", err)
+	}
+	if err := store.syncRetainedDirectory(directory); err != nil {
+		return "", safeBlobError("sync directory", err)
 	}
 	return filepath.ToSlash(reference), nil
+}
+
+func (store *LocalBlobStore) syncRetainedDirectory(name string) error {
+	if store.syncDirectory != nil {
+		return store.syncDirectory(store.root, name)
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := store.root.Open(name)
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func rootBlobMatches(root *os.Root, reference string, contents []byte) (bool, bool, error) {

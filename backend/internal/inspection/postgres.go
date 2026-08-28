@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,8 +51,9 @@ const selectReportsSQL = "SELECT " + reportColumnsSQL + " FROM inspection_report
 const selectReportsBeforeSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
 const claimRunsSQL = "SELECT " + runColumnsSQL + ", report_generated_at FROM inspection_runs WHERE status IN ('queued', 'collecting', 'evaluating', 'generating_report') AND (worker_lease_expires_at IS NULL OR worker_lease_expires_at <= $1) ORDER BY created_at, tenant_id, project_id, id FOR UPDATE SKIP LOCKED LIMIT $2"
 const claimRunSQL = "UPDATE inspection_runs SET worker_claim_token = $1, worker_lease_expires_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND id = $5 RETURNING worker_claim_token"
-const freshSnapshotSQL = "SELECT MAX(sampled_at) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND sampled_at >= $4 AND sampled_at <= $5 AND (labels->>'dbpilot_source_id' = $6 OR labels->>'component' = $7)"
-const evidenceSamplesSQL = "SELECT metric, labels, value, sampled_at, series_fingerprint FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND metric = ANY($4) AND sampled_at >= $5 AND sampled_at <= $6 ORDER BY sampled_at, metric, series_fingerprint LIMIT $7"
+const freshSnapshotSQL = "SELECT MAX(sampled_at) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND labels->>'dbpilot_source_id' = $4 AND sampled_at >= $5 AND sampled_at <= $6 AND accepted_at <= $6"
+const hostSnapshotSQL = "SELECT metric, labels, value, sampled_at, accepted_at, series_fingerprint FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND metric = ANY($4) AND labels->>'dbpilot_source_id' = $5 AND sampled_at >= $6 AND sampled_at <= $7 AND accepted_at <= $7 ORDER BY sampled_at DESC, metric, series_fingerprint LIMIT $8"
+const evidenceSamplesSQL = "SELECT metric, labels, value, sampled_at, series_fingerprint FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND metric = ANY($4) AND labels->>'dbpilot_source_id' = $5 AND sampled_at >= $6 AND sampled_at <= $7 AND accepted_at <= $7 ORDER BY sampled_at, metric, series_fingerprint LIMIT $8"
 
 type jobCreator interface {
 	CreateInTx(context.Context, *sql.Tx, job.Job, []job.OutboxMessage) error
@@ -1144,13 +1146,94 @@ func (repository *PostgresRepository) FreshSnapshotAt(ctx context.Context, scope
 		return time.Time{}, false, ErrInvalid
 	}
 	var sampledAt sql.NullTime
-	if err := repository.database.QueryRowContext(ctx, freshSnapshotSQL, scope.TenantID, scope.ProjectID, targetID, from.UTC(), to.UTC(), sourceID, sourceID).Scan(&sampledAt); err != nil {
+	if err := repository.database.QueryRowContext(ctx, freshSnapshotSQL, scope.TenantID, scope.ProjectID, targetID, sourceID, from.UTC(), to.UTC()).Scan(&sampledAt); err != nil {
 		return time.Time{}, false, err
 	}
 	if !sampledAt.Valid {
 		return time.Time{}, false, nil
 	}
 	return sampledAt.Time.UTC(), true, nil
+}
+
+func (repository *PostgresRepository) LoadHostSnapshot(ctx context.Context, scope platformscope.Scope, targetID string, items []Item, from, to time.Time, limit int) (HostSnapshotEvidence, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validID(targetID) || len(items) == 0 || len(items) > maxSnapshotItems || from.IsZero() || to.IsZero() || to.Before(from) || limit < 1 || limit > maxEvidenceSamples {
+		return HostSnapshotEvidence{}, ErrInvalidEvaluation
+	}
+	required := inspectionMetricRequirements(items)
+	if len(required) == 0 {
+		return HostSnapshotEvidence{}, nil
+	}
+	names := make([]string, 0, len(required))
+	for name := range required {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rows, err := repository.database.QueryContext(ctx, hostSnapshotSQL, scope.TenantID, scope.ProjectID, targetID, pq.Array(names), hostSnapshotSourceID, from.UTC(), to.UTC(), limit)
+	if err != nil {
+		return HostSnapshotEvidence{}, err
+	}
+	defer rows.Close()
+	type snapshotGroup struct {
+		sampledAt    time.Time
+		seen         map[string]struct{}
+		observations []Observation
+	}
+	groups := make([]snapshotGroup, 0)
+	for rows.Next() {
+		var metric, fingerprint string
+		var labels []byte
+		var value float64
+		var sampledAt, acceptedAt time.Time
+		if err := rows.Scan(&metric, &labels, &value, &sampledAt, &acceptedAt, &fingerprint); err != nil {
+			return HostSnapshotEvidence{}, err
+		}
+		source, expected := required[metric]
+		if !expected || acceptedAt.After(to) || sampledAt.Before(from) || sampledAt.After(to) {
+			return HostSnapshotEvidence{}, ErrInvalidEvaluation
+		}
+		sampledAt = sampledAt.UTC()
+		if len(groups) == 0 || !groups[len(groups)-1].sampledAt.Equal(sampledAt) {
+			groups = append(groups, snapshotGroup{sampledAt: sampledAt, seen: make(map[string]struct{})})
+		}
+		group := &groups[len(groups)-1]
+		group.seen[metric] = struct{}{}
+		if source == SourceMetric {
+			continue
+		}
+		var decodedLabels map[string]string
+		if err := json.Unmarshal(labels, &decodedLabels); err != nil {
+			return HostSnapshotEvidence{}, err
+		}
+		identity := targetID + "\x00" + metric + "\x00" + fingerprint + "\x00" + sampledAt.Format(time.RFC3339Nano)
+		digest := sha256.Sum256([]byte(identity))
+		group.observations = append(group.observations, Observation{
+			ID: "metric-" + hex.EncodeToString(digest[:16]), TargetID: targetID, Name: metric, SourceType: source,
+			Labels: decodedLabels, Value: value, ObservedAt: sampledAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return HostSnapshotEvidence{}, err
+	}
+	if len(groups) == 0 {
+		return HostSnapshotEvidence{}, nil
+	}
+	selected := groups[0]
+	for _, group := range groups {
+		if len(group.seen) == len(required) {
+			selected = group
+			break
+		}
+	}
+	sort.Slice(selected.observations, func(i, j int) bool {
+		if selected.observations[i].Name != selected.observations[j].Name {
+			return selected.observations[i].Name < selected.observations[j].Name
+		}
+		return selected.observations[i].ID < selected.observations[j].ID
+	})
+	if len(selected.observations) > maxTargetObservations {
+		return HostSnapshotEvidence{}, ErrInvalidEvaluation
+	}
+	return HostSnapshotEvidence{SampledAt: selected.sampledAt, Observations: selected.observations, Complete: len(selected.seen) == len(required)}, nil
 }
 
 func (repository *PostgresRepository) Samples(ctx context.Context, scope platformscope.Scope, targetID string, names []string, from, to time.Time, limit int) ([]Observation, error) {
@@ -1162,7 +1245,7 @@ func (repository *PostgresRepository) Samples(ctx context.Context, scope platfor
 			return nil, ErrInvalidEvaluation
 		}
 	}
-	rows, err := repository.database.QueryContext(ctx, evidenceSamplesSQL, scope.TenantID, scope.ProjectID, targetID, pq.Array(names), from.UTC(), to.UTC(), limit)
+	rows, err := repository.database.QueryContext(ctx, evidenceSamplesSQL, scope.TenantID, scope.ProjectID, targetID, pq.Array(names), hostSnapshotSourceID, from.UTC(), to.UTC(), limit)
 	if err != nil {
 		return nil, err
 	}

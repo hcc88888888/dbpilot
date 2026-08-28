@@ -920,7 +920,7 @@ func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql", "0006_monitoring_instance_state.sql")
+	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql", "0006_monitoring_instance_state.sql", "0007_metric_sample_acceptance.sql")
 	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "metric-batch-writer-2"), "")
 	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
 

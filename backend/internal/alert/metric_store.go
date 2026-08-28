@@ -51,7 +51,7 @@ type AtomicMetricBatchStore interface {
 	AppendBatch(context.Context, string, string, []MetricSample) (bool, error)
 }
 
-const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING"
+const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at, accepted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ON CONFLICT DO NOTHING"
 const monitoringInstanceUpsertSQL = "INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()"
 const metricBatchReserveSQL = "INSERT INTO ingest_batch_dedup (agent_id, batch_id, state) VALUES ($1, $2, 'processing') ON CONFLICT DO NOTHING RETURNING state"
 const metricBatchCommitSQL = "UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW() WHERE agent_id = $1 AND batch_id = $2"

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -311,8 +312,8 @@ func TestPostgresFreshSnapshotUsesExactSourceFenceAndJobDeadline(t *testing.T) {
 	from := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
 	to := from.Add(5 * time.Minute)
 	fresh := from.Add(time.Second)
-	mock.ExpectQuery("(?s)SELECT MAX\\(sampled_at\\) FROM metric_samples.*tenant_id = \\$1.*project_id = \\$2.*agent_id = \\$3.*sampled_at >= \\$4.*sampled_at <= \\$5.*dbpilot_source_id.*component").
-		WithArgs(scope.TenantID, scope.ProjectID, "agent-a", from, to, hostSnapshotSourceID, hostSnapshotSourceID).
+	mock.ExpectQuery("(?s)SELECT MAX\\(sampled_at\\) FROM metric_samples.*tenant_id = \\$1.*project_id = \\$2.*agent_id = \\$3.*dbpilot_source_id.*sampled_at >= \\$5.*sampled_at <= \\$6.*accepted_at <= \\$6").
+		WithArgs(scope.TenantID, scope.ProjectID, "agent-a", hostSnapshotSourceID, from, to).
 		WillReturnRows(sqlmock.NewRows([]string{"sampled_at"}).AddRow(fresh))
 
 	got, ok, err := NewPostgresRepository(database, nil).FreshSnapshotAt(context.Background(), scope, "agent-a", hostSnapshotSourceID, from, to)
@@ -320,6 +321,47 @@ func TestPostgresFreshSnapshotUsesExactSourceFenceAndJobDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, fresh, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresLoadHostSnapshotHydratesBuiltinMetadataAndLogEvidence(t *testing.T) {
+	// Break caught: metric samples for metadata/log built-ins must be mapped
+	// back into the canonical typed Observation sources before evaluation.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	from := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	to := from.Add(5 * time.Minute)
+	sampledAt := from.Add(time.Second)
+	acceptedAt := from.Add(2 * time.Second)
+	items := []Item{builtinItem("host.oom.evidence"), builtinItem("host.time.synchronization"), builtinItem("database.process.presence"), builtinItem("host.log.error_summary")}
+	labels := []byte(`{"component":"inspection-host-snapshot","dbpilot_source_id":"inspection-host-snapshot","host":"db-a","instance":"inspection-host-snapshot","role":"collector"}`)
+	rows := sqlmock.NewRows([]string{"metric", "labels", "value", "sampled_at", "accepted_at", "series_fingerprint"})
+	for index, metric := range []string{
+		"dbpilot.inspection.host.log.summary_available",
+		"dbpilot.inspection.host.oom.count",
+		"dbpilot.inspection.host.time.synchronization_available",
+		"dbpilot.inspection.host.time.synchronized",
+		"dbpilot.inspection.host.database.process_allowlist_available",
+		"dbpilot.inspection.host.database.required_process_count",
+		"dbpilot.inspection.host.log.warning_count",
+		"dbpilot.inspection.host.log.error_count",
+		"dbpilot.inspection.host.log.critical_count",
+	} {
+		rows.AddRow(metric, labels, float64(index%2), sampledAt, acceptedAt, fmt.Sprintf("series-%d", index))
+	}
+	mock.ExpectQuery("(?s)SELECT metric, labels, value, sampled_at, accepted_at, series_fingerprint FROM metric_samples.*tenant_id = \\$1.*project_id = \\$2.*agent_id = \\$3.*metric = ANY\\(\\$4\\).*dbpilot_source_id.*sampled_at >= \\$6.*sampled_at <= \\$7.*accepted_at <= \\$7.*LIMIT \\$8").
+		WithArgs(scope.TenantID, scope.ProjectID, "agent-a", sqlmock.AnyArg(), hostSnapshotSourceID, from, to, 256).
+		WillReturnRows(rows)
+
+	evidence, err := NewPostgresRepository(database, nil).LoadHostSnapshot(context.Background(), scope, "agent-a", items, from, to, 256)
+
+	require.NoError(t, err)
+	require.True(t, evidence.Complete)
+	require.Equal(t, sampledAt, evidence.SampledAt)
+	require.Contains(t, observationSources(evidence.Observations), "dbpilot.inspection.host.oom.count:metadata")
+	require.Contains(t, observationSources(evidence.Observations), "dbpilot.inspection.host.log.error_count:log_summary")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -543,6 +585,14 @@ func nullableTimeValue(value *time.Time) any {
 
 func findingColumnNames() []string {
 	return []string{"id", "run_id", "target_id", "item_id", "item_version", "level", "observed_at", "evidence", "warning_threshold", "critical_threshold", "summary", "recommendation"}
+}
+
+func observationSources(values []Observation) []string {
+	result := make([]string, len(values))
+	for index := range values {
+		result[index] = values[index].Name + ":" + string(values[index].SourceType)
+	}
+	return result
 }
 
 func policyRows(value Policy) *sqlmock.Rows {

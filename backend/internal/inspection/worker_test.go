@@ -34,6 +34,25 @@ func TestWorkerWaitsForFreshHostSnapshotAfterSuccessfulCommand(t *testing.T) {
 	require.Equal(t, []freshnessRequest{{TargetID: "agent-a", SourceID: hostSnapshotSourceID, From: fixture.created, To: fixture.deadline}}, fixture.repository.freshnessRequests)
 }
 
+func TestWorkerFreshUnrelatedMarkerDoesNotSatisfyRequiredMetric(t *testing.T) {
+	// Break caught: a fresh source marker cannot release evaluation while the
+	// required item metric in that snapshot is absent or stale.
+	fixture := newWorkerFixture(t, []TargetRun{workerTarget("agent-a")}, []job.TargetResult{workerJobResult("agent-a", job.TargetSucceeded)})
+	fixture.now = fixture.created.Add(time.Minute)
+	fixture.deadline = fixture.created.Add(5 * time.Minute)
+	fixture.repository.freshAt = map[string]time.Time{"agent-a": fixture.created.Add(time.Second)}
+	fixture.repository.hostComplete = map[string]bool{"agent-a": false}
+	fixture.evidence.observations = map[string][]Observation{
+		"agent-a": {{ID: "stale-required", TargetID: "agent-a", Name: "system.cpu.utilization", SourceType: SourceMetric, Value: 99, ObservedAt: fixture.created.Add(-time.Second)}},
+	}
+
+	_, err := fixture.worker().Process(context.Background(), fixture.now, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, RunCollecting, fixture.repository.detail.Run.Status)
+	require.Zero(t, fixture.evidence.calls)
+}
+
 func TestFreshnessDeadlineProducesMissingDataFromStaleOnlyEvidence(t *testing.T) {
 	// Break caught: a stale pre-run sample must not satisfy freshness, and the
 	// persisted Job deadline is the exact point at which waiting becomes a
@@ -50,8 +69,8 @@ func TestFreshnessDeadlineProducesMissingDataFromStaleOnlyEvidence(t *testing.T)
 	require.Equal(t, RunFailed, fixture.repository.detail.Run.Status)
 	require.Len(t, fixture.repository.detail.Findings, 1)
 	require.Equal(t, LevelMissingData, fixture.repository.detail.Findings[0].Level)
-	require.Equal(t, "snapshot_not_ingested_by_deadline", fixture.repository.detail.Findings[0].Evidence["reason"])
-	require.Zero(t, fixture.evidence.calls, "stale evidence must not reach the evaluator")
+	require.Equal(t, "0", fixture.repository.detail.Findings[0].Evidence["samples"])
+	require.Equal(t, 1, fixture.evidence.calls, "deadline evaluation must produce item-specific missing_data")
 }
 
 func TestWorkerEvaluationNeverUsesEvidenceAfterJobDeadline(t *testing.T) {
@@ -157,13 +176,46 @@ func TestWorkerArtifactFailureRetriesReportWithoutRepeatingEvaluation(t *testing
 	firstJSONChecksum := fixture.artifacts.values[0].Checksum
 
 	fixture.artifacts.failAt = 0
+	fixture.jobs.err = errors.New("Job storage unavailable during report repair")
+	jobCalls := fixture.jobs.calls
 	fixture.now = fixture.now.Add(time.Minute)
 	_, secondErr := fixture.worker().Process(context.Background(), fixture.now, 1)
 
 	require.NoError(t, secondErr)
 	require.Equal(t, RunCompleted, fixture.repository.detail.Run.Status)
 	require.Equal(t, 1, fixture.evidence.calls, "report repair must not evaluate again")
+	require.Equal(t, jobCalls, fixture.jobs.calls, "report repair must not load the Job")
 	require.Equal(t, firstJSONChecksum, fixture.artifacts.values[1].Checksum, "stable persisted generation time must keep retry bytes identical")
+}
+
+func TestFindingCompletenessControlsTargetAndRunOutcome(t *testing.T) {
+	// Break caught: one valid Finding must not mask a missing or unsupported
+	// sibling item on the same target.
+	tests := []struct {
+		name       string
+		findings   []Finding
+		wantTarget TargetStatus
+		wantRun    RunStatus
+	}{
+		{"all valid", []Finding{{Level: LevelHealthy}, {Level: LevelWarning}}, TargetSucceeded, RunCompleted},
+		{"incomplete valid", []Finding{{Level: LevelHealthy}}, TargetFailed, RunFailed},
+		{"valid plus missing", []Finding{{Level: LevelHealthy}, {Level: LevelMissingData}}, TargetFailed, RunFailed},
+		{"valid plus unsupported", []Finding{{Level: LevelHealthy}, {Level: LevelUnsupported}}, TargetUnsupported, RunFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := TargetRun{}
+			applyFindingOutcome(&target, test.findings, 2)
+			require.Equal(t, test.wantTarget, target.Status)
+			require.Equal(t, test.wantRun, AggregateRunStatus([]TargetStatus{target.Status}))
+		})
+	}
+
+	valid := TargetRun{}
+	applyFindingOutcome(&valid, []Finding{{Level: LevelHealthy}}, 1)
+	missing := TargetRun{}
+	applyFindingOutcome(&missing, []Finding{{Level: LevelMissingData}}, 1)
+	require.Equal(t, RunPartial, AggregateRunStatus([]TargetStatus{valid.Status, missing.Status}))
 }
 
 func TestWorkerAuditFailureRepairsPersistedEventWithoutRerendering(t *testing.T) {
@@ -300,6 +352,8 @@ type memoryRunWorkerRepository struct {
 	detail              RunDetail
 	report              ReportSnapshot
 	freshAt             map[string]time.Time
+	hostComplete        map[string]bool
+	hostObservations    map[string][]Observation
 	freshnessRequests   []freshnessRequest
 	released            int
 	pendingAudit        *ReportAuditClaim
@@ -343,6 +397,16 @@ func (repository *memoryRunWorkerRepository) FreshSnapshotAt(_ context.Context, 
 	repository.freshnessRequests = append(repository.freshnessRequests, freshnessRequest{TargetID: targetID, SourceID: sourceID, From: from, To: to})
 	at, ok := repository.freshAt[targetID]
 	return at, ok && !at.Before(from) && !at.After(to), nil
+}
+
+func (repository *memoryRunWorkerRepository) LoadHostSnapshot(_ context.Context, _ platformscope.Scope, targetID string, _ []Item, from, to time.Time, _ int) (HostSnapshotEvidence, error) {
+	repository.freshnessRequests = append(repository.freshnessRequests, freshnessRequest{TargetID: targetID, SourceID: hostSnapshotSourceID, From: from, To: to})
+	at, ok := repository.freshAt[targetID]
+	complete := ok && !at.Before(from) && !at.After(to)
+	if value, exists := repository.hostComplete[targetID]; exists {
+		complete = value
+	}
+	return HostSnapshotEvidence{SampledAt: at, Observations: append([]Observation(nil), repository.hostObservations[targetID]...), Complete: complete}, nil
 }
 
 func (repository *memoryRunWorkerRepository) SaveEvaluation(_ context.Context, claim RunClaim, targets []TargetRun, findings []Finding, generatedAt time.Time) (RunClaim, error) {
@@ -398,9 +462,11 @@ func (repository *memoryRunWorkerRepository) ReleaseReportAudit(context.Context,
 type memoryJobReader struct {
 	value job.Job
 	err   error
+	calls int
 }
 
 func (reader *memoryJobReader) Get(context.Context, platformscope.Scope, string) (job.Job, error) {
+	reader.calls++
 	return reader.value, reader.err
 }
 

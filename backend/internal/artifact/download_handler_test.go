@@ -3,6 +3,7 @@ package artifact
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +184,112 @@ func TestLocalBlobPutUsesRetainedRootAfterConfiguredPathReplacement(t *testing.T
 	require.NoError(t, err)
 	require.FileExists(t, filepath.Join(originalRoot, filepath.FromSlash(reference)))
 	require.NoFileExists(t, filepath.Join(configuredRoot, filepath.FromSlash(reference)))
+}
+
+func TestLocalBlobPutConcurrentWritersNeverClobber(t *testing.T) {
+	// Break caught: separate control-plane processes do not share a Go mutex;
+	// publication must use an atomic no-replace filesystem primitive.
+	root := t.TempDir()
+	first := NewLocalBlobStore(root)
+	second := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, first.Close()); require.NoError(t, second.Close()) })
+
+	t.Run("same content", func(t *testing.T) {
+		payload := []byte("same immutable bytes")
+		checksum := testChecksum(payload)
+		type result struct {
+			reference string
+			err       error
+		}
+		results := make(chan result, 2)
+		for _, store := range []*LocalBlobStore{first, second} {
+			go func(store *LocalBlobStore) {
+				reference, err := store.Put(context.Background(), checksum, payload)
+				results <- result{reference: reference, err: err}
+			}(store)
+		}
+		one, two := <-results, <-results
+		require.NoError(t, one.err)
+		require.NoError(t, two.err)
+		require.Equal(t, one.reference, two.reference)
+		stored, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(one.reference)))
+		require.NoError(t, err)
+		require.Equal(t, payload, stored)
+	})
+
+	t.Run("different content", func(t *testing.T) {
+		payloads := [][]byte{[]byte("first immutable bytes"), []byte("second immutable bytes")}
+		references := make(chan string, 2)
+		errorsChannel := make(chan error, 2)
+		for index, store := range []*LocalBlobStore{first, second} {
+			go func(store *LocalBlobStore, payload []byte) {
+				reference, err := store.Put(context.Background(), testChecksum(payload), payload)
+				references <- reference
+				errorsChannel <- err
+			}(store, payloads[index])
+		}
+		firstReference, secondReference := <-references, <-references
+		require.NoError(t, <-errorsChannel)
+		require.NoError(t, <-errorsChannel)
+		require.NotEqual(t, firstReference, secondReference)
+	})
+	temporary, err := filepath.Glob(filepath.Join(root, "sha256", ".tmp-*"))
+	require.NoError(t, err)
+	require.Empty(t, temporary)
+}
+
+func TestLocalBlobPutRepairsUncertainDirectorySyncOnRetry(t *testing.T) {
+	// Break caught: publication may be visible even when directory fsync fails;
+	// an identical retry must sync the containing directory before success.
+	root := t.TempDir()
+	store := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	payload := []byte("durable after retry")
+	checksum := testChecksum(payload)
+	forced := errors.New("forced directory sync failure")
+	store.syncDirectory = func(_ *os.Root, name string) error {
+		if name == "sha256" {
+			return forced
+		}
+		return nil
+	}
+
+	_, firstErr := store.Put(context.Background(), checksum, payload)
+	require.Error(t, firstErr)
+	store.syncDirectory = nil
+	reference, secondErr := store.Put(context.Background(), checksum, payload)
+
+	require.NoError(t, secondErr)
+	stored, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(reference)))
+	require.NoError(t, err)
+	require.Equal(t, payload, stored)
+}
+
+func TestLocalBlobPutNeverReplacesConflictingExistingBytes(t *testing.T) {
+	// Break caught: checksum-addressed publication must fail closed if storage
+	// is corrupt; repair may not overwrite the bytes that exposed corruption.
+	root := t.TempDir()
+	payload := []byte("expected immutable bytes")
+	checksum := testChecksum(payload)
+	reference := filepath.Join("sha256", strings.TrimPrefix(checksum, "sha256:")+".blob")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "sha256"), 0o700))
+	conflicting := []byte("conflict immutable bytes")
+	require.Equal(t, len(payload), len(conflicting))
+	require.NoError(t, os.WriteFile(filepath.Join(root, reference), conflicting, 0o600))
+	store := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	_, err := store.Put(context.Background(), checksum, payload)
+
+	require.ErrorIs(t, err, ErrIntegrityMismatch)
+	stored, readErr := os.ReadFile(filepath.Join(root, reference))
+	require.NoError(t, readErr)
+	require.Equal(t, conflicting, stored)
+}
+
+func testChecksum(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", digest)
 }
 
 func createTestDirectoryLink(target, link string) error {

@@ -164,6 +164,18 @@ func TestMonitoringInstanceStateMigrationPersistsScopedLiveness(t *testing.T) {
 	require.Contains(t, content, "ON CONFLICT (tenant_id, project_id, instance_id) DO NOTHING")
 }
 
+func TestMetricSampleAcceptanceMigrationPersistsIngestFence(t *testing.T) {
+	// Break caught: sampled_at is Agent supplied; without a server acceptance
+	// timestamp a late-ingested backdated batch can enter a completed Run.
+	migration, err := os.ReadFile(filepath.Join("migrations", "0007_metric_sample_acceptance.sql"))
+	require.NoError(t, err)
+	content := string(migration)
+	require.Contains(t, content, "ALTER TABLE metric_samples")
+	require.Contains(t, content, "accepted_at TIMESTAMPTZ")
+	require.Contains(t, content, "SET NOT NULL")
+	require.Contains(t, content, "metric_samples_inspection_acceptance_idx")
+}
+
 func TestPostgresRepositoryRejectsInvalidEventsBeforeWriting(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

@@ -30,7 +30,7 @@ func TestProductionPostgresMetricBatchHandsOffToMonitoringStoreForCoreEngines(t 
 			mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO ingest_batch_dedup (agent_id, batch_id, state) VALUES ($1, $2, 'processing') ON CONFLICT DO NOTHING RETURNING state")).
 				WithArgs("agent-a", "batch-"+string(engine)).
 				WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
-			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING")).
+			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at, accepted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ON CONFLICT DO NOTHING")).
 				WithArgs(scope.TenantID, scope.ProjectID, "agent-a", "host.cpu", sqlmock.AnyArg(), labels, 42.0, sample.SampledAt).
 				WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()")).

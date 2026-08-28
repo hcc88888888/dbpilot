@@ -41,6 +41,12 @@ type RunClaim struct {
 	ReportGeneratedAt time.Time
 }
 
+type HostSnapshotEvidence struct {
+	SampledAt    time.Time
+	Observations []Observation
+	Complete     bool
+}
+
 type ReportAuditClaim struct {
 	Scope          platformscope.Scope
 	RunID          string
@@ -53,7 +59,7 @@ type RunWorkerRepository interface {
 	ClaimRuns(context.Context, time.Time, int, time.Duration) ([]RunClaim, error)
 	MarkCollecting(context.Context, RunClaim, time.Time) (RunClaim, error)
 	BeginEvaluation(context.Context, RunClaim) (RunClaim, error)
-	FreshSnapshotAt(context.Context, platformscope.Scope, string, string, time.Time, time.Time) (time.Time, bool, error)
+	LoadHostSnapshot(context.Context, platformscope.Scope, string, []Item, time.Time, time.Time, int) (HostSnapshotEvidence, error)
 	SaveEvaluation(context.Context, RunClaim, []TargetRun, []Finding, time.Time) (RunClaim, error)
 	ReleaseRun(context.Context, RunClaim) error
 	FinalizeReport(context.Context, RunClaim, ReportSnapshot, RunStatus, audit.Event, time.Time) (ReportAuditClaim, error)
@@ -111,6 +117,9 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 	if run.Scope.Validate() != nil || !validID(run.ID) || !validID(run.JobID) || !canonicalText(claim.Token) {
 		return ErrInvalid
 	}
+	if run.Status == RunGeneratingReport {
+		return worker.generateReport(ctx, claim, now)
+	}
 	value, err := worker.Jobs.Get(ctx, run.Scope, run.JobID)
 	if err != nil {
 		return err
@@ -126,9 +135,6 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 		}
 		run = claim.Detail.Run
 	}
-	if run.Status == RunGeneratingReport {
-		return worker.generateReport(ctx, claim, now)
-	}
 	if run.Status != RunCollecting && run.Status != RunEvaluating {
 		return ErrInvalidRunTransition
 	}
@@ -136,14 +142,16 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 		return worker.Runs.ReleaseRun(ctx, claim)
 	}
 	results := jobResultsByTarget(value.TargetResults)
+	hostSnapshots := make(map[string]HostSnapshotEvidence, len(claim.Detail.Targets))
 	for _, target := range claim.Detail.Targets {
 		result, ok := results[target.TargetID]
 		if ok && result.Status == job.TargetSucceeded {
-			_, fresh, err := worker.Runs.FreshSnapshotAt(ctx, run.Scope, target.AgentID, hostSnapshotSourceID, run.CreatedAt.UTC(), deadline)
+			evidence, err := worker.Runs.LoadHostSnapshot(ctx, run.Scope, target.AgentID, run.ItemSnapshot, run.CreatedAt.UTC(), deadline, maxTargetObservations)
 			if err != nil {
 				return err
 			}
-			if !fresh && now.Before(deadline) {
+			hostSnapshots[target.TargetID] = evidence
+			if !evidence.Complete && now.Before(deadline) {
 				return worker.Runs.ReleaseRun(ctx, claim)
 			}
 		}
@@ -154,7 +162,7 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 			return err
 		}
 	}
-	targets, findings, err := worker.evaluateTargets(ctx, claim, value, results, deadline, now)
+	targets, findings, err := worker.evaluateTargets(ctx, claim, value, results, hostSnapshots, deadline, now)
 	if err != nil {
 		return err
 	}
@@ -165,7 +173,7 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 	return worker.generateReport(ctx, claim, now)
 }
 
-func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value job.Job, results map[string]job.TargetResult, deadline, now time.Time) ([]TargetRun, []Finding, error) {
+func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value job.Job, results map[string]job.TargetResult, hostSnapshots map[string]HostSnapshotEvidence, deadline, now time.Time) ([]TargetRun, []Finding, error) {
 	run := claim.Detail.Run
 	evaluationAt := now.UTC()
 	if deadline.Before(evaluationAt) {
@@ -177,6 +185,12 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 	for index := range targets {
 		targets[index].Status = TargetEvaluating
 		targets[index].ErrorCode = ""
+		if evidence, ok := hostSnapshots[targets[index].TargetID]; ok {
+			targets[index].Observations = append([]Observation(nil), evidence.Observations...)
+			if !evidence.SampledAt.IsZero() {
+				targets[index].ObservedAt = evidence.SampledAt.UTC()
+			}
+		}
 	}
 	snapshot := RunSnapshot{ID: run.ID, Scope: run.Scope, CreatedAt: run.CreatedAt.UTC(), Items: cloneItems(run.ItemSnapshot), Targets: targets}
 	findings := make([]Finding, 0, len(targets)*len(run.ItemSnapshot))
@@ -189,27 +203,15 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 		}
 		switch result.Status {
 		case job.TargetSucceeded:
-			freshAt, fresh, err := worker.Runs.FreshSnapshotAt(ctx, run.Scope, target.AgentID, hostSnapshotSourceID, run.CreatedAt.UTC(), deadline)
+			evaluated, err := evaluator.EvaluateTarget(ctx, snapshot, target)
 			if err != nil {
 				return nil, nil, err
-			}
-			var evaluated []Finding
-			if !fresh {
-				evaluated = missingSnapshotFindings(snapshot, target, evaluationAt)
-			} else {
-				evaluated, err = evaluator.EvaluateTarget(ctx, snapshot, target)
-				if err != nil {
-					return nil, nil, err
-				}
-				if targets[index].ObservedAt.IsZero() || freshAt.After(targets[index].ObservedAt) {
-					targets[index].ObservedAt = freshAt.UTC()
-				}
 			}
 			for findingIndex := range evaluated {
 				prepareFinding(&evaluated[findingIndex], snapshot.Items)
 			}
 			findings = append(findings, evaluated...)
-			applyFindingOutcome(&targets[index], evaluated)
+			applyFindingOutcome(&targets[index], evaluated, len(snapshot.Items))
 		case job.TargetCancelled:
 			targets[index].Status, targets[index].ErrorCode = TargetCancelled, "collection_cancelled"
 		case job.TargetTimedOut:
@@ -293,21 +295,6 @@ func (worker *Worker) repairAudit(ctx context.Context, claim ReportAuditClaim, n
 	return worker.Runs.MarkReportAuditRecorded(ctx, claim, now)
 }
 
-func missingSnapshotFindings(snapshot RunSnapshot, target TargetRun, now time.Time) []Finding {
-	items := cloneItems(snapshot.Items)
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].ID != items[j].ID {
-			return items[i].ID < items[j].ID
-		}
-		return items[i].Version < items[j].Version
-	})
-	result := make([]Finding, 0, len(items))
-	for _, item := range items {
-		result = append(result, baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"reason": "snapshot_not_ingested_by_deadline", "samples": "0"}))
-	}
-	return result
-}
-
 func prepareFinding(finding *Finding, items []Item) {
 	key := finding.RunID + "\x00" + finding.TargetID + "\x00" + finding.ItemID + "\x00" + strconv.Itoa(finding.ItemVersion)
 	digest := sha256.Sum256([]byte(key))
@@ -323,15 +310,15 @@ func prepareFinding(finding *Finding, items []Item) {
 	}
 }
 
-func applyFindingOutcome(target *TargetRun, findings []Finding) {
-	valid, unsupported, missing := false, false, false
+func applyFindingOutcome(target *TargetRun, findings []Finding, expectedItems int) {
+	valid, unsupported, missing := 0, false, false
 	for _, finding := range findings {
 		if target.ObservedAt.IsZero() || finding.ObservedAt.After(target.ObservedAt) {
 			target.ObservedAt = finding.ObservedAt.UTC()
 		}
 		switch finding.Level {
 		case LevelHealthy, LevelWarning, LevelCritical:
-			valid = true
+			valid++
 		case LevelUnsupported:
 			unsupported = true
 		case LevelMissingData:
@@ -339,12 +326,12 @@ func applyFindingOutcome(target *TargetRun, findings []Finding) {
 		}
 	}
 	switch {
-	case valid:
-		target.Status = TargetSucceeded
-	case missing:
+	case missing || expectedItems < 1 || len(findings) != expectedItems:
 		target.Status, target.ErrorCode = TargetFailed, "missing_data"
 	case unsupported:
 		target.Status, target.ErrorCode = TargetUnsupported, "unsupported"
+	case valid == expectedItems:
+		target.Status = TargetSucceeded
 	default:
 		target.Status, target.ErrorCode = TargetFailed, "missing_data"
 	}
@@ -448,4 +435,31 @@ func cloneEvidence(input map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
+}
+
+func inspectionMetricRequirements(items []Item) map[string]SourceType {
+	required := make(map[string]SourceType)
+	for _, item := range items {
+		if item.SourceType == SourceMetric && item.MetricRule != nil {
+			required[item.MetricRule.MetricName] = SourceMetric
+			continue
+		}
+		switch item.ID {
+		case "host.oom.evidence":
+			required["dbpilot.inspection.host.log.summary_available"] = SourceLogSummary
+			required["dbpilot.inspection.host.oom.count"] = SourceMetadata
+		case "host.time.synchronization":
+			required["dbpilot.inspection.host.time.synchronization_available"] = SourceMetadata
+			required["dbpilot.inspection.host.time.synchronized"] = SourceMetadata
+		case "database.process.presence":
+			required["dbpilot.inspection.host.database.process_allowlist_available"] = SourceMetadata
+			required["dbpilot.inspection.host.database.required_process_count"] = SourceMetadata
+		case "host.log.error_summary":
+			required["dbpilot.inspection.host.log.summary_available"] = SourceLogSummary
+			required["dbpilot.inspection.host.log.warning_count"] = SourceLogSummary
+			required["dbpilot.inspection.host.log.error_count"] = SourceLogSummary
+			required["dbpilot.inspection.host.log.critical_count"] = SourceLogSummary
+		}
+	}
+	return required
 }
