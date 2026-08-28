@@ -178,7 +178,7 @@ Agent 根据数据库类型和模板 ID 查找适配器探针。未注册组合�
 - 创建 Run、TargetRun、Job 和 outbox 必须在一致的事务边界内完成，避免孤立运行。
 - 每个目标独立执行；一个目标失败不取消其余目标。
 - 取消 Run 复用 Job 取消语义，尚未 Start 的目标不得执行探针。
-- 所有重试复用相同 Run/Target/Command 身份，不能重复产生 Finding 或报告。
+- 控制面内部的投递、采集、评价和报告修复重试复用相同 Run/Target/Command 身份，不能重复产生 Finding 或报告。用户对已终态 Run 发起“重新执行”是一个新的业务操作：创建新的 Run/Job/Command 身份并保存 `retry_of_run_id`，同一个重新执行请求仍受 Idempotency-Key 去重。
 
 计划调度失败记录可重试状态；调度器重启后从持久化 `next_run_at` 恢复。第一阶段不支持错过多次后无限补跑，只补最近一次未完成 occurrence。
 
@@ -202,6 +202,8 @@ Artifact 生成失败时 Run 保持 `generating_report` 可修复状态，不重
 
 首批 `/api/v1/tenants/{tenantId}/projects/{projectId}` 接口：
 
+- `GET /inspection-overview`
+- `GET /inspection-targets`
 - `GET /inspection-items`
 - `POST /inspection-items`
 - `GET /inspection-policies`
@@ -214,6 +216,7 @@ Artifact 生成失败时 Run 保持 `generating_report` 可修复状态，不重
 - `GET /inspection-runs/{runId}`
 - `POST /inspection-runs/{runId}/cancel`
 - `POST /inspection-runs/{runId}/retry`
+- `GET /inspection-reports`
 - `GET /inspection-reports/{reportId}`
 - `POST /inspection-reports/{reportId}/download`
 
