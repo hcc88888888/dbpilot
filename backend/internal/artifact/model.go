@@ -17,6 +17,7 @@ var (
 	ErrInvalidSignature         = errors.New("invalid artifact download signature")
 	ErrBeforeDownloadSideEffect = errors.New("artifact download failed before signer invocation")
 	ErrIntegrityMismatch        = errors.New("artifact content integrity mismatch")
+	ErrConflict                 = errors.New("artifact ID checksum conflict")
 )
 
 func validArtifactID(value string) bool { return strings.TrimSpace(value) != "" }

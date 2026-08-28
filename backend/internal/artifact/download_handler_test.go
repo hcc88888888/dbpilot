@@ -159,6 +159,31 @@ func TestReadyRootReplacementNeverReadsReplacementDirectory(t *testing.T) {
 	require.NotEqual(t, "replacement-secret", string(payload))
 }
 
+func TestLocalBlobPutUsesRetainedRootAfterConfiguredPathReplacement(t *testing.T) {
+	// Break caught: reopening the configured path for writes after Ready lets a
+	// path replacement redirect immutable report bytes outside the retained root.
+	parent := t.TempDir()
+	configuredRoot := filepath.Join(parent, "artifacts")
+	originalRoot := filepath.Join(parent, "original-artifacts")
+	require.NoError(t, os.Mkdir(configuredRoot, 0o700))
+	store := NewLocalBlobStore(configuredRoot)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoError(t, store.Ready())
+	if err := os.Rename(configuredRoot, originalRoot); err != nil {
+		t.Skipf("root directory replacement unavailable: %v", err)
+	}
+	require.NoError(t, os.Mkdir(configuredRoot, 0o700))
+	payload := []byte("durable retained-root report")
+	digest := sha256.Sum256(payload)
+	checksum := fmt.Sprintf("sha256:%x", digest)
+
+	reference, err := store.Put(context.Background(), checksum, payload)
+
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(originalRoot, filepath.FromSlash(reference)))
+	require.NoFileExists(t, filepath.Join(configuredRoot, filepath.FromSlash(reference)))
+}
+
 func createTestDirectoryLink(target, link string) error {
 	if err := os.Symlink(target, link); err == nil {
 		return nil

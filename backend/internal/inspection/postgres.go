@@ -1,8 +1,10 @@
 package inspection
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,8 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
+	"github.com/lib/pq"
 )
 
 const policyColumnsSQL = "tenant_id, project_id, id, name, enabled, version, schedule_cron, schedule_timezone, next_run_at, target_selector, item_snapshot, target_timeout_seconds, max_concurrency, created_at, updated_at, claim_token, lease_expires_at"
@@ -31,7 +35,7 @@ const selectRunByIdempotencySQL = "SELECT " + runColumnsSQL + " FROM inspection_
 const advanceClaimedPolicySQL = "UPDATE inspection_policies SET next_run_at = $1, claim_token = NULL, lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND version = $5 AND next_run_at = $6 AND claim_token = $7 RETURNING next_run_at"
 const insertPolicySQL = "INSERT INTO inspection_policies (tenant_id, project_id, id, name, enabled, version, schedule_cron, schedule_timezone, next_run_at, target_selector, item_snapshot, target_timeout_seconds, max_concurrency, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
 const selectRunSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
-const selectTargetRunsSQL = "SELECT target_snapshot FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id"
+const selectTargetRunsSQL = "SELECT target_snapshot, status, error_code, observed_at FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id"
 const findingColumnsSQL = "id, run_id, target_id, item_id, item_version, level, observed_at, evidence, warning_threshold, critical_threshold, summary, recommendation"
 const selectFindingsSQL = "SELECT " + findingColumnsSQL + " FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id, item_id, item_version"
 const selectItemsSQL = "SELECT created_at, snapshot FROM inspection_items WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, item_id DESC, version DESC LIMIT $3"
@@ -44,6 +48,10 @@ const reportColumnsSQL = "tenant_id, project_id, id, run_id, policy_id, status, 
 const selectReportSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
 const selectReportsSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3"
 const selectReportsBeforeSQL = "SELECT " + reportColumnsSQL + " FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
+const claimRunsSQL = "SELECT " + runColumnsSQL + ", report_generated_at FROM inspection_runs WHERE status IN ('queued', 'collecting', 'evaluating', 'generating_report') AND (worker_lease_expires_at IS NULL OR worker_lease_expires_at <= $1) ORDER BY created_at, tenant_id, project_id, id FOR UPDATE SKIP LOCKED LIMIT $2"
+const claimRunSQL = "UPDATE inspection_runs SET worker_claim_token = $1, worker_lease_expires_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND id = $5 RETURNING worker_claim_token"
+const freshSnapshotSQL = "SELECT MAX(sampled_at) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND sampled_at >= $4 AND sampled_at <= $5 AND (labels->>'dbpilot_source_id' = $6 OR labels->>'component' = $7)"
+const evidenceSamplesSQL = "SELECT metric, labels, value, sampled_at, series_fingerprint FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND metric = ANY($4) AND sampled_at >= $5 AND sampled_at <= $6 ORDER BY sampled_at, metric, series_fingerprint LIMIT $7"
 
 type jobCreator interface {
 	CreateInTx(context.Context, *sql.Tx, job.Job, []job.OutboxMessage) error
@@ -676,7 +684,7 @@ func (repository *PostgresRepository) GetRunByIdempotencyKey(ctx context.Context
 	return value, nil
 }
 func (repository *PostgresRepository) GetReport(ctx context.Context, scope platformscope.Scope, id string) (ReportSnapshot, error) {
-	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validID(id) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validStoredReportID(id) {
 		return ReportSnapshot{}, ErrInvalid
 	}
 	value, err := scanReport(repository.database.QueryRowContext(ctx, selectReportSQL, scope.TenantID, scope.ProjectID, id))
@@ -853,12 +861,22 @@ func (repository *PostgresRepository) getTargetRuns(ctx context.Context, scope p
 	result := make([]TargetRun, 0)
 	for rows.Next() {
 		var snapshot []byte
-		if err := rows.Scan(&snapshot); err != nil {
+		var status TargetStatus
+		var errorCode string
+		var observedAt sql.NullTime
+		if err := rows.Scan(&snapshot, &status, &errorCode, &observedAt); err != nil {
 			return nil, fmt.Errorf("scan inspection target run: %w", err)
 		}
 		var target TargetRun
 		if err := json.Unmarshal(snapshot, &target); err != nil {
 			return nil, fmt.Errorf("decode inspection target run: %w", err)
+		}
+		target.Status = status
+		target.ErrorCode = errorCode
+		if observedAt.Valid {
+			target.ObservedAt = observedAt.Time.UTC()
+		} else {
+			target.ObservedAt = time.Time{}
 		}
 		result = append(result, target)
 	}
@@ -942,3 +960,557 @@ func scanReport(scanner interface{ Scan(...any) error }) (ReportSnapshot, error)
 	value.CreatedAt = value.CreatedAt.UTC()
 	return value, nil
 }
+
+func (repository *PostgresRepository) ClaimRuns(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]RunClaim, error) {
+	if repository == nil || repository.database == nil || ctx == nil || now.IsZero() || limit < 1 || limit > maximumWorkerClaims || lease <= 0 {
+		return nil, ErrInvalid
+	}
+	now = now.UTC()
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin inspection Run claim: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, claimRunsSQL, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select inspection Run claims: %w", err)
+	}
+	claims := make([]RunClaim, 0, limit)
+	for rows.Next() {
+		value, generatedAt, err := scanRunClaim(rows)
+		if err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan inspection Run claim: %w", err)
+		}
+		claims = append(claims, RunClaim{Detail: RunDetail{Run: value}, ReportGeneratedAt: generatedAt})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	leaseExpiresAt := now.Add(lease)
+	for index := range claims {
+		token, err := randomToken()
+		if err != nil {
+			return nil, err
+		}
+		var persisted string
+		run := claims[index].Detail.Run
+		if err := tx.QueryRowContext(ctx, claimRunSQL, token, leaseExpiresAt, run.Scope.TenantID, run.Scope.ProjectID, run.ID).Scan(&persisted); err != nil {
+			return nil, fmt.Errorf("persist inspection Run claim: %w", err)
+		}
+		claims[index].Token = persisted
+		claims[index].LeaseExpiresAt = leaseExpiresAt
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit inspection Run claims: %w", err)
+	}
+	for index := range claims {
+		run := claims[index].Detail.Run
+		targets, err := repository.getTargetRuns(ctx, run.Scope, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		findings, err := repository.getFindings(ctx, run.Scope, run.ID)
+		if err != nil {
+			return nil, err
+		}
+		claims[index].Detail.Targets = targets
+		claims[index].Detail.Findings = findings
+		if run.Status == RunGeneratingReport && claims[index].ReportGeneratedAt.IsZero() {
+			return nil, ErrInvalid
+		}
+	}
+	return claims, nil
+}
+
+func scanRunClaim(scanner interface{ Scan(...any) error }) (Run, time.Time, error) {
+	var value Run
+	var policyID, retryID, occurrence, reportID, idempotency sql.NullString
+	var policyVersion sql.NullInt64
+	var scheduledFor, startedAt, finishedAt, reportGeneratedAt sql.NullTime
+	var policySnapshot, itemSnapshot []byte
+	err := scanner.Scan(
+		&value.Scope.TenantID, &value.Scope.ProjectID, &value.ID, &policyID, &policyVersion, &retryID, &value.JobID,
+		&value.Status, &value.Trigger, &occurrence, &scheduledFor, &policySnapshot, &itemSnapshot,
+		&value.TargetCount, &value.CompletedTargetCount, &value.FailedTargetCount, &reportID, &value.AuditCorrelation, &idempotency,
+		&value.InitiatedBy, &value.RequestID, &value.TraceID, &startedAt, &finishedAt, &value.CreatedAt, &reportGeneratedAt,
+	)
+	if err != nil {
+		return Run{}, time.Time{}, err
+	}
+	value.PolicyID, value.PolicyVersion, value.RetryOfRunID, value.OccurrenceKey, value.ReportID, value.IdempotencyKey = policyID.String, policyVersion.Int64, retryID.String, occurrence.String, reportID.String, idempotency.String
+	if scheduledFor.Valid {
+		value.ScheduledFor = timePointerValueUTC(scheduledFor.Time)
+	}
+	if startedAt.Valid {
+		value.StartedAt = timePointerValueUTC(startedAt.Time)
+	}
+	if finishedAt.Valid {
+		value.FinishedAt = timePointerValueUTC(finishedAt.Time)
+	}
+	if len(policySnapshot) > 0 && string(policySnapshot) != "null" {
+		value.PolicySnapshot = &Policy{}
+		if err := json.Unmarshal(policySnapshot, value.PolicySnapshot); err != nil {
+			return Run{}, time.Time{}, err
+		}
+	}
+	if err := json.Unmarshal(itemSnapshot, &value.ItemSnapshot); err != nil {
+		return Run{}, time.Time{}, err
+	}
+	value.CreatedAt = value.CreatedAt.UTC()
+	if reportGeneratedAt.Valid {
+		return value, reportGeneratedAt.Time.UTC(), nil
+	}
+	return value, time.Time{}, nil
+}
+
+func (repository *PostgresRepository) MarkCollecting(ctx context.Context, claim RunClaim, at time.Time) (RunClaim, error) {
+	if !validWorkerClaim(repository, ctx, claim) || at.IsZero() || claim.Detail.Run.Status != RunQueued {
+		return RunClaim{}, ErrInvalid
+	}
+	run := claim.Detail.Run
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var startedAt time.Time
+	err = tx.QueryRowContext(ctx, "UPDATE inspection_runs SET status = 'collecting', started_at = COALESCE(started_at, $1) WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND status = 'queued' AND worker_claim_token = $5 RETURNING started_at", at.UTC(), run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).Scan(&startedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunClaim{}, ErrConflict
+	}
+	if err != nil {
+		return RunClaim{}, err
+	}
+	result, err := tx.ExecContext(ctx, "UPDATE inspection_target_runs SET status = 'collecting' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND status = 'pending'", run.Scope.TenantID, run.Scope.ProjectID, run.ID)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	if rowsAffected(result) != int64(run.TargetCount) {
+		return RunClaim{}, ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return RunClaim{}, err
+	}
+	claim.Detail.Run.Status = RunCollecting
+	claim.Detail.Run.StartedAt = timePointerValueUTC(startedAt)
+	for index := range claim.Detail.Targets {
+		claim.Detail.Targets[index].Status = TargetCollecting
+	}
+	return claim, nil
+}
+
+func (repository *PostgresRepository) BeginEvaluation(ctx context.Context, claim RunClaim) (RunClaim, error) {
+	if !validWorkerClaim(repository, ctx, claim) || claim.Detail.Run.Status != RunCollecting {
+		return RunClaim{}, ErrInvalid
+	}
+	run := claim.Detail.Run
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var id string
+	err = tx.QueryRowContext(ctx, "UPDATE inspection_runs SET status = 'evaluating' WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND status = 'collecting' AND worker_claim_token = $4 RETURNING id", run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunClaim{}, ErrConflict
+	}
+	if err != nil {
+		return RunClaim{}, err
+	}
+	result, err := tx.ExecContext(ctx, "UPDATE inspection_target_runs SET status = 'evaluating' WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND status = 'collecting'", run.Scope.TenantID, run.Scope.ProjectID, run.ID)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	if rowsAffected(result) != int64(run.TargetCount) {
+		return RunClaim{}, ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return RunClaim{}, err
+	}
+	claim.Detail.Run.Status = RunEvaluating
+	for index := range claim.Detail.Targets {
+		claim.Detail.Targets[index].Status = TargetEvaluating
+	}
+	return claim, nil
+}
+
+func (repository *PostgresRepository) FreshSnapshotAt(ctx context.Context, scope platformscope.Scope, targetID, sourceID string, from, to time.Time) (time.Time, bool, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validID(targetID) || sourceID != hostSnapshotSourceID || from.IsZero() || to.IsZero() || to.Before(from) {
+		return time.Time{}, false, ErrInvalid
+	}
+	var sampledAt sql.NullTime
+	if err := repository.database.QueryRowContext(ctx, freshSnapshotSQL, scope.TenantID, scope.ProjectID, targetID, from.UTC(), to.UTC(), sourceID, sourceID).Scan(&sampledAt); err != nil {
+		return time.Time{}, false, err
+	}
+	if !sampledAt.Valid {
+		return time.Time{}, false, nil
+	}
+	return sampledAt.Time.UTC(), true, nil
+}
+
+func (repository *PostgresRepository) Samples(ctx context.Context, scope platformscope.Scope, targetID string, names []string, from, to time.Time, limit int) ([]Observation, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !validID(targetID) || len(names) == 0 || len(names) > maxSnapshotItems || from.IsZero() || to.IsZero() || to.Before(from) || limit < 1 || limit > maxEvidenceSamples {
+		return nil, ErrInvalidEvaluation
+	}
+	for _, name := range names {
+		if !validMetricName(name) {
+			return nil, ErrInvalidEvaluation
+		}
+	}
+	rows, err := repository.database.QueryContext(ctx, evidenceSamplesSQL, scope.TenantID, scope.ProjectID, targetID, pq.Array(names), from.UTC(), to.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]Observation, 0)
+	for rows.Next() {
+		var observation Observation
+		var labels []byte
+		var fingerprint string
+		if err := rows.Scan(&observation.Name, &labels, &observation.Value, &observation.ObservedAt, &fingerprint); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(labels, &observation.Labels); err != nil {
+			return nil, err
+		}
+		identity := targetID + "\x00" + observation.Name + "\x00" + fingerprint + "\x00" + observation.ObservedAt.UTC().Format(time.RFC3339Nano)
+		digest := sha256.Sum256([]byte(identity))
+		observation.ID = "metric-" + hex.EncodeToString(digest[:16])
+		observation.TargetID = targetID
+		observation.SourceType = SourceMetric
+		observation.ObservedAt = observation.ObservedAt.UTC()
+		result = append(result, observation)
+	}
+	return result, rows.Err()
+}
+
+func (repository *PostgresRepository) SaveEvaluation(ctx context.Context, claim RunClaim, targets []TargetRun, findings []Finding, generatedAt time.Time) (RunClaim, error) {
+	if !validWorkerClaim(repository, ctx, claim) || claim.Detail.Run.Status != RunEvaluating || generatedAt.IsZero() || len(targets) != claim.Detail.Run.TargetCount {
+		return RunClaim{}, ErrInvalid
+	}
+	run := claim.Detail.Run
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	seenTargets := make(map[string]struct{}, len(targets))
+	completed, failed := 0, 0
+	for _, target := range targets {
+		if target.Validate() != nil || !validTerminalTargetStatus(target.Status) {
+			return RunClaim{}, ErrInvalid
+		}
+		if _, duplicate := seenTargets[target.TargetID]; duplicate {
+			return RunClaim{}, ErrInvalid
+		}
+		seenTargets[target.TargetID] = struct{}{}
+		if target.Status == TargetSucceeded {
+			completed++
+		} else {
+			failed++
+		}
+		result, err := tx.ExecContext(ctx, "UPDATE inspection_target_runs SET status = $1, error_code = $2, observed_at = $3 WHERE tenant_id = $4 AND project_id = $5 AND run_id = $6 AND target_id = $7", target.Status, target.ErrorCode, nullableTime(nonZeroTimePointer(target.ObservedAt)), run.Scope.TenantID, run.Scope.ProjectID, run.ID, target.TargetID)
+		if err != nil || !exactlyOneRow(result) {
+			if err != nil {
+				return RunClaim{}, err
+			}
+			return RunClaim{}, ErrConflict
+		}
+	}
+	for _, finding := range findings {
+		if finding.Validate() != nil || finding.Scope != run.Scope || finding.RunID != run.ID {
+			return RunClaim{}, ErrInvalid
+		}
+		if _, exists := seenTargets[finding.TargetID]; !exists {
+			return RunClaim{}, ErrInvalid
+		}
+		if err := insertFindingOnce(ctx, tx, finding); err != nil {
+			return RunClaim{}, err
+		}
+	}
+	var persistedGeneratedAt time.Time
+	err = tx.QueryRowContext(ctx, "UPDATE inspection_runs SET status = 'generating_report', completed_target_count = $1, failed_target_count = $2, report_generated_at = COALESCE(report_generated_at, $3) WHERE tenant_id = $4 AND project_id = $5 AND id = $6 AND status = 'evaluating' AND worker_claim_token = $7 RETURNING report_generated_at", completed, failed, generatedAt.UTC(), run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).Scan(&persistedGeneratedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RunClaim{}, ErrConflict
+	}
+	if err != nil {
+		return RunClaim{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RunClaim{}, err
+	}
+	persistedTargets, err := repository.getTargetRuns(ctx, run.Scope, run.ID)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	persistedFindings, err := repository.getFindings(ctx, run.Scope, run.ID)
+	if err != nil {
+		return RunClaim{}, err
+	}
+	claim.Detail.Run.Status = RunGeneratingReport
+	claim.Detail.Run.CompletedTargetCount = completed
+	claim.Detail.Run.FailedTargetCount = failed
+	claim.Detail.Targets = persistedTargets
+	claim.Detail.Findings = persistedFindings
+	claim.ReportGeneratedAt = persistedGeneratedAt.UTC()
+	return claim, nil
+}
+
+func insertFindingOnce(ctx context.Context, tx *sql.Tx, finding Finding) error {
+	evidence, err := json.Marshal(finding.Evidence)
+	if err != nil {
+		return err
+	}
+	var id string
+	err = tx.QueryRowContext(ctx, "INSERT INTO inspection_findings (tenant_id, project_id, id, run_id, target_id, item_id, item_version, level, observed_at, evidence, warning_threshold, critical_threshold, summary, recommendation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, run_id, target_id, item_id, item_version) DO NOTHING RETURNING id", finding.Scope.TenantID, finding.Scope.ProjectID, finding.ID, finding.RunID, finding.TargetID, finding.ItemID, finding.ItemVersion, finding.Level, finding.ObservedAt.UTC(), evidence, finding.WarningThreshold, finding.CriticalThreshold, finding.Summary, finding.Recommendation).Scan(&id)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	existing, err := scanFinding(tx.QueryRowContext(ctx, "SELECT "+findingColumnsSQL+" FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 AND target_id = $4 AND item_id = $5 AND item_version = $6", finding.Scope.TenantID, finding.Scope.ProjectID, finding.RunID, finding.TargetID, finding.ItemID, finding.ItemVersion), finding.Scope)
+	if err != nil {
+		return err
+	}
+	if !equalFinding(existing, finding) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) ReleaseRun(ctx context.Context, claim RunClaim) error {
+	if !validWorkerClaim(repository, ctx, claim) {
+		return ErrInvalid
+	}
+	run := claim.Detail.Run
+	_, err := repository.database.ExecContext(ctx, "UPDATE inspection_runs SET worker_claim_token = NULL, worker_lease_expires_at = NULL WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND worker_claim_token = $4", run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token)
+	return err
+}
+
+func (repository *PostgresRepository) FinalizeReport(ctx context.Context, claim RunClaim, report ReportSnapshot, terminal RunStatus, event audit.Event, at time.Time) (ReportAuditClaim, error) {
+	if !validWorkerClaim(repository, ctx, claim) || claim.Detail.Run.Status != RunGeneratingReport || !isTerminalRunStatus(terminal) || report.Scope != claim.Detail.Run.Scope || report.RunID != claim.Detail.Run.ID || report.Status != ReportCompleted || len(report.Snapshot) == 0 || len(report.Snapshot) > maximumReportBytes || len(report.Artifacts) != 2 || at.IsZero() || event.Scope != report.Scope || !canonicalText(event.DedupeKey) {
+		return ReportAuditClaim{}, ErrInvalid
+	}
+	artifacts, err := json.Marshal(report.Artifacts)
+	if err != nil {
+		return ReportAuditClaim{}, err
+	}
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return ReportAuditClaim{}, err
+	}
+	run := claim.Detail.Run
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return ReportAuditClaim{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var reportID string
+	err = tx.QueryRowContext(ctx, "INSERT INTO inspection_reports (tenant_id, project_id, id, run_id, policy_id, status, summary, snapshot, artifacts, generated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (tenant_id, project_id, run_id) DO NOTHING RETURNING id", report.Scope.TenantID, report.Scope.ProjectID, report.ID, report.RunID, nullableText(report.PolicyID), report.Status, report.Summary, report.Snapshot, artifacts, report.GeneratedAt.UTC()).Scan(&reportID)
+	if errors.Is(err, sql.ErrNoRows) {
+		existing, getErr := scanReport(tx.QueryRowContext(ctx, selectReportSQL, report.Scope.TenantID, report.Scope.ProjectID, report.ID))
+		if getErr != nil || !equalReportSnapshot(existing, report) {
+			if getErr != nil && !errors.Is(getErr, sql.ErrNoRows) {
+				return ReportAuditClaim{}, getErr
+			}
+			return ReportAuditClaim{}, ErrConflict
+		}
+	} else if err != nil {
+		return ReportAuditClaim{}, err
+	}
+	completed, failed := targetCounts(claim.Detail.Targets)
+	var runID string
+	err = tx.QueryRowContext(ctx, "UPDATE inspection_runs SET status = $1, report_id = $2, completed_target_count = $3, failed_target_count = $4, finished_at = $5, report_audit_pending = TRUE, report_audit_event = $6, report_audit_dedupe_key = $7, report_audit_claim_token = NULL, report_audit_lease_expires_at = NULL, worker_claim_token = NULL, worker_lease_expires_at = NULL WHERE tenant_id = $8 AND project_id = $9 AND id = $10 AND status = 'generating_report' AND worker_claim_token = $11 RETURNING id", terminal, report.ID, completed, failed, at.UTC(), eventJSON, event.DedupeKey, run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).Scan(&runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReportAuditClaim{}, ErrConflict
+	}
+	if err != nil {
+		return ReportAuditClaim{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ReportAuditClaim{}, err
+	}
+	return ReportAuditClaim{Scope: run.Scope, RunID: run.ID, Event: event}, nil
+}
+
+func (repository *PostgresRepository) ClaimPendingReportAudits(ctx context.Context, now time.Time, limit int, lease time.Duration) ([]ReportAuditClaim, error) {
+	if repository == nil || repository.database == nil || ctx == nil || now.IsZero() || limit < 1 || limit > maximumWorkerClaims || lease <= 0 {
+		return nil, ErrInvalid
+	}
+	tx, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, "SELECT tenant_id, project_id, id, report_audit_event, report_audit_dedupe_key FROM inspection_runs WHERE report_audit_pending = TRUE AND (report_audit_lease_expires_at IS NULL OR report_audit_lease_expires_at <= $1) ORDER BY finished_at, tenant_id, project_id, id FOR UPDATE SKIP LOCKED LIMIT $2", now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	claims := make([]ReportAuditClaim, 0, limit)
+	for rows.Next() {
+		var claim ReportAuditClaim
+		var encoded []byte
+		var dedupe string
+		if err := rows.Scan(&claim.Scope.TenantID, &claim.Scope.ProjectID, &claim.RunID, &encoded, &dedupe); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := json.Unmarshal(encoded, &claim.Event); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		claim.Event.DedupeKey = dedupe
+		if claim.Event.Scope != claim.Scope {
+			_ = rows.Close()
+			return nil, ErrInvalid
+		}
+		claims = append(claims, claim)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	leaseExpiresAt := now.UTC().Add(lease)
+	for index := range claims {
+		token, err := randomToken()
+		if err != nil {
+			return nil, err
+		}
+		var persisted string
+		claim := claims[index]
+		err = tx.QueryRowContext(ctx, "UPDATE inspection_runs SET report_audit_claim_token = $1, report_audit_lease_expires_at = $2, report_audit_attempts = report_audit_attempts + 1 WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND report_audit_pending = TRUE RETURNING report_audit_claim_token", token, leaseExpiresAt, claim.Scope.TenantID, claim.Scope.ProjectID, claim.RunID).Scan(&persisted)
+		if err != nil {
+			return nil, err
+		}
+		claims[index].Token = persisted
+		claims[index].LeaseExpiresAt = leaseExpiresAt
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+func (repository *PostgresRepository) MarkReportAuditRecorded(ctx context.Context, claim ReportAuditClaim, at time.Time) error {
+	if repository == nil || repository.database == nil || ctx == nil || claim.Scope.Validate() != nil || !validID(claim.RunID) || !canonicalText(claim.Event.DedupeKey) || at.IsZero() {
+		return ErrInvalid
+	}
+	statement := "UPDATE inspection_runs SET report_audit_pending = FALSE, report_audit_claim_token = NULL, report_audit_lease_expires_at = NULL, report_audit_recorded_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND report_audit_pending = TRUE AND report_audit_dedupe_key = $5 AND report_audit_claim_token IS NULL"
+	arguments := []any{at.UTC(), claim.Scope.TenantID, claim.Scope.ProjectID, claim.RunID, claim.Event.DedupeKey}
+	if claim.Token != "" {
+		statement = "UPDATE inspection_runs SET report_audit_pending = FALSE, report_audit_claim_token = NULL, report_audit_lease_expires_at = NULL, report_audit_recorded_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND report_audit_pending = TRUE AND report_audit_dedupe_key = $5 AND report_audit_claim_token = $6"
+		arguments = append(arguments, claim.Token)
+	}
+	result, err := repository.database.ExecContext(ctx, statement, arguments...)
+	if err != nil {
+		return err
+	}
+	if !exactlyOneRow(result) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) ReleaseReportAudit(ctx context.Context, claim ReportAuditClaim) error {
+	if repository == nil || repository.database == nil || ctx == nil || claim.Scope.Validate() != nil || !validID(claim.RunID) {
+		return ErrInvalid
+	}
+	if claim.Token == "" {
+		return nil
+	}
+	_, err := repository.database.ExecContext(ctx, "UPDATE inspection_runs SET report_audit_claim_token = NULL, report_audit_lease_expires_at = NULL WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND report_audit_pending = TRUE AND report_audit_claim_token = $4", claim.Scope.TenantID, claim.Scope.ProjectID, claim.RunID, claim.Token)
+	return err
+}
+
+func scanFinding(scanner interface{ Scan(...any) error }, scope platformscope.Scope) (Finding, error) {
+	var value Finding
+	var evidence []byte
+	var warning, critical sql.NullFloat64
+	err := scanner.Scan(&value.ID, &value.RunID, &value.TargetID, &value.ItemID, &value.ItemVersion, &value.Level, &value.ObservedAt, &evidence, &warning, &critical, &value.Summary, &value.Recommendation)
+	if err != nil {
+		return Finding{}, err
+	}
+	value.Scope = scope
+	value.ObservedAt = value.ObservedAt.UTC()
+	if err := json.Unmarshal(evidence, &value.Evidence); err != nil {
+		return Finding{}, err
+	}
+	if warning.Valid {
+		value.WarningThreshold = &warning.Float64
+	}
+	if critical.Valid {
+		value.CriticalThreshold = &critical.Float64
+	}
+	return value, nil
+}
+
+func equalFinding(first, second Finding) bool {
+	firstEvidence, _ := json.Marshal(first.Evidence)
+	secondEvidence, _ := json.Marshal(second.Evidence)
+	return first.ID == second.ID && first.Scope == second.Scope && first.RunID == second.RunID && first.TargetID == second.TargetID && first.ItemID == second.ItemID && first.ItemVersion == second.ItemVersion && first.Level == second.Level && first.ObservedAt.Equal(second.ObservedAt) && nullableFloatEqual(first.WarningThreshold, second.WarningThreshold) && nullableFloatEqual(first.CriticalThreshold, second.CriticalThreshold) && first.Summary == second.Summary && first.Recommendation == second.Recommendation && bytes.Equal(firstEvidence, secondEvidence)
+}
+
+func equalReportSnapshot(first, second ReportSnapshot) bool {
+	firstArtifacts, _ := json.Marshal(first.Artifacts)
+	secondArtifacts, _ := json.Marshal(second.Artifacts)
+	return first.ID == second.ID && first.Scope == second.Scope && first.RunID == second.RunID && first.PolicyID == second.PolicyID && first.Status == second.Status && first.Summary == second.Summary && bytes.Equal(first.Snapshot, second.Snapshot) && bytes.Equal(firstArtifacts, secondArtifacts) && first.GeneratedAt.Equal(second.GeneratedAt)
+}
+
+func nullableFloatEqual(first, second *float64) bool {
+	if first == nil || second == nil {
+		return first == nil && second == nil
+	}
+	return *first == *second
+}
+
+func validWorkerClaim(repository *PostgresRepository, ctx context.Context, claim RunClaim) bool {
+	return repository != nil && repository.database != nil && ctx != nil && claim.Detail.Run.Scope.Validate() == nil && validID(claim.Detail.Run.ID) && canonicalText(claim.Token)
+}
+
+func exactlyOneRow(result sql.Result) bool {
+	if result == nil {
+		return false
+	}
+	rows, err := result.RowsAffected()
+	return err == nil && rows == 1
+}
+
+func rowsAffected(result sql.Result) int64 {
+	if result == nil {
+		return -1
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return -1
+	}
+	return rows
+}
+
+func timePointerValueUTC(value time.Time) *time.Time {
+	at := value.UTC()
+	return &at
+}
+
+func targetCounts(targets []TargetRun) (int, int) {
+	completed, failed := 0, 0
+	for _, target := range targets {
+		if target.Status == TargetSucceeded {
+			completed++
+		} else {
+			failed++
+		}
+	}
+	return completed, failed
+}
+
+var _ RunWorkerRepository = (*PostgresRepository)(nil)
+var _ EvidenceStore = (*PostgresRepository)(nil)

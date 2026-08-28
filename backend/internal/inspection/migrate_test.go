@@ -65,6 +65,12 @@ func TestMigrationAppliesThroughSharedRegistryExactlyOnce(t *testing.T) {
 	mock.ExpectExec("(?s)CREATE OR REPLACE FUNCTION guard_inspection_target_run_mutation.*inspection_target_runs_guard.*inspection_runs_delete_guard").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0004_target_run_guards.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0005_worker_reports.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE inspection_runs.*worker_claim_token.*report_audit_pending.*inspection_runs_worker_claim_idx.*inspection_runs_report_audit_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0005_worker_reports.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -122,5 +128,22 @@ func TestMigrationGuardsTargetIdentityAndHistoricalRunDeletion(t *testing.T) {
 	}
 	for _, mutable := range []string{"NEW.status", "NEW.error_code", "NEW.observed_at"} {
 		require.NotContains(t, schema, mutable, "TargetRun lifecycle column must remain mutable")
+	}
+}
+
+func TestMigrationAddsDurableWorkerAndReportAuditRepairState(t *testing.T) {
+	// Break caught: without durable leases and the exact pending Audit payload,
+	// a process crash either duplicates evaluation or loses the report Audit.
+	content, err := migrationFiles.ReadFile("migrations/0005_worker_reports.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{
+		"worker_claim_token", "worker_lease_expires_at", "report_generated_at",
+		"report_audit_pending", "report_audit_event", "report_audit_dedupe_key",
+		"report_audit_claim_token", "report_audit_lease_expires_at", "report_audit_recorded_at",
+		"inspection_runs_worker_claim_idx", "inspection_runs_report_audit_idx",
+		"OLD.report_audit_event IS NOT NULL", "OLD.report_audit_dedupe_key IS NOT NULL",
+	} {
+		require.Contains(t, schema, required)
 	}
 }

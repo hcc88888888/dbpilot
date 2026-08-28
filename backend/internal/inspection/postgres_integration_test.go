@@ -3,6 +3,7 @@ package inspection
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
@@ -91,6 +93,51 @@ func TestSchedulerClaimersReceiveDisjointPolicies(t *testing.T) {
 	require.Len(t, seen, 4)
 }
 
+func TestPostgresIntegrationWorkerClaimersReceiveDisjointRuns(t *testing.T) {
+	// Break caught: collection/evaluation/report repair must use the same
+	// disjoint SKIP LOCKED semantics as scheduling across control-plane replicas.
+	ctx, _, repository, _ := openInspectionIntegration(t, "worker-claims")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	scope := platformscope.Scope{TenantID: "tenant-worker-claims", ProjectID: "project-worker-claims"}
+	seedInspectionItem(t, ctx, repository, scope, now)
+	for index := 0; index < 4; index++ {
+		run, targets, value, messages := liveRunFixture(fmt.Sprintf("worker-%d", index), scope, now.Add(time.Duration(index)*time.Microsecond))
+		require.NoError(t, repository.CreateRunWithJob(ctx, run, targets, value, messages))
+	}
+
+	start := make(chan struct{})
+	results := make(chan []RunClaim, 2)
+	errorsChannel := make(chan error, 2)
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			claimed, err := repository.ClaimRuns(ctx, now.Add(time.Second), 2, time.Minute)
+			results <- claimed
+			errorsChannel <- err
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	close(errorsChannel)
+	for err := range errorsChannel {
+		require.NoError(t, err)
+	}
+	seen := make(map[string]struct{})
+	for claimed := range results {
+		require.Len(t, claimed, 2)
+		for _, claim := range claimed {
+			_, duplicate := seen[claim.Detail.Run.ID]
+			require.False(t, duplicate, claim.Detail.Run.ID)
+			seen[claim.Detail.Run.ID] = struct{}{}
+		}
+	}
+	require.Len(t, seen, 4)
+}
+
 func TestSchedulerRestartReclaimsExpiredLeaseWithoutLosingOccurrence(t *testing.T) {
 	// Break caught: a controller crash after claim must leave next_run_at intact
 	// and make the same occurrence reclaimable once the lease expires.
@@ -162,6 +209,83 @@ func TestInspectionReportRowsAreImmutableInPostgres(t *testing.T) {
 	require.ErrorContains(t, err, "immutable")
 	_, err = database.ExecContext(ctx, "DELETE FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, "report-1")
 	require.ErrorContains(t, err, "immutable")
+}
+
+func TestPostgresIntegrationReportFinalizationCrashRepairsAuditWithoutRepeatingWork(t *testing.T) {
+	// Break caught: a crash after report finalization but before Audit.RecordOnce
+	// must leave one immutable report/finding plus repairable Audit evidence.
+	ctx, database, repository, _ := openInspectionIntegration(t, "report-audit-repair")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	scope := platformscope.Scope{TenantID: "tenant-report-repair", ProjectID: "project-report-repair"}
+	item := seedInspectionItem(t, ctx, repository, scope, now)
+	run, targets, value, messages := liveRunFixture("report-repair", scope, now)
+	require.NoError(t, repository.CreateRunWithJob(ctx, run, targets, value, messages))
+
+	claims, err := repository.ClaimRuns(ctx, now.Add(time.Second), 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	claim, err := repository.MarkCollecting(ctx, claims[0], now.Add(time.Second))
+	require.NoError(t, err)
+	claim, err = repository.BeginEvaluation(ctx, claim)
+	require.NoError(t, err)
+	targets[0].Status = TargetSucceeded
+	targets[0].ObservedAt = now.Add(2 * time.Second)
+	finding := Finding{
+		ID: "inspection-finding-report-repair", Scope: scope, RunID: run.ID, TargetID: targets[0].TargetID,
+		ItemID: item.ID, ItemVersion: item.Version, Level: LevelHealthy, ObservedAt: targets[0].ObservedAt,
+		Evidence: map[string]string{"metric": item.MetricRule.MetricName, "value": "12", "samples": "1"}, Summary: "healthy",
+	}
+	claim, err = repository.SaveEvaluation(ctx, claim, targets, []Finding{finding}, now.Add(3*time.Second))
+	require.NoError(t, err)
+	report := ReportSnapshot{
+		Scope: scope, ID: "inspection-report-" + run.ID, RunID: run.ID, Status: ReportCompleted, Summary: "healthy",
+		Snapshot:    []byte(`{"report_id":"inspection-report-run-report-repair","run_id":"run-report-repair"}`),
+		Artifacts:   []job.ArtifactReference{{ArtifactID: "inspection-report-run-report-repair.json", Kind: "inspection-report"}, {ArtifactID: "inspection-report-run-report-repair.html", Kind: "inspection-report"}},
+		GeneratedAt: claim.ReportGeneratedAt, CreatedAt: claim.ReportGeneratedAt,
+	}
+	event := audit.Event{
+		Scope: scope, OccurredAt: claim.ReportGeneratedAt, Action: "inspection.report.completed",
+		Actor: audit.Actor{Type: "system", ID: "inspection-worker"}, Resource: audit.Resource{Type: "inspection_report", ID: report.ID},
+		Result: "completed", RequestID: run.RequestID, JobID: run.JobID, DedupeKey: run.AuditCorrelation + ":report",
+		Detail: map[string]any{"run_id": run.ID, "report_id": report.ID, "status": "completed"},
+	}
+	_, err = repository.FinalizeReport(ctx, claim, report, RunCompleted, event, now.Add(4*time.Second))
+	require.NoError(t, err)
+
+	var reports, findings int
+	var status RunStatus
+	var pending bool
+	var persistedDedupe string
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT status, report_audit_pending, report_audit_dedupe_key FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&status, &pending, &persistedDedupe))
+	require.Equal(t, RunCompleted, status)
+	require.True(t, pending)
+	require.Equal(t, event.DedupeKey, persistedDedupe)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&reports))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&findings))
+	require.Equal(t, []int{1, 1}, []int{reports, findings})
+
+	failingAudit := &memoryAuditRecorder{err: errors.New("audit unavailable")}
+	worker := &Worker{Runs: repository, Jobs: &memoryJobReader{}, Evaluator: &Evaluator{}, Artifacts: &memoryArtifactWriter{}, Audit: failingAudit}
+	processed, err := worker.Process(ctx, now.Add(5*time.Second), 1)
+	require.ErrorContains(t, err, "audit unavailable")
+	require.Equal(t, 1, processed)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT report_audit_pending FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&pending))
+	require.True(t, pending)
+
+	recordedAudit := &memoryAuditRecorder{}
+	worker.Audit = recordedAudit
+	processed, err = worker.Process(ctx, now.Add(6*time.Second), 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, processed)
+	require.Len(t, recordedAudit.events, 1)
+	require.Equal(t, event.DedupeKey, recordedAudit.events[0].DedupeKey)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT report_audit_pending FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&pending))
+	require.False(t, pending)
+	require.Empty(t, worker.Artifacts.(*memoryArtifactWriter).values)
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&reports))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3", scope.TenantID, scope.ProjectID, run.ID).Scan(&findings))
+	require.Equal(t, []int{1, 1}, []int{reports, findings}, "Audit repair must not repeat evaluation or reporting")
+	t.Logf("crash repair evidence: run=%s reports=%d findings=%d audit_pending=%t audit_events_replayed=%d", run.ID, reports, findings, pending, len(recordedAudit.events))
 }
 
 func TestPostgresIntegrationHistoricalRowsRejectMutationWhileLifecycleUpdatesRemainPossible(t *testing.T) {

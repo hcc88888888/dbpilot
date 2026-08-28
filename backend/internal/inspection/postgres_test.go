@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/DATA-DOG/go-sqlmock"
@@ -257,6 +258,159 @@ func TestPostgresCreatePolicyRejectsInvalidCronBeforeOpeningTransaction(t *testi
 	require.ErrorIs(t, err, ErrInvalid)
 }
 
+func TestPostgresClaimRunsUsesBoundedSkipLockedLeaseAndLoadsMutableTargets(t *testing.T) {
+	// Break caught: an unlocked read lets two control-plane instances evaluate
+	// the same Run, while reading only target_snapshot hides persisted lifecycle.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	run, targets, _, _ := runPersistenceFixture()
+	run.Status = RunCollecting
+	targets[0].Status = TargetCollecting
+	targetSnapshot, err := json.Marshal(targets[0])
+	require.NoError(t, err)
+	claimRows := sqlmock.NewRows(append(runColumnNames(), "report_generated_at"))
+	// Build the row literally so report_generated_at remains nullable.
+	policySnapshot, _ := json.Marshal(run.PolicySnapshot)
+	itemSnapshot, _ := json.Marshal(run.ItemSnapshot)
+	claimRows.AddRow(
+		run.Scope.TenantID, run.Scope.ProjectID, run.ID, nil, nil, nil, run.JobID, run.Status, run.Trigger, nil, nil,
+		policySnapshot, itemSnapshot, run.TargetCount, 0, 0, nil, run.AuditCorrelation, run.IdempotencyKey, run.InitiatedBy,
+		run.RequestID, run.TraceID, nil, nil, run.CreatedAt, nil,
+	)
+	mock.ExpectBegin()
+	mock.ExpectQuery("(?s)SELECT .* FROM inspection_runs.*status IN .*worker_lease_expires_at IS NULL OR worker_lease_expires_at <= \\$1.*FOR UPDATE SKIP LOCKED.*LIMIT \\$2").
+		WithArgs(now, 1).WillReturnRows(claimRows)
+	mock.ExpectQuery("UPDATE inspection_runs SET worker_claim_token = \\$1, worker_lease_expires_at = \\$2.*RETURNING worker_claim_token").
+		WithArgs(sqlmock.AnyArg(), now.Add(30*time.Second), run.Scope.TenantID, run.Scope.ProjectID, run.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"worker_claim_token"}).AddRow("claim-a"))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT target_snapshot, status, error_code, observed_at FROM inspection_target_runs WHERE tenant_id = \\$1 AND project_id = \\$2 AND run_id = \\$3 ORDER BY target_id").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).
+		WillReturnRows(sqlmock.NewRows([]string{"target_snapshot", "status", "error_code", "observed_at"}).AddRow(targetSnapshot, TargetCollecting, "", nil))
+	mock.ExpectQuery("SELECT .* FROM inspection_findings WHERE tenant_id = \\$1 AND project_id = \\$2 AND run_id = \\$3 ORDER BY target_id, item_id, item_version").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).WillReturnRows(sqlmock.NewRows(findingColumnNames()))
+
+	claims, err := NewPostgresRepository(database, nil).ClaimRuns(context.Background(), now, 1, 30*time.Second)
+
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	require.Equal(t, "claim-a", claims[0].Token)
+	require.Equal(t, TargetCollecting, claims[0].Detail.Targets[0].Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresFreshSnapshotUsesExactSourceFenceAndJobDeadline(t *testing.T) {
+	// Break caught: accepting an arbitrary Agent sample or querying beyond the
+	// Job deadline can make stale evidence appear fresh.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	from := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	to := from.Add(5 * time.Minute)
+	fresh := from.Add(time.Second)
+	mock.ExpectQuery("(?s)SELECT MAX\\(sampled_at\\) FROM metric_samples.*tenant_id = \\$1.*project_id = \\$2.*agent_id = \\$3.*sampled_at >= \\$4.*sampled_at <= \\$5.*dbpilot_source_id.*component").
+		WithArgs(scope.TenantID, scope.ProjectID, "agent-a", from, to, hostSnapshotSourceID, hostSnapshotSourceID).
+		WillReturnRows(sqlmock.NewRows([]string{"sampled_at"}).AddRow(fresh))
+
+	got, ok, err := NewPostgresRepository(database, nil).FreshSnapshotAt(context.Background(), scope, "agent-a", hostSnapshotSourceID, from, to)
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, fresh, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresMarkCollectingAdvancesRunAndTargetsAtomically(t *testing.T) {
+	// Break caught: advancing only the parent Run leaves every TargetRun pending
+	// even though its existing Job/Command is actively collecting.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	run, targets, _, _ := runPersistenceFixture()
+	claim := RunClaim{Detail: RunDetail{Run: run, Targets: targets}, Token: "claim-a"}
+	mock.ExpectBegin()
+	mock.ExpectQuery("UPDATE inspection_runs SET status = 'collecting'.*RETURNING started_at").
+		WithArgs(now, run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).
+		WillReturnRows(sqlmock.NewRows([]string{"started_at"}).AddRow(now))
+	mock.ExpectExec("UPDATE inspection_target_runs SET status = 'collecting'.*status = 'pending'").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	got, err := NewPostgresRepository(database, nil).MarkCollecting(context.Background(), claim, now)
+
+	require.NoError(t, err)
+	require.Equal(t, RunCollecting, got.Detail.Run.Status)
+	require.Equal(t, TargetCollecting, got.Detail.Targets[0].Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresBeginEvaluationAdvancesRunAndTargetsAtomically(t *testing.T) {
+	// Break caught: a crash-safe evaluation claim needs both parent and target
+	// lifecycle rows to enter evaluating in one transaction.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	run, targets, _, _ := runPersistenceFixture()
+	run.Status, targets[0].Status = RunCollecting, TargetCollecting
+	claim := RunClaim{Detail: RunDetail{Run: run, Targets: targets}, Token: "claim-a"}
+	mock.ExpectBegin()
+	mock.ExpectQuery("UPDATE inspection_runs SET status = 'evaluating'.*RETURNING id").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(run.ID))
+	mock.ExpectExec("UPDATE inspection_target_runs SET status = 'evaluating'.*status = 'collecting'").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	got, err := NewPostgresRepository(database, nil).BeginEvaluation(context.Background(), claim)
+
+	require.NoError(t, err)
+	require.Equal(t, RunEvaluating, got.Detail.Run.Status)
+	require.Equal(t, TargetEvaluating, got.Detail.Targets[0].Status)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresFinalizeReportCommitsImmutableSnapshotRunTerminalAndAuditPendingTogether(t *testing.T) {
+	// Break caught: the completed report and terminal Run must not commit
+	// without the exact repairable Audit payload in the same transaction.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 29, 10, 5, 0, 0, time.UTC)
+	run, targets, _, _ := runPersistenceFixture()
+	run.Status = RunGeneratingReport
+	targets[0].Status = TargetSucceeded
+	claim := RunClaim{Detail: RunDetail{Run: run, Targets: targets}, Token: "claim-a", ReportGeneratedAt: now.Add(-time.Second)}
+	report := ReportSnapshot{
+		Scope: run.Scope, ID: "inspection-report-" + run.ID, RunID: run.ID, Status: ReportCompleted,
+		Summary: "healthy", Snapshot: []byte(`{"report_id":"inspection-report-run-1"}`),
+		Artifacts:   []job.ArtifactReference{{ArtifactID: "inspection-report-run-1.json", Kind: "inspection-report"}, {ArtifactID: "inspection-report-run-1.html", Kind: "inspection-report"}},
+		GeneratedAt: claim.ReportGeneratedAt, CreatedAt: claim.ReportGeneratedAt,
+	}
+	event := audit.Event{
+		Scope: run.Scope, OccurredAt: claim.ReportGeneratedAt, Action: "inspection.report.completed", Actor: audit.Actor{Type: "system", ID: "inspection-worker"},
+		Resource: audit.Resource{Type: "inspection_report", ID: report.ID}, Result: "cancelled", RequestID: run.RequestID, JobID: run.JobID,
+		DedupeKey: run.AuditCorrelation + ":report", Detail: map[string]any{"report_id": report.ID},
+	}
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO inspection_reports .* ON CONFLICT .* DO NOTHING RETURNING id").WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(report.ID))
+	mock.ExpectQuery("(?s)UPDATE inspection_runs SET status = \\$1.*report_id = \\$2.*report_audit_pending = TRUE.*report_audit_event = \\$[0-9]+.*report_audit_dedupe_key = \\$[0-9]+.*worker_claim_token = NULL.*WHERE tenant_id = \\$[0-9]+ AND project_id = \\$[0-9]+ AND id = \\$[0-9]+ AND status = 'generating_report' AND worker_claim_token = \\$[0-9]+.*RETURNING id").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(run.ID))
+	mock.ExpectCommit()
+
+	auditClaim, err := NewPostgresRepository(database, nil).FinalizeReport(context.Background(), claim, report, RunCancelled, event, now)
+
+	require.NoError(t, err)
+	require.Equal(t, event.DedupeKey, auditClaim.Event.DedupeKey)
+	require.Equal(t, run.ID, auditClaim.RunID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPolicyValidationAllowsEnabledManualPolicyWithoutSchedule(t *testing.T) {
 	// Break caught: schedule is optional; enabled manual policies must remain
 	// runnable through RunInspectionPolicy without being scheduler candidates.
@@ -286,9 +440,9 @@ func TestPostgresGetRunScopesRunTargetsAndFindings(t *testing.T) {
 		WillReturnRows(runRows(run))
 	targetSnapshot, err := json.Marshal(targets[0])
 	require.NoError(t, err)
-	mock.ExpectQuery("SELECT target_snapshot FROM inspection_target_runs WHERE tenant_id = \\$1 AND project_id = \\$2 AND run_id = \\$3 ORDER BY target_id").
+	mock.ExpectQuery("SELECT target_snapshot, status, error_code, observed_at FROM inspection_target_runs WHERE tenant_id = \\$1 AND project_id = \\$2 AND run_id = \\$3 ORDER BY target_id").
 		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).
-		WillReturnRows(sqlmock.NewRows([]string{"target_snapshot"}).AddRow(targetSnapshot))
+		WillReturnRows(sqlmock.NewRows([]string{"target_snapshot", "status", "error_code", "observed_at"}).AddRow(targetSnapshot, targets[0].Status, targets[0].ErrorCode, nil))
 	mock.ExpectQuery("SELECT .* FROM inspection_findings WHERE tenant_id = \\$1 AND project_id = \\$2 AND run_id = \\$3 ORDER BY target_id, item_id, item_version").
 		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, run.ID).
 		WillReturnRows(sqlmock.NewRows(findingColumnNames()))

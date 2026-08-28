@@ -1,7 +1,9 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,6 +200,136 @@ func (store *LocalBlobStore) Open(ctx context.Context, value Artifact) (ReadSeek
 		return nil, ErrInvalid
 	}
 	return file, nil
+}
+
+// Put durably publishes checksum-addressed bytes beneath the already retained
+// os.Root. The checksum is verified before any write and an existing blob is
+// accepted only when its bytes are identical.
+func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents []byte) (string, error) {
+	if store == nil || ctx == nil || ctx.Err() != nil || len(contents) > 64<<20 || !strings.HasPrefix(checksum, "sha256:") {
+		return "", ErrInvalid
+	}
+	expected, err := hex.DecodeString(strings.TrimPrefix(checksum, "sha256:"))
+	if err != nil || len(expected) != sha256.Size {
+		return "", ErrInvalid
+	}
+	digest := sha256.Sum256(contents)
+	if !equalBytes(digest[:], expected) {
+		return "", ErrIntegrityMismatch
+	}
+	if err := store.Ready(); err != nil {
+		return "", err
+	}
+	hexDigest := hex.EncodeToString(expected)
+	directory := "sha256"
+	reference := filepath.Join(directory, hexDigest+".blob")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed || store.root == nil {
+		return "", ErrInvalid
+	}
+	if matches, exists, err := rootBlobMatches(store.root, reference, contents); err != nil {
+		return "", safeBlobError("inspect", err)
+	} else if exists {
+		if !matches {
+			return "", ErrIntegrityMismatch
+		}
+		return filepath.ToSlash(reference), nil
+	}
+	if err := store.root.MkdirAll(directory, 0o700); err != nil {
+		return "", safeBlobError("create directory", err)
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", safeBlobError("create temporary name", err)
+	}
+	temporary := filepath.Join(directory, ".tmp-"+hex.EncodeToString(random))
+	file, err := store.root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", safeBlobError("create temporary", err)
+	}
+	cleanup := func() {
+		_ = file.Close()
+		_ = store.root.Remove(temporary)
+	}
+	for offset := 0; offset < len(contents); {
+		if err := ctx.Err(); err != nil {
+			cleanup()
+			return "", err
+		}
+		written, writeErr := file.Write(contents[offset:])
+		if writeErr == nil && written <= 0 {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr != nil {
+			cleanup()
+			return "", safeBlobError("write temporary", writeErr)
+		}
+		offset += written
+	}
+	if err := file.Sync(); err != nil {
+		cleanup()
+		return "", safeBlobError("sync temporary", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = store.root.Remove(temporary)
+		return "", safeBlobError("close temporary", err)
+	}
+	if matches, exists, err := rootBlobMatches(store.root, reference, contents); err != nil {
+		_ = store.root.Remove(temporary)
+		return "", safeBlobError("inspect", err)
+	} else if exists {
+		_ = store.root.Remove(temporary)
+		if !matches {
+			return "", ErrIntegrityMismatch
+		}
+		return filepath.ToSlash(reference), nil
+	}
+	if err := store.root.Rename(temporary, reference); err != nil {
+		_ = store.root.Remove(temporary)
+		if matches, exists, inspectErr := rootBlobMatches(store.root, reference, contents); inspectErr == nil && exists && matches {
+			return filepath.ToSlash(reference), nil
+		}
+		return "", safeBlobError("publish", err)
+	}
+	if runtime.GOOS != "windows" {
+		directoryFile, err := store.root.Open(directory)
+		if err != nil {
+			return "", safeBlobError("open directory", err)
+		}
+		syncErr := directoryFile.Sync()
+		closeErr := directoryFile.Close()
+		if syncErr != nil {
+			return "", safeBlobError("sync directory", syncErr)
+		}
+		if closeErr != nil {
+			return "", safeBlobError("close directory", closeErr)
+		}
+	}
+	return filepath.ToSlash(reference), nil
+}
+
+func rootBlobMatches(root *os.Root, reference string, contents []byte) (bool, bool, error) {
+	file, err := root.Open(reference)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, true, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != int64(len(contents)) {
+		return false, true, nil
+	}
+	stored := make([]byte, len(contents))
+	if _, err := io.ReadFull(file, stored); err != nil {
+		return false, true, err
+	}
+	return bytes.Equal(stored, contents), true, nil
 }
 
 var _ http.Handler = (*DownloadHandler)(nil)

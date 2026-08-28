@@ -108,6 +108,7 @@ type ReportSnapshot struct {
 	Artifacts   []job.ArtifactReference `json:"artifacts"`
 	GeneratedAt time.Time               `json:"generated_at"`
 	CreatedAt   time.Time               `json:"-"`
+	Document    *ReportDocument         `json:"-"`
 }
 
 type CursorFilter struct {

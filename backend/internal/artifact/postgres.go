@@ -2,8 +2,11 @@ package artifact
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -11,10 +14,20 @@ import (
 
 const artifactColumnsSQL = "id, tenant_id, project_id, kind, content_type, size_bytes, checksum, source_resource_type, source_resource_id, job_id, created_by, created_at, expires_at, storage_reference"
 const artifactGetSQL = "SELECT " + artifactColumnsSQL + " FROM artifacts WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
+const artifactInsertSQL = "INSERT INTO artifacts (id, tenant_id, project_id, kind, content_type, size_bytes, checksum, source_resource_type, source_resource_id, job_id, created_by, created_at, expires_at, storage_reference) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) ON CONFLICT (tenant_id, project_id, id) DO NOTHING RETURNING " + artifactColumnsSQL
 
-type PostgresStore struct{ database *sql.DB }
+type PostgresStore struct {
+	database *sql.DB
+	blobs    *LocalBlobStore
+}
 
-func NewPostgresStore(database *sql.DB) *PostgresStore { return &PostgresStore{database: database} }
+func NewPostgresStore(database *sql.DB, blobs ...*LocalBlobStore) *PostgresStore {
+	store := &PostgresStore{database: database}
+	if len(blobs) == 1 {
+		store.blobs = blobs[0]
+	}
+	return store
+}
 
 func (store *PostgresStore) Get(ctx context.Context, scope platformscope.Scope, id string) (Artifact, error) {
 	if store == nil || store.database == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(id) == "" {
@@ -31,6 +44,61 @@ func (store *PostgresStore) Get(ctx context.Context, scope platformscope.Scope, 
 		return Artifact{}, ErrNotFound
 	}
 	return value, nil
+}
+
+func (store *PostgresStore) Put(ctx context.Context, value Artifact, contents []byte) (Artifact, error) {
+	if store == nil || store.database == nil || store.blobs == nil || ctx == nil || ctx.Err() != nil || !validArtifact(value, contents) {
+		return Artifact{}, ErrInvalid
+	}
+	reference, err := store.blobs.Put(ctx, value.Checksum, contents)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if value.StorageReference != "" && value.StorageReference != reference {
+		return Artifact{}, ErrInvalid
+	}
+	value.StorageReference = reference
+	value.CreatedAt = value.CreatedAt.UTC()
+	if value.ExpiresAt != nil {
+		expires := value.ExpiresAt.UTC()
+		value.ExpiresAt = &expires
+	}
+	stored, err := scanArtifact(store.database.QueryRowContext(ctx, artifactInsertSQL,
+		value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.Kind, value.ContentType, value.SizeBytes, value.Checksum,
+		value.SourceResource.ResourceType, value.SourceResource.ResourceID, value.JobID, value.CreatedBy, value.CreatedAt, value.ExpiresAt, value.StorageReference,
+	))
+	if err == nil {
+		return stored, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Artifact{}, fmt.Errorf("insert artifact metadata: %w", err)
+	}
+	existing, err := store.Get(ctx, value.Scope, value.ID)
+	if err != nil {
+		return Artifact{}, err
+	}
+	if existing.Checksum != value.Checksum {
+		return Artifact{}, ErrConflict
+	}
+	return existing, nil
+}
+
+func validArtifact(value Artifact, contents []byte) bool {
+	if !validArtifactID(value.ID) || value.Scope.Validate() != nil || strings.TrimSpace(value.Kind) == "" || strings.TrimSpace(value.ContentType) == "" || value.SizeBytes != int64(len(contents)) || value.CreatedAt.IsZero() || (value.SourceResource.ResourceType == "") != (value.SourceResource.ResourceID == "") {
+		return false
+	}
+	if value.ExpiresAt != nil && !value.ExpiresAt.After(value.CreatedAt) {
+		return false
+	}
+	if !strings.HasPrefix(value.Checksum, "sha256:") {
+		return false
+	}
+	expected, err := hex.DecodeString(strings.TrimPrefix(value.Checksum, "sha256:"))
+	if err != nil || len(expected) != sha256.Size {
+		return false
+	}
+	digest := sha256.Sum256(contents)
+	return equalBytes(digest[:], expected)
 }
 
 func scanArtifact(scanner interface{ Scan(...any) error }) (Artifact, error) {
