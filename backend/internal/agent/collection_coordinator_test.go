@@ -79,6 +79,40 @@ func TestCollectionCoordinatorRejectsUnavailableTypedNilCollector(t *testing.T) 
 	require.Error(t, err)
 }
 
+func TestCollectionCoordinatorPreflightsEveryCollectorBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name        string
+		coordinator *CollectionCoordinator
+	}{
+		{
+			name:        "later host unavailable",
+			coordinator: &CollectionCoordinator{Dependencies: recordingRequestCollector{name: "dependencies"}},
+		},
+		{
+			name:        "dependencies unavailable",
+			coordinator: &CollectionCoordinator{Host: recordingRequestCollector{name: "host"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := []string{}
+			if collector, ok := test.coordinator.Dependencies.(recordingRequestCollector); ok {
+				collector.calls = &calls
+				test.coordinator.Dependencies = collector
+			}
+			if collector, ok := test.coordinator.Host.(recordingRequestCollector); ok {
+				collector.calls = &calls
+				test.coordinator.Host = collector
+			}
+
+			err := test.coordinator.Collect(context.Background(), CollectionRequest{Kinds: []string{"host", "dependencies"}})
+
+			require.Error(t, err)
+			require.Empty(t, calls)
+		})
+	}
+}
+
 func TestDependencyCollectionAdapterRejectsNonDependencyRequest(t *testing.T) {
 	adapter := NewDependencyCollectionAdapter(&DependencyCollector{})
 	err := adapter.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}})

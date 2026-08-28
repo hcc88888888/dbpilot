@@ -98,6 +98,33 @@ func TestSpoolLogsConsumerObserverFailureCannotDropOrMutateOriginalBatch(t *test
 	require.Equal(t, uint64(1), observer.failures)
 }
 
+func TestSpoolLogsConsumerObserverAndFailureRecorderPanicsCannotDropOriginalBatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		observer *panickingHealthObserver
+	}{
+		{name: "observer panic", observer: &panickingHealthObserver{panicInObserve: true}},
+		{name: "failure recorder panic", observer: &panickingHealthObserver{panicInRecord: true}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &capturingLogStore{}
+			consumer, err := newSpoolLogsConsumer(store, ExporterConfig{MaxBatchBytes: 1 << 20}, test.observer)
+			require.NoError(t, err)
+			logs := plog.NewLogs()
+			appendTestLog(logs, "source-a", plog.SeverityNumberError, "", time.Now().UTC(), "original body")
+
+			require.NotPanics(t, func() {
+				require.NoError(t, consumer.ConsumeLogs(context.Background(), logs))
+			})
+			require.Len(t, store.batches, 1)
+			decoded, err := (&plog.ProtoUnmarshaler{}).UnmarshalLogs(store.batches[0].Payload)
+			require.NoError(t, err)
+			require.Equal(t, "original body", decoded.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str())
+		})
+	}
+}
+
 func appendTestLog(logs plog.Logs, source string, severity plog.SeverityNumber, severityText string, timestamp time.Time, body string) {
 	resourceLogs := logs.ResourceLogs().AppendEmpty()
 	resourceLogs.Resource().Attributes().PutStr("dbpilot.source.id", source)
@@ -129,3 +156,22 @@ func (observer *mutatingFailingObserver) Observe(_ context.Context, logs plog.Lo
 }
 
 func (observer *mutatingFailingObserver) RecordObserverFailure() { observer.failures++ }
+
+type panickingHealthObserver struct {
+	panicInObserve bool
+	panicInRecord  bool
+}
+
+func (observer *panickingHealthObserver) Observe(_ context.Context, logs plog.Logs) error {
+	logs.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().SetStr("observer mutation")
+	if observer.panicInObserve {
+		panic("observer panic")
+	}
+	return errors.New("observer failure")
+}
+
+func (observer *panickingHealthObserver) RecordObserverFailure() {
+	if observer.panicInRecord {
+		panic("failure recorder panic")
+	}
+}

@@ -28,7 +28,6 @@ import (
 
 const (
 	hostSnapshotSourceID        = "inspection-host-snapshot"
-	defaultHostBatchBytes       = 1 << 20
 	MaxHostFilesystems          = 64
 	MaxHostDisks                = 64
 	MaxHostInterfaces           = 64
@@ -165,15 +164,9 @@ func (GopsutilHostReader) Read(ctx context.Context) (HostSnapshot, error) {
 		return HostSnapshot{}, fmt.Errorf("read processes: %w", err)
 	}
 	sort.Slice(processes, func(i, j int) bool { return processes[i].Pid < processes[j].Pid })
-	processObservations := make([]ProcessObservation, 0, min(len(processes), MaxHostProcesses))
+	processObservations := make([]ProcessObservation, 0, len(processes))
 	for _, current := range processes {
-		if len(processObservations) >= MaxHostProcesses {
-			break
-		}
-		name, nameErr := current.NameWithContext(ctx)
-		if nameErr != nil || normalizeExecutableName(name) == "" {
-			continue
-		}
+		name, _ := current.NameWithContext(ctx)
 		status := "unknown"
 		if values, statusErr := current.StatusWithContext(ctx); statusErr == nil && len(values) > 0 {
 			status = values[0]
@@ -192,6 +185,10 @@ type HostSnapshotStore interface {
 	Stats() (spool.Stats, error)
 }
 
+type BatchLimitProvider interface {
+	BatchMaxBytes() int64
+}
+
 type LogSummary = telemetry.LogSummary
 
 type LogSummaryProvider interface {
@@ -199,17 +196,17 @@ type LogSummaryProvider interface {
 }
 
 type HostSnapshotCollector struct {
-	AgentID       string
-	Store         HostSnapshotStore
-	Reader        HostReader
-	Logs          LogSummaryProvider
-	ProcessNames  []string
-	Now           func() time.Time
-	MaxBatchBytes int64
+	AgentID      string
+	Store        HostSnapshotStore
+	Reader       HostReader
+	Logs         LogSummaryProvider
+	BatchLimits  BatchLimitProvider
+	ProcessNames []string
+	Now          func() time.Time
 }
 
 func (c *HostSnapshotCollector) Collect(ctx context.Context, request CollectionRequest) error {
-	if c == nil || ctx == nil || strings.TrimSpace(c.AgentID) == "" || isNilDependencyBoundary(c.Store) || isNilDependencyBoundary(c.Reader) {
+	if c == nil || ctx == nil || strings.TrimSpace(c.AgentID) == "" || isNilDependencyBoundary(c.Store) || isNilDependencyBoundary(c.Reader) || isNilDependencyBoundary(c.BatchLimits) {
 		return errors.New("invalid host snapshot collector configuration")
 	}
 	normalized, err := normalizeCollectionRequest(request)
@@ -218,6 +215,10 @@ func (c *HostSnapshotCollector) Collect(ctx context.Context, request CollectionR
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	maximum := c.BatchLimits.BatchMaxBytes()
+	if maximum <= 0 {
+		return errors.New("active telemetry batch limit is unavailable")
 	}
 	processNames, err := normalizeProcessNames(c.ProcessNames)
 	if err != nil {
@@ -246,11 +247,7 @@ func (c *HostSnapshotCollector) Collect(ctx context.Context, request CollectionR
 	if err != nil {
 		return fmt.Errorf("marshal host snapshot metrics: %w", err)
 	}
-	maximum := c.MaxBatchBytes
-	if maximum == 0 {
-		maximum = defaultHostBatchBytes
-	}
-	if maximum < 0 || int64(len(payload)) > maximum {
+	if int64(len(payload)) > maximum {
 		return fmt.Errorf("host snapshot batch exceeds exporter limit: %d > %d", len(payload), maximum)
 	}
 	id, err := newHostSnapshotBatchID()
@@ -370,9 +367,6 @@ func (c *HostSnapshotCollector) buildMetrics(snapshot HostSnapshot, stats spool.
 		}
 		return processes[i].Status < processes[j].Status
 	})
-	if len(processes) > MaxHostProcesses {
-		processes = processes[:MaxHostProcesses]
-	}
 	statusCounts := make(map[string]int64)
 	processAllowlist := make(map[string]struct{}, len(processNames))
 	for _, name := range processNames {
@@ -420,9 +414,6 @@ func (c *HostSnapshotCollector) buildMetrics(snapshot HostSnapshot, stats spool.
 		}
 		return summaries[i].Category < summaries[j].Category
 	})
-	if len(summaries) > maxHostLogSummaryDataPoints {
-		summaries = summaries[:maxHostLogSummaryDataPoints]
-	}
 	if len(summaries) == 0 {
 		addInt("dbpilot.inspection.host.log.summary_available", "1", 0, false, nil)
 	} else {
@@ -433,11 +424,23 @@ func (c *HostSnapshotCollector) buildMetrics(snapshot HostSnapshot, stats spool.
 				return pmetric.Metrics{}, errors.New("log summary count exceeds metric range")
 			}
 			if _, ok := counts[summary.Severity]; ok {
+				if counts[summary.Severity] > math.MaxInt64-int64(summary.Count) {
+					return pmetric.Metrics{}, errors.New("log severity aggregate exceeds metric range")
+				}
 				counts[summary.Severity] += int64(summary.Count)
 			}
 			if summary.Category == "oom" {
+				if counts["oom"] > math.MaxInt64-int64(summary.Count) {
+					return pmetric.Metrics{}, errors.New("OOM aggregate exceeds metric range")
+				}
 				counts["oom"] += int64(summary.Count)
 			}
+		}
+		dimensional := summaries
+		if len(dimensional) > maxHostLogSummaryDataPoints {
+			dimensional = dimensional[:maxHostLogSummaryDataPoints]
+		}
+		for _, summary := range dimensional {
 			addInt("dbpilot.inspection.host.log.source_count", "{events}", int64(summary.Count), false, boundedHostAttributes(map[string]string{"source.id": summary.SourceID, "severity": summary.Severity, "category": summary.Category}))
 		}
 		for _, severity := range []string{"warning", "error", "critical"} {

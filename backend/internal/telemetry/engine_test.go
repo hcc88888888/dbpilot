@@ -41,6 +41,31 @@ func TestEmbeddedBuilderRejectsTypedNilSpool(t *testing.T) {
 	require.ErrorContains(t, err, "requires a spool")
 }
 
+func TestEnginePublishesOnlyActivePolicyBatchLimit(t *testing.T) {
+	first := healthyCandidate(1)
+	rejected := unhealthyCandidate(2)
+	third := healthyCandidate(3)
+	engine := telemetry.NewEngine(newFakeBuilder(first, rejected, third))
+	require.Zero(t, engine.BatchMaxBytes())
+
+	result, err := engine.Apply(context.Background(), policyWithBatchLimit(1, 2048))
+	require.NoError(t, err)
+	require.Equal(t, telemetry.ApplyActive, result.State)
+	require.Equal(t, int64(2048), engine.BatchMaxBytes())
+
+	result, err = engine.Apply(context.Background(), policyWithBatchLimit(2, 1024))
+	require.Error(t, err)
+	require.Equal(t, telemetry.ApplyRolledBack, result.State)
+	require.Equal(t, int64(2048), engine.BatchMaxBytes(), "failed activation must retain the active policy limit")
+
+	result, err = engine.Apply(context.Background(), policyWithBatchLimit(3, 512))
+	require.NoError(t, err)
+	require.Equal(t, telemetry.ApplyActive, result.State)
+	require.Equal(t, int64(512), engine.BatchMaxBytes())
+	require.NoError(t, engine.Stop(context.Background()))
+	require.Zero(t, engine.BatchMaxBytes())
+}
+
 type typedNilSpoolAppender struct{}
 
 func (*typedNilSpoolAppender) Append(context.Context, spool.DataClass, spool.Batch) error { return nil }
@@ -193,6 +218,12 @@ func policyVersion(version uint64) policy.Policy {
 		Sources:   []policy.Source{{ID: "host", Kind: policy.SourceHostMetrics, Interval: 5 * time.Second}},
 		Limits:    policy.Limits{MaxSpoolBytes: 4 << 20, MaxBatchBytes: 1 << 20, MaxEventsPerSec: 100},
 	}
+}
+
+func policyWithBatchLimit(version uint64, limit int64) policy.Policy {
+	value := policyVersion(version)
+	value.Limits.MaxBatchBytes = limit
+	return value
 }
 
 type fakeBuilder struct {

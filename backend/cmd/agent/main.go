@@ -239,10 +239,8 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	client := telemetryv1.NewTelemetryIngestClient(connection)
 	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
 	logSummaries := telemetry.NewLogSummaryIndex()
-	hostCollector := &agent.HostSnapshotCollector{
-		AgentID: settings.AgentID, Store: store, Reader: agent.NewGopsutilHostReader(), Logs: logSummaries,
-		ProcessNames: settings.DatabaseProcessNames,
-	}
+	telemetryEngine := telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store, logSummaries))
+	hostCollector := newHostSnapshotCollector(settings, store, telemetryEngine, logSummaries)
 	var dependencyCollector *agent.DependencyCollector
 	var componentCollector agent.ComponentCollector
 	if len(settings.Components) > 0 {
@@ -284,7 +282,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		_ = store.Close()
 		return err
 	}
-	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store, logSummaries)), Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
+	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetryEngine, Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
 	serviceContext, cancelServices := context.WithCancel(ctx)
 	defer cancelServices()
 	results := make(chan error, 2)
@@ -300,6 +298,13 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return second
 	}
 	return nil
+}
+
+func newHostSnapshotCollector(settings agentConfig, store agent.HostSnapshotStore, limits agent.BatchLimitProvider, logs agent.LogSummaryProvider) *agent.HostSnapshotCollector {
+	return &agent.HostSnapshotCollector{
+		AgentID: settings.AgentID, Store: store, Reader: agent.NewGopsutilHostReader(), Logs: logs, BatchLimits: limits,
+		ProcessNames: settings.DatabaseProcessNames,
+	}
 }
 
 func configuredCommandExecutors(host agent.Collector, collector *agent.DependencyCollector) (*agent.ExecutorRegistry, error) {

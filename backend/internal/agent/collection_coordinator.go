@@ -35,19 +35,27 @@ func (c *CollectionCoordinator) Collect(ctx context.Context, request CollectionR
 	if err != nil {
 		return err
 	}
+	type selectedCollector struct {
+		kind      string
+		collector Collector
+	}
+	selected := make([]selectedCollector, 0, len(normalized.Kinds))
 	for _, kind := range normalized.Kinds {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		collector := c.collector(kind)
 		if isNilDependencyBoundary(collector) {
 			return fmt.Errorf("collection kind %q is unavailable", kind)
 		}
-		if err := collector.Collect(ctx, normalized); err != nil {
+		selected = append(selected, selectedCollector{kind: kind, collector: collector})
+	}
+	for _, value := range selected {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := value.collector.Collect(ctx, normalized); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("collect %s: %w", kind, err)
+			return fmt.Errorf("collect %s: %w", value.kind, err)
 		}
 	}
 	return nil

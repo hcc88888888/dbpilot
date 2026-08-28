@@ -12,6 +12,7 @@ import (
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/spool"
+	"dbpilot.local/platform/internal/telemetry"
 	"github.com/stretchr/testify/require"
 )
 
@@ -42,6 +43,21 @@ func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testi
 	withCollector, err := configuredCommandExecutors(&mainHostCollector{}, collector)
 	require.NoError(t, err)
 	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withCollector.Capabilities())
+}
+
+func TestProductionHostSnapshotCollectorSharesEngineLimitAndLogIndex(t *testing.T) {
+	store, err := spool.Open(t.TempDir(), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 64 << 10})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	engine := telemetry.NewEngine(nil)
+	logs := telemetry.NewLogSummaryIndex()
+	settings := agentConfig{AgentID: "agent-a", DatabaseProcessNames: []string{"postgres"}}
+
+	collector := newHostSnapshotCollector(settings, store, engine, logs)
+
+	require.Same(t, engine, collector.BatchLimits)
+	require.Same(t, logs, collector.Logs)
+	require.Equal(t, []string{"postgres"}, collector.ProcessNames)
 }
 
 type mainHostCollector struct{}

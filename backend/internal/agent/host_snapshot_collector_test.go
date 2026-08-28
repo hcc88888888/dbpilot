@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/spool"
+	"dbpilot.local/platform/internal/telemetry"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
@@ -29,7 +31,7 @@ func TestHostSnapshotCollectorAppendsBoundedCanonicalOTLPMetrics(t *testing.T) {
 			{SourceID: "source-a", Severity: "error", Category: "oom", Count: 1, ObservedAt: now},
 			{SourceID: "source-c", Severity: "critical", Category: "general", Count: 3, ObservedAt: now},
 		}},
-		ProcessNames: []string{"postgres", "mysqld"}, Now: func() time.Time { return now }, MaxBatchBytes: 1 << 20,
+		BatchLimits: &mutableBatchLimit{value: 1 << 20}, ProcessNames: []string{"postgres", "mysqld"}, Now: func() time.Time { return now },
 	}
 
 	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
@@ -92,7 +94,7 @@ func TestHostSnapshotCollectorAppendsBoundedCanonicalOTLPMetrics(t *testing.T) {
 func TestHostSnapshotCollectorEmptyLogWindowEmitsAvailabilityNotHealthyZeros(t *testing.T) {
 	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
 	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1024}}
-	collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, Logs: staticLogSummaryProvider{observerFailures: 2}, Now: func() time.Time { return now }}
+	collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, Logs: staticLogSummaryProvider{observerFailures: 2}, BatchLimits: &mutableBatchLimit{value: 1 << 20}, Now: func() time.Time { return now }}
 
 	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
 	decoded, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(store.batches[0].Payload)
@@ -104,6 +106,49 @@ func TestHostSnapshotCollectorEmptyLogWindowEmitsAvailabilityNotHealthyZeros(t *
 	require.NotContains(t, points, "dbpilot.inspection.host.log.error_count")
 	require.NotContains(t, points, "dbpilot.inspection.host.log.critical_count")
 	require.NotContains(t, points, "dbpilot.inspection.host.oom.count")
+}
+
+func TestHostSnapshotCollectorAggregatesEveryValidatedLogSummaryBeforeDimensionalCap(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	index := telemetry.NewLogSummaryIndex(func() time.Time { return now })
+	logs := plog.NewLogs()
+	resourceLogs := logs.ResourceLogs().AppendEmpty()
+	resourceLogs.Resource().Attributes().PutStr("dbpilot.source.id", "a-source")
+	records := resourceLogs.ScopeLogs().AppendEmpty().LogRecords()
+	for _, severity := range []plog.SeverityNumber{plog.SeverityNumberDebug, plog.SeverityNumberInfo, plog.SeverityNumberWarn, plog.SeverityNumberError, plog.SeverityNumberFatal} {
+		for category := 0; category < 15; category++ {
+			record := records.AppendEmpty()
+			record.SetTimestamp(pcommon.NewTimestampFromTime(now))
+			record.SetSeverityNumber(severity)
+			if category < 14 {
+				record.Attributes().PutStr("dbpilot.log.category", fmt.Sprintf("category-%02d", category))
+			}
+		}
+	}
+	oomResource := logs.ResourceLogs().AppendEmpty()
+	oomResource.Resource().Attributes().PutStr("dbpilot.source.id", "z-source")
+	oom := oomResource.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	oom.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	oom.SetSeverityNumber(plog.SeverityNumberError)
+	oom.Body().SetStr("Out of memory: Killed process 99")
+	require.NoError(t, index.Observe(context.Background(), logs))
+	require.Len(t, index.Snapshot(now, time.Hour), 76)
+
+	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1 << 20}}
+	collector := &HostSnapshotCollector{
+		AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, Logs: index,
+		BatchLimits: &mutableBatchLimit{value: 1 << 20}, ProcessNames: []string{"postgres"}, Now: func() time.Time { return now },
+	}
+	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
+	decoded, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(store.batches[0].Payload)
+	require.NoError(t, err)
+	points := decodedMetricPoints(t, decoded)
+
+	requireMetricValue(t, points, "dbpilot.inspection.host.log.warning_count", 15)
+	requireMetricValue(t, points, "dbpilot.inspection.host.log.error_count", 16)
+	requireMetricValue(t, points, "dbpilot.inspection.host.log.critical_count", 15)
+	requireMetricValue(t, points, "dbpilot.inspection.host.oom.count", 1)
+	require.Len(t, points["dbpilot.inspection.host.log.source_count"], maxHostLogSummaryDataPoints)
 }
 
 func TestHostSnapshotCollectorRejectsCancellationInvalidNumbersAndOversizedPayload(t *testing.T) {
@@ -128,7 +173,11 @@ func TestHostSnapshotCollectorRejectsCancellationInvalidNumbersAndOversizedPaylo
 				test.mutate(&value)
 			}
 			store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1024}}
-			collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: value}, Now: func() time.Time { return now }, MaxBatchBytes: test.maxBytes}
+			limit := test.maxBytes
+			if limit == 0 {
+				limit = 1 << 20
+			}
+			collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: value}, BatchLimits: &mutableBatchLimit{value: limit}, Now: func() time.Time { return now }}
 			ctx := context.Background()
 			if test.cancelled {
 				var cancel context.CancelFunc
@@ -148,8 +197,73 @@ func TestHostSnapshotCollectorReturnsAppendFailure(t *testing.T) {
 	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
 	appendErr := errors.New("durable spool unavailable")
 	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1024}, appendErr: appendErr}
-	collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, Now: func() time.Time { return now }}
+	collector := &HostSnapshotCollector{AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, BatchLimits: &mutableBatchLimit{value: 1 << 20}, Now: func() time.Time { return now }}
 	require.ErrorIs(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}), appendErr)
+}
+
+func TestHostSnapshotCollectorRequiresActiveDynamicBatchLimitBeforeRead(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	reader := &countingHostReader{snapshot: completeHostSnapshot(now)}
+	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1 << 20}}
+	collector := &HostSnapshotCollector{
+		AgentID: "agent-a", Store: store, Reader: reader, BatchLimits: &mutableBatchLimit{}, Now: func() time.Time { return now },
+	}
+
+	err := collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}})
+
+	require.ErrorContains(t, err, "active telemetry batch limit")
+	require.Zero(t, reader.calls)
+	require.Empty(t, store.batches)
+}
+
+func TestHostSnapshotCollectorReadsDynamicLimitEachCollectionWithoutPoisoningSpoolHead(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	store, err := spool.Open(t.TempDir(), spool.Limits{MaxBytes: 4 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	head := spool.Batch{ID: "existing-head", SourceID: "existing", CreatedAt: now, Payload: []byte("existing payload")}
+	require.NoError(t, store.Append(context.Background(), spool.Metric, head))
+	limits := &mutableBatchLimit{value: 1 << 20}
+	collector := &HostSnapshotCollector{
+		AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: completeHostSnapshot(now)}, BatchLimits: limits,
+		ProcessNames: []string{"postgres"}, Now: func() time.Time { return now },
+	}
+
+	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
+	pending, err := store.Pending(context.Background(), spool.Metric, 0)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+	require.Equal(t, head.ID, pending[0].ID)
+	require.Equal(t, head.Payload, pending[0].Payload)
+	beforeSmallerPolicy := pending
+
+	limits.value = 1
+	require.ErrorContains(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}), "exporter limit")
+	pending, err = store.Pending(context.Background(), spool.Metric, 0)
+	require.NoError(t, err)
+	require.Equal(t, beforeSmallerPolicy, pending, "smaller active policy must not append an oversized spool head")
+}
+
+func TestHostSnapshotCollectorCountsAndMatchesProcessesBeyondDetailLimit(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	snapshot := completeHostSnapshot(now)
+	snapshot.Processes = make([]ProcessObservation, 0, MaxHostProcesses+1)
+	for index := 0; index < MaxHostProcesses; index++ {
+		snapshot.Processes = append(snapshot.Processes, ProcessObservation{Name: fmt.Sprintf("process-%04d", index), Status: "running"})
+	}
+	snapshot.Processes = append(snapshot.Processes, ProcessObservation{Name: "postgres", Status: "running"})
+	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1 << 20}}
+	collector := &HostSnapshotCollector{
+		AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: snapshot}, ProcessNames: []string{"postgres"},
+		BatchLimits: &mutableBatchLimit{value: 1 << 20}, Now: func() time.Time { return now },
+	}
+
+	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
+	decoded, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(store.batches[0].Payload)
+	require.NoError(t, err)
+	points := decodedMetricPoints(t, decoded)
+	requireMetricValue(t, points, "system.processes.count", MaxHostProcesses+1)
+	requireMetricValue(t, points, "dbpilot.inspection.host.database.required_process_count", 1)
 }
 
 func completeHostSnapshot(now time.Time) HostSnapshot {
@@ -181,6 +295,20 @@ type staticHostReader struct {
 func (reader staticHostReader) Read(context.Context) (HostSnapshot, error) {
 	return reader.snapshot, reader.err
 }
+
+type countingHostReader struct {
+	snapshot HostSnapshot
+	calls    int
+}
+
+func (reader *countingHostReader) Read(context.Context) (HostSnapshot, error) {
+	reader.calls++
+	return reader.snapshot, nil
+}
+
+type mutableBatchLimit struct{ value int64 }
+
+func (limit *mutableBatchLimit) BatchMaxBytes() int64 { return limit.value }
 
 type staticLogSummaryProvider struct {
 	summaries        []LogSummary

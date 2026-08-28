@@ -8,6 +8,7 @@ import (
 	"maps"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dbpilot.local/platform/internal/policy"
@@ -451,9 +452,7 @@ func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) err
 		observed := plog.NewLogs()
 		logs.CopyTo(observed)
 		if err := safelyObserveLogs(c.observer, ctx, observed); err != nil {
-			if health, ok := c.observer.(interface{ RecordObserverFailure() }); ok {
-				health.RecordObserverFailure()
-			}
+			safelyRecordObserverFailure(c.observer)
 		}
 	}
 	for index := 0; index < logs.ResourceLogs().Len(); index++ {
@@ -475,6 +474,13 @@ func (c *spoolLogsConsumer) ConsumeLogs(ctx context.Context, logs plog.Logs) err
 		}
 	}
 	return nil
+}
+
+func safelyRecordObserverFailure(observer LogObserver) {
+	defer func() { _ = recover() }()
+	if health, ok := observer.(interface{ RecordObserverFailure() }); ok {
+		health.RecordObserverFailure()
+	}
 }
 
 func safelyObserveLogs(observer LogObserver, ctx context.Context, logs plog.Logs) (err error) {
@@ -587,8 +593,9 @@ type Engine struct {
 	builder Builder
 	catalog Catalog
 
-	transitionMu sync.Mutex
-	active       Candidate
+	transitionMu  sync.Mutex
+	active        Candidate
+	batchMaxBytes atomic.Int64
 }
 
 // NewEngine creates an empty telemetry engine. A nil builder is retained so
@@ -607,6 +614,15 @@ func (e *Engine) ActiveVersion() uint64 {
 	return e.active.Version()
 }
 
+// BatchMaxBytes returns zero until a signed policy has activated and after
+// the active pipeline is stopped.
+func (e *Engine) BatchMaxBytes() int64 {
+	if e == nil {
+		return 0
+	}
+	return e.batchMaxBytes.Load()
+}
+
 // Stop retires the active pipeline during agent shutdown. Apply and Stop are
 // serialized so a candidate cannot be published after shutdown begins.
 func (e *Engine) Stop(ctx context.Context) error {
@@ -617,6 +633,7 @@ func (e *Engine) Stop(ctx context.Context) error {
 	}
 	active := e.active
 	e.active = nil
+	e.batchMaxBytes.Store(0)
 	return active.Stop(ctx)
 }
 
@@ -691,6 +708,7 @@ func (e *Engine) Apply(ctx context.Context, p policy.Policy) (ApplyResult, error
 
 	old := e.active
 	e.active = candidate
+	e.batchMaxBytes.Store(cfg.BatchMaxBytes())
 	if old == nil {
 		return ApplyResult{Version: p.Version, State: ApplyActive}, nil
 	}
