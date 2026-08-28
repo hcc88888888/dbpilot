@@ -482,6 +482,34 @@ func TestInspectionCatalogSeedIsScopedAndIdempotent(t *testing.T) {
 	require.Equal(t, created, store.creates, "restart must not create a second catalog version")
 }
 
+func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabilities(t *testing.T) {
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	configured, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "Primary", Host: "db-1.example", Labels: map[string]string{"role": "database"}, Connectivity: "unknown", Capabilities: []string{}}})
+	require.NoError(t, err)
+	registry := &staticInspectionSessionRegistry{sessions: map[string]agentcontrol.SessionInfo{}}
+	resolver := liveInspectionTargetResolver{configured: configured, registry: registry}
+
+	offline, err := resolver.List(context.Background(), scope)
+	require.NoError(t, err)
+	require.Equal(t, "offline", offline[0].Connectivity)
+	require.Empty(t, offline[0].Capabilities)
+
+	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "host.inspect"}}
+	online, err := resolver.List(context.Background(), scope)
+	require.NoError(t, err)
+	require.Equal(t, "online", online[0].Connectivity)
+	require.Equal(t, []string{"collect_now", "host.inspect"}, online[0].Capabilities)
+}
+
+type staticInspectionSessionRegistry struct {
+	sessions map[string]agentcontrol.SessionInfo
+}
+
+func (registry *staticInspectionSessionRegistry) Session(agentID string) (agentcontrol.SessionInfo, bool) {
+	value, ok := registry.sessions[agentID]
+	return value, ok
+}
+
 type memoryInspectionCatalog struct {
 	items   map[string]inspection.Item
 	creates int

@@ -403,7 +403,7 @@ func NewServer(config Config) (*Server, error) {
 	if agentRegistry == nil {
 		agentRegistry = agentcontrol.NewRegistry(64)
 	}
-	inspectionTargets, err := inspection.NewConfiguredTargetResolver(configuredInspectionTargets(config.Agents))
+	configuredTargets, err := inspection.NewConfiguredTargetResolver(configuredInspectionTargets(config.Agents))
 	if err != nil {
 		if artifactBlobs != nil {
 			_ = artifactBlobs.Close()
@@ -413,6 +413,7 @@ func NewServer(config Config) (*Server, error) {
 		}
 		return nil, fmt.Errorf("configure inspection targets: %w", err)
 	}
+	inspectionTargets := liveInspectionTargetResolver{configured: configuredTargets, registry: agentRegistry}
 	inspectionRepository := inspection.NewPostgresRepository(database, jobRepository)
 	inspectionService := &inspection.Service{Repository: inspectionRepository, Targets: inspectionTargets}
 	inspectionWorker := &inspection.Worker{Runs: inspectionRepository, Jobs: jobRepository, Evaluator: &inspection.Evaluator{Evidence: inspectionRepository}, Artifacts: artifactStore, Audit: auditService}
@@ -890,6 +891,54 @@ func configuredInspectionTargets(assignments map[string]AgentAssignment) []inspe
 		})
 	}
 	return result
+}
+
+type inspectionSessionRegistry interface {
+	Session(string) (agentcontrol.SessionInfo, bool)
+}
+
+type liveInspectionTargetResolver struct {
+	configured inspection.TargetResolver
+	registry   inspectionSessionRegistry
+}
+
+func (resolver liveInspectionTargetResolver) Resolve(ctx context.Context, scope platformscope.Scope, selector inspection.TargetSelector) ([]inspection.HostTarget, error) {
+	if resolver.configured == nil {
+		return nil, inspection.ErrInvalid
+	}
+	targets, err := resolver.configured.Resolve(ctx, scope, selector)
+	if err != nil {
+		return nil, err
+	}
+	return resolver.withSessions(targets), nil
+}
+
+func (resolver liveInspectionTargetResolver) List(ctx context.Context, scope platformscope.Scope) ([]inspection.HostTarget, error) {
+	if resolver.configured == nil {
+		return nil, inspection.ErrInvalid
+	}
+	targets, err := resolver.configured.List(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	return resolver.withSessions(targets), nil
+}
+
+func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.HostTarget) []inspection.HostTarget {
+	for index := range targets {
+		targets[index].Connectivity = "offline"
+		targets[index].Capabilities = []string{}
+		if resolver.registry == nil {
+			continue
+		}
+		session, ok := resolver.registry.Session(targets[index].AgentID)
+		if !ok || session.AgentID != targets[index].AgentID {
+			continue
+		}
+		targets[index].Connectivity = "online"
+		targets[index].Capabilities = append([]string(nil), session.Capabilities...)
+	}
+	return targets
 }
 
 type inspectionCatalogStore interface {
