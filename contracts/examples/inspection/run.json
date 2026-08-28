@@ -1,0 +1,23 @@
+{
+  "id": "run-host-health-001",
+  "policy_id": "policy-host-health",
+  "job_id": "job-host-health-001",
+  "status": "collecting",
+  "scheduled_for": null,
+  "started_at": "2026-08-28T08:00:00Z",
+  "finished_at": null,
+  "target_count": 1,
+  "completed_target_count": 0,
+  "failed_target_count": 0,
+  "targets": [
+    {
+      "target_id": "agent-prod-01",
+      "agent_id": "agent-prod-01",
+      "status": "collecting",
+      "command_id": "command-host-health-001",
+      "observed_at": null
+    }
+  ],
+  "findings": [],
+  "created_at": "2026-08-28T08:00:00Z"
+}

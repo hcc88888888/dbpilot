@@ -23,21 +23,270 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for InspectionConnectivity.
+const (
+	Offline InspectionConnectivity = "offline"
+	Online  InspectionConnectivity = "online"
+	Unknown InspectionConnectivity = "unknown"
+)
+
+// Valid indicates whether the value is a known member of the InspectionConnectivity enum.
+func (e InspectionConnectivity) Valid() bool {
+	switch e {
+	case Offline:
+		return true
+	case Online:
+		return true
+	case Unknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionFindingLevel.
+const (
+	InspectionFindingLevelCritical    InspectionFindingLevel = "critical"
+	InspectionFindingLevelHealthy     InspectionFindingLevel = "healthy"
+	InspectionFindingLevelMissingData InspectionFindingLevel = "missing_data"
+	InspectionFindingLevelUnsupported InspectionFindingLevel = "unsupported"
+	InspectionFindingLevelWarning     InspectionFindingLevel = "warning"
+)
+
+// Valid indicates whether the value is a known member of the InspectionFindingLevel enum.
+func (e InspectionFindingLevel) Valid() bool {
+	switch e {
+	case InspectionFindingLevelCritical:
+		return true
+	case InspectionFindingLevelHealthy:
+		return true
+	case InspectionFindingLevelMissingData:
+		return true
+	case InspectionFindingLevelUnsupported:
+		return true
+	case InspectionFindingLevelWarning:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionMetricAggregation.
+const (
+	Avg    InspectionMetricAggregation = "avg"
+	Latest InspectionMetricAggregation = "latest"
+	Max    InspectionMetricAggregation = "max"
+	Min    InspectionMetricAggregation = "min"
+)
+
+// Valid indicates whether the value is a known member of the InspectionMetricAggregation enum.
+func (e InspectionMetricAggregation) Valid() bool {
+	switch e {
+	case Avg:
+		return true
+	case Latest:
+		return true
+	case Max:
+		return true
+	case Min:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionMetricOperator.
+const (
+	Gt  InspectionMetricOperator = "gt"
+	Gte InspectionMetricOperator = "gte"
+	Lt  InspectionMetricOperator = "lt"
+	Lte InspectionMetricOperator = "lte"
+)
+
+// Valid indicates whether the value is a known member of the InspectionMetricOperator enum.
+func (e InspectionMetricOperator) Valid() bool {
+	switch e {
+	case Gt:
+		return true
+	case Gte:
+		return true
+	case Lt:
+		return true
+	case Lte:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionMetricWindow.
+const (
+	N15m InspectionMetricWindow = "15m"
+	N1h  InspectionMetricWindow = "1h"
+	N5m  InspectionMetricWindow = "5m"
+)
+
+// Valid indicates whether the value is a known member of the InspectionMetricWindow enum.
+func (e InspectionMetricWindow) Valid() bool {
+	switch e {
+	case N15m:
+		return true
+	case N1h:
+		return true
+	case N5m:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionReportStatus.
+const (
+	InspectionReportStatusCompleted  InspectionReportStatus = "completed"
+	InspectionReportStatusFailed     InspectionReportStatus = "failed"
+	InspectionReportStatusGenerating InspectionReportStatus = "generating"
+)
+
+// Valid indicates whether the value is a known member of the InspectionReportStatus enum.
+func (e InspectionReportStatus) Valid() bool {
+	switch e {
+	case InspectionReportStatusCompleted:
+		return true
+	case InspectionReportStatusFailed:
+		return true
+	case InspectionReportStatusGenerating:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionRunStatus.
+const (
+	InspectionRunStatusCancelled        InspectionRunStatus = "cancelled"
+	InspectionRunStatusCollecting       InspectionRunStatus = "collecting"
+	InspectionRunStatusCompleted        InspectionRunStatus = "completed"
+	InspectionRunStatusEvaluating       InspectionRunStatus = "evaluating"
+	InspectionRunStatusFailed           InspectionRunStatus = "failed"
+	InspectionRunStatusGeneratingReport InspectionRunStatus = "generating_report"
+	InspectionRunStatusPartial          InspectionRunStatus = "partial"
+	InspectionRunStatusQueued           InspectionRunStatus = "queued"
+)
+
+// Valid indicates whether the value is a known member of the InspectionRunStatus enum.
+func (e InspectionRunStatus) Valid() bool {
+	switch e {
+	case InspectionRunStatusCancelled:
+		return true
+	case InspectionRunStatusCollecting:
+		return true
+	case InspectionRunStatusCompleted:
+		return true
+	case InspectionRunStatusEvaluating:
+		return true
+	case InspectionRunStatusFailed:
+		return true
+	case InspectionRunStatusGeneratingReport:
+		return true
+	case InspectionRunStatusPartial:
+		return true
+	case InspectionRunStatusQueued:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionScopeType.
+const (
+	Database InspectionScopeType = "database"
+	Host     InspectionScopeType = "host"
+)
+
+// Valid indicates whether the value is a known member of the InspectionScopeType enum.
+func (e InspectionScopeType) Valid() bool {
+	switch e {
+	case Database:
+		return true
+	case Host:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionSourceType.
+const (
+	LogSummary InspectionSourceType = "log_summary"
+	Metadata   InspectionSourceType = "metadata"
+	Metric     InspectionSourceType = "metric"
+	Probe      InspectionSourceType = "probe"
+)
+
+// Valid indicates whether the value is a known member of the InspectionSourceType enum.
+func (e InspectionSourceType) Valid() bool {
+	switch e {
+	case LogSummary:
+		return true
+	case Metadata:
+		return true
+	case Metric:
+		return true
+	case Probe:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InspectionTargetRunStatus.
+const (
+	InspectionTargetRunStatusCancelled   InspectionTargetRunStatus = "cancelled"
+	InspectionTargetRunStatusCollecting  InspectionTargetRunStatus = "collecting"
+	InspectionTargetRunStatusEvaluating  InspectionTargetRunStatus = "evaluating"
+	InspectionTargetRunStatusFailed      InspectionTargetRunStatus = "failed"
+	InspectionTargetRunStatusPending     InspectionTargetRunStatus = "pending"
+	InspectionTargetRunStatusSucceeded   InspectionTargetRunStatus = "succeeded"
+	InspectionTargetRunStatusUnsupported InspectionTargetRunStatus = "unsupported"
+)
+
+// Valid indicates whether the value is a known member of the InspectionTargetRunStatus enum.
+func (e InspectionTargetRunStatus) Valid() bool {
+	switch e {
+	case InspectionTargetRunStatusCancelled:
+		return true
+	case InspectionTargetRunStatusCollecting:
+		return true
+	case InspectionTargetRunStatusEvaluating:
+		return true
+	case InspectionTargetRunStatusFailed:
+		return true
+	case InspectionTargetRunStatusPending:
+		return true
+	case InspectionTargetRunStatusSucceeded:
+		return true
+	case InspectionTargetRunStatusUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for JobOutcome.
 const (
-	Complete JobOutcome = "complete"
-	None     JobOutcome = "none"
-	Partial  JobOutcome = "partial"
+	JobOutcomeComplete JobOutcome = "complete"
+	JobOutcomeNone     JobOutcome = "none"
+	JobOutcomePartial  JobOutcome = "partial"
 )
 
 // Valid indicates whether the value is a known member of the JobOutcome enum.
 func (e JobOutcome) Valid() bool {
 	switch e {
-	case Complete:
+	case JobOutcomeComplete:
 		return true
-	case None:
+	case JobOutcomeNone:
 		return true
-	case Partial:
+	case JobOutcomePartial:
 		return true
 	default:
 		return false
@@ -46,34 +295,34 @@ func (e JobOutcome) Valid() bool {
 
 // Defines values for JobStatus.
 const (
-	Cancelled  JobStatus = "cancelled"
-	Cancelling JobStatus = "cancelling"
-	Dispatched JobStatus = "dispatched"
-	Failed     JobStatus = "failed"
-	Queued     JobStatus = "queued"
-	Running    JobStatus = "running"
-	Succeeded  JobStatus = "succeeded"
-	TimedOut   JobStatus = "timed_out"
+	JobStatusCancelled  JobStatus = "cancelled"
+	JobStatusCancelling JobStatus = "cancelling"
+	JobStatusDispatched JobStatus = "dispatched"
+	JobStatusFailed     JobStatus = "failed"
+	JobStatusQueued     JobStatus = "queued"
+	JobStatusRunning    JobStatus = "running"
+	JobStatusSucceeded  JobStatus = "succeeded"
+	JobStatusTimedOut   JobStatus = "timed_out"
 )
 
 // Valid indicates whether the value is a known member of the JobStatus enum.
 func (e JobStatus) Valid() bool {
 	switch e {
-	case Cancelled:
+	case JobStatusCancelled:
 		return true
-	case Cancelling:
+	case JobStatusCancelling:
 		return true
-	case Dispatched:
+	case JobStatusDispatched:
 		return true
-	case Failed:
+	case JobStatusFailed:
 		return true
-	case Queued:
+	case JobStatusQueued:
 		return true
-	case Running:
+	case JobStatusRunning:
 		return true
-	case Succeeded:
+	case JobStatusSucceeded:
 		return true
-	case TimedOut:
+	case JobStatusTimedOut:
 		return true
 	default:
 		return false
@@ -182,6 +431,42 @@ type CapabilitySet struct {
 // CommandId Opaque Agent command identifier.
 type CommandId = string
 
+// CreateInspectionItemRequest defines model for CreateInspectionItemRequest.
+type CreateInspectionItemRequest struct {
+	Category               string                `json:"category"`
+	DatabaseTypes          *[]string             `json:"database_types,omitempty"`
+	Description            string                `json:"description"`
+	DocumentationUrl       *string               `json:"documentation_url,omitempty"`
+	EvidenceSelector       string                `json:"evidence_selector"`
+	MetricRule             *InspectionMetricRule `json:"metric_rule,omitempty"`
+	Name                   string                `json:"name"`
+	ProbeRule              *InspectionProbeRule  `json:"probe_rule,omitempty"`
+	RecommendationTemplate string                `json:"recommendation_template"`
+	RequiredCapabilities   *[]string             `json:"required_capabilities,omitempty"`
+	ScopeType              InspectionScopeType   `json:"scope_type"`
+	SourceType             InspectionSourceType  `json:"source_type"`
+}
+
+// CreateInspectionPolicyRequest defines model for CreateInspectionPolicyRequest.
+type CreateInspectionPolicyRequest struct {
+	Enabled              bool                   `json:"enabled"`
+	ItemVersions         []InspectionPolicyItem `json:"item_versions"`
+	Labels               *map[string]string     `json:"labels,omitempty"`
+	MaxConcurrency       *int                   `json:"max_concurrency,omitempty"`
+	Name                 string                 `json:"name"`
+	Schedule             *InspectionSchedule    `json:"schedule,omitempty"`
+	TargetIds            []string               `json:"target_ids"`
+	TargetTimeoutSeconds *int                   `json:"target_timeout_seconds,omitempty"`
+}
+
+// CreateInspectionRunRequest defines model for CreateInspectionRunRequest.
+type CreateInspectionRunRequest struct {
+	ItemVersions         []InspectionPolicyItem `json:"item_versions"`
+	MaxConcurrency       *int                   `json:"max_concurrency,omitempty"`
+	TargetIds            []string               `json:"target_ids"`
+	TargetTimeoutSeconds *int                   `json:"target_timeout_seconds,omitempty"`
+}
+
 // DownloadDescriptor defines model for DownloadDescriptor.
 type DownloadDescriptor struct {
 	// ExpiresAt RFC 3339 timestamp in UTC, represented with a Z suffix.
@@ -198,6 +483,225 @@ type FieldError struct {
 	Field   string `json:"field"`
 	Message string `json:"message"`
 }
+
+// InspectionConnectivity defines model for InspectionConnectivity.
+type InspectionConnectivity string
+
+// InspectionFinding defines model for InspectionFinding.
+type InspectionFinding struct {
+	CriticalThreshold *float32               `json:"critical_threshold,omitempty"`
+	Evidence          string                 `json:"evidence"`
+	Id                string                 `json:"id"`
+	ItemId            string                 `json:"item_id"`
+	ItemVersion       int                    `json:"item_version"`
+	Level             InspectionFindingLevel `json:"level"`
+
+	// ObservedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	ObservedAt       UtcTimestamp `json:"observed_at"`
+	Recommendation   string       `json:"recommendation"`
+	Summary          string       `json:"summary"`
+	TargetId         string       `json:"target_id"`
+	WarningThreshold *float32     `json:"warning_threshold,omitempty"`
+}
+
+// InspectionFindingLevel defines model for InspectionFindingLevel.
+type InspectionFindingLevel string
+
+// InspectionItem defines model for InspectionItem.
+type InspectionItem struct {
+	Category string `json:"category"`
+
+	// CreatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	CreatedAt              UtcTimestamp          `json:"created_at"`
+	DatabaseTypes          *[]string             `json:"database_types,omitempty"`
+	Description            string                `json:"description"`
+	DocumentationUrl       *string               `json:"documentation_url,omitempty"`
+	Enabled                bool                  `json:"enabled"`
+	EvidenceSelector       string                `json:"evidence_selector"`
+	Id                     string                `json:"id"`
+	MetricRule             *InspectionMetricRule `json:"metric_rule,omitempty"`
+	Name                   string                `json:"name"`
+	ProbeRule              *InspectionProbeRule  `json:"probe_rule,omitempty"`
+	RecommendationTemplate string                `json:"recommendation_template"`
+	RequiredCapabilities   *[]string             `json:"required_capabilities,omitempty"`
+	ScopeType              InspectionScopeType   `json:"scope_type"`
+	SourceType             InspectionSourceType  `json:"source_type"`
+	System                 bool                  `json:"system"`
+
+	// UpdatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	UpdatedAt UtcTimestamp `json:"updated_at"`
+	Version   int          `json:"version"`
+}
+
+// InspectionItemPage defines model for InspectionItemPage.
+type InspectionItemPage struct {
+	Items []InspectionItem `json:"items"`
+	Page  Page             `json:"page"`
+}
+
+// InspectionMetricAggregation defines model for InspectionMetricAggregation.
+type InspectionMetricAggregation string
+
+// InspectionMetricOperator defines model for InspectionMetricOperator.
+type InspectionMetricOperator string
+
+// InspectionMetricRule defines model for InspectionMetricRule.
+type InspectionMetricRule struct {
+	Aggregation       InspectionMetricAggregation `json:"aggregation"`
+	CriticalThreshold float32                     `json:"critical_threshold"`
+	Labels            *map[string]string          `json:"labels,omitempty"`
+	MetricName        string                      `json:"metric_name"`
+	Operator          InspectionMetricOperator    `json:"operator"`
+	WarningThreshold  float32                     `json:"warning_threshold"`
+	Window            InspectionMetricWindow      `json:"window"`
+}
+
+// InspectionMetricWindow defines model for InspectionMetricWindow.
+type InspectionMetricWindow string
+
+// InspectionOverview defines model for InspectionOverview.
+type InspectionOverview struct {
+	FindingLevelCounts    map[string]int `json:"finding_level_counts"`
+	LatestRunStatusCounts map[string]int `json:"latest_run_status_counts"`
+	OnlineTargetCount     int            `json:"online_target_count"`
+	TargetCount           int            `json:"target_count"`
+}
+
+// InspectionPolicy defines model for InspectionPolicy.
+type InspectionPolicy struct {
+	// CreatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	CreatedAt            UtcTimestamp           `json:"created_at"`
+	Enabled              bool                   `json:"enabled"`
+	Id                   string                 `json:"id"`
+	ItemVersions         []InspectionPolicyItem `json:"item_versions"`
+	Labels               map[string]string      `json:"labels"`
+	MaxConcurrency       *int                   `json:"max_concurrency,omitempty"`
+	Name                 string                 `json:"name"`
+	NextRunAt            *UtcTimestamp          `json:"next_run_at,omitempty"`
+	Schedule             *InspectionSchedule    `json:"schedule,omitempty"`
+	TargetIds            []string               `json:"target_ids"`
+	TargetTimeoutSeconds *int                   `json:"target_timeout_seconds,omitempty"`
+
+	// UpdatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	UpdatedAt UtcTimestamp `json:"updated_at"`
+	Version   int          `json:"version"`
+}
+
+// InspectionPolicyItem defines model for InspectionPolicyItem.
+type InspectionPolicyItem struct {
+	ItemId  string `json:"item_id"`
+	Version int    `json:"version"`
+}
+
+// InspectionPolicyPage defines model for InspectionPolicyPage.
+type InspectionPolicyPage struct {
+	Items []InspectionPolicy `json:"items"`
+	Page  Page               `json:"page"`
+}
+
+// InspectionProbeRule defines model for InspectionProbeRule.
+type InspectionProbeRule struct {
+	ProbeTemplateId string `json:"probe_template_id"`
+}
+
+// InspectionReport defines model for InspectionReport.
+type InspectionReport struct {
+	Artifacts []ArtifactReference  `json:"artifacts"`
+	Findings  *[]InspectionFinding `json:"findings,omitempty"`
+
+	// GeneratedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	GeneratedAt UtcTimestamp           `json:"generated_at"`
+	Id          string                 `json:"id"`
+	PolicyId    *string                `json:"policy_id,omitempty"`
+	RunId       string                 `json:"run_id"`
+	Status      InspectionReportStatus `json:"status"`
+	Summary     string                 `json:"summary"`
+}
+
+// InspectionReportPage defines model for InspectionReportPage.
+type InspectionReportPage struct {
+	Items []InspectionReport `json:"items"`
+	Page  Page               `json:"page"`
+}
+
+// InspectionReportStatus defines model for InspectionReportStatus.
+type InspectionReportStatus string
+
+// InspectionRun defines model for InspectionRun.
+type InspectionRun struct {
+	CompletedTargetCount int `json:"completed_target_count"`
+
+	// CreatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
+	CreatedAt         UtcTimestamp         `json:"created_at"`
+	FailedTargetCount int                  `json:"failed_target_count"`
+	Findings          *[]InspectionFinding `json:"findings,omitempty"`
+	FinishedAt        *UtcTimestamp        `json:"finished_at,omitempty"`
+	Id                string               `json:"id"`
+
+	// JobId Opaque job identifier.
+	JobId        *JobId                 `json:"job_id,omitempty"`
+	PolicyId     *string                `json:"policy_id,omitempty"`
+	ReportId     *string                `json:"report_id,omitempty"`
+	RetryOfRunId *string                `json:"retry_of_run_id,omitempty"`
+	ScheduledFor *UtcTimestamp          `json:"scheduled_for,omitempty"`
+	StartedAt    *UtcTimestamp          `json:"started_at,omitempty"`
+	Status       InspectionRunStatus    `json:"status"`
+	TargetCount  int                    `json:"target_count"`
+	Targets      *[]InspectionTargetRun `json:"targets,omitempty"`
+}
+
+// InspectionRunPage defines model for InspectionRunPage.
+type InspectionRunPage struct {
+	Items []InspectionRun `json:"items"`
+	Page  Page            `json:"page"`
+}
+
+// InspectionRunStatus defines model for InspectionRunStatus.
+type InspectionRunStatus string
+
+// InspectionSchedule defines model for InspectionSchedule.
+type InspectionSchedule struct {
+	// Cron Five-field cron expression; seconds are not accepted.
+	Cron     string `json:"cron"`
+	Timezone string `json:"timezone"`
+}
+
+// InspectionScopeType defines model for InspectionScopeType.
+type InspectionScopeType string
+
+// InspectionSourceType defines model for InspectionSourceType.
+type InspectionSourceType string
+
+// InspectionTarget defines model for InspectionTarget.
+type InspectionTarget struct {
+	AgentId      string                 `json:"agent_id"`
+	Capabilities []string               `json:"capabilities"`
+	Connectivity InspectionConnectivity `json:"connectivity"`
+	DisplayName  string                 `json:"display_name"`
+	Host         string                 `json:"host"`
+	Labels       map[string]string      `json:"labels"`
+}
+
+// InspectionTargetPage defines model for InspectionTargetPage.
+type InspectionTargetPage struct {
+	Items []InspectionTarget `json:"items"`
+	Page  Page               `json:"page"`
+}
+
+// InspectionTargetRun defines model for InspectionTargetRun.
+type InspectionTargetRun struct {
+	AgentId string `json:"agent_id"`
+
+	// CommandId Opaque Agent command identifier.
+	CommandId  *CommandId                `json:"command_id,omitempty"`
+	ErrorCode  *string                   `json:"error_code,omitempty"`
+	ObservedAt *UtcTimestamp             `json:"observed_at,omitempty"`
+	Status     InspectionTargetRunStatus `json:"status"`
+	TargetId   string                    `json:"target_id"`
+}
+
+// InspectionTargetRunStatus defines model for InspectionTargetRunStatus.
+type InspectionTargetRunStatus string
 
 // InstanceId Opaque database instance identifier.
 type InstanceId = string
@@ -303,6 +807,18 @@ type TenantId = string
 // TraceId Distributed trace identifier.
 type TraceId = string
 
+// UpdateInspectionPolicyRequest defines model for UpdateInspectionPolicyRequest.
+type UpdateInspectionPolicyRequest struct {
+	Enabled              bool                   `json:"enabled"`
+	ItemVersions         []InspectionPolicyItem `json:"item_versions"`
+	Labels               *map[string]string     `json:"labels,omitempty"`
+	MaxConcurrency       *int                   `json:"max_concurrency,omitempty"`
+	Name                 string                 `json:"name"`
+	Schedule             *InspectionSchedule    `json:"schedule,omitempty"`
+	TargetIds            []string               `json:"target_ids"`
+	TargetTimeoutSeconds *int                   `json:"target_timeout_seconds,omitempty"`
+}
+
 // UtcTimestamp RFC 3339 timestamp in UTC, represented with a Z suffix.
 type UtcTimestamp = time.Time
 
@@ -323,6 +839,77 @@ type ListAuditEventsParams struct {
 	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
+// ListInspectionItemsParams defines parameters for ListInspectionItems.
+type ListInspectionItemsParams struct {
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// CreateInspectionItemParams defines parameters for CreateInspectionItem.
+type CreateInspectionItemParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// ListInspectionPoliciesParams defines parameters for ListInspectionPolicies.
+type ListInspectionPoliciesParams struct {
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// CreateInspectionPolicyParams defines parameters for CreateInspectionPolicy.
+type CreateInspectionPolicyParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// UpdateInspectionPolicyParams defines parameters for UpdateInspectionPolicy.
+type UpdateInspectionPolicyParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+	IfMatch        string `json:"If-Match"`
+}
+
+// RunInspectionPolicyParams defines parameters for RunInspectionPolicy.
+type RunInspectionPolicyParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// ListInspectionReportsParams defines parameters for ListInspectionReports.
+type ListInspectionReportsParams struct {
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// CreateInspectionReportDownloadParams defines parameters for CreateInspectionReportDownload.
+type CreateInspectionReportDownloadParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// ListInspectionRunsParams defines parameters for ListInspectionRuns.
+type ListInspectionRunsParams struct {
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// CreateInspectionRunParams defines parameters for CreateInspectionRun.
+type CreateInspectionRunParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// CancelInspectionRunParams defines parameters for CancelInspectionRun.
+type CancelInspectionRunParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// RetryInspectionRunParams defines parameters for RetryInspectionRun.
+type RetryInspectionRunParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+}
+
+// ListInspectionTargetsParams defines parameters for ListInspectionTargets.
+type ListInspectionTargetsParams struct {
+	Cursor *string `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Limit  *int    `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
 // CancelJobParams defines parameters for CancelJob.
 type CancelJobParams struct {
 	IdempotencyKey string `json:"Idempotency-Key"`
@@ -330,6 +917,18 @@ type CancelJobParams struct {
 	// IfMatch Job entity tag matching the version being cancelled.
 	IfMatch string `json:"If-Match"`
 }
+
+// CreateInspectionItemJSONRequestBody defines body for CreateInspectionItem for application/json ContentType.
+type CreateInspectionItemJSONRequestBody = CreateInspectionItemRequest
+
+// CreateInspectionPolicyJSONRequestBody defines body for CreateInspectionPolicy for application/json ContentType.
+type CreateInspectionPolicyJSONRequestBody = CreateInspectionPolicyRequest
+
+// UpdateInspectionPolicyJSONRequestBody defines body for UpdateInspectionPolicy for application/json ContentType.
+type UpdateInspectionPolicyJSONRequestBody = UpdateInspectionPolicyRequest
+
+// CreateInspectionRunJSONRequestBody defines body for CreateInspectionRun for application/json ContentType.
+type CreateInspectionRunJSONRequestBody = CreateInspectionRunRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -345,6 +944,57 @@ type ServerInterface interface {
 	// GetCapabilities Get effective capabilities
 	// (GET /capabilities)
 	GetCapabilities(w http.ResponseWriter, r *http.Request)
+	// ListInspectionItems List inspection items
+	// (GET /inspection-items)
+	ListInspectionItems(w http.ResponseWriter, r *http.Request, params ListInspectionItemsParams)
+	// CreateInspectionItem Create a custom inspection item
+	// (POST /inspection-items)
+	CreateInspectionItem(w http.ResponseWriter, r *http.Request, params CreateInspectionItemParams)
+	// GetInspectionOverview Get host inspection overview
+	// (GET /inspection-overview)
+	GetInspectionOverview(w http.ResponseWriter, r *http.Request)
+	// ListInspectionPolicies List inspection policies
+	// (GET /inspection-policies)
+	ListInspectionPolicies(w http.ResponseWriter, r *http.Request, params ListInspectionPoliciesParams)
+	// CreateInspectionPolicy Create an inspection policy
+	// (POST /inspection-policies)
+	CreateInspectionPolicy(w http.ResponseWriter, r *http.Request, params CreateInspectionPolicyParams)
+	// GetInspectionPolicy Get an inspection policy
+	// (GET /inspection-policies/{policy_id})
+	GetInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string)
+	// UpdateInspectionPolicy Update an inspection policy
+	// (PATCH /inspection-policies/{policy_id})
+	UpdateInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string, params UpdateInspectionPolicyParams)
+	// RunInspectionPolicy Start an inspection policy immediately
+	// (POST /inspection-policies/{policy_id}/run)
+	RunInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string, params RunInspectionPolicyParams)
+	// ListInspectionReports List immutable inspection reports
+	// (GET /inspection-reports)
+	ListInspectionReports(w http.ResponseWriter, r *http.Request, params ListInspectionReportsParams)
+	// GetInspectionReport Get an immutable inspection report
+	// (GET /inspection-reports/{report_id})
+	GetInspectionReport(w http.ResponseWriter, r *http.Request, reportId string)
+	// CreateInspectionReportDownload Create a short-lived inspection report download descriptor
+	// (POST /inspection-reports/{report_id}/download)
+	CreateInspectionReportDownload(w http.ResponseWriter, r *http.Request, reportId string, params CreateInspectionReportDownloadParams)
+	// ListInspectionRuns List inspection runs
+	// (GET /inspection-runs)
+	ListInspectionRuns(w http.ResponseWriter, r *http.Request, params ListInspectionRunsParams)
+	// CreateInspectionRun Start an ad hoc inspection run
+	// (POST /inspection-runs)
+	CreateInspectionRun(w http.ResponseWriter, r *http.Request, params CreateInspectionRunParams)
+	// GetInspectionRun Get an inspection run
+	// (GET /inspection-runs/{run_id})
+	GetInspectionRun(w http.ResponseWriter, r *http.Request, runId string)
+	// CancelInspectionRun Cancel an inspection run
+	// (POST /inspection-runs/{run_id}/cancel)
+	CancelInspectionRun(w http.ResponseWriter, r *http.Request, runId string, params CancelInspectionRunParams)
+	// RetryInspectionRun Retry a terminal inspection run as a new run
+	// (POST /inspection-runs/{run_id}/retry)
+	RetryInspectionRun(w http.ResponseWriter, r *http.Request, runId string, params RetryInspectionRunParams)
+	// ListInspectionTargets List host inspection targets
+	// (GET /inspection-targets)
+	ListInspectionTargets(w http.ResponseWriter, r *http.Request, params ListInspectionTargetsParams)
 	// GetJob Get a job
 	// (GET /jobs/{job_id})
 	GetJob(w http.ResponseWriter, r *http.Request, jobId JobId)
@@ -493,6 +1143,756 @@ func (siw *ServerInterfaceWrapper) GetCapabilities(w http.ResponseWriter, r *htt
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetCapabilities(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInspectionItems operation middleware
+func (siw *ServerInterfaceWrapper) ListInspectionItems(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListInspectionItemsParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInspectionItems(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateInspectionItem operation middleware
+func (siw *ServerInterfaceWrapper) CreateInspectionItem(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateInspectionItemParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateInspectionItem(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetInspectionOverview operation middleware
+func (siw *ServerInterfaceWrapper) GetInspectionOverview(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetInspectionOverview(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInspectionPolicies operation middleware
+func (siw *ServerInterfaceWrapper) ListInspectionPolicies(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListInspectionPoliciesParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInspectionPolicies(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateInspectionPolicy operation middleware
+func (siw *ServerInterfaceWrapper) CreateInspectionPolicy(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateInspectionPolicyParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateInspectionPolicy(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetInspectionPolicy operation middleware
+func (siw *ServerInterfaceWrapper) GetInspectionPolicy(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "policy_id" -------------
+	var policyId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "policy_id", r.PathValue("policy_id"), &policyId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "policy_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetInspectionPolicy(w, r, policyId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// UpdateInspectionPolicy operation middleware
+func (siw *ServerInterfaceWrapper) UpdateInspectionPolicy(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "policy_id" -------------
+	var policyId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "policy_id", r.PathValue("policy_id"), &policyId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "policy_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params UpdateInspectionPolicyParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	// ------------- Required header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = IfMatch
+
+	} else {
+		err := fmt.Errorf("Header parameter If-Match is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "If-Match", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateInspectionPolicy(w, r, policyId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RunInspectionPolicy operation middleware
+func (siw *ServerInterfaceWrapper) RunInspectionPolicy(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "policy_id" -------------
+	var policyId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "policy_id", r.PathValue("policy_id"), &policyId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "policy_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RunInspectionPolicyParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RunInspectionPolicy(w, r, policyId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInspectionReports operation middleware
+func (siw *ServerInterfaceWrapper) ListInspectionReports(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListInspectionReportsParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInspectionReports(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetInspectionReport operation middleware
+func (siw *ServerInterfaceWrapper) GetInspectionReport(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "report_id" -------------
+	var reportId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "report_id", r.PathValue("report_id"), &reportId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "report_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetInspectionReport(w, r, reportId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateInspectionReportDownload operation middleware
+func (siw *ServerInterfaceWrapper) CreateInspectionReportDownload(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "report_id" -------------
+	var reportId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "report_id", r.PathValue("report_id"), &reportId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "report_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateInspectionReportDownloadParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateInspectionReportDownload(w, r, reportId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInspectionRuns operation middleware
+func (siw *ServerInterfaceWrapper) ListInspectionRuns(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListInspectionRunsParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInspectionRuns(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateInspectionRun operation middleware
+func (siw *ServerInterfaceWrapper) CreateInspectionRun(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CreateInspectionRunParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateInspectionRun(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetInspectionRun operation middleware
+func (siw *ServerInterfaceWrapper) GetInspectionRun(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "run_id" -------------
+	var runId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "run_id", r.PathValue("run_id"), &runId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "run_id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetInspectionRun(w, r, runId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CancelInspectionRun operation middleware
+func (siw *ServerInterfaceWrapper) CancelInspectionRun(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "run_id" -------------
+	var runId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "run_id", r.PathValue("run_id"), &runId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "run_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params CancelInspectionRunParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CancelInspectionRun(w, r, runId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RetryInspectionRun operation middleware
+func (siw *ServerInterfaceWrapper) RetryInspectionRun(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "run_id" -------------
+	var runId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "run_id", r.PathValue("run_id"), &runId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "run_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RetryInspectionRunParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RetryInspectionRun(w, r, runId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListInspectionTargets operation middleware
+func (siw *ServerInterfaceWrapper) ListInspectionTargets(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListInspectionTargetsParams
+
+	// ------------- Optional query parameter "cursor" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "cursor", r.URL.Query(), &params.Cursor, runtime.BindQueryParameterOptions{Type: "string", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "cursor"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "cursor", Err: err})
+		}
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameterWithOptions("form", true, false, "limit", r.URL.Query(), &params.Limit, runtime.BindQueryParameterOptions{Type: "integer", Format: ""})
+	if err != nil {
+		var requiredError *runtime.RequiredParameterError
+		if errors.As(err, &requiredError) {
+			siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "limit"})
+		} else {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		}
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListInspectionTargets(w, r, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -729,6 +2129,23 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/artifacts/{artifact_id}/actions/download", wrapper.CreateArtifactDownload)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/audit-events", wrapper.ListAuditEvents)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/capabilities", wrapper.GetCapabilities)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-items", wrapper.ListInspectionItems)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-items", wrapper.CreateInspectionItem)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-overview", wrapper.GetInspectionOverview)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-policies", wrapper.ListInspectionPolicies)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-policies", wrapper.CreateInspectionPolicy)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-policies/{policy_id}", wrapper.GetInspectionPolicy)
+	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/inspection-policies/{policy_id}", wrapper.UpdateInspectionPolicy)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-policies/{policy_id}/run", wrapper.RunInspectionPolicy)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-reports", wrapper.ListInspectionReports)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-reports/{report_id}", wrapper.GetInspectionReport)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-reports/{report_id}/download", wrapper.CreateInspectionReportDownload)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-runs", wrapper.ListInspectionRuns)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-runs", wrapper.CreateInspectionRun)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-runs/{run_id}", wrapper.GetInspectionRun)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-runs/{run_id}/cancel", wrapper.CancelInspectionRun)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/inspection-runs/{run_id}/retry", wrapper.RetryInspectionRun)
+	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/inspection-targets", wrapper.ListInspectionTargets)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/jobs/{job_id}", wrapper.GetJob)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/jobs/{job_id}/actions/cancel", wrapper.CancelJob)
 
@@ -1120,6 +2537,1687 @@ func (response GetCapabilities405ApplicationProblemPlusJSONResponse) VisitGetCap
 	return err
 }
 
+type ListInspectionItemsRequestObject struct {
+	Params ListInspectionItemsParams
+}
+
+type ListInspectionItemsResponseObject interface {
+	VisitListInspectionItemsResponse(w http.ResponseWriter) error
+}
+
+type ListInspectionItems200JSONResponse InspectionItemPage
+
+func (response ListInspectionItems200JSONResponse) VisitListInspectionItemsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionItems400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionItems400ApplicationProblemPlusJSONResponse) VisitListInspectionItemsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionItems401ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionItems401ApplicationProblemPlusJSONResponse) VisitListInspectionItemsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionItems403ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionItems403ApplicationProblemPlusJSONResponse) VisitListInspectionItemsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionItems405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionItems405ApplicationProblemPlusJSONResponse) VisitListInspectionItemsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItemRequestObject struct {
+	Params CreateInspectionItemParams
+	Body   *CreateInspectionItemJSONRequestBody
+}
+
+type CreateInspectionItemResponseObject interface {
+	VisitCreateInspectionItemResponse(w http.ResponseWriter) error
+}
+
+type CreateInspectionItem201JSONResponse InspectionItem
+
+func (response CreateInspectionItem201JSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItem400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionItem400ApplicationProblemPlusJSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItem401ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionItem401ApplicationProblemPlusJSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItem403ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionItem403ApplicationProblemPlusJSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItem405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionItem405ApplicationProblemPlusJSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionItem409ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionItem409ApplicationProblemPlusJSONResponse) VisitCreateInspectionItemResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionOverviewRequestObject struct {
+}
+
+type GetInspectionOverviewResponseObject interface {
+	VisitGetInspectionOverviewResponse(w http.ResponseWriter) error
+}
+
+type GetInspectionOverview200JSONResponse InspectionOverview
+
+func (response GetInspectionOverview200JSONResponse) VisitGetInspectionOverviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionOverview400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionOverview400ApplicationProblemPlusJSONResponse) VisitGetInspectionOverviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionOverview401ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionOverview401ApplicationProblemPlusJSONResponse) VisitGetInspectionOverviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionOverview403ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionOverview403ApplicationProblemPlusJSONResponse) VisitGetInspectionOverviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionOverview405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionOverview405ApplicationProblemPlusJSONResponse) VisitGetInspectionOverviewResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionPoliciesRequestObject struct {
+	Params ListInspectionPoliciesParams
+}
+
+type ListInspectionPoliciesResponseObject interface {
+	VisitListInspectionPoliciesResponse(w http.ResponseWriter) error
+}
+
+type ListInspectionPolicies200JSONResponse InspectionPolicyPage
+
+func (response ListInspectionPolicies200JSONResponse) VisitListInspectionPoliciesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionPolicies400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionPolicies400ApplicationProblemPlusJSONResponse) VisitListInspectionPoliciesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionPolicies401ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionPolicies401ApplicationProblemPlusJSONResponse) VisitListInspectionPoliciesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionPolicies403ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionPolicies403ApplicationProblemPlusJSONResponse) VisitListInspectionPoliciesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionPolicies405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionPolicies405ApplicationProblemPlusJSONResponse) VisitListInspectionPoliciesResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicyRequestObject struct {
+	Params CreateInspectionPolicyParams
+	Body   *CreateInspectionPolicyJSONRequestBody
+}
+
+type CreateInspectionPolicyResponseObject interface {
+	VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error
+}
+
+type CreateInspectionPolicy201ResponseHeaders struct {
+	ETag string
+}
+
+type CreateInspectionPolicy201JSONResponse struct {
+	Body    InspectionPolicy
+	Headers CreateInspectionPolicy201ResponseHeaders
+}
+
+func (response CreateInspectionPolicy201JSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(201)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicy400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionPolicy400ApplicationProblemPlusJSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicy401ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionPolicy401ApplicationProblemPlusJSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicy403ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionPolicy403ApplicationProblemPlusJSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicy405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionPolicy405ApplicationProblemPlusJSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionPolicy409ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionPolicy409ApplicationProblemPlusJSONResponse) VisitCreateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicyRequestObject struct {
+	PolicyId string `json:"policy_id"`
+}
+
+type GetInspectionPolicyResponseObject interface {
+	VisitGetInspectionPolicyResponse(w http.ResponseWriter) error
+}
+
+type GetInspectionPolicy200ResponseHeaders struct {
+	ETag string
+}
+
+type GetInspectionPolicy200JSONResponse struct {
+	Body    InspectionPolicy
+	Headers GetInspectionPolicy200ResponseHeaders
+}
+
+func (response GetInspectionPolicy200JSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicy400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionPolicy400ApplicationProblemPlusJSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicy401ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionPolicy401ApplicationProblemPlusJSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicy403ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionPolicy403ApplicationProblemPlusJSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicy404ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionPolicy404ApplicationProblemPlusJSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionPolicy405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionPolicy405ApplicationProblemPlusJSONResponse) VisitGetInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicyRequestObject struct {
+	PolicyId string `json:"policy_id"`
+	Params   UpdateInspectionPolicyParams
+	Body     *UpdateInspectionPolicyJSONRequestBody
+}
+
+type UpdateInspectionPolicyResponseObject interface {
+	VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error
+}
+
+type UpdateInspectionPolicy200ResponseHeaders struct {
+	ETag string
+}
+
+type UpdateInspectionPolicy200JSONResponse struct {
+	Body    InspectionPolicy
+	Headers UpdateInspectionPolicy200ResponseHeaders
+}
+
+func (response UpdateInspectionPolicy200JSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateInspectionPolicy400ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy401ApplicationProblemPlusJSONResponse Problem
+
+func (response UpdateInspectionPolicy401ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy403ApplicationProblemPlusJSONResponse Problem
+
+func (response UpdateInspectionPolicy403ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy404ApplicationProblemPlusJSONResponse Problem
+
+func (response UpdateInspectionPolicy404ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response UpdateInspectionPolicy405ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy409ApplicationProblemPlusJSONResponse Problem
+
+func (response UpdateInspectionPolicy409ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type UpdateInspectionPolicy412ApplicationProblemPlusJSONResponse Problem
+
+func (response UpdateInspectionPolicy412ApplicationProblemPlusJSONResponse) VisitUpdateInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(412)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicyRequestObject struct {
+	PolicyId string `json:"policy_id"`
+	Params   RunInspectionPolicyParams
+}
+
+type RunInspectionPolicyResponseObject interface {
+	VisitRunInspectionPolicyResponse(w http.ResponseWriter) error
+}
+
+type RunInspectionPolicy202JSONResponse InspectionRun
+
+func (response RunInspectionPolicy202JSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RunInspectionPolicy400ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy401ApplicationProblemPlusJSONResponse Problem
+
+func (response RunInspectionPolicy401ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy403ApplicationProblemPlusJSONResponse Problem
+
+func (response RunInspectionPolicy403ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy404ApplicationProblemPlusJSONResponse Problem
+
+func (response RunInspectionPolicy404ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RunInspectionPolicy405ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RunInspectionPolicy409ApplicationProblemPlusJSONResponse Problem
+
+func (response RunInspectionPolicy409ApplicationProblemPlusJSONResponse) VisitRunInspectionPolicyResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionReportsRequestObject struct {
+	Params ListInspectionReportsParams
+}
+
+type ListInspectionReportsResponseObject interface {
+	VisitListInspectionReportsResponse(w http.ResponseWriter) error
+}
+
+type ListInspectionReports200JSONResponse InspectionReportPage
+
+func (response ListInspectionReports200JSONResponse) VisitListInspectionReportsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionReports400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionReports400ApplicationProblemPlusJSONResponse) VisitListInspectionReportsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionReports401ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionReports401ApplicationProblemPlusJSONResponse) VisitListInspectionReportsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionReports403ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionReports403ApplicationProblemPlusJSONResponse) VisitListInspectionReportsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionReports405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionReports405ApplicationProblemPlusJSONResponse) VisitListInspectionReportsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReportRequestObject struct {
+	ReportId string `json:"report_id"`
+}
+
+type GetInspectionReportResponseObject interface {
+	VisitGetInspectionReportResponse(w http.ResponseWriter) error
+}
+
+type GetInspectionReport200JSONResponse InspectionReport
+
+func (response GetInspectionReport200JSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReport400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionReport400ApplicationProblemPlusJSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReport401ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionReport401ApplicationProblemPlusJSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReport403ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionReport403ApplicationProblemPlusJSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReport404ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionReport404ApplicationProblemPlusJSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionReport405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionReport405ApplicationProblemPlusJSONResponse) VisitGetInspectionReportResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownloadRequestObject struct {
+	ReportId string `json:"report_id"`
+	Params   CreateInspectionReportDownloadParams
+}
+
+type CreateInspectionReportDownloadResponseObject interface {
+	VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error
+}
+
+type CreateInspectionReportDownload200JSONResponse DownloadDescriptor
+
+func (response CreateInspectionReportDownload200JSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionReportDownload400ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload401ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionReportDownload401ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload403ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionReportDownload403ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload404ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionReportDownload404ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionReportDownload405ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionReportDownload409ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionReportDownload409ApplicationProblemPlusJSONResponse) VisitCreateInspectionReportDownloadResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionRunsRequestObject struct {
+	Params ListInspectionRunsParams
+}
+
+type ListInspectionRunsResponseObject interface {
+	VisitListInspectionRunsResponse(w http.ResponseWriter) error
+}
+
+type ListInspectionRuns200JSONResponse InspectionRunPage
+
+func (response ListInspectionRuns200JSONResponse) VisitListInspectionRunsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionRuns400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionRuns400ApplicationProblemPlusJSONResponse) VisitListInspectionRunsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionRuns401ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionRuns401ApplicationProblemPlusJSONResponse) VisitListInspectionRunsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionRuns403ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionRuns403ApplicationProblemPlusJSONResponse) VisitListInspectionRunsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionRuns405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionRuns405ApplicationProblemPlusJSONResponse) VisitListInspectionRunsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRunRequestObject struct {
+	Params CreateInspectionRunParams
+	Body   *CreateInspectionRunJSONRequestBody
+}
+
+type CreateInspectionRunResponseObject interface {
+	VisitCreateInspectionRunResponse(w http.ResponseWriter) error
+}
+
+type CreateInspectionRun202JSONResponse InspectionRun
+
+func (response CreateInspectionRun202JSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRun400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionRun400ApplicationProblemPlusJSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRun401ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionRun401ApplicationProblemPlusJSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRun403ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionRun403ApplicationProblemPlusJSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRun405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CreateInspectionRun405ApplicationProblemPlusJSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CreateInspectionRun409ApplicationProblemPlusJSONResponse Problem
+
+func (response CreateInspectionRun409ApplicationProblemPlusJSONResponse) VisitCreateInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRunRequestObject struct {
+	RunId string `json:"run_id"`
+}
+
+type GetInspectionRunResponseObject interface {
+	VisitGetInspectionRunResponse(w http.ResponseWriter) error
+}
+
+type GetInspectionRun200JSONResponse InspectionRun
+
+func (response GetInspectionRun200JSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRun400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionRun400ApplicationProblemPlusJSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRun401ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionRun401ApplicationProblemPlusJSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRun403ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionRun403ApplicationProblemPlusJSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRun404ApplicationProblemPlusJSONResponse Problem
+
+func (response GetInspectionRun404ApplicationProblemPlusJSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type GetInspectionRun405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response GetInspectionRun405ApplicationProblemPlusJSONResponse) VisitGetInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRunRequestObject struct {
+	RunId  string `json:"run_id"`
+	Params CancelInspectionRunParams
+}
+
+type CancelInspectionRunResponseObject interface {
+	VisitCancelInspectionRunResponse(w http.ResponseWriter) error
+}
+
+type CancelInspectionRun202JSONResponse InspectionRun
+
+func (response CancelInspectionRun202JSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CancelInspectionRun400ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun401ApplicationProblemPlusJSONResponse Problem
+
+func (response CancelInspectionRun401ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun403ApplicationProblemPlusJSONResponse Problem
+
+func (response CancelInspectionRun403ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun404ApplicationProblemPlusJSONResponse Problem
+
+func (response CancelInspectionRun404ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response CancelInspectionRun405ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type CancelInspectionRun409ApplicationProblemPlusJSONResponse Problem
+
+func (response CancelInspectionRun409ApplicationProblemPlusJSONResponse) VisitCancelInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRunRequestObject struct {
+	RunId  string `json:"run_id"`
+	Params RetryInspectionRunParams
+}
+
+type RetryInspectionRunResponseObject interface {
+	VisitRetryInspectionRunResponse(w http.ResponseWriter) error
+}
+
+type RetryInspectionRun202JSONResponse InspectionRun
+
+func (response RetryInspectionRun202JSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RetryInspectionRun400ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun401ApplicationProblemPlusJSONResponse Problem
+
+func (response RetryInspectionRun401ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun403ApplicationProblemPlusJSONResponse Problem
+
+func (response RetryInspectionRun403ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun404ApplicationProblemPlusJSONResponse Problem
+
+func (response RetryInspectionRun404ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RetryInspectionRun405ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetryInspectionRun409ApplicationProblemPlusJSONResponse Problem
+
+func (response RetryInspectionRun409ApplicationProblemPlusJSONResponse) VisitRetryInspectionRunResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionTargetsRequestObject struct {
+	Params ListInspectionTargetsParams
+}
+
+type ListInspectionTargetsResponseObject interface {
+	VisitListInspectionTargetsResponse(w http.ResponseWriter) error
+}
+
+type ListInspectionTargets200JSONResponse InspectionTargetPage
+
+func (response ListInspectionTargets200JSONResponse) VisitListInspectionTargetsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionTargets400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionTargets400ApplicationProblemPlusJSONResponse) VisitListInspectionTargetsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionTargets401ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionTargets401ApplicationProblemPlusJSONResponse) VisitListInspectionTargetsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionTargets403ApplicationProblemPlusJSONResponse Problem
+
+func (response ListInspectionTargets403ApplicationProblemPlusJSONResponse) VisitListInspectionTargetsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ListInspectionTargets405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response ListInspectionTargets405ApplicationProblemPlusJSONResponse) VisitListInspectionTargetsResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 type GetJobRequestObject struct {
 	JobId JobId `json:"job_id"`
 }
@@ -1367,6 +4465,57 @@ type StrictServerInterface interface {
 	// GetCapabilities Get effective capabilities
 	// (GET /capabilities)
 	GetCapabilities(ctx context.Context, request GetCapabilitiesRequestObject) (GetCapabilitiesResponseObject, error)
+	// ListInspectionItems List inspection items
+	// (GET /inspection-items)
+	ListInspectionItems(ctx context.Context, request ListInspectionItemsRequestObject) (ListInspectionItemsResponseObject, error)
+	// CreateInspectionItem Create a custom inspection item
+	// (POST /inspection-items)
+	CreateInspectionItem(ctx context.Context, request CreateInspectionItemRequestObject) (CreateInspectionItemResponseObject, error)
+	// GetInspectionOverview Get host inspection overview
+	// (GET /inspection-overview)
+	GetInspectionOverview(ctx context.Context, request GetInspectionOverviewRequestObject) (GetInspectionOverviewResponseObject, error)
+	// ListInspectionPolicies List inspection policies
+	// (GET /inspection-policies)
+	ListInspectionPolicies(ctx context.Context, request ListInspectionPoliciesRequestObject) (ListInspectionPoliciesResponseObject, error)
+	// CreateInspectionPolicy Create an inspection policy
+	// (POST /inspection-policies)
+	CreateInspectionPolicy(ctx context.Context, request CreateInspectionPolicyRequestObject) (CreateInspectionPolicyResponseObject, error)
+	// GetInspectionPolicy Get an inspection policy
+	// (GET /inspection-policies/{policy_id})
+	GetInspectionPolicy(ctx context.Context, request GetInspectionPolicyRequestObject) (GetInspectionPolicyResponseObject, error)
+	// UpdateInspectionPolicy Update an inspection policy
+	// (PATCH /inspection-policies/{policy_id})
+	UpdateInspectionPolicy(ctx context.Context, request UpdateInspectionPolicyRequestObject) (UpdateInspectionPolicyResponseObject, error)
+	// RunInspectionPolicy Start an inspection policy immediately
+	// (POST /inspection-policies/{policy_id}/run)
+	RunInspectionPolicy(ctx context.Context, request RunInspectionPolicyRequestObject) (RunInspectionPolicyResponseObject, error)
+	// ListInspectionReports List immutable inspection reports
+	// (GET /inspection-reports)
+	ListInspectionReports(ctx context.Context, request ListInspectionReportsRequestObject) (ListInspectionReportsResponseObject, error)
+	// GetInspectionReport Get an immutable inspection report
+	// (GET /inspection-reports/{report_id})
+	GetInspectionReport(ctx context.Context, request GetInspectionReportRequestObject) (GetInspectionReportResponseObject, error)
+	// CreateInspectionReportDownload Create a short-lived inspection report download descriptor
+	// (POST /inspection-reports/{report_id}/download)
+	CreateInspectionReportDownload(ctx context.Context, request CreateInspectionReportDownloadRequestObject) (CreateInspectionReportDownloadResponseObject, error)
+	// ListInspectionRuns List inspection runs
+	// (GET /inspection-runs)
+	ListInspectionRuns(ctx context.Context, request ListInspectionRunsRequestObject) (ListInspectionRunsResponseObject, error)
+	// CreateInspectionRun Start an ad hoc inspection run
+	// (POST /inspection-runs)
+	CreateInspectionRun(ctx context.Context, request CreateInspectionRunRequestObject) (CreateInspectionRunResponseObject, error)
+	// GetInspectionRun Get an inspection run
+	// (GET /inspection-runs/{run_id})
+	GetInspectionRun(ctx context.Context, request GetInspectionRunRequestObject) (GetInspectionRunResponseObject, error)
+	// CancelInspectionRun Cancel an inspection run
+	// (POST /inspection-runs/{run_id}/cancel)
+	CancelInspectionRun(ctx context.Context, request CancelInspectionRunRequestObject) (CancelInspectionRunResponseObject, error)
+	// RetryInspectionRun Retry a terminal inspection run as a new run
+	// (POST /inspection-runs/{run_id}/retry)
+	RetryInspectionRun(ctx context.Context, request RetryInspectionRunRequestObject) (RetryInspectionRunResponseObject, error)
+	// ListInspectionTargets List host inspection targets
+	// (GET /inspection-targets)
+	ListInspectionTargets(ctx context.Context, request ListInspectionTargetsRequestObject) (ListInspectionTargetsResponseObject, error)
 	// GetJob Get a job
 	// (GET /jobs/{job_id})
 	GetJob(ctx context.Context, request GetJobRequestObject) (GetJobResponseObject, error)
@@ -1517,6 +4666,479 @@ func (sh *strictHandler) GetCapabilities(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// ListInspectionItems operation middleware
+func (sh *strictHandler) ListInspectionItems(w http.ResponseWriter, r *http.Request, params ListInspectionItemsParams) {
+	var request ListInspectionItemsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInspectionItems(ctx, request.(ListInspectionItemsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInspectionItems")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInspectionItemsResponseObject); ok {
+		if err := validResponse.VisitListInspectionItemsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateInspectionItem operation middleware
+func (sh *strictHandler) CreateInspectionItem(w http.ResponseWriter, r *http.Request, params CreateInspectionItemParams) {
+	var request CreateInspectionItemRequestObject
+
+	request.Params = params
+
+	var body CreateInspectionItemJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateInspectionItem(ctx, request.(CreateInspectionItemRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateInspectionItem")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateInspectionItemResponseObject); ok {
+		if err := validResponse.VisitCreateInspectionItemResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetInspectionOverview operation middleware
+func (sh *strictHandler) GetInspectionOverview(w http.ResponseWriter, r *http.Request) {
+	var request GetInspectionOverviewRequestObject
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetInspectionOverview(ctx, request.(GetInspectionOverviewRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetInspectionOverview")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetInspectionOverviewResponseObject); ok {
+		if err := validResponse.VisitGetInspectionOverviewResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListInspectionPolicies operation middleware
+func (sh *strictHandler) ListInspectionPolicies(w http.ResponseWriter, r *http.Request, params ListInspectionPoliciesParams) {
+	var request ListInspectionPoliciesRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInspectionPolicies(ctx, request.(ListInspectionPoliciesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInspectionPolicies")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInspectionPoliciesResponseObject); ok {
+		if err := validResponse.VisitListInspectionPoliciesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateInspectionPolicy operation middleware
+func (sh *strictHandler) CreateInspectionPolicy(w http.ResponseWriter, r *http.Request, params CreateInspectionPolicyParams) {
+	var request CreateInspectionPolicyRequestObject
+
+	request.Params = params
+
+	var body CreateInspectionPolicyJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateInspectionPolicy(ctx, request.(CreateInspectionPolicyRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateInspectionPolicy")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateInspectionPolicyResponseObject); ok {
+		if err := validResponse.VisitCreateInspectionPolicyResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetInspectionPolicy operation middleware
+func (sh *strictHandler) GetInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string) {
+	var request GetInspectionPolicyRequestObject
+
+	request.PolicyId = policyId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetInspectionPolicy(ctx, request.(GetInspectionPolicyRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetInspectionPolicy")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetInspectionPolicyResponseObject); ok {
+		if err := validResponse.VisitGetInspectionPolicyResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// UpdateInspectionPolicy operation middleware
+func (sh *strictHandler) UpdateInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string, params UpdateInspectionPolicyParams) {
+	var request UpdateInspectionPolicyRequestObject
+
+	request.PolicyId = policyId
+	request.Params = params
+
+	var body UpdateInspectionPolicyJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UpdateInspectionPolicy(ctx, request.(UpdateInspectionPolicyRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UpdateInspectionPolicy")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UpdateInspectionPolicyResponseObject); ok {
+		if err := validResponse.VisitUpdateInspectionPolicyResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RunInspectionPolicy operation middleware
+func (sh *strictHandler) RunInspectionPolicy(w http.ResponseWriter, r *http.Request, policyId string, params RunInspectionPolicyParams) {
+	var request RunInspectionPolicyRequestObject
+
+	request.PolicyId = policyId
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RunInspectionPolicy(ctx, request.(RunInspectionPolicyRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RunInspectionPolicy")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RunInspectionPolicyResponseObject); ok {
+		if err := validResponse.VisitRunInspectionPolicyResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListInspectionReports operation middleware
+func (sh *strictHandler) ListInspectionReports(w http.ResponseWriter, r *http.Request, params ListInspectionReportsParams) {
+	var request ListInspectionReportsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInspectionReports(ctx, request.(ListInspectionReportsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInspectionReports")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInspectionReportsResponseObject); ok {
+		if err := validResponse.VisitListInspectionReportsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetInspectionReport operation middleware
+func (sh *strictHandler) GetInspectionReport(w http.ResponseWriter, r *http.Request, reportId string) {
+	var request GetInspectionReportRequestObject
+
+	request.ReportId = reportId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetInspectionReport(ctx, request.(GetInspectionReportRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetInspectionReport")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetInspectionReportResponseObject); ok {
+		if err := validResponse.VisitGetInspectionReportResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateInspectionReportDownload operation middleware
+func (sh *strictHandler) CreateInspectionReportDownload(w http.ResponseWriter, r *http.Request, reportId string, params CreateInspectionReportDownloadParams) {
+	var request CreateInspectionReportDownloadRequestObject
+
+	request.ReportId = reportId
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateInspectionReportDownload(ctx, request.(CreateInspectionReportDownloadRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateInspectionReportDownload")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateInspectionReportDownloadResponseObject); ok {
+		if err := validResponse.VisitCreateInspectionReportDownloadResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListInspectionRuns operation middleware
+func (sh *strictHandler) ListInspectionRuns(w http.ResponseWriter, r *http.Request, params ListInspectionRunsParams) {
+	var request ListInspectionRunsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInspectionRuns(ctx, request.(ListInspectionRunsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInspectionRuns")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInspectionRunsResponseObject); ok {
+		if err := validResponse.VisitListInspectionRunsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateInspectionRun operation middleware
+func (sh *strictHandler) CreateInspectionRun(w http.ResponseWriter, r *http.Request, params CreateInspectionRunParams) {
+	var request CreateInspectionRunRequestObject
+
+	request.Params = params
+
+	var body CreateInspectionRunJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateInspectionRun(ctx, request.(CreateInspectionRunRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateInspectionRun")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateInspectionRunResponseObject); ok {
+		if err := validResponse.VisitCreateInspectionRunResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetInspectionRun operation middleware
+func (sh *strictHandler) GetInspectionRun(w http.ResponseWriter, r *http.Request, runId string) {
+	var request GetInspectionRunRequestObject
+
+	request.RunId = runId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetInspectionRun(ctx, request.(GetInspectionRunRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetInspectionRun")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetInspectionRunResponseObject); ok {
+		if err := validResponse.VisitGetInspectionRunResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CancelInspectionRun operation middleware
+func (sh *strictHandler) CancelInspectionRun(w http.ResponseWriter, r *http.Request, runId string, params CancelInspectionRunParams) {
+	var request CancelInspectionRunRequestObject
+
+	request.RunId = runId
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CancelInspectionRun(ctx, request.(CancelInspectionRunRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CancelInspectionRun")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CancelInspectionRunResponseObject); ok {
+		if err := validResponse.VisitCancelInspectionRunResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RetryInspectionRun operation middleware
+func (sh *strictHandler) RetryInspectionRun(w http.ResponseWriter, r *http.Request, runId string, params RetryInspectionRunParams) {
+	var request RetryInspectionRunRequestObject
+
+	request.RunId = runId
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RetryInspectionRun(ctx, request.(RetryInspectionRunRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RetryInspectionRun")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RetryInspectionRunResponseObject); ok {
+		if err := validResponse.VisitRetryInspectionRunResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListInspectionTargets operation middleware
+func (sh *strictHandler) ListInspectionTargets(w http.ResponseWriter, r *http.Request, params ListInspectionTargetsParams) {
+	var request ListInspectionTargetsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListInspectionTargets(ctx, request.(ListInspectionTargetsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListInspectionTargets")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListInspectionTargetsResponseObject); ok {
+		if err := validResponse.VisitListInspectionTargetsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // GetJob operation middleware
 func (sh *strictHandler) GetJob(w http.ResponseWriter, r *http.Request, jobId JobId) {
 	var request GetJobRequestObject
@@ -1575,57 +5197,107 @@ func (sh *strictHandler) CancelJob(w http.ResponseWriter, r *http.Request, jobId
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
+	"vDHxc11bBnD4xWJxtPj/AQA=",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

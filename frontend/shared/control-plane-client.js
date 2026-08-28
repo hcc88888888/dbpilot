@@ -66,6 +66,7 @@ export function createControlPlaneClient({
 
       return {
         platform: controlPlanePlatform(api),
+        inspection: controlPlanePlatform(api),
         requestOptions({ idempotencyKey, etag, signal } = {}) {
           return {
             [REQUEST_OPTIONS]: true,

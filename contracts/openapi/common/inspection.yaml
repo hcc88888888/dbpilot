@@ -1,0 +1,618 @@
+InspectionConnectivity:
+  type: string
+  enum: [online, offline, unknown]
+InspectionScopeType:
+  type: string
+  enum: [host, database]
+InspectionSourceType:
+  type: string
+  enum: [metric, metadata, log_summary, probe]
+InspectionMetricWindow:
+  type: string
+  enum: [5m, 15m, 1h]
+InspectionMetricAggregation:
+  type: string
+  enum: [latest, avg, max, min]
+InspectionMetricOperator:
+  type: string
+  enum: [gt, gte, lt, lte]
+InspectionTargetRunStatus:
+  type: string
+  enum: [pending, collecting, evaluating, succeeded, failed, unsupported, cancelled]
+InspectionFindingLevel:
+  type: string
+  enum: [healthy, warning, critical, unsupported, missing_data]
+InspectionReportStatus:
+  type: string
+  enum: [generating, completed, failed]
+InspectionTarget:
+  type: object
+  additionalProperties: false
+  required: [agent_id, display_name, host, labels, connectivity, capabilities]
+  properties:
+    agent_id:
+      type: string
+      minLength: 1
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    host:
+      type: string
+      minLength: 1
+      maxLength: 255
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    connectivity:
+      $ref: '#/InspectionConnectivity'
+    capabilities:
+      type: array
+      maxItems: 128
+      items:
+        type: string
+        minLength: 1
+        maxLength: 128
+InspectionTargetPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/InspectionTarget'
+    page:
+      $ref: ./pagination.yaml#/Page
+InspectionMetricRule:
+  type: object
+  additionalProperties: false
+  required: [metric_name, window, aggregation, operator, warning_threshold, critical_threshold]
+  properties:
+    metric_name:
+      type: string
+      pattern: '^[a-z][a-z0-9_.]{1,127}$'
+    labels:
+      type: object
+      maxProperties: 16
+      additionalProperties:
+        type: string
+        maxLength: 128
+    window:
+      $ref: '#/InspectionMetricWindow'
+    aggregation:
+      $ref: '#/InspectionMetricAggregation'
+    operator:
+      $ref: '#/InspectionMetricOperator'
+    warning_threshold:
+      type: number
+    critical_threshold:
+      type: number
+InspectionProbeRule:
+  type: object
+  additionalProperties: false
+  required: [probe_template_id]
+  properties:
+    probe_template_id:
+      type: string
+      minLength: 1
+      maxLength: 120
+InspectionItem:
+  type: object
+  additionalProperties: false
+  required: [id, version, name, description, category, scope_type, source_type, evidence_selector, recommendation_template, system, enabled, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    version:
+      type: integer
+      minimum: 1
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 2000
+    category:
+      type: string
+      minLength: 1
+      maxLength: 80
+    scope_type:
+      $ref: '#/InspectionScopeType'
+    source_type:
+      $ref: '#/InspectionSourceType'
+    database_types:
+      type: array
+      maxItems: 16
+      items:
+        type: string
+        minLength: 1
+        maxLength: 64
+    required_capabilities:
+      type: array
+      maxItems: 64
+      items:
+        type: string
+        minLength: 1
+        maxLength: 128
+    metric_rule:
+      $ref: '#/InspectionMetricRule'
+    probe_rule:
+      $ref: '#/InspectionProbeRule'
+    evidence_selector:
+      type: string
+      maxLength: 65536
+    recommendation_template:
+      type: string
+      maxLength: 4000
+    documentation_url:
+      type: string
+      format: uri
+      maxLength: 2048
+    system:
+      type: boolean
+    enabled:
+      type: boolean
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    updated_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+InspectionItemPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/InspectionItem'
+    page:
+      $ref: ./pagination.yaml#/Page
+CreateInspectionItemRequest:
+  type: object
+  additionalProperties: false
+  required: [name, description, category, scope_type, source_type, evidence_selector, recommendation_template]
+  properties:
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 2000
+    category:
+      type: string
+      minLength: 1
+      maxLength: 80
+    scope_type:
+      $ref: '#/InspectionScopeType'
+    source_type:
+      $ref: '#/InspectionSourceType'
+    database_types:
+      type: array
+      maxItems: 16
+      items:
+        type: string
+        minLength: 1
+        maxLength: 64
+    required_capabilities:
+      type: array
+      maxItems: 64
+      items:
+        type: string
+        minLength: 1
+        maxLength: 128
+    metric_rule:
+      $ref: '#/InspectionMetricRule'
+    probe_rule:
+      $ref: '#/InspectionProbeRule'
+    evidence_selector:
+      type: string
+      maxLength: 65536
+    recommendation_template:
+      type: string
+      maxLength: 4000
+    documentation_url:
+      type: string
+      format: uri
+      maxLength: 2048
+InspectionPolicyItem:
+  type: object
+  additionalProperties: false
+  required: [item_id, version]
+  properties:
+    item_id:
+      type: string
+      minLength: 1
+    version:
+      type: integer
+      minimum: 1
+InspectionSchedule:
+  type: object
+  additionalProperties: false
+  required: [cron, timezone]
+  properties:
+    cron:
+      type: string
+      pattern: '^(?:[^\s]+\s+){4}[^\s]+$'
+      maxLength: 256
+      description: Five-field cron expression; seconds are not accepted.
+    timezone:
+      type: string
+      format: iana-timezone
+      pattern: '^[A-Za-z_]+(?:/[A-Za-z_+-]+)+$'
+      maxLength: 128
+InspectionPolicy:
+  type: object
+  additionalProperties: false
+  required: [id, name, enabled, version, item_versions, target_ids, labels, created_at, updated_at]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    enabled:
+      type: boolean
+    version:
+      type: integer
+      minimum: 1
+    schedule:
+      oneOf:
+        - $ref: '#/InspectionSchedule'
+        - type: 'null'
+    next_run_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    item_versions:
+      type: array
+      maxItems: 200
+      items:
+        $ref: '#/InspectionPolicyItem'
+    target_ids:
+      type: array
+      maxItems: 10000
+      items:
+        type: string
+        minLength: 1
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    target_timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 3600
+    max_concurrency:
+      type: integer
+      minimum: 1
+      maximum: 1000
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    updated_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+InspectionPolicyPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/InspectionPolicy'
+    page:
+      $ref: ./pagination.yaml#/Page
+CreateInspectionPolicyRequest:
+  type: object
+  additionalProperties: false
+  required: [name, enabled, item_versions, target_ids]
+  properties:
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    enabled:
+      type: boolean
+    schedule:
+      oneOf:
+        - $ref: '#/InspectionSchedule'
+        - type: 'null'
+    item_versions:
+      type: array
+      minItems: 1
+      maxItems: 200
+      items:
+        $ref: '#/InspectionPolicyItem'
+    target_ids:
+      type: array
+      maxItems: 10000
+      items:
+        type: string
+        minLength: 1
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    target_timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 3600
+    max_concurrency:
+      type: integer
+      minimum: 1
+      maximum: 1000
+UpdateInspectionPolicyRequest:
+  type: object
+  additionalProperties: false
+  required: [name, enabled, item_versions, target_ids]
+  properties:
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    enabled:
+      type: boolean
+    schedule:
+      oneOf:
+        - $ref: '#/InspectionSchedule'
+        - type: 'null'
+    item_versions:
+      type: array
+      minItems: 1
+      maxItems: 200
+      items:
+        $ref: '#/InspectionPolicyItem'
+    target_ids:
+      type: array
+      maxItems: 10000
+      items:
+        type: string
+        minLength: 1
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    target_timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 3600
+    max_concurrency:
+      type: integer
+      minimum: 1
+      maximum: 1000
+InspectionRunStatus:
+  type: string
+  enum: [queued, collecting, evaluating, generating_report, completed, partial, failed, cancelled]
+InspectionTargetRun:
+  type: object
+  additionalProperties: false
+  required: [target_id, agent_id, status]
+  properties:
+    target_id:
+      type: string
+      minLength: 1
+    agent_id:
+      type: string
+      minLength: 1
+    status:
+      $ref: '#/InspectionTargetRunStatus'
+    command_id:
+      $ref: ./identifiers.yaml#/CommandId
+    error_code:
+      type: string
+      maxLength: 128
+    observed_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+InspectionFinding:
+  type: object
+  additionalProperties: false
+  required: [id, item_id, item_version, target_id, level, observed_at, evidence, summary, recommendation]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    item_id:
+      type: string
+      minLength: 1
+    item_version:
+      type: integer
+      minimum: 1
+    target_id:
+      type: string
+      minLength: 1
+    level:
+      $ref: '#/InspectionFindingLevel'
+    observed_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    evidence:
+      type: string
+      maxLength: 65536
+    warning_threshold:
+      type: number
+    critical_threshold:
+      type: number
+    summary:
+      type: string
+      maxLength: 2000
+    recommendation:
+      type: string
+      maxLength: 4000
+InspectionRun:
+  type: object
+  additionalProperties: false
+  required: [id, status, target_count, completed_target_count, failed_target_count, created_at]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    policy_id:
+      type: string
+      minLength: 1
+    retry_of_run_id:
+      type: string
+      minLength: 1
+    job_id:
+      $ref: ./identifiers.yaml#/JobId
+    status:
+      $ref: '#/InspectionRunStatus'
+    scheduled_for:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    started_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    finished_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    target_count:
+      type: integer
+      minimum: 0
+      maximum: 10000
+    completed_target_count:
+      type: integer
+      minimum: 0
+      maximum: 10000
+    failed_target_count:
+      type: integer
+      minimum: 0
+      maximum: 10000
+    targets:
+      type: array
+      maxItems: 10000
+      items:
+        $ref: '#/InspectionTargetRun'
+    findings:
+      type: array
+      maxItems: 2000000
+      items:
+        $ref: '#/InspectionFinding'
+    report_id:
+      type: string
+      minLength: 1
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+InspectionRunPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/InspectionRun'
+    page:
+      $ref: ./pagination.yaml#/Page
+CreateInspectionRunRequest:
+  type: object
+  additionalProperties: false
+  required: [target_ids, item_versions]
+  properties:
+    target_ids:
+      type: array
+      minItems: 1
+      maxItems: 10000
+      items:
+        type: string
+        minLength: 1
+    item_versions:
+      type: array
+      minItems: 1
+      maxItems: 200
+      items:
+        $ref: '#/InspectionPolicyItem'
+    target_timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 3600
+    max_concurrency:
+      type: integer
+      minimum: 1
+      maximum: 1000
+InspectionReport:
+  type: object
+  additionalProperties: false
+  required: [id, run_id, status, summary, artifacts, generated_at]
+  properties:
+    id:
+      type: string
+      minLength: 1
+    run_id:
+      type: string
+      minLength: 1
+    policy_id:
+      type: string
+      minLength: 1
+    status:
+      $ref: '#/InspectionReportStatus'
+    summary:
+      type: string
+      maxLength: 4000
+    findings:
+      type: array
+      maxItems: 2000000
+      items:
+        $ref: '#/InspectionFinding'
+    artifacts:
+      type: array
+      minItems: 1
+      maxItems: 2
+      items:
+        $ref: ./artifacts.yaml#/ArtifactReference
+    generated_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+InspectionReportPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/InspectionReport'
+    page:
+      $ref: ./pagination.yaml#/Page
+InspectionOverview:
+  type: object
+  additionalProperties: false
+  required: [target_count, online_target_count, latest_run_status_counts, finding_level_counts]
+  properties:
+    target_count:
+      type: integer
+      minimum: 0
+    online_target_count:
+      type: integer
+      minimum: 0
+    latest_run_status_counts:
+      type: object
+      additionalProperties:
+        type: integer
+        minimum: 0
+    finding_level_counts:
+      type: object
+      additionalProperties:
+        type: integer
+        minimum: 0

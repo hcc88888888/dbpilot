@@ -63,3 +63,65 @@ components:
       $ref: ./common/permissions.yaml#/Capability
     CapabilitySet:
       $ref: ./common/permissions.yaml#/CapabilitySet
+    InspectionConnectivity:
+      $ref: ./common/inspection.yaml#/InspectionConnectivity
+    InspectionScopeType:
+      $ref: ./common/inspection.yaml#/InspectionScopeType
+    InspectionSourceType:
+      $ref: ./common/inspection.yaml#/InspectionSourceType
+    InspectionMetricWindow:
+      $ref: ./common/inspection.yaml#/InspectionMetricWindow
+    InspectionMetricAggregation:
+      $ref: ./common/inspection.yaml#/InspectionMetricAggregation
+    InspectionMetricOperator:
+      $ref: ./common/inspection.yaml#/InspectionMetricOperator
+    InspectionTargetRunStatus:
+      $ref: ./common/inspection.yaml#/InspectionTargetRunStatus
+    InspectionFindingLevel:
+      $ref: ./common/inspection.yaml#/InspectionFindingLevel
+    InspectionReportStatus:
+      $ref: ./common/inspection.yaml#/InspectionReportStatus
+    InspectionTarget:
+      $ref: ./common/inspection.yaml#/InspectionTarget
+    InspectionTargetPage:
+      $ref: ./common/inspection.yaml#/InspectionTargetPage
+    InspectionMetricRule:
+      $ref: ./common/inspection.yaml#/InspectionMetricRule
+    InspectionProbeRule:
+      $ref: ./common/inspection.yaml#/InspectionProbeRule
+    InspectionItem:
+      $ref: ./common/inspection.yaml#/InspectionItem
+    InspectionItemPage:
+      $ref: ./common/inspection.yaml#/InspectionItemPage
+    CreateInspectionItemRequest:
+      $ref: ./common/inspection.yaml#/CreateInspectionItemRequest
+    InspectionPolicyItem:
+      $ref: ./common/inspection.yaml#/InspectionPolicyItem
+    InspectionSchedule:
+      $ref: ./common/inspection.yaml#/InspectionSchedule
+    InspectionPolicy:
+      $ref: ./common/inspection.yaml#/InspectionPolicy
+    InspectionPolicyPage:
+      $ref: ./common/inspection.yaml#/InspectionPolicyPage
+    CreateInspectionPolicyRequest:
+      $ref: ./common/inspection.yaml#/CreateInspectionPolicyRequest
+    UpdateInspectionPolicyRequest:
+      $ref: ./common/inspection.yaml#/UpdateInspectionPolicyRequest
+    InspectionRunStatus:
+      $ref: ./common/inspection.yaml#/InspectionRunStatus
+    InspectionTargetRun:
+      $ref: ./common/inspection.yaml#/InspectionTargetRun
+    InspectionFinding:
+      $ref: ./common/inspection.yaml#/InspectionFinding
+    InspectionRun:
+      $ref: ./common/inspection.yaml#/InspectionRun
+    InspectionRunPage:
+      $ref: ./common/inspection.yaml#/InspectionRunPage
+    CreateInspectionRunRequest:
+      $ref: ./common/inspection.yaml#/CreateInspectionRunRequest
+    InspectionReport:
+      $ref: ./common/inspection.yaml#/InspectionReport
+    InspectionReportPage:
+      $ref: ./common/inspection.yaml#/InspectionReportPage
+    InspectionOverview:
+      $ref: ./common/inspection.yaml#/InspectionOverview

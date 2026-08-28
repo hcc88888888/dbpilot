@@ -18,6 +18,23 @@ const expectedOperations = [
   ['/artifacts/{artifact_id}/actions/download', 'post', 'createArtifactDownload', 'platform.artifacts.download'],
   ['/audit-events', 'get', 'listAuditEvents', 'platform.audit.read'],
   ['/capabilities', 'get', 'getCapabilities', 'platform.capabilities.read'],
+  ['/inspection-overview', 'get', 'getInspectionOverview', 'inspection:view'],
+  ['/inspection-targets', 'get', 'listInspectionTargets', 'inspection:view'],
+  ['/inspection-items', 'get', 'listInspectionItems', 'inspection:view'],
+  ['/inspection-items', 'post', 'createInspectionItem', 'inspection:manage'],
+  ['/inspection-policies', 'get', 'listInspectionPolicies', 'inspection:view'],
+  ['/inspection-policies', 'post', 'createInspectionPolicy', 'inspection:manage'],
+  ['/inspection-policies/{policy_id}', 'get', 'getInspectionPolicy', 'inspection:view'],
+  ['/inspection-policies/{policy_id}', 'patch', 'updateInspectionPolicy', 'inspection:manage'],
+  ['/inspection-policies/{policy_id}/run', 'post', 'runInspectionPolicy', 'inspection:execute'],
+  ['/inspection-runs', 'get', 'listInspectionRuns', 'inspection:view'],
+  ['/inspection-runs', 'post', 'createInspectionRun', 'inspection:execute'],
+  ['/inspection-runs/{run_id}', 'get', 'getInspectionRun', 'inspection:view'],
+  ['/inspection-runs/{run_id}/cancel', 'post', 'cancelInspectionRun', 'inspection:execute'],
+  ['/inspection-runs/{run_id}/retry', 'post', 'retryInspectionRun', 'inspection:execute'],
+  ['/inspection-reports', 'get', 'listInspectionReports', 'inspection:view'],
+  ['/inspection-reports/{report_id}', 'get', 'getInspectionReport', 'inspection:view'],
+  ['/inspection-reports/{report_id}/download', 'post', 'createInspectionReportDownload', 'inspection:view'],
 ];
 
 async function bundleContract() {

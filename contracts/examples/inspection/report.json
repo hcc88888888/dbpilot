@@ -1,0 +1,27 @@
+{
+  "id": "report-host-health-001",
+  "run_id": "run-host-health-001",
+  "policy_id": "policy-host-health",
+  "status": "completed",
+  "summary": "One production host completed the host health inspection.",
+  "findings": [
+    {
+      "id": "finding-host-cpu-001",
+      "item_id": "host-cpu-utilization",
+      "item_version": 1,
+      "target_id": "agent-prod-01",
+      "level": "healthy",
+      "observed_at": "2026-08-28T08:01:00Z",
+      "evidence": "average CPU utilization was 42.1% over 15 minutes",
+      "warning_threshold": 75,
+      "critical_threshold": 90,
+      "summary": "CPU utilization is healthy.",
+      "recommendation": "No action is required."
+    }
+  ],
+  "artifacts": [
+    { "artifact_id": "inspection-report-run-host-health-001-json", "kind": "inspection-report-json" },
+    { "artifact_id": "inspection-report-run-host-health-001-html", "kind": "inspection-report-html" }
+  ],
+  "generated_at": "2026-08-28T08:01:30Z"
+}

@@ -132,6 +132,51 @@ test('write request options propagate idempotency, entity tag, and abort signal'
   assert.equal(seen[0].init.signal, controller.signal);
 });
 
+test('inspection writes preserve scoped auth, idempotency, entity tags, and cancellation', async () => {
+  const seen = [];
+  const controller = new AbortController();
+  const scoped = createControlPlaneClient({
+    baseUrl: 'https://control.example',
+    getAccessToken: () => 'inspection-token',
+    requestIdFactory: () => 'req-inspection-write',
+    fetchImpl: async (url, init) => {
+      seen.push({ url, init });
+      return new Response(JSON.stringify({
+        id: 'policy-1', name: 'Host health', enabled: true, version: 4,
+        item_versions: [], target_ids: [], labels: {},
+        created_at: '2026-08-28T08:00:00Z', updated_at: '2026-08-28T08:00:00Z',
+      }), { headers: { 'Content-Type': 'application/json', ETag: '"v4"' } });
+    },
+  }).forScope({ tenantId: 'tenant-a', projectId: 'project-a' });
+
+  await scoped.inspection.updateInspectionPolicy(
+    { policyId: 'policy / 1', updateInspectionPolicyRequest: { name: 'Host health', enabled: true, itemVersions: [], targetIds: [] } },
+    scoped.requestOptions({ idempotencyKey: 'idem-inspection', etag: '"v4"', signal: controller.signal }),
+  );
+
+  assert.equal(seen[0].url, 'https://control.example/api/v1/tenants/tenant-a/projects/project-a/inspection-policies/policy%20%2F%201');
+  assert.equal(seen[0].init.headers.Authorization, 'Bearer inspection-token');
+  assert.equal(seen[0].init.headers['X-Request-ID'], 'req-inspection-write');
+  assert.equal(seen[0].init.headers['Idempotency-Key'], 'idem-inspection');
+  assert.equal(seen[0].init.headers['If-Match'], '"v4"');
+  assert.equal(seen[0].init.signal, controller.signal);
+});
+
+test('inspection authorization failures never fall back to demo data', async () => {
+  for (const [status, code, kind] of [[401, 'unauthorized', 'unauthorized'], [403, 'forbidden', 'forbidden']]) {
+    const scoped = createControlPlaneClient({
+      baseUrl: 'https://control.example',
+      getAccessToken: () => 'token',
+      requestIdFactory: () => 'req-inspection-auth',
+      fetchImpl: async () => problemResponse({ status, code }),
+    }).forScope({ tenantId: 'tenant-a', projectId: 'project-a' });
+
+    await assert.rejects(scoped.inspection.getInspectionOverview(), (error) => (
+      error instanceof ControlPlaneError && error.kind === kind
+    ));
+  }
+});
+
 test('problem responses map a stable code to a safe control-plane error', async () => {
   const scoped = createControlPlaneClient({
     baseUrl: 'https://control.example',

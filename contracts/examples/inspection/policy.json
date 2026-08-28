@@ -1,0 +1,20 @@
+{
+  "id": "policy-host-health",
+  "name": "Production host health",
+  "enabled": true,
+  "version": 4,
+  "schedule": {
+    "cron": "0 */6 * * *",
+    "timezone": "Asia/Shanghai"
+  },
+  "next_run_at": "2026-08-28T12:00:00Z",
+  "item_versions": [
+    { "item_id": "host-cpu-utilization", "version": 1 }
+  ],
+  "target_ids": ["agent-prod-01"],
+  "labels": { "environment": "production" },
+  "target_timeout_seconds": 300,
+  "max_concurrency": 10,
+  "created_at": "2026-08-28T08:00:00Z",
+  "updated_at": "2026-08-28T08:00:00Z"
+}

@@ -18,9 +18,23 @@ import type {
   Artifact,
   AuditEventPage,
   CapabilitySet,
+  CreateInspectionItemRequest,
+  CreateInspectionPolicyRequest,
+  CreateInspectionRunRequest,
   DownloadDescriptor,
+  InspectionItem,
+  InspectionItemPage,
+  InspectionOverview,
+  InspectionPolicy,
+  InspectionPolicyPage,
+  InspectionReport,
+  InspectionReportPage,
+  InspectionRun,
+  InspectionRunPage,
+  InspectionTargetPage,
   Job,
   Problem,
+  UpdateInspectionPolicyRequest,
 } from '../models/index.js';
 import {
     ArtifactFromJSON,
@@ -29,13 +43,46 @@ import {
     AuditEventPageToJSON,
     CapabilitySetFromJSON,
     CapabilitySetToJSON,
+    CreateInspectionItemRequestFromJSON,
+    CreateInspectionItemRequestToJSON,
+    CreateInspectionPolicyRequestFromJSON,
+    CreateInspectionPolicyRequestToJSON,
+    CreateInspectionRunRequestFromJSON,
+    CreateInspectionRunRequestToJSON,
     DownloadDescriptorFromJSON,
     DownloadDescriptorToJSON,
+    InspectionItemFromJSON,
+    InspectionItemToJSON,
+    InspectionItemPageFromJSON,
+    InspectionItemPageToJSON,
+    InspectionOverviewFromJSON,
+    InspectionOverviewToJSON,
+    InspectionPolicyFromJSON,
+    InspectionPolicyToJSON,
+    InspectionPolicyPageFromJSON,
+    InspectionPolicyPageToJSON,
+    InspectionReportFromJSON,
+    InspectionReportToJSON,
+    InspectionReportPageFromJSON,
+    InspectionReportPageToJSON,
+    InspectionRunFromJSON,
+    InspectionRunToJSON,
+    InspectionRunPageFromJSON,
+    InspectionRunPageToJSON,
+    InspectionTargetPageFromJSON,
+    InspectionTargetPageToJSON,
     JobFromJSON,
     JobToJSON,
     ProblemFromJSON,
     ProblemToJSON,
+    UpdateInspectionPolicyRequestFromJSON,
+    UpdateInspectionPolicyRequestToJSON,
 } from '../models/index.js';
+
+export interface CancelInspectionRunRequest {
+    runId: string;
+    idempotencyKey: string;
+}
 
 export interface CancelJobRequest {
     jobId: string;
@@ -48,8 +95,40 @@ export interface CreateArtifactDownloadRequest {
     idempotencyKey: string;
 }
 
+export interface CreateInspectionItemOperationRequest {
+    idempotencyKey: string;
+    createInspectionItemRequest: CreateInspectionItemRequest;
+}
+
+export interface CreateInspectionPolicyOperationRequest {
+    idempotencyKey: string;
+    createInspectionPolicyRequest: CreateInspectionPolicyRequest;
+}
+
+export interface CreateInspectionReportDownloadRequest {
+    reportId: string;
+    idempotencyKey: string;
+}
+
+export interface CreateInspectionRunOperationRequest {
+    idempotencyKey: string;
+    createInspectionRunRequest: CreateInspectionRunRequest;
+}
+
 export interface GetArtifactRequest {
     artifactId: string;
+}
+
+export interface GetInspectionPolicyRequest {
+    policyId: string;
+}
+
+export interface GetInspectionReportRequest {
+    reportId: string;
+}
+
+export interface GetInspectionRunRequest {
+    runId: string;
 }
 
 export interface GetJobRequest {
@@ -61,10 +140,108 @@ export interface ListAuditEventsRequest {
     limit?: number;
 }
 
+export interface ListInspectionItemsRequest {
+    cursor?: string;
+    limit?: number;
+}
+
+export interface ListInspectionPoliciesRequest {
+    cursor?: string;
+    limit?: number;
+}
+
+export interface ListInspectionReportsRequest {
+    cursor?: string;
+    limit?: number;
+}
+
+export interface ListInspectionRunsRequest {
+    cursor?: string;
+    limit?: number;
+}
+
+export interface ListInspectionTargetsRequest {
+    cursor?: string;
+    limit?: number;
+}
+
+export interface RetryInspectionRunRequest {
+    runId: string;
+    idempotencyKey: string;
+}
+
+export interface RunInspectionPolicyRequest {
+    policyId: string;
+    idempotencyKey: string;
+}
+
+export interface UpdateInspectionPolicyOperationRequest {
+    policyId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    updateInspectionPolicyRequest: UpdateInspectionPolicyRequest;
+}
+
 /**
  *
  */
 export class DefaultApi extends runtime.BaseAPI {
+
+    /**
+     * Cancel an inspection run
+     */
+    async cancelInspectionRunRaw(requestParameters: CancelInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>> {
+        if (requestParameters['runId'] == null) {
+            throw new runtime.RequiredError(
+                'runId',
+                'Required parameter "runId" was null or undefined when calling cancelInspectionRun().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling cancelInspectionRun().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-runs/{run_id}/cancel`;
+        urlPath = urlPath.replace(`{${"run_id"}}`, encodeURIComponent(String(requestParameters['runId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunFromJSON(jsonValue));
+    }
+
+    /**
+     * Cancel an inspection run
+     */
+    async cancelInspectionRun(requestParameters: CancelInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun> {
+        const response = await this.cancelInspectionRunRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
 
     /**
      * Request job cancellation
@@ -190,6 +367,236 @@ export class DefaultApi extends runtime.BaseAPI {
     }
 
     /**
+     * Create a custom inspection item
+     */
+    async createInspectionItemRaw(requestParameters: CreateInspectionItemOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionItem>> {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling createInspectionItem().'
+            );
+        }
+
+        if (requestParameters['createInspectionItemRequest'] == null) {
+            throw new runtime.RequiredError(
+                'createInspectionItemRequest',
+                'Required parameter "createInspectionItemRequest" was null or undefined when calling createInspectionItem().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-items`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateInspectionItemRequestToJSON(requestParameters['createInspectionItemRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionItemFromJSON(jsonValue));
+    }
+
+    /**
+     * Create a custom inspection item
+     */
+    async createInspectionItem(requestParameters: CreateInspectionItemOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionItem> {
+        const response = await this.createInspectionItemRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Create an inspection policy
+     */
+    async createInspectionPolicyRaw(requestParameters: CreateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>> {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling createInspectionPolicy().'
+            );
+        }
+
+        if (requestParameters['createInspectionPolicyRequest'] == null) {
+            throw new runtime.RequiredError(
+                'createInspectionPolicyRequest',
+                'Required parameter "createInspectionPolicyRequest" was null or undefined when calling createInspectionPolicy().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-policies`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateInspectionPolicyRequestToJSON(requestParameters['createInspectionPolicyRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionPolicyFromJSON(jsonValue));
+    }
+
+    /**
+     * Create an inspection policy
+     */
+    async createInspectionPolicy(requestParameters: CreateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy> {
+        const response = await this.createInspectionPolicyRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Create a short-lived inspection report download descriptor
+     */
+    async createInspectionReportDownloadRaw(requestParameters: CreateInspectionReportDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DownloadDescriptor>> {
+        if (requestParameters['reportId'] == null) {
+            throw new runtime.RequiredError(
+                'reportId',
+                'Required parameter "reportId" was null or undefined when calling createInspectionReportDownload().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling createInspectionReportDownload().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-reports/{report_id}/download`;
+        urlPath = urlPath.replace(`{${"report_id"}}`, encodeURIComponent(String(requestParameters['reportId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => DownloadDescriptorFromJSON(jsonValue));
+    }
+
+    /**
+     * Create a short-lived inspection report download descriptor
+     */
+    async createInspectionReportDownload(requestParameters: CreateInspectionReportDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DownloadDescriptor> {
+        const response = await this.createInspectionReportDownloadRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Start an ad hoc inspection run
+     */
+    async createInspectionRunRaw(requestParameters: CreateInspectionRunOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>> {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling createInspectionRun().'
+            );
+        }
+
+        if (requestParameters['createInspectionRunRequest'] == null) {
+            throw new runtime.RequiredError(
+                'createInspectionRunRequest',
+                'Required parameter "createInspectionRunRequest" was null or undefined when calling createInspectionRun().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-runs`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateInspectionRunRequestToJSON(requestParameters['createInspectionRunRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunFromJSON(jsonValue));
+    }
+
+    /**
+     * Start an ad hoc inspection run
+     */
+    async createInspectionRun(requestParameters: CreateInspectionRunOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun> {
+        const response = await this.createInspectionRunRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
      * Get artifact metadata
      */
     async getArtifactRaw(requestParameters: GetArtifactRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Artifact>> {
@@ -268,6 +675,178 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async getCapabilities(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<CapabilitySet> {
         const response = await this.getCapabilitiesRaw(initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Get host inspection overview
+     */
+    async getInspectionOverviewRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionOverview>> {
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-overview`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionOverviewFromJSON(jsonValue));
+    }
+
+    /**
+     * Get host inspection overview
+     */
+    async getInspectionOverview(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionOverview> {
+        const response = await this.getInspectionOverviewRaw(initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Get an inspection policy
+     */
+    async getInspectionPolicyRaw(requestParameters: GetInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>> {
+        if (requestParameters['policyId'] == null) {
+            throw new runtime.RequiredError(
+                'policyId',
+                'Required parameter "policyId" was null or undefined when calling getInspectionPolicy().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-policies/{policy_id}`;
+        urlPath = urlPath.replace(`{${"policy_id"}}`, encodeURIComponent(String(requestParameters['policyId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionPolicyFromJSON(jsonValue));
+    }
+
+    /**
+     * Get an inspection policy
+     */
+    async getInspectionPolicy(requestParameters: GetInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy> {
+        const response = await this.getInspectionPolicyRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Get an immutable inspection report
+     */
+    async getInspectionReportRaw(requestParameters: GetInspectionReportRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionReport>> {
+        if (requestParameters['reportId'] == null) {
+            throw new runtime.RequiredError(
+                'reportId',
+                'Required parameter "reportId" was null or undefined when calling getInspectionReport().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-reports/{report_id}`;
+        urlPath = urlPath.replace(`{${"report_id"}}`, encodeURIComponent(String(requestParameters['reportId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionReportFromJSON(jsonValue));
+    }
+
+    /**
+     * Get an immutable inspection report
+     */
+    async getInspectionReport(requestParameters: GetInspectionReportRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionReport> {
+        const response = await this.getInspectionReportRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Get an inspection run
+     */
+    async getInspectionRunRaw(requestParameters: GetInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>> {
+        if (requestParameters['runId'] == null) {
+            throw new runtime.RequiredError(
+                'runId',
+                'Required parameter "runId" was null or undefined when calling getInspectionRun().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-runs/{run_id}`;
+        urlPath = urlPath.replace(`{${"run_id"}}`, encodeURIComponent(String(requestParameters['runId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunFromJSON(jsonValue));
+    }
+
+    /**
+     * Get an inspection run
+     */
+    async getInspectionRun(requestParameters: GetInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun> {
+        const response = await this.getInspectionRunRaw(requestParameters, initOverrides);
         return await response.value();
     }
 
@@ -358,6 +937,420 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async listAuditEvents(requestParameters: ListAuditEventsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<AuditEventPage> {
         const response = await this.listAuditEventsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * List inspection items
+     */
+    async listInspectionItemsRaw(requestParameters: ListInspectionItemsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionItemPage>> {
+        const queryParameters: any = {};
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-items`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionItemPageFromJSON(jsonValue));
+    }
+
+    /**
+     * List inspection items
+     */
+    async listInspectionItems(requestParameters: ListInspectionItemsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionItemPage> {
+        const response = await this.listInspectionItemsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * List inspection policies
+     */
+    async listInspectionPoliciesRaw(requestParameters: ListInspectionPoliciesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicyPage>> {
+        const queryParameters: any = {};
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-policies`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionPolicyPageFromJSON(jsonValue));
+    }
+
+    /**
+     * List inspection policies
+     */
+    async listInspectionPolicies(requestParameters: ListInspectionPoliciesRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicyPage> {
+        const response = await this.listInspectionPoliciesRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * List immutable inspection reports
+     */
+    async listInspectionReportsRaw(requestParameters: ListInspectionReportsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionReportPage>> {
+        const queryParameters: any = {};
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-reports`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionReportPageFromJSON(jsonValue));
+    }
+
+    /**
+     * List immutable inspection reports
+     */
+    async listInspectionReports(requestParameters: ListInspectionReportsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionReportPage> {
+        const response = await this.listInspectionReportsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * List inspection runs
+     */
+    async listInspectionRunsRaw(requestParameters: ListInspectionRunsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRunPage>> {
+        const queryParameters: any = {};
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-runs`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunPageFromJSON(jsonValue));
+    }
+
+    /**
+     * List inspection runs
+     */
+    async listInspectionRuns(requestParameters: ListInspectionRunsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRunPage> {
+        const response = await this.listInspectionRunsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * List host inspection targets
+     */
+    async listInspectionTargetsRaw(requestParameters: ListInspectionTargetsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionTargetPage>> {
+        const queryParameters: any = {};
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-targets`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionTargetPageFromJSON(jsonValue));
+    }
+
+    /**
+     * List host inspection targets
+     */
+    async listInspectionTargets(requestParameters: ListInspectionTargetsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionTargetPage> {
+        const response = await this.listInspectionTargetsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Retry a terminal inspection run as a new run
+     */
+    async retryInspectionRunRaw(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>> {
+        if (requestParameters['runId'] == null) {
+            throw new runtime.RequiredError(
+                'runId',
+                'Required parameter "runId" was null or undefined when calling retryInspectionRun().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling retryInspectionRun().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-runs/{run_id}/retry`;
+        urlPath = urlPath.replace(`{${"run_id"}}`, encodeURIComponent(String(requestParameters['runId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunFromJSON(jsonValue));
+    }
+
+    /**
+     * Retry a terminal inspection run as a new run
+     */
+    async retryInspectionRun(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun> {
+        const response = await this.retryInspectionRunRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Start an inspection policy immediately
+     */
+    async runInspectionPolicyRaw(requestParameters: RunInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>> {
+        if (requestParameters['policyId'] == null) {
+            throw new runtime.RequiredError(
+                'policyId',
+                'Required parameter "policyId" was null or undefined when calling runInspectionPolicy().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling runInspectionPolicy().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-policies/{policy_id}/run`;
+        urlPath = urlPath.replace(`{${"policy_id"}}`, encodeURIComponent(String(requestParameters['policyId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionRunFromJSON(jsonValue));
+    }
+
+    /**
+     * Start an inspection policy immediately
+     */
+    async runInspectionPolicy(requestParameters: RunInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun> {
+        const response = await this.runInspectionPolicyRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Update an inspection policy
+     */
+    async updateInspectionPolicyRaw(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>> {
+        if (requestParameters['policyId'] == null) {
+            throw new runtime.RequiredError(
+                'policyId',
+                'Required parameter "policyId" was null or undefined when calling updateInspectionPolicy().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling updateInspectionPolicy().'
+            );
+        }
+
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError(
+                'ifMatch',
+                'Required parameter "ifMatch" was null or undefined when calling updateInspectionPolicy().'
+            );
+        }
+
+        if (requestParameters['updateInspectionPolicyRequest'] == null) {
+            throw new runtime.RequiredError(
+                'updateInspectionPolicyRequest',
+                'Required parameter "updateInspectionPolicyRequest" was null or undefined when calling updateInspectionPolicy().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/inspection-policies/{policy_id}`;
+        urlPath = urlPath.replace(`{${"policy_id"}}`, encodeURIComponent(String(requestParameters['policyId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'PATCH',
+            headers: headerParameters,
+            query: queryParameters,
+            body: UpdateInspectionPolicyRequestToJSON(requestParameters['updateInspectionPolicyRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => InspectionPolicyFromJSON(jsonValue));
+    }
+
+    /**
+     * Update an inspection policy
+     */
+    async updateInspectionPolicy(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy> {
+        const response = await this.updateInspectionPolicyRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

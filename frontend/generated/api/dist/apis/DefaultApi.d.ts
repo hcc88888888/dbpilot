@@ -10,7 +10,11 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { Artifact, AuditEventPage, CapabilitySet, DownloadDescriptor, Job } from '../models/index.js';
+import type { Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, DownloadDescriptor, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, UpdateInspectionPolicyRequest } from '../models/index.js';
+export interface CancelInspectionRunRequest {
+    runId: string;
+    idempotencyKey: string;
+}
 export interface CancelJobRequest {
     jobId: string;
     idempotencyKey: string;
@@ -20,8 +24,33 @@ export interface CreateArtifactDownloadRequest {
     artifactId: string;
     idempotencyKey: string;
 }
+export interface CreateInspectionItemOperationRequest {
+    idempotencyKey: string;
+    createInspectionItemRequest: CreateInspectionItemRequest;
+}
+export interface CreateInspectionPolicyOperationRequest {
+    idempotencyKey: string;
+    createInspectionPolicyRequest: CreateInspectionPolicyRequest;
+}
+export interface CreateInspectionReportDownloadRequest {
+    reportId: string;
+    idempotencyKey: string;
+}
+export interface CreateInspectionRunOperationRequest {
+    idempotencyKey: string;
+    createInspectionRunRequest: CreateInspectionRunRequest;
+}
 export interface GetArtifactRequest {
     artifactId: string;
+}
+export interface GetInspectionPolicyRequest {
+    policyId: string;
+}
+export interface GetInspectionReportRequest {
+    reportId: string;
+}
+export interface GetInspectionRunRequest {
+    runId: string;
 }
 export interface GetJobRequest {
     jobId: string;
@@ -30,10 +59,52 @@ export interface ListAuditEventsRequest {
     cursor?: string;
     limit?: number;
 }
+export interface ListInspectionItemsRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface ListInspectionPoliciesRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface ListInspectionReportsRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface ListInspectionRunsRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface ListInspectionTargetsRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface RetryInspectionRunRequest {
+    runId: string;
+    idempotencyKey: string;
+}
+export interface RunInspectionPolicyRequest {
+    policyId: string;
+    idempotencyKey: string;
+}
+export interface UpdateInspectionPolicyOperationRequest {
+    policyId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    updateInspectionPolicyRequest: UpdateInspectionPolicyRequest;
+}
 /**
  *
  */
 export declare class DefaultApi extends runtime.BaseAPI {
+    /**
+     * Cancel an inspection run
+     */
+    cancelInspectionRunRaw(requestParameters: CancelInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
+    /**
+     * Cancel an inspection run
+     */
+    cancelInspectionRun(requestParameters: CancelInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
     /**
      * Request job cancellation
      */
@@ -51,6 +122,38 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     createArtifactDownload(requestParameters: CreateArtifactDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DownloadDescriptor>;
     /**
+     * Create a custom inspection item
+     */
+    createInspectionItemRaw(requestParameters: CreateInspectionItemOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionItem>>;
+    /**
+     * Create a custom inspection item
+     */
+    createInspectionItem(requestParameters: CreateInspectionItemOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionItem>;
+    /**
+     * Create an inspection policy
+     */
+    createInspectionPolicyRaw(requestParameters: CreateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>>;
+    /**
+     * Create an inspection policy
+     */
+    createInspectionPolicy(requestParameters: CreateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy>;
+    /**
+     * Create a short-lived inspection report download descriptor
+     */
+    createInspectionReportDownloadRaw(requestParameters: CreateInspectionReportDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DownloadDescriptor>>;
+    /**
+     * Create a short-lived inspection report download descriptor
+     */
+    createInspectionReportDownload(requestParameters: CreateInspectionReportDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DownloadDescriptor>;
+    /**
+     * Start an ad hoc inspection run
+     */
+    createInspectionRunRaw(requestParameters: CreateInspectionRunOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
+    /**
+     * Start an ad hoc inspection run
+     */
+    createInspectionRun(requestParameters: CreateInspectionRunOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
+    /**
      * Get artifact metadata
      */
     getArtifactRaw(requestParameters: GetArtifactRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Artifact>>;
@@ -67,6 +170,38 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     getCapabilities(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<CapabilitySet>;
     /**
+     * Get host inspection overview
+     */
+    getInspectionOverviewRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionOverview>>;
+    /**
+     * Get host inspection overview
+     */
+    getInspectionOverview(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionOverview>;
+    /**
+     * Get an inspection policy
+     */
+    getInspectionPolicyRaw(requestParameters: GetInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>>;
+    /**
+     * Get an inspection policy
+     */
+    getInspectionPolicy(requestParameters: GetInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy>;
+    /**
+     * Get an immutable inspection report
+     */
+    getInspectionReportRaw(requestParameters: GetInspectionReportRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionReport>>;
+    /**
+     * Get an immutable inspection report
+     */
+    getInspectionReport(requestParameters: GetInspectionReportRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionReport>;
+    /**
+     * Get an inspection run
+     */
+    getInspectionRunRaw(requestParameters: GetInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
+    /**
+     * Get an inspection run
+     */
+    getInspectionRun(requestParameters: GetInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
+    /**
      * Get a job
      */
     getJobRaw(requestParameters: GetJobRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
@@ -82,4 +217,68 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * List audit events
      */
     listAuditEvents(requestParameters?: ListAuditEventsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<AuditEventPage>;
+    /**
+     * List inspection items
+     */
+    listInspectionItemsRaw(requestParameters: ListInspectionItemsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionItemPage>>;
+    /**
+     * List inspection items
+     */
+    listInspectionItems(requestParameters?: ListInspectionItemsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionItemPage>;
+    /**
+     * List inspection policies
+     */
+    listInspectionPoliciesRaw(requestParameters: ListInspectionPoliciesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicyPage>>;
+    /**
+     * List inspection policies
+     */
+    listInspectionPolicies(requestParameters?: ListInspectionPoliciesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicyPage>;
+    /**
+     * List immutable inspection reports
+     */
+    listInspectionReportsRaw(requestParameters: ListInspectionReportsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionReportPage>>;
+    /**
+     * List immutable inspection reports
+     */
+    listInspectionReports(requestParameters?: ListInspectionReportsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionReportPage>;
+    /**
+     * List inspection runs
+     */
+    listInspectionRunsRaw(requestParameters: ListInspectionRunsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRunPage>>;
+    /**
+     * List inspection runs
+     */
+    listInspectionRuns(requestParameters?: ListInspectionRunsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRunPage>;
+    /**
+     * List host inspection targets
+     */
+    listInspectionTargetsRaw(requestParameters: ListInspectionTargetsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionTargetPage>>;
+    /**
+     * List host inspection targets
+     */
+    listInspectionTargets(requestParameters?: ListInspectionTargetsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionTargetPage>;
+    /**
+     * Retry a terminal inspection run as a new run
+     */
+    retryInspectionRunRaw(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
+    /**
+     * Retry a terminal inspection run as a new run
+     */
+    retryInspectionRun(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
+    /**
+     * Start an inspection policy immediately
+     */
+    runInspectionPolicyRaw(requestParameters: RunInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
+    /**
+     * Start an inspection policy immediately
+     */
+    runInspectionPolicy(requestParameters: RunInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
+    /**
+     * Update an inspection policy
+     */
+    updateInspectionPolicyRaw(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>>;
+    /**
+     * Update an inspection policy
+     */
+    updateInspectionPolicy(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy>;
 }

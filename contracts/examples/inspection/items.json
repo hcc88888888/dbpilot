@@ -1,0 +1,34 @@
+{
+  "items": [
+    {
+      "id": "host-cpu-utilization",
+      "version": 1,
+      "name": "Host CPU utilization",
+      "description": "Evaluates host CPU utilization over the selected window.",
+      "category": "capacity",
+      "scope_type": "host",
+      "source_type": "metric",
+      "required_capabilities": ["host.metrics"],
+      "metric_rule": {
+        "metric_name": "host.cpu.utilization",
+        "labels": { "mode": "total" },
+        "window": "15m",
+        "aggregation": "avg",
+        "operator": "gte",
+        "warning_threshold": 75,
+        "critical_threshold": 90
+      },
+      "evidence_selector": "host.cpu.utilization",
+      "recommendation_template": "Reduce host CPU contention or scale the workload.",
+      "system": true,
+      "enabled": true,
+      "created_at": "2026-08-28T08:00:00Z",
+      "updated_at": "2026-08-28T08:00:00Z"
+    }
+  ],
+  "page": {
+    "limit": 100,
+    "next_cursor": null,
+    "has_more": false
+  }
+}

@@ -205,3 +205,597 @@
         $ref: ../common/errors.yaml#/ProblemResponse
       '405':
         $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-overview:
+  get:
+    operationId: getInspectionOverview
+    summary: Get host inspection overview
+    x-dbpilot-permission: inspection:view
+    responses:
+      '200':
+        description: Current host inspection coverage and findings summary.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionOverview
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-targets:
+  get:
+    operationId: listInspectionTargets
+    summary: List host inspection targets
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+    responses:
+      '200':
+        description: Cursor-paginated inspection targets without endpoint, credential, or local filesystem data.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionTargetPage
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-items:
+  get:
+    operationId: listInspectionItems
+    summary: List inspection items
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+    responses:
+      '200':
+        description: Cursor-paginated inspection items.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionItemPage
+            examples:
+              host-items:
+                externalValue: ../../examples/inspection/items.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+  post:
+    operationId: createInspectionItem
+    summary: Create a custom inspection item
+    x-dbpilot-permission: inspection:manage
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../common/inspection.yaml#/CreateInspectionItemRequest
+    responses:
+      '201':
+        description: Created inspection item.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionItem
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-policies:
+  get:
+    operationId: listInspectionPolicies
+    summary: List inspection policies
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+    responses:
+      '200':
+        description: Cursor-paginated inspection policies.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionPolicyPage
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+  post:
+    operationId: createInspectionPolicy
+    summary: Create an inspection policy
+    x-dbpilot-permission: inspection:manage
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../common/inspection.yaml#/CreateInspectionPolicyRequest
+    responses:
+      '201':
+        description: Created inspection policy.
+        headers:
+          ETag:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionPolicy
+            examples:
+              host-policy:
+                externalValue: ../../examples/inspection/policy.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-policies/{policy_id}:
+  get:
+    operationId: getInspectionPolicy
+    summary: Get an inspection policy
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '200':
+        description: Inspection policy.
+        headers:
+          ETag:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionPolicy
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+  patch:
+    operationId: updateInspectionPolicy
+    summary: Update an inspection policy
+    x-dbpilot-permission: inspection:manage
+    parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../common/inspection.yaml#/UpdateInspectionPolicyRequest
+    responses:
+      '200':
+        description: Updated inspection policy.
+        headers:
+          ETag:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionPolicy
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '412':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-policies/{policy_id}/run:
+  post:
+    operationId: runInspectionPolicy
+    summary: Start an inspection policy immediately
+    x-dbpilot-permission: inspection:execute
+    parameters:
+      - name: policy_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '202':
+        description: Inspection run accepted.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRun
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-runs:
+  get:
+    operationId: listInspectionRuns
+    summary: List inspection runs
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+    responses:
+      '200':
+        description: Cursor-paginated inspection runs.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRunPage
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+  post:
+    operationId: createInspectionRun
+    summary: Start an ad hoc inspection run
+    x-dbpilot-permission: inspection:execute
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../common/inspection.yaml#/CreateInspectionRunRequest
+    responses:
+      '202':
+        description: Inspection run accepted.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRun
+            examples:
+              host-run:
+                externalValue: ../../examples/inspection/run.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-runs/{run_id}:
+  get:
+    operationId: getInspectionRun
+    summary: Get an inspection run
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '200':
+        description: Inspection run.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRun
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-runs/{run_id}/cancel:
+  post:
+    operationId: cancelInspectionRun
+    summary: Cancel an inspection run
+    x-dbpilot-permission: inspection:execute
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '202':
+        description: Inspection run cancellation accepted.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRun
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-runs/{run_id}/retry:
+  post:
+    operationId: retryInspectionRun
+    summary: Retry a terminal inspection run as a new run
+    x-dbpilot-permission: inspection:execute
+    parameters:
+      - name: run_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '202':
+        description: New retry inspection run accepted.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionRun
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+/inspection-reports:
+  get:
+    operationId: listInspectionReports
+    summary: List immutable inspection reports
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: cursor
+        in: query
+        schema:
+          type: string
+          minLength: 1
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+    responses:
+      '200':
+        description: Cursor-paginated immutable inspection reports.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionReportPage
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-reports/{report_id}:
+  get:
+    operationId: getInspectionReport
+    summary: Get an immutable inspection report
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: report_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '200':
+        description: Immutable inspection report snapshot.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/inspection.yaml#/InspectionReport
+            examples:
+              host-report:
+                externalValue: ../../examples/inspection/report.json
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+/inspection-reports/{report_id}/download:
+  post:
+    operationId: createInspectionReportDownload
+    summary: Create a short-lived inspection report download descriptor
+    x-dbpilot-permission: inspection:view
+    parameters:
+      - name: report_id
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      '200':
+        description: Short-lived authorized report download descriptor; never report bytes.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/artifacts.yaml#/DownloadDescriptor
+      '400':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '401':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '403':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '404':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '405':
+        $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
+      '409':
+        $ref: ../common/errors.yaml#/ProblemResponse

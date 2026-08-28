@@ -3,19 +3,53 @@
 package openapi
 
 const (
-	PermissionCancelJob              = "platform.jobs.cancel"
-	PermissionCreateArtifactDownload = "platform.artifacts.download"
-	PermissionGetArtifact            = "platform.artifacts.read"
-	PermissionGetCapabilities        = "platform.capabilities.read"
-	PermissionGetJob                 = "platform.jobs.read"
-	PermissionListAuditEvents        = "platform.audit.read"
+	PermissionCancelInspectionRun            = "inspection:execute"
+	PermissionCancelJob                      = "platform.jobs.cancel"
+	PermissionCreateArtifactDownload         = "platform.artifacts.download"
+	PermissionCreateInspectionItem           = "inspection:manage"
+	PermissionCreateInspectionPolicy         = "inspection:manage"
+	PermissionCreateInspectionReportDownload = "inspection:view"
+	PermissionCreateInspectionRun            = "inspection:execute"
+	PermissionGetArtifact                    = "platform.artifacts.read"
+	PermissionGetCapabilities                = "platform.capabilities.read"
+	PermissionGetInspectionOverview          = "inspection:view"
+	PermissionGetInspectionPolicy            = "inspection:view"
+	PermissionGetInspectionReport            = "inspection:view"
+	PermissionGetInspectionRun               = "inspection:view"
+	PermissionGetJob                         = "platform.jobs.read"
+	PermissionListAuditEvents                = "platform.audit.read"
+	PermissionListInspectionItems            = "inspection:view"
+	PermissionListInspectionPolicies         = "inspection:view"
+	PermissionListInspectionReports          = "inspection:view"
+	PermissionListInspectionRuns             = "inspection:view"
+	PermissionListInspectionTargets          = "inspection:view"
+	PermissionRetryInspectionRun             = "inspection:execute"
+	PermissionRunInspectionPolicy            = "inspection:execute"
+	PermissionUpdateInspectionPolicy         = "inspection:manage"
 )
 
 var OperationPermissions = map[string]string{
-	"cancelJob":              PermissionCancelJob,
-	"createArtifactDownload": PermissionCreateArtifactDownload,
-	"getArtifact":            PermissionGetArtifact,
-	"getCapabilities":        PermissionGetCapabilities,
-	"getJob":                 PermissionGetJob,
-	"listAuditEvents":        PermissionListAuditEvents,
+	"cancelInspectionRun":            PermissionCancelInspectionRun,
+	"cancelJob":                      PermissionCancelJob,
+	"createArtifactDownload":         PermissionCreateArtifactDownload,
+	"createInspectionItem":           PermissionCreateInspectionItem,
+	"createInspectionPolicy":         PermissionCreateInspectionPolicy,
+	"createInspectionReportDownload": PermissionCreateInspectionReportDownload,
+	"createInspectionRun":            PermissionCreateInspectionRun,
+	"getArtifact":                    PermissionGetArtifact,
+	"getCapabilities":                PermissionGetCapabilities,
+	"getInspectionOverview":          PermissionGetInspectionOverview,
+	"getInspectionPolicy":            PermissionGetInspectionPolicy,
+	"getInspectionReport":            PermissionGetInspectionReport,
+	"getInspectionRun":               PermissionGetInspectionRun,
+	"getJob":                         PermissionGetJob,
+	"listAuditEvents":                PermissionListAuditEvents,
+	"listInspectionItems":            PermissionListInspectionItems,
+	"listInspectionPolicies":         PermissionListInspectionPolicies,
+	"listInspectionReports":          PermissionListInspectionReports,
+	"listInspectionRuns":             PermissionListInspectionRuns,
+	"listInspectionTargets":          PermissionListInspectionTargets,
+	"retryInspectionRun":             PermissionRetryInspectionRun,
+	"runInspectionPolicy":            PermissionRunInspectionPolicy,
+	"updateInspectionPolicy":         PermissionUpdateInspectionPolicy,
 }
