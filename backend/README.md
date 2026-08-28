@@ -100,8 +100,11 @@ Windows development can verify both Linux executables inside the exact
 `cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` image. The verifier builds
 both architectures, executes each selected-architecture binary with `--version`, starts the Agent with a signed
 sample policy, proves its bbolt command journal opens and closes, and runs a
-two-phase protocol probe proving a prepared command remains unexecuted without
-Start. It also resolves the command execution-token and Artifact signing
+real mTLS AgentControl probe against the production Agent. The probe requires
+the Agent to advertise `collect_now`, sends signed Prepare and fenced Start,
+runs the configured JMX-backed `DependencyCollector`, verifies the typed
+Result, returns ResultAck, and then confirms the journal marks that exact result
+reported. It also resolves the command execution-token and Artifact signing
 credentials, validates the private Artifact storage root, and starts the
 control plane through readiness initialization until the expected PostgreSQL
 connection failure. It rejects missing Docker/images, non-Kylin

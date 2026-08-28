@@ -37,7 +37,7 @@ function Remove-DBPilotOwnedContainer {
         [AllowNull()][AllowEmptyString()][string]$ContainerID
     )
     if ([string]::IsNullOrWhiteSpace($ContainerID)) { return }
-    & $DockerBinary rm -f $ContainerID | Out-Null
+    & $DockerBinary rm -f -v $ContainerID | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Unable to remove owned container '$ContainerID'."
     }

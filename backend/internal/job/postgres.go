@@ -923,7 +923,7 @@ func timeoutJobTargetInTx(ctx context.Context, tx *sql.Tx, current Job, message 
 
 func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {
 	base := TerminalResultOutcome{CommandID: input.CommandID}
-	if repository == nil || repository.db == nil || ctx == nil || input.Scope.Validate() != nil || strings.TrimSpace(input.CommandID) == "" || input.ExpectedExecutionRevision == 0 || !terminalCommandStatus(input.Status) || input.Status == CommandRejected || input.At.IsZero() {
+	if repository == nil || repository.db == nil || ctx == nil || input.Scope.Validate() != nil || strings.TrimSpace(input.CommandID) == "" || input.ExpectedExecutionRevision == 0 || !terminalCommandStatus(input.Status) || input.Status == CommandRejected || (input.AllowTimedOutDigestAttach && input.Status != CommandTimedOut) || input.At.IsZero() {
 		return base, ErrInvalidCommandPayload
 	}
 	tx, err := repository.db.BeginTx(ctx, nil)
@@ -956,6 +956,33 @@ func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context,
 	if phase == CommandPhaseSucceeded || phase == CommandPhaseFailed || phase == CommandPhaseCancelled || phase == CommandPhaseTimedOut || phase == CommandPhaseRejected {
 		if !fenceMatches {
 			return rollback(ErrConflict)
+		}
+		if phase == CommandPhaseTimedOut && storedStatus == CommandTimedOut && len(storedDigest) == 0 && input.AllowTimedOutDigestAttach {
+			result, updateErr := tx.ExecContext(ctx, `
+				UPDATE command_outbox
+				SET terminal_result_digest = $1
+				WHERE tenant_id = $2 AND project_id = $3 AND id = $4
+					AND command_phase = 'timed_out' AND command_status = 'timed_out'
+					AND terminal_result_digest IS NULL
+					AND execution_token_hash = $5 AND execution_revision = $6
+			`, input.ResultDigest[:], input.Scope.TenantID, input.Scope.ProjectID, input.CommandID, input.TokenHash[:], input.ExpectedExecutionRevision)
+			if updateErr != nil {
+				return rollback(classifyWriteError("attach interrupted result digest to timed-out command", updateErr))
+			}
+			updated, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return rollback(fmt.Errorf("read timed-out result digest attachment: %w", rowsErr))
+			}
+			if updated != 1 {
+				return rollback(ErrConflict)
+			}
+			base.ResultDigest = input.ResultDigest
+			base.Persisted = true
+			base.Duplicate = true
+			if err := tx.Commit(); err != nil {
+				return TerminalResultOutcome{}, fmt.Errorf("commit timed-out result digest attachment: %w: %w", ErrAmbiguousCommit, err)
+			}
+			return base, nil
 		}
 		if storedStatus == input.Status && len(storedDigest) == sha256.Size && subtle.ConstantTimeCompare(storedDigest, input.ResultDigest[:]) == 1 {
 			base.Persisted = true

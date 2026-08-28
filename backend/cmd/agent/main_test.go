@@ -1,15 +1,32 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
 )
+
+func TestConfiguredCommandExecutorsAdvertiseCollectNowOnlyWithCollector(t *testing.T) {
+	withoutCollector, err := configuredCommandExecutors(nil)
+	require.NoError(t, err)
+	require.Empty(t, withoutCollector.Capabilities())
+
+	collector := &configuredCollectNowCollector{}
+	withCollector, err := configuredCommandExecutors(collector)
+	require.NoError(t, err)
+	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withCollector.Capabilities())
+}
+
+type configuredCollectNowCollector struct{}
+
+func (*configuredCollectNowCollector) CollectOnce(context.Context) error { return nil }
 
 func TestLoadConfigRejectsRelativePrivateAndDataPaths(t *testing.T) {
 	path := writeConfig(t, `

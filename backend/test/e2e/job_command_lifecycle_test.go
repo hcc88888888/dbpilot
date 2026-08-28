@@ -187,6 +187,82 @@ func TestTwoPhaseCommandLifecycle(t *testing.T) {
 		require.NotEqual(t, job.TargetTimedOut, current.TargetResults[0].Status)
 	})
 
+	t.Run("timeout worker accepts matching interrupted recovery evidence", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		environment := newContractCommandEnvironment(t, ctx, dsn)
+		dispatcher := newCapturedCommandDispatcher()
+		lifecycle := environment.newLifecycle(t, dispatcher)
+		scope := platformscope.Scope{TenantID: "tenant-timeout-interrupted", ProjectID: "project-timeout-interrupted"}
+		created := time.Now().UTC().Truncate(time.Microsecond)
+		value := contractJob("job-timeout-interrupted", scope, "agent-a", created)
+		message := contractOutbox(t, value, "command-timeout-interrupted", "agent-a", created)
+		require.NoError(t, environment.repository.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}))
+		dispatched, err := lifecycle.DispatchPending(ctx, created.Add(time.Millisecond))
+		require.NoError(t, err)
+		require.Equal(t, 1, dispatched)
+		envelope := dispatcher.nextEnvelope(t)
+		_, err = lifecycle.Prepared(ctx, "agent-a", contractPrepared(t, envelope).GetCommandPrepared())
+		require.NoError(t, err)
+		start := dispatcher.nextStart(t)
+
+		journalPath := filepath.Join(t.TempDir(), "timeout-interrupted.db")
+		journal, err := commandjournal.Open(journalPath)
+		require.NoError(t, err)
+		prepared, err := journal.Prepare(ctx, envelope, time.Now().UTC())
+		require.NoError(t, err)
+		require.True(t, prepared)
+		require.NoError(t, journal.AuthorizeStart(ctx, start.GetCommandId(), start.GetExecutionToken(), start.GetLeaseRevision(), start.GetStartDeadline().AsTime()))
+		require.NoError(t, journal.Close())
+		journal, err = commandjournal.Open(journalPath)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = journal.Close() })
+
+		timeoutAt := time.Now().UTC().Add(10 * time.Second)
+		claims, err := environment.repository.ClaimExpiredExecution(ctx, 1, timeoutAt)
+		require.NoError(t, err)
+		require.Len(t, claims, 1)
+		require.NoError(t, environment.repository.FinalizeExpiredExecution(ctx, claims[0], timeoutAt.Add(time.Millisecond)))
+		_, err = lifecycle.DispatchPending(ctx, timeoutAt.Add(2*time.Millisecond))
+		require.NoError(t, err)
+
+		registry := agentcontrol.NewRegistry(16)
+		_, streamOpener := startCommandControlServer(t, registry, lifecycle)
+		executor := &countingCommandExecutor{}
+		executors := agent.NewExecutorRegistry()
+		require.NoError(t, executors.Register(agent.CommandKindCollectNow, executor))
+		verifier, err := agent.NewCommandVerifier("agent-a", environment.publicKey, executors.Capabilities())
+		require.NoError(t, err)
+		client := startContractControlClient(t, ctx, streamOpener, journal, verifier, executors, 20*time.Millisecond)
+		defer client.stop(t)
+
+		require.Eventually(t, func() bool {
+			pending, pendingErr := journal.PendingResults(ctx)
+			return pendingErr == nil && len(pending) == 0
+		}, 3*time.Second, 20*time.Millisecond)
+		require.Zero(t, executor.calls.Load())
+		stored, err := environment.repository.LookupCommand(ctx, message.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.CommandPhaseTimedOut, stored.Phase)
+		require.Len(t, stored.TerminalResultDigest, sha256.Size)
+		current, err := environment.repository.Get(ctx, scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, job.StatusTimedOut, current.Status)
+		require.Equal(t, job.TargetTimedOut, current.TargetResults[0].Status)
+		var interruptedAudits int
+		require.NoError(t, environment.database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE command_id = $1 AND action = 'command.execution_interrupted'", message.ID).Scan(&interruptedAudits))
+		require.Equal(t, 1, interruptedAudits)
+		var timeoutAudits int
+		require.NoError(t, environment.database.QueryRowContext(ctx, "SELECT count(*) FROM audit_events WHERE command_id = $1 AND action = 'command.execution_timed_out'", message.ID).Scan(&timeoutAudits))
+		require.Equal(t, 1, timeoutAudits)
+
+		conflictResult := contractResult(start, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, "").GetCommandResult()
+		conflict, err := lifecycle.Result(ctx, "agent-a", conflictResult)
+		require.NoError(t, err)
+		require.False(t, conflict.Persisted)
+		require.Equal(t, "RESULT_CONFLICT", conflict.ReasonCode)
+	})
+
 	t.Run("control-plane crash before ResultAck replays the durable result", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()

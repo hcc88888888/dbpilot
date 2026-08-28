@@ -233,9 +233,10 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	client := telemetryv1.NewTelemetryIngestClient(connection)
 	verifier := agent.Verifier{PublicKey: publicKey, Environment: policy.ValidationEnvironment{AllowedRoots: settings.AllowedLogRoots, ForbiddenRoots: []string{"/proc", "/sys", "/etc"}, ResolvePath: filepath.EvalSymlinks}}
+	var dependencyCollector *agent.DependencyCollector
 	var componentCollector agent.ComponentCollector
 	if len(settings.Components) > 0 {
-		componentCollector, err = agent.NewDependencyCollector(agent.DependencyCollectorConfig{
+		dependencyCollector, err = agent.NewDependencyCollector(agent.DependencyCollectorConfig{
 			AgentID: settings.AgentID, Definitions: settings.Components, SecretResolver: database.EnvironmentSecretResolver{}, Store: store,
 			Interval: settings.ComponentCollection.interval(), RequestTimeout: settings.ComponentCollection.requestTimeout(), MaxAttempts: settings.ComponentCollection.MaxAttempts,
 			InitialBackoff: settings.ComponentCollection.initialBackoff(), MaxBackoff: settings.ComponentCollection.maxBackoff(),
@@ -244,6 +245,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return fmt.Errorf("configure component collector: %w", err)
 		}
+		componentCollector = dependencyCollector
 	}
 	journal, err := commandjournal.Open(settings.Control.JournalPath)
 	if err != nil {
@@ -251,7 +253,11 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return err
 	}
 	defer journal.Close()
-	executors := agent.NewExecutorRegistry()
+	executors, err := configuredCommandExecutors(dependencyCollector)
+	if err != nil {
+		_ = store.Close()
+		return err
+	}
 	commandVerifier, err := agent.NewCommandVerifier(settings.AgentID, controlPublicKey, executors.Capabilities())
 	if err != nil {
 		_ = store.Close()
@@ -284,6 +290,21 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return second
 	}
 	return nil
+}
+
+func configuredCommandExecutors(collector agent.CollectNowCollector) (*agent.ExecutorRegistry, error) {
+	executors := agent.NewExecutorRegistry()
+	if collector == nil {
+		return executors, nil
+	}
+	executor, err := agent.NewCollectNowExecutor(collector)
+	if err != nil {
+		return nil, fmt.Errorf("configure CollectNow executor: %w", err)
+	}
+	if err := executors.Register(agent.CommandKindCollectNow, executor); err != nil {
+		return nil, fmt.Errorf("register CollectNow executor: %w", err)
+	}
+	return executors, nil
 }
 
 func loadPublicKey(path string) (ed25519.PublicKey, error) {

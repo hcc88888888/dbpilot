@@ -44,8 +44,22 @@ test('owned-container helper leaves a similarly named pre-existing container unt
     assert.equal(result.status, 0, result.stderr);
     const invocations = await readFile(fixture.log, 'utf8');
     assert.match(invocations, /ps -a --filter name=\^\/dbpilot-contract-postgres-0123456789abcdef0123456789abcdef\$ --format \{\{\.ID\}\}/);
-    assert.match(invocations, /rm -f created-id/);
+    assert.match(invocations, /rm -f -v created-id/);
     assert.doesNotMatch(invocations, /rm -f preexisting-id/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('owned-container removal deletes anonymous volumes from the recorded container only', async () => {
+  const fixture = await fakeDockerFixture();
+  const command = `. '${helper}'; $id=New-DBPilotOwnedContainer -DockerBinary '${fixture.docker}' -Name 'dbpilot-volume-cleanup-0123456789abcdef0123456789abcdef' -CreateArguments @('postgres:16-alpine'); Remove-DBPilotOwnedContainer -DockerBinary '${fixture.docker}' -ContainerID $id`;
+  try {
+    const result = pwsh(['-Command', command], { DOCKER_LOG: fixture.log });
+    assert.equal(result.status, 0, result.stderr);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, /^rm -f -v created-id$/m);
+    assert.doesNotMatch(invocations, /rm .*preexisting-id/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

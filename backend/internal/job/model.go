@@ -207,6 +207,7 @@ type TerminalResultCAS struct {
 	ExpectedExecutionRevision uint64
 	Status                    CommandStatus
 	ResultDigest              [32]byte
+	AllowTimedOutDigestAttach bool
 	At                        time.Time
 }
 

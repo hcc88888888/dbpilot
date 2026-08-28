@@ -944,7 +944,8 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	at := lifecycle.currentTime()
 	terminal, err := lifecycle.dispatchRepository.PersistTerminalResult(ctx, TerminalResultCAS{
 		Scope: message.Scope, CommandID: message.ID, TokenHash: tokenHash,
-		ExpectedExecutionRevision: result.GetLeaseRevision(), Status: commandStatus, ResultDigest: resultDigest, At: at,
+		ExpectedExecutionRevision: result.GetLeaseRevision(), Status: commandStatus, ResultDigest: resultDigest,
+		AllowTimedOutDigestAttach: result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED, At: at,
 	})
 	if err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
@@ -959,6 +960,21 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, recordErr
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
+	}
+	if terminal.Duplicate && terminal.Status == CommandTimedOut && result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED {
+		value, getErr := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if getErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, getErr
+		}
+		storedTarget, found := targetFor(value.TargetResults, message.TargetID)
+		if !found || storedTarget.Status != TargetTimedOut {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrConflict
+		}
+		event := lifecycle.auditEvent(value, message, "command.execution_interrupted", "failure", map[string]any{"state": result.GetState().String()}, at, "command.execution_interrupted:"+message.ID)
+		if _, recordErr := lifecycle.audit.RecordOnce(ctx, event); recordErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, recordErr
+		}
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
 	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {

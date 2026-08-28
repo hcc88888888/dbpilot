@@ -14,6 +14,7 @@ $repoRoot = (Resolve-Path (Join-Path $backendRoot '..')).Path
 $null = . (Join-Path $PSScriptRoot 'container-safety.ps1')
 $postgresContainer = New-DBPilotOwnedContainerName -Prefix 'dbpilot-contract-postgres'
 $postgresContainerID = $null
+$postgresAnonymousVolumes = @()
 $temporaryRoot = Join-Path $backendRoot ('.tmp-contract-foundation-' + [guid]::NewGuid().ToString('N'))
 $primaryFailure = $null
 
@@ -102,12 +103,21 @@ try {
     }
 
 	$postgresContainerID = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $postgresContainer -CreateArguments @(
+		'--label', 'dbpilot.verifier=contract-foundation',
+		'--label', "dbpilot.run=$postgresContainer",
         '--publish', '127.0.0.1:55432:5432',
         '--env', 'POSTGRES_DB=dbpilot_contract',
         '--env', 'POSTGRES_USER=dbpilot_contract',
         '--env', 'POSTGRES_PASSWORD=dbpilot_contract',
         'postgres:16-alpine'
     )
+	$containerInspectionJSON = (& $DockerBinary inspect $postgresContainerID | Out-String)
+	if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect foundation PostgreSQL ownership metadata.' }
+	$containerInspection = @($containerInspectionJSON | ConvertFrom-Json)
+	if ($containerInspection.Count -ne 1 -or $containerInspection[0].Config.Labels.'dbpilot.run' -cne $postgresContainer) {
+		throw 'Foundation PostgreSQL ownership label is missing or incorrect.'
+	}
+	$postgresAnonymousVolumes = @($containerInspection[0].Mounts | Where-Object { $_.Type -eq 'volume' } | ForEach-Object { $_.Name })
 	Invoke-Checked $DockerBinary @('start', $postgresContainerID)
     $ready = $false
     for ($attempt = 1; $attempt -le 60; $attempt++) {
@@ -160,6 +170,16 @@ finally {
 			$remaining = @(& $DockerBinary ps -a --no-trunc --filter "id=$postgresContainerID" --format '{{.ID}}')
 			if ($LASTEXITCODE -ne 0) { throw 'Unable to verify foundation container cleanup.' }
 			if ($remaining -contains $postgresContainerID) { throw "Foundation verifier left container '$postgresContainerID' behind." }
+		}
+		$remainingByRun = @(& $DockerBinary ps -a --filter "label=dbpilot.run=$postgresContainer" --format '{{.ID}}')
+		if ($LASTEXITCODE -ne 0) { throw 'Unable to audit foundation run-label cleanup.' }
+		if ($remainingByRun.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($remainingByRun -join ''))) {
+			throw "Foundation verifier left a run-labelled container for '$postgresContainer' behind."
+		}
+		foreach ($volume in $postgresAnonymousVolumes) {
+			$remainingVolume = @(& $DockerBinary volume ls --filter "name=^$volume$" --format '{{.Name}}')
+			if ($LASTEXITCODE -ne 0) { throw "Unable to audit anonymous volume cleanup for '$volume'." }
+			if ($remainingVolume -contains $volume) { throw "Foundation verifier left anonymous volume '$volume' behind." }
 		}
 	}
 	catch {
