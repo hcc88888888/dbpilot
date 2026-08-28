@@ -265,6 +265,10 @@ func TestLeaseFenceHeartbeatInvalidatesTimeoutClaim(t *testing.T) {
 	require.NoError(t, repository.MarkPrepared(ctx, value.Scope, message.ID, digest, now))
 	grant, err := repository.AuthorizeStart(ctx, value.Scope, message.ID, digest, token, []byte("ciphertext-lease-fence"), now, now.Add(time.Second))
 	require.NoError(t, err)
+	dispatched, err := repository.Transition(ctx, Transition{Scope: value.Scope, JobID: value.ID, CurrentVersion: value.Version, To: StatusDispatched, At: now.Add(-time.Second)})
+	require.NoError(t, err)
+	running, err := repository.Transition(ctx, Transition{Scope: value.Scope, JobID: value.ID, CurrentVersion: dispatched.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: message.TargetID, Status: TargetRunning}}, At: now})
+	require.NoError(t, err)
 
 	claims, err := repository.ClaimExpiredExecution(ctx, 1, now.Add(2*time.Second))
 	require.NoError(t, err)
@@ -273,6 +277,15 @@ func TestLeaseFenceHeartbeatInvalidatesTimeoutClaim(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, newRevision, claims[0].ClaimedRecoveryRevision)
 	require.ErrorIs(t, repository.FinalizeExpiredExecution(ctx, claims[0], now.Add(3*time.Second)), ErrConflict)
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, running.Version, storedJob.Version)
+	require.Equal(t, StatusRunning, storedJob.Status)
+	require.Equal(t, TargetRunning, storedJob.TargetResults[0].Status)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseRunning, storedCommand.Phase)
+	require.False(t, storedCommand.TerminalAuditPending)
 }
 
 func TestResultFenceTerminalResultInvalidatesTimeoutClaimAndIsIdempotent(t *testing.T) {
@@ -314,6 +327,242 @@ func TestResultFenceTerminalResultInvalidatesTimeoutClaimAndIsIdempotent(t *test
 	require.NoError(t, err)
 	require.True(t, duplicate.Persisted)
 	require.True(t, duplicate.Duplicate)
+}
+
+func TestResultFenceResultWinsBeforeAtomicTimeoutAndKeepsJobConsistent(t *testing.T) {
+	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, grant, token := createExpiredStartedCommand(t, ctx, repository, "result-wins-timeout", now)
+	claims, err := repository.ClaimExpiredExecution(ctx, 1, now.Add(2*time.Second))
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x77}, 32))
+	require.NoError(t, err)
+	lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: repository, Jobs: repository, Agents: &recordingCommandDispatcher{}, Signer: signer,
+		Audit: &recordingAudit{}, TokenProtector: protector, Now: func() time.Time { return now.Add(2 * time.Second) },
+	})
+	require.NoError(t, err)
+	result := &agentv1.CommandResult{
+		CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "completed",
+		ExecutionToken: token[:], LeaseRevision: grant.ExecutionRevision,
+	}
+	outcome, err := lifecycle.Result(ctx, message.TargetID, result)
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.ErrorIs(t, repository.FinalizeExpiredExecution(ctx, claims[0], now.Add(3*time.Second)), ErrConflict)
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusSucceeded, storedJob.Status)
+	require.Equal(t, TargetSucceeded, storedJob.TargetResults[0].Status)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseSucceeded, storedCommand.Phase)
+	require.False(t, storedCommand.TerminalAuditPending)
+}
+
+func TestTimeoutFenceAtomicallyTerminalizesJobTargetAndCommand(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, _, _ := createExpiredStartedCommand(t, ctx, repository, "atomic-timeout", now)
+	claims, err := repository.ClaimExpiredExecution(ctx, 1, now.Add(2*time.Second))
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+
+	require.NoError(t, repository.FinalizeExpiredExecution(ctx, claims[0], now.Add(3*time.Second)))
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, storedJob.Status)
+	require.Equal(t, TargetTimedOut, storedJob.TargetResults[0].Status)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseTimedOut, storedCommand.Phase)
+	var pending bool
+	var dedupe string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_audit_pending, terminal_audit_dedupe_key FROM command_outbox WHERE id = $1`, message.ID).Scan(&pending, &dedupe))
+	require.True(t, pending)
+	require.Equal(t, "command.execution_timed_out:"+message.ID, dedupe)
+}
+
+func TestTimeoutFenceCommandWriteFailureRollsBackJobAndTarget(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, _, _ := createExpiredStartedCommand(t, ctx, repository, "atomic-rollback", now)
+	claims, err := repository.ClaimExpiredExecution(ctx, 1, now.Add(2*time.Second))
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	_, err = database.ExecContext(ctx, `
+		CREATE FUNCTION fail_timeout_command_update() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.command_phase = 'timed_out' THEN RAISE EXCEPTION 'injected timeout command failure'; END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER fail_timeout_command_update BEFORE UPDATE ON command_outbox
+		FOR EACH ROW EXECUTE FUNCTION fail_timeout_command_update();
+	`)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = database.Exec(`DROP TRIGGER IF EXISTS fail_timeout_command_update ON command_outbox`)
+		_, _ = database.Exec(`DROP FUNCTION IF EXISTS fail_timeout_command_update()`)
+	})
+
+	require.ErrorContains(t, repository.FinalizeExpiredExecution(ctx, claims[0], now.Add(3*time.Second)), "injected timeout command failure")
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusRunning, storedJob.Status)
+	require.Equal(t, TargetRunning, storedJob.TargetResults[0].Status)
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseStartAuthorized, storedCommand.Phase)
+	require.NotEmpty(t, storedCommand.RecoveryClaimToken)
+}
+
+func TestTimeoutFenceAuditFailureRepairsAfterRestartWithoutJobMutation(t *testing.T) {
+	ctx, _, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message, _, _ := createExpiredStartedCommand(t, ctx, repository, "audit-repair", now)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x78}, 32))
+	require.NoError(t, err)
+	auditRecorder := &recordingAudit{onceErrors: []error{errors.New("audit unavailable"), nil}}
+	agents := &recordingCommandDispatcher{}
+	lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: repository, Jobs: repository, Agents: agents, Signer: signer,
+		Audit: auditRecorder, TokenProtector: protector, ClaimLimit: 4, Now: func() time.Time { return now.Add(2 * time.Second) },
+	})
+	require.NoError(t, err)
+	_, err = lifecycle.DispatchPending(ctx, now.Add(2*time.Second))
+	require.ErrorContains(t, err, "audit unavailable")
+	storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, storedJob.Status)
+	version := storedJob.Version
+	storedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.Equal(t, CommandPhaseTimedOut, storedCommand.Phase)
+	require.True(t, storedCommand.TerminalAuditPending)
+	require.Empty(t, auditRecorder.events)
+
+	restarted, err := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: repository, Jobs: repository, Agents: agents, Signer: signer,
+		Audit: auditRecorder, TokenProtector: protector, ClaimLimit: 4, Now: func() time.Time { return now.Add(DefaultOutboxLease + 3*time.Second) },
+	})
+	require.NoError(t, err)
+	_, err = restarted.DispatchPending(ctx, now.Add(DefaultOutboxLease+3*time.Second))
+	require.NoError(t, err)
+	repairedJob, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, version, repairedJob.Version)
+	repairedCommand, err := repository.LookupCommand(ctx, message.ID)
+	require.NoError(t, err)
+	require.False(t, repairedCommand.TerminalAuditPending)
+	require.NotNil(t, repairedCommand.TerminalAuditRecordedAt)
+	require.Len(t, auditRecorder.events, 1)
+}
+
+func TestTimeoutFenceConcurrentHeartbeatResultAndTimeoutStress(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	auditService := audit.NewService(audit.NewPostgresStore(database))
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x79}, 32))
+	require.NoError(t, err)
+
+	for iteration := 0; iteration < 20; iteration++ {
+		now := time.Now().UTC().Add(time.Duration(iteration) * time.Minute).Truncate(time.Millisecond)
+		suffix := fmt.Sprintf("timeout-stress-%02d", iteration)
+		value, message, grant, token := createExpiredStartedCommand(t, ctx, repository, suffix, now)
+		claims, err := repository.ClaimExpiredExecution(ctx, 1, now.Add(2*time.Second))
+		require.NoError(t, err)
+		require.Len(t, claims, 1)
+		lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+			DispatchRepository: repository, Jobs: repository, Agents: &recordingCommandDispatcher{}, Signer: signer,
+			Audit: auditService, TokenProtector: protector, ClaimLimit: 4, Now: func() time.Time { return now.Add(3 * time.Second) },
+		})
+		require.NoError(t, err)
+		start := make(chan struct{})
+		errorsChannel := make(chan error, 3)
+		var wait sync.WaitGroup
+		wait.Add(3)
+		go func() {
+			defer wait.Done()
+			<-start
+			tokenHash := sha256.Sum256(token[:])
+			_, renewErr := repository.RenewExecutionLease(ctx, value.Scope, message.ID, tokenHash, grant.ExecutionRevision, now.Add(3*time.Second), now.Add(time.Minute))
+			if renewErr != nil && !errors.Is(renewErr, ErrConflict) {
+				errorsChannel <- renewErr
+			}
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			_, resultErr := lifecycle.Result(ctx, message.TargetID, &agentv1.CommandResult{
+				CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "stress result",
+				ExecutionToken: token[:], LeaseRevision: grant.ExecutionRevision,
+			})
+			if resultErr != nil && !errors.Is(resultErr, ErrConflict) {
+				errorsChannel <- resultErr
+			}
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			finalizeErr := repository.FinalizeExpiredExecution(ctx, claims[0], now.Add(3*time.Second))
+			if finalizeErr != nil && !errors.Is(finalizeErr, ErrConflict) {
+				errorsChannel <- finalizeErr
+			}
+		}()
+		close(start)
+		wait.Wait()
+		close(errorsChannel)
+		for raceErr := range errorsChannel {
+			require.NoError(t, raceErr)
+		}
+		_, err = lifecycle.DispatchPending(ctx, now.Add(4*time.Second))
+		require.NoError(t, err)
+		storedJob, err := repository.Get(ctx, value.Scope, value.ID)
+		require.NoError(t, err)
+		storedCommand, err := repository.LookupCommand(ctx, message.ID)
+		require.NoError(t, err)
+		switch storedCommand.Phase {
+		case CommandPhaseTimedOut:
+			require.Equal(t, StatusTimedOut, storedJob.Status)
+			require.Equal(t, TargetTimedOut, storedJob.TargetResults[0].Status)
+		case CommandPhaseSucceeded:
+			require.Equal(t, StatusSucceeded, storedJob.Status)
+			require.Equal(t, TargetSucceeded, storedJob.TargetResults[0].Status)
+		default:
+			t.Fatalf("iteration %d left inconsistent command phase %q with Job %q", iteration, storedCommand.Phase, storedJob.Status)
+		}
+	}
+}
+
+func createExpiredStartedCommand(t *testing.T, ctx context.Context, repository *PostgresRepository, suffix string, now time.Time) (Job, OutboxMessage, StartGrant, [sha256.Size]byte) {
+	t.Helper()
+	value, message := integrationPersistenceFixture(suffix, platformscope.Scope{TenantID: "tenant-" + suffix, ProjectID: "project-" + suffix}, now.Add(-time.Minute))
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+	dispatched, err := repository.Transition(ctx, Transition{Scope: value.Scope, JobID: value.ID, CurrentVersion: value.Version, To: StatusDispatched, At: now.Add(-30 * time.Second)})
+	require.NoError(t, err)
+	running, err := repository.Transition(ctx, Transition{Scope: value.Scope, JobID: value.ID, CurrentVersion: dispatched.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: message.TargetID, Status: TargetRunning}}, At: now.Add(-20 * time.Second)})
+	require.NoError(t, err)
+	value = running
+	digest := sha256.Sum256([]byte("prepared-" + suffix))
+	token := sha256.Sum256([]byte("token-" + suffix))
+	tokenHash := sha256.Sum256(token[:])
+	require.NoError(t, repository.MarkPrepared(ctx, value.Scope, message.ID, digest, now))
+	grant, err := repository.AuthorizeStart(ctx, value.Scope, message.ID, digest, tokenHash, []byte("ciphertext-"+suffix), now, now.Add(time.Second))
+	require.NoError(t, err)
+	return value, message, grant, token
 }
 
 func openTwoPhaseIntegrationRepository(t *testing.T) (context.Context, *sql.DB, *PostgresRepository) {

@@ -408,31 +408,15 @@ func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time
 	}
 	var result []error
 	for _, claim := range claims {
-		message, lookupErr := lifecycle.dispatchRepository.LookupCommand(ctx, claim.CommandID)
-		if lookupErr != nil {
-			result = append(result, fmt.Errorf("lookup expired command %q: %w", claim.CommandID, lookupErr))
-			continue
-		}
-		if !matchingRecoveryClaim(message, claim) {
-			continue
-		}
-		target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "execution lease expired", FinishedAt: timePointer(at)}
-		value, _, applyErr := lifecycle.applyTarget(ctx, message, target, at)
-		if applyErr != nil {
-			result = append(result, fmt.Errorf("expire command %q: %w", message.ID, applyErr))
-			continue
-		}
-		event := lifecycle.auditEvent(value, message, "command.execution_timed_out", "failure", map[string]any{"reason": "execution_deadline"}, at, "command.execution_timed_out:"+message.ID)
-		if _, recordErr := lifecycle.audit.RecordOnce(ctx, event); recordErr != nil {
-			result = append(result, fmt.Errorf("audit expired command %q: %w", message.ID, recordErr))
-			continue
-		}
 		if err := lifecycle.dispatchRepository.FinalizeExpiredExecution(ctx, claim, at); err != nil {
 			if errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
 				continue
 			}
 			result = append(result, fmt.Errorf("fence expired command %q: %w", claim.CommandID, err))
 		}
+	}
+	if err := lifecycle.repairPendingTerminalAudits(ctx, at); err != nil {
+		result = append(result, err)
 	}
 	return errors.Join(result...)
 }
@@ -443,6 +427,42 @@ func matchingRecoveryClaim(message OutboxMessage, claim RecoveryClaim) bool {
 		message.ExecutionDeadline.Equal(claim.ClaimedDeadline) && message.RecoveryClaimedDeadline.Equal(claim.ClaimedDeadline) &&
 		message.RecoveryRevision == claim.ClaimedRecoveryRevision && message.RecoveryClaimedRevision == claim.ClaimedRecoveryRevision &&
 		len(message.RecoveryClaimToken) == len(claim.ClaimToken) && subtle.ConstantTimeCompare(message.RecoveryClaimToken, claim.ClaimToken[:]) == 1
+}
+
+func (lifecycle *CommandLifecycle) repairPendingTerminalAudits(ctx context.Context, at time.Time) error {
+	messages, err := lifecycle.dispatchRepository.ClaimPendingTerminalAudits(ctx, lifecycle.claimLimit, at)
+	if err != nil {
+		return err
+	}
+	return lifecycle.repairTerminalAuditMessages(ctx, messages, at)
+}
+
+func (lifecycle *CommandLifecycle) repairTerminalAuditMessages(ctx context.Context, messages []OutboxMessage, at time.Time) error {
+	var result []error
+	for _, message := range messages {
+		if !message.TerminalAuditPending || message.TerminalAt == nil || strings.TrimSpace(message.TerminalAuditDedupeKey) == "" || strings.TrimSpace(message.TerminalAuditAction) == "" || strings.TrimSpace(message.TerminalAuditResult) == "" {
+			result = append(result, fmt.Errorf("repair terminal Audit %q: %w", message.ID, ErrInvalidCommandPayload))
+			continue
+		}
+		value, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
+		if err != nil {
+			result = append(result, fmt.Errorf("load terminal Audit Job %q: %w", message.ID, err))
+			continue
+		}
+		detail := make(map[string]any, len(message.TerminalAuditDetail))
+		for key, item := range message.TerminalAuditDetail {
+			detail[key] = item
+		}
+		event := lifecycle.auditEvent(value, message, message.TerminalAuditAction, message.TerminalAuditResult, detail, message.TerminalAt.UTC(), message.TerminalAuditDedupeKey)
+		if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+			result = append(result, fmt.Errorf("record terminal Audit %q: %w", message.ID, err))
+			continue
+		}
+		if err := lifecycle.dispatchRepository.MarkTerminalAuditRecorded(ctx, message.Scope, message.ID, message.TerminalAuditDedupeKey, at); err != nil {
+			result = append(result, fmt.Errorf("mark terminal Audit %q recorded: %w", message.ID, err))
+		}
+	}
+	return errors.Join(result...)
 }
 
 func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message OutboxMessage, at time.Time) error {
@@ -669,6 +689,12 @@ func (lifecycle *CommandLifecycle) Connected(ctx context.Context, session agentc
 		}
 	}
 	lifecycle.renewExecutionLeases(ctx, session.AgentID, active, lifecycle.currentTime())
+	pendingAudits, err := lifecycle.dispatchRepository.PendingTerminalAuditsForAgent(ctx, session.AgentID, lifecycle.claimLimit)
+	if err != nil {
+		lifecycle.onError(err)
+	} else if err := lifecycle.repairTerminalAuditMessages(ctx, pendingAudits, lifecycle.currentTime()); err != nil {
+		lifecycle.onError(err)
+	}
 	prepared, err := lifecycle.dispatchRepository.PreparedCommandsForAgent(ctx, session.AgentID, lifecycle.claimLimit)
 	if err != nil {
 		lifecycle.onError(err)

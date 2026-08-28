@@ -12,7 +12,15 @@ ALTER TABLE command_outbox
     ADD COLUMN recovery_claimed_deadline TIMESTAMPTZ,
     ADD COLUMN recovery_claimed_revision BIGINT,
     ADD COLUMN terminal_result_digest BYTEA,
-    ADD COLUMN terminal_at TIMESTAMPTZ;
+    ADD COLUMN terminal_at TIMESTAMPTZ,
+    ADD COLUMN terminal_audit_pending BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN terminal_audit_dedupe_key TEXT NOT NULL DEFAULT '',
+    ADD COLUMN terminal_audit_action TEXT NOT NULL DEFAULT '',
+    ADD COLUMN terminal_audit_result TEXT NOT NULL DEFAULT '',
+    ADD COLUMN terminal_audit_detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN terminal_audit_lease_expires_at TIMESTAMPTZ,
+    ADD COLUMN terminal_audit_attempts INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN terminal_audit_recorded_at TIMESTAMPTZ;
 
 -- Commands that were active under the single-phase 0004 schema cannot be
 -- safely resumed because no execution token existed. Give them an
@@ -97,6 +105,19 @@ ALTER TABLE command_outbox
     ADD CONSTRAINT command_outbox_terminal_digest_phase_check CHECK (
         terminal_result_digest IS NULL
         OR command_phase IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+    ),
+    ADD CONSTRAINT command_outbox_terminal_audit_check CHECK (
+        NOT terminal_audit_pending
+        OR (
+            command_phase IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'rejected')
+            AND terminal_audit_dedupe_key <> ''
+            AND terminal_audit_action <> ''
+            AND terminal_audit_result <> ''
+            AND terminal_audit_recorded_at IS NULL
+        )
+    ),
+    ADD CONSTRAINT command_outbox_terminal_audit_attempts_check CHECK (
+        terminal_audit_attempts >= 0
     );
 
 CREATE INDEX command_outbox_prepared_idx
@@ -116,3 +137,7 @@ CREATE INDEX command_outbox_expired_execution_v2_idx
     ON command_outbox (execution_deadline_at, recovery_claimed_deadline, recovery_claimed_revision, created_at, id)
     WHERE command_phase IN ('start_authorized', 'running', 'cancelling')
       AND execution_deadline_at IS NOT NULL;
+
+CREATE INDEX command_outbox_terminal_audit_pending_idx
+    ON command_outbox (terminal_audit_lease_expires_at, terminal_at, id)
+    WHERE terminal_audit_pending;

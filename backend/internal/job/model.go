@@ -155,6 +155,14 @@ type OutboxMessage struct {
 	RecoveryClaimedRevision  uint64              `json:"recovery_claimed_revision"`
 	TerminalResultDigest     []byte              `json:"-"`
 	TerminalAt               *time.Time          `json:"terminal_at,omitempty"`
+	TerminalAuditPending     bool                `json:"terminal_audit_pending"`
+	TerminalAuditDedupeKey   string              `json:"terminal_audit_dedupe_key,omitempty"`
+	TerminalAuditAction      string              `json:"terminal_audit_action,omitempty"`
+	TerminalAuditResult      string              `json:"terminal_audit_result,omitempty"`
+	TerminalAuditDetail      map[string]any      `json:"terminal_audit_detail,omitempty"`
+	TerminalAuditLeasedUntil *time.Time          `json:"terminal_audit_leased_until,omitempty"`
+	TerminalAuditAttempts    int                 `json:"terminal_audit_attempts"`
+	TerminalAuditRecordedAt  *time.Time          `json:"terminal_audit_recorded_at,omitempty"`
 }
 
 type CommandPhase string

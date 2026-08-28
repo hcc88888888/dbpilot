@@ -32,6 +32,9 @@ type DispatchRepository interface {
 	RenewExecutionLease(context.Context, platformscope.Scope, string, [32]byte, uint64, time.Time, time.Time) (uint64, error)
 	ClaimExpiredExecution(context.Context, int, time.Time) ([]RecoveryClaim, error)
 	FinalizeExpiredExecution(context.Context, RecoveryClaim, time.Time) error
+	ClaimPendingTerminalAudits(context.Context, int, time.Time) ([]OutboxMessage, error)
+	PendingTerminalAuditsForAgent(context.Context, string, int) ([]OutboxMessage, error)
+	MarkTerminalAuditRecorded(context.Context, platformscope.Scope, string, string, time.Time) error
 	PersistTerminalResult(context.Context, TerminalResultCAS) (TerminalResultOutcome, error)
 	ClaimPendingCancellations(context.Context, int, time.Time) ([]OutboxMessage, error)
 	DeferCancellation(context.Context, platformscope.Scope, string, time.Time) error

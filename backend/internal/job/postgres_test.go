@@ -152,8 +152,8 @@ func TestClaimOutboxLeasesRowsWithSkipLockedInCreationOrder(t *testing.T) {
 	createdTwo := at.Add(-time.Minute)
 	columns := strings.Split(outboxColumnsSQL, ", ")
 	rows := sqlmock.NewRows(columns).
-		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", mustUnsignedCollectPayload("db-1"), nil, createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0, "pending", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil).
-		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", mustUnsignedCollectPayload("db-2"), nil, createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0, "pending", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil)
+		AddRow("msg-1", "tenant-1", "project-1", "job-1", "db-1", "agent.command", mustUnsignedCollectPayload("db-1"), nil, createdOne, createdOne, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0, "pending", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil, false, "", "", "", []byte("{}"), nil, 0, nil).
+		AddRow("msg-2", "tenant-1", "project-1", "job-1", "db-2", "agent.command", mustUnsignedCollectPayload("db-2"), nil, createdTwo, createdTwo, at.Add(DefaultOutboxLease), nil, 1, "pending", nil, nil, nil, nil, nil, "", nil, nil, 0, "pending", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil, false, "", "", "", []byte("{}"), nil, 0, nil)
 	mock.ExpectQuery("(?s)FOR UPDATE SKIP LOCKED.*SET lease_expires_at.*ORDER BY created_at, id").
 		WithArgs(at.UTC(), 2, at.UTC().Add(DefaultOutboxLease)).
 		WillReturnRows(rows)
@@ -420,7 +420,7 @@ func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *test
 	columns := strings.Split(outboxColumnsSQL, ", ")
 	published := message.CreatedAt.Add(time.Minute)
 	mock.ExpectQuery("SELECT .* FROM command_outbox WHERE id = \\$1").WithArgs(message.ID).WillReturnRows(
-		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, nil, message.AvailableAt, message.CreatedAt, nil, published, 2, "active", published, published.Add(time.Minute), published, nil, nil, "", nil, nil, 0, "running", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil),
+		sqlmock.NewRows(columns).AddRow(message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, nil, message.AvailableAt, message.CreatedAt, nil, published, 2, "active", published, published.Add(time.Minute), published, nil, nil, "", nil, nil, 0, "running", nil, nil, nil, nil, 0, 0, nil, nil, nil, nil, nil, nil, nil, false, "", "", "", []byte("{}"), nil, 0, nil),
 	)
 
 	got, err := repository.LookupCommand(context.Background(), message.ID)

@@ -191,13 +191,14 @@ func TestTimeoutRepairPersistsJobAndAuditBeforeCommandFinalization(t *testing.T)
 	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
 	require.ErrorContains(t, err, "terminal write unavailable")
 	first := fixture.persistence.currentJob()
-	require.Equal(t, StatusTimedOut, first.Status)
+	require.Equal(t, StatusRunning, first.Status)
 	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus)
-	require.Len(t, fixture.audit.events, 1)
+	require.Empty(t, fixture.audit.events)
 
 	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultOutboxLease+time.Second))
 	require.NoError(t, err)
-	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Greater(t, fixture.persistence.currentJob().Version, first.Version)
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
 	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
 	require.Len(t, fixture.audit.events, 1, "timeout retry must use the same RecordOnce evidence")
 }
@@ -222,14 +223,48 @@ func TestTimeoutAuditFailureLeavesCommandClaimableForIdempotentRepair(t *testing
 	require.ErrorContains(t, err, "audit unavailable")
 	first := fixture.persistence.currentJob()
 	require.Equal(t, StatusTimedOut, first.Status)
-	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.True(t, fixture.persistence.messages[message.ID].TerminalAuditPending)
 	require.Empty(t, fixture.audit.events)
 
+	restarted, restartErr := NewCommandLifecycle(CommandLifecycleConfig{
+		DispatchRepository: fixture.persistence, Jobs: fixture.persistence, Agents: fixture.agents,
+		Signer: fixture.lifecycle.signer, Audit: fixture.audit, TokenProtector: fixture.lifecycle.tokenProtector,
+		ClaimLimit: 8, Now: func() time.Time { return fixture.now.Add(DefaultOutboxLease + time.Second) },
+	})
+	require.NoError(t, restartErr)
+	fixture.lifecycle = restarted
 	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultOutboxLease+time.Second))
 	require.NoError(t, err)
 	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
 	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
 	require.Len(t, fixture.audit.events, 1)
+	require.False(t, fixture.persistence.messages[message.ID].TerminalAuditPending)
+}
+
+func TestConnectedRepairsPendingTerminalAuditWithoutJobMutation(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-a", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	deadline := fixture.now.Add(-time.Second)
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err := ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+	claims, err := fixture.persistence.ClaimExpiredExecution(context.Background(), 1, fixture.now)
+	require.NoError(t, err)
+	require.NoError(t, fixture.persistence.FinalizeExpiredExecution(context.Background(), claims[0], fixture.now))
+	version := fixture.persistence.currentJob().Version
+
+	fixture.lifecycle.Connected(context.Background(), agentcontrol.SessionInfo{AgentID: "agent-a"})
+	require.Equal(t, version, fixture.persistence.currentJob().Version)
+	require.Len(t, fixture.audit.events, 1)
+	require.False(t, fixture.persistence.messages[message.ID].TerminalAuditPending)
 }
 
 func TestLegacyAcceptedAcknowledgementCannotInvalidateTimeoutClaim(t *testing.T) {
@@ -1180,16 +1215,21 @@ func (store *memoryCommandPersistence) ClaimExpiredExecution(_ context.Context, 
 func (store *memoryCommandPersistence) FinalizeExpiredExecution(_ context.Context, claim RecoveryClaim, at time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	message := store.messages[claim.CommandID]
+	if message.ExecutionDeadline == nil || message.RecoveryClaimedDeadline == nil || !bytes.Equal(message.RecoveryClaimToken, claim.ClaimToken[:]) || !message.ExecutionDeadline.Equal(claim.ClaimedDeadline) || message.RecoveryRevision != claim.ClaimedRecoveryRevision || message.RecoveryClaimedRevision != claim.ClaimedRecoveryRevision {
+		return ErrConflict
+	}
+	current := store.jobs[message.JobID]
+	next, err := timeoutMemoryJob(current, message, at)
+	if err != nil {
+		return err
+	}
 	if len(store.finalizeErrors) > 0 {
 		err := store.finalizeErrors[0]
 		store.finalizeErrors = store.finalizeErrors[1:]
 		if err != nil {
 			return err
 		}
-	}
-	message := store.messages[claim.CommandID]
-	if message.ExecutionDeadline == nil || message.RecoveryClaimedDeadline == nil || !bytes.Equal(message.RecoveryClaimToken, claim.ClaimToken[:]) || !message.ExecutionDeadline.Equal(claim.ClaimedDeadline) || message.RecoveryRevision != claim.ClaimedRecoveryRevision || message.RecoveryClaimedRevision != claim.ClaimedRecoveryRevision {
-		return ErrConflict
 	}
 	message.Phase = CommandPhaseTimedOut
 	message.CommandStatus = CommandTimedOut
@@ -1198,7 +1238,92 @@ func (store *memoryCommandPersistence) FinalizeExpiredExecution(_ context.Contex
 	message.RecoveryClaimToken = nil
 	message.RecoveryClaimedDeadline = nil
 	message.RecoveryClaimedRevision = 0
+	message.TerminalAuditPending = true
+	message.TerminalAuditDedupeKey = "command.execution_timed_out:" + message.ID
+	message.TerminalAuditAction = "command.execution_timed_out"
+	message.TerminalAuditResult = "failure"
+	message.TerminalAuditDetail = map[string]any{"reason": "execution_deadline"}
+	store.jobs[message.JobID] = next
 	store.messages[claim.CommandID] = message
+	return nil
+}
+func timeoutMemoryJob(current Job, message OutboxMessage, at time.Time) (Job, error) {
+	if current.Status == StatusQueued {
+		var err error
+		current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
+		if err != nil {
+			return Job{}, err
+		}
+	}
+	if !isTerminal(current.Status) {
+		to := StatusRunning
+		actor := ""
+		if current.Status == StatusCancelling {
+			to = StatusCancelling
+			actor = current.CancelRequestedBy
+		}
+		var err error
+		current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: to, Actor: actor, At: at, TargetResults: []TargetResult{{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "execution lease expired", FinishedAt: timePointer(at)}}})
+		if err != nil {
+			return Job{}, err
+		}
+	}
+	if !allTargetsTerminal(current) || isTerminal(current.Status) {
+		return current, nil
+	}
+	to := StatusFailed
+	if current.Progress.CompletedTargets > 0 {
+		to = StatusSucceeded
+	} else if allTargetsCancelled(current.TargetResults) {
+		to = StatusCancelled
+	} else if hasTimedOutTarget(current.TargetResults) {
+		to = StatusTimedOut
+	}
+	return ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: to, Artifacts: collectArtifacts(current.TargetResults), ResultSummary: "Agent commands completed", At: at})
+}
+func (store *memoryCommandPersistence) ClaimPendingTerminalAudits(_ context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for id, message := range store.messages {
+		if len(result) >= limit {
+			break
+		}
+		if message.TerminalAuditPending && (message.TerminalAuditLeasedUntil == nil || !message.TerminalAuditLeasedUntil.After(at)) {
+			leasedUntil := at.Add(DefaultOutboxLease)
+			message.TerminalAuditLeasedUntil = &leasedUntil
+			message.TerminalAuditAttempts++
+			store.messages[id] = message
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
+func (store *memoryCommandPersistence) PendingTerminalAuditsForAgent(_ context.Context, agentID string, limit int) ([]OutboxMessage, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var result []OutboxMessage
+	for _, message := range store.messages {
+		if len(result) >= limit {
+			break
+		}
+		if message.TargetID == agentID && message.TerminalAuditPending {
+			result = append(result, message)
+		}
+	}
+	return result, nil
+}
+func (store *memoryCommandPersistence) MarkTerminalAuditRecorded(_ context.Context, scope platformscope.Scope, id, dedupeKey string, at time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message := store.messages[id]
+	if message.Scope != scope || message.TerminalAuditDedupeKey != dedupeKey {
+		return ErrConflict
+	}
+	message.TerminalAuditPending = false
+	message.TerminalAuditLeasedUntil = nil
+	message.TerminalAuditRecordedAt = timePointer(at.UTC())
+	store.messages[id] = message
 	return nil
 }
 func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {

@@ -24,8 +24,8 @@ const DefaultOutboxLease = 30 * time.Second
 const DefaultCancellationRetry = 30 * time.Second
 
 const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id"
-const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at"
-const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at"
+const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at, terminal_audit_pending, terminal_audit_dedupe_key, terminal_audit_action, terminal_audit_result, terminal_audit_detail, terminal_audit_lease_expires_at, terminal_audit_attempts, terminal_audit_recorded_at"
+const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at, o.terminal_audit_pending, o.terminal_audit_dedupe_key, o.terminal_audit_action, o.terminal_audit_result, o.terminal_audit_detail, o.terminal_audit_lease_expires_at, o.terminal_audit_attempts, o.terminal_audit_recorded_at"
 const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)"
 const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
@@ -36,6 +36,7 @@ const selectTargetsSQL = "SELECT target_id, status, error_summary, result_summar
 const updateJobSQL = "UPDATE jobs SET status = $1, outcome = $2, version = $3, completed_targets = $4, failed_targets = $5, skipped_targets = $6, error_summary = $7, result_summary = $8, artifacts = $9, dispatched_at = $10, started_at = $11, finished_at = $12, cancel_requested_by = $13, cancel_requested_at = $14 WHERE tenant_id = $15 AND project_id = $16 AND id = $17 AND version = $18"
 const claimOutboxSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NULL AND cancellation_requested_at IS NULL AND command_status = 'pending' AND available_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
 const claimPreparedCommandsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE command_phase IN ('prepared', 'start_authorized') AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY prepared_at, created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET lease_expires_at = $3, attempts = o.attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY prepared_at, created_at, id"
+const claimPendingTerminalAuditsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE terminal_audit_pending AND (terminal_audit_lease_expires_at IS NULL OR terminal_audit_lease_expires_at <= $1) ORDER BY terminal_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET terminal_audit_lease_expires_at = $3, terminal_audit_attempts = o.terminal_audit_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY terminal_at, id"
 const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4"
 const selectOutboxByIDSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE id = $1"
 const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4), command_phase = CASE WHEN command_phase = 'pending' THEN 'preparing' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing') RETURNING prepared_envelope"
@@ -48,6 +49,8 @@ const claimExpiredCommandsSQL = "WITH candidates AS (SELECT id FROM command_outb
 const markCommandTerminalSQL = "UPDATE command_outbox SET command_status = $1, command_phase = $1, terminal_at = COALESCE(terminal_at, $2), published_at = COALESCE(published_at, $2), lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL, recovery_claim_token = NULL, recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND (command_status IN ('pending', 'active', 'rejected') OR command_status = $1)"
 const pendingCancellationsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND cancellation_requested_at IS NOT NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling') ORDER BY created_at, id LIMIT $2"
 const preparedCommandsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND command_phase IN ('prepared', 'start_authorized') ORDER BY prepared_at, created_at, id LIMIT $2"
+const pendingTerminalAuditsForAgentSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE target_id = $1 AND terminal_audit_pending ORDER BY terminal_at, id LIMIT $2"
+const markTerminalAuditRecordedSQL = "UPDATE command_outbox SET terminal_audit_pending = FALSE, terminal_audit_lease_expires_at = NULL, terminal_audit_recorded_at = COALESCE(terminal_audit_recorded_at, $1) WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND terminal_audit_dedupe_key = $5"
 
 type PostgresRepository struct {
 	db               *sql.DB
@@ -325,6 +328,10 @@ func (repository *PostgresRepository) ClaimPreparedCommands(ctx context.Context,
 	return repository.claimCommands(ctx, claimPreparedCommandsSQL, "claim prepared commands", limit, at)
 }
 
+func (repository *PostgresRepository) ClaimPendingTerminalAudits(ctx context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
+	return repository.claimCommands(ctx, claimPendingTerminalAuditsSQL, "claim pending terminal Audits", limit, at)
+}
+
 func (repository *PostgresRepository) ClaimExpiredCommands(ctx context.Context, limit int, at time.Time) ([]OutboxMessage, error) {
 	return repository.claimCommands(ctx, claimExpiredCommandsSQL, "claim expired commands", limit, at)
 }
@@ -438,6 +445,33 @@ func (repository *PostgresRepository) PreparedCommandsForAgent(ctx context.Conte
 		result = append(result, message)
 	}
 	return result, rows.Err()
+}
+
+func (repository *PostgresRepository) PendingTerminalAuditsForAgent(ctx context.Context, agentID string, limit int) ([]OutboxMessage, error) {
+	if repository == nil || repository.db == nil || ctx == nil || strings.TrimSpace(agentID) == "" || limit <= 0 {
+		return nil, ErrInvalidCommandPayload
+	}
+	rows, err := repository.db.QueryContext(ctx, pendingTerminalAuditsForAgentSQL, agentID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending terminal Audits for Agent: %w", err)
+	}
+	defer rows.Close()
+	result := make([]OutboxMessage, 0, limit)
+	for rows.Next() {
+		message, err := scanOutbox(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan pending terminal Audit: %w", err)
+		}
+		result = append(result, message)
+	}
+	return result, rows.Err()
+}
+
+func (repository *PostgresRepository) MarkTerminalAuditRecorded(ctx context.Context, scope platformscope.Scope, commandID, dedupeKey string, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || strings.TrimSpace(dedupeKey) == "" || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	return repository.execScopedCommand(ctx, markTerminalAuditRecordedSQL, []any{at.UTC(), scope.TenantID, scope.ProjectID, commandID, dedupeKey})
 }
 
 func (repository *PostgresRepository) execScopedCommand(ctx context.Context, query string, args []any) error {
@@ -760,32 +794,131 @@ func (repository *PostgresRepository) ClaimExpiredExecution(ctx context.Context,
 }
 
 func (repository *PostgresRepository) FinalizeExpiredExecution(ctx context.Context, claim RecoveryClaim, at time.Time) error {
-	if repository == nil || repository.db == nil || ctx == nil || claim.Scope.Validate() != nil || strings.TrimSpace(claim.CommandID) == "" || claim.ClaimedDeadline.IsZero() || claim.ClaimedRecoveryRevision == 0 || at.IsZero() {
+	if repository == nil || repository.db == nil || ctx == nil || claim.Scope.Validate() != nil || strings.TrimSpace(claim.CommandID) == "" || strings.TrimSpace(claim.JobID) == "" || strings.TrimSpace(claim.TargetID) == "" || claim.ClaimedDeadline.IsZero() || claim.ClaimedRecoveryRevision == 0 || at.IsZero() {
 		return ErrInvalidCommandPayload
 	}
-	result, err := repository.db.ExecContext(ctx, `
+	at = at.UTC()
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin expired execution finalization: %w", err)
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	value, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, claim.Scope.TenantID, claim.Scope.ProjectID, claim.JobID))
+	if err != nil {
+		return rollback(classifyReadError("lock Job for expired execution", err))
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, `SELECT `+outboxColumnsSQL+` FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE`, claim.Scope.TenantID, claim.Scope.ProjectID, claim.CommandID))
+	if err != nil {
+		return rollback(classifyReadError("lock expired command", err))
+	}
+	if message.JobID != claim.JobID || message.TargetID != claim.TargetID || !matchingRecoveryClaim(message, claim) {
+		return rollback(ErrConflict)
+	}
+	value.TargetResults, err = getTargetsFrom(ctx, tx, claim.Scope, claim.JobID)
+	if err != nil {
+		return rollback(err)
+	}
+	value.TargetResourceIDs = make([]string, len(value.TargetResults))
+	for index := range value.TargetResults {
+		value.TargetResourceIDs[index] = value.TargetResults[index].TargetID
+	}
+	if _, err := timeoutJobTargetInTx(ctx, tx, value, message, at); err != nil {
+		return rollback(err)
+	}
+	auditDetail, err := json.Marshal(map[string]any{"reason": "execution_deadline"})
+	if err != nil {
+		return rollback(fmt.Errorf("marshal timeout Audit detail: %w", err))
+	}
+	dedupeKey := "command.execution_timed_out:" + message.ID
+	result, err := tx.ExecContext(ctx, `
 		UPDATE command_outbox
 		SET command_phase = 'timed_out', command_status = 'timed_out', terminal_at = $1,
 			execution_deadline_at = NULL, recovery_lease_expires_at = NULL,
 			recovery_claim_token = NULL, recovery_claimed_deadline = NULL,
-			recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL
+			recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL,
+			terminal_audit_pending = TRUE, terminal_audit_dedupe_key = $8,
+			terminal_audit_action = 'command.execution_timed_out', terminal_audit_result = 'failure',
+			terminal_audit_detail = $9, terminal_audit_lease_expires_at = NULL,
+			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL
 		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
 			AND command_phase IN ('start_authorized', 'running', 'cancelling')
 			AND recovery_claim_token = $5 AND execution_deadline_at = $6
 			AND recovery_claimed_deadline = $6 AND recovery_revision = $7
 			AND recovery_claimed_revision = $7
-	`, at.UTC(), claim.Scope.TenantID, claim.Scope.ProjectID, claim.CommandID, claim.ClaimToken[:], claim.ClaimedDeadline.UTC(), claim.ClaimedRecoveryRevision)
+	`, at, claim.Scope.TenantID, claim.Scope.ProjectID, claim.CommandID, claim.ClaimToken[:], claim.ClaimedDeadline.UTC(), claim.ClaimedRecoveryRevision, dedupeKey, auditDetail)
 	if err != nil {
-		return classifyWriteError("finalize expired execution", err)
+		return rollback(classifyWriteError("finalize expired execution", err))
 	}
 	updated, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read expired execution finalization result: %w", err)
+		return rollback(fmt.Errorf("read expired execution finalization result: %w", err))
 	}
 	if updated != 1 {
-		return ErrConflict
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit expired execution finalization: %w: %w", ErrAmbiguousCommit, err)
 	}
 	return nil
+}
+
+func timeoutJobTargetInTx(ctx context.Context, tx *sql.Tx, current Job, message OutboxMessage, at time.Time) (Job, error) {
+	if current.ID != message.JobID || current.Scope != message.Scope || !containsTarget(current.TargetResourceIDs, message.TargetID) {
+		return Job{}, ErrInvalidCommandPayload
+	}
+	if isTerminal(current.Status) {
+		target, found := targetFor(current.TargetResults, message.TargetID)
+		if current.Status == StatusTimedOut && found && target.Status == TargetTimedOut {
+			return current, nil
+		}
+		return Job{}, ErrConflict
+	}
+	if current.Status == StatusQueued {
+		var err error
+		current, err = transitionInTx(ctx, tx, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
+		if err != nil {
+			return Job{}, err
+		}
+	}
+	existing, found := targetFor(current.TargetResults, message.TargetID)
+	if found && isTerminalTarget(existing.Status) {
+		if existing.Status != TargetTimedOut {
+			return Job{}, ErrConflict
+		}
+	} else {
+		to := StatusRunning
+		actor := ""
+		if current.Status == StatusCancelling {
+			to = StatusCancelling
+			actor = current.CancelRequestedBy
+		}
+		var err error
+		current, err = transitionInTx(ctx, tx, Transition{
+			Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: to, Actor: actor, At: at,
+			TargetResults: []TargetResult{{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "execution lease expired", FinishedAt: timePointer(at)}},
+		})
+		if err != nil {
+			return Job{}, err
+		}
+	}
+	if !allTargetsTerminal(current) {
+		return current, nil
+	}
+	to := StatusFailed
+	if current.Progress.CompletedTargets > 0 {
+		to = StatusSucceeded
+	} else if allTargetsCancelled(current.TargetResults) {
+		to = StatusCancelled
+	} else if hasTimedOutTarget(current.TargetResults) {
+		to = StatusTimedOut
+	}
+	return transitionInTx(ctx, tx, Transition{
+		Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: to,
+		Artifacts: collectArtifacts(current.TargetResults), ResultSummary: "Agent commands completed", At: at,
+	})
 }
 
 func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {
@@ -947,8 +1080,9 @@ func scanJob(row rowScanner) (Job, error) {
 func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	var value OutboxMessage
 	var leased, published, acknowledged, executionDeadline, lastHeartbeat, recoveryLeased, cancelRequested, cancelAvailable, cancelLeased sql.NullTime
-	var prepared, startDeadline, startEnqueued, claimedDeadline, terminal sql.NullTime
+	var prepared, startDeadline, startEnqueued, claimedDeadline, terminal, terminalAuditLeased, terminalAuditRecorded sql.NullTime
 	var claimedRevision sql.NullInt64
+	var terminalAuditDetail []byte
 	err := row.Scan(
 		&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.JobID, &value.TargetID, &value.Type,
 		&value.Payload, &value.PreparedEnvelope, &value.AvailableAt, &value.CreatedAt, &leased, &published, &value.Attempts,
@@ -957,6 +1091,8 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 		&value.Phase, &value.PrepareDigest, &prepared, &value.ExecutionTokenHash, &value.ExecutionTokenCiphertext,
 		&value.ExecutionRevision, &value.RecoveryRevision, &startDeadline, &startEnqueued, &value.RecoveryClaimToken,
 		&claimedDeadline, &claimedRevision, &value.TerminalResultDigest, &terminal,
+		&value.TerminalAuditPending, &value.TerminalAuditDedupeKey, &value.TerminalAuditAction, &value.TerminalAuditResult,
+		&terminalAuditDetail, &terminalAuditLeased, &value.TerminalAuditAttempts, &terminalAuditRecorded,
 	)
 	if err != nil {
 		return OutboxMessage{}, err
@@ -980,6 +1116,14 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 		value.RecoveryClaimedRevision = uint64(claimedRevision.Int64)
 	}
 	value.TerminalAt = nullTimePointer(terminal)
+	value.TerminalAuditLeasedUntil = nullTimePointer(terminalAuditLeased)
+	value.TerminalAuditRecordedAt = nullTimePointer(terminalAuditRecorded)
+	if len(terminalAuditDetail) == 0 {
+		terminalAuditDetail = []byte("{}")
+	}
+	if err := json.Unmarshal(terminalAuditDetail, &value.TerminalAuditDetail); err != nil {
+		return OutboxMessage{}, fmt.Errorf("decode terminal audit detail: %w", err)
+	}
 	value.PrepareDigest = append([]byte(nil), value.PrepareDigest...)
 	value.ExecutionTokenHash = append([]byte(nil), value.ExecutionTokenHash...)
 	value.ExecutionTokenCiphertext = append([]byte(nil), value.ExecutionTokenCiphertext...)
@@ -1002,7 +1146,7 @@ func validateNewJob(value Job) error {
 }
 
 func validateOutboxMessage(ctx context.Context, value Job, message OutboxMessage, authorizer commandvalidation.TargetAuthorizer) error {
-	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 || message.Phase != "" || len(message.PrepareDigest) != 0 || message.PreparedAt != nil || len(message.ExecutionTokenHash) != 0 || len(message.ExecutionTokenCiphertext) != 0 || message.ExecutionRevision != 0 || message.RecoveryRevision != 0 || message.StartDeadline != nil || message.StartEnqueuedAt != nil || len(message.RecoveryClaimToken) != 0 || message.RecoveryClaimedDeadline != nil || message.RecoveryClaimedRevision != 0 || len(message.TerminalResultDigest) != 0 || message.TerminalAt != nil {
+	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 || message.Phase != "" || len(message.PrepareDigest) != 0 || message.PreparedAt != nil || len(message.ExecutionTokenHash) != 0 || len(message.ExecutionTokenCiphertext) != 0 || message.ExecutionRevision != 0 || message.RecoveryRevision != 0 || message.StartDeadline != nil || message.StartEnqueuedAt != nil || len(message.RecoveryClaimToken) != 0 || message.RecoveryClaimedDeadline != nil || message.RecoveryClaimedRevision != 0 || len(message.TerminalResultDigest) != 0 || message.TerminalAt != nil || message.TerminalAuditPending || message.TerminalAuditDedupeKey != "" || message.TerminalAuditAction != "" || message.TerminalAuditResult != "" || len(message.TerminalAuditDetail) != 0 || message.TerminalAuditLeasedUntil != nil || message.TerminalAuditAttempts != 0 || message.TerminalAuditRecordedAt != nil {
 		return fmt.Errorf("create outbox message: %w", ErrInvalidCommandPayload)
 	}
 	envelope := new(agentv1.CommandEnvelope)
