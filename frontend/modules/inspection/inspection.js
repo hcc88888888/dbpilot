@@ -14,6 +14,25 @@ export function inspectionFailureMessage(error, subject = '巡检数据') {
   return `暂时无法加载${subject}`;
 }
 
+const INSPECTION_LABEL_ERROR = '标签必须每行使用 key=value，键值不得重复且最多 32 项';
+
+export function parseInspectionLabels(input) {
+  const text = String(input ?? '');
+  if (!text.trim()) return { labels: {}, error: '' };
+  const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
+  if (lines.length > 32) return { labels: null, error: INSPECTION_LABEL_ERROR };
+  const labels = {};
+  for (const line of lines) {
+    const separator = line.indexOf('=');
+    if (separator <= 0) return { labels: null, error: INSPECTION_LABEL_ERROR };
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (!/^[A-Za-z_.-][A-Za-z0-9_.-]{0,127}$/.test(key) || !value || value.length > 128 || Object.hasOwn(labels, key)) return { labels: null, error: INSPECTION_LABEL_ERROR };
+    labels[key] = value;
+  }
+  return { labels, error: '' };
+}
+
 export function renderInspectionOverviewMarkup(value = {}) {
   const levels = value.finding_level_counts ?? {};
   const runs = value.latest_run_status_counts ?? {};
@@ -38,10 +57,12 @@ export function renderInspectionPolicyMarkup(value = {}, permissions = {}) {
   const editing = value.editing_policy ?? null;
   const selectedTargets = new Set(editing?.target_ids ?? []);
   const selectedItems = new Set((editing?.item_versions ?? []).map((item) => `${item.item_id}:${Number(item.version)}`));
+  const labelsText = Object.entries(editing?.labels ?? {}).sort(([left], [right]) => left.localeCompare(right)).map(([key, labelValue]) => `${key}=${labelValue}`).join('\n');
   const form = permissions.manage === true ? `<form class="ins-panel ins-policy-form" data-inspection-policy-form ${editing ? `data-inspection-policy-id="${safe(editing.id)}" data-inspection-policy-etag="${safe(editing.etag)}"` : ''}>
     <div class="ins-panel-head"><div><span class="ins-kicker">POLICY</span><h3>${editing ? '编辑巡检策略' : '创建巡检策略'}</h3></div>${editing ? '<button type="button" class="ins-link" data-inspection-policy-edit-cancel>取消编辑</button>' : ''}</div>
     <label>策略名称<input name="name" required maxlength="120" autocomplete="off" value="${safe(editing?.name ?? '')}"></label>
     <label class="ins-check"><input type="checkbox" name="enabled"${editing?.enabled !== false ? ' checked' : ''}><span><b>启用策略</b></span></label>
+    <label>目标标签<textarea name="labels" rows="4" placeholder="role=database&#10;zone=east">${safe(labelsText)}</textarea><small>每行 key=value，最多 32 项</small></label>
     <fieldset aria-label="巡检目标"><legend>巡检目标</legend>${targets.map((target) => `<label class="ins-check"><input type="checkbox" name="target_id" value="${safe(target.agent_id)}"${selectedTargets.has(target.agent_id) ? ' checked' : ''}><span><b>${safe(target.display_name)}</b><small>${safe(target.host)}</small></span></label>`).join('') || '<p class="ins-empty">暂无可用目标</p>'}</fieldset>
     <fieldset aria-label="巡检项"><legend>巡检项</legend>${items.map((item) => { const key = `${item.id}:${Number(item.version)}`; return `<label class="ins-check"><input type="checkbox" name="item_version" value="${safe(key)}"${selectedItems.has(key) ? ' checked' : ''}><span><b>${safe(item.name)}</b><small>${safe(item.category)} · v${Number(item.version)}</small></span></label>`; }).join('') || '<p class="ins-empty">暂无可用巡检项</p>'}</fieldset>
     <div class="ins-form-grid"><label>Cron 表达式<input name="cron" placeholder="0 2 * * *" value="${safe(editing?.schedule?.cron ?? '')}"></label><label>时区<input name="timezone" value="${safe(editing?.schedule?.timezone ?? 'Asia/Shanghai')}"></label></div>
@@ -107,10 +128,9 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     const targets = data.getAll('target_id').map(String);
     const items = data.getAll('item_version').map((value) => { const [item_id, raw] = String(value).split(':'); return { item_id, version: Number(raw) }; });
     const cron = String(data.get('cron') ?? '').trim();
-    const value = { name: String(data.get('name') ?? '').trim(), enabled: data.get('enabled') === 'on', target_ids: targets, labels: { ...(state.editingPolicy?.labels ?? {}) }, item_versions: items, target_timeout_seconds: Number(data.get('target_timeout_seconds')), max_concurrency: Number(data.get('max_concurrency')), ...(cron ? { schedule: { cron, timezone: String(data.get('timezone') ?? '').trim() } } : {}) };
+    const value = { name: String(data.get('name') ?? '').trim(), enabled: data.get('enabled') === 'on', target_ids: targets, item_versions: items, labels_text: String(data.get('labels') ?? ''), target_timeout_seconds: Number(data.get('target_timeout_seconds')), max_concurrency: Number(data.get('max_concurrency')), ...(cron ? { schedule: { cron, timezone: String(data.get('timezone') ?? '').trim() } } : {}) };
     if (!value.name || !targets.length || !items.length) { onToast('请填写策略名称并选择目标与巡检项'); return; }
-    if (state.editingPolicy) savePolicy(value);
-    else action(() => api.createPolicy(state.scope, value, newKey('policy')), '巡检策略已创建');
+    submitPolicy(value);
   });
 
   function open(view = 'overview') { state.view = VIEWS.has(view) ? view : 'overview'; if (state.view !== 'report-detail') state.selectedReport = null; if (state.view !== 'policies') state.editingPolicy = null; reload(); }
@@ -193,7 +213,18 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
       onToast(inspectionFailureMessage(error, '策略'));
     }
   }
-  function action(callback, message) { Promise.resolve().then(callback).then(() => { onToast(message); reload(); }).catch((error) => onToast(inspectionFailureMessage(error, '操作'))); }
+  function submitPolicy(input) {
+    const parsed = parseInspectionLabels(input?.labels_text);
+    if (parsed.error) {
+      onToast(parsed.error);
+      return Promise.resolve();
+    }
+    const value = { ...input, labels: parsed.labels };
+    delete value.labels_text;
+    if (state.editingPolicy) return savePolicy(value);
+    return action(() => api.createPolicy(state.scope, value, newKey('policy')), '巡检策略已创建');
+  }
+  function action(callback, message) { return Promise.resolve().then(callback).then(() => { onToast(message); return reload(); }).catch((error) => onToast(inspectionFailureMessage(error, '操作'))); }
   function download(id) { action(async () => { const descriptor = await api.downloadReport(state.scope, id, newKey('download')); if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer'); }, '报告下载已授权'); }
   function render() {
     const source = state.data?.source;
@@ -213,7 +244,7 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     }
     return renderInspectionOverviewMarkup(state.data ?? {});
   }
-  return { open, setScope, reload, editPolicy, savePolicy, openRun, openReport };
+  return { open, setScope, reload, editPolicy, savePolicy, submitPolicy, openRun, openReport };
 }
 
 function overviewCard(label, value, note, tone) { return `<article class="ins-overview-card ${tone}"><span>${label}</span><strong>${Number(value)}</strong><p>${note}</p></article>`; }

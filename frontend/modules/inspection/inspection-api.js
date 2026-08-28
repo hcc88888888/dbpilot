@@ -21,7 +21,7 @@ export function createInspectionApi({ baseUrl = '', available = true, controlPla
   return {
     getOverview: (scope, signal) => read(scope, 'getInspectionOverview', undefined, signal),
     listItems: (scope, page = {}, signal) => read(scope, 'listInspectionItems', pageParams(page), signal),
-    createItem: (scope, value, key, signal) => write(scope, 'createInspectionItem', { idempotencyKey: key, createInspectionItemRequest: value }, { idempotencyKey: key, signal }),
+    createItem: (scope, value, key, signal) => write(scope, 'createInspectionItem', { idempotencyKey: key, createInspectionItemRequest: inspectionItemRequest(value) }, { idempotencyKey: key, signal }),
     listTargets: (scope, page = {}, signal) => read(scope, 'listInspectionTargets', pageParams(page), signal),
     listPolicies: (scope, page = {}, signal) => read(scope, 'listInspectionPolicies', pageParams(page), signal),
     async getPolicy(scope, id, signal) {
@@ -31,12 +31,12 @@ export function createInspectionApi({ baseUrl = '', available = true, controlPla
       if (!etag) throw Object.assign(new Error('policy ETag unavailable'), { kind: 'unavailable' });
       return { ...normalize(await response.value(), 'control-plane'), etag };
     },
-    createPolicy: (scope, value, key, signal) => write(scope, 'createInspectionPolicy', { idempotencyKey: key, createInspectionPolicyRequest: value }, { idempotencyKey: key, signal }),
-    updatePolicy: (scope, id, value, etag, key, signal) => write(scope, 'updateInspectionPolicy', { policyId: requiredID(id), idempotencyKey: key, ifMatch: etag, updateInspectionPolicyRequest: value }, { idempotencyKey: key, etag, signal }),
+    createPolicy: (scope, value, key, signal) => write(scope, 'createInspectionPolicy', { idempotencyKey: key, createInspectionPolicyRequest: inspectionPolicyRequest(value) }, { idempotencyKey: key, signal }),
+    updatePolicy: (scope, id, value, etag, key, signal) => write(scope, 'updateInspectionPolicy', { policyId: requiredID(id), idempotencyKey: key, ifMatch: etag, updateInspectionPolicyRequest: inspectionPolicyRequest(value) }, { idempotencyKey: key, etag, signal }),
     runPolicy: (scope, id, key, signal) => write(scope, 'runInspectionPolicy', { policyId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
     listRuns: (scope, page = {}, signal) => read(scope, 'listInspectionRuns', pageParams(page), signal),
     getRun: (scope, id, signal) => read(scope, 'getInspectionRun', { runId: requiredID(id) }, signal),
-    createRun: (scope, value, key, signal) => write(scope, 'createInspectionRun', { idempotencyKey: key, createInspectionRunRequest: value }, { idempotencyKey: key, signal }),
+    createRun: (scope, value, key, signal) => write(scope, 'createInspectionRun', { idempotencyKey: key, createInspectionRunRequest: inspectionRunRequest(value) }, { idempotencyKey: key, signal }),
     cancelRun: (scope, id, key, signal) => write(scope, 'cancelInspectionRun', { runId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
     retryRun: (scope, id, key, signal) => write(scope, 'retryInspectionRun', { runId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
     listReports: (scope, page = {}, signal) => read(scope, 'listInspectionReports', pageParams(page), signal),
@@ -64,6 +64,82 @@ function demoInspectionApi() {
     async listRuns() { return page([run]); }, async getRun() { return { ...run, source: 'demo' }; }, async listReports() { return page([report]); }, async getReport() { return { ...report, source: 'demo' }; },
     async createItem() { return { ...item, source: 'demo' }; }, async createPolicy() { return { ...policy, source: 'demo' }; }, async updatePolicy() { return { ...policy, source: 'demo' }; }, async runPolicy() { return { ...run, source: 'demo' }; }, async createRun() { return { ...run, source: 'demo' }; }, async cancelRun() { return { ...run, source: 'demo' }; }, async retryRun() { return { ...run, source: 'demo' }; }, async downloadReport() { return { source: 'demo', url: '#demo-inspection-report', expires_at: now }; },
   };
+}
+
+// Generated request serializers read camelCase model properties and also
+// spread enumerable properties. Defining the exact model fields as
+// non-enumerable keeps serializer access intact while preventing camelCase
+// transport keys from leaking into additionalProperties:false JSON bodies.
+function generatedModel(values) {
+  const model = {};
+  for (const [name, value] of Object.entries(values)) {
+    Object.defineProperty(model, name, { value, enumerable: false, writable: false, configurable: false });
+  }
+  return model;
+}
+
+function inspectionPolicyItem(value = {}) {
+  return generatedModel({ itemId: value.item_id, version: value.version });
+}
+
+function inspectionSchedule(value) {
+  if (!value) return undefined;
+  return generatedModel({ cron: value.cron, timezone: value.timezone });
+}
+
+function inspectionPolicyRequest(value = {}) {
+  return generatedModel({
+    name: value.name,
+    enabled: value.enabled,
+    schedule: inspectionSchedule(value.schedule),
+    itemVersions: Array.isArray(value.item_versions) ? value.item_versions.map(inspectionPolicyItem) : [],
+    targetIds: Array.isArray(value.target_ids) ? [...value.target_ids] : [],
+    labels: copyRecord(value.labels),
+    targetTimeoutSeconds: value.target_timeout_seconds,
+    maxConcurrency: value.max_concurrency,
+  });
+}
+
+function inspectionMetricRule(value) {
+  if (!value) return undefined;
+  return generatedModel({
+    metricName: value.metric_name,
+    labels: copyRecord(value.labels),
+    window: value.window,
+    aggregation: value.aggregation,
+    operator: value.operator,
+    warningThreshold: value.warning_threshold,
+    criticalThreshold: value.critical_threshold,
+  });
+}
+
+function inspectionItemRequest(value = {}) {
+  return generatedModel({
+    name: value.name,
+    description: value.description,
+    category: value.category,
+    scopeType: value.scope_type,
+    sourceType: value.source_type,
+    requiredCapabilities: Array.isArray(value.required_capabilities) ? [...value.required_capabilities] : undefined,
+    metricRule: inspectionMetricRule(value.metric_rule),
+    evidenceSelector: value.evidence_selector ? generatedModel({ fields: new Set(value.evidence_selector.fields ?? []) }) : undefined,
+    recommendationTemplate: value.recommendation_template,
+    documentationUrl: value.documentation_url,
+  });
+}
+
+function inspectionRunRequest(value = {}) {
+  return generatedModel({
+    targetIds: Array.isArray(value.target_ids) ? [...value.target_ids] : [],
+    itemVersions: Array.isArray(value.item_versions) ? value.item_versions.map(inspectionPolicyItem) : [],
+    targetTimeoutSeconds: value.target_timeout_seconds,
+    maxConcurrency: value.max_concurrency,
+  });
+}
+
+function copyRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)]));
 }
 
 function normalize(value, source) {
