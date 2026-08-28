@@ -216,7 +216,7 @@ func latestObservation(input []Observation, targetID string, source SourceType, 
 		if observation.TargetID != targetID || observation.Name != name {
 			continue
 		}
-		if observation.SourceType != source || !isUTC(observation.ObservedAt) || !finite(observation.Value) {
+		if observation.SourceType != source || observation.Validate() != nil {
 			malformed = true
 			continue
 		}
@@ -252,10 +252,32 @@ func aggregateObservations(aggregation Aggregation, observations []Observation) 
 	case AggregationLatest:
 		return observations[len(observations)-1].Value, true
 	case AggregationAverage:
-		average := 0.0
-		divisor := float64(len(observations))
-		for _, observation := range observations {
-			average += observation.Value / divisor
+		average := observations[0].Value
+		if !finite(average) {
+			return 0, false
+		}
+		for index, observation := range observations[1:] {
+			if !finite(observation.Value) {
+				return 0, false
+			}
+			divisor := float64(index + 2)
+			delta := observation.Value - average
+			if finite(delta) {
+				adjustment := delta / divisor
+				candidate := average + adjustment
+				if finite(adjustment) && finite(candidate) {
+					average = candidate
+					continue
+				}
+			}
+			previousWeight := float64(index+1) / divisor
+			weightedPrevious := average * previousWeight
+			weightedObservation := observation.Value / divisor
+			candidate := weightedPrevious + weightedObservation
+			if !finite(weightedPrevious) || !finite(weightedObservation) || !finite(candidate) {
+				return 0, false
+			}
+			average = candidate
 		}
 		return average, finite(average)
 	case AggregationMaximum:

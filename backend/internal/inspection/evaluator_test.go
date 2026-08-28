@@ -2,6 +2,7 @@ package inspection
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -261,6 +262,33 @@ func TestEvaluatorTreatsMalformedMetadataEvidenceAsMissingData(t *testing.T) {
 	}
 }
 
+func TestEvaluatorRequiresStructurallyValidMetadataObservation(t *testing.T) {
+	// Break caught: a structurally malformed matching metadata observation must not classify as healthy.
+	now := testTime()
+	for _, tc := range []struct {
+		name string
+		edit func(*Observation)
+	}{
+		{"invalid id", func(observation *Observation) { observation.ID = "" }},
+		{"invalid label key", func(observation *Observation) { observation.Labels = map[string]string{"bad key": "value"} }},
+		{"invalid label value", func(observation *Observation) { observation.Labels = map[string]string{"host": "api_token"} }},
+		{"nonfinite value", func(observation *Observation) { observation.Value = math.Inf(1) }},
+		{"non utc timestamp", func(observation *Observation) { observation.ObservedAt = now.In(time.FixedZone("CST", 8*60*60)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observation := metadataObservation("oom", "dbpilot.inspection.host.oom.count", 0, now)
+			tc.edit(&observation)
+			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), metadataSnapshot("host.oom.evidence", []Observation{observation}), metricTarget())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings[0].Level != LevelMissingData {
+				t.Fatalf("malformed metadata level = %q, want missing_data", findings[0].Level)
+			}
+		})
+	}
+}
+
 func TestEvaluatorAppliesFullLogWindowSemantics(t *testing.T) {
 	// Break caught: a missing or malformed log counter must not masquerade as a healthy window.
 	now := testTime()
@@ -286,6 +314,33 @@ func TestEvaluatorAppliesFullLogWindowSemantics(t *testing.T) {
 			}
 			if findings[0].Level != tc.want {
 				t.Fatalf("log level = %q, want %q", findings[0].Level, tc.want)
+			}
+		})
+	}
+}
+
+func TestEvaluatorRequiresStructurallyValidLogObservation(t *testing.T) {
+	// Break caught: a malformed matching log counter must invalidate the full observation window.
+	now := testTime()
+	for _, tc := range []struct {
+		name string
+		edit func(*Observation)
+	}{
+		{"invalid id", func(observation *Observation) { observation.ID = "" }},
+		{"invalid label key", func(observation *Observation) { observation.Labels = map[string]string{"bad key": "value"} }},
+		{"invalid label value", func(observation *Observation) { observation.Labels = map[string]string{"host": "password"} }},
+		{"nonfinite value", func(observation *Observation) { observation.Value = math.NaN() }},
+		{"non utc timestamp", func(observation *Observation) { observation.ObservedAt = now.In(time.FixedZone("CST", 8*60*60)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observations := logObservations(now, 0, 0, 0)
+			tc.edit(&observations[0])
+			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), metadataSnapshot("host.log.error_summary", observations), metricTarget())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings[0].Level != LevelMissingData {
+				t.Fatalf("malformed log level = %q, want missing_data", findings[0].Level)
 			}
 		})
 	}
@@ -330,6 +385,33 @@ func TestEvaluatorAveragesMaxFiniteValuesWithoutOverflow(t *testing.T) {
 	}
 	if findings[0].Level != LevelCritical || findings[0].Evidence["value"] == "+Inf" || findings[0].Evidence["value"] == "NaN" {
 		t.Fatalf("overflow-safe average finding = %#v", findings[0])
+	}
+}
+
+func TestAverageAggregationHandlesExtremeAndSubnormalFiniteValues(t *testing.T) {
+	// Break caught: divide-first averaging loses subnormal values and naive deltas overflow at opposite extremes.
+	for _, tc := range []struct {
+		name   string
+		values []float64
+		want   float64
+	}{
+		{"three max floats", []float64{math.MaxFloat64, math.MaxFloat64, math.MaxFloat64}, math.MaxFloat64},
+		{"equal smallest subnormals", []float64{math.SmallestNonzeroFloat64, math.SmallestNonzeroFloat64, math.SmallestNonzeroFloat64}, math.SmallestNonzeroFloat64},
+		{"opposite extremes", []float64{-math.MaxFloat64, math.MaxFloat64}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observations := make([]Observation, len(tc.values))
+			for index, value := range tc.values {
+				observations[index] = metricObservation(fmt.Sprintf("sample-%d", index), "target-1", "system.filesystem.utilization", value, testTime().Add(time.Duration(index)*time.Second))
+			}
+			got, ok := aggregateObservations(AggregationAverage, observations)
+			if !ok || !finite(got) || got != tc.want {
+				t.Fatalf("average = %v, ok=%t; want %v", got, ok, tc.want)
+			}
+		})
+	}
+	if _, ok := aggregateObservations(AggregationAverage, []Observation{{Value: math.Inf(1)}}); ok {
+		t.Fatal("impossible nonfinite aggregate must be rejected")
 	}
 }
 

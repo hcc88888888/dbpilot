@@ -175,3 +175,18 @@ func TestSnapshotBoundsEmbeddedObservations(t *testing.T) {
 		t.Fatal("snapshot with more than 10000 observations must be rejected")
 	}
 }
+
+func TestSnapshotAcceptsExactlyTenThousandTargetsAndRejectsOneMore(t *testing.T) {
+	// Break caught: changing the target-count guard would admit an unbounded run snapshot.
+	snapshot := metricSnapshot(AggregationLatest)
+	for index := 0; index < 9999; index++ {
+		snapshot.Targets = append(snapshot.Targets, TargetRun{TargetID: fmt.Sprintf("target-%d", index+2), AgentID: "agent-1", Status: TargetPending})
+	}
+	if len(snapshot.Targets) != 10000 || snapshot.Validate() != nil {
+		t.Fatalf("exactly 10000 valid targets must be accepted, got %d", len(snapshot.Targets))
+	}
+	snapshot.Targets = append(snapshot.Targets, TargetRun{TargetID: "target-10001", AgentID: "agent-1", Status: TargetPending})
+	if err := snapshot.Validate(); err == nil {
+		t.Fatal("10001 valid unique targets must be rejected")
+	}
+}
