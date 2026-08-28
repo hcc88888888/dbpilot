@@ -22,9 +22,9 @@ func TestPostgresStoreAtomicallyClaimsNewOrExpiredCompletedKeys(t *testing.T) {
 	t.Run("new", func(t *testing.T) {
 		database, mock := newIdempotencySQLMock(t)
 		mock.ExpectBegin()
-		mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).
+		mock.ExpectQuery(regexp.QuoteMeta(insertClaimSQL)).
 			WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, nil, expires, now).
-			WillReturnResult(sqlmock.NewResult(0, 1))
+			WillReturnRows(sqlmock.NewRows([]string{"created_at"}).AddRow(now))
 		mock.ExpectCommit()
 
 		claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
@@ -37,10 +37,10 @@ func TestPostgresStoreAtomicallyClaimsNewOrExpiredCompletedKeys(t *testing.T) {
 	t.Run("expired", func(t *testing.T) {
 		database, mock := newIdempotencySQLMock(t)
 		mock.ExpectBegin()
-		mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
-		mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).
+		mock.ExpectQuery(regexp.QuoteMeta(insertClaimSQL)).WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
+		mock.ExpectQuery(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).
 			WithArgs(fingerprint, owner, nil, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
-			WillReturnResult(sqlmock.NewResult(0, 1))
+			WillReturnRows(sqlmock.NewRows([]string{"created_at"}).AddRow(now))
 		mock.ExpectCommit()
 
 		claim, err := NewPostgresStore(database).Claim(context.Background(), ClaimRequest{Key: key, Fingerprint: fingerprint, OwnerToken: owner, Now: now, ExpiresAt: expires})
@@ -78,8 +78,8 @@ func TestPostgresStoreReplaysCompletedAndClassifiesDuplicateClaims(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			database, mock := newIdempotencySQLMock(t)
 			mock.ExpectBegin()
-			mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
-			mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
+			mock.ExpectQuery(regexp.QuoteMeta(insertClaimSQL)).WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
+			mock.ExpectQuery(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
 			mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
 				WithArgs(key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).
 				WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json", "created_at"}).
@@ -114,8 +114,8 @@ func TestPostgresStoreNeverReclaimsExpiredProcessingClaim(t *testing.T) {
 
 	database, mock := newIdempotencySQLMock(t)
 	mock.ExpectBegin()
-	mock.ExpectExec(regexp.QuoteMeta(insertClaimSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(regexp.QuoteMeta(insertClaimSQL)).WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
+	mock.ExpectQuery(regexp.QuoteMeta(reclaimExpiredCompletedSQL)).WillReturnRows(sqlmock.NewRows([]string{"created_at"}))
 	mock.ExpectQuery(regexp.QuoteMeta(selectRecordSQL)).
 		WillReturnRows(sqlmock.NewRows([]string{"request_fingerprint", "owner_token", "state", "response_status", "response_headers", "response_json", "audit_event_json", "created_at"}).
 			AddRow(fingerprint, owner, StateProcessing, 0, []byte(`{}`), nil, nil, now))

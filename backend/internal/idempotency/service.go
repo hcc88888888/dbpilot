@@ -143,7 +143,7 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 		return Claim{}, err
 	}
 	if claim.Claimed {
-		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil || claim.CreatedAt.IsZero() || !claim.CreatedAt.Equal(now) || !bytesEqual(claim.Reconciliation, reconciliation) {
+		if claim.OwnerToken != owner || claim.State != StateProcessing || claim.Response != nil || claim.CreatedAt.IsZero() || claim.CreatedAt.Before(now.Add(-time.Second)) || claim.CreatedAt.After(now.Add(time.Second)) || !bytesEqual(claim.Reconciliation, reconciliation) {
 			return Claim{}, ErrInvalid
 		}
 		claim.Reconciliation = append([]byte(nil), claim.Reconciliation...)

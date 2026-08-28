@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, audit_event_json, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $10, $10) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING"
-const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = $3, expires_at = $4, created_at = $5, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND state = 'completed' AND expires_at <= $5"
+const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, state, audit_event_json, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'processing', $8, $9, $10, $10) ON CONFLICT (tenant_id, project_id, actor, operation_id, idempotency_key) DO NOTHING RETURNING created_at"
+const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = $3, expires_at = $4, created_at = $5, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND state = 'completed' AND expires_at <= $5 RETURNING created_at"
 const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json, audit_event_json, created_at FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
 const commitSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, audit_event_json = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND request_fingerprint = $11 AND owner_token = $12 AND state = 'processing'"
 const markAuditedSQL = "UPDATE idempotency_records SET state = 'audited', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'side_effect_committed'"
@@ -43,33 +43,28 @@ func (store *PostgresStore) Claim(ctx context.Context, request ClaimRequest) (Cl
 		_ = transaction.Rollback()
 		return Claim{}, cause
 	}
-	inserted, err := transaction.ExecContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, reconciliation, expires, now)
-	if err != nil {
+	var persistedCreatedAt time.Time
+	err = transaction.QueryRowContext(ctx, insertClaimSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner, reconciliation, expires, now).Scan(&persistedCreatedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return rollback(fmt.Errorf("insert idempotency claim: %w", err))
 	}
-	rows, err := inserted.RowsAffected()
-	if err != nil {
-		return rollback(fmt.Errorf("read idempotency insert result: %w", err))
-	}
-	if rows == 1 {
+	if err == nil {
+		persistedCreatedAt = persistedCreatedAt.UTC()
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit idempotency claim: %w", err)
 		}
-		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: now, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: persistedCreatedAt, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
 	}
-	reclaimed, err := transaction.ExecContext(ctx, reclaimExpiredCompletedSQL, fingerprint, owner, reconciliation, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey)
-	if err != nil {
+	err = transaction.QueryRowContext(ctx, reclaimExpiredCompletedSQL, fingerprint, owner, reconciliation, expires, now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey).Scan(&persistedCreatedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return rollback(fmt.Errorf("reclaim expired idempotency key: %w", err))
 	}
-	rows, err = reclaimed.RowsAffected()
-	if err != nil {
-		return rollback(fmt.Errorf("read idempotency reclaim result: %w", err))
-	}
-	if rows == 1 {
+	if err == nil {
+		persistedCreatedAt = persistedCreatedAt.UTC()
 		if err := transaction.Commit(); err != nil {
 			return Claim{}, fmt.Errorf("commit reclaimed idempotency key: %w", err)
 		}
-		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: now, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
+		return Claim{Claimed: true, OwnerToken: owner, State: StateProcessing, CreatedAt: persistedCreatedAt, Reconciliation: append([]byte(nil), request.Reconciliation...)}, nil
 	}
 	record, err := scanClaim(transaction.QueryRowContext(ctx, selectRecordSQL, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey))
 	if err != nil {
