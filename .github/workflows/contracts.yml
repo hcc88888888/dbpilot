@@ -90,6 +90,10 @@ jobs:
         working-directory: backend
         run: go vet ./...
 
+      - name: Run PostgreSQL host inspection lifecycle
+        shell: pwsh
+        run: ./backend/scripts/verify-host-inspection.ps1
+
       - name: Run live foundation and Linux verification
         shell: pwsh
         run: ./backend/scripts/verify-contract-foundation.ps1

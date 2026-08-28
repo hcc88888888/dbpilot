@@ -143,6 +143,19 @@ func (GopsutilHostReader) Read(ctx context.Context) (HostSnapshot, error) {
 			UsedBytes: usage.Used, TotalBytes: usage.Total, UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
 		})
 	}
+	if len(filesystems) == 0 {
+		usage, usageErr := disk.UsageWithContext(ctx, string(filepath.Separator))
+		if usageErr != nil {
+			return HostSnapshot{}, fmt.Errorf("read root filesystem usage: %w", usageErr)
+		}
+		if usage.Total == 0 {
+			return HostSnapshot{}, errors.New("read root filesystem usage: zero capacity")
+		}
+		filesystems = append(filesystems, FilesystemObservation{
+			Device: string(filepath.Separator), Mountpoint: string(filepath.Separator), Type: "rootfs",
+			UsedBytes: usage.Used, TotalBytes: usage.Total, UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
+		})
+	}
 	diskCounters, err := disk.IOCountersWithContext(ctx)
 	if err != nil {
 		return HostSnapshot{}, fmt.Errorf("read disk counters: %w", err)

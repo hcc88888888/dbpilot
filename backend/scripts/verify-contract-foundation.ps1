@@ -105,7 +105,7 @@ try {
 	$postgresContainerID = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $postgresContainer -CreateArguments @(
 		'--label', 'dbpilot.verifier=contract-foundation',
 		'--label', "dbpilot.run=$postgresContainer",
-        '--publish', '127.0.0.1:55432:5432',
+		'--publish', '127.0.0.1::5432',
         '--env', 'POSTGRES_DB=dbpilot_contract',
         '--env', 'POSTGRES_USER=dbpilot_contract',
         '--env', 'POSTGRES_PASSWORD=dbpilot_contract',
@@ -129,12 +129,15 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw 'Contract PostgreSQL did not become ready.' }
+	$binding = (& $DockerBinary port $postgresContainerID '5432/tcp' | Out-String).Trim()
+	if ($LASTEXITCODE -ne 0 -or $binding -notmatch '^127\.0\.0\.1:(\d+)$') { throw 'Unable to resolve the foundation PostgreSQL ephemeral loopback port.' }
+	$postgresPort = $Matches[1]
 
     $env:DBPILOT_CONTRACT_E2E = '1'
-    $env:DBPILOT_CONTRACT_POSTGRES_DSN = 'postgres://dbpilot_contract:dbpilot_contract@127.0.0.1:55432/dbpilot_contract?sslmode=disable'
+	$env:DBPILOT_CONTRACT_POSTGRES_DSN = "postgres://dbpilot_contract:dbpilot_contract@127.0.0.1:$postgresPort/dbpilot_contract?sslmode=disable"
     Push-Location $backendRoot
     try {
-		Invoke-Checked $GoBinary @('test', './test/e2e', '-run', 'Test(JobCommandLifecycle|TwoPhaseCommandLifecycle)', '-v', '-count=1')
+		Invoke-Checked $GoBinary @('test', './test/e2e', '-run', 'Test(HostInspectionLifecycle|JobCommandLifecycle|TwoPhaseCommandLifecycle)', '-v', '-count=1')
     }
     finally {
         Pop-Location
@@ -181,6 +184,7 @@ finally {
 			if ($LASTEXITCODE -ne 0) { throw "Unable to audit anonymous volume cleanup for '$volume'." }
 			if ($remainingVolume -contains $volume) { throw "Foundation verifier left anonymous volume '$volume' behind." }
 		}
+		Write-Host "Foundation cleanup audit passed: container=$postgresContainerID anonymous_volumes=$($postgresAnonymousVolumes.Count)."
 	}
 	catch {
 		$cleanupFailures += $_

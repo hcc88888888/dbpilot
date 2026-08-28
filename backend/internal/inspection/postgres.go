@@ -380,8 +380,17 @@ func scanRun(scanner interface{ Scan(...any) error }) (Run, error) {
 	if err := json.Unmarshal(itemSnapshot, &value.ItemSnapshot); err != nil {
 		return Run{}, err
 	}
+	normalizePersistedSystemItemLabels(value.ItemSnapshot)
 	value.CreatedAt = value.CreatedAt.UTC()
 	return value, nil
+}
+
+func normalizePersistedSystemItemLabels(items []Item) {
+	for index := range items {
+		if items[index].System && items[index].MetricRule != nil && items[index].MetricRule.Labels == nil {
+			items[index].MetricRule.Labels = map[string]string{}
+		}
+	}
 }
 
 func insertPolicyItems(ctx context.Context, tx *sql.Tx, value Policy) error {
@@ -1063,6 +1072,7 @@ func scanRunClaim(scanner interface{ Scan(...any) error }) (Run, time.Time, erro
 	if err := json.Unmarshal(itemSnapshot, &value.ItemSnapshot); err != nil {
 		return Run{}, time.Time{}, err
 	}
+	normalizePersistedSystemItemLabels(value.ItemSnapshot)
 	value.CreatedAt = value.CreatedAt.UTC()
 	if reportGeneratedAt.Valid {
 		return value, reportGeneratedAt.Time.UTC(), nil

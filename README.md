@@ -106,14 +106,22 @@ OpenAPI 与 Agent Protobuf 的唯一可编辑源分别位于 `contracts/openapi/
 
 开发期间可用 `npm run contracts:mock:start` 启动 Prism，结束后运行对应的
 Docker Compose `down`；自动化路径优先使用会自行清理的
-`npm run contracts:mock:test`。一条命令运行合同、前端、Go、Prism、真实
-PostgreSQL Job→Command E2E 与 Linux 交叉构建：
+`npm run contracts:mock:test`。主机巡检的策略、证据新鲜度、partial、不可变报告、
+修复与保留语义见 `docs/host-inspection-operations.md`。以下门禁覆盖真实 PostgreSQL
+双目标巡检、Job→Command 两阶段 E2E、Linux 交叉构建及批准的 Kylin 生产 Agent：
 
 ```powershell
+powershell -NoProfile -File backend/scripts/verify-host-inspection.ps1
 powershell -NoProfile -File backend/scripts/verify-contract-foundation.ps1
 powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
   -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' -Architecture amd64
 ```
+
+主机巡检 PostgreSQL 脚本只发布动态分配的 loopback 端口，并在 `finally` 中按记录的
+容器 ID/所有权标签清除自身容器与匿名卷。Kylin 门禁必须使用上述精确镜像与 amd64，
+运行生产 Agent/native host reader，解码真实 spool 中非空 CPU、内存、文件系统、负载和
+snapshot timestamp，并验证 ResultAck 已写入 journal；静态数据、通用 Linux 或
+`-SkipKylin` 不构成完成证据。GitHub CI 运行公开 PostgreSQL 门禁，不依赖私有 Kylin registry。
 
 Agent 命令采用 `Prepare → Start` 两阶段执行。Prepare 只把签名 envelope 同步写入
 Agent journal，不调用 executor；只有控制面在 PostgreSQL 中原子提交 Start fence 后，

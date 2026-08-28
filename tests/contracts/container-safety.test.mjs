@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const helper = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const kylinVerifier = join(repoRoot, 'backend', 'scripts', 'verify-kylin-docker.ps1');
+const hostInspectionVerifier = join(repoRoot, 'backend', 'scripts', 'verify-host-inspection.ps1');
 
 function pwsh(args, env = {}) {
   return spawnSync('pwsh', ['-NoProfile', ...args], {
@@ -103,6 +104,39 @@ test('Kylin verifier rejects every image reference except the approved V10 SP1 t
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /cr\.kylinos\.cn\/kylin\/kylin-server-platform:v10sp1/);
     await assert.rejects(readFile(fixture.log, 'utf8'), { code: 'ENOENT' });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('host inspection verifier owns an ephemeral loopback PostgreSQL container and audits exact cleanup on test failure', async () => {
+  const fixture = await fakeDockerFixture();
+  const fakeGo = join(fixture.root, 'go.ps1');
+  await writeFile(fakeGo, `$global:LASTEXITCODE=19\n`);
+  const dockerSource = `
+$line = $args -join ' '
+[IO.File]::AppendAllText($env:DOCKER_LOG, $line + [Environment]::NewLine)
+switch ($args[0]) {
+  'ps' { $global:LASTEXITCODE=0; return }
+  'create' { Write-Output 'host-created-id'; $global:LASTEXITCODE=0; return }
+  'inspect' { Write-Output '[{"Id":"host-created-id","Config":{"Labels":{"dbpilot.verifier":"host-inspection","dbpilot.run":"dbpilot-host-inspection-postgres-0123456789abcdef0123456789abcdef"}},"Mounts":[{"Type":"volume","Name":"host-anonymous-volume"}]}]'; $global:LASTEXITCODE=0; return }
+  'start' { $global:LASTEXITCODE=0; return }
+  'exec' { $global:LASTEXITCODE=0; return }
+  'port' { Write-Output '127.0.0.1:49173'; $global:LASTEXITCODE=0; return }
+  'rm' { $global:LASTEXITCODE=0; return }
+  'volume' { $global:LASTEXITCODE=0; return }
+  default { $global:LASTEXITCODE=0; return }
+}
+`;
+  await writeFile(fixture.docker, dockerSource);
+  try {
+    const result = pwsh(['-File', hostInspectionVerifier, '-DockerBinary', fixture.docker, '-GoBinary', fakeGo, '-RunId', '0123456789abcdef0123456789abcdef'], { DOCKER_LOG: fixture.log });
+    assert.notEqual(result.status, 0, 'the fake Go test intentionally fails');
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, /create --name dbpilot-host-inspection-postgres-0123456789abcdef0123456789abcdef .*--label dbpilot\.verifier=host-inspection .*--label dbpilot\.run=dbpilot-host-inspection-postgres-0123456789abcdef0123456789abcdef .*--publish 127\.0\.0\.1::5432 .*postgres:16-alpine/);
+    assert.match(invocations, /^rm -f -v host-created-id$/m);
+    assert.match(invocations, /volume ls --filter name=\^host-anonymous-volume\$ --format \{\{\.Name\}\}/);
+    assert.doesNotMatch(invocations, /rm .*preexisting-id/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

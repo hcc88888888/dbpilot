@@ -5,6 +5,10 @@ identity/inventory integration, notification security, backup/restore, and the
 Docker/Kylin evidence boundary, see
 [`docs/alert-control-plane-operations.md`](docs/alert-control-plane-operations.md).
 
+For host inspection scheduling, freshness/acceptance fences, partial Runs,
+immutable report repair, retention and release gates, see
+[`../docs/host-inspection-operations.md`](../docs/host-inspection-operations.md).
+
 `dbpilot-agent` is a single embedded telemetry process for Linux. It does not
 install, start, expose, or depend on Vector or a standalone OpenTelemetry
 Collector process.
@@ -101,17 +105,21 @@ Windows development can verify both Linux executables inside the exact
 both architectures, executes each selected-architecture binary with `--version`, starts the Agent with a signed
 sample policy, proves its bbolt command journal opens and closes, and runs a
 real mTLS AgentControl probe against the production Agent. The probe requires
-the Agent to advertise `collect_now`, sends signed Prepare and fenced Start,
-runs the configured JMX-backed `DependencyCollector`, verifies the typed
-Result, returns ResultAck, and then confirms the journal marks that exact result
-reported. It also resolves the command execution-token and Artifact signing
+the Agent to advertise `collect_now`, preserves the signed JMX-backed
+`dependencies` Prepare/Start, then sends a separate signed and fenced
+`CollectNow{collection_kinds:["host"]}` through the native gopsutil reader.
+After ResultAck it confirms both journal entries are completed/reported and
+decodes the real retained spool, requiring non-empty canonical CPU, memory,
+filesystem and load metrics plus `inspection.snapshot_at`. It also resolves the
+command execution-token and Artifact signing
 credentials, validates the private Artifact storage root, and starts the
 control plane through readiness initialization until the expected PostgreSQL
 connection failure. It rejects missing Docker/images, non-Kylin
 `/etc/os-release`, architecture mismatches, and unexpected startup failures;
 it requires the exact Kylin V10/Tercel release identity, always removes only
-the uniquely named container it created plus temporary keys/binaries, and never
-substitutes a generic Linux image.
+the uniquely named ownership-labelled container it created plus any recorded
+anonymous volumes and temporary keys/binaries, and never substitutes static
+data, a generic Linux image or `-SkipKylin`.
 
 ```powershell
 powershell -NoProfile -File .\scripts\verify-kylin-docker.ps1 `
@@ -139,6 +147,7 @@ npm run contracts:verify
 node --test
 Push-Location backend; go test ./...; Pop-Location
 npm run contracts:mock:test
+powershell -NoProfile -File backend/scripts/verify-host-inspection.ps1
 powershell -NoProfile -File backend/scripts/verify-contract-foundation.ps1
 ```
 
