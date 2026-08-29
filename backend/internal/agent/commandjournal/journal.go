@@ -160,6 +160,23 @@ func Open(path string) (*BoltJournal, error) {
 	return journal, nil
 }
 
+// OpenReadOnly opens an existing journal for inspection without permission
+// changes, recovery transitions, bucket creation, or synchronization writes.
+func OpenReadOnly(path string) (*BoltJournal, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("command journal path is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("existing regular command journal is required")
+	}
+	database, err := bbolt.Open(path, 0o600, &bbolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("open command journal read-only: %w", err)
+	}
+	return &BoltJournal{database: database, now: time.Now}, nil
+}
+
 func (j *BoltJournal) Prepare(ctx context.Context, envelope *agentv1.CommandEnvelope, at time.Time) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

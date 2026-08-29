@@ -196,6 +196,9 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 	if current.Status == StatusCancelling || current.Status == StatusCancelled || message.CancellationRequestedAt != nil {
 		return false, lifecycle.cancelUndelivered(ctx, message, at)
 	}
+	if current.TimeoutAt != nil && !current.TimeoutAt.After(at) {
+		return false, lifecycle.timeoutUndelivered(ctx, message, at)
+	}
 	if isTerminal(current.Status) {
 		if len(message.PreparedEnvelope) > 0 {
 			unsigned, decodeErr := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
@@ -265,6 +268,19 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 		return false, err
 	}
 	return true, lifecycle.recordAudit(ctx, value, message, "command.dispatched", "success", map[string]any{"state": "dispatched"})
+}
+
+func (lifecycle *CommandLifecycle) timeoutUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
+	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "Job timeout elapsed before delivery", FinishedAt: timePointer(at)}
+	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
+	if err != nil {
+		return err
+	}
+	event := lifecycle.auditEvent(value, message, "command.undelivered_timed_out", "failure", map[string]any{"phase": string(message.Phase)}, at, "command.undelivered_timed_out:"+message.ID)
+	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+		return err
+	}
+	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at)
 }
 
 func (lifecycle *CommandLifecycle) recoverPreparedCommands(ctx context.Context, at time.Time) error {

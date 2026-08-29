@@ -108,6 +108,55 @@ func TestConnectRegistersCapabilitiesSendsHelloAckAndRejectsDuplicateSession(t *
 	require.Eventually(t, func() bool { _, exists := registry.Session("agent-a"); return !exists }, time.Second, time.Millisecond)
 }
 
+func TestConnectRecordsRealHeartbeatWhileConnectedObserverIsBlocked(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	registry := NewRegistry(2)
+	observer := &blockingObserver{connectedEntered: make(chan struct{}), connectedRelease: make(chan struct{}), resultEntered: make(chan struct{}), resultRelease: make(chan struct{})}
+	server := NewServer(registry, observer)
+	server.now = func() time.Time { return now }
+	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
+	done := make(chan error, 1)
+	go func() { done <- server.Connect(stream) }()
+	_ = stream.nextSent(t)
+	<-observer.connectedEntered
+
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a"}}})
+	require.Eventually(t, func() bool {
+		session, ok := registry.Session("agent-a")
+		return ok && session.LastHeartbeat.Equal(now)
+	}, 200*time.Millisecond, time.Millisecond)
+
+	close(observer.connectedRelease)
+	stream.closeReceive()
+	require.NoError(t, <-done)
+}
+
+func TestConnectRecordsRealHeartbeatWhileCommandResultObserverIsBlocked(t *testing.T) {
+	now := time.Unix(1_725_000_000, 0).UTC()
+	registry := NewRegistry(2)
+	observer := &blockingObserver{connectedEntered: make(chan struct{}), connectedRelease: make(chan struct{}), resultEntered: make(chan struct{}), resultRelease: make(chan struct{})}
+	server := NewServer(registry, observer)
+	server.now = func() time.Time { return now }
+	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
+	done := make(chan error, 1)
+	go func() { done <- server.Connect(stream) }()
+	_ = stream.nextSent(t)
+	<-observer.connectedEntered
+	close(observer.connectedRelease)
+
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: &agentv1.CommandResult{CommandId: "command-replay", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: testServerExecutionToken(0x41), LeaseRevision: 1}}})
+	<-observer.resultEntered
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a"}}})
+	require.Eventually(t, func() bool {
+		session, ok := registry.Session("agent-a")
+		return ok && session.LastHeartbeat.Equal(now)
+	}, 200*time.Millisecond, time.Millisecond)
+
+	close(observer.resultRelease)
+	stream.closeReceive()
+	require.NoError(t, <-done)
+}
+
 func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.T) {
 	now := time.Unix(1_725_000_000, 0).UTC()
 	registry := NewRegistry(1)
@@ -445,6 +494,33 @@ type recordingObserver struct {
 	prepared     chan *agentv1.CommandPrepared
 	start        *agentv1.CommandStart
 	resultDigest []byte
+}
+
+type blockingObserver struct {
+	NoopObserver
+	connectedEntered chan struct{}
+	connectedRelease chan struct{}
+	resultEntered    chan struct{}
+	resultRelease    chan struct{}
+}
+
+func (o *blockingObserver) Connected(ctx context.Context, _ SessionInfo) {
+	o.connectedEntered <- struct{}{}
+	select {
+	case <-o.connectedRelease:
+	case <-ctx.Done():
+	}
+}
+
+func (o *blockingObserver) Result(ctx context.Context, _ string, result *agentv1.CommandResult) (ResultPersistence, error) {
+	o.resultEntered <- struct{}{}
+	select {
+	case <-o.resultRelease:
+	case <-ctx.Done():
+	}
+	encoded, _ := proto.MarshalOptions{Deterministic: true}.Marshal(result)
+	digest := sha256.Sum256(encoded)
+	return ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: digest[:], Persisted: true}, nil
 }
 
 func (o *recordingObserver) Connected(_ context.Context, session SessionInfo)      { o.connected <- session }

@@ -32,6 +32,17 @@ func TestLogSummaryIndexKeepsOnlyBoundedNormalizedCounters(t *testing.T) {
 	require.NotContains(t, fmt.Sprintf("%#v", index), "secret")
 }
 
+func TestLogSummaryIndexClassifiesCanonicalFileLogSeverityPrefix(t *testing.T) {
+	now := time.Date(2026, 8, 29, 8, 30, 0, 0, time.UTC)
+	index := NewLogSummaryIndex(func() time.Time { return now })
+	logs := plog.NewLogs()
+	appendTestLog(logs, "acceptance-filelog", plog.SeverityNumberUnspecified, "", now, "WARN controlled acceptance log")
+
+	require.NoError(t, index.Observe(context.Background(), logs))
+	require.Equal(t, []LogSummary{{SourceID: "acceptance-filelog", Severity: "warning", Category: "general", Count: 1, ObservedAt: now}}, index.Snapshot(now, time.Hour))
+	require.NotContains(t, fmt.Sprintf("%#v", index), "controlled acceptance log")
+}
+
 func TestLogSummaryIndexBoundsSourcesWindowAndInvalidMetadata(t *testing.T) {
 	now := time.Date(2026, 8, 29, 8, 30, 0, 0, time.UTC)
 	clock := now.Add(-2 * time.Hour)

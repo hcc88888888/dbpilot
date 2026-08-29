@@ -804,7 +804,7 @@ func (service *inspectionApplicationService) CreateItem(ctx context.Context, sco
 		}
 		return page.Items[0], nil
 	}
-	return executeInspectionWrite(ctx, service, scope, actor, key, "CreateInspectionItem", "inspection.item.created", "inspection_item", id, http.StatusCreated, recover, func(context.Context) (inspection.Item, error) {
+	return executeInspectionWrite(ctx, service, scope, actor, key, "CreateInspectionItem", "inspection.item.created", "inspection_item", id, "", http.StatusCreated, recover, func(context.Context) (inspection.Item, error) {
 		return value, service.repository.CreateItem(ctx, value)
 	})
 }
@@ -884,7 +884,7 @@ func (service *inspectionApplicationService) CreatePolicy(ctx context.Context, s
 		}
 		return stored, err
 	}
-	return executeInspectionWrite(ctx, service, scope, actor, key, "CreateInspectionPolicy", "inspection.policy.created", "inspection_policy", id, http.StatusCreated, recover, func(context.Context) (inspection.Policy, error) {
+	return executeInspectionWrite(ctx, service, scope, actor, key, "CreateInspectionPolicy", "inspection.policy.created", "inspection_policy", id, "", http.StatusCreated, recover, func(context.Context) (inspection.Policy, error) {
 		return value, service.repository.CreatePolicy(ctx, value)
 	})
 }
@@ -913,7 +913,7 @@ func (service *inspectionApplicationService) UpdatePolicy(ctx context.Context, s
 		}
 		return recovered, nil
 	}
-	return executeInspectionWrite(ctx, service, scope, actor, key, "UpdateInspectionPolicy", "inspection.policy.updated", "inspection_policy", id, http.StatusOK, recover, func(context.Context) (inspection.Policy, error) {
+	return executeInspectionWrite(ctx, service, scope, actor, key, "UpdateInspectionPolicy", "inspection.policy.updated", "inspection_policy", id, entityTag(current), http.StatusOK, recover, func(context.Context) (inspection.Policy, error) {
 		return service.repository.UpdatePolicy(ctx, value, current)
 	})
 }
@@ -1143,9 +1143,9 @@ func (service *inspectionApplicationService) executeRun(ctx context.Context, sco
 	return decodeInspectionResponse[inspection.Run](stored)
 }
 
-func executeInspectionWrite[T any](ctx context.Context, service *inspectionApplicationService, scope platformscope.Scope, actor, key, operation, action, resourceType, resourceID string, status int, recoverValue func(context.Context) (T, error), perform func(context.Context) (T, error)) (T, error) {
+func executeInspectionWrite[T any](ctx context.Context, service *inspectionApplicationService, scope platformscope.Scope, actor, key, operation, action, resourceType, resourceID, ifMatch string, status int, recoverValue func(context.Context) (T, error), perform func(context.Context) (T, error)) (T, error) {
 	var zero T
-	fingerprint, err := platformIdempotencyFingerprint(ctx, operation, resourceID, "")
+	fingerprint, err := platformIdempotencyFingerprint(ctx, operation, resourceID, ifMatch)
 	if err != nil {
 		return zero, err
 	}

@@ -1,6 +1,9 @@
 package inspection
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestBuiltinHostCatalogPublishesVersionOneThresholds(t *testing.T) {
 	// Break caught: an accidental catalog threshold change would silently alter v1 findings.
@@ -12,6 +15,9 @@ func TestBuiltinHostCatalogPublishesVersionOneThresholds(t *testing.T) {
 	for _, item := range items {
 		if item.Version != 1 || !item.System || item.Validate() != nil {
 			t.Fatalf("invalid built-in item %#v", item)
+		}
+		if strings.TrimSpace(item.RecommendationTemplate) == "" || len(item.RecommendationTemplate) > 4000 {
+			t.Fatalf("built-in item %q has no bounded operator recommendation", item.ID)
 		}
 		byID[item.ID] = item
 	}

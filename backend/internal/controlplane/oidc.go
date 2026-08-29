@@ -20,9 +20,10 @@ type OIDCGrant struct {
 }
 
 type OIDCClaims struct {
-	Subject       string      `json:"sub"`
-	PlatformAdmin bool        `json:"dbpilot_platform_admin"`
-	Grants        []OIDCGrant `json:"dbpilot_grants"`
+	Subject       string                `json:"sub"`
+	PlatformAdmin bool                  `json:"dbpilot_platform_admin"`
+	Projects      []platformscope.Scope `json:"dbpilot_projects"`
+	Grants        []OIDCGrant           `json:"dbpilot_grants"`
 }
 
 type TokenVerifier interface {
@@ -70,8 +71,18 @@ func principalFromClaims(claims OIDCClaims) (Principal, error) {
 	principal := Principal{
 		Subject:       claims.Subject,
 		PlatformAdmin: claims.PlatformAdmin,
-		Projects:      make(map[string]struct{}),
+		Projects:      make(map[string]struct{}, len(claims.Projects)),
 		Grants:        make(map[string]map[string]struct{}, len(claims.Grants)),
+	}
+	for _, scope := range claims.Projects {
+		if scope.Validate() != nil || !headerIdentifier.MatchString(scope.TenantID) || !headerIdentifier.MatchString(scope.ProjectID) {
+			return Principal{}, ErrUnauthenticated
+		}
+		key := scope.Key()
+		if _, duplicate := principal.Projects[key]; duplicate {
+			return Principal{}, ErrUnauthenticated
+		}
+		principal.Projects[key] = struct{}{}
 	}
 	for _, claim := range claims.Grants {
 		scope := platformscope.Scope{TenantID: claim.TenantID, ProjectID: claim.ProjectID}

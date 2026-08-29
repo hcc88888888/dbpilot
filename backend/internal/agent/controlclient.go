@@ -16,6 +16,8 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	"dbpilot.local/platform/internal/commandvalidation"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -270,6 +272,9 @@ func (c *ControlClient) Run(ctx context.Context) (runErr error) {
 		if errors.As(err, &fatal) {
 			return fatal.err
 		}
+		if permanentControlStreamError(err) {
+			return err
+		}
 		if err := c.waitForReconnect(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -279,6 +284,15 @@ func (c *ControlClient) Run(ctx context.Context) (runErr error) {
 		if ctx.Err() != nil {
 			return nil
 		}
+	}
+}
+
+func permanentControlStreamError(err error) bool {
+	switch status.Code(err) {
+	case codes.Unauthenticated, codes.PermissionDenied, codes.FailedPrecondition:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -352,6 +366,9 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
+	if err := c.sendHeartbeat(session); err != nil {
+		return err
+	}
 	if err := c.replayPendingResults(ctx, session); err != nil {
 		return err
 	}

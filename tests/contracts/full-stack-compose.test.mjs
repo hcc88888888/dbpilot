@@ -88,11 +88,13 @@ test('Compose resolves the exact isolated full-stack service, image, network, an
   const config = loadCompose();
   assert.deepEqual(Object.keys(config.services).sort(), serviceNames);
   assert.deepEqual(Object.keys(config.volumes).sort(), volumeNames);
-  assert.deepEqual(Object.keys(config.networks).sort(), ['acceptance', 'builder-egress']);
+  assert.deepEqual(Object.keys(config.networks).sort(), ['acceptance', 'builder-egress', 'frontend-edge']);
   assert.equal(config.networks.acceptance.internal, true);
   assert.equal(config.networks.acceptance.driver, 'bridge');
   assert.notEqual(config.networks['builder-egress'].internal, true);
   assert.equal(config.networks['builder-egress'].driver, 'bridge');
+  assert.notEqual(config.networks['frontend-edge'].internal, true);
+  assert.equal(config.networks['frontend-edge'].driver, 'bridge');
 
   const expectedImages = {
     'asset-builder': 'golang:1.27.0-bookworm',
@@ -115,7 +117,11 @@ test('Compose resolves the exact isolated full-stack service, image, network, an
   assert.equal(config.services['acceptance-runner'].build.dockerfile, 'backend/docker/full-stack/runner.Dockerfile');
 
   for (const [name, service] of Object.entries(config.services)) {
-    const expectedNetworks = name === 'asset-builder' ? ['builder-egress'] : ['acceptance'];
+    const expectedNetworks = name === 'asset-builder'
+      ? ['builder-egress']
+      : name === 'frontend'
+        ? ['acceptance', 'frontend-edge']
+        : ['acceptance'];
     assert.deepEqual(Object.keys(service.networks), expectedNetworks, `${name} must use only its approved network`);
     assert.equal(service.labels['dbpilot.verifier'], 'full-stack-compose');
     assert.ok(service.labels['dbpilot.run'], `${name} must carry a run ownership label`);
@@ -152,6 +158,20 @@ test('builder uses a non-login shell and exact static linux amd64 settings to bu
   assert.match(command, /\/acceptance\/bin\/dbpilot-controlplane/);
   assert.match(command, /\/acceptance\/bin\/dbpilot-agent/);
   assert.match(command, /\/acceptance\/bin\/dbpilot-fullstack-fixture/);
+  assert.equal((command.match(/for attempt in 1 2 3; do go build/g) ?? []).length, 3, 'each approved binary build must retry transient transport failures within a fixed bound');
+  assert.equal((command.match(/test "\$\$attempt" -lt 3; done/g) ?? []).length, 3, 'every build retry loop must stop after three attempts');
+});
+
+test('bootstrap output root has no nested volume mounts before fixture generation', () => {
+  const bootstrap = loadCompose().services.bootstrap;
+  const rootMatch = commandText(bootstrap).match(/\bbootstrap\s+--root\s+(\S+)/);
+  assert.ok(rootMatch, 'bootstrap must declare its generated output root');
+
+  const outputRoot = rootMatch[1].replace(/\/$/, '');
+  const nestedMounts = (bootstrap.volumes ?? [])
+    .map((volume) => volume.target)
+    .filter((target) => target === outputRoot || target.startsWith(`${outputRoot}/`));
+  assert.deepEqual(nestedMounts, [], 'the fixture rejects a bootstrap root that already contains mounted entries');
 });
 
 test('opt-in clean-cache builder produces all binaries and removes its exact labelled project resources', {
@@ -267,6 +287,22 @@ test('runtime mounts keep source, binaries, config, and secrets read-only while 
   }
 });
 
+test('Agent working directories stay in bootstrap-owned writable data volumes', () => {
+  const services = loadCompose().services;
+  const bootstrapCommand = commandText(services.bootstrap);
+  const expected = {
+    agent: ['/acceptance/state/agent-online', '/acceptance/state/agent-online/runtime', '/volumes/agent-data/runtime'],
+    'rogue-untrusted': ['/acceptance/state/agent-untrusted', '/acceptance/state/agent-untrusted/runtime', '/volumes/rogue-untrusted-data/runtime'],
+    'rogue-mismatch': ['/acceptance/state/agent-mismatch', '/acceptance/state/agent-mismatch/runtime', '/volumes/rogue-mismatch-data/runtime'],
+  };
+  for (const [name, [dataRoot, workingDirectory, bootstrapDirectory]] of Object.entries(expected)) {
+    const service = services[name];
+    assert.equal(service.working_dir, workingDirectory);
+    assert.notEqual(mountAt(service, dataRoot)?.read_only, true, `${name} working directory must be backed by its writable data volume`);
+    assert.ok(bootstrapCommand.includes(bootstrapDirectory), `${name} working directory must be created before the runtime mount`);
+  }
+});
+
 test('only frontend publishes a Docker-assigned loopback port and runtime dependencies use completion or health conditions', () => {
   const config = loadCompose();
   for (const [name, service] of Object.entries(config.services)) {
@@ -316,6 +352,9 @@ test('Kylin production runtimes verify OS, architecture, and binary version befo
     assert.match(command, /dbpilot-(?:controlplane|agent) --version/);
     assert.match(command, /exec (?:timeout[^\n]+ )?\/acceptance\/bin\/dbpilot-(?:controlplane|agent)/);
   }
+  for (const name of ['rogue-untrusted', 'rogue-mismatch']) {
+    assert.match(commandText(services[name]), /WARN controlled acceptance file-log source.*\/var\/log\/dbpilot\/acceptance\.log/s, `${name} must materialize its signed-policy file source before Agent startup`);
+  }
 });
 
 test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream without exposing OIDC', async () => {
@@ -325,12 +364,13 @@ test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream
   assert.match(nginx, /ssl_certificate_key\s+\/acceptance\/secrets\/frontend-key\.pem/);
   assert.match(nginx, /ssl_protocols\s+TLSv1\.2\s+TLSv1\.3/);
   assert.match(nginx, /location\s*=\s*\/healthz/);
-  assert.match(nginx, /root\s+\/srv\/dbpilot\/frontend/);
+  assert.match(nginx, /root\s+\/srv\/dbpilot\s*;/);
   assert.match(nginx, /location\s+\/api\//);
   assert.match(nginx, /proxy_pass\s+https:\/\/controlplane:8443/);
   assert.match(nginx, /proxy_ssl_verify\s+on/);
   assert.match(nginx, /proxy_ssl_server_name\s+on/);
   assert.match(nginx, /proxy_ssl_name\s+controlplane/);
+  assert.match(nginx, /proxy_set_header\s+Host\s+\$http_host/, 'signed same-origin Artifact requests must preserve the descriptor host and port');
   assert.match(nginx, /proxy_set_header\s+X-Forwarded-Proto\s+https/);
   assert.match(nginx, /proxy_ssl_trusted_certificate\s+\/acceptance\/config\/ca\.pem/);
   assert.match(nginx, /proxy_buffering\s+off/);
@@ -354,8 +394,14 @@ test('generated Artifact descriptor origin and path are served by the checked-in
   assert.equal(descriptor.pathname, '/api/v1/artifact-downloads/artifact-acceptance');
 
   const frontend = loadCompose().services.frontend;
-  assert.deepEqual(Object.keys(frontend.networks), ['acceptance']);
+  assert.deepEqual(Object.keys(frontend.networks), ['acceptance', 'frontend-edge']);
   assert.equal(frontend.user, '10001:10001');
+  const indexMount = mountAt(frontend, '/srv/dbpilot/index.html');
+  assert.equal(indexMount.read_only, true);
+  assert.match(indexMount.source, /[\\/]index\.html$/);
+  const frontendSourceMount = mountAt(frontend, '/srv/dbpilot/frontend');
+  assert.equal(frontendSourceMount.read_only, true);
+  assert.match(frontendSourceMount.source, /[\\/]frontend$/);
   assert.equal(mountAt(frontend, '/acceptance/config').read_only, true);
   assert.equal(mountAt(frontend, '/acceptance/secrets').read_only, true);
   assert.equal(frontend.ports[0].target, Number(descriptor.port));

@@ -15,9 +15,9 @@ services:
     command:
       - |
         install -d -m 0755 /acceptance/bin /go-cache/build /go-cache/mod /go-cache/tmp
-        go build -trimpath -o /acceptance/bin/dbpilot-controlplane ./cmd/controlplane
-        go build -trimpath -o /acceptance/bin/dbpilot-agent ./cmd/agent
-        go build -trimpath -o /acceptance/bin/dbpilot-fullstack-fixture ./test/fixtures/fullstack
+        for attempt in 1 2 3; do go build -trimpath -o /acceptance/bin/dbpilot-controlplane ./cmd/controlplane && break; test "$$attempt" -lt 3; done
+        for attempt in 1 2 3; do go build -trimpath -o /acceptance/bin/dbpilot-agent ./cmd/agent && break; test "$$attempt" -lt 3; done
+        for attempt in 1 2 3; do go build -trimpath -o /acceptance/bin/dbpilot-fullstack-fixture ./test/fixtures/fullstack && break; test "$$attempt" -lt 3; done
         chown 10001:10001 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture
         chmod 0555 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture
     environment:
@@ -56,11 +56,11 @@ services:
         test "$${VERSION_ID:-}" = V10
         test "$$(uname -m)" = x86_64
         install -d -m 0700 /acceptance
-        /acceptance/bin/dbpilot-fullstack-fixture bootstrap --root /acceptance >/dev/null
+        /fixture-bin/dbpilot-fullstack-fixture bootstrap --root /acceptance >/dev/null
         cp -a /acceptance/config/. /volumes/config/
         cp -a /acceptance/secrets/. /volumes/secrets/
         cp -a /acceptance/state/. /volumes/state/
-        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/rogue-untrusted-data /volumes/rogue-mismatch-data
+        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/agent-data/runtime /volumes/rogue-untrusted-data /volumes/rogue-untrusted-data/runtime /volumes/rogue-mismatch-data /volumes/rogue-mismatch-data/runtime
         chown -R 10001:10001 /volumes/config /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/rogue-untrusted-data /volumes/rogue-mismatch-data
         chmod 0700 /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/rogue-untrusted-data /volumes/rogue-mismatch-data
     depends_on:
@@ -71,7 +71,7 @@ services:
       - /acceptance:rw,nosuid,size=32m,mode=0700
       - /tmp:rw,noexec,nosuid,size=16m,mode=1777
     volumes:
-      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-bin:/fixture-bin:ro
       - acceptance-config:/volumes/config
       - acceptance-secrets:/volumes/secrets
       - acceptance-state:/volumes/state
@@ -208,6 +208,7 @@ services:
     image: *kylin-image
     platform: linux/amd64
     user: "10001:10001"
+    working_dir: /acceptance/state/agent-online/runtime
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -216,7 +217,7 @@ services:
         test "$${VERSION_ID:-}" = V10
         test "$$(uname -m)" = x86_64
         /acceptance/bin/dbpilot-agent --version >/dev/null
-        printf '%s\n' 'acceptance warning: controlled file-log source' >>/var/log/dbpilot/acceptance.log
+        printf '%s\n' 'WARN controlled acceptance file-log source' >>/var/log/dbpilot/acceptance.log
         exec /acceptance/bin/dbpilot-agent --config /acceptance/config/agent.yaml
     depends_on:
       controlplane:
@@ -250,12 +251,13 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m,mode=1777
     volumes:
+      - ../../../index.html:/srv/dbpilot/index.html:ro
       - ../../../frontend:/srv/dbpilot/frontend:ro
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - acceptance-config:/acceptance/config:ro
       - acceptance-config:/etc/ssl/certs:ro
       - acceptance-secrets:/acceptance/secrets:ro
-    networks: [acceptance]
+    networks: [acceptance, frontend-edge]
     ports:
       - target: 8443
         published: "0"
@@ -314,6 +316,7 @@ services:
     platform: linux/amd64
     profiles: ["faults"]
     user: "10001:10001"
+    working_dir: /acceptance/state/agent-untrusted/runtime
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -322,6 +325,7 @@ services:
         test "$${VERSION_ID:-}" = V10
         test "$$(uname -m)" = x86_64
         /acceptance/bin/dbpilot-agent --version >/dev/null
+        printf '%s\n' 'WARN controlled acceptance file-log source' >>/var/log/dbpilot/acceptance.log
         exec timeout --signal=TERM --kill-after=5s 30s /acceptance/bin/dbpilot-agent --config /acceptance/config/agent-untrusted.yaml
     environment:
       GRPC_GO_LOG_SEVERITY_LEVEL: info
@@ -353,6 +357,7 @@ services:
     platform: linux/amd64
     profiles: ["faults"]
     user: "10001:10001"
+    working_dir: /acceptance/state/agent-mismatch/runtime
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
@@ -361,6 +366,7 @@ services:
         test "$${VERSION_ID:-}" = V10
         test "$$(uname -m)" = x86_64
         /acceptance/bin/dbpilot-agent --version >/dev/null
+        printf '%s\n' 'WARN controlled acceptance file-log source' >>/var/log/dbpilot/acceptance.log
         exec timeout --signal=TERM --kill-after=5s 30s /acceptance/bin/dbpilot-agent --config /acceptance/config/agent-mismatch.yaml
     environment:
       GRPC_GO_LOG_SEVERITY_LEVEL: info
@@ -417,6 +423,9 @@ services:
             printf 'postgres://dbpilot:%s@postgres/dbpilot?sslmode=disable' "$${password}" >/tmp/postgres-dsn
             exec /acceptance/bin/dbpilot-fullstack-fixture replay --dsn-file /tmp/postgres-dsn --phase-state-file /acceptance/state/phase-state.json --spool-root /acceptance/state/agent-online
             ;;
+          summary)
+            exec /acceptance/bin/dbpilot-fullstack-fixture summary --phase-state-file /acceptance/state/phase-state.json
+            ;;
           *)
             echo 'assertion phase is invalid' >&2
             exit 2
@@ -449,6 +458,9 @@ networks:
     internal: true
     labels: *ownership-labels
   builder-egress:
+    driver: bridge
+    labels: *ownership-labels
+  frontend-edge:
     driver: bridge
     labels: *ownership-labels
 

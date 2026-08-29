@@ -120,20 +120,21 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		uri        string
 		client     bool
 		authority  generatedAuthority
+		rsaKey     bool
 	}{
-		{"controlplane_http_cert", "controlplane_http_key", "controlplane-http", "controlplane HTTP", []string{"controlplane"}, "", false, ca},
-		{"controlplane_grpc_cert", "controlplane_grpc_key", "controlplane-grpc", "controlplane gRPC", []string{"controlplane"}, "", false, ca},
-		{"frontend_cert", "frontend_key", "frontend", "frontend HTTPS", []string{"frontend"}, "", false, ca},
-		{"oidc_cert", "oidc_key", "oidc", "OIDC", []string{"oidc"}, "", false, ca},
-		{"agent_online_cert", "agent_online_key", "agent-online", options.OnlineAgentID, nil, "spiffe://dbpilot.local/agent/" + options.OnlineAgentID, true, ca},
-		{"agent_mismatch_cert", "agent_mismatch_key", "agent-mismatch", "agent-certificate-id", nil, "spiffe://dbpilot.local/agent/agent-certificate-id", true, ca},
-		{"agent_untrusted_cert", "agent_untrusted_key", "agent-untrusted", "agent-untrusted", nil, "spiffe://dbpilot.local/agent/agent-untrusted", true, untrustedCA},
+		{"controlplane_http_cert", "controlplane_http_key", "controlplane-http", "controlplane HTTP", []string{"controlplane"}, "", false, ca, false},
+		{"controlplane_grpc_cert", "controlplane_grpc_key", "controlplane-grpc", "controlplane gRPC", []string{"controlplane"}, "", false, ca, false},
+		{"frontend_cert", "frontend_key", "frontend", "frontend HTTPS", []string{"frontend"}, "", false, ca, true},
+		{"oidc_cert", "oidc_key", "oidc", "OIDC", []string{"oidc"}, "", false, ca, false},
+		{"agent_online_cert", "agent_online_key", "agent-online", options.OnlineAgentID, nil, "spiffe://dbpilot.local/agent/" + options.OnlineAgentID, true, ca, false},
+		{"agent_mismatch_cert", "agent_mismatch_key", "agent-mismatch", "agent-certificate-id", nil, "spiffe://dbpilot.local/agent/agent-certificate-id", true, ca, false},
+		{"agent_untrusted_cert", "agent_untrusted_key", "agent-untrusted", "agent-untrusted", nil, "spiffe://dbpilot.local/agent/agent-untrusted", true, untrustedCA, false},
 	}
 	for _, item := range certificates {
 		if err := ctx.Err(); err != nil {
 			return BootstrapManifest{}, err
 		}
-		certificate, certificateErr := newSignedCertificate(randomSource, item.authority, item.commonName, item.dnsNames, item.uri, item.client, now)
+		certificate, certificateErr := newSignedCertificate(randomSource, item.authority, item.commonName, item.dnsNames, item.uri, item.client, item.rsaKey, now)
 		if certificateErr != nil {
 			return BootstrapManifest{}, certificateErr
 		}
@@ -215,24 +216,29 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		return BootstrapManifest{}, err
 	}
 
-	policyEnvelope, err := policy.Sign(policyPrivate, policy.Policy{
-		AgentID: options.OnlineAgentID, Version: 1, IssuedAt: now, ExpiresAt: now.Add(24 * time.Hour),
-		Sources: []policy.Source{
-			{ID: "acceptance-host", Kind: policy.SourceHostMetrics, Interval: 10 * time.Second, Labels: map[string]string{"environment": "acceptance"}},
-			{ID: "acceptance-filelog", Kind: policy.SourceFileLog, Path: "/var/log/dbpilot/acceptance.log", Interval: 5 * time.Second, Labels: map[string]string{"environment": "acceptance"}},
-		},
-		Limits: policy.Limits{MaxSpoolBytes: 64 << 20, MaxBatchBytes: 1 << 20, MaxEventsPerSec: 100},
-	})
-	if err != nil {
-		return BootstrapManifest{}, fmt.Errorf("sign Agent policy: %w", err)
-	}
-	policyBody, err := json.MarshalIndent(policyEnvelope, "", "  ")
-	if err != nil {
-		return BootstrapManifest{}, fmt.Errorf("marshal Agent policy: %w", err)
-	}
-	policyBody = append(policyBody, '\n')
-	if err := writer.write("policy", "config/policy-envelope.json", policyBody, 0o644); err != nil {
-		return BootstrapManifest{}, err
+	for _, configured := range []struct{ name, path, agentID string }{
+		{"policy", "config/policy-envelope.json", options.OnlineAgentID},
+		{"agent_mismatch_policy", "config/policy-mismatch-envelope.json", "agent-claimed-id"},
+		{"agent_untrusted_policy", "config/policy-untrusted-envelope.json", "agent-untrusted"},
+	} {
+		policyEnvelope, signErr := policy.Sign(policyPrivate, policy.Policy{
+			AgentID: configured.agentID, Version: 1, IssuedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+			Sources: []policy.Source{
+				{ID: "acceptance-host", Kind: policy.SourceHostMetrics, Interval: 10 * time.Second, Labels: map[string]string{"environment": "acceptance"}},
+				{ID: "acceptance-filelog", Kind: policy.SourceFileLog, Path: "/var/log/dbpilot/acceptance.log", Interval: 5 * time.Second, Labels: map[string]string{"environment": "acceptance"}, Params: map[string]string{"start_at": "beginning"}},
+			},
+			Limits: policy.Limits{MaxSpoolBytes: 64 << 20, MaxBatchBytes: 1 << 20, MaxEventsPerSec: 100},
+		})
+		if signErr != nil {
+			return BootstrapManifest{}, fmt.Errorf("sign Agent policy: %w", signErr)
+		}
+		policyBody, marshalErr := json.MarshalIndent(policyEnvelope, "", "  ")
+		if marshalErr != nil {
+			return BootstrapManifest{}, fmt.Errorf("marshal Agent policy: %w", marshalErr)
+		}
+		if err := writer.write(configured.name, configured.path, append(policyBody, '\n'), 0o644); err != nil {
+			return BootstrapManifest{}, err
+		}
 	}
 
 	containerPath := func(relative string) string {
@@ -270,17 +276,18 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		agentID    string
 		certPath   string
 		keyPath    string
+		policyPath string
 		dataSuffix string
 	}{
-		{"agent_config", "config/agent.yaml", options.OnlineAgentID, "config/agent-online.pem", "secrets/agent-online-key.pem", "agent-online"},
-		{"agent_mismatch_config", "config/agent-mismatch.yaml", "agent-claimed-id", "config/agent-mismatch.pem", "secrets/agent-mismatch-key.pem", "agent-mismatch"},
-		{"agent_untrusted_config", "config/agent-untrusted.yaml", "agent-untrusted", "config/agent-untrusted.pem", "secrets/agent-untrusted-key.pem", "agent-untrusted"},
+		{"agent_config", "config/agent.yaml", options.OnlineAgentID, "config/agent-online.pem", "secrets/agent-online-key.pem", "config/policy-envelope.json", "agent-online"},
+		{"agent_mismatch_config", "config/agent-mismatch.yaml", "agent-claimed-id", "config/agent-mismatch.pem", "secrets/agent-mismatch-key.pem", "config/policy-mismatch-envelope.json", "agent-mismatch"},
+		{"agent_untrusted_config", "config/agent-untrusted.yaml", "agent-untrusted", "config/agent-untrusted.pem", "secrets/agent-untrusted-key.pem", "config/policy-untrusted-envelope.json", "agent-untrusted"},
 	}
 	for _, configured := range agentConfigs {
 		body, marshalErr := yaml.Marshal(map[string]any{
 			"agent_id": configured.agentID, "server_address": "controlplane:9443",
 			"ca_file": containerPath("config/ca.pem"), "cert_file": containerPath(configured.certPath), "key_file": containerPath(configured.keyPath),
-			"policy_public_key_file": containerPath("config/policy-signing-public.pem"), "policy_file": containerPath("config/policy-envelope.json"),
+			"policy_public_key_file": containerPath("config/policy-signing-public.pem"), "policy_file": containerPath(configured.policyPath),
 			"data_directory": containerPath("state/" + configured.dataSuffix), "allowed_log_roots": []string{"/var/log/dbpilot"}, "file_collection_enabled": true,
 			"database_process_names": []string{"dbpilot-agent"},
 			"control":                map[string]any{"public_key_file": containerPath("config/command-signing-public.pem"), "journal_path": containerPath("state/" + configured.dataSuffix + "/command-journal.db"), "heartbeat_interval": "5s", "reconnect_backoff": "1s"},
@@ -392,10 +399,20 @@ func newAuthority(randomSource io.Reader, commonName string, now time.Time) (gen
 	return generatedAuthority{certificate: certificate, privateKey: privateKey, certificatePEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}, nil
 }
 
-func newSignedCertificate(randomSource io.Reader, authority generatedAuthority, commonName string, dnsNames []string, rawURI string, client bool, now time.Time) (generatedCertificate, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(randomSource)
-	if err != nil {
-		return generatedCertificate{}, fmt.Errorf("generate TLS key: %w", err)
+func newSignedCertificate(randomSource io.Reader, authority generatedAuthority, commonName string, dnsNames []string, rawURI string, client, rsaKey bool, now time.Time) (generatedCertificate, error) {
+	var publicKey, privateKey any
+	if rsaKey {
+		key, err := rsa.GenerateKey(randomSource, 2048)
+		if err != nil {
+			return generatedCertificate{}, fmt.Errorf("generate RSA TLS key: %w", err)
+		}
+		publicKey, privateKey = &key.PublicKey, key
+	} else {
+		keyPublic, keyPrivate, err := ed25519.GenerateKey(randomSource)
+		if err != nil {
+			return generatedCertificate{}, fmt.Errorf("generate TLS key: %w", err)
+		}
+		publicKey, privateKey = keyPublic, keyPrivate
 	}
 	serial, err := randomSerial(randomSource)
 	if err != nil {
@@ -405,9 +422,13 @@ func newSignedCertificate(randomSource io.Reader, authority generatedAuthority, 
 	if client {
 		usage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
 	}
+	keyUsage := x509.KeyUsageDigitalSignature
+	if rsaKey {
+		keyUsage |= x509.KeyUsageKeyEncipherment
+	}
 	template := &x509.Certificate{
 		SerialNumber: serial, Subject: pkix.Name{CommonName: commonName}, NotBefore: now.Add(-5 * time.Minute), NotAfter: now.Add(24 * time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: usage, BasicConstraintsValid: true, DNSNames: append([]string(nil), dnsNames...),
+		KeyUsage: keyUsage, ExtKeyUsage: usage, BasicConstraintsValid: true, DNSNames: append([]string(nil), dnsNames...),
 	}
 	if rawURI != "" {
 		identity, parseErr := url.Parse(rawURI)

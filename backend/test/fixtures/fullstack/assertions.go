@@ -44,10 +44,46 @@ type AssertionOptions struct {
 	ReplayPendingBatchCount            int       `json:"replay_pending_batch_count"`
 	RogueUntrustedVerifiedAt           time.Time `json:"rogue_untrusted_verified_at"`
 	RogueMismatchVerifiedAt            time.Time `json:"rogue_mismatch_verified_at"`
+	TargetCount                        int       `json:"target_count"`
 	ReportCount                        int       `json:"report_count"`
 	FindingCount                       int       `json:"finding_count"`
+	ArtifactCount                      int       `json:"artifact_count"`
 	AuditCount                         int       `json:"audit_count"`
 	SensitiveValues                    []string  `json:"-"`
+}
+
+type SuccessSummary struct {
+	RunID                   string    `json:"run_id"`
+	JobID                   string    `json:"job_id"`
+	OnlineCommandID         string    `json:"online_command_id"`
+	OfflineCommandID        string    `json:"offline_command_id"`
+	ReportID                string    `json:"report_id"`
+	TargetCount             int       `json:"target_count"`
+	FindingCount            int       `json:"finding_count"`
+	ReportCount             int       `json:"report_count"`
+	ArtifactCount           int       `json:"artifact_count"`
+	AuditCount              int       `json:"audit_count"`
+	ControlplaneStoppedAt   time.Time `json:"controlplane_stopped_at"`
+	ControlplaneRestartedAt time.Time `json:"controlplane_restarted_at"`
+}
+
+func BuildSuccessSummary(options AssertionOptions) (SuccessSummary, error) {
+	identifiers := []string{options.RunID, options.JobID, options.OnlineCommandID, options.OfflineCommandID, options.ReportID}
+	for _, value := range identifiers {
+		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\t") {
+			return SuccessSummary{}, errors.New("success summary phase state is invalid")
+		}
+	}
+	if options.Version != 1 || options.OnlineCommandID == options.OfflineCommandID || options.TargetCount != 2 || options.FindingCount != 13 || options.ReportCount != 1 || options.ArtifactCount != 2 || options.AuditCount < 4 || options.ControlplaneStoppedAt.IsZero() || !options.ControlplaneRestartedAt.After(options.ControlplaneStoppedAt) {
+		return SuccessSummary{}, errors.New("success summary phase state is invalid")
+	}
+	return SuccessSummary{
+		RunID: options.RunID, JobID: options.JobID, OnlineCommandID: options.OnlineCommandID,
+		OfflineCommandID: options.OfflineCommandID, ReportID: options.ReportID,
+		TargetCount: options.TargetCount, FindingCount: options.FindingCount, ReportCount: options.ReportCount,
+		ArtifactCount: options.ArtifactCount, AuditCount: options.AuditCount,
+		ControlplaneStoppedAt: options.ControlplaneStoppedAt, ControlplaneRestartedAt: options.ControlplaneRestartedAt,
+	}, nil
 }
 
 type JournalAssertion struct {
@@ -78,7 +114,7 @@ const (
 	assertFindingsSQL  = "SELECT target_id, item_id, item_version, level, observed_at FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id, item_id, item_version"
 	assertReportSQL    = "SELECT id, run_id, status, generated_at FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY id"
 	assertArtifactsSQL = "SELECT id, job_id, source_resource_type, source_resource_id, content_type, size_bytes, checksum, storage_reference FROM artifacts WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id"
-	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id"
+	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.undelivered_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id"
 	assertMetricsSQL   = "SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint"
 	assertRogueRowsSQL = "SELECT (SELECT COUNT(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND target_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND resource_id IN ($3, $4, $5))"
 	assertReplaySQL    = "SELECT agent_id, batch_id, sampled_from, sampled_to, accepted_at, COUNT(*) OVER (PARTITION BY agent_id, batch_id) AS identity_count FROM ingest_batch_dedup WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND state = 'accepted' AND sampled_from >= $4 AND sampled_to <= $5 AND accepted_at > $5 ORDER BY sampled_from, batch_id LIMIT 1"
@@ -490,7 +526,7 @@ func validCommandAudit(action, dedupeKey, commandID string, online bool) bool {
 		return action == "command.result" && dedupeKey == "command.result:"+commandID
 	}
 	switch action {
-	case "command.delivery_timed_out", "command.prepared_timed_out", "command.prepared_envelope_expired", "command.execution_timed_out", "command.skipped_terminal_job", "command.prepared_terminal_job":
+	case "command.delivery_timed_out", "command.undelivered_timed_out", "command.prepared_timed_out", "command.prepared_envelope_expired", "command.execution_timed_out", "command.skipped_terminal_job", "command.prepared_terminal_job":
 		return dedupeKey == action+":"+commandID
 	default:
 		return false
@@ -567,7 +603,7 @@ func AssertJournal(path string, assertion JournalAssertion) error {
 	if !filepath.IsAbs(path) || assertion.CommandID == "" || assertion.CommandID != strings.TrimSpace(assertion.CommandID) || strings.ContainsAny(assertion.CommandID, "\r\n\t") {
 		return errors.New("journal assertion input is invalid")
 	}
-	journal, err := commandjournal.Open(path)
+	journal, err := commandjournal.OpenReadOnly(path)
 	if err != nil {
 		return redactAssertionError(fmt.Errorf("open Agent command journal: %w", err), assertion.SensitiveValues)
 	}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/platformscope"
 	coreosoidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/stretchr/testify/require"
 )
@@ -60,6 +61,7 @@ func TestNewOIDCServerServesDiscoveryJWKSAndProductionVerifiableToken(t *testing
 		Audience string                   `json:"aud"`
 		IssuedAt int64                    `json:"iat"`
 		Expires  int64                    `json:"exp"`
+		Projects []platformscope.Scope    `json:"dbpilot_projects"`
 		Grants   []controlplane.OIDCGrant `json:"dbpilot_grants"`
 	}
 	require.NoError(t, json.Unmarshal(rawClaims, &claims))
@@ -67,6 +69,7 @@ func TestNewOIDCServerServesDiscoveryJWKSAndProductionVerifiableToken(t *testing
 	require.Equal(t, fixture.issuer, claims.Issuer)
 	require.Equal(t, "dbpilot-control-plane", claims.Audience)
 	require.LessOrEqual(t, time.Unix(claims.Expires, 0).Sub(time.Unix(claims.IssuedAt, 0)), 15*time.Minute)
+	require.Equal(t, []platformscope.Scope{{TenantID: "tenant-acceptance", ProjectID: "project-acceptance"}}, claims.Projects)
 	require.Equal(t, []controlplane.OIDCGrant{{
 		TenantID: "tenant-acceptance", ProjectID: "project-acceptance",
 		Permissions: []string{"inspection:view", "inspection:manage", "inspection:execute", "platform.jobs.read", "platform.jobs.cancel", "platform.artifacts.read", "platform.artifacts.download", "platform.audit.read", "platform.capabilities.read"},

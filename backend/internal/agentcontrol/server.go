@@ -114,24 +114,40 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	if err := stream.Send(ack); err != nil {
 		return err
 	}
-	if snapshot, ok := s.registry.snapshot(agentID, current); ok {
-		s.observer.Connected(sessionContext, snapshot)
+	type receiveResult struct {
+		message *agentv1.AgentMessage
+		err     error
 	}
-
-	receiveErrors := make(chan error, 1)
+	received := make(chan receiveResult, 1)
 	go func() {
 		for {
 			message, receiveErr := stream.Recv()
 			if receiveErr != nil {
-				receiveErrors <- receiveErr
+				select {
+				case received <- receiveResult{err: receiveErr}:
+				case <-sessionContext.Done():
+				}
 				return
 			}
-			if handleErr := s.handleAgentMessage(sessionContext, agentID, message); handleErr != nil {
-				receiveErrors <- handleErr
+			if heartbeat := message.GetHeartbeat(); heartbeat != nil {
+				if heartbeatErr := s.recordHeartbeat(agentID, heartbeat); heartbeatErr != nil {
+					select {
+					case received <- receiveResult{err: heartbeatErr}:
+					case <-sessionContext.Done():
+					}
+					return
+				}
+			}
+			select {
+			case received <- receiveResult{message: message}:
+			case <-sessionContext.Done():
 				return
 			}
 		}
 	}()
+	if snapshot, ok := s.registry.snapshot(agentID, current); ok {
+		s.observer.Connected(sessionContext, snapshot)
+	}
 
 	for {
 		select {
@@ -140,15 +156,28 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 			if err := stream.Send(message); err != nil {
 				return err
 			}
-		case receiveErr := <-receiveErrors:
-			if errors.Is(receiveErr, io.EOF) {
+		case item := <-received:
+			if errors.Is(item.err, io.EOF) {
 				return nil
 			}
-			return receiveErr
+			if item.err != nil {
+				return item.err
+			}
+			if err := s.handleAgentMessage(sessionContext, agentID, item.message); err != nil {
+				return err
+			}
 		case <-sessionContext.Done():
 			return sessionContext.Err()
 		}
 	}
+}
+
+func (s *Server) recordHeartbeat(agentID string, heartbeat *agentv1.Heartbeat) error {
+	if heartbeat == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(heartbeat.GetAgentId())) != 1 {
+		return status.Error(codes.PermissionDenied, "heartbeat Agent ID does not match the session identity")
+	}
+	s.registry.renew(agentID, heartbeat, s.now())
+	return nil
 }
 
 func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message *agentv1.AgentMessage) error {
@@ -157,10 +186,6 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 	}
 	switch typed := message.GetMessage().(type) {
 	case *agentv1.AgentMessage_Heartbeat:
-		if typed.Heartbeat == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.Heartbeat.GetAgentId())) != 1 {
-			return status.Error(codes.PermissionDenied, "heartbeat Agent ID does not match the session identity")
-		}
-		s.registry.renew(agentID, typed.Heartbeat, s.now())
 		s.observer.Heartbeat(ctx, agentID, typed.Heartbeat)
 	case *agentv1.AgentMessage_CommandAcknowledgement:
 		if typed.CommandAcknowledgement == nil {

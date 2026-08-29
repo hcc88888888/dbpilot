@@ -340,7 +340,7 @@ func (resolver inspectionScopeResolver) ScopeForAgent(_ context.Context, agentID
 }
 
 func inspectionIngestPeerContext(agentID string) context.Context {
-	identity, _ := url.Parse("spiffe://dbpilot/agent/" + agentID)
+	identity, _ := url.Parse("spiffe://dbpilot.local/agent/" + agentID)
 	certificate := &x509.Certificate{URIs: []*url.URL{identity}}
 	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{certificate}, VerifiedChains: [][]*x509.Certificate{{certificate}}}
 	return peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{State: state}})

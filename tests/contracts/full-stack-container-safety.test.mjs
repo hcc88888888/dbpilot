@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -43,7 +43,7 @@ async function fakeRuntime(mode = 'success', { withSpaces = false } = {}) {
 $line = $args -join ' '
 [IO.File]::AppendAllText($env:DOCKER_LOG, $line + [Environment]::NewLine)
 $history = [IO.File]::ReadAllText($env:DOCKER_LOG)
-$containers = @('builder-id','bootstrap-id','postgres-id','oidc-id','controlplane-id','agent-id','frontend-id','runner-normal-id','runner-unauthorized-id','assertion-initial-id','runner-post-id','rogue-untrusted-id','runner-rogue-untrusted-id','rogue-mismatch-id','runner-rogue-mismatch-id','assertion-replay-id','assertion-journal-id','assertion-final-id')
+$containers = @('builder-id','bootstrap-id','postgres-id','oidc-id','controlplane-id','agent-id','frontend-id','runner-normal-id','runner-unauthorized-id','assertion-initial-id','runner-post-id','rogue-untrusted-id','runner-rogue-untrusted-id','rogue-mismatch-id','runner-rogue-mismatch-id','assertion-replay-id','assertion-journal-id','assertion-final-id','assertion-summary-id')
 $volumes = @('volume-bin','volume-secrets','volume-config','volume-state','volume-artifacts','volume-agent','volume-runner','volume-go-cache','volume-rogue-untrusted','volume-rogue-mismatch')
 $networks = @('network-acceptance','network-builder')
 function Present([string]$kind, [string]$id) {
@@ -71,6 +71,7 @@ function CreatedContainer([string]$id) {
     'assertion-replay-id' { return $history -match 'DBPILOT_ASSERTION_PHASE=replay.*assertions' }
     'assertion-journal-id' { return $history -match 'DBPILOT_ASSERTION_PHASE=journal.*assertions' }
     'assertion-final-id' { return ([regex]::Matches($history, 'DBPILOT_ASSERTION_PHASE=database.*assertions')).Count -ge 2 }
+    'assertion-summary-id' { return $history -match 'DBPILOT_ASSERTION_PHASE=summary.*assertions' }
     default { return $false }
   }
 }
@@ -88,6 +89,8 @@ if ($args[0] -eq 'image' -and $args[1] -eq 'inspect') { Write-Output 'sha256:kyl
 if ($args[0] -eq 'compose') {
   if ($args -contains 'version') { Write-Output 'Docker Compose version v5.3.1'; $global:LASTEXITCODE=0; return }
   if ($args -contains 'pull' -and $env:DOCKER_MODE -eq 'materialization-hang') { Start-Sleep -Seconds 30; $global:LASTEXITCODE=0; return }
+  if ($args -contains 'pull' -and $env:DOCKER_MODE -eq 'materialization-transient' -and ([regex]::Matches($history, ' pull asset-builder postgres frontend')).Count -eq 1) { $global:LASTEXITCODE=41; return }
+  if ($args -contains 'build' -and $env:DOCKER_MODE -eq 'materialization-transient') { $global:LASTEXITCODE=41; return }
   if ($args -contains 'up' -and $args -contains 'bootstrap' -and $env:DOCKER_MODE -eq 'asset-build-slow-success') { $global:LASTEXITCODE=41; return }
   if ($args -contains 'build' -and $env:DOCKER_MODE -eq 'build-hang') { Start-Sleep -Seconds 30; $global:LASTEXITCODE=0; return }
   if ($args -contains 'config' -or $args -contains 'pull' -or $args -contains 'build' -or $args -contains 'up') { $global:LASTEXITCODE=0; return }
@@ -108,6 +111,7 @@ if ($args[0] -eq 'compose') {
     elseif ($joined -match 'rogue-mismatch$') { Write-Output 'rogue-mismatch-id' }
     elseif ($joined -match 'DBPILOT_ASSERTION_PHASE=replay.*assertions$') { Write-Output 'assertion-replay-id' }
     elseif ($joined -match 'DBPILOT_ASSERTION_PHASE=journal.*assertions$') { Write-Output 'assertion-journal-id' }
+    elseif ($joined -match 'DBPILOT_ASSERTION_PHASE=summary.*assertions$') { Write-Output 'assertion-summary-id' }
     elseif ($joined -match 'DBPILOT_ASSERTION_PHASE=database.*assertions$') {
       $count = ([regex]::Matches($history, 'DBPILOT_ASSERTION_PHASE=database.*assertions')).Count
       Write-Output $(if ($count -le 1) { 'assertion-initial-id' } else { 'assertion-final-id' })
@@ -199,7 +203,9 @@ if ($args[0] -eq 'wait') {
 if ($args[0] -eq 'logs') {
   if ($args[-1] -eq 'rogue-untrusted-id') { Write-Output 'x509: certificate signed by unknown authority' }
   elseif ($args[-1] -eq 'rogue-mismatch-id') { Write-Output 'rpc error: code = PermissionDenied Hello Agent ID differs from verified SPIFFE identity' }
-  elseif ($env:DOCKER_MODE -eq 'phase-failure') { Write-Output 'Bearer eyJsecret.header.signature postgres://user:password@postgres/db' }
+  elseif ($args[-1] -eq 'assertion-summary-id' -and $env:DOCKER_MODE -eq 'summary-leak') { Write-Output '{"run_id":"run-1","job_id":"job-1","online_command_id":"command-online","offline_command_id":"command-offline","report_id":"report-1","target_count":2,"finding_count":13,"report_count":1,"artifact_count":2,"audit_count":4,"controlplane_stopped_at":"2026-08-29T04:00:10Z","controlplane_restarted_at":"2026-08-29T04:01:00Z","token":"Bearer eyJsecret.payload.signature"}' }
+  elseif ($args[-1] -eq 'assertion-summary-id') { Write-Output '{"run_id":"run-1","job_id":"job-1","online_command_id":"command-online","offline_command_id":"command-offline","report_id":"report-1","target_count":2,"finding_count":13,"report_count":1,"artifact_count":2,"audit_count":4,"controlplane_stopped_at":"2026-08-29T04:00:10Z","controlplane_restarted_at":"2026-08-29T04:01:00Z"}' }
+  elseif ($env:DOCKER_MODE -eq 'phase-failure') { [Console]::Error.WriteLine('browser stderr diagnostic Bearer eyJsecret.header.signature postgres://user:password@postgres/db') }
   else { Write-Output 'bounded safe log' }
   $global:LASTEXITCODE=0; return
 }
@@ -281,6 +287,9 @@ test('verifier owns one unique project, preserves phase order, records the ephem
     assert.equal(new Set(projectNames).size, 1, 'every Compose call must use the same unique project');
     assert.match(invocations, /port frontend-id 8443\/tcp/);
     assert.match(result.stdout, /frontend_port=49177/);
+    assert.match(invocations, /cp .* runner-post-id:\/acceptance\/artifacts\/rogue-untrusted\.log/, 'rogue evidence must use the direct writable Artifact mount');
+    assert.match(invocations, /cp .* runner-post-id:\/acceptance\/artifacts\/rogue-mismatch\.log/);
+    assert.doesNotMatch(invocations, /cp .* controlplane-id:\/acceptance\/state\/artifacts\//, 'docker cp cannot traverse a read-only parent mount');
     const pull = invocations.indexOf(' pull asset-builder postgres frontend');
     const build = invocations.indexOf(' build acceptance-runner');
     const firstUp = invocations.indexOf(' up --pull never -d --no-deps asset-builder');
@@ -294,6 +303,7 @@ test('verifier owns one unique project, preserves phase order, records the ephem
       'Agent mTLS communication passed',
       'Host inspection browser acceptance passed',
       'Control-plane restart and spool recovery passed',
+      'Full-stack success summary:',
       'Rogue Agent rejection passed',
       'Database and journal assertions passed',
       'Full-stack cleanup audit passed',
@@ -319,6 +329,7 @@ test('verifier owns one unique project, preserves phase order, records the ephem
       'DBPILOT_ASSERTION_PHASE=replay',
       'DBPILOT_ASSERTION_PHASE=journal',
       'DBPILOT_ASSERTION_PHASE=database',
+      'DBPILOT_ASSERTION_PHASE=summary',
     ];
     let cursor = -1;
     for (const marker of ordered) {
@@ -351,6 +362,14 @@ test('verifier propagates a phase failure, emits only redacted failure artifacts
     assert.match(combined, /Full-stack failure artifacts:/);
     assert.match(combined, /Full-stack cleanup audit passed/);
     assert.doesNotMatch(combined, /eyJsecret|user:password|Bearer\s+\S+/i);
+    const failureDirectory = (await readdir(fixture.root, { withFileTypes: true }))
+      .find((entry) => entry.isDirectory() && entry.name.startsWith('dbpilot-full-stack-failure-'));
+    assert.ok(failureDirectory, 'failure artifact directory was not retained');
+    const failurePath = join(fixture.root, failureDirectory.name);
+    const logFiles = (await readdir(failurePath, { withFileTypes: true })).filter((entry) => entry.isFile() && entry.name.endsWith('.log'));
+    const artifactText = (await Promise.all(logFiles.map((entry) => readFile(join(failurePath, entry.name), 'utf8')))).join('\n');
+    assert.match(artifactText, /browser stderr diagnostic/);
+    assert.doesNotMatch(artifactText, /eyJsecret|user:password|Bearer\s+eyJ/i);
     const invocations = await readFile(fixture.log, 'utf8');
     assert.match(invocations, /^rm -f -v runner-normal-id$/m);
     assert.match(invocations, /cp runner-normal-id:\/acceptance\/artifacts\/playwright\/\./);
@@ -359,6 +378,13 @@ test('verifier propagates a phase failure, emits only redacted failure artifacts
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test('bounded Docker failures retain redacted stderr diagnostics', async () => {
+  const source = await readFile(verifier, 'utf8');
+  assert.match(source, /function Get-DockerFailureMessage/);
+  assert.match(source, /Get-DockerFailureMessage[^]*\.Stdout[^]*\.Stderr[^]*Redact-Text/);
+  assert.match(source, /Get-DockerFailureMessage[^]*4096/);
 });
 
 test('verifier never removes a recorded volume whose ownership labels do not match', async () => {
@@ -420,8 +446,40 @@ test('verifier does not claim rogue persistence or final assertions before the f
     const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
     assert.notEqual(result.status, 0);
     assert.doesNotMatch(result.stdout, /Rogue Agent rejection passed|Database and journal assertions passed/);
+    assert.doesNotMatch(result.stdout, /Full-stack success summary:/);
     assert.match(result.stdout, /Control-plane restart and spool recovery passed/);
     assert.match(result.stdout, /Full-stack cleanup audit passed/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('success summary prints only allowlisted validated state after final assertions', async () => {
+  const fixture = await fakeRuntime();
+  try {
+    const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const match = result.stdout.match(/Full-stack success summary: (\{[^\r\n]+\})/);
+    assert.ok(match, result.stdout);
+    assert.deepEqual(JSON.parse(match[1]), {
+      run_id: 'run-1', job_id: 'job-1', online_command_id: 'command-online', offline_command_id: 'command-offline', report_id: 'report-1',
+      target_count: 2, finding_count: 13, report_count: 1, artifact_count: 2, audit_count: 4,
+      controlplane_stopped_at: '2026-08-29T04:00:10.000Z', controlplane_restarted_at: '2026-08-29T04:01:00.000Z',
+    });
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.ok(invocations.lastIndexOf('DBPILOT_ASSERTION_PHASE=summary') > invocations.lastIndexOf('DBPILOT_ASSERTION_PHASE=database'));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('success summary rejects unknown fields without printing sensitive values', async () => {
+  const fixture = await fakeRuntime('summary-leak');
+  try {
+    const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stdout, /Full-stack success summary:|eyJsecret|Bearer\s+\S+/i);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Full-stack cleanup audit passed/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -474,6 +532,20 @@ test('verifier terminates a hung public-image materialization phase before build
     const run = invocations.match(/label=dbpilot\.run=([0-9a-f]{32})/)?.[1];
     assert.ok(run, invocations);
     assert.equal(existsSync(join(repoRoot, 'backend', `.tmp-full-stack-${run}`)), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier retries the exact public-image materialization once before build', async () => {
+  const fixture = await fakeRuntime('materialization-transient');
+  try {
+    const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0, 'the fake runner build intentionally stops after materialization');
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.equal((invocations.match(/ pull asset-builder postgres frontend/g) ?? []).length, 2, invocations);
+    assert.equal((invocations.match(/ build acceptance-runner/g) ?? []).length, 1, invocations);
+    assert.match(result.stdout, /Full-stack cleanup audit passed/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

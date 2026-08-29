@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const MaxBatchPayloadBytes = 1 << 20
+const (
+	MaxBatchPayloadBytes = 1 << 20
+	spiffeTrustDomain    = "dbpilot.local"
+)
 
 var errMissingVerifiedIdentity = errors.New("missing verified client certificate identity")
 
@@ -299,17 +303,31 @@ func spiffeAgentFromTLS(state tls.ConnectionState) (string, error) {
 	if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
 		return "", errMissingVerifiedIdentity
 	}
-	const prefix = "spiffe://dbpilot/agent/"
+	var identity *url.URL
 	for _, uri := range state.PeerCertificates[0].URIs {
-		if uri == nil {
+		if uri == nil || !strings.EqualFold(uri.Scheme, "spiffe") {
 			continue
 		}
-		value := uri.String()
-		if strings.HasPrefix(value, prefix) && len(value) > len(prefix) && !strings.Contains(value[len(prefix):], "/") {
-			return value[len(prefix):], nil
+		if identity != nil {
+			return "", fmt.Errorf("%w: exactly one SPIFFE URI SAN is required", errMissingVerifiedIdentity)
 		}
+		identity = uri
 	}
-	return "", fmt.Errorf("%w: required SPIFFE URI absent", errMissingVerifiedIdentity)
+	if identity == nil {
+		return "", fmt.Errorf("%w: required SPIFFE URI absent", errMissingVerifiedIdentity)
+	}
+	if identity.Host != spiffeTrustDomain || identity.User != nil || identity.RawQuery != "" || identity.Fragment != "" {
+		return "", fmt.Errorf("%w: SPIFFE trust domain is invalid", errMissingVerifiedIdentity)
+	}
+	const prefix = "/agent/"
+	if !strings.HasPrefix(identity.Path, prefix) {
+		return "", fmt.Errorf("%w: SPIFFE Agent path is invalid", errMissingVerifiedIdentity)
+	}
+	agentID := strings.TrimPrefix(identity.Path, prefix)
+	if agentID == "" || agentID != strings.TrimSpace(agentID) || strings.Contains(agentID, "/") {
+		return "", fmt.Errorf("%w: SPIFFE Agent ID is invalid", errMissingVerifiedIdentity)
+	}
+	return agentID, nil
 }
 
 // AllowAnyVerifiedAgent is appropriate only for the local contract-test

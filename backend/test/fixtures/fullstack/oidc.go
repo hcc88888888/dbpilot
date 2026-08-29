@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/platformscope"
 )
 
 const maximumOIDCRequestBodyBytes = 4 << 10
@@ -224,6 +225,7 @@ func (handler *oidcHandler) issueToken(variant string) (string, int64, error) {
 		"sub": "acceptance-admin", "iss": handler.config.Issuer, "aud": audience,
 		"iat": issuedAt.Unix(), "exp": expiresAt.Unix(),
 		"dbpilot_platform_admin": false,
+		"dbpilot_projects":       []platformscope.Scope{{TenantID: handler.config.TenantID, ProjectID: handler.config.ProjectID}},
 		"dbpilot_grants":         []controlplane.OIDCGrant{{TenantID: handler.config.TenantID, ProjectID: handler.config.ProjectID, Permissions: permissions}},
 	}
 	header := map[string]string{"alg": "RS256", "typ": "JWT", "kid": oidcKeyID(&handler.signingKey.PublicKey)}

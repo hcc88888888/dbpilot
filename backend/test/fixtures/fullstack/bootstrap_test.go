@@ -42,9 +42,9 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 	require.Equal(t, "agent-offline", manifest.OfflineAgentID)
 
 	wantFiles := []string{
-		"agent_config", "agent_mismatch_cert", "agent_mismatch_config", "agent_mismatch_key",
+		"agent_config", "agent_mismatch_cert", "agent_mismatch_config", "agent_mismatch_key", "agent_mismatch_policy",
 		"agent_online_cert", "agent_online_key", "agent_untrusted_cert", "agent_untrusted_config",
-		"agent_untrusted_key", "artifact_key", "ca_cert", "command_private_key", "command_public_key",
+		"agent_untrusted_key", "agent_untrusted_policy", "artifact_key", "ca_cert", "command_private_key", "command_public_key",
 		"controlplane_config", "controlplane_grpc_cert", "controlplane_grpc_key", "controlplane_http_cert",
 		"controlplane_http_key", "execution_key", "frontend_ca_bundle", "frontend_cert", "frontend_key", "jwks", "manifest", "oidc_cert", "oidc_config",
 		"oidc_key", "oidc_signing_key", "policy", "policy_private_key", "policy_public_key", "postgres_password",
@@ -117,11 +117,12 @@ func TestGenerateBootstrapUsesExactCertificateIdentitiesAndKeyAlgorithms(t *test
 	frontendCertificate := mustCertificate(t, manifest.Files["frontend_cert"])
 	require.Equal(t, []string{"frontend"}, frontendCertificate.DNSNames)
 	require.Empty(t, frontendCertificate.URIs)
-	require.IsType(t, ed25519.PublicKey{}, frontendCertificate.PublicKey)
+	require.IsType(t, &rsa.PublicKey{}, frontendCertificate.PublicKey)
 	require.NoError(t, frontendCertificate.CheckSignatureFrom(ca))
-	frontendKey, ok := mustPrivateKey(t, manifest.Files["frontend_key"]).(ed25519.PrivateKey)
+	frontendKey, ok := mustPrivateKey(t, manifest.Files["frontend_key"]).(*rsa.PrivateKey)
 	require.True(t, ok)
-	require.Equal(t, ed25519.PublicKey(frontendKey.Public().(ed25519.PublicKey)), frontendCertificate.PublicKey)
+	require.Equal(t, 2048, frontendKey.N.BitLen())
+	require.Equal(t, &frontendKey.PublicKey, frontendCertificate.PublicKey)
 
 	wantAgentURIs := map[string]string{
 		"agent_online_cert":    "spiffe://dbpilot.local/agent/agent-online",
@@ -161,9 +162,17 @@ func TestGenerateBootstrapProducesBoundedPolicyInventoryAndOIDCConfig(t *testing
 	require.Equal(t, policy.SourceHostMetrics, verified.Sources[0].Kind)
 	require.Equal(t, policy.SourceFileLog, verified.Sources[1].Kind)
 	require.Equal(t, "/var/log/dbpilot/acceptance.log", verified.Sources[1].Path)
+	require.Equal(t, "beginning", verified.Sources[1].Params["start_at"], "the controlled seed is written before the Agent starts")
 	require.Positive(t, verified.Limits.MaxSpoolBytes)
 	require.Positive(t, verified.Limits.MaxBatchBytes)
 	require.Positive(t, verified.Limits.MaxEventsPerSec)
+	for name, wantAgentID := range map[string]string{"agent_mismatch_policy": "agent-claimed-id", "agent_untrusted_policy": "agent-untrusted"} {
+		var rogueEnvelope policy.SignatureEnvelope
+		require.NoError(t, json.Unmarshal(mustRead(t, manifest.Files[name]), &rogueEnvelope), name)
+		roguePolicy, verifyErr := policy.Verify(publicKey, rogueEnvelope, time.Date(2026, 8, 29, 2, 3, 4, 0, time.UTC))
+		require.NoError(t, verifyErr, name)
+		require.Equal(t, wantAgentID, roguePolicy.AgentID, name)
+	}
 
 	var controlplane map[string]any
 	require.NoError(t, yaml.Unmarshal(mustRead(t, manifest.Files["controlplane_config"]), &controlplane))

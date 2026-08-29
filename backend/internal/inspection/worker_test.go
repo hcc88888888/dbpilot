@@ -165,6 +165,19 @@ func TestWorkerFailedAuthenticatedOfflineTargetUsesStableAgentOfflineCode(t *tes
 	require.Empty(t, fixture.repository.detail.Findings)
 }
 
+func TestWorkerTimedOutAuthenticatedOfflineTargetUsesStableAgentOfflineCode(t *testing.T) {
+	target := workerTarget("agent-a")
+	target.Connectivity = "offline"
+	fixture := newWorkerFixture(t, []TargetRun{target}, []job.TargetResult{workerJobResult("agent-a", job.TargetTimedOut)})
+
+	_, err := fixture.worker().Process(context.Background(), fixture.now, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, RunFailed, fixture.repository.detail.Run.Status)
+	require.Equal(t, "agent_offline", fixture.repository.detail.Targets[0].ErrorCode)
+	require.Empty(t, fixture.repository.detail.Findings)
+}
+
 func TestWorkerMapsCancelledTargetWithoutCancellingSibling(t *testing.T) {
 	// Break caught: target-local cancellation must remain target-local and a
 	// valid sibling must still produce a report and a partial Run.

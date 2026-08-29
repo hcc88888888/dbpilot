@@ -81,7 +81,7 @@ func prepare(directory, hbase, hbaseFailing, hdfs, zookeeper string) error {
 	if err != nil {
 		return err
 	}
-	identity, _ := url.Parse("spiffe://dbpilot/agent/agent-kylin")
+	identity, _ := url.Parse("spiffe://dbpilot.local/agent/agent-kylin")
 	clientTemplate := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "agent-kylin"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), URIs: []*url.URL{identity}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
 	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, ca, clientPublic, caPrivate)
 	if err != nil {

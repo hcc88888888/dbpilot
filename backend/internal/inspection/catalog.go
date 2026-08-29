@@ -9,7 +9,8 @@ func BuiltinHostItems() []Item {
 	metric := func(id, name, metric string, warning, critical float64) Item {
 		return Item{
 			ID: id, Version: 1, Name: name, Category: "host", ScopeType: ScopeHost, SourceType: SourceMetric, System: true,
-			MetricRule: &MetricRule{MetricName: metric, Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: AggregationLatest, Operator: OperatorGTE, WarningThreshold: warning, CriticalThreshold: critical},
+			MetricRule:             &MetricRule{MetricName: metric, Labels: map[string]string{}, Window: 5 * time.Minute, Aggregation: AggregationLatest, Operator: OperatorGTE, WarningThreshold: warning, CriticalThreshold: critical},
+			RecommendationTemplate: "Review " + name + " evidence and remediate the underlying host condition.",
 		}
 	}
 	items := []Item{
@@ -24,19 +25,19 @@ func BuiltinHostItems() []Item {
 		metric("agent.spool.utilization", "Agent spool utilization", "dbpilot.inspection.host.spool.utilization", 70, 90),
 		{
 			ID: "host.oom.evidence", Version: 1, Name: "OOM evidence", Category: "host", ScopeType: ScopeHost, SourceType: SourceMetadata, System: true,
-			EvidenceSelector: []string{"oom_count"},
+			EvidenceSelector: []string{"oom_count"}, RecommendationTemplate: "Review memory pressure and OOM-killed processes, then correct the responsible workload or host capacity.",
 		},
 		{
 			ID: "host.time.synchronization", Version: 1, Name: "Time synchronization", Category: "host", ScopeType: ScopeHost, SourceType: SourceMetadata, System: true,
-			EvidenceSelector: []string{"synchronized"},
+			EvidenceSelector: []string{"synchronized"}, RecommendationTemplate: "Restore host time synchronization and verify the configured clock source.",
 		},
 		{
 			ID: "database.process.presence", Version: 1, Name: "Required database process", Category: "database", ScopeType: ScopeHost, SourceType: SourceMetadata, System: true,
-			EvidenceSelector: []string{"required_process_count"},
+			EvidenceSelector: []string{"required_process_count"}, RecommendationTemplate: "Verify the required database processes and restart or reconfigure any missing service.",
 		},
 		{
 			ID: "host.log.error_summary", Version: 1, Name: "Error log summary", Category: "host", ScopeType: ScopeHost, SourceType: SourceLogSummary, System: true,
-			EvidenceSelector: []string{"warning_count", "error_count", "critical_count"},
+			EvidenceSelector: []string{"warning_count", "error_count", "critical_count"}, RecommendationTemplate: "Investigate the summarized warning and error events and address recurring causes.",
 		},
 	}
 	return cloneItems(items)

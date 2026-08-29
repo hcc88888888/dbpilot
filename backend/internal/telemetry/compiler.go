@@ -177,7 +177,10 @@ func Compile(p policy.Policy, allowed Catalog) (RuntimeConfig, error) {
 	if err := cfg.addProcessor("batch", allowed); err != nil {
 		return RuntimeConfig{}, err
 	}
-	storageID, hasStorage := cfg.addFileStorage(p.AgentID, p.Limits.MaxSpoolBytes, allowed)
+	storageID, hasStorage, err := cfg.addFileStorage(p.AgentID, p.Limits.MaxSpoolBytes, allowed)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
 
 	sources := slices.Clone(p.Sources)
 	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
@@ -238,27 +241,30 @@ func (cfg *RuntimeConfig) addProcessor(name string, allowed Catalog) error {
 	return nil
 }
 
-func (cfg *RuntimeConfig) addFileStorage(agentID string, maxSpoolBytes int64, allowed Catalog) (component.ID, bool) {
+func (cfg *RuntimeConfig) addFileStorage(agentID string, maxSpoolBytes int64, allowed Catalog) (component.ID, bool, error) {
 	if c, ok := allowed.(*catalog); ok && c.fileStorageFactory() != nil {
 		storageType, err := component.NewType("file_storage")
 		if err != nil {
-			return component.ID{}, false
+			return component.ID{}, false, err
 		}
 		storageID := component.NewIDWithName(storageType, "")
 		storageConfig, ok := c.fileStorageFactory().CreateDefaultConfig().(*filestorage.Config)
 		if !ok {
-			return component.ID{}, false
+			return component.ID{}, false, fmt.Errorf("file storage factory returned an invalid configuration")
 		}
 		storageConfig.Directory = filepath.Join("dbpilot-spool", storageDirectory(agentID))
 		storageConfig.MaxSize = maxSpoolBytes
 		storageConfig.CreateDirectory = true
 		storageConfig.FSync = true
+		if err := storageConfig.Validate(); err != nil {
+			return component.ID{}, false, fmt.Errorf("validate file storage configuration: %w", err)
+		}
 		cfg.extensions["file_storage"] = extensionConfig{
 			id: "file_storage", kind: "file_storage", config: storageConfig,
 		}
-		return storageID, true
+		return storageID, true, nil
 	}
-	return component.ID{}, false
+	return component.ID{}, false, nil
 }
 
 func (cfg *RuntimeConfig) addPipelines() {

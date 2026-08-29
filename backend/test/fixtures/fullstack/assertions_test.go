@@ -59,7 +59,7 @@ func TestAssertDatabaseRequiresScopedRunTargetsFindingsReportArtifactsAuditsAndM
 		WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "source_resource_type", "source_resource_id", "content_type", "size_bytes", "checksum", "storage_reference"}).
 			AddRow("artifact-html", options.JobID, "inspection_report", options.ReportID, "text/html; charset=utf-8", 100, "sha256:html", "reports/report.html").
 			AddRow("artifact-json", options.JobID, "inspection_report", options.ReportID, "application/json", 100, "sha256:json", "reports/report.json"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.undelivered_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
 		WithArgs(options.TenantID, options.ProjectID, options.JobID, options.RunID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "action", "resource_type", "resource_id", "request_id", "trace_id", "job_id", "command_id", "dedupe_key"}).
 			AddRow("audit-run", "inspection.run.created", "inspection_run", options.RunID, "request-run", "trace-run", "", "", "http:inspection-run").
@@ -109,6 +109,46 @@ func TestAssertDatabaseRedactsSensitiveDriverErrors(t *testing.T) {
 	require.Contains(t, err.Error(), "[REDACTED]")
 }
 
+func TestBuildSuccessSummaryEmitsOnlyAllowlistedValidatedState(t *testing.T) {
+	options := validAssertionOptions()
+	options.TenantID = "tenant-must-not-be-emitted"
+	options.PolicyID = "policy-must-not-be-emitted"
+	options.AuditCorrelation = "correlation-must-not-be-emitted"
+	options.ControlplaneStoppedAt = time.Date(2026, 8, 29, 4, 0, 10, 0, time.UTC)
+	options.ControlplaneRestartedAt = time.Date(2026, 8, 29, 4, 1, 0, 0, time.UTC)
+	options.TargetCount = 2
+	options.FindingCount = 13
+	options.ReportCount = 1
+	options.ArtifactCount = 2
+	options.AuditCount = 4
+
+	summary, err := BuildSuccessSummary(options)
+	require.NoError(t, err)
+	body, err := json.Marshal(summary)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"run_id":"run-acceptance","job_id":"job-acceptance","online_command_id":"command-online","offline_command_id":"command-offline","report_id":"report-acceptance","target_count":2,"finding_count":13,"report_count":1,"artifact_count":2,"audit_count":4,"controlplane_stopped_at":"2026-08-29T04:00:10Z","controlplane_restarted_at":"2026-08-29T04:01:00Z"}`, string(body))
+	for _, forbidden := range []string{"tenant-must-not-be-emitted", "policy-must-not-be-emitted", "correlation-must-not-be-emitted", "replay_batch_id", "metric_sample_at"} {
+		require.NotContains(t, string(body), forbidden)
+	}
+
+	options.ControlplaneRestartedAt = options.ControlplaneStoppedAt
+	_, err = BuildSuccessSummary(options)
+	require.EqualError(t, err, "success summary phase state is invalid")
+}
+
+func TestRunSummaryRejectsUnknownStateWithoutEchoingIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "phase-state.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"version":1,"token":"Bearer eyJsecret.payload.signature"}`), 0o600))
+	var stdout, stderr bytes.Buffer
+
+	exitCode := runSummary([]string{"--phase-state-file", path}, &stdout, &stderr)
+
+	require.Equal(t, 2, exitCode)
+	require.Empty(t, stdout.String())
+	require.Equal(t, "success summary phase state is unavailable or invalid\n", stderr.String())
+	require.NotContains(t, stderr.String(), "eyJsecret")
+}
+
 func TestAssertJournalRequiresCompletedReportedCommandAndNoPendingResults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "command-journal.db")
 	now := time.Now().UTC()
@@ -135,13 +175,13 @@ func TestAssertJournalRequiresCompletedReportedCommandAndNoPendingResults(t *tes
 	require.NoError(t, AssertJournal(path, JournalAssertion{CommandID: "command-online"}))
 }
 
-func TestAssertJournalRejectsPendingResultAndRedactsPath(t *testing.T) {
+func TestAssertJournalRejectsMissingPathWithoutRetainingIt(t *testing.T) {
 	sensitivePath := filepath.Join(t.TempDir(), "missing", "token-secret-journal.db")
 	err := AssertJournal(sensitivePath, JournalAssertion{CommandID: "command-online", SensitiveValues: []string{sensitivePath, "token-secret"}})
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), sensitivePath)
 	require.NotContains(t, err.Error(), "token-secret")
-	require.Contains(t, err.Error(), "[REDACTED]")
+	require.Equal(t, "open Agent command journal: existing regular command journal is required", err.Error())
 }
 
 func TestRunJournalAssertionsReadsCommandIDFromPhaseState(t *testing.T) {
@@ -222,7 +262,7 @@ func TestAssertAuditsRequiresBothExpectedCommandIDs(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	options := validAssertionOptions()
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.undelivered_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
 		WithArgs(options.TenantID, options.ProjectID, options.JobID, options.RunID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "action", "resource_type", "resource_id", "request_id", "trace_id", "job_id", "command_id", "dedupe_key"}).
 			AddRow("audit-run", "inspection.run.created", "inspection_run", options.RunID, "request-run", "trace-run", "", "", "http:inspection-run").
@@ -233,6 +273,12 @@ func TestAssertAuditsRequiresBothExpectedCommandIDs(t *testing.T) {
 		"command-online": options.OnlineAgentID, "command-offline": options.OfflineAgentID,
 	})
 	require.ErrorContains(t, err, "both expected Command Audit correlations")
+}
+
+func TestCommandAuditValidationAcceptsUndeliveredJobTimeout(t *testing.T) {
+	const commandID = "command-offline"
+	require.Contains(t, assertAuditsSQL, "'command.undelivered_timed_out'")
+	require.True(t, validCommandAudit("command.undelivered_timed_out", "command.undelivered_timed_out:"+commandID, commandID, false))
 }
 
 func TestAssertCommandsRequiresBothScopedDurableTerminalRows(t *testing.T) {
@@ -454,6 +500,7 @@ func TestAssertRogueAgentsRequireZeroPersistentRows(t *testing.T) {
 
 func validAssertionOptions() AssertionOptions {
 	return AssertionOptions{
+		Version:  1,
 		TenantID: "tenant-acceptance", ProjectID: "project-acceptance", RunID: "run-acceptance", JobID: "job-acceptance",
 		ReportID: "report-acceptance", OnlineAgentID: "agent-online", OfflineAgentID: "agent-offline", AuditCorrelation: "acceptance-correlation",
 		OnlineCommandID: "command-online", OfflineCommandID: "command-offline", JournalCommandID: "command-online",

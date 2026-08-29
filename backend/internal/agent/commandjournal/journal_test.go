@@ -33,6 +33,24 @@ func TestOpenRehardensExistingJournalPermissions(t *testing.T) {
 	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
 
+func TestOpenReadOnlyReadsExistingJournalWithoutRecoveryWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "commands.db")
+	now := time.Unix(1_725_000_000, 0).UTC()
+	envelope := journalEnvelope("command-read-only", now.Add(time.Hour))
+	writer, err := Open(path)
+	require.NoError(t, err)
+	_, err = writer.Prepare(context.Background(), envelope, now)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	reader, err := OpenReadOnly(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close() })
+	entry, err := reader.Get(context.Background(), envelope.GetCommandId())
+	require.NoError(t, err)
+	require.Equal(t, StatePrepared, entry.State)
+}
+
 func TestPreparePersistsEnvelopeWithoutAuthorizingExecution(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "commands.db")
 	now := time.Unix(1_725_000_000, 0).UTC()

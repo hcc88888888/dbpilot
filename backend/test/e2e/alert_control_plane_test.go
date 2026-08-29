@@ -131,7 +131,7 @@ func TestPrepareAlertControlPlaneFixture(t *testing.T) {
 	require.NoError(t, err)
 
 	server := signedFixtureCertificate(t, 2, "controlplane", []string{"controlplane", "webhook-sink", "smtp-sink"}, "", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, ca, caPrivate)
-	agent := signedFixtureCertificate(t, 3, "agent-t1-p1", nil, "spiffe://dbpilot/agent/agent-t1-p1", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, ca, caPrivate)
+	agent := signedFixtureCertificate(t, 3, "agent-t1-p1", nil, "spiffe://dbpilot.local/agent/agent-t1-p1", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, ca, caPrivate)
 	admin := signedFixtureCertificate(t, 4, "fixture-admin", nil, "spiffe://dbpilot.example/operators/admin", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, ca, caPrivate)
 	member := signedFixtureCertificate(t, 5, "fixture-member-p2", nil, "spiffe://dbpilot.example/operators/member-p2", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, ca, caPrivate)
 

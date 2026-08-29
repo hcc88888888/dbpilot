@@ -25,6 +25,8 @@ const baseState = Object.freeze({
   offline_command_id: 'command-offline',
   journal_command_id: 'command-online',
   audit_correlation: 'correlation-1',
+  target_count: 2,
+  artifact_count: 2,
 });
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -74,6 +76,7 @@ test('Compose wires verifier-selected runner/assertion phases and isolated bound
   assert.match(assertions.command.join(' '), /DBPILOT_ASSERTION_PHASE/);
   assert.match(assertions.command.join(' '), /journal/);
   assert.match(assertions.command.join(' '), /replay/);
+  assert.match(assertions.command.join(' '), /summary/);
   assert.notEqual(assertions.volumes.find((mount) => mount.target === '/acceptance/state').read_only, true);
 });
 
@@ -146,7 +149,7 @@ test('post-restart rejects unchanged metric or AgentControl heartbeat state', as
       maxAttempts: 1,
       faultWindow: { stoppedAt: '2026-08-29T04:00:10.000Z', restartedAt: '2026-08-29T04:01:00.000Z' },
     }),
-    /post-restart communication state did not advance/,
+    /post-restart communication state did not advance: .*metric_advanced=false/,
   );
 });
 
@@ -175,13 +178,17 @@ test('post-restart records verifier outage boundaries and distinct advanced metr
     report_count: 1, finding_count: 13, audit_count: 4,
   };
   let written;
+  let observedState;
   const result = await runCommunicationPhase('post-restart', {
-    observe: async () => observation({
+    observe: async (state) => {
+      observedState = state;
+      return observation({
       capabilities: ['collect_now.host.v1'],
       metricSampleAt: '2026-08-29T04:01:03.000Z', agentControlHeartbeatAt: '2026-08-29T04:01:04.000Z',
       reportCount: 1, findingCount: 13, auditCount: 4,
       terminalCommandID: 'command-online',
-    }),
+      });
+    },
     readState: async () => previous,
     writeState: async (state) => { written = state; },
     wait: async () => {},
@@ -195,6 +202,7 @@ test('post-restart records verifier outage boundaries and distinct advanced metr
   assert.equal(result.post_restart_metric_sample_at, '2026-08-29T04:01:03.000Z');
   assert.equal(result.pre_restart_agent_control_heartbeat_at, previous.agent_control_heartbeat_at);
   assert.equal(result.post_restart_agent_control_heartbeat_at, '2026-08-29T04:01:04.000Z');
+  assert.deepEqual(observedState, previous);
   assert.deepEqual(written, result);
 });
 
@@ -228,6 +236,11 @@ test('rogue rejection parser requires exact x509 or PermissionDenied SPIFFE mism
   assert.doesNotThrow(() => assertRogueAgentRejected({
     kind: 'untrusted', timedOut: true, exitCode: 124,
     stderr: 'transport: authentication handshake failed: certificate signed by unknown authority',
+    inventory: rogueTargets(),
+  }));
+  assert.doesNotThrow(() => assertRogueAgentRejected({
+    kind: 'untrusted', timedOut: false, exitCode: 1,
+    stderr: 'connection error: desc = "error reading server preface: remote error: tls: certificate required"',
     inventory: rogueTargets(),
   }));
   assert.doesNotThrow(() => assertRogueAgentRejected({
@@ -283,6 +296,30 @@ test('communication failures redact configured credentials and bearer values', a
   );
 });
 
+test('failed browser process retains bounded diagnostics only after secret redaction', async () => {
+  const secret = 'browser-process-secret-that-must-not-leak';
+  await assert.rejects(
+    runCommunicationPhase('normal', {
+      observe: async () => observation(),
+      runProcess: async () => ({
+        exitCode: 1,
+        stdout: `Bearer ${secret}`,
+        stderr: 'browser launch failed with a fixed diagnostic',
+      }),
+      writeState: async () => {},
+      wait: async () => {},
+      maxAttempts: 1,
+      sensitiveValues: [secret],
+    }),
+    (error) => {
+      const message = String(error);
+      return !message.includes(secret)
+        && message.includes('[REDACTED]')
+        && message.includes('browser launch failed with a fixed diagnostic');
+    },
+  );
+});
+
 test('runtime observation keeps authenticated metric liveness separate from AgentControl heartbeat', async () => {
   const requests = [];
   const responseBySuffix = new Map([
@@ -320,6 +357,19 @@ test('runtime observation keeps authenticated metric liveness separate from Agen
   assert.equal(result.finding_count, 13);
   assert.equal(result.audit_count, 4);
   assert.equal(result.terminal_command_id, 'command-online');
+});
+
+test('runtime observation names the missing liveness timestamp without retaining values', async () => {
+  for (const missing of ['metric_sample_at', 'agent_control_heartbeat_at']) {
+    await assert.rejects(collectRuntimeObservation({
+      requestJSON: async (path) => path.includes('/monitoring/instances') ? { items: [{ id: 'agent-online', agent_id: 'agent-online', last_sample_at: missing === 'metric_sample_at' ? undefined : '2026-08-29T04:00:03Z' }] } : { items: [
+        { agent_id: 'agent-online', connectivity: 'online', capabilities: ['collect_now.host.v1'], agent_control_heartbeat_at: missing === 'agent_control_heartbeat_at' ? undefined : '2026-08-29T04:00:04Z' },
+        { agent_id: 'agent-offline', connectivity: 'offline', capabilities: [] },
+        ...rogueTargets(),
+      ] },
+      tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
+    }), new RegExp(`runtime ${missing} timestamp is invalid${missing === 'agent_control_heartbeat_at' ? ' connectivity=online' : ''}`));
+  }
 });
 
 function observation({

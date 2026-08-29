@@ -155,6 +155,28 @@ func TestPreparedRecoveryTimesOutJobAndCommandWithoutStart(t *testing.T) {
 	require.Equal(t, "command.prepared_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
 }
 
+func TestDispatchPendingTimesOutUndeliveredPreparingCommandAtJobDeadline(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-offline", "agent-a")
+	message.Phase = CommandPhasePreparing
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.claimed = []OutboxMessage{message}
+	value := fixture.persistence.currentJob()
+	timeout := fixture.now.Add(-time.Second)
+	value.TimeoutAt = &timeout
+	fixture.persistence.jobs[value.ID] = value
+
+	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+
+	require.NoError(t, err)
+	require.Zero(t, dispatched)
+	require.Empty(t, fixture.agents.envelopes, "an expired Job must not keep retrying an undelivered command")
+	require.Equal(t, StatusTimedOut, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, "command.undelivered_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
+}
+
 func TestPreparedEnvelopeExpiryPeriodicallyTerminalizesWithoutStartAndIsIdempotent(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	message, _ := fixture.persistPreparedCommand(t, "command-expired-periodic", "agent-a")

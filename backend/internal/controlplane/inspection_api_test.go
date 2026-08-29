@@ -197,6 +197,28 @@ func TestInspectionCreateItemIdempotencyReplaysOneDeterministicResourceAndAudit(
 	require.Equal(t, 1, repository.creates)
 }
 
+func TestInspectionPolicyUpdateBindsIfMatchInIdempotencyFingerprint(t *testing.T) {
+	now := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
+	stored := inspection.Policy{
+		Scope: platformTestScope, ID: "policy-1", Name: "Daily", Enabled: true, Version: 1,
+		Items:         []inspection.PolicyItem{{ItemID: "custom.cpu", Version: 1}},
+		Selector:      inspection.TargetSelector{AgentIDs: []string{"agent-1"}, Labels: map[string]string{}},
+		TargetTimeout: time.Minute, MaxConcurrency: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	repository := &applicationInspectionRepository{items: map[string]inspection.Item{}, policies: map[string]inspection.Policy{"policy-1": stored}}
+	application := &inspectionApplicationService{repository: repository, audit: &recordingAuditService{}, idempotency: idempotency.NewService(newHTTPIdempotencyStore()), now: func() time.Time { return now.Add(time.Minute) }}
+	request := httptest.NewRequest(http.MethodPatch, platformBasePath+"/inspection-policies/policy-1", strings.NewReader(strings.Replace(validInspectionPolicyBody(), `"Daily"`, `"Daily updated"`, 1)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "update-policy-if-match")
+	request.Header.Set("If-Match", `"1"`)
+
+	response := servePlatformRequest(Services{Inspection: application}, principalWith(platformTestScope, openapi.PermissionUpdateInspectionPolicy), request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, `"2"`, response.Header().Get("ETag"))
+	require.Equal(t, 1, repository.updates)
+}
+
 func TestInspectionCancelCrashRetryUsesImmutableSnapshotCorrelation(t *testing.T) {
 	now := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
 	run := inspection.Run{Scope: platformTestScope, ID: "run-1", JobID: "job-1", Status: inspection.RunCollecting, Trigger: inspection.RunTriggerManual, ItemSnapshot: []inspection.Item{}, TargetCount: 1, AuditCorrelation: "inspection-run:run-1", InitiatedBy: "trusted-user", RequestID: "request-run-1", CreatedAt: now.Add(-time.Minute)}
@@ -472,6 +494,8 @@ func timePointer(value time.Time) *time.Time { return &value }
 type applicationInspectionRepository struct {
 	items             map[string]inspection.Item
 	creates           int
+	policies          map[string]inspection.Policy
+	updates           int
 	runDetail         inspection.RunDetail
 	runsByCorrelation map[string]inspection.Run
 	runCreates        int
@@ -496,17 +520,34 @@ func (repository *applicationInspectionRepository) ListItems(_ context.Context, 
 	}
 	return page, nil
 }
-func (*applicationInspectionRepository) CreatePolicy(context.Context, inspection.Policy) error {
+func (repository *applicationInspectionRepository) CreatePolicy(_ context.Context, value inspection.Policy) error {
+	if repository.policies == nil {
+		repository.policies = map[string]inspection.Policy{}
+	}
+	repository.policies[value.ID] = value
 	return nil
 }
 func (*applicationInspectionRepository) ListPolicies(context.Context, platformscope.Scope, inspection.PolicyFilter) (inspection.PolicyPage, error) {
 	return inspection.PolicyPage{}, nil
 }
-func (*applicationInspectionRepository) GetPolicy(context.Context, platformscope.Scope, string) (inspection.Policy, error) {
-	return inspection.Policy{}, inspection.ErrNotFound
+func (repository *applicationInspectionRepository) GetPolicy(_ context.Context, scope platformscope.Scope, id string) (inspection.Policy, error) {
+	value, ok := repository.policies[id]
+	if !ok || value.Scope != scope {
+		return inspection.Policy{}, inspection.ErrNotFound
+	}
+	return value, nil
 }
-func (*applicationInspectionRepository) UpdatePolicy(context.Context, inspection.Policy, int64) (inspection.Policy, error) {
-	return inspection.Policy{}, inspection.ErrNotFound
+func (repository *applicationInspectionRepository) UpdatePolicy(_ context.Context, value inspection.Policy, current int64) (inspection.Policy, error) {
+	stored, ok := repository.policies[value.ID]
+	if !ok {
+		return inspection.Policy{}, inspection.ErrNotFound
+	}
+	if stored.Version != current {
+		return inspection.Policy{}, inspection.ErrConflict
+	}
+	repository.updates++
+	repository.policies[value.ID] = value
+	return value, nil
 }
 func (*applicationInspectionRepository) ClaimDuePolicies(context.Context, time.Time, int, time.Duration) ([]inspection.Policy, error) {
 	return nil, nil

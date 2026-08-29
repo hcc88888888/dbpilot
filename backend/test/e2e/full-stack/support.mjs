@@ -21,10 +21,13 @@ export function browserPhaseState({ tenantID, projectID, onlineAgentID, offlineA
     offline_command_id: offlineCommand,
     journal_command_id: onlineCommand,
     audit_correlation: report?.references?.audit_correlation,
+    target_count: run?.target_count,
+    artifact_count: Array.isArray(report?.artifacts) ? report.artifacts.length : undefined,
   };
   if (report?.id !== run?.report_id || onlineCommand === offlineCommand || Object.entries(state).some(([name, value]) => (
-    name !== 'version' && (typeof value !== 'string' || !value || value !== value.trim() || /[\r\n\t]/.test(value))
+    !['version', 'target_count', 'artifact_count'].includes(name) && (typeof value !== 'string' || !value || value !== value.trim() || /[\r\n\t]/.test(value))
   ))) throw new Error('browser phase state is invalid');
+  if (state.target_count !== 2 || state.artifact_count !== 2) throw new Error('browser phase state is invalid');
   return Object.freeze(state);
 }
 
@@ -41,6 +44,33 @@ export function createFailureArtifacts({ secrets = [], html = '', consoleEntries
     console: consoleEntries.map((entry) => redactSecrets(entry, secrets)).join('\n'),
     screenshotMarkup: SCREENSHOT_MARKUP,
   };
+}
+
+export function inspectionRunDiagnostic(value = {}, job = {}, report = {}) {
+  const targets = Array.isArray(value?.targets) ? value.targets : [];
+  const jobTargets = Array.isArray(job?.target_results) ? job.target_results : [];
+  const targetStates = diagnosticCounts(targets.map((target) => target?.status));
+  const errorCodes = diagnosticCounts(targets.map((target) => target?.error_code).filter(Boolean));
+  const jobTargetStates = diagnosticCounts(jobTargets.map((target) => target?.status));
+  const findings = Array.isArray(report?.findings) ? report.findings.slice(0, 100) : [];
+  const findingLevels = diagnosticCounts(findings.map((finding) => finding?.level));
+  const missingItems = findings.filter((finding) => finding?.level === 'missing_data').map((finding) => diagnosticID(finding?.item_id)).sort().slice(0, 20).join(',');
+  const progress = job?.progress ?? {};
+  return [
+    `run_status=${diagnosticWord(value?.status)}`,
+    `target_count=${diagnosticInteger(value?.target_count)}`,
+    `completed=${diagnosticInteger(value?.completed_target_count)}`,
+    `failed=${diagnosticInteger(value?.failed_target_count)}`,
+    `target_states=${targetStates || 'none'}`,
+    `error_codes=${errorCodes || 'none'}`,
+    `job_status=${diagnosticWord(job?.status)}`,
+    `job_progress=${diagnosticInteger(progress?.completed_targets)}/${diagnosticInteger(progress?.total_targets)}`,
+    `job_failed=${diagnosticInteger(progress?.failed_targets)}`,
+    `job_skipped=${diagnosticInteger(progress?.skipped_targets)}`,
+    `job_target_states=${jobTargetStates || 'none'}`,
+    `finding_levels=${findingLevels || 'none'}`,
+    `missing_items=${missingItems || 'none'}`,
+  ].join(' ');
 }
 
 export function redactSecrets(value, secrets = []) {
@@ -123,4 +153,27 @@ function canonicalContentType(value) {
 
 function normalizedSecrets(secrets) {
   return [...new Set(secrets.map((secret) => String(secret ?? '')).filter(Boolean))];
+}
+
+function diagnosticCounts(values) {
+  const counts = new Map();
+  for (const value of values.slice(0, 100)) {
+    const word = diagnosticWord(value);
+    counts.set(word, (counts.get(word) ?? 0) + 1);
+  }
+  return [...counts].sort(([left], [right]) => left.localeCompare(right)).slice(0, 20).map(([word, count]) => `${word}:${count}`).join(',');
+}
+
+function diagnosticWord(value) {
+  const word = String(value ?? 'unknown');
+  return /^[a-z][a-z0-9_]{0,63}$/.test(word) ? word : 'unknown';
+}
+
+function diagnosticInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : -1;
+}
+
+function diagnosticID(value) {
+  const id = String(value ?? 'unknown');
+  return /^[a-z][a-z0-9_.-]{0,127}$/.test(id) ? id : 'unknown';
 }

@@ -41,11 +41,22 @@ export async function runCommunicationPhase(phase, dependencies = {}) {
 
     const previous = validatePhaseState(await requiredFunction(dependencies.readState, 'phase state reader')());
     const faultWindow = validateFaultWindow(dependencies.faultWindow);
-    const observation = await waitForObservation(
-      dependencies,
-      (candidate) => postRestartAdvanced(previous, candidate),
-      'post-restart communication state did not advance',
-    );
+    let lastObservation;
+    let observation;
+    try {
+      observation = await waitForObservation(
+        dependencies,
+        (candidate) => {
+          lastObservation = candidate;
+          return postRestartAdvanced(previous, candidate);
+        },
+        'post-restart communication state did not advance',
+        previous,
+      );
+    } catch (error) {
+      if (lastObservation) throw new Error(`${String(error?.message ?? error)}: ${postRestartDiagnostic(previous, lastObservation)}`);
+      throw error;
+    }
     const state = Object.freeze({
       ...mergeObservation(previous, observation),
       controlplane_stopped_at: faultWindow.stoppedAt,
@@ -85,6 +96,7 @@ export async function collectRuntimeObservation({
     capabilities: Array.isArray(item?.capabilities) ? item.capabilities.map(String) : [],
     agent_control_heartbeat_at: item?.agent_control_heartbeat_at,
   })) : [];
+  const onlineTarget = inventory.find((item) => item.agent_id === onlineAgentID);
 
   let reportCount = 0;
   let findingCount = 0;
@@ -111,8 +123,8 @@ export async function collectRuntimeObservation({
   }
   return validateObservation({
     inventory,
-    metric_sample_at: canonicalTimestamp(instance?.last_sample_at),
-    agent_control_heartbeat_at: canonicalTimestamp(inventory.find((item) => item.agent_id === onlineAgentID)?.agent_control_heartbeat_at),
+    metric_sample_at: canonicalTimestamp(instance?.last_sample_at, 'metric_sample_at'),
+    agent_control_heartbeat_at: canonicalTimestamp(onlineTarget?.agent_control_heartbeat_at, 'agent_control_heartbeat_at', onlineTarget?.connectivity),
     report_count: reportCount,
     finding_count: findingCount,
     audit_count: auditCount,
@@ -131,19 +143,19 @@ export function assertRogueAgentRejected(result) {
   }
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   const expected = result.kind === 'untrusted'
-    ? /(?:x509:\s*certificate signed by unknown authority|authentication handshake failed[^\n]*unknown authority|tls[^\n]*(?:failed to verify certificate|unknown certificate authority))/i
+    ? /(?:x509:\s*certificate signed by unknown authority|authentication handshake failed[^\n]*unknown authority|tls[^\n]*(?:failed to verify certificate|unknown certificate authority)|remote error:\s*tls:\s*certificate required)/i
     : /code\s*=\s*PermissionDenied[^\n]*(?:Hello Agent ID[^\n]*verified SPIFFE identity|SPIFFE[^\n]*mismatch)/i;
   if (!expected.test(output)) throw new Error(`rogue ${result.kind} Agent rejection evidence is missing`);
 }
 
-async function waitForObservation(dependencies, predicate, timeoutMessage) {
+async function waitForObservation(dependencies, predicate, timeoutMessage, state) {
   const observe = requiredFunction(dependencies.observe, 'communication observer');
   const wait = dependencies.wait ?? defaultWait;
   const maxAttempts = positiveInteger(dependencies.maxAttempts, 60);
   let lastError = '';
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
-      const observation = validateObservation(await observe());
+      const observation = validateObservation(await observe(state));
       if (predicate(observation)) return observation;
     } catch (error) {
       lastError = String(error?.message ?? error);
@@ -167,13 +179,23 @@ function communicationReady(observation) {
 }
 
 function postRestartAdvanced(previous, observation) {
-  return communicationReady(observation)
-    && Date.parse(observation.metric_sample_at) > Date.parse(previous.metric_sample_at)
-    && Date.parse(observation.agent_control_heartbeat_at) > Date.parse(previous.agent_control_heartbeat_at)
-    && observation.report_count === previous.report_count
-    && observation.finding_count === previous.finding_count
-    && observation.audit_count === previous.audit_count
-    && observation.terminal_command_id === previous.journal_command_id;
+  return Object.values(postRestartChecks(previous, observation)).every(Boolean);
+}
+
+function postRestartDiagnostic(previous, observation) {
+  return Object.entries(postRestartChecks(previous, observation)).map(([name, value]) => `${name}=${value}`).join(' ');
+}
+
+function postRestartChecks(previous, observation) {
+  return {
+    ready: communicationReady(observation),
+    metric_advanced: Date.parse(observation.metric_sample_at) > Date.parse(previous.metric_sample_at),
+    heartbeat_advanced: Date.parse(observation.agent_control_heartbeat_at) > Date.parse(previous.agent_control_heartbeat_at),
+    report_unchanged: observation.report_count === previous.report_count,
+    findings_unchanged: observation.finding_count === previous.finding_count,
+    audits_unchanged: observation.audit_count === previous.audit_count,
+    terminal_command_match: observation.terminal_command_id === previous.journal_command_id,
+  };
 }
 
 function mergeObservation(state, observation) {
@@ -198,7 +220,12 @@ function validateBrowserState(value) {
   if (value.online_agent_id === value.offline_agent_id || value.journal_command_id !== value.online_command_id || value.online_command_id === value.offline_command_id) {
     throw new Error('browser phase command identities are invalid');
   }
-  return Object.freeze(Object.fromEntries(['version', ...required].map((name) => [name, value[name]])));
+  if (value.target_count !== 2 || value.artifact_count !== 2) throw new Error('browser phase counters are invalid');
+  return Object.freeze({
+    ...Object.fromEntries(['version', ...required].map((name) => [name, value[name]])),
+    target_count: value.target_count,
+    artifact_count: value.artifact_count,
+  });
 }
 
 function validatePhaseState(value) {
@@ -243,7 +270,10 @@ function validateObservation(value) {
 }
 
 async function requireProcessSuccess(result) {
-  if (!result || result.exitCode !== 0) throw new Error('acceptance phase process failed');
+  if (!result || result.exitCode !== 0) {
+    const diagnostic = `${result?.stdout ?? ''}\n${result?.stderr ?? ''}`.trim().slice(-64_000);
+    throw new Error(diagnostic ? `acceptance phase process failed: ${diagnostic}` : 'acceptance phase process failed');
+  }
   return result;
 }
 
@@ -264,8 +294,11 @@ function positiveInteger(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
-function canonicalTimestamp(value) {
-  if (!validTimestamp(value)) throw new Error('runtime communication timestamp is invalid');
+function canonicalTimestamp(value, name, connectivity) {
+  if (!['metric_sample_at', 'agent_control_heartbeat_at'].includes(name) || !validTimestamp(value)) {
+    const suffix = name === 'agent_control_heartbeat_at' ? ` connectivity=${['online', 'offline'].includes(connectivity) ? connectivity : 'unknown'}` : '';
+    throw new Error(`runtime ${['metric_sample_at', 'agent_control_heartbeat_at'].includes(name) ? name : 'communication'} timestamp is invalid${suffix}`);
+  }
   return value;
 }
 

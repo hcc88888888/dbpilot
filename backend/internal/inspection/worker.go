@@ -228,7 +228,11 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 		case job.TargetCancelled:
 			targets[index].Status, targets[index].ErrorCode = TargetCancelled, "collection_cancelled"
 		case job.TargetTimedOut:
-			targets[index].Status, targets[index].ErrorCode = TargetFailed, "collection_timed_out"
+			errorCode := "collection_timed_out"
+			if target.Connectivity == "offline" {
+				errorCode = "agent_offline"
+			}
+			targets[index].Status, targets[index].ErrorCode = TargetFailed, errorCode
 		case job.TargetSkipped:
 			targets[index].Status, targets[index].ErrorCode = TargetUnsupported, "collection_unsupported"
 		case job.TargetFailed:

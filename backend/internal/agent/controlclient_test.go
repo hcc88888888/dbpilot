@@ -18,6 +18,8 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -389,6 +391,19 @@ func TestControlClientReconnectReportsActiveCommands(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestControlClientDoesNotRetryPermanentIdentityRejection(t *testing.T) {
+	stream := newFakeControlStream()
+	stream.receiveErrors <- status.Error(codes.PermissionDenied, "Hello Agent ID does not match the verified SPIFFE identity")
+	client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err := client.Run(ctx)
+
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Contains(t, err.Error(), "Hello Agent ID does not match the verified SPIFFE identity")
+}
+
 func TestControlClientReconnectKeepsInFlightExecutorAlive(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
@@ -462,14 +477,15 @@ func TestControlClientNeverSendsNewOutputToStaleOrHandshakingSession(t *testing.
 
 	err := client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: "during-handshake"}}})
 	require.ErrorIs(t, err, ErrControlStreamDisconnected)
-	require.Len(t, first.sentMessages(), 1)
+	require.Len(t, first.sentMessages(), 2)
+	require.NotNil(t, first.sentMessages()[1].GetHeartbeat(), "the acknowledged session must establish real liveness before it becomes stale")
 	require.Len(t, second.sentMessages(), 1)
 
 	second.receive <- helloAckMessage()
 	require.Eventually(t, func() bool {
 		return client.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: "new-session"}}}) == nil
 	}, time.Second, time.Millisecond)
-	require.Len(t, first.sentMessages(), 1, "stale session must never receive new output")
+	require.Len(t, first.sentMessages(), 2, "stale session must never receive new output")
 	cancel()
 	require.NoError(t, <-done)
 }
@@ -583,6 +599,17 @@ func TestControlClientReplaysPendingResultAfterSendFailureAndReconnect(t *testin
 	go func() { done <- client.Run(ctx) }()
 
 	require.Eventually(t, func() bool { return countResults(second.sentMessages()) == 1 }, 2*time.Second, time.Millisecond)
+	heartbeatIndex, resultIndex := -1, -1
+	for index, message := range second.sentMessages() {
+		if message.GetHeartbeat() != nil && heartbeatIndex < 0 {
+			heartbeatIndex = index
+		}
+		if message.GetCommandResult() != nil && resultIndex < 0 {
+			resultIndex = index
+		}
+	}
+	require.GreaterOrEqual(t, heartbeatIndex, 0, "reconnect must establish real AgentControl liveness before replay")
+	require.Less(t, heartbeatIndex, resultIndex, "pending CommandResult replay must not block the first real Heartbeat")
 	require.Zero(t, countResults(first.sentMessages()), "failed result send must not be treated as delivered")
 	pending, err := journal.PendingResults(context.Background())
 	require.NoError(t, err)

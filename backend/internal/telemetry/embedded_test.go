@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -35,6 +36,31 @@ func TestEmbeddedBuilderRejectsInvalidGraph(t *testing.T) {
 	builder := telemetry.NewEmbeddedBuilder(openEmbeddedStore(t))
 	_, err := builder.Build(context.Background(), telemetry.RuntimeConfig{})
 	require.Error(t, err)
+}
+
+// Skipping Collector config validation leaves directory_permissions unparsed,
+// so Linux creates file-storage directories with mode 000 and activation fails.
+func TestEmbeddedBuilderCreatesUsableFileStorageDirectoryOnLinux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux enforces the parsed file-storage directory permissions")
+	}
+	directory := t.TempDir()
+	previous, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(directory))
+	t.Cleanup(func() { require.NoError(t, os.Chdir(previous)) })
+
+	path := filepath.Join(directory, "application.log")
+	require.NoError(t, os.WriteFile(path, []byte("acceptance\n"), 0o600))
+	store := openEmbeddedStore(t)
+	candidate, err := telemetry.NewEmbeddedBuilder(store).Build(context.Background(), compileEmbeddedFileConfig(t, path))
+	require.NoError(t, err)
+	require.NoError(t, candidate.Start(context.Background()))
+	t.Cleanup(func() { require.NoError(t, candidate.Stop(context.Background())) })
+
+	storageInfo, err := os.Stat(filepath.Join(directory, "dbpilot-spool"))
+	require.NoError(t, err)
+	require.NotZero(t, storageInfo.Mode().Perm()&0o100, "file-storage owner must be able to traverse its directory")
 }
 
 // Replacing the receiver-to-spool adapter with a no-op would leave the real

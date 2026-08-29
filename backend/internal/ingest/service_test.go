@@ -48,6 +48,25 @@ func TestIngestRejectsUnverifiedCertificate(t *testing.T) {
 	assert.Equal(t, codes.Unauthenticated, status.Code(err))
 }
 
+func TestIngestAcceptsVerifiedDBPilotLocalSPIFFEIdentity(t *testing.T) {
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
+	ctx := contextWithRawSPIFFEAgent(t, true, "spiffe://dbpilot.local/agent/agent-a")
+
+	ack, err := service.PushLogBatch(ctx, validLogBatch("current-trust-domain", "agent-a", []byte("payload")))
+
+	require.NoError(t, err)
+	require.True(t, ack.GetAccepted())
+}
+
+func TestIngestRejectsLegacySPIFFETrustDomain(t *testing.T) {
+	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
+	ctx := contextWithRawSPIFFEAgent(t, true, "spiffe://dbpilot/agent/agent-a")
+
+	_, err := service.PushLogBatch(ctx, validLogBatch("legacy-trust-domain", "agent-a", []byte("payload")))
+
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
 func TestIngestRejectsChecksumMismatchAndOversizedPayload(t *testing.T) {
 	service := NewService(knownAgents{"agent-a": true}, newMemoryDedup())
 	checksumMismatch := validLogBatch("bad-checksum", "agent-a", []byte("x"))
@@ -274,7 +293,7 @@ func validMetricBatch(id, agentID string, payload []byte) *telemetryv1.MetricBat
 
 func contextWithSPIFFEAgent(t *testing.T, agentID string) context.Context {
 	t.Helper()
-	uri, err := url.Parse("spiffe://dbpilot/agent/" + agentID)
+	uri, err := url.Parse("spiffe://dbpilot.local/agent/" + agentID)
 	require.NoError(t, err)
 	cert := &x509.Certificate{URIs: []*url.URL{uri}}
 	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}, VerifiedChains: [][]*x509.Certificate{{cert}}}
@@ -283,10 +302,22 @@ func contextWithSPIFFEAgent(t *testing.T, agentID string) context.Context {
 
 func contextWithUnverifiedSPIFFEAgent(t *testing.T, agentID string) context.Context {
 	t.Helper()
-	uri, err := url.Parse("spiffe://dbpilot/agent/" + agentID)
+	uri, err := url.Parse("spiffe://dbpilot.local/agent/" + agentID)
 	require.NoError(t, err)
 	cert := &x509.Certificate{URIs: []*url.URL{uri}}
 	return peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}}})
+}
+
+func contextWithRawSPIFFEAgent(t *testing.T, verified bool, rawURI string) context.Context {
+	t.Helper()
+	uri, err := url.Parse(rawURI)
+	require.NoError(t, err)
+	cert := &x509.Certificate{URIs: []*url.URL{uri}}
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}}
+	if verified {
+		state.VerifiedChains = [][]*x509.Certificate{{cert}}
+	}
+	return peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{State: state}})
 }
 
 type knownAgents map[string]bool

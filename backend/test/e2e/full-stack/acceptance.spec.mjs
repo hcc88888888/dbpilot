@@ -7,6 +7,7 @@ import {
   browserPhaseState,
   createFailureArtifacts,
   findingEvidenceIsComplete,
+  inspectionRunDiagnostic,
   renderedFindingMatches,
   verifyArtifactDownload,
 } from './support.mjs';
@@ -159,6 +160,23 @@ phaseTest('normal', 'real Agent readiness, label policy, partial inspection, rep
   const updateResponsePromise = page.waitForResponse((response) => response.request().method() === 'PATCH' && response.url().endsWith(`/inspection-policies/${encodeURIComponent(acceptedPolicy.id)}`));
   await form.locator('[data-inspection-policy-save]').click();
   const updateResponse = await updateResponsePromise;
+  if (updateResponse.status() !== 200) {
+    const requestBody = updateResponse.request().postDataJSON();
+    const problem = await updateResponse.json().catch(() => ({}));
+    const fields = requestBody && typeof requestBody === 'object' ? Object.keys(requestBody).sort() : [];
+    const diagnostic = [
+      `status=${updateResponse.status()}`,
+      `code=${/^[a-z0-9_.-]+$/.test(String(problem?.code ?? '')) ? problem.code : 'unknown'}`,
+      `fields=${fields.join(',')}`,
+      `items=${Array.isArray(requestBody?.item_versions) ? requestBody.item_versions.length : -1}`,
+      `targets=${Array.isArray(requestBody?.target_ids) ? requestBody.target_ids.length : -1}`,
+      `labels=${requestBody?.labels && typeof requestBody.labels === 'object' && !Array.isArray(requestBody.labels) ? Object.keys(requestBody.labels).length : -1}`,
+      `timeout_integer=${Number.isInteger(requestBody?.target_timeout_seconds)}`,
+      `concurrency_integer=${Number.isInteger(requestBody?.max_concurrency)}`,
+      `if_match_valid=${/^"[1-9][0-9]*"$/.test(String(updateResponse.request().headers()['if-match'] ?? ''))}`,
+    ].join(' ');
+    throw new Error(`policy update rejected ${diagnostic}`);
+  }
   expect(updateResponse.status()).toBe(200);
   expect(updateResponse.request().headers()['if-match']).toBe(etag);
   acceptedPolicy = await updateResponse.json();
@@ -233,7 +251,7 @@ phaseTest('normal', 'real Agent readiness, label policy, partial inspection, rep
   await requireText(page.locator('.ins-report-meta'), acceptedReport.references.job_id, 'Job reference was not rendered');
   await requireText(page.locator('.ins-report-meta'), acceptedReport.references.audit_correlation, 'Audit reference was not rendered');
   for (const command of acceptedReport.references.commands) await requireText(page.locator('.ins-report-meta'), command.command_id, 'Command reference was not rendered');
-  await requireText(page.locator('.ins-target-navigation'), environment.EXPECTED_ONLINE_AGENT_ID, 'report target navigation was not rendered');
+  await requireText(page.locator('.ins-target-navigation'), readiness.online.display_name, 'report target navigation was not rendered');
 
   const artifacts = await Promise.all(acceptedReport.artifacts.map((reference) => apiJSON(`${scopePath}/artifacts/${encodeURIComponent(reference.artifact_id)}`, tokens.valid)));
   auditValueForSecrets(artifacts);
@@ -317,10 +335,17 @@ async function waitForAgentReadiness(accessToken) {
 }
 
 async function pollJSON(path, accessToken, predicate) {
-  return poll(async () => {
-    const value = await apiJSON(path, accessToken);
-    return predicate(value) ? value : undefined;
-  }, 'inspection terminal state');
+  let observed;
+  try {
+    return await poll(async () => {
+      observed = await apiJSON(path, accessToken);
+      return predicate(observed) ? observed : undefined;
+    }, 'inspection terminal state');
+  } catch {
+    const job = observed?.job_id ? await apiJSON(`${scopePath}/jobs/${encodeURIComponent(observed.job_id)}`, accessToken).catch(() => ({})) : {};
+    const report = observed?.report_id ? await apiJSON(`${scopePath}/inspection-reports/${encodeURIComponent(observed.report_id)}`, accessToken).catch(() => ({})) : {};
+    throw new Error(`inspection terminal state timed out: ${inspectionRunDiagnostic(observed, job, report)}`);
+  }
 }
 
 async function poll(load, label, timeout = 120_000) {

@@ -90,6 +90,42 @@ func TestBearerPrincipalResolverMapsValidatedScopedPermissionGrants(t *testing.T
 	require.Equal(t, []string{"valid-token"}, verifier.tokens)
 }
 
+func TestBearerPrincipalResolverMapsExplicitLegacyProjectMembershipSeparatelyFromGrants(t *testing.T) {
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	verifier := &recordingTokenVerifier{raw: json.RawMessage(`{
+		"sub":"legacy-reader",
+		"dbpilot_platform_admin":false,
+		"dbpilot_projects":[{"tenant_id":"tenant-a","project_id":"project-a"}],
+		"dbpilot_grants":[{"tenant_id":"tenant-a","project_id":"project-a","permissions":["platform.jobs.read"]}]
+	}`)}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set("Authorization", "Bearer membership-token")
+
+	principal, err := (BearerPrincipalResolver{Verifier: verifier}).ResolvePrincipal(request)
+
+	require.NoError(t, err)
+	require.Contains(t, principal.Projects, scope.Key())
+	require.True(t, principal.AlertPrincipal().Allows(alert.Scope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}))
+	require.True(t, principal.Allows(scope, "platform.jobs.read"))
+	require.False(t, principal.Allows(scope, "platform.jobs.cancel"), "legacy membership must not imply an action grant")
+}
+
+func TestBearerPrincipalResolverRejectsInvalidExplicitLegacyProjectMembership(t *testing.T) {
+	for name, raw := range map[string]string{
+		"invalid scope":   `{"sub":"user","dbpilot_projects":[{"tenant_id":"tenant/a","project_id":"project-a"}],"dbpilot_grants":[]}`,
+		"duplicate scope": `{"sub":"user","dbpilot_projects":[{"tenant_id":"tenant-a","project_id":"project-a"},{"tenant_id":"tenant-a","project_id":"project-a"}],"dbpilot_grants":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.Header.Set("Authorization", "Bearer membership-token")
+
+			_, err := (BearerPrincipalResolver{Verifier: &recordingTokenVerifier{raw: json.RawMessage(raw)}}).ResolvePrincipal(request)
+
+			require.ErrorIs(t, err, ErrUnauthenticated)
+		})
+	}
+}
+
 func TestOIDCPlatformCapabilityGrantCannotMutateLegacyAlertConfiguration(t *testing.T) {
 	fixture := newHTTPFixture()
 	verifier := &recordingTokenVerifier{claims: OIDCClaims{Subject: "platform-only", Grants: []OIDCGrant{{

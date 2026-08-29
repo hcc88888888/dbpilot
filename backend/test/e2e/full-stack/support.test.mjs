@@ -7,16 +7,39 @@ import {
   browserPhaseState,
   createFailureArtifacts,
   findingEvidenceIsComplete,
+  inspectionRunDiagnostic,
   renderedFindingMatches,
   verifyArtifactDownload,
 } from './support.mjs';
+
+test('inspection timeout diagnostic retains only bounded state and counts', () => {
+  const diagnostic = inspectionRunDiagnostic({
+    status: 'collecting', target_count: 2, completed_target_count: 0, failed_target_count: 0,
+    targets: [
+      { status: 'pending', error_code: '', command_id: 'command-secret-id' },
+      { status: 'failed', error_code: 'agent_offline', agent_id: 'agent-secret-id' },
+    ],
+    id: 'run-secret-id', job_id: 'job-secret-id', initiated_by: 'operator-secret-id',
+  }, {
+    status: 'running', progress: { total_targets: 2, completed_targets: 1, failed_targets: 0, skipped_targets: 0 },
+    target_results: [{ status: 'succeeded', target_id: 'agent-secret-id' }], id: 'job-secret-id',
+  }, {
+    findings: [
+      { level: 'healthy', item_id: 'host.cpu.utilization' },
+      { level: 'missing_data', item_id: 'host.time.synchronization' },
+      { level: 'missing_data', item_id: 'credential=do-not-retain' },
+    ],
+  });
+  assert.equal(diagnostic, 'run_status=collecting target_count=2 completed=0 failed=0 target_states=failed:1,pending:1 error_codes=agent_offline:1 job_status=running job_progress=1/2 job_failed=0 job_skipped=0 job_target_states=succeeded:1 finding_levels=healthy:1,missing_data:2 missing_items=host.time.synchronization,unknown');
+  assert.equal(diagnostic.includes('secret-id'), false);
+});
 
 test('browser phase state contains only non-secret scope and durable workflow identities', () => {
   const state = browserPhaseState({
     tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
     policy: { id: 'policy-1' },
-    run: { id: 'run-1', report_id: 'report-1' },
-    report: { id: 'report-1', references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [
+    run: { id: 'run-1', report_id: 'report-1', target_count: 2 },
+    report: { id: 'report-1', artifacts: [{ artifact_id: 'artifact-html' }, { artifact_id: 'artifact-json' }], references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [
       { target_id: 'agent-online', command_id: 'command-online' },
       { target_id: 'agent-offline', command_id: 'command-offline' },
     ] } },
@@ -25,11 +48,12 @@ test('browser phase state contains only non-secret scope and durable workflow id
     version: 1, tenant_id: 'tenant-acceptance', project_id: 'project-acceptance', online_agent_id: 'agent-online', offline_agent_id: 'agent-offline', policy_id: 'policy-1',
     run_id: 'run-1', job_id: 'job-1', report_id: 'report-1', online_command_id: 'command-online',
     offline_command_id: 'command-offline', journal_command_id: 'command-online', audit_correlation: 'correlation-1',
+    target_count: 2, artifact_count: 2,
   });
   assert.equal(JSON.stringify(state).includes('token'), false);
   assert.throws(() => browserPhaseState({
     tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
-    policy: { id: 'policy-1' }, run: { id: 'run-1', report_id: 'report-1' }, report: { id: 'report-1', references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [] } },
+    policy: { id: 'policy-1' }, run: { id: 'run-1', report_id: 'report-1', target_count: 2 }, report: { id: 'report-1', artifacts: [{}, {}], references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [] } },
   }), /browser phase state is invalid/);
 });
 

@@ -32,7 +32,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		stderr = io.Discard
 	}
 	if len(arguments) == 0 {
-		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, database, journal, or replay")
+		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, database, journal, replay, or summary")
 		return 2
 	}
 	switch arguments[0] {
@@ -46,10 +46,36 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runJournalAssertions(arguments[1:], stderr)
 	case "replay":
 		return runReplayAssertions(arguments[1:], stderr)
+	case "summary":
+		return runSummary(arguments[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown subcommand")
 		return 2
 	}
+}
+
+func runSummary(arguments []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("summary", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	phaseStateFile := flags.String("phase-state-file", "", "absolute full-stack phase state file")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*phaseStateFile) {
+		return 2
+	}
+	var state AssertionOptions
+	if err := decodeJSONFile(*phaseStateFile, 64<<10, &state); err != nil {
+		fmt.Fprintln(stderr, "success summary phase state is unavailable or invalid")
+		return 2
+	}
+	summary, err := BuildSuccessSummary(state)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if err := json.NewEncoder(stdout).Encode(summary); err != nil {
+		fmt.Fprintln(stderr, "success summary output failed")
+		return 1
+	}
+	return 0
 }
 
 func runReplayAssertions(arguments []string, stderr io.Writer) int {

@@ -163,7 +163,7 @@ func certificatePair(t *testing.T) (*tls.Config, *tls.Config) {
 	caCertificate, err := x509.ParseCertificate(caDER)
 	require.NoError(t, err)
 	server := signedCertificate(t, 2, "gateway", []string{"gateway"}, nil, caCertificate, caPrivate)
-	client := signedCertificate(t, 3, "agent-a", nil, []string{"spiffe://dbpilot/agent/agent-a"}, caCertificate, caPrivate)
+	client := signedCertificate(t, 3, "agent-a", nil, []string{"spiffe://dbpilot.local/agent/agent-a"}, caCertificate, caPrivate)
 	pool := x509.NewCertPool()
 	pool.AddCert(caCertificate)
 	return &tls.Config{Certificates: []tls.Certificate{server}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, MinVersion: tls.VersionTLS12}, &tls.Config{Certificates: []tls.Certificate{client}, RootCAs: pool, ServerName: "gateway", MinVersion: tls.VersionTLS12}

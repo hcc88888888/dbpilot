@@ -193,6 +193,16 @@ function Invoke-DockerProcess {
 
 $boundedDockerInvoker = { param([string[]]$Arguments) Invoke-DockerProcess -Arguments $Arguments }
 
+function Get-DockerFailureMessage {
+    param([string]$Failure, [object]$Result)
+    $detail = @($Result.Stdout, $Result.Stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $detail = $detail -join [Environment]::NewLine
+    if ($detail.Length -gt 4096) { $detail = $detail.Substring($detail.Length - 4096) }
+    $detail = Redact-Text $detail
+    if ([string]::IsNullOrWhiteSpace($detail)) { return $Failure }
+    return "$Failure $detail"
+}
+
 function Invoke-DockerChecked {
     param(
         [string[]]$Arguments,
@@ -201,7 +211,7 @@ function Invoke-DockerChecked {
         [string]$TimeoutFailure = 'Docker operation timed out.'
     )
     $result = Invoke-DockerProcess $Arguments $TimeoutSeconds $Failure $TimeoutFailure
-    if ($result.ExitCode -ne 0) { throw $Failure }
+    if ($result.ExitCode -ne 0) { throw (Get-DockerFailureMessage $Failure $result) }
 }
 
 function Invoke-DockerCapture {
@@ -212,7 +222,7 @@ function Invoke-DockerCapture {
         [string]$TimeoutFailure = 'Docker operation timed out.'
     )
     $result = Invoke-DockerProcess $Arguments $TimeoutSeconds $Failure $TimeoutFailure
-    if ($result.ExitCode -ne 0) { throw $Failure }
+    if ($result.ExitCode -ne 0) { throw (Get-DockerFailureMessage $Failure $result) }
     return $result.Stdout
 }
 
@@ -235,6 +245,16 @@ function Invoke-ComposeChecked {
         [string]$TimeoutFailure = 'Docker Compose operation timed out.'
     )
     Invoke-DockerChecked (Get-ComposeArguments $Arguments) $TimeoutSeconds $Failure $TimeoutFailure
+}
+
+function Invoke-PublicImageMaterialization {
+    $arguments = Get-ComposeArguments @('pull', 'asset-builder', 'postgres', 'frontend')
+    $failure = 'Public acceptance image materialization failed.'
+    $timeoutFailure = 'Public acceptance image materialization timed out.'
+    $first = Invoke-DockerProcess $arguments $MaterializeTimeoutSeconds $failure $timeoutFailure
+    if ($first.ExitCode -eq 0) { return }
+    $second = Invoke-DockerProcess $arguments $MaterializeTimeoutSeconds $failure $timeoutFailure
+    if ($second.ExitCode -ne 0) { throw $failure }
 }
 
 function Write-ResourceLedger {
@@ -350,7 +370,10 @@ function Redact-Text {
 
 function Save-BoundedContainerLog {
     param([string]$ContainerID, [string]$Path)
-    $body = Invoke-DockerCapture @('logs', '--tail', '500', $ContainerID) 'Unable to collect a bounded container log.'
+    $result = Invoke-DockerProcess @('logs', '--tail', '500', $ContainerID)
+    if ($result.ExitCode -ne 0) { throw 'Unable to collect a bounded container log.' }
+    $body = @($result.Stdout, $result.Stderr) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $body = $body -join [Environment]::NewLine
     if ($body.Length -gt 1000000) { $body = $body.Substring($body.Length - 1000000) }
     [IO.File]::WriteAllText($Path, (Redact-Text $body), [Text.UTF8Encoding]::new($false))
 }
@@ -379,8 +402,69 @@ function Invoke-ComposeJob {
 }
 
 function Invoke-AssertionPhase {
-    param([ValidateSet('database', 'replay', 'journal')][string]$Phase)
+    param([ValidateSet('database', 'replay', 'journal', 'summary')][string]$Phase)
     return Invoke-ComposeJob -Service 'assertions' -Environment @{ DBPILOT_ASSERTION_PHASE = $Phase }
+}
+
+function Write-SuccessSummary {
+    param([Parameter(Mandatory = $true)]$Result)
+    if ([string]::IsNullOrWhiteSpace($Result.LogPath) -or -not (Test-Path -LiteralPath $Result.LogPath -PathType Leaf)) {
+        throw 'Full-stack success summary is unavailable.'
+    }
+    $body = [IO.File]::ReadAllText($Result.LogPath).Trim()
+    if ($body.Length -eq 0 -or $body.Length -gt 8192) { throw 'Full-stack success summary is invalid.' }
+    try { $value = $body | ConvertFrom-Json } catch { throw 'Full-stack success summary is invalid.' }
+    $allowed = @(
+        'run_id', 'job_id', 'online_command_id', 'offline_command_id', 'report_id',
+        'target_count', 'finding_count', 'report_count', 'artifact_count', 'audit_count',
+        'controlplane_stopped_at', 'controlplane_restarted_at'
+    )
+    $actual = @($value.PSObject.Properties.Name)
+    if ($actual.Count -ne $allowed.Count -or @($actual | Where-Object { $_ -cnotin $allowed }).Count -ne 0) {
+        throw 'Full-stack success summary contains an unapproved field.'
+    }
+    foreach ($name in @('run_id', 'job_id', 'online_command_id', 'offline_command_id', 'report_id')) {
+        if ($value.$name -isnot [string] -or $value.$name -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$') {
+            throw 'Full-stack success summary contains an invalid identifier.'
+        }
+    }
+    $expectedCounts = @{ target_count = 2; finding_count = 13; report_count = 1; artifact_count = 2 }
+    foreach ($name in @('target_count', 'finding_count', 'report_count', 'artifact_count', 'audit_count')) {
+        if ($value.$name -is [bool] -or $value.$name -isnot [ValueType]) { throw 'Full-stack success summary contains an invalid count.' }
+        try { $count = [int64]$value.$name } catch { throw 'Full-stack success summary contains an invalid count.' }
+        if (($expectedCounts.ContainsKey($name) -and $count -ne $expectedCounts[$name]) -or ($name -ceq 'audit_count' -and $count -lt 4)) {
+            throw 'Full-stack success summary contains an invalid count.'
+        }
+    }
+    $instants = @{}
+    foreach ($name in @('controlplane_stopped_at', 'controlplane_restarted_at')) {
+        $rawTimestamp = $value.$name
+        if ($rawTimestamp -is [DateTimeOffset]) {
+            $parsed = $rawTimestamp
+        } elseif ($rawTimestamp -is [DateTime]) {
+            $parsed = [DateTimeOffset]::new($rawTimestamp.ToUniversalTime())
+        } elseif ($rawTimestamp -is [string] -and $rawTimestamp -match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$') {
+            $parsed = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParse($rawTimestamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+                throw 'Full-stack success summary contains an invalid timestamp.'
+            }
+        } else {
+            throw 'Full-stack success summary contains an invalid timestamp.'
+        }
+        $instants[$name] = $parsed
+    }
+    if ($instants.controlplane_restarted_at -le $instants.controlplane_stopped_at) {
+        throw 'Full-stack success summary contains an invalid outage boundary.'
+    }
+    $safe = [ordered]@{}
+    foreach ($name in $allowed) {
+        $safe[$name] = if ($instants.ContainsKey($name)) {
+            $instants[$name].UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
+        } else {
+            $value.$name
+        }
+    }
+    Write-Host ('Full-stack success summary: ' + ($safe | ConvertTo-Json -Compress))
 }
 
 function Wait-OutageBoundary {
@@ -394,9 +478,9 @@ function Wait-OutageBoundary {
 }
 
 function Copy-RogueEvidence {
-    param([string]$ControlplaneID, [string]$Kind, [string]$Source)
+    param([string]$ArtifactCarrierID, [string]$Kind, [string]$Source)
     $name = "rogue-$Kind.log"
-    Invoke-DockerChecked @('cp', $Source, "${ControlplaneID}:/acceptance/state/artifacts/$name")
+    Invoke-DockerChecked @('cp', $Source, "${ArtifactCarrierID}:/acceptance/artifacts/$name")
     return "/acceptance/artifacts/$name"
 }
 
@@ -475,7 +559,7 @@ try {
     Write-ResourceLedger
 
     Invoke-ComposeChecked @('--profile', '*', 'config', '--quiet')
-    Invoke-ComposeChecked -Arguments @('pull', 'asset-builder', 'postgres', 'frontend') -TimeoutSeconds $MaterializeTimeoutSeconds -Failure 'Public acceptance image materialization failed.' -TimeoutFailure 'Public acceptance image materialization timed out.'
+    Invoke-PublicImageMaterialization
     Invoke-ComposeChecked -Arguments @('build', 'acceptance-runner') -TimeoutSeconds $BuildTimeoutSeconds -Failure 'The acceptance-runner image build failed.' -TimeoutFailure 'The acceptance-runner image build timed out.'
     Register-OwnedResources
 
@@ -530,7 +614,7 @@ try {
     Invoke-DockerChecked @('start', $controlplaneID)
     $restartedAt = Get-UTCInstant
     Wait-Healthy $controlplaneID 'controlplane'
-    $null = Invoke-ComposeJob -Service 'acceptance-runner' -Command @('post-restart') -Environment @{
+    $postRestartResult = Invoke-ComposeJob -Service 'acceptance-runner' -Command @('post-restart') -Environment @{
         CONTROLPLANE_STOPPED_AT = $stoppedAt
         CONTROLPLANE_RESTARTED_AT = $restartedAt
     }
@@ -540,7 +624,7 @@ try {
         [pscustomobject]@{ Service = 'rogue-mismatch'; Kind = 'mismatch' }
     )) {
         $result = Invoke-ComposeJob -Service $rogue.Service -ExpectedFailure
-        $containerLog = Copy-RogueEvidence $controlplaneID $rogue.Kind $result.LogPath
+        $containerLog = Copy-RogueEvidence $postRestartResult.ContainerID $rogue.Kind $result.LogPath
         $null = Invoke-ComposeJob -Service 'acceptance-runner' -Command @('rogue') -Environment @{
             ROGUE_KIND = $rogue.Kind
             ROGUE_EXIT_CODE = [string]$result.ExitCode
@@ -554,6 +638,8 @@ try {
     Write-Host 'Control-plane restart and spool recovery passed'
     $null = Invoke-AssertionPhase 'journal'
     $null = Invoke-AssertionPhase 'database'
+    $successSummaryResult = Invoke-AssertionPhase 'summary'
+    Write-SuccessSummary $successSummaryResult
     Write-Host 'Rogue Agent rejection passed'
     Write-Host 'Database and journal assertions passed'
 }

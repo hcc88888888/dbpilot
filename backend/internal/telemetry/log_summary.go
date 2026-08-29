@@ -98,7 +98,7 @@ func (index *LogSummaryIndex) Observe(ctx context.Context, logs plog.Logs) error
 			records := resourceLogs.ScopeLogs().At(scopeIndex).LogRecords()
 			for recordIndex := 0; recordIndex < records.Len(); recordIndex++ {
 				record := records.At(recordIndex)
-				severity, ok := normalizedSeverity(record.SeverityNumber(), record.SeverityText())
+				severity, ok := normalizedRecordSeverity(record)
 				observedAt := logObservedAt(record, now)
 				if !ok || observedAt.Before(index.startedAt) || observedAt.Before(now.Add(-maximumLogSummaryWindow)) || observedAt.After(now.Add(time.Minute)) {
 					index.invalidMetadata++
@@ -269,6 +269,14 @@ func normalizedSeverity(number plog.SeverityNumber, text string) (string, bool) 
 	default:
 		return "", false
 	}
+}
+
+func normalizedRecordSeverity(record plog.LogRecord) (string, bool) {
+	severity, ok := normalizedSeverity(record.SeverityNumber(), record.SeverityText())
+	if ok || record.SeverityNumber() != plog.SeverityNumberUnspecified || strings.TrimSpace(record.SeverityText()) != "" || record.Body().Type() != pcommon.ValueTypeStr {
+		return severity, ok
+	}
+	return normalizedSeverity(plog.SeverityNumberUnspecified, record.Body().Str())
 }
 
 func logObservedAt(record plog.LogRecord, fallback time.Time) time.Time {
