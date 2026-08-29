@@ -128,6 +128,61 @@ test('configured inspection api keeps the generated client default token resolve
   assert.doesNotThrow(() => createInspectionApi({ baseUrl: 'https://control.example', fetchImpl: async () => new Response('{}') }));
 });
 
+test('configured inspection api resolves a fresh bootstrap token for every request', async () => {
+  const seen = [];
+  let tokenReads = 0;
+  const api = createInspectionApi({
+    baseUrl: 'https://control.example',
+    getAccessToken: async () => `inspection-token-${++tokenReads}`,
+    fetchImpl: async (url, init) => {
+      seen.push({ url, authorization: init.headers.Authorization });
+      return new Response(JSON.stringify({ target_count: 0, online_target_count: 0, latest_run_status_counts: {}, finding_level_counts: {} }), { headers: { 'Content-Type': 'application/json' } });
+    },
+  });
+
+  await api.getOverview({ tenantId: 'tenant-a', projectId: 'project-a' });
+  await api.getOverview({ tenantId: 'tenant-a', projectId: 'project-a' });
+
+  assert.equal(tokenReads, 2);
+  assert.deepEqual(seen.map((request) => request.authorization), ['Bearer inspection-token-1', 'Bearer inspection-token-2']);
+  assert.equal(seen.some((request) => request.url.includes('inspection-token')), false);
+});
+
+test('configured inspection without a token renders fixed unauthenticated state and never falls back to demo', async () => {
+  let authorization;
+  const api = createInspectionApi({
+    baseUrl: 'https://control.example',
+    getAccessToken: async () => undefined,
+    fetchImpl: async (_url, init) => {
+      authorization = init.headers.Authorization;
+      return new Response(JSON.stringify({ type: 'about:blank', title: 'unsafe token detail', status: 401, code: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/problem+json' } });
+    },
+  });
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 'tenant-a', projectId: 'project-a' }, permissions: { view: true } });
+
+  await center.open('overview');
+
+  assert.equal(authorization, undefined);
+  assert.match(root.innerHTML, /登录状态已失效，请重新登录/);
+  assert.doesNotMatch(root.innerHTML, /unsafe token detail|演示数据/);
+});
+
+test('inspection demo mode never invokes the bootstrap token provider', async () => {
+  let tokenReads = 0;
+  const api = createInspectionApi({
+    baseUrl: '',
+    getAccessToken: async () => {
+      tokenReads += 1;
+      throw new Error('demo must not request authentication');
+    },
+  });
+
+  const overview = await api.getOverview({ tenantId: 'demo', projectId: 'production' });
+  assert.equal(overview.source, 'demo');
+  assert.equal(tokenReads, 0);
+});
+
 test('inspection api normalizes generated Date fields without losing timestamps', async () => {
   const createdAt = new Date('2026-08-29T08:00:00Z');
   const client = { forScope: () => ({ inspection: { listInspectionRuns: () => Promise.resolve({ items: [{ id: 'run-1', createdAt }], page: { limit: 50, hasMore: false } }) }, requestOptions: (value) => value }) };
@@ -390,23 +445,30 @@ test('real adapter 412 refreshes policy state once without overwrite', async () 
   assert.equal(toasts.at(-1), '策略已被其他操作者更新，已刷新最新版本');
 });
 
-test('real adapter policy edit request aborts on scope change', async () => {
+test('real adapter policy edit request aborts on scope change while token refresh is pending', async () => {
   const seen = [];
-  const api = createInspectionApi({ baseUrl: 'https://control.example', fetchImpl: (url, init) => {
+  let releaseToken;
+  let tokenRequested;
+  const tokenPending = new Promise((resolve) => { releaseToken = resolve; });
+  const tokenStarted = new Promise((resolve) => { tokenRequested = resolve; });
+  const api = createInspectionApi({ baseUrl: 'https://control.example', getAccessToken: () => {
+    tokenRequested();
+    return tokenPending;
+  }, fetchImpl: (url, init) => {
     seen.push({ url, signal: init.signal });
-    if (new URL(url).pathname.endsWith('/inspection-policies/policy-1')) {
-      return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
-    }
+    if (init.signal?.aborted) return Promise.reject(new DOMException('aborted', 'AbortError'));
     return Promise.resolve(new Response(JSON.stringify({ target_count: 0, online_target_count: 0, latest_run_status_counts: {}, finding_level_counts: {} }), { headers: { 'Content-Type': 'application/json' } }));
   } });
   const root = { innerHTML: '', addEventListener() {} };
   const center = createInspectionCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' }, permissions: { view: true, manage: true } });
   center.editPolicy('policy-1');
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  const first = seen[0];
+  await tokenStarted;
   center.setScope({ tenantId: 't2', projectId: 'p2' });
+  releaseToken('short-lived-token');
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(first.signal.aborted, true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const staleRequest = seen.find((request) => request.url.includes('/tenants/t1/projects/p1/'));
+  assert.equal(staleRequest.signal.aborted, true);
   assert.match(seen.at(-1).url, /tenants\/t2\/projects\/p2\/inspection-overview$/);
 });
 

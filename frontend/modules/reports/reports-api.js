@@ -25,12 +25,12 @@ const DEMO_INSTANCES = {
  * URL selects the real control-plane API; otherwise the adapter supplies
  * explicitly marked, safe local demo data.
  */
-export function createReportsApi({ baseUrl = '', fetchImpl = globalThis.fetch, available = true, controlPlaneClient } = {}) {
+export function createReportsApi({ baseUrl = '', fetchImpl = globalThis.fetch, available = true, controlPlaneClient, getAccessToken } = {}) {
   if (!available) return createUnavailableAdapter();
   if (!baseUrl) return createDemoAdapter();
   if (typeof fetchImpl !== 'function') throw reportsFailure('network');
 
-  return createInspectionReportsAdapter(controlPlaneClient ?? createControlPlaneClient({ baseUrl, fetchImpl }));
+  return createInspectionReportsAdapter(controlPlaneClient ?? createControlPlaneClient({ baseUrl, fetchImpl, getAccessToken }));
 }
 
 function createInspectionReportsAdapter(client) {

@@ -141,6 +141,62 @@ test('failure messages and source labels never leak error detail', () => {
   assert.equal(reportsFailureMessage({ kind: 'unknown' }, '报告'), '暂时无法加载报告');
 });
 
+test('configured reports api resolves a fresh bootstrap token for every request', async () => {
+  const seen = [];
+  let tokenReads = 0;
+  const api = createReportsApi({
+    baseUrl: 'https://control.example',
+    getAccessToken: async () => `reports-token-${++tokenReads}`,
+    fetchImpl: async (url, init) => {
+      seen.push({ url, authorization: init.headers.Authorization });
+      return new Response(JSON.stringify({ items: [], page: { limit: 5, has_more: false } }), { headers: { 'Content-Type': 'application/json' } });
+    },
+  });
+
+  await api.getOverview({ tenantId: 'tenant-a', projectId: 'project-a' });
+  await api.listReports({ tenantId: 'tenant-a', projectId: 'project-a' });
+
+  assert.equal(tokenReads, 2);
+  assert.deepEqual(seen.map((request) => request.authorization), ['Bearer reports-token-1', 'Bearer reports-token-2']);
+  assert.equal(seen.some((request) => request.url.includes('reports-token')), false);
+});
+
+test('configured reports without a token renders fixed unauthenticated state and never falls back to demo', async () => {
+  let authorization;
+  const api = createReportsApi({
+    baseUrl: 'https://control.example',
+    getAccessToken: async () => undefined,
+    fetchImpl: async (_url, init) => {
+      authorization = init.headers.Authorization;
+      return new Response(JSON.stringify({ type: 'about:blank', title: 'unsafe token detail', status: 401, code: 'unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/problem+json' } });
+    },
+  });
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createReportsCenter({ root, api, scope: { tenantId: 'tenant-a', projectId: 'project-a' }, permissions: { manage: false } });
+
+  center.open('overview');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(authorization, undefined);
+  assert.match(root.innerHTML, /登录状态已失效，请重新登录/);
+  assert.doesNotMatch(root.innerHTML, /unsafe token detail|演示数据/);
+});
+
+test('reports demo mode never invokes the bootstrap token provider', async () => {
+  let tokenReads = 0;
+  const api = createReportsApi({
+    baseUrl: '',
+    getAccessToken: async () => {
+      tokenReads += 1;
+      throw new Error('demo must not request authentication');
+    },
+  });
+
+  const overview = await api.getOverview({ tenantId: 'demo', projectId: 'production' });
+  assert.equal(overview.source, 'demo');
+  assert.equal(tokenReads, 0);
+});
+
 test('center renders overview markers from a fake scoped api', async () => {
   const root = { innerHTML: '', addEventListener() {} };
   const api = {
