@@ -369,7 +369,12 @@ func (api platformAPI) ListInspectionTargets(ctx context.Context, request openap
 		if !connectivity.Valid() {
 			return nil, errors.New("inspection target has invalid connectivity")
 		}
-		items[index] = openapi.InspectionTarget{AgentId: value.AgentID, DisplayName: value.DisplayName, Host: value.Host, Labels: cloneStringMap(value.Labels), Connectivity: connectivity, Capabilities: append([]string{}, value.Capabilities...)}
+		item := openapi.InspectionTarget{AgentId: value.AgentID, DisplayName: value.DisplayName, Host: value.Host, Labels: cloneStringMap(value.Labels), Connectivity: connectivity, Capabilities: append([]string{}, value.Capabilities...)}
+		if !value.AgentControlHeartbeatAt.IsZero() {
+			heartbeatAt := value.AgentControlHeartbeatAt.UTC()
+			item.AgentControlHeartbeatAt = &heartbeatAt
+		}
+		items[index] = item
 	}
 	return openapi.ListInspectionTargets200JSONResponse{Items: items, Page: inspectionPage(filter.Limit, page.More, page.NextCursor)}, nil
 }

@@ -1,10 +1,10 @@
 import { spawn } from 'node:child_process';
-import { readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import https from 'node:https';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const PHASES = new Set(['normal', 'post-restart', 'unauthorized']);
+const PHASES = new Set(['normal', 'post-restart', 'unauthorized', 'rogue']);
 const REQUIRED_CAPABILITY = 'collect_now.host.v1';
 
 export async function runCommunicationPhase(phase, dependencies = {}) {
@@ -27,7 +27,20 @@ export async function runCommunicationPhase(phase, dependencies = {}) {
       return state;
     }
 
+    if (phase === 'rogue') {
+      const previous = validatePhaseState(await requiredFunction(dependencies.readState, 'phase state reader')());
+      const observation = validateObservation(await requiredFunction(dependencies.observe, 'communication observer')(previous));
+      const rogueResult = { ...dependencies.rogueResult, inventory: observation.inventory };
+      assertRogueAgentRejected(rogueResult);
+      if (!validTimestamp(rogueResult.observedAt)) throw new Error('rogue Agent observation timestamp is invalid');
+      const field = rogueResult.kind === 'untrusted' ? 'rogue_untrusted_verified_at' : 'rogue_mismatch_verified_at';
+      const state = Object.freeze({ ...previous, [field]: rogueResult.observedAt });
+      await requiredFunction(dependencies.writeState, 'phase state writer')(state);
+      return state;
+    }
+
     const previous = validatePhaseState(await requiredFunction(dependencies.readState, 'phase state reader')());
+    const faultWindow = validateFaultWindow(dependencies.faultWindow);
     const observation = await waitForObservation(
       dependencies,
       (candidate) => postRestartAdvanced(previous, candidate),
@@ -35,8 +48,12 @@ export async function runCommunicationPhase(phase, dependencies = {}) {
     );
     const state = Object.freeze({
       ...mergeObservation(previous, observation),
-      pre_restart_accepted_at: previous.pre_restart_accepted_at ?? previous.accepted_at,
-      post_restart_accepted_at: observation.accepted_at,
+      controlplane_stopped_at: faultWindow.stoppedAt,
+      controlplane_restarted_at: faultWindow.restartedAt,
+      pre_restart_metric_sample_at: previous.metric_sample_at,
+      post_restart_metric_sample_at: observation.metric_sample_at,
+      pre_restart_agent_control_heartbeat_at: previous.agent_control_heartbeat_at,
+      post_restart_agent_control_heartbeat_at: observation.agent_control_heartbeat_at,
     });
     await requiredFunction(dependencies.writeState, 'phase state writer')(state);
     return state;
@@ -52,31 +69,21 @@ export async function collectRuntimeObservation({
   projectID,
   onlineAgentID,
   offlineAgentID,
-  now = new Date(),
 } = {}) {
   if (typeof requestJSON !== 'function' || ![tenantID, projectID, onlineAgentID, offlineAgentID].every(validIdentifier)) {
     throw new Error('runtime communication observation input is invalid');
   }
   const scopePath = `/api/v1/tenants/${encodeURIComponent(tenantID)}/projects/${encodeURIComponent(projectID)}`;
-  const from = new Date(now.getTime() - 30 * 60 * 1_000).toISOString();
-  const to = now.toISOString();
-  const seriesPath = `${scopePath}/monitoring/series?instance_id=${encodeURIComponent(onlineAgentID)}&metric=${encodeURIComponent('dbpilot.inspection.host.spool.pending_batch_count')}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&step=5s`;
-  const [targets, instances, series] = await Promise.all([
+  const [targets, instances] = await Promise.all([
     requestJSON(`${scopePath}/inspection-targets?limit=100`),
     requestJSON(`${scopePath}/monitoring/instances?limit=100`),
-    requestJSON(seriesPath),
   ]);
-  const buckets = Array.isArray(series?.series?.buckets) ? series.series.buckets : [];
-  const normalizedPoints = buckets
-    .filter((bucket) => bucket?.value !== null && bucket?.value !== undefined)
-    .map((bucket) => ({ at: canonicalTimestamp(bucket?.at), value: nonnegativeInteger(bucket?.value) }));
-  if (normalizedPoints.length === 0) throw new Error('authenticated telemetry acceptance observation is empty');
-  const latest = normalizedPoints.at(-1);
   const instance = (instances?.items ?? []).find((item) => item?.agent_id === onlineAgentID || item?.id === onlineAgentID);
   const inventory = Array.isArray(targets?.items) ? targets.items.map((item) => ({
     agent_id: String(item?.agent_id ?? ''),
     connectivity: String(item?.connectivity ?? ''),
     capabilities: Array.isArray(item?.capabilities) ? item.capabilities.map(String) : [],
+    agent_control_heartbeat_at: item?.agent_control_heartbeat_at,
   })) : [];
 
   let reportCount = 0;
@@ -104,11 +111,8 @@ export async function collectRuntimeObservation({
   }
   return validateObservation({
     inventory,
-    accepted_at: canonicalTimestamp(instance?.last_sample_at),
-    heartbeat_at: canonicalTimestamp(instance?.last_heartbeat_at),
-    accepted_count: normalizedPoints.length,
-    spool_observed_count: normalizedPoints.reduce((sum, point) => sum + point.value, 0),
-    spool_pending_count: latest.value,
+    metric_sample_at: canonicalTimestamp(instance?.last_sample_at),
+    agent_control_heartbeat_at: canonicalTimestamp(inventory.find((item) => item.agent_id === onlineAgentID)?.agent_control_heartbeat_at),
     report_count: reportCount,
     finding_count: findingCount,
     audit_count: auditCount,
@@ -118,15 +122,17 @@ export async function collectRuntimeObservation({
 
 export function assertRogueAgentRejected(result) {
   if (!result || !['untrusted', 'mismatch'].includes(result.kind)) throw new Error('rogue Agent result is invalid');
-  if (!Number.isInteger(result.inventoryRows) || !Number.isInteger(result.dataRows) || result.inventoryRows < 0 || result.dataRows < 0) {
-    throw new Error('rogue Agent row counts are invalid');
+  if (!Array.isArray(result.inventory) || !Number.isInteger(result.exitCode) || typeof result.timedOut !== 'boolean') throw new Error('rogue Agent result is invalid');
+  if ((result.timedOut && result.exitCode !== 124) || (!result.timedOut && result.exitCode === 0)) throw new Error('rogue Agent process result is invalid');
+  const requiredIDs = result.kind === 'untrusted' ? ['agent-untrusted'] : ['agent-claimed-id', 'agent-certificate-id'];
+  for (const agentID of requiredIDs) {
+    const matches = result.inventory.filter((target) => target?.agent_id === agentID);
+    if (matches.length !== 1 || matches[0].connectivity !== 'offline') throw new Error('rogue Agent target is not authoritatively offline');
   }
-  if (result.inventoryRows !== 0 || result.dataRows !== 0) throw new Error('rogue Agent created inventory or data rows');
-  if (!result.timedOut && result.exitCode === 0) throw new Error('rogue Agent unexpectedly completed successfully');
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   const expected = result.kind === 'untrusted'
-    ? /(?:tls|x509|certificate|unknown authority|authentication handshake)/i
-    : /(?:permissiondenied|permission denied|identity mismatch)/i;
+    ? /(?:x509:\s*certificate signed by unknown authority|authentication handshake failed[^\n]*unknown authority|tls[^\n]*(?:failed to verify certificate|unknown certificate authority))/i
+    : /code\s*=\s*PermissionDenied[^\n]*(?:Hello Agent ID[^\n]*verified SPIFFE identity|SPIFFE[^\n]*mismatch)/i;
   if (!expected.test(output)) throw new Error(`rogue ${result.kind} Agent rejection evidence is missing`);
 }
 
@@ -150,19 +156,20 @@ async function waitForObservation(dependencies, predicate, timeoutMessage) {
 function communicationReady(observation) {
   const online = observation.inventory.find((agent) => agent.agent_id === 'agent-online');
   const offline = observation.inventory.find((agent) => agent.agent_id === 'agent-offline');
-  return observation.inventory.length === 2
+  const rogueOffline = ['agent-untrusted', 'agent-claimed-id', 'agent-certificate-id'].every((agentID) => (
+    observation.inventory.filter((agent) => agent.agent_id === agentID && agent.connectivity === 'offline').length === 1
+  ));
+  return observation.inventory.length === 5
     && online?.connectivity === 'online'
     && online.capabilities.includes(REQUIRED_CAPABILITY)
-    && offline?.connectivity === 'offline';
+    && offline?.connectivity === 'offline'
+    && rogueOffline;
 }
 
 function postRestartAdvanced(previous, observation) {
   return communicationReady(observation)
-    && Date.parse(observation.accepted_at) > Date.parse(previous.accepted_at)
-    && Date.parse(observation.heartbeat_at) > Date.parse(previous.heartbeat_at)
-    && observation.accepted_count > previous.accepted_count
-    && observation.spool_observed_count > previous.spool_observed_count
-    && observation.spool_pending_count === 0
+    && Date.parse(observation.metric_sample_at) > Date.parse(previous.metric_sample_at)
+    && Date.parse(observation.agent_control_heartbeat_at) > Date.parse(previous.agent_control_heartbeat_at)
     && observation.report_count === previous.report_count
     && observation.finding_count === previous.finding_count
     && observation.audit_count === previous.audit_count
@@ -172,11 +179,8 @@ function postRestartAdvanced(previous, observation) {
 function mergeObservation(state, observation) {
   return Object.freeze({
     ...state,
-    accepted_at: observation.accepted_at,
-    heartbeat_at: observation.heartbeat_at,
-    accepted_count: observation.accepted_count,
-    spool_observed_count: observation.spool_observed_count,
-    spool_pending_count: observation.spool_pending_count,
+    metric_sample_at: observation.metric_sample_at,
+    agent_control_heartbeat_at: observation.agent_control_heartbeat_at,
     report_count: observation.report_count,
     finding_count: observation.finding_count,
     audit_count: observation.audit_count,
@@ -199,16 +203,27 @@ function validateBrowserState(value) {
 
 function validatePhaseState(value) {
   const state = validateBrowserState(value);
-  for (const name of ['accepted_at', 'heartbeat_at']) {
+  for (const name of ['metric_sample_at', 'agent_control_heartbeat_at']) {
     if (!validTimestamp(value[name])) throw new Error('communication phase timestamp is invalid');
   }
-  for (const name of ['accepted_count', 'spool_observed_count', 'spool_pending_count', 'report_count', 'finding_count', 'audit_count']) {
+  for (const name of ['report_count', 'finding_count', 'audit_count']) {
     if (!Number.isSafeInteger(value[name]) || value[name] < 0) throw new Error('communication phase counter is invalid');
   }
-  return Object.freeze({ ...state, ...Object.fromEntries([
-    'accepted_at', 'heartbeat_at', 'accepted_count', 'spool_observed_count', 'spool_pending_count',
-    'report_count', 'finding_count', 'audit_count',
-  ].map((name) => [name, value[name]])) });
+  const result = { ...state, ...Object.fromEntries([
+    'metric_sample_at', 'agent_control_heartbeat_at', 'report_count', 'finding_count', 'audit_count',
+  ].map((name) => [name, value[name]])) };
+  for (const name of [
+    'controlplane_stopped_at', 'controlplane_restarted_at',
+    'pre_restart_metric_sample_at', 'post_restart_metric_sample_at',
+    'pre_restart_agent_control_heartbeat_at', 'post_restart_agent_control_heartbeat_at',
+    'rogue_untrusted_verified_at', 'rogue_mismatch_verified_at',
+  ]) {
+    if (value[name] !== undefined) {
+      if (!validTimestamp(value[name])) throw new Error('communication phase timestamp is invalid');
+      result[name] = value[name];
+    }
+  }
+  return Object.freeze(result);
 }
 
 function validateObservation(value) {
@@ -219,8 +234,8 @@ function validateObservation(value) {
     }
     return { agent_id: agent.agent_id, connectivity: agent.connectivity, capabilities: agent.capabilities.map(String) };
   });
-  if (!validTimestamp(value.accepted_at) || !validTimestamp(value.heartbeat_at)) throw new Error('communication observation timestamp is invalid');
-  for (const name of ['accepted_count', 'spool_observed_count', 'spool_pending_count', 'report_count', 'finding_count', 'audit_count']) {
+  if (!validTimestamp(value.metric_sample_at) || !validTimestamp(value.agent_control_heartbeat_at)) throw new Error('communication observation timestamp is invalid');
+  for (const name of ['report_count', 'finding_count', 'audit_count']) {
     if (!Number.isSafeInteger(value[name]) || value[name] < 0) throw new Error('communication observation counter is invalid');
   }
   if (!validIdentifier(value.terminal_command_id)) throw new Error('terminal command observation is invalid');
@@ -249,12 +264,6 @@ function positiveInteger(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
-function nonnegativeInteger(value) {
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < 0) throw new Error('spool counter observation is invalid');
-  return number;
-}
-
 function canonicalTimestamp(value) {
   if (!validTimestamp(value)) throw new Error('runtime communication timestamp is invalid');
   return value;
@@ -280,7 +289,7 @@ async function commandMain(arguments_) {
   const phase = arguments_[0];
   let sensitiveValues = [];
   try {
-    const runtime = await createRuntimeDependencies();
+    const runtime = await createRuntimeDependencies(phase);
     sensitiveValues = runtime.sensitiveValues;
     await runCommunicationPhase(phase, runtime);
     process.stdout.write(`communication phase ${phase} passed\n`);
@@ -291,7 +300,7 @@ async function commandMain(arguments_) {
   }
 }
 
-async function createRuntimeDependencies() {
+async function createRuntimeDependencies(phase) {
   const environment = requiredEnvironment([
     'FRONTEND_URL', 'OIDC_URL', 'OIDC_CA_FILE', 'OIDC_CREDENTIAL_FILE', 'ACCEPTANCE_STATE_FILE',
     'TENANT_ID', 'PROJECT_ID', 'EXPECTED_ONLINE_AGENT_ID', 'EXPECTED_OFFLINE_AGENT_ID',
@@ -323,9 +332,28 @@ async function createRuntimeDependencies() {
     await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'w' });
     await rename(temporary, environment.ACCEPTANCE_STATE_FILE);
   };
+  const faultWindow = phase === 'post-restart' ? validateFaultWindow({
+    stoppedAt: process.env.CONTROLPLANE_STOPPED_AT,
+    restartedAt: process.env.CONTROLPLANE_RESTARTED_AT,
+  }) : undefined;
+  let rogueResult;
+  if (phase === 'rogue') {
+    const rogueEnvironment = requiredEnvironment(['ROGUE_KIND', 'ROGUE_EXIT_CODE', 'ROGUE_TIMED_OUT', 'ROGUE_LOG_FILE', 'ROGUE_OBSERVED_AT']);
+    if (!path.isAbsolute(rogueEnvironment.ROGUE_LOG_FILE)) throw new Error('rogue Agent log path is invalid');
+    const info = await stat(rogueEnvironment.ROGUE_LOG_FILE);
+    if (!info.isFile() || info.size > 1_000_000) throw new Error('rogue Agent log is unavailable or oversized');
+    const exitCode = Number(rogueEnvironment.ROGUE_EXIT_CODE);
+    if (!Number.isInteger(exitCode) || !['true', 'false'].includes(rogueEnvironment.ROGUE_TIMED_OUT)) throw new Error('rogue Agent process result is invalid');
+    rogueResult = {
+      kind: rogueEnvironment.ROGUE_KIND, exitCode, timedOut: rogueEnvironment.ROGUE_TIMED_OUT === 'true',
+      stderr: await readFile(rogueEnvironment.ROGUE_LOG_FILE, 'utf8'), observedAt: rogueEnvironment.ROGUE_OBSERVED_AT,
+    };
+  }
   return {
     sensitiveValues: [credential, accessToken],
     maxAttempts: 120,
+    faultWindow,
+    rogueResult,
     observe: async (state) => collectRuntimeObservation({
       state, requestJSON,
       tenantID: environment.TENANT_ID, projectID: environment.PROJECT_ID,
@@ -340,6 +368,13 @@ async function createRuntimeDependencies() {
       return result;
     },
   };
+}
+
+function validateFaultWindow(value) {
+  if (!value || !validTimestamp(value.stoppedAt) || !validTimestamp(value.restartedAt) || Date.parse(value.restartedAt) <= Date.parse(value.stoppedAt)) {
+    throw new Error('control-plane outage window is invalid');
+  }
+  return Object.freeze({ stoppedAt: value.stoppedAt, restartedAt: value.restartedAt });
 }
 
 function spawnPhaseProcess(phase, environment) {

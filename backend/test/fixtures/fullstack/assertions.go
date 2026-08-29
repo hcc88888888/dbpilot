@@ -12,38 +12,63 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/spool"
 )
 
 type AssertionOptions struct {
-	Version               int       `json:"version"`
-	TenantID              string    `json:"tenant_id"`
-	ProjectID             string    `json:"project_id"`
-	PolicyID              string    `json:"policy_id"`
-	RunID                 string    `json:"run_id"`
-	JobID                 string    `json:"job_id"`
-	ReportID              string    `json:"report_id"`
-	OnlineAgentID         string    `json:"online_agent_id"`
-	OfflineAgentID        string    `json:"offline_agent_id"`
-	OnlineCommandID       string    `json:"online_command_id"`
-	OfflineCommandID      string    `json:"offline_command_id"`
-	JournalCommandID      string    `json:"journal_command_id"`
-	AuditCorrelation      string    `json:"audit_correlation"`
-	AcceptedAt            time.Time `json:"accepted_at"`
-	HeartbeatAt           time.Time `json:"heartbeat_at"`
-	PreRestartAcceptedAt  time.Time `json:"pre_restart_accepted_at"`
-	PostRestartAcceptedAt time.Time `json:"post_restart_accepted_at"`
-	AcceptedCount         int       `json:"accepted_count"`
-	SpoolObservedCount    int       `json:"spool_observed_count"`
-	SpoolPendingCount     int       `json:"spool_pending_count"`
-	ReportCount           int       `json:"report_count"`
-	FindingCount          int       `json:"finding_count"`
-	AuditCount            int       `json:"audit_count"`
-	SensitiveValues       []string  `json:"-"`
+	Version                            int       `json:"version"`
+	TenantID                           string    `json:"tenant_id"`
+	ProjectID                          string    `json:"project_id"`
+	PolicyID                           string    `json:"policy_id"`
+	RunID                              string    `json:"run_id"`
+	JobID                              string    `json:"job_id"`
+	ReportID                           string    `json:"report_id"`
+	OnlineAgentID                      string    `json:"online_agent_id"`
+	OfflineAgentID                     string    `json:"offline_agent_id"`
+	OnlineCommandID                    string    `json:"online_command_id"`
+	OfflineCommandID                   string    `json:"offline_command_id"`
+	JournalCommandID                   string    `json:"journal_command_id"`
+	AuditCorrelation                   string    `json:"audit_correlation"`
+	MetricSampleAt                     time.Time `json:"metric_sample_at"`
+	AgentControlHeartbeatAt            time.Time `json:"agent_control_heartbeat_at"`
+	ControlplaneStoppedAt              time.Time `json:"controlplane_stopped_at"`
+	ControlplaneRestartedAt            time.Time `json:"controlplane_restarted_at"`
+	PreRestartMetricSampleAt           time.Time `json:"pre_restart_metric_sample_at"`
+	PostRestartMetricSampleAt          time.Time `json:"post_restart_metric_sample_at"`
+	PreRestartAgentControlHeartbeatAt  time.Time `json:"pre_restart_agent_control_heartbeat_at"`
+	PostRestartAgentControlHeartbeatAt time.Time `json:"post_restart_agent_control_heartbeat_at"`
+	ReplayBatchID                      string    `json:"replay_batch_id"`
+	ReplaySampledFrom                  time.Time `json:"replay_sampled_from"`
+	ReplaySampledTo                    time.Time `json:"replay_sampled_to"`
+	ReplayAcceptedAt                   time.Time `json:"replay_accepted_at"`
+	ReplayPendingBatchCount            int       `json:"replay_pending_batch_count"`
+	RogueUntrustedVerifiedAt           time.Time `json:"rogue_untrusted_verified_at"`
+	RogueMismatchVerifiedAt            time.Time `json:"rogue_mismatch_verified_at"`
+	ReportCount                        int       `json:"report_count"`
+	FindingCount                       int       `json:"finding_count"`
+	AuditCount                         int       `json:"audit_count"`
+	SensitiveValues                    []string  `json:"-"`
 }
 
 type JournalAssertion struct {
 	CommandID       string   `json:"command_id"`
 	SensitiveValues []string `json:"-"`
+}
+
+type ReplayAssertion struct {
+	TenantID                string    `json:"tenant_id"`
+	ProjectID               string    `json:"project_id"`
+	AgentID                 string    `json:"online_agent_id"`
+	ControlplaneStoppedAt   time.Time `json:"controlplane_stopped_at"`
+	ControlplaneRestartedAt time.Time `json:"controlplane_restarted_at"`
+}
+
+type ReplayEvidence struct {
+	BatchID           string    `json:"replay_batch_id"`
+	SampledFrom       time.Time `json:"replay_sampled_from"`
+	SampledTo         time.Time `json:"replay_sampled_to"`
+	AcceptedAt        time.Time `json:"replay_accepted_at"`
+	PendingBatchCount int       `json:"replay_pending_batch_count"`
 }
 
 const (
@@ -56,7 +81,42 @@ const (
 	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id"
 	assertMetricsSQL   = "SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint"
 	assertRogueRowsSQL = "SELECT (SELECT COUNT(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND target_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND resource_id IN ($3, $4, $5))"
+	assertReplaySQL    = "SELECT agent_id, batch_id, sampled_from, sampled_to, accepted_at, COUNT(*) OVER (PARTITION BY agent_id, batch_id) AS identity_count FROM ingest_batch_dedup WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 AND state = 'accepted' AND sampled_from >= $4 AND sampled_to <= $5 AND accepted_at > $5 ORDER BY sampled_from, batch_id LIMIT 1"
 )
+
+func AssertReplay(ctx context.Context, database *sql.DB, spoolRoot string, assertion ReplayAssertion) (ReplayEvidence, error) {
+	if ctx == nil || database == nil || !filepath.IsAbs(spoolRoot) {
+		return ReplayEvidence{}, errors.New("replay assertion input is invalid")
+	}
+	for _, value := range []string{assertion.TenantID, assertion.ProjectID, assertion.AgentID} {
+		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\t") {
+			return ReplayEvidence{}, errors.New("replay assertion identity is invalid")
+		}
+	}
+	if assertion.ControlplaneStoppedAt.IsZero() || !assertion.ControlplaneRestartedAt.After(assertion.ControlplaneStoppedAt) {
+		return ReplayEvidence{}, errors.New("replay assertion outage window is invalid")
+	}
+	var evidence ReplayEvidence
+	var agentID string
+	var identityCount int
+	err := database.QueryRowContext(ctx, assertReplaySQL, assertion.TenantID, assertion.ProjectID, assertion.AgentID, assertion.ControlplaneStoppedAt, assertion.ControlplaneRestartedAt).
+		Scan(&agentID, &evidence.BatchID, &evidence.SampledFrom, &evidence.SampledTo, &evidence.AcceptedAt, &identityCount)
+	if err != nil {
+		return ReplayEvidence{}, fmt.Errorf("query exact outage batch: %w", err)
+	}
+	if agentID != assertion.AgentID || evidence.BatchID == "" || identityCount != 1 || evidence.SampledFrom.Before(assertion.ControlplaneStoppedAt) || evidence.SampledTo.After(assertion.ControlplaneRestartedAt) || evidence.SampledTo.Before(evidence.SampledFrom) || !evidence.AcceptedAt.After(assertion.ControlplaneRestartedAt) {
+		return ReplayEvidence{}, errors.New("exact outage batch evidence is invalid")
+	}
+	pending, err := spool.PendingBatchCount(spoolRoot)
+	if err != nil {
+		return ReplayEvidence{}, fmt.Errorf("inspect stopped Agent spool: %w", err)
+	}
+	evidence.PendingBatchCount = pending
+	if pending != 0 {
+		return ReplayEvidence{}, fmt.Errorf("stopped Agent spool has %d pending batches", pending)
+	}
+	return evidence, nil
+}
 
 func AssertDatabase(ctx context.Context, database *sql.DB, options AssertionOptions) error {
 	if ctx == nil {
@@ -115,8 +175,20 @@ func validateAssertionOptions(options AssertionOptions) error {
 	if options.OnlineCommandID == options.OfflineCommandID || options.JournalCommandID != options.OnlineCommandID {
 		return errors.New("database assertion Command IDs are invalid")
 	}
-	if options.PreRestartAcceptedAt.IsZero() != options.PostRestartAcceptedAt.IsZero() || (!options.PreRestartAcceptedAt.IsZero() && !options.PostRestartAcceptedAt.After(options.PreRestartAcceptedAt)) {
-		return errors.New("database assertion restart timestamps are invalid")
+	if options.ControlplaneStoppedAt.IsZero() != options.ControlplaneRestartedAt.IsZero() || (!options.ControlplaneStoppedAt.IsZero() && !options.ControlplaneRestartedAt.After(options.ControlplaneStoppedAt)) {
+		return errors.New("database assertion outage timestamps are invalid")
+	}
+	if !options.ControlplaneStoppedAt.IsZero() && (options.PreRestartMetricSampleAt.IsZero() || !options.PostRestartMetricSampleAt.After(options.PreRestartMetricSampleAt) || options.PreRestartAgentControlHeartbeatAt.IsZero() || !options.PostRestartAgentControlHeartbeatAt.After(options.PreRestartAgentControlHeartbeatAt)) {
+		return errors.New("database assertion post-restart liveness evidence is invalid")
+	}
+	if options.ControlplaneStoppedAt.IsZero() != (options.ReplayBatchID == "") {
+		return errors.New("database assertion replay evidence is incomplete")
+	}
+	if options.ReplayBatchID != "" && (options.ReplaySampledFrom.Before(options.ControlplaneStoppedAt) || options.ReplaySampledTo.After(options.ControlplaneRestartedAt) || options.ReplaySampledTo.Before(options.ReplaySampledFrom) || !options.ReplayAcceptedAt.After(options.ControlplaneRestartedAt) || options.ReplayPendingBatchCount != 0) {
+		return errors.New("database assertion replay evidence is invalid")
+	}
+	if options.ReplayBatchID != "" && (options.RogueUntrustedVerifiedAt.Before(options.ControlplaneRestartedAt) || options.RogueMismatchVerifiedAt.Before(options.ControlplaneRestartedAt)) {
+		return errors.New("database assertion rogue evidence is incomplete")
 	}
 	return nil
 }
@@ -433,7 +505,6 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 	defer rows.Close()
 	seen := make(map[string]struct{})
 	count := 0
-	postRestartReplay := options.PostRestartAcceptedAt.IsZero()
 	for rows.Next() {
 		var agentID, metric, seriesFingerprint, sourceID string
 		var sampledAt, acceptedAt time.Time
@@ -453,9 +524,6 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 			return errors.New("metric sample is duplicated")
 		}
 		seen[key] = struct{}{}
-		if !options.PostRestartAcceptedAt.IsZero() && sampledAt.Equal(options.PostRestartAcceptedAt) && acceptedAt.After(options.PreRestartAcceptedAt) {
-			postRestartReplay = true
-		}
 		count++
 	}
 	if err := rows.Err(); err != nil {
@@ -464,10 +532,19 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 	if count == 0 {
 		return errors.New("accepted online metric sample is missing")
 	}
-	if !postRestartReplay {
-		return errors.New("post-restart replay sample is missing")
-	}
 	return nil
+}
+
+func WithReplayEvidence(options AssertionOptions, evidence ReplayEvidence) (AssertionOptions, error) {
+	if options.ControlplaneStoppedAt.IsZero() || !options.ControlplaneRestartedAt.After(options.ControlplaneStoppedAt) || evidence.BatchID == "" || evidence.SampledFrom.Before(options.ControlplaneStoppedAt) || evidence.SampledTo.After(options.ControlplaneRestartedAt) || evidence.SampledTo.Before(evidence.SampledFrom) || !evidence.AcceptedAt.After(options.ControlplaneRestartedAt) || evidence.PendingBatchCount != 0 {
+		return AssertionOptions{}, errors.New("replay evidence cannot be persisted")
+	}
+	options.ReplayBatchID = evidence.BatchID
+	options.ReplaySampledFrom = evidence.SampledFrom
+	options.ReplaySampledTo = evidence.SampledTo
+	options.ReplayAcceptedAt = evidence.AcceptedAt
+	options.ReplayPendingBatchCount = evidence.PendingBatchCount
+	return options, nil
 }
 
 func assertRogueRows(ctx context.Context, database *sql.DB, options AssertionOptions) error {

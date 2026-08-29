@@ -515,6 +515,7 @@ func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabiliti
 	require.Equal(t, "offline", offline[0].Connectivity)
 	require.Empty(t, offline[0].Capabilities)
 	require.Empty(t, offline[0].AdvertisedSources)
+	require.True(t, offline[0].AgentControlHeartbeatAt.IsZero())
 
 	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"host.inspect"}}
 	withoutCollectNow, err := resolver.List(context.Background(), scope)
@@ -529,10 +530,12 @@ func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabiliti
 	require.Equal(t, []string{"collect_now", "host.inspect"}, rollingOld[0].Capabilities)
 	require.Empty(t, rollingOld[0].AdvertisedSources, "generic rolling Agent capability must not overclaim host sources")
 
-	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "collect_now.host.v1", "host.inspect"}}
+	heartbeatAt := time.Date(2026, 8, 29, 10, 1, 0, 0, time.UTC)
+	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "collect_now.host.v1", "host.inspect"}, LastHeartbeat: heartbeatAt}
 	online, err := resolver.List(context.Background(), scope)
 	require.NoError(t, err)
 	require.Equal(t, []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, online[0].AdvertisedSources)
+	require.Equal(t, heartbeatAt, online[0].AgentControlHeartbeatAt)
 }
 
 func TestLiveInspectionResolverCreateRunEvaluatorKeepsCollectNowSources(t *testing.T) {

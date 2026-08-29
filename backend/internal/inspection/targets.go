@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
 )
@@ -15,14 +16,15 @@ var (
 )
 
 type HostTarget struct {
-	Scope             platformscope.Scope `json:"scope"`
-	AgentID           string              `json:"agent_id"`
-	DisplayName       string              `json:"display_name"`
-	Host              string              `json:"host"`
-	Labels            map[string]string   `json:"labels"`
-	Connectivity      string              `json:"connectivity"`
-	Capabilities      []string            `json:"capabilities"`
-	AdvertisedSources []SourceType        `json:"advertised_sources,omitempty"`
+	Scope                   platformscope.Scope `json:"scope"`
+	AgentID                 string              `json:"agent_id"`
+	DisplayName             string              `json:"display_name"`
+	Host                    string              `json:"host"`
+	Labels                  map[string]string   `json:"labels"`
+	Connectivity            string              `json:"connectivity"`
+	AgentControlHeartbeatAt time.Time           `json:"agent_control_heartbeat_at,omitempty"`
+	Capabilities            []string            `json:"capabilities"`
+	AdvertisedSources       []SourceType        `json:"advertised_sources,omitempty"`
 }
 
 type TargetResolver interface {
@@ -104,7 +106,7 @@ func (resolver *ConfiguredTargetResolver) List(ctx context.Context, scope platfo
 }
 
 func validateHostTarget(target HostTarget) error {
-	if target.Scope.Validate() != nil || !validID(target.AgentID) || strings.TrimSpace(target.DisplayName) == "" || len(target.DisplayName) > 120 || strings.TrimSpace(target.Host) == "" || len(target.Host) > 255 || !validSelectorLabels(target.Labels) || len(target.Capabilities) > 128 {
+	if target.Scope.Validate() != nil || !validID(target.AgentID) || strings.TrimSpace(target.DisplayName) == "" || len(target.DisplayName) > 120 || strings.TrimSpace(target.Host) == "" || len(target.Host) > 255 || !validSelectorLabels(target.Labels) || len(target.Capabilities) > 128 || (!target.AgentControlHeartbeatAt.IsZero() && target.AgentControlHeartbeatAt.Location() != time.UTC) {
 		return ErrInvalid
 	}
 	for _, capability := range target.Capabilities {

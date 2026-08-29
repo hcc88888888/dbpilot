@@ -411,6 +411,12 @@ services:
           journal)
             exec /acceptance/bin/dbpilot-fullstack-fixture journal --path /acceptance/state/agent-online/command-journal.db --phase-state-file /acceptance/state/phase-state.json
             ;;
+          replay)
+            password="$$(cat /acceptance/secrets/postgres-password)"
+            umask 077
+            printf 'postgres://dbpilot:%s@postgres/dbpilot?sslmode=disable' "$${password}" >/tmp/postgres-dsn
+            exec /acceptance/bin/dbpilot-fullstack-fixture replay --dsn-file /tmp/postgres-dsn --phase-state-file /acceptance/state/phase-state.json --spool-root /acceptance/state/agent-online
+            ;;
           *)
             echo 'assertion phase is invalid' >&2
             exit 2
@@ -426,7 +432,7 @@ services:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-config:/acceptance/config:ro
       - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-state:/acceptance/state:ro
+      - acceptance-state:/acceptance/state
       - acceptance-agent-data:/acceptance/state/agent-online:ro
     networks: [acceptance]
     labels: *ownership-labels

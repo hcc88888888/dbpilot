@@ -176,6 +176,19 @@ func TestMetricSampleAcceptanceMigrationPersistsIngestFence(t *testing.T) {
 	require.Contains(t, content, "metric_samples_inspection_acceptance_idx")
 }
 
+func TestIngestBatchSampleRangeMigrationPersistsReplayIdentity(t *testing.T) {
+	migration, err := os.ReadFile(filepath.Join("migrations", "0008_ingest_batch_sample_range.sql"))
+	require.NoError(t, err)
+	content := string(migration)
+	require.Contains(t, content, "ALTER TABLE ingest_batch_dedup")
+	require.Contains(t, content, "sampled_from TIMESTAMPTZ")
+	require.Contains(t, content, "sampled_to TIMESTAMPTZ")
+	require.Contains(t, content, "tenant_id TEXT")
+	require.Contains(t, content, "project_id TEXT")
+	require.Contains(t, content, "sampled_from <= sampled_to")
+	require.Contains(t, content, "ingest_batch_dedup_replay_idx")
+}
+
 func TestPostgresRepositoryRejectsInvalidEventsBeforeWriting(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)

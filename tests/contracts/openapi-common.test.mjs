@@ -135,7 +135,7 @@ test('bundled contract structurally defines the common platform contract', async
   assert.match(document.components.schemas.UtcTimestamp.description, /UTC/);
   assert.equal(document.components.schemas.UtcTimestamp.pattern, utcPattern);
 
-  const { Job, Artifact, DownloadDescriptor, AuditEvent } = document.components.schemas;
+  const { Job, Artifact, DownloadDescriptor, AuditEvent, InspectionTarget } = document.components.schemas;
   assertUtcTimestampReference(Job.properties.created_at);
   for (const field of ['dispatched_at', 'started_at', 'finished_at', 'timeout_at']) {
     assertUtcTimestampReference(Job.properties[field], true);
@@ -144,6 +144,8 @@ test('bundled contract structurally defines the common platform contract', async
   assertUtcTimestampReference(Artifact.properties.expires_at, true);
   assertUtcTimestampReference(DownloadDescriptor.properties.expires_at);
   assertUtcTimestampReference(AuditEvent.properties.occurred_at);
+	assertUtcTimestampReference(InspectionTarget.properties.agent_control_heartbeat_at);
+	assert.equal(InspectionTarget.required.includes('agent_control_heartbeat_at'), false);
 	assert.ok(AuditEvent.required.includes('result'));
 	assert.equal(AuditEvent.properties.result.minLength, 1);
 	assert.deepEqual(AuditEvent.properties.command_id, { $ref: '#/components/schemas/CommandId' });

@@ -52,6 +52,8 @@ InspectionTarget:
         maxLength: 128
     connectivity:
       $ref: '#/InspectionConnectivity'
+    agent_control_heartbeat_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
     capabilities:
       type: array
       maxItems: 128

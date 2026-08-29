@@ -920,7 +920,7 @@ func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql", "0006_monitoring_instance_state.sql", "0007_metric_sample_acceptance.sql")
+	databaseOne, schema := setupNotificationIntegrationSchemaThrough(t, ctx, dsn, "0001_alert_control_plane.sql", "0003_ingest_dedup.sql", "0004_atomic_ingest_batch.sql", "0006_monitoring_instance_state.sql", "0007_metric_sample_acceptance.sql", "0008_ingest_batch_sample_range.sql")
 	databaseTwo := openAlertIntegrationDB(t, alertIntegrationDSN(t, dsn, schema, "metric-batch-writer-2"), "")
 	t.Cleanup(func() { require.NoError(t, databaseTwo.Close()) })
 
@@ -949,6 +949,13 @@ func TestPostgresMetricBatchDedupIsAtomicAcrossInstances(t *testing.T) {
 	require.NoError(t, databaseOne.QueryRowContext(ctx, "SELECT count(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3", "tenant-a", "project-a", "agent-a").Scan(&metricCount))
 	require.Equal(t, 1, dedupCount)
 	require.Equal(t, 1, metricCount)
+	var tenantID, projectID string
+	var sampledFrom, sampledTo time.Time
+	require.NoError(t, databaseOne.QueryRowContext(ctx, "SELECT tenant_id, project_id, sampled_from, sampled_to FROM ingest_batch_dedup WHERE agent_id = $1 AND batch_id = $2", "agent-a", "batch-a").Scan(&tenantID, &projectID, &sampledFrom, &sampledTo))
+	require.Equal(t, sample.Scope.TenantID, tenantID)
+	require.Equal(t, sample.Scope.ProjectID, projectID)
+	require.WithinDuration(t, sample.SampledAt, sampledFrom, time.Microsecond)
+	require.WithinDuration(t, sample.SampledAt, sampledTo, time.Microsecond)
 
 	_, err := databaseOne.ExecContext(ctx, "CREATE FUNCTION fail_metric_batch_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected metric failure'; END $$")
 	require.NoError(t, err)

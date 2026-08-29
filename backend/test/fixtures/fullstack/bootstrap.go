@@ -252,6 +252,9 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		"agents": map[string]any{
 			options.OnlineAgentID:  agentAssignment(options, "Acceptance online agent", "agent-online", "online"),
 			options.OfflineAgentID: agentAssignment(options, "Acceptance offline agent", "agent-offline", "offline"),
+			"agent-untrusted":      rogueAgentAssignment(options, "Untrusted certificate Agent", "agent-untrusted"),
+			"agent-claimed-id":     rogueAgentAssignment(options, "Mismatched claimed Agent", "agent-claimed-id"),
+			"agent-certificate-id": rogueAgentAssignment(options, "Mismatched certificate Agent", "agent-certificate-id"),
 		},
 	})
 	if err != nil {
@@ -491,6 +494,13 @@ func agentAssignment(options BootstrapOptions, displayName, host, state string) 
 	return map[string]any{
 		"tenant_id": options.TenantID, "project_id": options.ProjectID, "display_name": displayName, "host": host,
 		"labels": map[string]string{"environment": "acceptance", "connectivity_fixture": state},
+	}
+}
+
+func rogueAgentAssignment(options BootstrapOptions, displayName, host string) map[string]any {
+	return map[string]any{
+		"tenant_id": options.TenantID, "project_id": options.ProjectID, "display_name": displayName, "host": host,
+		"labels": map[string]string{"environment": "rogue", "acceptance_role": "negative-identity"},
 	}
 }
 

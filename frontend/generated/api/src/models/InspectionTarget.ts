@@ -59,6 +59,12 @@ export interface InspectionTarget {
      */
     connectivity: InspectionConnectivity;
     /**
+     * RFC 3339 timestamp in UTC, represented with a Z suffix.
+     * @type {Date}
+     * @memberof InspectionTarget
+     */
+    agentControlHeartbeatAt?: Date;
+    /**
      *
      * @type {Array<string>}
      * @memberof InspectionTarget
@@ -97,6 +103,7 @@ export function InspectionTargetFromJSONTyped(json: any, ignoreDiscriminator: bo
         'host': json['host'],
         'labels': json['labels'],
         'connectivity': InspectionConnectivityFromJSON(json['connectivity']),
+        'agentControlHeartbeatAt': json['agent_control_heartbeat_at'] == null ? undefined : (new Date(json['agent_control_heartbeat_at'])),
         'capabilities': json['capabilities'],
     };
 }
@@ -118,6 +125,7 @@ export function InspectionTargetToJSONTyped(value?: InspectionTarget | null, ign
         'host': value['host'],
         'labels': value['labels'],
         'connectivity': InspectionConnectivityToJSON(value['connectivity']),
+        'agent_control_heartbeat_at': value['agentControlHeartbeatAt'] == null ? undefined : ((value['agentControlHeartbeatAt']).toISOString()),
         'capabilities': value['capabilities'],
     };
 }

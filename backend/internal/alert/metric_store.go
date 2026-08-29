@@ -54,7 +54,7 @@ type AtomicMetricBatchStore interface {
 const metricInsertSQL = "INSERT INTO metric_samples (tenant_id, project_id, agent_id, metric, series_fingerprint, labels, value, sampled_at, accepted_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) ON CONFLICT DO NOTHING"
 const monitoringInstanceUpsertSQL = "INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()"
 const metricBatchReserveSQL = "INSERT INTO ingest_batch_dedup (agent_id, batch_id, state) VALUES ($1, $2, 'processing') ON CONFLICT DO NOTHING RETURNING state"
-const metricBatchCommitSQL = "UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW() WHERE agent_id = $1 AND batch_id = $2"
+const metricBatchCommitSQL = "UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW(), tenant_id = $3, project_id = $4, sampled_from = $5, sampled_to = $6 WHERE agent_id = $1 AND batch_id = $2"
 const metricQuerySQL = "SELECT tenant_id, project_id, agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND metric = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC"
 
 // Append writes an entire batch transactionally. Replayed samples are safe:
@@ -108,10 +108,26 @@ func (r *PostgresRepository) AppendBatch(ctx context.Context, agentID, batchID s
 	if state != "processing" {
 		return false, fmt.Errorf("unexpected metric batch reservation state %q", state)
 	}
+	if len(samples) == 0 {
+		return false, ErrInvalidMetricSample
+	}
+	scope := samples[0].Scope
+	sampledFrom, sampledTo := samples[0].SampledAt, samples[0].SampledAt
+	for _, sample := range samples[1:] {
+		if sample.Scope != scope {
+			return false, ErrInvalidMetricSample
+		}
+		if sample.SampledAt.Before(sampledFrom) {
+			sampledFrom = sample.SampledAt
+		}
+		if sample.SampledAt.After(sampledTo) {
+			sampledTo = sample.SampledAt
+		}
+	}
 	if err := appendMetricSamples(ctx, tx, samples); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, metricBatchCommitSQL, agentID, batchID)
+	result, err := tx.ExecContext(ctx, metricBatchCommitSQL, agentID, batchID, scope.TenantID, scope.ProjectID, sampledFrom, sampledTo)
 	if err != nil {
 		return false, err
 	}

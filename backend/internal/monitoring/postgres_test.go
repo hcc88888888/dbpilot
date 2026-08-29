@@ -36,8 +36,8 @@ func TestProductionPostgresMetricBatchHandsOffToMonitoringStoreForCoreEngines(t 
 			mock.ExpectExec(regexp.QuoteMeta("INSERT INTO monitoring_instances (tenant_id, project_id, instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ON CONFLICT (tenant_id, project_id, instance_id) DO UPDATE SET agent_id = EXCLUDED.agent_id, engine = EXCLUDED.engine, host = EXCLUDED.host, labels = EXCLUDED.labels, collect_every_ns = EXCLUDED.collect_every_ns, last_sample_at = GREATEST(monitoring_instances.last_sample_at, EXCLUDED.last_sample_at), last_heartbeat_at = NOW()")).
 				WithArgs(scope.TenantID, scope.ProjectID, instanceID, "agent-a", string(engine), instanceID+".internal", labels, int64(time.Minute), sample.SampledAt).
 				WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec(regexp.QuoteMeta("UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW() WHERE agent_id = $1 AND batch_id = $2")).
-				WithArgs("agent-a", "batch-"+string(engine)).
+			mock.ExpectExec(regexp.QuoteMeta("UPDATE ingest_batch_dedup SET state = 'accepted', accepted_at = NOW(), tenant_id = $3, project_id = $4, sampled_from = $5, sampled_to = $6 WHERE agent_id = $1 AND batch_id = $2")).
+				WithArgs("agent-a", "batch-"+string(engine), scope.TenantID, scope.ProjectID, sample.SampledAt, sample.SampledAt).
 				WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectCommit()
 			first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-"+string(engine), []alert.MetricSample{sample})

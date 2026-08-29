@@ -99,12 +99,37 @@ func TestMetricStoreAppendBatchCommitsReservationAndSamplesAtomically(t *testing
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
 	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT INTO monitoring_instances").WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a", "t1", "p1", sampledAt, sampledAt).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", []alert.MetricSample{sample})
 	require.NoError(t, err)
 	require.True(t, first)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMetricStoreAppendBatchPersistsActualMinimumAndMaximumSampleTimes(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { mock.ExpectClose(); require.NoError(t, db.Close()) })
+	from := time.Date(2026, time.August, 26, 10, 0, 0, 0, time.UTC)
+	to := from.Add(5 * time.Second)
+	first := alert.MetricSample{Scope: alert.Scope{TenantID: "t1", ProjectID: "p1"}, AgentID: "agent-a", Name: "db.connections", Labels: canonicalMetricLabels(), Value: 12, SampledAt: to}
+	second := first
+	second.Name, second.SampledAt = "db.sessions", from
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-range").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
+	for range []int{0, 1} {
+		mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
+		mock.ExpectExec("INSERT INTO monitoring_instances").WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-range", "t1", "p1", from, to).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	accepted, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-range", []alert.MetricSample{first, second})
+	require.NoError(t, err)
+	require.True(t, accepted)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -135,7 +160,7 @@ func TestMetricStoreAppendBatchFailsClosedWhenReservationCommitIsLost(t *testing
 	mock.ExpectQuery("INSERT INTO ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnRows(sqlmock.NewRows([]string{"state"}).AddRow("processing"))
 	mock.ExpectExec("INSERT INTO metric_samples").WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec("INSERT INTO monitoring_instances").WillReturnResult(sqlmock.NewResult(1, 1))
-	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("UPDATE ingest_batch_dedup").WithArgs("agent-a", "batch-a", sample.Scope.TenantID, sample.Scope.ProjectID, sample.SampledAt, sample.SampledAt).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectRollback()
 
 	first, err := alert.NewPostgresRepository(db).AppendBatch(context.Background(), "agent-a", "batch-a", []alert.MetricSample{sample})

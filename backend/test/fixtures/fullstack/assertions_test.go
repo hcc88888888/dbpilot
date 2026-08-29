@@ -12,11 +12,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/spool"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -301,20 +303,134 @@ func TestAssertTargetsRequiresExactPhaseStateCommandIDs(t *testing.T) {
 	require.ErrorContains(t, err, "phase state Command identity")
 }
 
-func TestAssertMetricsRequiresPostRestartReplaySample(t *testing.T) {
+func TestAssertReplayRequiresExactOutageBatchAcceptedAfterRestartAndDrainedSpool(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
-	options := validAssertionOptions()
-	options.PreRestartAcceptedAt = time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
-	options.PostRestartAcceptedAt = options.PreRestartAcceptedAt.Add(time.Minute)
-	mock.ExpectQuery("SELECT agent_id, metric, series_fingerprint").
-		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
-		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
-			AddRow(options.OnlineAgentID, "system.cpu.utilization", "cpu-total", "inspection-host-snapshot", options.PreRestartAcceptedAt, options.PreRestartAcceptedAt.Add(time.Second)))
+	stoppedAt := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	restartedAt := stoppedAt.Add(time.Minute)
+	sampledFrom, sampledTo, acceptedAt := stoppedAt.Add(10*time.Second), stoppedAt.Add(20*time.Second), restartedAt.Add(time.Second)
+	mock.ExpectQuery("SELECT agent_id, batch_id, sampled_from, sampled_to, accepted_at").
+		WithArgs("tenant-acceptance", "project-acceptance", "agent-online", stoppedAt, restartedAt).
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "batch_id", "sampled_from", "sampled_to", "accepted_at", "identity_count"}).
+			AddRow("agent-online", "batch-outage-1", sampledFrom, sampledTo, acceptedAt, 1))
+	spoolRoot := filepath.Join(t.TempDir(), "spool")
+	store, err := spool.Open(spoolRoot, spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
 
-	err = assertMetrics(context.Background(), database, options)
-	require.ErrorContains(t, err, "post-restart replay sample")
+	evidence, err := AssertReplay(context.Background(), database, spoolRoot, ReplayAssertion{
+		TenantID: "tenant-acceptance", ProjectID: "project-acceptance", AgentID: "agent-online",
+		ControlplaneStoppedAt: stoppedAt, ControlplaneRestartedAt: restartedAt,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "batch-outage-1", evidence.BatchID)
+	require.Equal(t, sampledFrom, evidence.SampledFrom)
+	require.Equal(t, sampledTo, evidence.SampledTo)
+	require.Equal(t, acceptedAt, evidence.AcceptedAt)
+	require.Zero(t, evidence.PendingBatchCount)
+}
+
+func TestAssertReplayRejectsFreshPostRestartBatchAndHistoricalGaugeEvidence(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	stoppedAt := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	restartedAt := stoppedAt.Add(time.Minute)
+	freshAt := restartedAt.Add(time.Second)
+	mock.ExpectQuery("SELECT agent_id, batch_id, sampled_from, sampled_to, accepted_at").
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "batch_id", "sampled_from", "sampled_to", "accepted_at", "identity_count"}).
+			AddRow("agent-online", "batch-fresh", freshAt, freshAt, freshAt.Add(time.Second), 1))
+	spoolRoot := filepath.Join(t.TempDir(), "spool")
+	store, err := spool.Open(spoolRoot, spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	_, err = AssertReplay(context.Background(), database, spoolRoot, ReplayAssertion{
+		TenantID: "tenant-acceptance", ProjectID: "project-acceptance", AgentID: "agent-online",
+		ControlplaneStoppedAt: stoppedAt, ControlplaneRestartedAt: restartedAt,
+	})
+	require.ErrorContains(t, err, "outage batch")
+}
+
+func TestAssertReplayRejectsExactOutageBatchWhileStoppedAgentSpoolIsPending(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	stoppedAt := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	restartedAt := stoppedAt.Add(time.Minute)
+	mock.ExpectQuery("SELECT agent_id, batch_id, sampled_from, sampled_to, accepted_at").
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "batch_id", "sampled_from", "sampled_to", "accepted_at", "identity_count"}).
+			AddRow("agent-online", "batch-outage", stoppedAt.Add(10*time.Second), stoppedAt.Add(20*time.Second), restartedAt.Add(time.Second), 1))
+	spoolRoot := filepath.Join(t.TempDir(), "spool")
+	store, err := spool.Open(spoolRoot, spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	require.NoError(t, store.Append(context.Background(), spool.Metric, spool.Batch{ID: "still-pending", SourceID: "acceptance-host", CreatedAt: stoppedAt, Payload: []byte("pending")}))
+	require.NoError(t, store.Close())
+
+	_, err = AssertReplay(context.Background(), database, spoolRoot, ReplayAssertion{
+		TenantID: "tenant-acceptance", ProjectID: "project-acceptance", AgentID: "agent-online",
+		ControlplaneStoppedAt: stoppedAt, ControlplaneRestartedAt: restartedAt,
+	})
+	require.ErrorContains(t, err, "1 pending batches")
+}
+
+func TestWithReplayEvidencePersistsOnlyExactBatchTimestampsAndCount(t *testing.T) {
+	stoppedAt := time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	restartedAt := stoppedAt.Add(time.Minute)
+	options := validAssertionOptions()
+	options.ControlplaneStoppedAt = stoppedAt
+	options.ControlplaneRestartedAt = restartedAt
+	evidence := ReplayEvidence{BatchID: "batch-outage-1", SampledFrom: stoppedAt.Add(10 * time.Second), SampledTo: stoppedAt.Add(20 * time.Second), AcceptedAt: restartedAt.Add(time.Second), PendingBatchCount: 0}
+
+	updated, err := WithReplayEvidence(options, evidence)
+	require.NoError(t, err)
+	require.Equal(t, "batch-outage-1", updated.ReplayBatchID)
+	require.Equal(t, evidence.SampledFrom, updated.ReplaySampledFrom)
+	require.Equal(t, evidence.SampledTo, updated.ReplaySampledTo)
+	require.Equal(t, evidence.AcceptedAt, updated.ReplayAcceptedAt)
+	require.Zero(t, updated.ReplayPendingBatchCount)
+	body, err := json.Marshal(updated)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), `"accepted_at"`)
+	require.NotContains(t, string(body), "spool_observed_count")
+}
+
+func TestWriteJSONFileAtomicReplacesPhaseStateWithPrivateMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "phase-state.json")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+	require.NoError(t, writeJSONFileAtomic(path, map[string]any{"replay_batch_id": "batch-outage-1", "replay_pending_batch_count": 0}))
+	var state map[string]any
+	require.NoError(t, json.Unmarshal(mustRead(t, path), &state))
+	require.Equal(t, "batch-outage-1", state["replay_batch_id"])
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	if runtime.GOOS != "windows" {
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".phase-state-*.tmp"))
+	require.NoError(t, err)
+	require.Empty(t, matches)
+}
+
+func TestValidateAssertionOptionsRequiresReplayHeartbeatAndBothRoguePhasesAfterOutage(t *testing.T) {
+	options := validAssertionOptions()
+	options.ControlplaneStoppedAt = time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	options.ControlplaneRestartedAt = options.ControlplaneStoppedAt.Add(time.Minute)
+	options.PreRestartMetricSampleAt = options.ControlplaneStoppedAt.Add(-time.Second)
+	options.PostRestartMetricSampleAt = options.ControlplaneRestartedAt.Add(time.Second)
+	options.PreRestartAgentControlHeartbeatAt = options.ControlplaneStoppedAt.Add(-time.Second)
+	options.PostRestartAgentControlHeartbeatAt = options.ControlplaneRestartedAt.Add(time.Second)
+	options.ReplayBatchID = "batch-outage"
+	options.ReplaySampledFrom = options.ControlplaneStoppedAt.Add(10 * time.Second)
+	options.ReplaySampledTo = options.ControlplaneStoppedAt.Add(20 * time.Second)
+	options.ReplayAcceptedAt = options.ControlplaneRestartedAt.Add(time.Second)
+
+	err := validateAssertionOptions(options)
+	require.ErrorContains(t, err, "rogue evidence is incomplete")
+	options.RogueUntrustedVerifiedAt = options.ControlplaneRestartedAt.Add(2 * time.Second)
+	options.RogueMismatchVerifiedAt = options.ControlplaneRestartedAt.Add(3 * time.Second)
+	require.NoError(t, validateAssertionOptions(options))
 }
 
 func TestAssertRogueAgentsRequireZeroPersistentRows(t *testing.T) {

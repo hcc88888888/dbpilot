@@ -73,15 +73,16 @@ test('Compose wires verifier-selected runner/assertion phases and isolated bound
   const assertions = config.services.assertions;
   assert.match(assertions.command.join(' '), /DBPILOT_ASSERTION_PHASE/);
   assert.match(assertions.command.join(' '), /journal/);
-  assert.equal(assertions.volumes.find((mount) => mount.target === '/acceptance/state').read_only, true);
+  assert.match(assertions.command.join(' '), /replay/);
+  assert.notEqual(assertions.volumes.find((mount) => mount.target === '/acceptance/state').read_only, true);
 });
 
-test('normal phase waits for Hello-derived online host.v1 readiness before browser work and records counters', async () => {
+test('normal phase waits for Hello-derived online host.v1 readiness and records distinct metric and control heartbeats', async () => {
   const events = [];
   const observations = [
-    observation({ capabilities: [], acceptedCount: 1 }),
-    observation({ capabilities: ['collect_now.host.v1'], acceptedCount: 3, spoolObservedCount: 2 }),
-    observation({ capabilities: ['collect_now.host.v1'], acceptedCount: 4, spoolObservedCount: 2 }),
+    observation({ capabilities: [], agentControlHeartbeatAt: undefined }),
+    observation({ capabilities: ['collect_now.host.v1'] }),
+    observation({ capabilities: ['collect_now.host.v1'] }),
   ];
   let written;
 
@@ -100,11 +101,11 @@ test('normal phase waits for Hello-derived online host.v1 readiness before brows
   });
 
   assert.deepEqual(events, ['observe', 'observe', 'process:normal', 'observe']);
-  assert.equal(result.accepted_count, 4);
   assert.equal(result.online_agent_id, 'agent-online');
-  assert.equal(result.spool_observed_count, 2);
-  assert.equal(result.accepted_at, '2026-08-29T04:00:03.000Z');
-  assert.equal(result.heartbeat_at, '2026-08-29T04:00:04.000Z');
+  assert.equal(result.metric_sample_at, '2026-08-29T04:00:03.000Z');
+  assert.equal(result.agent_control_heartbeat_at, '2026-08-29T04:00:04.000Z');
+  assert.equal('accepted_at' in result, false);
+  assert.equal('spool_observed_count' in result, false);
   assert.deepEqual(written, result);
 });
 
@@ -123,14 +124,11 @@ test('normal phase never starts browser work without online host.v1 readiness', 
   assert.equal(processCalls, 0);
 });
 
-test('post-restart rejects unchanged acceptance, heartbeat, spool, or terminal command state', async () => {
+test('post-restart rejects unchanged metric or AgentControl heartbeat state', async () => {
   const previous = {
     ...baseState,
-    accepted_at: '2026-08-29T04:00:03.000Z',
-    heartbeat_at: '2026-08-29T04:00:04.000Z',
-    accepted_count: 3,
-    spool_observed_count: 2,
-    spool_pending_count: 0,
+    metric_sample_at: '2026-08-29T04:00:03.000Z',
+    agent_control_heartbeat_at: '2026-08-29T04:00:04.000Z',
     report_count: 1,
     finding_count: 13,
     audit_count: 4,
@@ -139,33 +137,48 @@ test('post-restart rejects unchanged acceptance, heartbeat, spool, or terminal c
     runCommunicationPhase('post-restart', {
       observe: async () => observation({
         capabilities: ['collect_now.host.v1'],
-        acceptedAt: previous.accepted_at,
-        heartbeatAt: previous.heartbeat_at,
-        acceptedCount: previous.accepted_count,
-        spoolObservedCount: previous.spool_observed_count,
+        metricSampleAt: previous.metric_sample_at,
+        agentControlHeartbeatAt: previous.agent_control_heartbeat_at,
       }),
       readState: async () => previous,
       writeState: async () => {},
       wait: async () => {},
       maxAttempts: 1,
+      faultWindow: { stoppedAt: '2026-08-29T04:00:10.000Z', restartedAt: '2026-08-29T04:01:00.000Z' },
     }),
     /post-restart communication state did not advance/,
   );
 });
 
-test('post-restart accepts newer authenticated telemetry with replayed spool and unchanged durable identities', async () => {
+test('post-restart rejects missing or reversed verifier stop/restart boundaries', async () => {
   const previous = {
     ...baseState,
-    accepted_at: '2026-08-29T04:00:03.000Z', heartbeat_at: '2026-08-29T04:00:04.000Z',
-    accepted_count: 3, spool_observed_count: 0, spool_pending_count: 0,
+    metric_sample_at: '2026-08-29T04:00:03.000Z', agent_control_heartbeat_at: '2026-08-29T04:00:04.000Z',
+    report_count: 1, finding_count: 13, audit_count: 4,
+  };
+  for (const faultWindow of [undefined, { stoppedAt: '2026-08-29T04:01:00.000Z', restartedAt: '2026-08-29T04:00:10.000Z' }]) {
+    await assert.rejects(runCommunicationPhase('post-restart', {
+      observe: async () => observation({ metricSampleAt: '2026-08-29T04:01:03.000Z', agentControlHeartbeatAt: '2026-08-29T04:01:04.000Z' }),
+      readState: async () => previous,
+      writeState: async () => {},
+      wait: async () => {},
+      maxAttempts: 1,
+      faultWindow,
+    }), /control-plane outage window is invalid/);
+  }
+});
+
+test('post-restart records verifier outage boundaries and distinct advanced metric/control liveness', async () => {
+  const previous = {
+    ...baseState,
+    metric_sample_at: '2026-08-29T04:00:03.000Z', agent_control_heartbeat_at: '2026-08-29T04:00:04.000Z',
     report_count: 1, finding_count: 13, audit_count: 4,
   };
   let written;
   const result = await runCommunicationPhase('post-restart', {
     observe: async () => observation({
       capabilities: ['collect_now.host.v1'],
-      acceptedAt: '2026-08-29T04:01:03.000Z', heartbeatAt: '2026-08-29T04:01:04.000Z',
-      acceptedCount: 5, spoolObservedCount: 2, spoolPendingCount: 0,
+      metricSampleAt: '2026-08-29T04:01:03.000Z', agentControlHeartbeatAt: '2026-08-29T04:01:04.000Z',
       reportCount: 1, findingCount: 13, auditCount: 4,
       terminalCommandID: 'command-online',
     }),
@@ -173,13 +186,34 @@ test('post-restart accepts newer authenticated telemetry with replayed spool and
     writeState: async (state) => { written = state; },
     wait: async () => {},
     maxAttempts: 1,
+    faultWindow: { stoppedAt: '2026-08-29T04:00:10.000Z', restartedAt: '2026-08-29T04:01:00.000Z' },
   });
   assert.equal(result.journal_command_id, previous.journal_command_id);
-  assert.equal(result.accepted_count, 5);
-  assert.equal(result.spool_pending_count, 0);
-  assert.equal(result.pre_restart_accepted_at, previous.accepted_at);
-  assert.equal(result.post_restart_accepted_at, '2026-08-29T04:01:03.000Z');
+  assert.equal(result.controlplane_stopped_at, '2026-08-29T04:00:10.000Z');
+  assert.equal(result.controlplane_restarted_at, '2026-08-29T04:01:00.000Z');
+  assert.equal(result.pre_restart_metric_sample_at, previous.metric_sample_at);
+  assert.equal(result.post_restart_metric_sample_at, '2026-08-29T04:01:03.000Z');
+  assert.equal(result.pre_restart_agent_control_heartbeat_at, previous.agent_control_heartbeat_at);
+  assert.equal(result.post_restart_agent_control_heartbeat_at, '2026-08-29T04:01:04.000Z');
   assert.deepEqual(written, result);
+});
+
+test('post-restart rejects online Agent and newer metrics when AgentControl heartbeat is unchanged or missing', async () => {
+  const previous = {
+    ...baseState,
+    metric_sample_at: '2026-08-29T04:00:03.000Z', agent_control_heartbeat_at: '2026-08-29T04:00:04.000Z',
+    report_count: 1, finding_count: 13, audit_count: 4,
+  };
+  for (const heartbeat of [previous.agent_control_heartbeat_at, undefined]) {
+    await assert.rejects(runCommunicationPhase('post-restart', {
+      observe: async () => observation({ metricSampleAt: '2026-08-29T04:01:03.000Z', agentControlHeartbeatAt: heartbeat }),
+      readState: async () => previous,
+      writeState: async () => {},
+      wait: async () => {},
+      maxAttempts: 1,
+      faultWindow: { stoppedAt: '2026-08-29T04:00:10.000Z', restartedAt: '2026-08-29T04:01:00.000Z' },
+    }), /post-restart communication state did not advance/);
+  }
 });
 
 test('unauthorized phase runs only the bounded negative browser process', async () => {
@@ -190,20 +224,48 @@ test('unauthorized phase runs only the bounded negative browser process', async 
   assert.deepEqual(phases, ['unauthorized']);
 });
 
-test('rogue Agents require bounded TLS or PermissionDenied evidence and zero inventory/data rows', () => {
+test('rogue rejection parser requires exact x509 or PermissionDenied SPIFFE mismatch evidence', () => {
   assert.doesNotThrow(() => assertRogueAgentRejected({
     kind: 'untrusted', timedOut: true, exitCode: 124,
     stderr: 'transport: authentication handshake failed: certificate signed by unknown authority',
-    inventoryRows: 0, dataRows: 0,
+    inventory: rogueTargets(),
   }));
   assert.doesNotThrow(() => assertRogueAgentRejected({
     kind: 'mismatch', timedOut: false, exitCode: 1,
-    stderr: 'rpc error: code = PermissionDenied desc = identity mismatch',
-    inventoryRows: 0, dataRows: 0,
+    stderr: 'rpc error: code = PermissionDenied desc = Hello Agent ID does not match the verified SPIFFE identity',
+    inventory: rogueTargets(),
   }));
   assert.throws(() => assertRogueAgentRejected({
-    kind: 'mismatch', timedOut: true, exitCode: 124, stderr: 'PermissionDenied', inventoryRows: 1, dataRows: 0,
-  }), /rogue Agent created inventory or data rows/);
+    kind: 'untrusted', timedOut: true, exitCode: 124, stderr: 'TLS client initialized with certificate', inventory: rogueTargets(),
+  }), /rejection evidence is missing/);
+  assert.throws(() => assertRogueAgentRejected({
+    kind: 'mismatch', timedOut: true, exitCode: 124, stderr: 'rpc error: code = PermissionDenied', inventory: rogueTargets(),
+  }), /rejection evidence is missing/);
+  assert.throws(() => assertRogueAgentRejected({
+    kind: 'mismatch', timedOut: true, exitCode: 124, stderr: 'code = PermissionDenied', inventory: rogueTargets().map((target) => target.agent_id === 'agent-claimed-id' ? { ...target, connectivity: 'online' } : target),
+  }), /rogue Agent target is not authoritatively offline/);
+});
+
+test('rogue phase consumes structured process evidence and persists only verified timestamps', async () => {
+  const previous = {
+    ...baseState,
+    metric_sample_at: '2026-08-29T04:01:03.000Z', agent_control_heartbeat_at: '2026-08-29T04:01:04.000Z',
+    report_count: 1, finding_count: 13, audit_count: 4,
+  };
+  let written;
+  const result = await runCommunicationPhase('rogue', {
+    observe: async () => observation(),
+    readState: async () => previous,
+    writeState: async (state) => { written = state; },
+    rogueResult: {
+      kind: 'mismatch', timedOut: false, exitCode: 1,
+      stderr: 'rpc error: code = PermissionDenied desc = Hello Agent ID does not match the verified SPIFFE identity',
+      observedAt: '2026-08-29T04:02:00.000Z',
+    },
+  });
+  assert.equal(result.rogue_mismatch_verified_at, '2026-08-29T04:02:00.000Z');
+  assert.equal('stderr' in result, false);
+  assert.deepEqual(written, result);
 });
 
 test('communication failures redact configured credentials and bearer values', async () => {
@@ -221,21 +283,17 @@ test('communication failures redact configured credentials and bearer values', a
   );
 });
 
-test('runtime observation derives authenticated acceptance and spool replay counters from API facts', async () => {
+test('runtime observation keeps authenticated metric liveness separate from AgentControl heartbeat', async () => {
   const requests = [];
   const responseBySuffix = new Map([
     ['/inspection-targets?limit=100', { items: [
-      { agent_id: 'agent-online', connectivity: 'online', capabilities: ['collect_now.host.v1'] },
+      { agent_id: 'agent-online', connectivity: 'online', capabilities: ['collect_now.host.v1'], agent_control_heartbeat_at: '2026-08-29T04:00:04Z' },
       { agent_id: 'agent-offline', connectivity: 'offline', capabilities: [] },
+      ...rogueTargets(),
     ] }],
     ['/monitoring/instances?limit=100', { items: [
-      { id: 'agent-online', agent_id: 'agent-online', last_sample_at: '2026-08-29T04:00:03Z', last_heartbeat_at: '2026-08-29T04:00:04Z' },
+      { id: 'agent-online', agent_id: 'agent-online', last_sample_at: '2026-08-29T04:00:03Z', last_heartbeat_at: '2099-01-01T00:00:00Z' },
     ] }],
-    ['/monitoring/series', { series: { buckets: [
-      { at: '2026-08-29T04:00:01.000Z', value: 0 },
-      { at: '2026-08-29T04:00:02.000Z', value: 2 },
-      { at: '2026-08-29T04:00:03.000Z', value: 0 },
-    ] } }],
     ['/inspection-reports/report-1', { id: 'report-1', findings: Array.from({ length: 13 }, (_, index) => ({ item_id: `item-${index}` })), references: { commands: [
       { command_id: 'command-online' }, { command_id: 'command-offline' },
     ] } }],
@@ -253,15 +311,11 @@ test('runtime observation derives authenticated acceptance and spool replay coun
     },
     tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
   });
-  assert.equal(requests.length, 5);
-  const seriesRequest = new URL(requests.find((request) => request.includes('/monitoring/series')), 'https://frontend:8443');
-  assert.equal(seriesRequest.searchParams.get('step'), '5s');
-  assert.ok(Date.parse(seriesRequest.searchParams.get('to')) - Date.parse(seriesRequest.searchParams.get('from')) <= 30 * 60 * 1_000);
-  assert.equal(result.accepted_at, '2026-08-29T04:00:03Z');
-  assert.equal(result.accepted_count, 3);
-  assert.equal(result.spool_observed_count, 2);
-  assert.equal(result.spool_pending_count, 0);
-  assert.equal(result.heartbeat_at, '2026-08-29T04:00:04Z');
+  assert.equal(requests.length, 4);
+  assert.equal(requests.some((request) => request.includes('/monitoring/series')), false);
+  assert.equal(result.metric_sample_at, '2026-08-29T04:00:03Z');
+  assert.equal(result.agent_control_heartbeat_at, '2026-08-29T04:00:04Z');
+  assert.equal(result.inventory.length, 5);
   assert.equal(result.report_count, 1);
   assert.equal(result.finding_count, 13);
   assert.equal(result.audit_count, 4);
@@ -270,11 +324,8 @@ test('runtime observation derives authenticated acceptance and spool replay coun
 
 function observation({
   capabilities = ['collect_now.host.v1'],
-  acceptedAt = '2026-08-29T04:00:03.000Z',
-  heartbeatAt = '2026-08-29T04:00:04.000Z',
-  acceptedCount = 1,
-  spoolObservedCount = 0,
-  spoolPendingCount = 0,
+  metricSampleAt = '2026-08-29T04:00:03.000Z',
+  agentControlHeartbeatAt = '2026-08-29T04:00:04.000Z',
   reportCount = 1,
   findingCount = 13,
   auditCount = 4,
@@ -282,17 +333,19 @@ function observation({
 } = {}) {
   return {
     inventory: [
-      { agent_id: 'agent-online', connectivity: 'online', capabilities },
+      { agent_id: 'agent-online', connectivity: 'online', capabilities, agent_control_heartbeat_at: agentControlHeartbeatAt },
       { agent_id: 'agent-offline', connectivity: 'offline', capabilities: [] },
+      ...rogueTargets(),
     ],
-    accepted_at: acceptedAt,
-    heartbeat_at: heartbeatAt,
-    accepted_count: acceptedCount,
-    spool_observed_count: spoolObservedCount,
-    spool_pending_count: spoolPendingCount,
+    metric_sample_at: metricSampleAt,
+    agent_control_heartbeat_at: agentControlHeartbeatAt,
     report_count: reportCount,
     finding_count: findingCount,
     audit_count: auditCount,
     terminal_command_id: terminalCommandID,
   };
+}
+
+function rogueTargets() {
+  return ['agent-untrusted', 'agent-claimed-id', 'agent-certificate-id'].map((agent_id) => ({ agent_id, connectivity: 'offline', capabilities: [] }));
 }

@@ -63,6 +63,15 @@ func TestInspectionStrictHandlersCoverGeneratedOperationsWithURLScope(t *testing
 			require.Len(t, service.calls, before+1)
 			require.Equal(t, platformTestScope, service.calls[before].scope, "only the authenticated URL scope may reach the service")
 			requireOpenAPIResponse(t, request, response)
+			if test.name == "list targets" {
+				var body struct {
+					Items []struct {
+						AgentControlHeartbeatAt time.Time `json:"agent_control_heartbeat_at"`
+					} `json:"items"`
+				}
+				require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+				require.Equal(t, service.time(), body.Items[0].AgentControlHeartbeatAt)
+			}
 		})
 	}
 }
@@ -420,7 +429,7 @@ func (service *recordingInspectionService) RetryRun(_ context.Context, scope pla
 }
 func (service *recordingInspectionService) ListTargets(_ context.Context, scope platformscope.Scope, filter inspection.CursorFilter) (InspectionTargetPage, error) {
 	err := service.record("list-targets", scope, "", "", "", filter)
-	return InspectionTargetPage{Items: []inspection.HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "DB host", Host: "db-1.example", Labels: map[string]string{"role": "db"}, Connectivity: "online", Capabilities: []string{"host.inspect"}}}}, err
+	return InspectionTargetPage{Items: []inspection.HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "DB host", Host: "db-1.example", Labels: map[string]string{"role": "db"}, Connectivity: "online", Capabilities: []string{"host.inspect"}, AgentControlHeartbeatAt: service.time()}}}, err
 }
 
 func (service *recordingInspectionService) time() time.Time {

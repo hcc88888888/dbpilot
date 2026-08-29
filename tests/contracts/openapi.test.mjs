@@ -173,7 +173,7 @@ test('inspection DTOs bound host data, status vocabularies, and public examples'
   assert.equal(schemas.InspectionSchedule.properties.timezone.pattern, '^[A-Za-z][A-Za-z0-9._+/-]{0,127}$');
 
   const targetProperties = Object.keys(schemas.InspectionTarget.properties).sort();
-  assert.deepEqual(targetProperties, ['agent_id', 'capabilities', 'connectivity', 'display_name', 'host', 'labels']);
+  assert.deepEqual(targetProperties, ['agent_control_heartbeat_at', 'agent_id', 'capabilities', 'connectivity', 'display_name', 'host', 'labels']);
 
   const ajv = validationContext(document);
   const examples = [

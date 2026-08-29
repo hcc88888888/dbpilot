@@ -32,7 +32,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		stderr = io.Discard
 	}
 	if len(arguments) == 0 {
-		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, database, or journal")
+		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, database, journal, or replay")
 		return 2
 	}
 	switch arguments[0] {
@@ -44,10 +44,89 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runDatabaseAssertions(arguments[1:], stderr)
 	case "journal":
 		return runJournalAssertions(arguments[1:], stderr)
+	case "replay":
+		return runReplayAssertions(arguments[1:], stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown subcommand")
 		return 2
 	}
+}
+
+func runReplayAssertions(arguments []string, stderr io.Writer) int {
+	flags := flag.NewFlagSet("replay", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dsnFile := flags.String("dsn-file", "", "absolute PostgreSQL DSN file")
+	phaseStateFile := flags.String("phase-state-file", "", "absolute full-stack phase state file")
+	spoolRoot := flags.String("spool-root", "", "absolute stopped Agent spool root")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*dsnFile) || !filepath.IsAbs(*phaseStateFile) || !filepath.IsAbs(*spoolRoot) {
+		return 2
+	}
+	dsnBody, err := readBoundedRegularFile(*dsnFile, 8<<10, true)
+	if err != nil || len(dsnBody) == 0 {
+		fmt.Fprintln(stderr, "database credential is unavailable")
+		return 2
+	}
+	dsn := string(dsnBody)
+	defer zeroBytes(dsnBody)
+	var state AssertionOptions
+	if err := decodeJSONFile(*phaseStateFile, 64<<10, &state); err != nil {
+		fmt.Fprintln(stderr, "replay phase state is unavailable or invalid")
+		return 2
+	}
+	database, err := sql.Open("postgres", dsn)
+	if err != nil {
+		fmt.Fprintln(stderr, "replay assertion connection failed")
+		return 1
+	}
+	defer database.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	evidence, err := AssertReplay(ctx, database, *spoolRoot, ReplayAssertion{
+		TenantID: state.TenantID, ProjectID: state.ProjectID, AgentID: state.OnlineAgentID,
+		ControlplaneStoppedAt: state.ControlplaneStoppedAt, ControlplaneRestartedAt: state.ControlplaneRestartedAt,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, redactAssertionError(err, []string{dsn}))
+		return 1
+	}
+	state, err = WithReplayEvidence(state, evidence)
+	if err != nil || writeJSONFileAtomic(*phaseStateFile, state) != nil {
+		fmt.Fprintln(stderr, "replay evidence persistence failed")
+		return 1
+	}
+	return 0
+}
+
+func writeJSONFileAtomic(path string, value any) (resultErr error) {
+	if !filepath.IsAbs(path) || value == nil {
+		return errors.New("JSON output is invalid")
+	}
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, ".phase-state-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() {
+		_ = temporary.Close()
+		if resultErr != nil {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(temporary)
+	if err := encoder.Encode(value); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func runBootstrap(arguments []string, stdout, stderr io.Writer) int {

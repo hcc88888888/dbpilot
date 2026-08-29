@@ -50,6 +50,12 @@ export interface InspectionTarget {
      */
     connectivity: InspectionConnectivity;
     /**
+     * RFC 3339 timestamp in UTC, represented with a Z suffix.
+     * @type {Date}
+     * @memberof InspectionTarget
+     */
+    agentControlHeartbeatAt?: Date;
+    /**
      *
      * @type {Array<string>}
      * @memberof InspectionTarget

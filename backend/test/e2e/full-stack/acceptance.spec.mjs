@@ -24,6 +24,7 @@ const environment = requireEnvironment([
   'ACCEPTANCE_STATE_FILE',
 ]);
 const acceptancePhase = requireAcceptancePhase(process.env.DBPILOT_ACCEPTANCE_PHASE);
+const rogueAgentIDs = Object.freeze(['agent-untrusted', 'agent-claimed-id', 'agent-certificate-id']);
 const scopePath = `/api/v1/tenants/${encodeURIComponent(environment.TENANT_ID)}/projects/${encodeURIComponent(environment.PROJECT_ID)}`;
 const fullPermissions = Object.freeze({
   manage: true,
@@ -104,10 +105,12 @@ phaseTest('normal', 'real Agent readiness, label policy, partial inspection, rep
 
   const readiness = await waitForAgentReadiness(tokens.valid);
   auditValueForSecrets(readiness);
-  expect(readiness.targets).toHaveLength(2);
+  expect(readiness.targets).toHaveLength(5);
   expect(readiness.online.connectivity).toBe('online');
   expect(readiness.online.capabilities).toContain('collect_now.host.v1');
+  expect(readiness.online.agent_control_heartbeat_at).toBeTruthy();
   expect(readiness.offline.connectivity).toBe('offline');
+  expect(readiness.rogue.every((target) => target.connectivity === 'offline')).toBe(true);
   expect(readiness.items).toHaveLength(13);
 
   await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
@@ -120,11 +123,12 @@ phaseTest('normal', 'real Agent readiness, label policy, partial inspection, rep
   const targetInputs = page.locator('fieldset[aria-label="巡检目标"] input[name="target_id"]');
   const itemInputs = page.locator('fieldset[aria-label="巡检项"] input[name="item_version"]');
   await auditBrowserLeaks(page);
-  await requireCount(targetInputs, 2, 'expected targets were not rendered');
+  await requireCount(targetInputs, 5, 'expected targets were not rendered');
   await requireCount(itemInputs, 13, 'expected inspection items were not rendered');
   expect(await targetInputs.evaluateAll((inputs) => inputs.map((input) => input.value).sort())).toEqual([
     environment.EXPECTED_OFFLINE_AGENT_ID,
     environment.EXPECTED_ONLINE_AGENT_ID,
+    ...rogueAgentIDs,
   ].sort());
 
   const policyName = `Compose label policy ${Date.now()}`;
@@ -306,8 +310,9 @@ async function waitForAgentReadiness(accessToken) {
     const targets = targetsPage.items ?? [];
     const online = targets.find((target) => target.agent_id === environment.EXPECTED_ONLINE_AGENT_ID);
     const offline = targets.find((target) => target.agent_id === environment.EXPECTED_OFFLINE_AGENT_ID);
-    if (targets.length !== 2 || !online || !offline || online.connectivity !== 'online' || offline.connectivity !== 'offline' || !online.capabilities?.includes('collect_now.host.v1') || itemsPage.items?.length !== 13) return undefined;
-    return { targets, online, offline, items: itemsPage.items };
+    const rogue = rogueAgentIDs.map((agentID) => targets.find((target) => target.agent_id === agentID));
+    if (targets.length !== 5 || !online || !offline || rogue.some((target) => !target) || online.connectivity !== 'online' || !online.agent_control_heartbeat_at || offline.connectivity !== 'offline' || rogue.some((target) => target.connectivity !== 'offline') || !online.capabilities?.includes('collect_now.host.v1') || itemsPage.items?.length !== 13) return undefined;
+    return { targets, online, offline, rogue, items: itemsPage.items };
   }, 'Agent online/capability and inspection catalog readiness');
 }
 

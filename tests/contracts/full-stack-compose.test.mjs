@@ -245,6 +245,7 @@ test('runtime mounts keep source, binaries, config, and secrets read-only while 
     'acceptance-runner': ['/acceptance/artifacts', '/acceptance/state', '/work/node_modules'],
     'rogue-untrusted': ['/acceptance/state/agent-untrusted'],
     'rogue-mismatch': ['/acceptance/state/agent-mismatch'],
+    assertions: ['/acceptance/state'],
   };
 
   for (const [name, service] of Object.entries(config.services)) {

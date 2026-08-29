@@ -172,11 +172,16 @@ func TestGenerateBootstrapProducesBoundedPolicyInventoryAndOIDCConfig(t *testing
 	require.Equal(t, "dbpilot-control-plane", nestedString(t, controlplane, "identity", "audience"))
 	require.Equal(t, "https://frontend:8443", controlplane["event_url_base"])
 	agents := controlplane["agents"].(map[string]any)
-	require.ElementsMatch(t, []string{"agent-online", "agent-offline"}, mapKeys(agents))
-	for _, id := range []string{"agent-online", "agent-offline"} {
+	require.ElementsMatch(t, []string{"agent-online", "agent-offline", "agent-untrusted", "agent-claimed-id", "agent-certificate-id"}, mapKeys(agents))
+	for _, id := range []string{"agent-online", "agent-offline", "agent-untrusted", "agent-claimed-id", "agent-certificate-id"} {
 		assignment := agents[id].(map[string]any)
 		require.Equal(t, "tenant-acceptance", assignment["tenant_id"])
 		require.Equal(t, "project-acceptance", assignment["project_id"])
+	}
+	for _, id := range []string{"agent-untrusted", "agent-claimed-id", "agent-certificate-id"} {
+		labels := agents[id].(map[string]any)["labels"].(map[string]any)
+		require.Equal(t, "rogue", labels["environment"])
+		require.Equal(t, "negative-identity", labels["acceptance_role"])
 	}
 
 	var agent map[string]any
@@ -247,6 +252,7 @@ func TestRunRejectsUnknownAndIncompleteSubcommands(t *testing.T) {
 		"OIDC relative config":   {"oidc", "--config", "relative.json"},
 		"database missing files": {"database"},
 		"journal missing files":  {"journal"},
+		"replay missing files":   {"replay"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			code := run(args, io.Discard, io.Discard)

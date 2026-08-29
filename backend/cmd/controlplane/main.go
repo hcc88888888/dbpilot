@@ -928,6 +928,7 @@ func (resolver liveInspectionTargetResolver) List(ctx context.Context, scope pla
 func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.HostTarget) []inspection.HostTarget {
 	for index := range targets {
 		targets[index].Connectivity = "offline"
+		targets[index].AgentControlHeartbeatAt = time.Time{}
 		targets[index].Capabilities = []string{}
 		targets[index].AdvertisedSources = []inspection.SourceType{}
 		if resolver.registry == nil {
@@ -938,6 +939,7 @@ func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.H
 			continue
 		}
 		targets[index].Connectivity = "online"
+		targets[index].AgentControlHeartbeatAt = session.LastHeartbeat.UTC()
 		targets[index].Capabilities = append([]string(nil), session.Capabilities...)
 		for _, capability := range session.Capabilities {
 			if capability == agent.CapabilityCollectNowHostV1 {

@@ -176,6 +176,40 @@ func Open(root string, limits Limits) (*Store, error) {
 	return s, nil
 }
 
+// PendingBatchCount reads the durable pending index without mutating or
+// repairing the spool. The owning Agent must be stopped before this diagnostic
+// is used so the read-only bbolt view represents a stable shutdown state.
+func PendingBatchCount(root string) (int, error) {
+	if err := validRoot(root); err != nil {
+		return 0, err
+	}
+	statePath := filepath.Join(root, "state.db")
+	if info, err := os.Lstat(statePath); err != nil {
+		return 0, err
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return 0, ErrInvalidRoot
+	}
+	db, err := bolt.Open(statePath, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err != nil {
+		return 0, fmt.Errorf("open spool state read-only: %w", err)
+	}
+	defer db.Close()
+	count := 0
+	if err := db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(bucketSegmentIndex)
+		if bucket == nil {
+			return ErrInvalidRoot
+		}
+		return bucket.ForEach(func(_, _ []byte) error {
+			count++
+			return nil
+		})
+	}); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func validRoot(root string) error {
 	if root == "" || !filepath.IsAbs(root) {
 		return ErrInvalidRoot
