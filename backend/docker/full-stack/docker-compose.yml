@@ -14,7 +14,7 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - |
-        install -d -m 0755 /acceptance/bin /go-cache/build /go-cache/mod
+        install -d -m 0755 /acceptance/bin /go-cache/build /go-cache/mod /go-cache/tmp
         go build -trimpath -o /acceptance/bin/dbpilot-controlplane ./cmd/controlplane
         go build -trimpath -o /acceptance/bin/dbpilot-agent ./cmd/agent
         go build -trimpath -o /acceptance/bin/dbpilot-fullstack-fixture ./test/fixtures/fullstack
@@ -27,6 +27,7 @@ services:
       GOAMD64: v1
       GOCACHE: /go-cache/build
       GOMODCACHE: /go-cache/mod
+      GOTMPDIR: /go-cache/tmp
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
@@ -34,13 +35,13 @@ services:
       - ../../..:/workspace:ro
       - acceptance-bin:/acceptance/bin
       - acceptance-go-cache:/go-cache
-    networks: [acceptance]
+    networks: [builder-egress]
     labels: *ownership-labels
     restart: "no"
     cap_drop: ["NET_RAW"]
     security_opt: ["no-new-privileges:true"]
-    cpus: 2.0
-    mem_limit: 2g
+    cpus: 4.0
+    mem_limit: 4g
     pids_limit: 512
 
   bootstrap:
@@ -273,15 +274,17 @@ services:
     build:
       context: ../../..
       dockerfile: backend/docker/full-stack/runner.Dockerfile
+    profiles: ["acceptance-runner"]
     user: "10001:10001"
-    depends_on:
-      agent:
-        condition: service_started
-      frontend:
-        condition: service_healthy
     environment:
-      DBPILOT_ACCEPTANCE_BASE_URL: http://frontend:8080
-      DBPILOT_OIDC_URL: https://oidc:9444
+      FRONTEND_URL: http://frontend:8080
+      OIDC_URL: https://oidc:9444
+      OIDC_CA_FILE: /acceptance/config/ca.pem
+      OIDC_CREDENTIAL_FILE: /acceptance/secrets/oidc-token-credential
+      TENANT_ID: tenant-acceptance
+      PROJECT_ID: project-acceptance
+      EXPECTED_ONLINE_AGENT_ID: agent-online
+      EXPECTED_OFFLINE_AGENT_ID: agent-offline
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,size=512m,mode=1777
@@ -413,6 +416,9 @@ networks:
   acceptance:
     driver: bridge
     internal: true
+    labels: *ownership-labels
+  builder-egress:
+    driver: bridge
     labels: *ownership-labels
 
 volumes:

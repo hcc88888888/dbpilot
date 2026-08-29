@@ -239,7 +239,7 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		"http":              map[string]any{"address": "0.0.0.0:8443", "tls": map[string]any{"cert_file": containerPath("config/controlplane-http.pem"), "key_file": containerPath("secrets/controlplane-http-key.pem")}},
 		"identity":          map[string]any{"mode": "oidc", "issuer": options.Issuer, "audience": options.Audience},
 		"grpc":              map[string]any{"address": "0.0.0.0:9443", "tls": map[string]any{"cert_file": containerPath("config/controlplane-grpc.pem"), "key_file": containerPath("secrets/controlplane-grpc-key.pem"), "client_ca_file": containerPath("config/ca.pem")}},
-		"webhook_allowlist": []string{"hooks.example.invalid"}, "event_url_base": "https://frontend",
+		"webhook_allowlist": []string{"hooks.example.invalid"}, "event_url_base": "http://frontend:8080",
 		"evaluation_every": "5s", "retry_every": "5s",
 		"command":           map[string]any{"signing_private_key_ref": "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", "execution_token_key_ref": "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"},
 		"artifact":          map[string]any{"storage_root": containerPath("state/artifacts"), "signing_key_ref": "secret://controlplane/artifact-download"},

@@ -160,6 +160,7 @@ func TestGenerateBootstrapProducesBoundedPolicyInventoryAndOIDCConfig(t *testing
 	require.Equal(t, "oidc", nestedString(t, controlplane, "identity", "mode"))
 	require.Equal(t, "https://oidc:9444", nestedString(t, controlplane, "identity", "issuer"))
 	require.Equal(t, "dbpilot-control-plane", nestedString(t, controlplane, "identity", "audience"))
+	require.Equal(t, "http://frontend:8080", controlplane["event_url_base"])
 	agents := controlplane["agents"].(map[string]any)
 	require.ElementsMatch(t, []string{"agent-online", "agent-offline"}, mapKeys(agents))
 	for _, id := range []string{"agent-online", "agent-offline"} {

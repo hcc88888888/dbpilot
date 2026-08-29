@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -9,6 +10,9 @@ const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const composeFile = join(repoRoot, 'backend', 'docker', 'full-stack', 'docker-compose.yml');
 const nginxFile = join(repoRoot, 'backend', 'docker', 'full-stack', 'nginx.conf');
 const runnerFile = join(repoRoot, 'backend', 'docker', 'full-stack', 'runner.Dockerfile');
+const bootstrapFile = join(repoRoot, 'backend', 'test', 'fixtures', 'fullstack', 'bootstrap.go');
+const runnerPackageFile = join(repoRoot, 'backend', 'test', 'e2e', 'full-stack', 'package.json');
+const runnerLockFile = join(repoRoot, 'backend', 'test', 'e2e', 'full-stack', 'package-lock.json');
 
 const serviceNames = [
   'acceptance-runner',
@@ -52,13 +56,28 @@ function commandText(service) {
   return [...(service.entrypoint ?? []), ...(service.command ?? [])].join(' ');
 }
 
+function docker(args, env = {}, timeout = 300_000) {
+  return spawnSync('docker', args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+    timeout,
+  });
+}
+
+function lines(value) {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
 test('Compose resolves the exact isolated full-stack service, image, network, and volume topology', () => {
   const config = loadCompose();
   assert.deepEqual(Object.keys(config.services).sort(), serviceNames);
   assert.deepEqual(Object.keys(config.volumes).sort(), volumeNames);
-  assert.deepEqual(Object.keys(config.networks), ['acceptance']);
+  assert.deepEqual(Object.keys(config.networks).sort(), ['acceptance', 'builder-egress']);
   assert.equal(config.networks.acceptance.internal, true);
   assert.equal(config.networks.acceptance.driver, 'bridge');
+  assert.notEqual(config.networks['builder-egress'].internal, true);
+  assert.equal(config.networks['builder-egress'].driver, 'bridge');
 
   const expectedImages = {
     'asset-builder': 'golang:1.27.0-bookworm',
@@ -81,7 +100,8 @@ test('Compose resolves the exact isolated full-stack service, image, network, an
   assert.equal(config.services['acceptance-runner'].build.dockerfile, 'backend/docker/full-stack/runner.Dockerfile');
 
   for (const [name, service] of Object.entries(config.services)) {
-    assert.deepEqual(Object.keys(service.networks), ['acceptance'], `${name} must use only the acceptance network`);
+    const expectedNetworks = name === 'asset-builder' ? ['builder-egress'] : ['acceptance'];
+    assert.deepEqual(Object.keys(service.networks), expectedNetworks, `${name} must use only its approved network`);
     assert.equal(service.labels['dbpilot.verifier'], 'full-stack-compose');
     assert.ok(service.labels['dbpilot.run'], `${name} must carry a run ownership label`);
     assert.equal(service.restart, 'no');
@@ -102,6 +122,9 @@ test('builder uses a non-login shell and exact static linux amd64 settings to bu
   assert.equal(builder.environment.GOOS, 'linux');
   assert.equal(builder.environment.GOARCH, 'amd64');
   assert.equal(builder.environment.GOAMD64, 'v1');
+  assert.equal(builder.environment.GOTMPDIR, '/go-cache/tmp');
+  assert.ok(Number(builder.cpus) >= 4, 'production dependency compilation needs a bounded four-CPU builder');
+  assert.ok(Number(builder.mem_limit) >= 4 * 1024 ** 3, 'production dependency compilation needs a bounded 4 GiB builder');
   assert.equal(builder.working_dir, '/workspace/backend');
   assert.equal(mountAt(builder, '/workspace').read_only, true);
   assert.notEqual(mountAt(builder, '/acceptance/bin').read_only, true);
@@ -114,6 +137,78 @@ test('builder uses a non-login shell and exact static linux amd64 settings to bu
   assert.match(command, /\/acceptance\/bin\/dbpilot-controlplane/);
   assert.match(command, /\/acceptance\/bin\/dbpilot-agent/);
   assert.match(command, /\/acceptance\/bin\/dbpilot-fullstack-fixture/);
+});
+
+test('opt-in clean-cache builder produces all binaries and removes its exact labelled project resources', {
+  skip: process.env.DBPILOT_FULL_STACK_BUILDER_PROBE !== '1',
+  timeout: 1_260_000,
+}, () => {
+  const project = `dbpilot-t2-builder-${process.pid}-${Date.now().toString(36)}`.toLowerCase();
+  const env = { DBPILOT_ACCEPTANCE_RUN_ID: project };
+  const compose = ['compose', '-p', project, '-f', composeFile];
+  const recorded = { containers: [], networks: [], volumes: [] };
+  let primaryError;
+
+  try {
+    const up = docker([...compose, 'up', '--no-deps', '--pull', 'never', '--abort-on-container-exit', '--exit-code-from', 'asset-builder', 'asset-builder'], env, 1_200_000);
+    assert.equal(up.status, 0, up.stderr || up.stdout);
+
+    recorded.containers = lines(docker(['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`]).stdout);
+    recorded.networks = lines(docker(['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).stdout);
+    recorded.volumes = lines(docker(['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`]).stdout);
+    assert.equal(recorded.containers.length, 1);
+    assert.equal(recorded.networks.length, 1);
+    assert.deepEqual(recorded.volumes.sort(), [`${project}_acceptance-bin`, `${project}_acceptance-go-cache`]);
+
+    for (const [kind, values] of Object.entries(recorded)) {
+      for (const value of values) {
+        const noun = kind === 'containers' ? 'container' : kind.slice(0, -1);
+        const format = noun === 'container' ? '{{json .Config.Labels}}' : '{{json .Labels}}';
+        const inspected = docker([noun, 'inspect', '--format', format, value]);
+        assert.equal(inspected.status, 0, inspected.stderr);
+        const labels = JSON.parse(inspected.stdout);
+        assert.equal(labels['com.docker.compose.project'], project);
+        assert.equal(labels['dbpilot.verifier'], 'full-stack-compose');
+        assert.equal(labels['dbpilot.run'], project);
+      }
+    }
+
+    const binaryVolume = `${project}_acceptance-bin`;
+    const probeName = `${project}-output-probe`;
+    const probe = docker([
+      'run', '--rm', '--pull', 'never', '--name', probeName,
+      '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      '--volume', `${binaryVolume}:/acceptance/bin:ro`, '--entrypoint', '/bin/sh', 'golang:1.27.0-bookworm',
+      '-ec', 'for binary in dbpilot-controlplane dbpilot-agent dbpilot-fullstack-fixture; do test -s "/acceptance/bin/$binary"; test -x "/acceptance/bin/$binary"; done',
+    ]);
+    assert.equal(probe.status, 0, probe.stderr || probe.stdout);
+    const removedProbe = docker(['container', 'inspect', probeName]);
+    assert.notEqual(removedProbe.status, 0, 'the --rm output probe container must be removed');
+  } catch (error) {
+    primaryError = error;
+  }
+
+  const cleanupErrors = [];
+  const down = docker([...compose, 'down', '-v', '--remove-orphans', '--timeout', '10'], env);
+  if (down.status !== 0) cleanupErrors.push(new Error(down.stderr || down.stdout));
+  for (const [kind, values] of Object.entries(recorded)) {
+    for (const value of values) {
+      const noun = kind === 'containers' ? 'container' : kind.slice(0, -1);
+      const inspected = docker([noun, 'inspect', value]);
+      if (inspected.status === 0) cleanupErrors.push(new Error(`${noun} ${value} survived exact project cleanup`));
+    }
+  }
+  for (const kind of ['container', 'network', 'volume']) {
+    const command = kind === 'container' ? ['ps', '-aq'] : [kind, 'ls', '-q'];
+    const remaining = docker([...command, '--filter', `label=com.docker.compose.project=${project}`]);
+    if (remaining.status !== 0 || lines(remaining.stdout).length !== 0) {
+      cleanupErrors.push(new Error(`${kind} cleanup audit failed for project ${project}`));
+    }
+  }
+
+  if (primaryError || cleanupErrors.length > 0) {
+    throw new AggregateError([...(primaryError ? [primaryError] : []), ...cleanupErrors], 'clean-cache builder probe failed');
+  }
 });
 
 test('one-shot ownership initializers retain default CHOWN without adding capabilities', () => {
@@ -154,7 +249,7 @@ test('runtime mounts keep source, binaries, config, and secrets read-only while 
   }
 });
 
-test('only frontend publishes a Docker-assigned loopback port and dependencies use completion or health conditions', () => {
+test('only frontend publishes a Docker-assigned loopback port and runtime dependencies use completion or health conditions', () => {
   const config = loadCompose();
   for (const [name, service] of Object.entries(config.services)) {
     if (name === 'frontend') {
@@ -177,7 +272,12 @@ test('only frontend publishes a Docker-assigned loopback port and dependencies u
   assert.equal(config.services.controlplane.depends_on.oidc.condition, 'service_healthy');
   assert.equal(config.services.agent.depends_on.controlplane.condition, 'service_healthy');
   assert.equal(config.services.frontend.depends_on.controlplane.condition, 'service_healthy');
-  assert.equal(config.services['acceptance-runner'].depends_on.frontend.condition, 'service_healthy');
+});
+
+test('acceptance runner is verifier-controlled and encodes no false Agent readiness edge', () => {
+  const runner = loadCompose().services['acceptance-runner'];
+  assert.deepEqual(runner.profiles, ['acceptance-runner']);
+  assert.equal(runner.depends_on, undefined);
 });
 
 test('Kylin production runtimes verify OS, architecture, and binary version before execution', () => {
@@ -211,7 +311,41 @@ test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream
   assert.doesNotMatch(nginx, /oidc|\/token|acceptance\/secrets/i);
 });
 
-test('runner image pins Playwright 1.62.0, installs only its locked package, and drops to pwuser', async () => {
+test('generated Artifact descriptor origin and path are served by the checked-in frontend proxy', async () => {
+  const [bootstrap, nginx] = await Promise.all([readFile(bootstrapFile, 'utf8'), readFile(nginxFile, 'utf8')]);
+  const match = bootstrap.match(/"event_url_base":\s*"([^"]+)"/);
+  assert.ok(match, 'bootstrap must generate an explicit Artifact descriptor base');
+  const descriptor = new URL('/api/v1/artifact-downloads/artifact-acceptance?signature=redacted', match[1]);
+  assert.equal(descriptor.protocol, 'http:');
+  assert.equal(descriptor.hostname, 'frontend');
+  assert.equal(descriptor.port, '8080');
+  assert.equal(descriptor.pathname, '/api/v1/artifact-downloads/artifact-acceptance');
+
+  const frontend = loadCompose().services.frontend;
+  assert.deepEqual(Object.keys(frontend.networks), ['acceptance']);
+  assert.equal(frontend.ports[0].target, Number(descriptor.port));
+  assert.match(nginx, new RegExp(`listen\\s+${descriptor.port}`));
+  assert.match(nginx, /location\s+\/api\//);
+  assert.match(nginx, /proxy_pass\s+https:\/\/controlplane:8443/);
+});
+
+test('runner exports the complete exact Task 3 environment interface over read-only fixture mounts', () => {
+  const runner = loadCompose().services['acceptance-runner'];
+  assert.deepEqual(runner.environment, {
+    EXPECTED_OFFLINE_AGENT_ID: 'agent-offline',
+    EXPECTED_ONLINE_AGENT_ID: 'agent-online',
+    FRONTEND_URL: 'http://frontend:8080',
+    OIDC_CA_FILE: '/acceptance/config/ca.pem',
+    OIDC_CREDENTIAL_FILE: '/acceptance/secrets/oidc-token-credential',
+    OIDC_URL: 'https://oidc:9444',
+    PROJECT_ID: 'project-acceptance',
+    TENANT_ID: 'tenant-acceptance',
+  });
+  assert.equal(mountAt(runner, '/acceptance/config').read_only, true);
+  assert.equal(mountAt(runner, '/acceptance/secrets').read_only, true);
+});
+
+test('runner image pins Playwright 1.62.0 and stages only the dedicated Task 3 inputs', async () => {
   const dockerfile = await readFile(runnerFile, 'utf8');
   assert.match(dockerfile, /^FROM mcr\.microsoft\.com\/playwright:v1\.62\.0-noble$/m);
   assert.match(dockerfile, /COPY .*backend\/test\/e2e\/full-stack\/package\.json .*backend\/test\/e2e\/full-stack\/package-lock\.json/);
@@ -219,4 +353,24 @@ test('runner image pins Playwright 1.62.0, installs only its locked package, and
   assert.match(dockerfile, /COPY .*playwright\.config\.mjs .*acceptance\.spec\.mjs/);
   assert.doesNotMatch(dockerfile, /COPY\s+\.\s/);
   assert.match(dockerfile, /^USER pwuser$/m);
+});
+
+test('runner package and lock resolve exactly @playwright/test 1.62.0 when Task 3 assets exist', {
+  skip: !existsSync(runnerPackageFile) && !existsSync(runnerLockFile),
+}, async () => {
+  const [packageBody, lockBody, dockerfile] = await Promise.all([
+    readFile(runnerPackageFile, 'utf8'),
+    readFile(runnerLockFile, 'utf8'),
+    readFile(runnerFile, 'utf8'),
+  ]);
+  const packageMetadata = JSON.parse(packageBody);
+  const lock = JSON.parse(lockBody);
+  assert.deepEqual(packageMetadata.dependencies ?? {}, {});
+  assert.deepEqual(packageMetadata.devDependencies, { '@playwright/test': '1.62.0' });
+  assert.equal(packageMetadata.scripts?.postinstall, undefined);
+  assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {});
+  assert.deepEqual(lock.packages?.['']?.devDependencies, { '@playwright/test': '1.62.0' });
+  assert.equal(lock.packages?.['node_modules/@playwright/test']?.version, '1.62.0');
+  const imageVersion = dockerfile.match(/^FROM mcr\.microsoft\.com\/playwright:v([0-9.]+)-noble$/m)?.[1];
+  assert.equal(imageVersion, '1.62.0');
 });
