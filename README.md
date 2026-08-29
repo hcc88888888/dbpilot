@@ -123,6 +123,12 @@ powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
 snapshot timestamp，并验证 ResultAck 已写入 journal；静态数据、通用 Linux 或
 `-SkipKylin` 不构成完成证据。GitHub CI 运行公开 PostgreSQL 门禁，不依赖私有 Kylin registry。
 
+完整的浏览器、OIDC、Agent mTLS、重启补发、非法身份、PostgreSQL 与 journal
+Compose 验收由 `backend/scripts/verify-full-stack-compose.ps1` 统一编排。它只接受精确
+Kylin V10 SP1 镜像，按唯一所有权标签记录并清理资源；成功不保留产物，失败只保留脱敏
+诊断。先阅读 [全栈 Compose 验收说明](docs/full-stack-compose-acceptance.md)。普通 CI 只运行
+Compose 静态解析和 fake-Docker 清理契约；真实私有镜像门禁必须显式手动启用。
+
 Agent 命令采用 `Prepare → Start` 两阶段执行。Prepare 只把签名 envelope 同步写入
 Agent journal，不调用 executor；只有控制面在 PostgreSQL 中原子提交 Start fence 后，
 匹配 execution token/revision 的 Start 才能产生副作用。取消事务若先提交，则不生成

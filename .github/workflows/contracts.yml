@@ -1,6 +1,13 @@
 name: Contract foundation
 
 on:
+  workflow_dispatch:
+    inputs:
+      run_full_stack:
+        description: Run the private-image full-stack Compose acceptance on a prepared Windows runner
+        required: false
+        type: boolean
+        default: false
   pull_request:
     paths:
       - 'contracts/**'
@@ -70,6 +77,12 @@ jobs:
       - name: Install locked Node dependencies
         run: npm ci
 
+      - name: Validate full-stack Compose topology
+        run: docker compose -f backend/docker/full-stack/docker-compose.yml --profile '*' config --quiet
+
+      - name: Run full-stack fake-Docker cleanup contracts
+        run: node --test tests/contracts/full-stack-container-safety.test.mjs
+
       - name: Lint canonical contracts
         run: npm run contracts:lint
 
@@ -97,3 +110,33 @@ jobs:
       - name: Run live foundation and Linux verification
         shell: pwsh
         run: ./backend/scripts/verify-contract-foundation.ps1
+
+  full-stack-acceptance:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_full_stack == true }}
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Install locked Node dependencies
+        run: npm ci
+
+      - name: Run private-image full-stack acceptance
+        shell: pwsh
+        run: |
+          ./backend/scripts/verify-full-stack-compose.ps1 `
+            -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' `
+            -Architecture amd64 `
+            -GoBinary (Get-Command go).Source

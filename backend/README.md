@@ -295,3 +295,11 @@ JMX services are not full HBase, HDFS, or ZooKeeper distributions. A production
 endpoint-to-endpoint support claim still requires matching-version clusters and
 Kylin V10 VM or bare-metal evidence with real service health, networking, and
 credentials.
+
+The repository-level production-binary browser and Agent acceptance is
+orchestrated by `scripts/verify-full-stack-compose.ps1`. See
+[`../docs/full-stack-compose-acceptance.md`](../docs/full-stack-compose-acceptance.md)
+for prerequisites, exact invocation, phase evidence, redacted failure artifacts,
+and the recorded-ID/ownership-label cleanup contract. The live private-image CI
+job is manual opt-in; pull requests run only Compose parsing and fake-Docker
+lifecycle safety.
