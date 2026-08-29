@@ -439,7 +439,7 @@ test('post-download failure retains a safe Artifact path and status without sign
   await assertPostDownloadFailureArtifacts(pwsh);
 });
 
-test('Windows PowerShell 5.1 redacts signed Artifact URLs from post-download failure artifacts', async () => {
+test('Windows PowerShell 5.1 redacts signed Artifact URLs from post-download failure artifacts', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
   await assertPostDownloadFailureArtifacts(windowsPowerShell);
 });
 
@@ -454,7 +454,7 @@ test('Redact-Text removes signed URL values without damaging fixed diagnostics',
   await assertSignatureRedaction('pwsh');
 });
 
-test('Windows PowerShell 5.1 Redact-Text removes signed URL values without damaging fixed diagnostics', async () => {
+test('Windows PowerShell 5.1 Redact-Text removes signed URL values without damaging fixed diagnostics', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
   await assertSignatureRedaction(windowsPowerShellBinary);
 });
 

@@ -120,6 +120,14 @@ defensive failure-text redaction and their fake-runtime/static contracts. The
 broader Compose/communication/container-safety gate below is fresh after this
 hardening.
 
+The two new Windows PowerShell 5.1-only regressions use the same executable-
+presence skip guard as the pre-existing PS5.1 cases. On Windows, the complete
+container-safety file passed 28/28 after that guard. With `SystemRoot` changed
+after Node initialization to resolve a deliberately absent `powershell.exe`, the
+focused cross-platform probe passed both pwsh cases and skipped both PS5.1 cases
+(4 total, 2 passed, 2 skipped, 0 failed). Thus the always-on Linux job retains
+pwsh leak coverage without attempting a Windows-only executable.
+
 ## Regression and production gates
 
 | Gate | Result |
