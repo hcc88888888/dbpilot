@@ -104,6 +104,9 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 	if err := writer.write("ca_cert", "config/ca.pem", ca.certificatePEM, 0o644); err != nil {
 		return BootstrapManifest{}, err
 	}
+	if err := writer.write("frontend_ca_bundle", "config/ca-certificates.crt", ca.certificatePEM, 0o644); err != nil {
+		return BootstrapManifest{}, err
+	}
 	if err := writer.write("untrusted_ca_cert", "config/untrusted-ca.pem", untrustedCA.certificatePEM, 0o644); err != nil {
 		return BootstrapManifest{}, err
 	}

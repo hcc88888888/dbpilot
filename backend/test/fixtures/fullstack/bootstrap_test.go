@@ -46,7 +46,7 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 		"agent_online_cert", "agent_online_key", "agent_untrusted_cert", "agent_untrusted_config",
 		"agent_untrusted_key", "artifact_key", "ca_cert", "command_private_key", "command_public_key",
 		"controlplane_config", "controlplane_grpc_cert", "controlplane_grpc_key", "controlplane_http_cert",
-		"controlplane_http_key", "execution_key", "frontend_cert", "frontend_key", "jwks", "manifest", "oidc_cert", "oidc_config",
+		"controlplane_http_key", "execution_key", "frontend_ca_bundle", "frontend_cert", "frontend_key", "jwks", "manifest", "oidc_cert", "oidc_config",
 		"oidc_key", "oidc_signing_key", "policy", "policy_private_key", "policy_public_key", "postgres_password",
 		"token_credential", "untrusted_ca_cert",
 	}
@@ -66,6 +66,8 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 	}
 	sort.Strings(gotFiles)
 	require.Equal(t, wantFiles, gotFiles)
+	require.Equal(t, "ca-certificates.crt", filepath.Base(manifest.Files["frontend_ca_bundle"]))
+	require.Equal(t, mustRead(t, manifest.Files["ca_cert"]), mustRead(t, manifest.Files["frontend_ca_bundle"]))
 
 	if runtime.GOOS != "windows" {
 		for _, name := range []string{"agent_mismatch_key", "agent_online_key", "agent_untrusted_key", "artifact_key", "command_private_key", "controlplane_config", "execution_key", "frontend_key", "oidc_key", "oidc_signing_key", "policy_private_key", "postgres_password", "token_credential"} {

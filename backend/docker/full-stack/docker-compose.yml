@@ -251,6 +251,7 @@ services:
       - ../../../frontend:/srv/dbpilot/frontend:ro
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - acceptance-config:/acceptance/config:ro
+      - acceptance-config:/etc/ssl/certs:ro
       - acceptance-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     ports:
@@ -259,7 +260,7 @@ services:
         host_ip: 127.0.0.1
         protocol: tcp
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "--ca-certificate", "/acceptance/config/ca.pem", "https://frontend:8443/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "https://frontend:8443/healthz"]
       interval: 2s
       timeout: 3s
       retries: 30

@@ -278,8 +278,12 @@ test('only frontend publishes a Docker-assigned loopback port and runtime depend
   assert.ok(config.services.oidc.healthcheck);
   assert.ok(config.services.controlplane.healthcheck);
   assert.ok(config.services.frontend.healthcheck);
-  assert.match(config.services.frontend.healthcheck.test.join(' '), /https:\/\/frontend:8443\/healthz/);
-  assert.match(config.services.frontend.healthcheck.test.join(' '), /\/acceptance\/config\/ca\.pem/);
+  assert.deepEqual(config.services.frontend.healthcheck.test, ['CMD', 'wget', '-q', '--spider', 'https://frontend:8443/healthz']);
+  assert.doesNotMatch(config.services.frontend.healthcheck.test.join(' '), /ca-certificate|no-check-certificate/i);
+  const frontendTrust = mountAt(config.services.frontend, '/etc/ssl/certs');
+  const frontendConfig = mountAt(config.services.frontend, '/acceptance/config');
+  assert.equal(frontendTrust.source, frontendConfig.source);
+  assert.equal(frontendTrust.read_only, true);
   assert.equal(config.services.bootstrap.depends_on['asset-builder'].condition, 'service_completed_successfully');
   assert.equal(config.services.postgres.depends_on.bootstrap.condition, 'service_completed_successfully');
   assert.equal(config.services.oidc.depends_on.bootstrap.condition, 'service_completed_successfully');
@@ -327,6 +331,9 @@ test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream
   assert.match(nginx, /proxy_buffering\s+off/);
   assert.match(nginx, /client_max_body_size\s+\d+[km]/i);
   assert.match(nginx, /proxy_(?:connect|read|send)_timeout\s+\d+s/);
+  for (const temporaryPath of ['client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi']) {
+    assert.match(nginx, new RegExp(`${temporaryPath}_temp_path\\s+\\/tmp\\/`), `${temporaryPath} temp output must stay off the read-only root`);
+  }
   assert.equal(nginx.match(/\/acceptance\/secrets\//g)?.length, 1, 'only the frontend TLS key may be read from secrets');
   assert.doesNotMatch(nginx, /oidc|location\s+[^\n]*\/token|proxy_pass[^\n]*\/token/i);
 });
