@@ -126,10 +126,6 @@ if ($args[0] -eq 'ps') {
   }
   if ($args -contains 'label=dbpilot.verifier=full-stack-compose') {
     if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
-    if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-      if ($history -match ' up --pull never -d --no-deps asset-builder' -and (Present 'container' 'builder-id')) { Write-Output 'builder-id' }
-      $global:LASTEXITCODE=0; return
-    }
     if ($history -match '(?m)^rm -f -v agent-id\r?$') { $global:LASTEXITCODE=0; return }
     foreach ($id in $containers) {
       if ($env:DOCKER_MODE -eq 'container-label-mismatch' -and $id -eq 'runner-normal-id' -and $history -notmatch 'acceptance-runner normal') { continue }
@@ -141,10 +137,6 @@ if ($args[0] -eq 'ps') {
 if ($args[0] -eq 'network' -and $args[1] -eq 'ls') {
   if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
-  if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-    if ($history -match ' up --pull never -d --no-deps asset-builder' -and (Present 'network' 'network-builder')) { Write-Output 'network-builder' }
-    $global:LASTEXITCODE=0; return
-  }
   if ($history -match '(?m)^network rm network-acceptance\r?$') { $global:LASTEXITCODE=0; return }
   foreach ($id in $networks) { if ((CreatedNetwork $id) -and (Present 'network' $id)) { Write-Output $id } }
   $global:LASTEXITCODE=0; return
@@ -152,12 +144,6 @@ if ($args[0] -eq 'network' -and $args[1] -eq 'ls') {
 if ($args[0] -eq 'volume' -and $args[1] -eq 'ls') {
   if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
-  if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-    if ($history -match ' up --pull never -d --no-deps asset-builder') {
-      foreach ($id in @('volume-bin','volume-go-cache')) { if (Present 'volume' $id) { Write-Output $id } }
-    }
-    $global:LASTEXITCODE=0; return
-  }
   if ($history -match '(?m)^volume rm volume-agent\r?$') { $global:LASTEXITCODE=0; return }
   foreach ($id in $volumes) { if ((CreatedVolume $id) -and (Present 'volume' $id)) { Write-Output $id } }
   $global:LASTEXITCODE=0; return
@@ -170,7 +156,7 @@ if ($args[0] -eq 'inspect') {
       $observations = ([regex]::Matches($history, 'inspect --format \{\{json \.State\}\} builder-id')).Count
       if ($observations -le 2) { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
     }
-    if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $id -eq 'builder-id') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
+    if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $id -eq 'bootstrap-id') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
     $code = if ($env:DOCKER_MODE -eq 'phase-failure' -and $id -eq 'runner-normal-id') { 19 }
       elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $id -eq 'assertion-replay-id') { 23 }
       elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $id -eq 'assertion-final-id') { 29 }
@@ -202,7 +188,7 @@ if ($args[0] -eq 'volume' -and $args[1] -eq 'inspect') {
 }
 if ($args[0] -eq 'port') { Write-Output '127.0.0.1:49177'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'wait') {
-  if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $args[1] -eq 'builder-id') { Start-Sleep -Seconds 30; Write-Output '0'; $global:LASTEXITCODE=0; return }
+  if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $args[1] -eq 'bootstrap-id') { Start-Sleep -Seconds 30; Write-Output '0'; $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'phase-failure' -and $args[1] -eq 'runner-normal-id') { Write-Output '19' }
   elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $args[1] -eq 'assertion-replay-id') { Write-Output '23' }
   elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $args[1] -eq 'assertion-final-id') { Write-Output '29' }
@@ -524,16 +510,22 @@ test('asset builder dedicated deadline still times out and cleans exact resource
 test('verifier times out a running one-shot container without docker wait and cleans its exact resources', async () => {
   const fixture = await fakeRuntime('one-shot-hang');
   try {
-    const started = Date.now();
-    const result = pwsh(boundedVerifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
-    const elapsed = Date.now() - started;
-    assert.notEqual(result.status, 0);
-    assert.ok(elapsed < 35_000, `one-shot wait was not bounded: ${elapsed}ms`);
-    assert.match(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    const tokens = boundedVerifierArguments(fixture).slice(2).map((value) => value.startsWith('-') ? value : `'${value.replaceAll("'", "''")}'`).join(' ');
+    const command = `$env:DBPILOT_ACCEPTANCE_PROJECT='sentinel-project'; $env:DBPILOT_ACCEPTANCE_RUN_ID='sentinel-run'; try { & '${verifier}' ${tokens} } catch { Write-Output ('FIXED=' + $_.Exception.Message) }; Write-Output ('RESTORED=' + $env:DBPILOT_ACCEPTANCE_PROJECT + '|' + $env:DBPILOT_ACCEPTANCE_RUN_ID)`;
+    const result = pwsh(['-Command', command], { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /FIXED=bootstrap did not exit before the deadline\./);
+    assert.match(result.stdout, /RESTORED=sentinel-project\|sentinel-run/);
     const invocations = await readFile(fixture.log, 'utf8');
     assert.doesNotMatch(invocations, /^wait /m);
+    assert.match(invocations, /^rm -f -v bootstrap-id$/m);
     assert.match(invocations, /^rm -f -v builder-id$/m);
-    assert.match(`${result.stdout}\n${result.stderr}`, /Full-stack cleanup audit passed/);
+    assert.match(invocations, /^network rm network-acceptance$/m);
+    assert.match(invocations, /^network rm network-builder$/m);
+    assert.match(invocations, /^volume rm volume-agent$/m);
+    assert.match(invocations, /^volume rm volume-bin$/m);
+    assert.doesNotMatch(invocations, / up --pull never -d --no-deps postgres oidc/);
+    assert.match(result.stdout, /Full-stack cleanup audit passed/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -590,13 +582,22 @@ test('Windows PowerShell 5.1 kills a hung build and restores caller environment'
 test('Windows PowerShell 5.1 bounds a running one-shot and cleans exact resources', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
   const fixture = await fakeRuntime('one-shot-hang', { withSpaces: true });
   try {
-    const result = windowsPowerShell(boundedVerifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
-    assert.notEqual(result.status, 0);
-    assert.match(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    const tokens = boundedVerifierArguments(fixture).slice(2).map((value) => value.startsWith('-') ? value : `'${value.replaceAll("'", "''")}'`).join(' ');
+    const command = `$env:DBPILOT_ACCEPTANCE_PROJECT='sentinel-project'; $env:DBPILOT_ACCEPTANCE_RUN_ID='sentinel-run'; try { & '${verifier}' ${tokens} } catch { Write-Output ('FIXED=' + $_.Exception.Message) }; Write-Output ('RESTORED=' + $env:DBPILOT_ACCEPTANCE_PROJECT + '|' + $env:DBPILOT_ACCEPTANCE_RUN_ID)`;
+    const result = windowsPowerShell(['-Command', command], { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /FIXED=bootstrap did not exit before the deadline\./);
+    assert.match(result.stdout, /RESTORED=sentinel-project\|sentinel-run/);
     assert.match(result.stdout, /Full-stack cleanup audit passed/);
     const invocations = await readFile(fixture.log, 'utf8');
     assert.doesNotMatch(invocations, /^wait /m);
+    assert.match(invocations, /^rm -f -v bootstrap-id$/m);
     assert.match(invocations, /^rm -f -v builder-id$/m);
+    assert.match(invocations, /^network rm network-acceptance$/m);
+    assert.match(invocations, /^network rm network-builder$/m);
+    assert.match(invocations, /^volume rm volume-agent$/m);
+    assert.match(invocations, /^volume rm volume-bin$/m);
+    assert.doesNotMatch(invocations, / up --pull never -d --no-deps postgres oidc/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
