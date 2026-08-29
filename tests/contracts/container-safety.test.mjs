@@ -10,6 +10,7 @@ const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const helper = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const kylinVerifier = join(repoRoot, 'backend', 'scripts', 'verify-kylin-docker.ps1');
 const hostInspectionVerifier = join(repoRoot, 'backend', 'scripts', 'verify-host-inspection.ps1');
+const fullStackCompose = join(repoRoot, 'backend', 'docker', 'full-stack', 'docker-compose.yml');
 
 function pwsh(args, env = {}) {
   return spawnSync('pwsh', ['-NoProfile', ...args], {
@@ -139,5 +140,27 @@ switch ($args[0]) {
     assert.doesNotMatch(invocations, /rm .*preexisting-id/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('full-stack Compose grants no privileged mode, added capabilities, or Docker socket access', () => {
+  const result = spawnSync('docker', ['compose', '-f', fullStackCompose, '--profile', '*', 'config', '--format', 'json'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const config = JSON.parse(result.stdout);
+  for (const [name, service] of Object.entries(config.services)) {
+    assert.notEqual(service.privileged, true, `${name} must not be privileged`);
+    assert.equal(service.cap_add, undefined, `${name} must not add Linux capabilities`);
+    assert.ok(service.security_opt?.includes('no-new-privileges:true'), `${name} must enable no-new-privileges`);
+    assert.ok(service.cap_drop?.length > 0, `${name} must drop Linux capabilities`);
+    for (const mount of service.volumes ?? []) {
+      assert.notEqual(mount.source, '/var/run/docker.sock', `${name} must not mount the Docker socket`);
+      assert.notEqual(mount.target, '/var/run/docker.sock', `${name} must not mount the Docker socket`);
+    }
+  }
+  for (const name of ['asset-builder', 'bootstrap', 'oidc', 'controlplane', 'agent', 'frontend', 'acceptance-runner', 'rogue-untrusted', 'rogue-mismatch', 'assertions']) {
+    assert.equal(config.services[name].read_only, true, `${name} must have a read-only root filesystem`);
   }
 });

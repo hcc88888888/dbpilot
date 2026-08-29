@@ -1,0 +1,434 @@
+name: ${DBPILOT_ACCEPTANCE_PROJECT:-dbpilot-full-stack-acceptance}
+
+x-labels: &ownership-labels
+  dbpilot.verifier: full-stack-compose
+  dbpilot.run: ${DBPILOT_ACCEPTANCE_RUN_ID:-unassigned}
+
+x-kylin-image: &kylin-image cr.kylinos.cn/kylin/kylin-server-platform:v10sp1
+
+services:
+  asset-builder:
+    image: golang:1.27.0-bookworm
+    user: "0:0"
+    working_dir: /workspace/backend
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        install -d -m 0755 /acceptance/bin /go-cache/build /go-cache/mod
+        go build -trimpath -o /acceptance/bin/dbpilot-controlplane ./cmd/controlplane
+        go build -trimpath -o /acceptance/bin/dbpilot-agent ./cmd/agent
+        go build -trimpath -o /acceptance/bin/dbpilot-fullstack-fixture ./test/fixtures/fullstack
+        chown 10001:10001 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture
+        chmod 0555 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture
+    environment:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: amd64
+      GOAMD64: v1
+      GOCACHE: /go-cache/build
+      GOMODCACHE: /go-cache/mod
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    volumes:
+      - ../../..:/workspace:ro
+      - acceptance-bin:/acceptance/bin
+      - acceptance-go-cache:/go-cache
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 512
+
+  bootstrap:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        install -d -m 0700 /acceptance
+        /acceptance/bin/dbpilot-fullstack-fixture bootstrap --root /acceptance >/dev/null
+        cp -a /acceptance/config/. /volumes/config/
+        cp -a /acceptance/secrets/. /volumes/secrets/
+        cp -a /acceptance/state/. /volumes/state/
+        install -d -m 0700 /volumes/artifacts /volumes/agent-data
+        chown -R 10001:10001 /volumes/config /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data
+        chmod 0700 /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data
+    depends_on:
+      asset-builder:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /acceptance:rw,nosuid,size=32m,mode=0700
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/volumes/config
+      - acceptance-secrets:/volumes/secrets
+      - acceptance-state:/volumes/state
+      - acceptance-artifacts:/volumes/artifacts
+      - acceptance-agent-data:/volumes/agent-data
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dbpilot
+      POSTGRES_USER: dbpilot
+      POSTGRES_PASSWORD_FILE: /acceptance/secrets/postgres-password
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=512m
+      - /var/run/postgresql:rw,noexec,nosuid,size=16m
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-secrets:/acceptance/secrets:ro
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbpilot -d dbpilot"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+
+  oidc:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        exec /acceptance/bin/dbpilot-fullstack-fixture oidc --config /acceptance/config/oidc.json
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/acceptance/config/ca.pem", "https://oidc:9444/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+      start_period: 3s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  controlplane:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-controlplane --version >/dev/null
+        export DBPILOT_COMMAND_SIGNING_PRIVATE_KEY="$$(cat /acceptance/secrets/command-signing-key.pem)"
+        export DBPILOT_COMMAND_EXECUTION_TOKEN_KEY="$$(cat /acceptance/secrets/execution-token-key)"
+        export DBPILOT_SECRET_CONTROLPLANE_ARTIFACT_DOWNLOAD="$$(cat /acceptance/secrets/artifact-signing-key)"
+        export SSL_CERT_FILE=/acceptance/config/ca.pem
+        exec /acceptance/bin/dbpilot-controlplane --config /acceptance/secrets/controlplane.yaml
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      oidc:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-state:/acceptance/state:ro
+      - acceptance-artifacts:/acceptance/state/artifacts
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/acceptance/config/ca.pem", "https://controlplane:8443/readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.5
+    mem_limit: 1g
+    pids_limit: 256
+
+  agent:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-agent --version >/dev/null
+        printf '%s\n' 'acceptance warning: controlled file-log source' >>/var/log/dbpilot/acceptance.log
+        exec /acceptance/bin/dbpilot-agent --config /acceptance/config/agent.yaml
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+      - /var/log/dbpilot:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-state:/acceptance/state:ro
+      - acceptance-agent-data:/acceptance/state/agent-online
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 192
+
+  frontend:
+    image: nginx:1.29.1-alpine
+    user: "101:101"
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - ../../../frontend:/srv/dbpilot/frontend:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - acceptance-config:/acceptance/config:ro
+    networks: [acceptance]
+    ports:
+      - target: 8080
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 96
+
+  acceptance-runner:
+    build:
+      context: ../../..
+      dockerfile: backend/docker/full-stack/runner.Dockerfile
+    user: "10001:10001"
+    depends_on:
+      agent:
+        condition: service_started
+      frontend:
+        condition: service_healthy
+    environment:
+      DBPILOT_ACCEPTANCE_BASE_URL: http://frontend:8080
+      DBPILOT_OIDC_URL: https://oidc:9444
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m,mode=1777
+      - /home/pwuser:rw,nosuid,size=64m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts
+      - acceptance-runner-node-modules:/work/node_modules
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 512
+
+  rogue-untrusted:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["faults"]
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-agent --version >/dev/null
+        exec /acceptance/bin/dbpilot-agent --config /acceptance/config/agent-untrusted.yaml
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+      - /acceptance/state/agent-untrusted:rw,noexec,nosuid,size=32m,mode=0700,uid=10001,gid=10001
+      - /var/log/dbpilot:rw,noexec,nosuid,size=4m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-state:/acceptance/state:ro
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  rogue-mismatch:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["faults"]
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-agent --version >/dev/null
+        exec /acceptance/bin/dbpilot-agent --config /acceptance/config/agent-mismatch.yaml
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+      - /acceptance/state/agent-mismatch:rw,noexec,nosuid,size=32m,mode=0700,uid=10001,gid=10001
+      - /var/log/dbpilot:rw,noexec,nosuid,size=4m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-state:/acceptance/state:ro
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  assertions:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["assertions"]
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        password="$$(cat /acceptance/secrets/postgres-password)"
+        umask 077
+        printf 'postgres://dbpilot:%s@postgres/dbpilot?sslmode=disable' "$${password}" >/tmp/postgres-dsn
+        exec /acceptance/bin/dbpilot-fullstack-fixture database --dsn-file /tmp/postgres-dsn --assertions-file /acceptance/state/database-assertions.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-state:/acceptance/state:ro
+      - acceptance-agent-data:/acceptance/state/agent-online:ro
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+networks:
+  acceptance:
+    driver: bridge
+    internal: true
+    labels: *ownership-labels
+
+volumes:
+  acceptance-bin:
+    labels: *ownership-labels
+  acceptance-secrets:
+    labels: *ownership-labels
+  acceptance-config:
+    labels: *ownership-labels
+  acceptance-state:
+    labels: *ownership-labels
+  acceptance-artifacts:
+    labels: *ownership-labels
+  acceptance-agent-data:
+    labels: *ownership-labels
+  acceptance-runner-node-modules:
+    labels: *ownership-labels
+  acceptance-go-cache:
+    labels: *ownership-labels
