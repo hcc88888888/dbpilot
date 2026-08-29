@@ -160,6 +160,20 @@ func TestNewOIDCServerTLSListenerRejectsPlainHTTPAndUsesTLS12Minimum(t *testing.
 	require.NoError(t, connection.Close())
 }
 
+func TestOIDCTLSFixtureVerifiesChainAtDeterministicAcceptanceTime(t *testing.T) {
+	fixture := startOIDCFixture(t)
+	transport := fixture.client.Transport.(*http.Transport)
+	require.NotNil(t, transport.TLSClientConfig.Time)
+	verificationTime := transport.TLSClientConfig.Time()
+	require.Equal(t, time.Date(2026, 8, 29, 3, 3, 4, 0, time.UTC), verificationTime)
+	chains, err := fixture.certificate.Verify(x509.VerifyOptions{
+		DNSName: "oidc", Roots: fixture.roots, CurrentTime: verificationTime,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, chains)
+}
+
 type runningOIDCFixture struct {
 	issuer          string
 	credential      string
@@ -167,6 +181,8 @@ type runningOIDCFixture struct {
 	server          *http.Server
 	logs            *bytes.Buffer
 	listenerAddress string
+	certificate     *x509.Certificate
+	roots           *x509.CertPool
 }
 
 type tokenResponse struct {
@@ -221,8 +237,9 @@ func startOIDCFixture(t *testing.T) runningOIDCFixture {
 	caPool := x509.NewCertPool()
 	require.True(t, caPool.AppendCertsFromPEM(mustRead(t, manifest.Files["ca_cert"])))
 	dialer := &net.Dialer{Timeout: time.Second}
+	verificationTime := time.Date(2026, 8, 29, 3, 3, 4, 0, time.UTC)
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: caPool, MinVersion: tls.VersionTLS12},
+		TLSClientConfig: &tls.Config{RootCAs: caPool, MinVersion: tls.VersionTLS12, Time: func() time.Time { return verificationTime }},
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 			parsed, parseErr := url.Parse("https://" + address)
 			if parseErr != nil || parsed.Hostname() != "oidc" {
@@ -234,6 +251,6 @@ func startOIDCFixture(t *testing.T) runningOIDCFixture {
 	credential := strings.TrimSpace(string(mustRead(t, manifest.Files["token_credential"])))
 	return runningOIDCFixture{
 		issuer: issuer, credential: credential, client: &http.Client{Transport: transport, Timeout: 3 * time.Second},
-		server: server, logs: logs, listenerAddress: listener.Addr().String(),
+		server: server, logs: logs, listenerAddress: listener.Addr().String(), certificate: mustCertificate(t, manifest.Files["oidc_cert"]), roots: caPool,
 	}
 }

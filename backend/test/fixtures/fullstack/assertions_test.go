@@ -35,6 +35,11 @@ func TestAssertDatabaseRequiresScopedRunTargetsFindingsReportArtifactsAuditsAndM
 		WillReturnRows(sqlmock.NewRows([]string{"target_id", "agent_id", "command_id", "status", "error_code", "observed_at"}).
 			AddRow("agent-offline", options.OfflineAgentID, "command-offline", "failed", "agent_offline", nil).
 			AddRow("agent-online", options.OnlineAgentID, "command-online", "succeeded", "", now))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, target_id, message_type, command_phase, command_status, terminal_at FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id")).
+		WithArgs(options.TenantID, options.ProjectID, options.JobID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "target_id", "message_type", "command_phase", "command_status", "terminal_at"}).
+			AddRow("command-offline", options.OfflineAgentID, "agent.command", "timed_out", "timed_out", now).
+			AddRow("command-online", options.OnlineAgentID, "agent.command", "succeeded", "succeeded", now))
 	findingRows := sqlmock.NewRows([]string{"target_id", "item_id", "item_version", "level", "observed_at"})
 	for index := 0; index < 13; index++ {
 		findingRows.AddRow("agent-online", fmt.Sprintf("host.item.%02d", index), 1, "healthy", now)
@@ -49,16 +54,17 @@ func TestAssertDatabaseRequiresScopedRunTargetsFindingsReportArtifactsAuditsAndM
 		WillReturnRows(sqlmock.NewRows([]string{"id", "job_id", "source_resource_type", "source_resource_id", "content_type", "size_bytes", "checksum", "storage_reference"}).
 			AddRow("artifact-html", options.JobID, "inspection_report", options.ReportID, "text/html; charset=utf-8", 100, "sha256:html", "reports/report.html").
 			AddRow("artifact-json", options.JobID, "inspection_report", options.ReportID, "application/json", 100, "sha256:json", "reports/report.json"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (job_id = $3 OR resource_id = $4) ORDER BY id")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
 		WithArgs(options.TenantID, options.ProjectID, options.JobID, options.RunID).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "action", "resource_type", "resource_id", "request_id", "trace_id", "job_id", "command_id", "dedupe_key"}).
-			AddRow("audit-run", "inspection.run_created", "inspection_run", options.RunID, "request-run", "trace-run", "", "", "http:inspection-run").
-			AddRow("audit-command", "command.completed", "job_target", "agent-online", "request-command", "trace-command", options.JobID, "command-online", "").
-			AddRow("audit-report", "inspection.report_generated", "inspection_report", options.ReportID, "request-report", "trace-report", options.JobID, "", options.AuditCorrelation+":report"))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT agent_id, metric, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric")).
+			AddRow("audit-run", "inspection.run.created", "inspection_run", options.RunID, "request-run", "trace-run", "", "", "http:inspection-run").
+			AddRow("audit-command-offline", "command.prepared_timed_out", "job_target", options.OfflineAgentID, "request-command", "trace-command", options.JobID, "command-offline", "command.prepared_timed_out:command-offline").
+			AddRow("audit-command-online", "command.result", "job_target", options.OnlineAgentID, "request-command", "trace-command", options.JobID, "command-online", "command.result:command-online").
+			AddRow("audit-report", "inspection.report.completed", "inspection_report", options.ReportID, "request-report", "trace-report", options.JobID, "", options.AuditCorrelation+":report"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint")).
 		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
-		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "source_id", "sampled_at", "accepted_at"}).
-			AddRow(options.OnlineAgentID, "system.cpu.utilization", "inspection-host-snapshot", now, now.Add(time.Second)))
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
+			AddRow(options.OnlineAgentID, "system.cpu.utilization", "cpu-total", "inspection-host-snapshot", now, now.Add(time.Second)))
 
 	require.NoError(t, AssertDatabase(context.Background(), database, options))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -137,6 +143,108 @@ func TestAssertDatabaseHonorsCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.ErrorIs(t, AssertDatabase(ctx, database, validAssertionOptions()), context.Canceled)
+}
+
+func TestAssertMetricsAcceptsProductionMultiSeriesAtOneSampleTime(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint")).
+		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
+			AddRow(options.OnlineAgentID, "system.disk.io", "disk-sda-read", "inspection-host-snapshot", now, now.Add(time.Second)).
+			AddRow(options.OnlineAgentID, "system.disk.io", "disk-sda-write", "inspection-host-snapshot", now, now.Add(time.Second)))
+
+	require.NoError(t, assertMetrics(context.Background(), database, options))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestAssertMetricsRejectsDuplicateProductionIdentity(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint")).
+		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
+			AddRow(options.OnlineAgentID, "system.disk.io", "disk-sda-read", "inspection-host-snapshot", now, now.Add(time.Second)).
+			AddRow(options.OnlineAgentID, "system.disk.io", "disk-sda-read", "inspection-host-snapshot", now, now.Add(time.Second)))
+
+	err = assertMetrics(context.Background(), database, options)
+	require.ErrorContains(t, err, "metric sample is duplicated")
+}
+
+func TestAssertAuditsRequiresBothExpectedCommandIDs(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id")).
+		WithArgs(options.TenantID, options.ProjectID, options.JobID, options.RunID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "action", "resource_type", "resource_id", "request_id", "trace_id", "job_id", "command_id", "dedupe_key"}).
+			AddRow("audit-run", "inspection.run.created", "inspection_run", options.RunID, "request-run", "trace-run", "", "", "http:inspection-run").
+			AddRow("audit-command-online", "command.result", "job_target", options.OnlineAgentID, "request-command", "trace-command", options.JobID, "command-online", "command.result:command-online").
+			AddRow("audit-report", "inspection.report.completed", "inspection_report", options.ReportID, "request-report", "trace-report", options.JobID, "", options.AuditCorrelation+":report"))
+
+	err = assertAudits(context.Background(), database, options, map[string]string{
+		"command-online": options.OnlineAgentID, "command-offline": options.OfflineAgentID,
+	})
+	require.ErrorContains(t, err, "both expected Command Audit correlations")
+}
+
+func TestAssertCommandsRequiresBothScopedDurableTerminalRows(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	now := time.Date(2026, 8, 29, 3, 0, 0, 0, time.UTC)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT id, target_id, message_type, command_phase, command_status, terminal_at FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id")).
+		WithArgs(options.TenantID, options.ProjectID, options.JobID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "target_id", "message_type", "command_phase", "command_status", "terminal_at"}).
+			AddRow("command-offline", options.OfflineAgentID, "agent.command", "timed_out", "timed_out", now).
+			AddRow("command-online", options.OnlineAgentID, "agent.command", "succeeded", "succeeded", now))
+
+	require.NoError(t, assertCommands(context.Background(), database, options, map[string]string{
+		"command-online": options.OnlineAgentID, "command-offline": options.OfflineAgentID,
+	}))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestAssertCommandsRejectsMissingOrNonterminalRows(t *testing.T) {
+	tests := map[string]struct {
+		rows *sqlmock.Rows
+		want string
+	}{
+		"missing offline": {
+			rows: sqlmock.NewRows([]string{"id", "target_id", "message_type", "command_phase", "command_status", "terminal_at"}).
+				AddRow("command-online", "agent-online", "agent.command", "succeeded", "succeeded", time.Now().UTC()),
+			want: "exactly both expected durable Commands",
+		},
+		"offline nonterminal": {
+			rows: sqlmock.NewRows([]string{"id", "target_id", "message_type", "command_phase", "command_status", "terminal_at"}).
+				AddRow("command-offline", "agent-offline", "agent.command", "prepared", "pending", nil).
+				AddRow("command-online", "agent-online", "agent.command", "succeeded", "succeeded", time.Now().UTC()),
+			want: "durable Command is not in an acceptable terminal phase",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			database, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = database.Close() })
+			options := validAssertionOptions()
+			mock.ExpectQuery("SELECT id, target_id, message_type, command_phase, command_status, terminal_at FROM command_outbox").
+				WithArgs(options.TenantID, options.ProjectID, options.JobID).WillReturnRows(test.rows)
+
+			err = assertCommands(context.Background(), database, options, map[string]string{
+				"command-online": options.OnlineAgentID, "command-offline": options.OfflineAgentID,
+			})
+			require.ErrorContains(t, err, test.want)
+		})
+	}
 }
 
 func validAssertionOptions() AssertionOptions {

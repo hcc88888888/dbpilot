@@ -34,11 +34,12 @@ type JournalAssertion struct {
 const (
 	assertRunSQL       = "SELECT id, job_id, report_id, status, target_count, completed_target_count, failed_target_count, audit_correlation, request_id, trace_id, started_at, finished_at FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
 	assertTargetsSQL   = "SELECT target_id, agent_id, command_id, status, error_code, observed_at FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id"
+	assertCommandsSQL  = "SELECT id, target_id, message_type, command_phase, command_status, terminal_at FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id"
 	assertFindingsSQL  = "SELECT target_id, item_id, item_version, level, observed_at FROM inspection_findings WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY target_id, item_id, item_version"
 	assertReportSQL    = "SELECT id, run_id, status, generated_at FROM inspection_reports WHERE tenant_id = $1 AND project_id = $2 AND run_id = $3 ORDER BY id"
 	assertArtifactsSQL = "SELECT id, job_id, source_resource_type, source_resource_id, content_type, size_bytes, checksum, storage_reference FROM artifacts WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id"
-	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (job_id = $3 OR resource_id = $4) ORDER BY id"
-	assertMetricsSQL   = "SELECT agent_id, metric, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric"
+	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id"
+	assertMetricsSQL   = "SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint"
 )
 
 func AssertDatabase(ctx context.Context, database *sql.DB, options AssertionOptions) error {
@@ -59,6 +60,9 @@ func AssertDatabase(ctx context.Context, database *sql.DB, options AssertionOpti
 	}
 	commands, err := assertTargets(ctx, database, options)
 	if err != nil {
+		return redactAssertionError(err, options.SensitiveValues)
+	}
+	if err := assertCommands(ctx, database, options, commands); err != nil {
 		return redactAssertionError(err, options.SensitiveValues)
 	}
 	if err := assertFindings(ctx, database, options); err != nil {
@@ -169,6 +173,58 @@ func assertTargets(ctx context.Context, database *sql.DB, options AssertionOptio
 	return commands, nil
 }
 
+func assertCommands(ctx context.Context, database *sql.DB, options AssertionOptions, expected map[string]string) error {
+	if len(expected) != 2 {
+		return errors.New("exactly two expected Command identities are required")
+	}
+	rows, err := database.QueryContext(ctx, assertCommandsSQL, options.TenantID, options.ProjectID, options.JobID)
+	if err != nil {
+		return fmt.Errorf("query scoped durable Commands: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{}, 2)
+	for rows.Next() {
+		var id, targetID, messageType, phase, status string
+		var terminalAt sql.NullTime
+		if err := rows.Scan(&id, &targetID, &messageType, &phase, &status, &terminalAt); err != nil {
+			return fmt.Errorf("scan scoped durable Command: %w", err)
+		}
+		expectedTarget, ok := expected[id]
+		if !ok || targetID != expectedTarget || messageType != "agent.command" {
+			return errors.New("durable Command identity, target, or message type is invalid")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return errors.New("durable Command is duplicated")
+		}
+		if !acceptableTerminalCommand(phase, status, targetID == options.OnlineAgentID) || !terminalAt.Valid || terminalAt.Time.IsZero() {
+			return errors.New("durable Command is not in an acceptable terminal phase")
+		}
+		seen[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate scoped durable Commands: %w", err)
+	}
+	if len(seen) != len(expected) {
+		return errors.New("exactly both expected durable Commands are required")
+	}
+	return nil
+}
+
+func acceptableTerminalCommand(phase, status string, online bool) bool {
+	if phase != status {
+		return false
+	}
+	if online {
+		return phase == "succeeded"
+	}
+	switch phase {
+	case "failed", "cancelled", "timed_out", "rejected":
+		return true
+	default:
+		return false
+	}
+}
+
 func assertFindings(ctx context.Context, database *sql.DB, options AssertionOptions) error {
 	rows, err := database.QueryContext(ctx, assertFindingsSQL, options.TenantID, options.ProjectID, options.RunID)
 	if err != nil {
@@ -274,7 +330,8 @@ func assertAudits(ctx context.Context, database *sql.DB, options AssertionOption
 	}
 	defer rows.Close()
 	seenIDs, seenDedupe := make(map[string]struct{}), make(map[string]struct{})
-	runCorrelation, reportCorrelation, commandCorrelation := false, false, false
+	runCorrelation, reportCorrelation := false, false
+	auditedCommands := make(map[string]struct{}, len(commands))
 	for rows.Next() {
 		var id, action, resourceType, resourceID, requestID, traceID, jobID, commandID, dedupeKey string
 		if err := rows.Scan(&id, &action, &resourceType, &resourceID, &requestID, &traceID, &jobID, &commandID, &dedupeKey); err != nil {
@@ -294,29 +351,47 @@ func assertAudits(ctx context.Context, database *sql.DB, options AssertionOption
 		}
 		seenIDs[id] = struct{}{}
 		if resourceID == options.RunID {
+			if action != "inspection.run.created" || resourceType != "inspection_run" || commandID != "" {
+				return errors.New("Run Audit correlation is invalid")
+			}
 			runCorrelation = true
 		}
 		if resourceID == options.ReportID {
-			if jobID != options.JobID || dedupeKey != options.AuditCorrelation+":report" {
+			if action != "inspection.report.completed" || resourceType != "inspection_report" || jobID != options.JobID || commandID != "" || dedupeKey != options.AuditCorrelation+":report" {
 				return errors.New("Report Audit correlation is invalid")
 			}
 			reportCorrelation = true
 		}
 		if commandID != "" {
-			_, matched := commands[commandID]
-			if jobID != options.JobID || !matched {
+			targetID, matched := commands[commandID]
+			if jobID != options.JobID || !matched || resourceType != "job_target" || resourceID != targetID || !validCommandAudit(action, dedupeKey, commandID, targetID == options.OnlineAgentID) {
 				return errors.New("Command Audit correlation is invalid")
 			}
-			commandCorrelation = commandCorrelation || matched
+			auditedCommands[commandID] = struct{}{}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate scoped Audit correlations: %w", err)
 	}
-	if !runCorrelation || !reportCorrelation || !commandCorrelation {
-		return errors.New("Run, Report, or Command Audit correlation is missing")
+	if !runCorrelation || !reportCorrelation {
+		return errors.New("Run or Report Audit correlation is missing")
+	}
+	if len(auditedCommands) != len(commands) {
+		return errors.New("both expected Command Audit correlations are required")
 	}
 	return nil
+}
+
+func validCommandAudit(action, dedupeKey, commandID string, online bool) bool {
+	if online {
+		return action == "command.result" && dedupeKey == "command.result:"+commandID
+	}
+	switch action {
+	case "command.delivery_timed_out", "command.prepared_timed_out", "command.prepared_envelope_expired", "command.execution_timed_out", "command.skipped_terminal_job", "command.prepared_terminal_job":
+		return dedupeKey == action+":"+commandID
+	default:
+		return false
+	}
 }
 
 func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptions) error {
@@ -328,12 +403,12 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 	seen := make(map[string]struct{})
 	count := 0
 	for rows.Next() {
-		var agentID, metric, sourceID string
+		var agentID, metric, seriesFingerprint, sourceID string
 		var sampledAt, acceptedAt time.Time
-		if err := rows.Scan(&agentID, &metric, &sourceID, &sampledAt, &acceptedAt); err != nil {
+		if err := rows.Scan(&agentID, &metric, &seriesFingerprint, &sourceID, &sampledAt, &acceptedAt); err != nil {
 			return fmt.Errorf("scan scoped metric acceptance: %w", err)
 		}
-		if agentID != options.OnlineAgentID || metric == "" || sampledAt.IsZero() || acceptedAt.IsZero() {
+		if agentID != options.OnlineAgentID || metric == "" || seriesFingerprint == "" || sampledAt.IsZero() || acceptedAt.IsZero() {
 			return errors.New("metric source or acceptance timestamp is invalid")
 		}
 		switch sourceID {
@@ -341,7 +416,7 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 		default:
 			return errors.New("metric source is not an acceptance source")
 		}
-		key := agentID + "\x00" + metric + "\x00" + sourceID + "\x00" + sampledAt.UTC().Format(time.RFC3339Nano)
+		key := agentID + "\x00" + metric + "\x00" + seriesFingerprint + "\x00" + sampledAt.UTC().Format(time.RFC3339Nano)
 		if _, duplicate := seen[key]; duplicate {
 			return errors.New("metric sample is duplicated")
 		}
