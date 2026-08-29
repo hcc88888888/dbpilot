@@ -20,6 +20,15 @@ The verifier does not replace the private Kylin image with another Linux image
 and does not log in to the enterprise registry. Pull or authorize the image
 before starting the run.
 
+Before creating services, the verifier performs one bounded Compose pull for
+only `asset-builder`, `postgres`, and `frontend`. It never force-pulls the
+private Kylin image. The Playwright runner image build and the clean Go asset
+build have separate 30-minute deadlines; ordinary one-shot phases retain their
+shorter five-minute deadline. Every subsequent Compose `up` uses
+`--pull never`, so daemon-side image downloads cannot escape verifier process
+ownership. Short Docker inspect/start/remove commands retain a 30-second
+deadline.
+
 ## Run
 
 From the repository root:

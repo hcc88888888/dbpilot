@@ -53,13 +53,13 @@ function Present([string]$kind, [string]$id) {
 }
 function CreatedContainer([string]$id) {
   switch ($id) {
-    'builder-id' { return $history -match ' up -d --no-deps asset-builder' }
-    'bootstrap-id' { return $history -match ' up -d --no-deps bootstrap' }
-    'postgres-id' { return $history -match ' up -d --no-deps postgres oidc' }
-    'oidc-id' { return $history -match ' up -d --no-deps postgres oidc' }
-    'controlplane-id' { return $history -match ' up -d --no-deps controlplane' }
-    'agent-id' { return $history -match ' up -d --no-deps agent' }
-    'frontend-id' { return $history -match ' up -d --no-deps frontend' }
+    'builder-id' { return $history -match ' up --pull never -d --no-deps asset-builder' }
+    'bootstrap-id' { return $history -match ' up --pull never -d --no-deps bootstrap' }
+    'postgres-id' { return $history -match ' up --pull never -d --no-deps postgres oidc' }
+    'oidc-id' { return $history -match ' up --pull never -d --no-deps postgres oidc' }
+    'controlplane-id' { return $history -match ' up --pull never -d --no-deps controlplane' }
+    'agent-id' { return $history -match ' up --pull never -d --no-deps agent' }
+    'frontend-id' { return $history -match ' up --pull never -d --no-deps frontend' }
     'runner-normal-id' { return $history -match 'acceptance-runner normal' }
     'runner-unauthorized-id' { return $history -match 'acceptance-runner unauthorized' }
     'assertion-initial-id' { return ([regex]::Matches($history, 'DBPILOT_ASSERTION_PHASE=database.*assertions')).Count -ge 1 }
@@ -75,20 +75,22 @@ function CreatedContainer([string]$id) {
   }
 }
 function CreatedNetwork([string]$id) {
-  if ($id -eq 'network-builder') { return $history -match ' up -d --no-deps asset-builder' }
-  return $history -match ' up -d --no-deps bootstrap'
+  if ($id -eq 'network-builder') { return $history -match ' up --pull never -d --no-deps asset-builder' }
+  return $history -match ' up --pull never -d --no-deps bootstrap'
 }
 function CreatedVolume([string]$id) {
-  if ($id -in @('volume-bin','volume-go-cache')) { return $history -match ' up -d --no-deps asset-builder' }
-  return $history -match ' up -d --no-deps bootstrap'
+  if ($id -in @('volume-bin','volume-go-cache')) { return $history -match ' up --pull never -d --no-deps asset-builder' }
+  return $history -match ' up --pull never -d --no-deps bootstrap'
 }
 if ($args[0] -eq 'version') { Write-Output '29.7.2'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'info') { Write-Output 'amd64'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'image' -and $args[1] -eq 'inspect') { Write-Output 'sha256:kylin'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'compose') {
   if ($args -contains 'version') { Write-Output 'Docker Compose version v5.3.1'; $global:LASTEXITCODE=0; return }
+  if ($args -contains 'pull' -and $env:DOCKER_MODE -eq 'materialization-hang') { Start-Sleep -Seconds 30; $global:LASTEXITCODE=0; return }
+  if ($args -contains 'up' -and $args -contains 'bootstrap' -and $env:DOCKER_MODE -eq 'asset-build-slow-success') { $global:LASTEXITCODE=41; return }
   if ($args -contains 'build' -and $env:DOCKER_MODE -eq 'build-hang') { Start-Sleep -Seconds 30; $global:LASTEXITCODE=0; return }
-  if ($args -contains 'config' -or $args -contains 'build' -or $args -contains 'up') { $global:LASTEXITCODE=0; return }
+  if ($args -contains 'config' -or $args -contains 'pull' -or $args -contains 'build' -or $args -contains 'up') { $global:LASTEXITCODE=0; return }
   if ($args -contains 'ps') {
     $service = $args[-1]
     $ids = @{ 'asset-builder'='builder-id'; bootstrap='bootstrap-id'; postgres='postgres-id'; oidc='oidc-id'; controlplane='controlplane-id'; agent='agent-id'; frontend='frontend-id' }
@@ -125,7 +127,7 @@ if ($args[0] -eq 'ps') {
   if ($args -contains 'label=dbpilot.verifier=full-stack-compose') {
     if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
     if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-      if ($history -match ' up -d --no-deps asset-builder' -and (Present 'container' 'builder-id')) { Write-Output 'builder-id' }
+      if ($history -match ' up --pull never -d --no-deps asset-builder' -and (Present 'container' 'builder-id')) { Write-Output 'builder-id' }
       $global:LASTEXITCODE=0; return
     }
     if ($history -match '(?m)^rm -f -v agent-id\r?$') { $global:LASTEXITCODE=0; return }
@@ -140,7 +142,7 @@ if ($args[0] -eq 'network' -and $args[1] -eq 'ls') {
   if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-    if ($history -match ' up -d --no-deps asset-builder' -and (Present 'network' 'network-builder')) { Write-Output 'network-builder' }
+    if ($history -match ' up --pull never -d --no-deps asset-builder' -and (Present 'network' 'network-builder')) { Write-Output 'network-builder' }
     $global:LASTEXITCODE=0; return
   }
   if ($history -match '(?m)^network rm network-acceptance\r?$') { $global:LASTEXITCODE=0; return }
@@ -151,7 +153,7 @@ if ($args[0] -eq 'volume' -and $args[1] -eq 'ls') {
   if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'one-shot-hang') {
-    if ($history -match ' up -d --no-deps asset-builder') {
+    if ($history -match ' up --pull never -d --no-deps asset-builder') {
       foreach ($id in @('volume-bin','volume-go-cache')) { if (Present 'volume' $id) { Write-Output $id } }
     }
     $global:LASTEXITCODE=0; return
@@ -163,6 +165,11 @@ if ($args[0] -eq 'volume' -and $args[1] -eq 'ls') {
 if ($args[0] -eq 'inspect') {
   if ($args -contains '{{json .State}}') {
     $id = $args[-1]
+    if ($id -eq 'builder-id' -and $env:DOCKER_MODE -eq 'asset-build-timeout') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
+    if ($id -eq 'builder-id' -and $env:DOCKER_MODE -eq 'asset-build-slow-success') {
+      $observations = ([regex]::Matches($history, 'inspect --format \{\{json \.State\}\} builder-id')).Count
+      if ($observations -le 2) { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
+    }
     if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $id -eq 'builder-id') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
     $code = if ($env:DOCKER_MODE -eq 'phase-failure' -and $id -eq 'runner-normal-id') { 19 }
       elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $id -eq 'assertion-replay-id') { 23 }
@@ -235,6 +242,10 @@ function boundedVerifierArguments(fixture) {
   return [...verifierArguments(fixture), '-DockerCommandTimeoutSeconds', '2', '-BuildTimeoutSeconds', '1', '-JobTimeoutSeconds', '1'];
 }
 
+function coldStartVerifierArguments(fixture, { materialize = 1, assetBuild = 4 } = {}) {
+  return [...boundedVerifierArguments(fixture), '-MaterializeTimeoutSeconds', String(materialize), '-AssetBuildTimeoutSeconds', String(assetBuild)];
+}
+
 test('verifier rejects an unapproved Kylin image before invoking Docker', async () => {
   const fixture = await fakeRuntime();
   try {
@@ -284,6 +295,14 @@ test('verifier owns one unique project, preserves phase order, records the ephem
     assert.equal(new Set(projectNames).size, 1, 'every Compose call must use the same unique project');
     assert.match(invocations, /port frontend-id 8443\/tcp/);
     assert.match(result.stdout, /frontend_port=49177/);
+    const pull = invocations.indexOf(' pull asset-builder postgres frontend');
+    const build = invocations.indexOf(' build acceptance-runner');
+    const firstUp = invocations.indexOf(' up --pull never -d --no-deps asset-builder');
+    assert.ok(pull >= 0 && pull < build && build < firstUp, invocations);
+    for (const line of invocations.split(/\r?\n/).filter((value) => value.includes(' up '))) {
+      assert.match(line, / up --pull never /, `up escaped explicit pull policy: ${line}`);
+    }
+    assert.doesNotMatch(invocations, / pull .*?(?:bootstrap|oidc|controlplane|agent|rogue|assertions)/);
     const milestones = [
       'OIDC acceptance passed',
       'Agent mTLS communication passed',
@@ -449,6 +468,54 @@ test('verifier owns and terminates a hung Compose build before restoring its env
     const invocations = await readFile(fixture.log, 'utf8');
     assert.match(invocations, /compose .* build acceptance-runner/);
     assert.doesNotMatch(invocations, /compose .* up /);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier terminates a hung public-image materialization phase before build and restores environment', async () => {
+  const fixture = await fakeRuntime('materialization-hang');
+  try {
+    const tokens = coldStartVerifierArguments(fixture).slice(2).map((value) => value.startsWith('-') ? value : `'${value.replaceAll("'", "''")}'`).join(' ');
+    const command = `$env:DBPILOT_ACCEPTANCE_PROJECT='sentinel-project'; $env:DBPILOT_ACCEPTANCE_RUN_ID='sentinel-run'; try { & '${verifier}' ${tokens} } catch { Write-Output ('FIXED=' + $_.Exception.Message) }; Write-Output ('RESTORED=' + $env:DBPILOT_ACCEPTANCE_PROJECT + '|' + $env:DBPILOT_ACCEPTANCE_RUN_ID)`;
+    const result = pwsh(['-Command', command], { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /FIXED=Public acceptance image materialization timed out\./);
+    assert.match(result.stdout, /RESTORED=sentinel-project\|sentinel-run/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, / pull asset-builder postgres frontend/);
+    assert.doesNotMatch(invocations, / build acceptance-runner| up /);
+    const run = invocations.match(/label=dbpilot\.run=([0-9a-f]{32})/)?.[1];
+    assert.ok(run, invocations);
+    assert.equal(existsSync(join(repoRoot, 'backend', `.tmp-full-stack-${run}`)), false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('asset builder can exceed the generic job deadline while remaining inside its dedicated deadline', async () => {
+  const fixture = await fakeRuntime('asset-build-slow-success');
+  try {
+    const result = pwsh(coldStartVerifierArguments(fixture, { assetBuild: 4 }), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0, 'the fake bootstrap start intentionally fails after the builder proves its separate deadline');
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.ok((invocations.match(/inspect --format \{\{json \.State\}\} builder-id/g) ?? []).length >= 3, invocations);
+    assert.match(invocations, /^rm -f -v builder-id$/m);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('asset builder dedicated deadline still times out and cleans exact resources', async () => {
+  const fixture = await fakeRuntime('asset-build-timeout');
+  try {
+    const result = pwsh(coldStartVerifierArguments(fixture, { assetBuild: 1 }), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    assert.match(result.stdout, /Full-stack cleanup audit passed/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, /^rm -f -v builder-id$/m);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

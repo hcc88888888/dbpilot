@@ -7,7 +7,9 @@ param(
     [ValidateRange(0, 120)][int]$OutageSeconds = 12,
     [string]$FailureArtifactRoot = [IO.Path]::GetTempPath(),
     [ValidateRange(1, 300)][int]$DockerCommandTimeoutSeconds = 30,
-    [ValidateRange(1, 3600)][int]$BuildTimeoutSeconds = 900,
+    [ValidateRange(1, 7200)][int]$MaterializeTimeoutSeconds = 1800,
+    [ValidateRange(1, 7200)][int]$BuildTimeoutSeconds = 1800,
+    [ValidateRange(1, 7200)][int]$AssetBuildTimeoutSeconds = 1800,
     [ValidateRange(1, 900)][int]$JobTimeoutSeconds = 300
 )
 
@@ -473,36 +475,37 @@ try {
     Write-ResourceLedger
 
     Invoke-ComposeChecked @('--profile', '*', 'config', '--quiet')
+    Invoke-ComposeChecked -Arguments @('pull', 'asset-builder', 'postgres', 'frontend') -TimeoutSeconds $MaterializeTimeoutSeconds -Failure 'Public acceptance image materialization failed.' -TimeoutFailure 'Public acceptance image materialization timed out.'
     Invoke-ComposeChecked -Arguments @('build', 'acceptance-runner') -TimeoutSeconds $BuildTimeoutSeconds -Failure 'The acceptance-runner image build failed.' -TimeoutFailure 'The acceptance-runner image build timed out.'
     Register-OwnedResources
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'asset-builder')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'asset-builder')
     Register-OwnedResources
     $builderID = Get-ServiceContainerID 'asset-builder'
-    if ((Wait-ContainerExit $builderID 'asset-builder') -ne 0) { throw 'The asset-builder service failed.' }
+    if ((Wait-ContainerExit $builderID 'asset-builder' $AssetBuildTimeoutSeconds) -ne 0) { throw 'The asset-builder service failed.' }
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'bootstrap')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'bootstrap')
     Register-OwnedResources
     $bootstrapID = Get-ServiceContainerID 'bootstrap'
     if ((Wait-ContainerExit $bootstrapID 'bootstrap') -ne 0) { throw 'The bootstrap service failed.' }
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'postgres', 'oidc')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'postgres', 'oidc')
     Register-OwnedResources
     $postgresID = Get-ServiceContainerID 'postgres'
     $oidcID = Get-ServiceContainerID 'oidc'
     Wait-Healthy $postgresID 'postgres'
     Wait-Healthy $oidcID 'oidc'
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'controlplane')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'controlplane')
     Register-OwnedResources
     $controlplaneID = Get-ServiceContainerID 'controlplane'
     Wait-Healthy $controlplaneID 'controlplane'
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'agent')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'agent')
     Register-OwnedResources
     $agentID = Get-ServiceContainerID 'agent'
 
-    Invoke-ComposeChecked @('up', '-d', '--no-deps', 'frontend')
+    Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'frontend')
     Register-OwnedResources
     $frontendID = Get-ServiceContainerID 'frontend'
     Wait-Healthy $frontendID 'frontend'
