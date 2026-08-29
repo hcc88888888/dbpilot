@@ -461,7 +461,7 @@ func expectJobInsert(mock sqlmock.Sqlmock, job Job) {
 		job.InitiatedBy, job.SourceResource.ResourceType, job.SourceResource.ResourceID, job.IdempotencyKey, job.Version,
 		job.Progress.TotalTargets, job.Progress.CompletedTargets, job.Progress.FailedTargets, job.Progress.SkippedTargets,
 		job.ErrorSummary, job.ResultSummary, []byte("[]"), job.CreatedAt.UTC(), nil, nil, nil, job.TimeoutAt.UTC(), "", nil,
-		job.RequestID, job.TraceID,
+		job.RequestID, job.TraceID, nullableTestInt(job.MaxConcurrency), nullableTestInt(int(job.TargetTimeout/time.Second)),
 	).WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -489,7 +489,15 @@ func jobRows(job Job) *sqlmock.Rows {
 		job.Progress.TotalTargets, job.Progress.CompletedTargets, job.Progress.FailedTargets, job.Progress.SkippedTargets,
 		job.ErrorSummary, job.ResultSummary, []byte("[]"), job.CreatedAt, job.DispatchedAt, job.StartedAt, job.FinishedAt, job.TimeoutAt,
 		job.CancelRequestedBy, job.CancelRequestedAt, job.RequestID, job.TraceID,
+		nullableTestInt(job.MaxConcurrency), nullableTestInt(int(job.TargetTimeout/time.Second)),
 	)
+}
+
+func nullableTestInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func TestLookupCommandReturnsDurableScopeAndCorrelationByGlobalCommandID(t *testing.T) {

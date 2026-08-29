@@ -53,6 +53,24 @@ func TestPostgresListRunsUsesExactScopeAndDescendingTupleCursor(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresScanAcceptsBackfilledLegacyRunWithoutOriginalIdempotencyKey(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	run, _, _, _ := runPersistenceFixture()
+	run.IdempotencyKey = ""
+	mock.ExpectQuery("SELECT .* FROM inspection_runs WHERE tenant_id = \\$1 AND project_id = \\$2 ORDER BY created_at DESC, id DESC LIMIT \\$3").
+		WithArgs(run.Scope.TenantID, run.Scope.ProjectID, 2).
+		WillReturnRows(runRows(run))
+
+	page, err := NewPostgresRepository(database, nil).ListRuns(context.Background(), run.Scope, RunFilter{CursorFilter: CursorFilter{Limit: 1}})
+
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	require.Empty(t, page.Items[0].IdempotencyKey)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresListItemsUsesVersionedTupleCursorWithoutSkippingEqualTimestamps(t *testing.T) {
 	// Break caught: a cursor without item version repeats or skips rows when
 	// multiple versions share the same item ID and creation timestamp.
@@ -195,11 +213,12 @@ func TestSchedulerClaimDuplicateOccurrenceReturnsExistingRunAndAdvancesMatchingC
 	creator := &recordingJobCreator{}
 	run, targets, value, messages := runPersistenceFixture()
 	policy := policyFixture()
+	policy.Schedule = &Schedule{Cron: "* * * * *", Timezone: "UTC"}
 	occurrence := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
 	next, err := NextScheduledOccurrence(*policy.Schedule, occurrence)
 	require.NoError(t, err)
 	policy.NextRunAt = &occurrence
-	policy.Claim = &PolicyClaim{Token: "claim-1", Occurrence: occurrence, LeaseExpiresAt: occurrence.Add(time.Minute)}
+	policy.Claim = &PolicyClaim{Token: "claim-1", ClaimedOccurrence: occurrence, Occurrence: occurrence, NextOccurrence: next, LeaseExpiresAt: occurrence.Add(time.Minute)}
 	run.PolicyID, run.PolicyVersion, run.Trigger = policy.ID, policy.Version, RunTriggerScheduled
 	run.OccurrenceKey, run.ScheduledFor, run.IdempotencyKey = scheduledOccurrenceKey(policy, occurrence), &occurrence, scheduledOccurrenceKey(policy, occurrence)
 	run.PolicySnapshot = clonePolicy(&policy)
@@ -278,7 +297,8 @@ func TestPostgresClaimRunsUsesBoundedSkipLockedLeaseAndLoadsMutableTargets(t *te
 	claimRows.AddRow(
 		run.Scope.TenantID, run.Scope.ProjectID, run.ID, nil, nil, nil, run.JobID, run.Status, run.Trigger, nil, nil,
 		policySnapshot, itemSnapshot, run.TargetCount, 0, 0, nil, run.AuditCorrelation, run.IdempotencyKey, run.InitiatedBy,
-		run.RequestID, run.TraceID, nil, nil, run.CreatedAt, nil,
+		run.RequestID, run.TraceID, nil, nil, run.CreatedAt, int64(run.TargetTimeout/time.Second), run.MaxConcurrency,
+		run.IdempotencyActor, run.IdempotencyOperation, run.IdempotencyFingerprint, nil,
 	)
 	mock.ExpectBegin()
 	mock.ExpectQuery("(?s)SELECT .* FROM inspection_runs.*status IN .*worker_lease_expires_at IS NULL OR worker_lease_expires_at <= \\$1.*FOR UPDATE SKIP LOCKED.*LIMIT \\$2").
@@ -453,6 +473,24 @@ func TestPostgresFinalizeReportCommitsImmutableSnapshotRunTerminalAndAuditPendin
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresFailReportTerminalizesClaimedPermanentRendererFailure(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	run, _, _, _ := runPersistenceFixture()
+	run.Status = RunGeneratingReport
+	claim := RunClaim{Detail: RunDetail{Run: run}, Token: "claim-token", LeaseExpiresAt: now.Add(time.Minute), ReportGeneratedAt: now}
+	mock.ExpectQuery("(?s)UPDATE inspection_runs SET status = 'failed'.*finished_at = \\$1.*worker_claim_token = NULL.*WHERE tenant_id = \\$2 AND project_id = \\$3 AND id = \\$4 AND status = 'generating_report' AND worker_claim_token = \\$5.*RETURNING id").
+		WithArgs(now, run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(run.ID))
+
+	err = NewPostgresRepository(database, nil).FailReport(context.Background(), claim, now)
+
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPolicyValidationAllowsEnabledManualPolicyWithoutSchedule(t *testing.T) {
 	// Break caught: schedule is optional; enabled manual policies must remain
 	// runnable through RunInspectionPolicy without being scheduler candidates.
@@ -530,10 +568,11 @@ func runPersistenceFixture() (Run, []TargetRun, job.Job, []job.OutboxMessage) {
 	run := Run{
 		Scope: scope, ID: "run-1", JobID: "job-1", Status: RunQueued, Trigger: RunTriggerManual,
 		ItemSnapshot: []Item{item}, TargetCount: 1, AuditCorrelation: "inspection-run:run-1",
-		IdempotencyKey: "request-key", InitiatedBy: "operator-1", RequestID: "request-1", CreatedAt: now,
+		IdempotencyKey: "request-key", IdempotencyActor: "operator-1", IdempotencyOperation: "CreateInspectionRun", IdempotencyFingerprint: "sha256:" + strings.Repeat("a", 64),
+		InitiatedBy: "operator-1", RequestID: "request-1", TargetTimeout: time.Minute, MaxConcurrency: 1, CreatedAt: now,
 	}
 	targets := []TargetRun{{TargetID: "agent-1", AgentID: "agent-1", CommandID: "command-1", DisplayName: "Agent 1", Host: "agent-1.example", Status: TargetPending}}
-	value := job.Job{ID: "job-1", Scope: scope, IdempotencyKey: "request-key"}
+	value := job.Job{ID: "job-1", Scope: scope, IdempotencyKey: "request-key", TargetTimeout: time.Minute, MaxConcurrency: 1}
 	messages := []job.OutboxMessage{{ID: "command-1", Scope: scope, JobID: "job-1", TargetID: "agent-1"}}
 	return run, targets, value, messages
 }
@@ -548,6 +587,7 @@ func runRows(values ...Run) *sqlmock.Rows {
 			value.Status, value.Trigger, nullableString(value.OccurrenceKey), nullableTimeValue(value.ScheduledFor), policySnapshot, itemSnapshot,
 			value.TargetCount, value.CompletedTargetCount, value.FailedTargetCount, nullableString(value.ReportID), value.AuditCorrelation, nullableString(value.IdempotencyKey),
 			value.InitiatedBy, value.RequestID, value.TraceID, nullableTimeValue(value.StartedAt), nullableTimeValue(value.FinishedAt), value.CreatedAt,
+			int64(value.TargetTimeout/time.Second), value.MaxConcurrency, value.IdempotencyActor, value.IdempotencyOperation, value.IdempotencyFingerprint,
 		)
 	}
 	return rows

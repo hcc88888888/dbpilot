@@ -123,6 +123,16 @@ components:
       $ref: ./common/inspection.yaml#/CreateInspectionRunRequest
     InspectionReport:
       $ref: ./common/inspection.yaml#/InspectionReport
+    InspectionReportTarget:
+      $ref: ./common/inspection.yaml#/InspectionReportTarget
+    InspectionReportCommandReference:
+      $ref: ./common/inspection.yaml#/InspectionReportCommandReference
+    InspectionReportReferences:
+      $ref: ./common/inspection.yaml#/InspectionReportReferences
+    InspectionReportDownloadRequest:
+      $ref: ./common/inspection.yaml#/InspectionReportDownloadRequest
+    InspectionReportFormat:
+      $ref: ./common/inspection.yaml#/InspectionReportFormat
     InspectionReportPage:
       $ref: ./common/inspection.yaml#/InspectionReportPage
     InspectionOverview:

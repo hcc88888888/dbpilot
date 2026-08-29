@@ -11,7 +11,7 @@
  */
 import type { InspectionPolicyItem } from './InspectionPolicyItem.js';
 /**
- *
+ * The resolved target and item cross-product must not exceed 10,000 findings, and the deterministic worst-case JSON or HTML report budget must not exceed the 1 MiB persisted render limit; violations return 422 before a Run or Job is created.
  * @export
  * @interface CreateInspectionRunRequest
  */

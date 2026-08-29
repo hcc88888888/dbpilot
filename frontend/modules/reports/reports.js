@@ -100,7 +100,7 @@ export function renderReportDetailMarkup(report = {}, permissions = {}) {
       <button class="rpt-back" data-reports-view="reports">← 报告列表</button>
       <span class="rpt-tag ${safeText(report.status)}">${safeText(reportStatusLabel(report.status))}</span>
       <h3>${safeText(report.title)}</h3>
-      <div class="rpt-actions">${report.status === 'ready' || report.status === 'sent' ? `<button class="rpt-btn-secondary" data-reports-download="${safeText(report.id)}">下载</button>` : ''}</div>
+      <div class="rpt-actions">${report.status === 'ready' || report.status === 'sent' ? reportDownloadActions(report, 'rpt-btn-secondary') : ''}</div>
     </div>
     <div class="rpt-meta-grid">${metaItem('报告编号', report.id)}${metaItem('报告类型', reportTypeLabel(report.type))}${metaItem('所属实例', report.instance_name || report.instance_id || '—')}${metaItem('创建人', report.created_by || '—')}${metaItem('生成时间', formatReportTime(report.generated_at || report.created_at))}${metaItem('文件格式', formatReportLabel(report.format))}${metaItem('文件大小', report.size_kb ? `${report.size_kb} KB` : '—')}</div>
     ${report.failure ? `<div class="rpt-alert">${safeText(report.failure)}</div>` : ''}
@@ -158,7 +158,7 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     } else if (match.dataset.reportsEmail) {
       openEmailModal(match.dataset.reportsEmail);
     } else if (match.dataset.reportsDownload) {
-      handleDownload(match.dataset.reportsDownload);
+      handleDownload(match.dataset.reportsDownload, match.dataset.reportsFormat);
     } else if (match.hasAttribute('data-reports-template-new')) {
       openTemplateForm(null);
     } else if (match.dataset.reportsTemplateEdit) {
@@ -361,13 +361,14 @@ export function createReportsCenter({ root, api, scope, permissions = {}, onToas
     onToast(reportsFailureMessage(error, '报告'));
   }
 
-  function handleDownload(id) {
+  function handleDownload(id, format) {
     if (typeof api.downloadReport !== 'function') {
       onToast('当前报告暂不支持下载');
       return;
     }
     const key = `report-download-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
-    api.downloadReport(state.scope, id, key)
+    const request = format ? api.downloadReport(state.scope, id, format, key) : api.downloadReport(state.scope, id, key);
+    request
       .then((descriptor) => {
         if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer');
         onToast(`报告 ${id} 的下载已开始`);
@@ -582,7 +583,7 @@ function reportRow(report, manage) {
 function reportActions(report, manage) {
   const actions = [`<button class="rpt-link-btn" data-reports-report="${safeText(report.id)}">查看</button>`];
   if (report.status === 'ready' || report.status === 'sent') {
-    actions.push(`<button class="rpt-link-btn" data-reports-download="${safeText(report.id)}">下载</button>`);
+    actions.push(reportDownloadActions(report, 'rpt-link-btn'));
   }
   if (report.status === 'ready' && manage && report.inspection_artifact !== true) {
     actions.push(`<button class="rpt-link-btn" data-reports-email="${safeText(report.id)}">发送邮件</button>`);
@@ -642,6 +643,13 @@ function statusOptions(selected) {
 
 function formatReportLabel(value) {
   return { pdf: 'PDF', word: 'Word', 'html/json': 'HTML / JSON' }[value] ?? (value ? String(value) : '—');
+}
+
+function reportDownloadActions(report, className) {
+  if (report.inspection_artifact === true) {
+    return ['html', 'json'].map((format) => `<button class="${className}" data-reports-download="${safeText(report.id)}" data-reports-format="${format}">${format.toUpperCase()}</button>`).join('');
+  }
+  return `<button class="${className}" data-reports-download="${safeText(report.id)}">下载</button>`;
 }
 
 function formatSuccessRate(value) {

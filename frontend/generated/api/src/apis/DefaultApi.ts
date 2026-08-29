@@ -28,6 +28,7 @@ import type {
   InspectionPolicy,
   InspectionPolicyPage,
   InspectionReport,
+  InspectionReportDownloadRequest,
   InspectionReportPage,
   InspectionRun,
   InspectionRunPage,
@@ -63,6 +64,8 @@ import {
     InspectionPolicyPageToJSON,
     InspectionReportFromJSON,
     InspectionReportToJSON,
+    InspectionReportDownloadRequestFromJSON,
+    InspectionReportDownloadRequestToJSON,
     InspectionReportPageFromJSON,
     InspectionReportPageToJSON,
     InspectionRunFromJSON,
@@ -108,6 +111,7 @@ export interface CreateInspectionPolicyOperationRequest {
 export interface CreateInspectionReportDownloadRequest {
     reportId: string;
     idempotencyKey: string;
+    inspectionReportDownloadRequest: InspectionReportDownloadRequest;
 }
 
 export interface CreateInspectionRunOperationRequest {
@@ -500,9 +504,18 @@ export class DefaultApi extends runtime.BaseAPI {
             );
         }
 
+        if (requestParameters['inspectionReportDownloadRequest'] == null) {
+            throw new runtime.RequiredError(
+                'inspectionReportDownloadRequest',
+                'Required parameter "inspectionReportDownloadRequest" was null or undefined when calling createInspectionReportDownload().'
+            );
+        }
+
         const queryParameters: any = {};
 
         const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
 
         if (requestParameters['idempotencyKey'] != null) {
             headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
@@ -525,6 +538,7 @@ export class DefaultApi extends runtime.BaseAPI {
             method: 'POST',
             headers: headerParameters,
             query: queryParameters,
+            body: InspectionReportDownloadRequestToJSON(requestParameters['inspectionReportDownloadRequest']),
         }, initOverrides);
 
         return new runtime.JSONApiResponse(response, (jsonValue) => DownloadDescriptorFromJSON(jsonValue));

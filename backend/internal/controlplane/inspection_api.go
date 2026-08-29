@@ -244,10 +244,10 @@ func (api platformAPI) CreateInspectionReportDownload(ctx context.Context, reque
 	if err != nil {
 		return nil, err
 	}
-	if !validIdempotencyKey(request.Params.IdempotencyKey) {
+	if request.Body == nil || !request.Body.Format.Valid() || !validIdempotencyKey(request.Params.IdempotencyKey) {
 		return nil, ErrInvalidRequest
 	}
-	value, err := api.services.Inspection.CreateReportDownload(ctx, scope, principal.Subject, request.Params.IdempotencyKey, request.ReportId)
+	value, err := api.services.Inspection.CreateReportDownload(ctx, scope, principal.Subject, request.Params.IdempotencyKey, request.ReportId, string(request.Body.Format))
 	if err != nil {
 		return nil, err
 	}
@@ -550,13 +550,31 @@ func openAPIInspectionReport(value inspection.ReportSnapshot, scope platformscop
 		}
 		findings := make([]inspection.Finding, len(document.Findings))
 		for index, finding := range document.Findings {
-			findings[index] = inspection.Finding{ID: "inspection-report-finding-" + strconv.Itoa(index+1), Scope: scope, RunID: value.RunID, TargetID: finding.TargetID, ItemID: finding.ItemID, ItemVersion: finding.ItemVersion, Level: finding.Level, ObservedAt: finding.ObservedAt, WarningThreshold: finding.WarningThreshold, CriticalThreshold: finding.CriticalThreshold, Evidence: finding.Evidence, Summary: finding.Summary, Recommendation: finding.Recommendation}
+			findingID := finding.ID
+			if findingID == "" {
+				findingID = "inspection-report-finding-" + strconv.Itoa(index+1)
+			}
+			findings[index] = inspection.Finding{ID: findingID, Scope: scope, RunID: value.RunID, TargetID: finding.TargetID, ItemID: finding.ItemID, ItemVersion: finding.ItemVersion, Level: finding.Level, ObservedAt: finding.ObservedAt, WarningThreshold: finding.WarningThreshold, CriticalThreshold: finding.CriticalThreshold, Evidence: finding.Evidence, Summary: finding.Summary, Recommendation: finding.Recommendation}
 		}
 		mapped, err := openAPIInspectionFindings(findings)
 		if err != nil {
 			return openapi.InspectionReport{}, err
 		}
 		response.Findings = &mapped
+		targets := make([]openapi.InspectionReportTarget, len(document.Targets))
+		for index, target := range document.Targets {
+			targets[index] = openapi.InspectionReportTarget{TargetId: target.TargetID, DisplayName: target.DisplayName, Host: target.Host, Status: openapi.InspectionTargetRunStatus(target.Status), CommandId: openapi.CommandId(target.CommandID)}
+			if target.ErrorCode != "" {
+				errorCode := target.ErrorCode
+				targets[index].ErrorCode = &errorCode
+			}
+		}
+		response.Targets = &targets
+		commands := make([]openapi.InspectionReportCommandReference, len(document.References.Commands))
+		for index, reference := range document.References.Commands {
+			commands[index] = openapi.InspectionReportCommandReference{TargetId: reference.TargetID, CommandId: openapi.CommandId(reference.CommandID)}
+		}
+		response.References = &openapi.InspectionReportReferences{JobId: openapi.JobId(document.References.JobID), Commands: commands, AuditCorrelation: document.References.AuditCorrelation}
 	}
 	return response, nil
 }
@@ -572,6 +590,8 @@ func openAPIInspectionFindings(values []inspection.Finding) ([]openapi.Inspectio
 			return nil, err
 		}
 		result[index] = openapi.InspectionFinding{Id: value.ID, ItemId: value.ItemID, ItemVersion: value.ItemVersion, TargetId: value.TargetID, Level: openapi.InspectionFindingLevel(value.Level), ObservedAt: value.ObservedAt.UTC(), Evidence: string(evidence), Summary: value.Summary, Recommendation: value.Recommendation, WarningThreshold: float64ToFloat32(value.WarningThreshold), CriticalThreshold: float64ToFloat32(value.CriticalThreshold)}
+		evidenceFields := cloneStringMap(value.Evidence)
+		result[index].EvidenceFields = &evidenceFields
 	}
 	return result, nil
 }
@@ -899,7 +919,8 @@ func (service *inspectionApplicationService) RunPolicy(ctx context.Context, scop
 		return inspection.Run{}, err
 	}
 	request := inspection.CreateRunRequest{Scope: scope, PolicyID: policy.ID, PolicyVersion: policy.Version, Selector: policy.Selector, Items: policy.Items, TargetTimeout: policy.TargetTimeout, MaxConcurrency: policy.MaxConcurrency, IdempotencyKey: key, InitiatedBy: actor, RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx), Trigger: inspection.RunTriggerManual, PolicySnapshot: &policy}
-	return service.executeRun(ctx, scope, actor, key, "RunInspectionPolicy", id, request, func(runContext context.Context) (inspection.Run, error) {
+	return service.executeRun(ctx, scope, actor, key, "RunInspectionPolicy", id, request, func(runContext context.Context, runID, fingerprint string) (inspection.Run, error) {
+		request.RunID, request.IdempotencyOperation, request.IdempotencyFingerprint = runID, "RunInspectionPolicy", fingerprint
 		return service.runs.CreateRun(runContext, request)
 	})
 }
@@ -911,14 +932,14 @@ func (service *inspectionApplicationService) GetReport(ctx context.Context, scop
 	return service.repository.GetReport(ctx, scope, id)
 }
 
-func (service *inspectionApplicationService) CreateReportDownload(ctx context.Context, scope platformscope.Scope, actor, key, id string) (artifact.Download, error) {
+func (service *inspectionApplicationService) CreateReportDownload(ctx context.Context, scope platformscope.Scope, actor, key, id, format string) (artifact.Download, error) {
 	report, err := service.repository.GetReport(ctx, scope, id)
 	if err != nil {
 		return artifact.Download{}, err
 	}
-	artifactID := preferredInspectionArtifact(report.Artifacts)
-	if artifactID == "" {
-		return artifact.Download{}, artifact.ErrNotFound
+	artifactID, err := inspectionArtifactByFormat(report.Artifacts, format)
+	if err != nil {
+		return artifact.Download{}, err
 	}
 	operation := "CreateInspectionReportDownload"
 	fingerprint, err := platformIdempotencyFingerprint(ctx, operation, id, "")
@@ -956,7 +977,8 @@ func (service *inspectionApplicationService) ListRuns(ctx context.Context, scope
 	return service.repository.ListRuns(ctx, scope, filter)
 }
 func (service *inspectionApplicationService) CreateRun(ctx context.Context, request inspection.CreateRunRequest) (inspection.Run, error) {
-	return service.executeRun(ctx, request.Scope, request.InitiatedBy, request.IdempotencyKey, "CreateInspectionRun", "ad-hoc", request, func(runContext context.Context) (inspection.Run, error) {
+	return service.executeRun(ctx, request.Scope, request.InitiatedBy, request.IdempotencyKey, "CreateInspectionRun", "ad-hoc", request, func(runContext context.Context, runID, fingerprint string) (inspection.Run, error) {
+		request.RunID, request.IdempotencyOperation, request.IdempotencyFingerprint = runID, "CreateInspectionRun", fingerprint
 		return service.runs.CreateRun(runContext, request)
 	})
 }
@@ -1030,8 +1052,8 @@ func (service *inspectionApplicationService) CancelRun(ctx context.Context, scop
 }
 
 func (service *inspectionApplicationService) RetryRun(ctx context.Context, scope platformscope.Scope, actor, key, id string) (inspection.Run, error) {
-	return service.executeRun(ctx, scope, actor, key, "RetryInspectionRun", id, inspection.CreateRunRequest{}, func(runContext context.Context) (inspection.Run, error) {
-		return service.runs.RetryRun(runContext, scope, id, key, actor)
+	return service.executeRun(ctx, scope, actor, key, "RetryInspectionRun", id, inspection.CreateRunRequest{}, func(runContext context.Context, runID, fingerprint string) (inspection.Run, error) {
+		return service.runs.RetryRun(runContext, scope, id, key, actor, requestIDFromContext(runContext), traceIDFromContext(runContext), inspection.RunIdempotency{Actor: actor, Operation: "RetryInspectionRun", Key: key, Fingerprint: fingerprint}, runID)
 	})
 }
 
@@ -1061,15 +1083,59 @@ func (service *inspectionApplicationService) ListTargets(ctx context.Context, sc
 	return page, nil
 }
 
-func (service *inspectionApplicationService) executeRun(ctx context.Context, scope platformscope.Scope, actor, key, operation, resourceID string, request inspection.CreateRunRequest, create func(context.Context) (inspection.Run, error)) (inspection.Run, error) {
+func (service *inspectionApplicationService) executeRun(ctx context.Context, scope platformscope.Scope, actor, key, operation, resourceID string, request inspection.CreateRunRequest, create func(context.Context, string, string) (inspection.Run, error)) (inspection.Run, error) {
+	fingerprint, err := platformIdempotencyFingerprint(ctx, operation, resourceID, "")
+	if err != nil {
+		return inspection.Run{}, err
+	}
+	runID := deterministicInspectionID("inspection-run", scope, actor, operation, key)
+	auditJSON, reconcile, err := httpActionAuditReconciliation(ctx, service.audit, scope, Principal{Subject: actor}, "inspection.run.created", "inspection_run", runID, "success", operation, key)
+	if err != nil {
+		return inspection.Run{}, err
+	}
+	idemKey := idempotency.Key{Scope: scope, Actor: actor, OperationID: operation, IdempotencyKey: key}
 	recover := func(recoveryContext context.Context) (inspection.Run, error) {
-		value, err := service.repository.GetRunByIdempotencyKey(recoveryContext, scope, key)
+		value, err := service.repository.GetRunByIdempotency(recoveryContext, scope, inspection.RunIdempotency{Actor: actor, Operation: operation, Key: key, Fingerprint: fingerprint})
 		if errors.Is(err, inspection.ErrNotFound) {
 			return inspection.Run{}, idempotency.ErrInProgress
 		}
+		if err == nil && value.ID != runID {
+			return inspection.Run{}, inspection.ErrIdempotencyConflict
+		}
 		return value, err
 	}
-	return executeInspectionWrite(ctx, service, scope, actor, key, operation, "inspection.run.created", "inspection_run", resourceID, http.StatusAccepted, recover, create)
+	claim, err := service.idempotency.BeginRecoverable(ctx, idemKey, fingerprint, auditJSON, reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
+		value, recoverErr := recover(recoveryContext)
+		if recoverErr != nil {
+			return idempotency.Response{}, recoverErr
+		}
+		return encodeInspectionResponse(http.StatusAccepted, value)
+	})
+	if err != nil {
+		return inspection.Run{}, err
+	}
+	if claim.Response != nil {
+		return decodeInspectionResponse[inspection.Run](*claim.Response)
+	}
+	value, err := create(ctx, runID, fingerprint)
+	if err != nil {
+		if inspectionWriteFailedBeforeSideEffect(err) {
+			_ = service.idempotency.Abort(ctx, idemKey, fingerprint, claim.OwnerToken)
+		}
+		return inspection.Run{}, err
+	}
+	if value.ID != runID {
+		return inspection.Run{}, inspection.ErrIdempotencyConflict
+	}
+	response, err := encodeInspectionResponse(http.StatusAccepted, value)
+	if err != nil {
+		return inspection.Run{}, err
+	}
+	stored, err := service.idempotency.Complete(ctx, idemKey, fingerprint, claim.OwnerToken, response, auditJSON, reconcile)
+	if err != nil {
+		return inspection.Run{}, err
+	}
+	return decodeInspectionResponse[inspection.Run](stored)
 }
 
 func executeInspectionWrite[T any](ctx context.Context, service *inspectionApplicationService, scope platformscope.Scope, actor, key, operation, action, resourceType, resourceID string, status int, recoverValue func(context.Context) (T, error), perform func(context.Context) (T, error)) (T, error) {
@@ -1146,20 +1212,19 @@ func setInspectionNextRun(value *inspection.Policy, after time.Time) error {
 	return nil
 }
 func inspectionWriteFailedBeforeSideEffect(err error) bool {
-	return errors.Is(err, inspection.ErrInvalid) || errors.Is(err, inspection.ErrInvalidItem) || errors.Is(err, inspection.ErrInvalidSchedule) || errors.Is(err, inspection.ErrNotFound) || errors.Is(err, inspection.ErrConflict) || errors.Is(err, inspection.ErrRunNotRetryable) || errors.Is(err, inspection.ErrUnknownTarget) || errors.Is(err, inspection.ErrNoTargets)
+	return errors.Is(err, inspection.ErrInvalid) || errors.Is(err, inspection.ErrInvalidItem) || errors.Is(err, inspection.ErrInvalidSchedule) || errors.Is(err, inspection.ErrNotFound) || errors.Is(err, inspection.ErrConflict) || errors.Is(err, inspection.ErrRunNotRetryable) || errors.Is(err, inspection.ErrUnknownTarget) || errors.Is(err, inspection.ErrNoTargets) || errors.Is(err, inspection.ErrReportBudgetExceeded) || errors.Is(err, inspection.ErrReportBudgetOverflow) || errors.Is(err, inspection.ErrIdempotencyConflict)
 }
-func preferredInspectionArtifact(values []job.ArtifactReference) string {
-	for _, value := range values {
-		if strings.HasSuffix(strings.ToLower(value.ArtifactID), ".html") {
-			return value.ArtifactID
-		}
+func inspectionArtifactByFormat(values []job.ArtifactReference, format string) (string, error) {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format != "html" && format != "json" {
+		return "", inspection.ErrInvalid
 	}
 	for _, value := range values {
-		if strings.HasSuffix(strings.ToLower(value.ArtifactID), ".json") {
-			return value.ArtifactID
+		if strings.HasSuffix(strings.ToLower(value.ArtifactID), "."+format) {
+			return value.ArtifactID, nil
 		}
 	}
-	return ""
+	return "", artifact.ErrNotFound
 }
 
 type inspectionTargetCursor struct {

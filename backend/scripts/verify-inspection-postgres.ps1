@@ -62,6 +62,10 @@ $hadPlatformIntegration = Test-Path Env:DBPILOT_PLATFORM_POSTGRES_INTEGRATION
 $previousPlatformIntegration = $env:DBPILOT_PLATFORM_POSTGRES_INTEGRATION
 $hadPlatformDSN = Test-Path Env:DBPILOT_PLATFORM_POSTGRES_DSN
 $previousPlatformDSN = $env:DBPILOT_PLATFORM_POSTGRES_DSN
+$hadJobIntegration = Test-Path Env:DBPILOT_JOB_POSTGRES_INTEGRATION
+$previousJobIntegration = $env:DBPILOT_JOB_POSTGRES_INTEGRATION
+$hadJobDSN = Test-Path Env:DBPILOT_JOB_POSTGRES_DSN
+$previousJobDSN = $env:DBPILOT_JOB_POSTGRES_DSN
 
 try {
     $containerID = New-DBPilotOwnedContainer -DockerBinary $DockerBinary -Name $containerName -CreateArguments @(
@@ -93,9 +97,12 @@ try {
     $env:DBPILOT_INSPECTION_POSTGRES_DSN = "postgres://dbpilot_inspection:dbpilot_inspection@127.0.0.1:$port/dbpilot_inspection?sslmode=disable"
     $env:DBPILOT_PLATFORM_POSTGRES_INTEGRATION = '1'
     $env:DBPILOT_PLATFORM_POSTGRES_DSN = $env:DBPILOT_INSPECTION_POSTGRES_DSN
+	$env:DBPILOT_JOB_POSTGRES_INTEGRATION = '1'
+	$env:DBPILOT_JOB_POSTGRES_DSN = $env:DBPILOT_INSPECTION_POSTGRES_DSN
     Push-Location $backendRoot
     try {
         Invoke-Checked $GoBinary @('test', './internal/inspection', '-run', 'Test(PostgresIntegration|Scheduler|InspectionReportRows)', '-count=1', '-v')
+		Invoke-Checked $GoBinary @('test', './internal/job', '-run', 'TestPostgresIntegrationPrepareSlotsSurviveConcurrentDispatchersRestartAndRelease', '-count=1', '-v')
         Invoke-Checked $GoBinary @('test', './internal/platformdb', '-run', 'TestPlatformPostgresIntegration', '-count=1', '-v')
     }
     finally { Pop-Location }
@@ -109,6 +116,8 @@ finally {
     if ($hadDSN) { $env:DBPILOT_INSPECTION_POSTGRES_DSN = $previousDSN } else { Remove-Item Env:DBPILOT_INSPECTION_POSTGRES_DSN -ErrorAction SilentlyContinue }
     if ($hadPlatformIntegration) { $env:DBPILOT_PLATFORM_POSTGRES_INTEGRATION = $previousPlatformIntegration } else { Remove-Item Env:DBPILOT_PLATFORM_POSTGRES_INTEGRATION -ErrorAction SilentlyContinue }
     if ($hadPlatformDSN) { $env:DBPILOT_PLATFORM_POSTGRES_DSN = $previousPlatformDSN } else { Remove-Item Env:DBPILOT_PLATFORM_POSTGRES_DSN -ErrorAction SilentlyContinue }
+	if ($hadJobIntegration) { $env:DBPILOT_JOB_POSTGRES_INTEGRATION = $previousJobIntegration } else { Remove-Item Env:DBPILOT_JOB_POSTGRES_INTEGRATION -ErrorAction SilentlyContinue }
+	if ($hadJobDSN) { $env:DBPILOT_JOB_POSTGRES_DSN = $previousJobDSN } else { Remove-Item Env:DBPILOT_JOB_POSTGRES_DSN -ErrorAction SilentlyContinue }
     $cleanupFailures = @()
     try {
         Remove-DBPilotOwnedContainer -DockerBinary $DockerBinary -ContainerID $containerID

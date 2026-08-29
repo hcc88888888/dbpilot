@@ -22,17 +22,17 @@ import (
 )
 
 const policyColumnsSQL = "tenant_id, project_id, id, name, enabled, version, schedule_cron, schedule_timezone, next_run_at, target_selector, item_snapshot, target_timeout_seconds, max_concurrency, created_at, updated_at, claim_token, lease_expires_at"
-const runColumnsSQL = "tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at"
+const runColumnsSQL = "tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at, target_timeout_seconds, max_concurrency, idempotency_actor, idempotency_operation, idempotency_fingerprint"
 
 const selectRunsBeforeSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND (created_at, id) < ($3, $4) ORDER BY created_at DESC, id DESC LIMIT $5"
 const selectDuePoliciesSQL = "SELECT " + policyColumnsSQL + " FROM inspection_policies WHERE enabled = TRUE AND next_run_at <= $1 AND (lease_expires_at IS NULL OR lease_expires_at <= $1) ORDER BY next_run_at, tenant_id, project_id, id FOR UPDATE SKIP LOCKED LIMIT $2"
 const claimPolicySQL = "UPDATE inspection_policies SET claim_token = $1, lease_expires_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND version = $6 RETURNING claim_token"
 const insertItemSQL = "INSERT INTO inspection_items (tenant_id, project_id, item_id, version, enabled, system, category, source_type, snapshot, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
-const insertRunSQL = "INSERT INTO inspection_runs (tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) ON CONFLICT (tenant_id, project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
-const insertScheduledRunSQL = "INSERT INTO inspection_runs (tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) ON CONFLICT (tenant_id, project_id, occurrence_key) DO NOTHING RETURNING id"
+const insertRunSQL = "INSERT INTO inspection_runs (tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at, target_timeout_seconds, max_concurrency, idempotency_actor, idempotency_operation, idempotency_fingerprint) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) ON CONFLICT (tenant_id, project_id, idempotency_actor, idempotency_operation, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id"
+const insertScheduledRunSQL = "INSERT INTO inspection_runs (tenant_id, project_id, id, policy_id, policy_version, retry_of_run_id, job_id, status, trigger_source, occurrence_key, scheduled_for, policy_snapshot, item_snapshot, target_count, completed_target_count, failed_target_count, report_id, audit_correlation, idempotency_key, initiated_by, request_id, trace_id, started_at, finished_at, created_at, target_timeout_seconds, max_concurrency, idempotency_actor, idempotency_operation, idempotency_fingerprint) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30) ON CONFLICT (tenant_id, project_id, occurrence_key) DO NOTHING RETURNING id"
 const insertTargetRunSQL = "INSERT INTO inspection_target_runs (tenant_id, project_id, run_id, target_id, agent_id, command_id, status, target_snapshot, error_code, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
 const selectRunByOccurrenceSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND occurrence_key = $3"
-const selectRunByIdempotencySQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND idempotency_key = $3"
+const selectRunByIdempotencySQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND idempotency_actor = $3 AND idempotency_operation = $4 AND idempotency_key = $5"
 const advanceClaimedPolicySQL = "UPDATE inspection_policies SET next_run_at = $1, claim_token = NULL, lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND version = $5 AND next_run_at = $6 AND claim_token = $7 RETURNING next_run_at"
 const insertPolicySQL = "INSERT INTO inspection_policies (tenant_id, project_id, id, name, enabled, version, schedule_cron, schedule_timezone, next_run_at, target_selector, item_snapshot, target_timeout_seconds, max_concurrency, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
 const selectRunSQL = "SELECT " + runColumnsSQL + " FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND id = $3"
@@ -343,7 +343,7 @@ func scanPolicy(scanner interface{ Scan(...any) error }) (Policy, error) {
 	value.CreatedAt = value.CreatedAt.UTC()
 	value.UpdatedAt = value.UpdatedAt.UTC()
 	if claimToken.Valid && leaseExpiresAt.Valid && value.NextRunAt != nil {
-		value.Claim = &PolicyClaim{Token: claimToken.String, Occurrence: *value.NextRunAt, LeaseExpiresAt: leaseExpiresAt.Time.UTC()}
+		value.Claim = &PolicyClaim{Token: claimToken.String, ClaimedOccurrence: *value.NextRunAt, Occurrence: *value.NextRunAt, LeaseExpiresAt: leaseExpiresAt.Time.UTC()}
 	}
 	return value, nil
 }
@@ -352,13 +352,18 @@ func scanRun(scanner interface{ Scan(...any) error }) (Run, error) {
 	var value Run
 	var policyID, retryID, occurrence, reportID, idempotency sql.NullString
 	var policyVersion sql.NullInt64
+	var targetTimeoutSeconds int64
 	var scheduledFor, startedAt, finishedAt sql.NullTime
 	var policySnapshot, itemSnapshot []byte
-	err := scanner.Scan(&value.Scope.TenantID, &value.Scope.ProjectID, &value.ID, &policyID, &policyVersion, &retryID, &value.JobID, &value.Status, &value.Trigger, &occurrence, &scheduledFor, &policySnapshot, &itemSnapshot, &value.TargetCount, &value.CompletedTargetCount, &value.FailedTargetCount, &reportID, &value.AuditCorrelation, &idempotency, &value.InitiatedBy, &value.RequestID, &value.TraceID, &startedAt, &finishedAt, &value.CreatedAt)
+	err := scanner.Scan(&value.Scope.TenantID, &value.Scope.ProjectID, &value.ID, &policyID, &policyVersion, &retryID, &value.JobID, &value.Status, &value.Trigger, &occurrence, &scheduledFor, &policySnapshot, &itemSnapshot, &value.TargetCount, &value.CompletedTargetCount, &value.FailedTargetCount, &reportID, &value.AuditCorrelation, &idempotency, &value.InitiatedBy, &value.RequestID, &value.TraceID, &startedAt, &finishedAt, &value.CreatedAt, &targetTimeoutSeconds, &value.MaxConcurrency, &value.IdempotencyActor, &value.IdempotencyOperation, &value.IdempotencyFingerprint)
 	if err != nil {
 		return Run{}, err
 	}
 	value.PolicyID, value.PolicyVersion, value.RetryOfRunID, value.OccurrenceKey, value.ReportID, value.IdempotencyKey = policyID.String, policyVersion.Int64, retryID.String, occurrence.String, reportID.String, idempotency.String
+	value.TargetTimeout = time.Duration(targetTimeoutSeconds) * time.Second
+	if value.TargetTimeout < time.Second || value.TargetTimeout > time.Hour || value.MaxConcurrency < 1 || value.MaxConcurrency > 1000 || validatePersistedRunIdempotency(value) != nil {
+		return Run{}, ErrInvalid
+	}
 	if scheduledFor.Valid {
 		at := scheduledFor.Time.UTC()
 		value.ScheduledFor = &at
@@ -586,6 +591,13 @@ func (repository *PostgresRepository) CreateRunWithJob(ctx context.Context, run 
 	rollback := func(cause error) error { _ = tx.Rollback(); return cause }
 	inserted, err := insertRun(ctx, tx, insertRunSQL, run)
 	if errors.Is(err, sql.ErrNoRows) {
+		existing, getErr := scanRun(tx.QueryRowContext(ctx, selectRunByIdempotencySQL, run.Scope.TenantID, run.Scope.ProjectID, run.IdempotencyActor, run.IdempotencyOperation, run.IdempotencyKey))
+		if getErr != nil {
+			return rollback(getErr)
+		}
+		if existing.IdempotencyFingerprint != run.IdempotencyFingerprint {
+			return rollback(ErrIdempotencyConflict)
+		}
 		return rollback(ErrDuplicate)
 	}
 	if err != nil {
@@ -612,10 +624,7 @@ func (repository *PostgresRepository) CreateClaimedRunWithJob(ctx context.Contex
 	if err := validateRunCreation(repository, ctx, run, targets, value, messages); err != nil {
 		return Run{}, err
 	}
-	next, err := NextScheduledOccurrence(*policy.Schedule, policy.Claim.Occurrence)
-	if err != nil {
-		return Run{}, err
-	}
+	next := policy.Claim.NextOccurrence.UTC()
 	tx, err := repository.database.BeginTx(ctx, nil)
 	if err != nil {
 		return Run{}, fmt.Errorf("begin claimed inspection run creation: %w", err)
@@ -644,7 +653,7 @@ func (repository *PostgresRepository) CreateClaimedRunWithJob(ctx context.Contex
 	}
 	var persistedNext time.Time
 	err = tx.QueryRowContext(ctx, advanceClaimedPolicySQL,
-		next, policy.Scope.TenantID, policy.Scope.ProjectID, policy.ID, policy.Version, policy.Claim.Occurrence.UTC(), policy.Claim.Token,
+		next, policy.Scope.TenantID, policy.Scope.ProjectID, policy.ID, policy.Version, policy.Claim.ClaimedOccurrence.UTC(), policy.Claim.Token,
 	).Scan(&persistedNext)
 	if errors.Is(err, sql.ErrNoRows) {
 		return rollback(ErrConflict)
@@ -681,16 +690,19 @@ func (repository *PostgresRepository) GetRun(ctx context.Context, scope platform
 	}
 	return RunDetail{Run: value, Targets: targets, Findings: findings}, nil
 }
-func (repository *PostgresRepository) GetRunByIdempotencyKey(ctx context.Context, scope platformscope.Scope, key string) (Run, error) {
-	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !canonicalText(key) {
+func (repository *PostgresRepository) GetRunByIdempotency(ctx context.Context, scope platformscope.Scope, correlation RunIdempotency) (Run, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || validateRunIdempotency(correlation) != nil {
 		return Run{}, ErrInvalid
 	}
-	value, err := scanRun(repository.database.QueryRowContext(ctx, selectRunByIdempotencySQL, scope.TenantID, scope.ProjectID, key))
+	value, err := scanRun(repository.database.QueryRowContext(ctx, selectRunByIdempotencySQL, scope.TenantID, scope.ProjectID, correlation.Actor, correlation.Operation, correlation.Key))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Run{}, ErrNotFound
 	}
 	if err != nil {
-		return Run{}, fmt.Errorf("get inspection run by idempotency key: %w", err)
+		return Run{}, fmt.Errorf("get inspection run by scoped idempotency key: %w", err)
+	}
+	if value.IdempotencyFingerprint != correlation.Fingerprint {
+		return Run{}, ErrIdempotencyConflict
 	}
 	return value, nil
 }
@@ -756,7 +768,7 @@ func validateStoredItem(value Item) error {
 }
 
 func validateRunCreation(repository *PostgresRepository, ctx context.Context, run Run, targets []TargetRun, value job.Job, messages []job.OutboxMessage) error {
-	if repository == nil || repository.database == nil || repository.jobs == nil || ctx == nil || run.Scope.Validate() != nil || !validID(run.ID) || !validID(run.JobID) || run.JobID != value.ID || run.Scope != value.Scope || run.Status != RunQueued || (run.Trigger != RunTriggerManual && run.Trigger != RunTriggerScheduled && run.Trigger != RunTriggerRetry) || !isUTC(run.CreatedAt) || !canonicalText(run.IdempotencyKey) || run.TargetCount != len(targets) || len(targets) == 0 || len(targets) > maxSnapshotTargets || len(messages) != len(targets) || len(run.ItemSnapshot) == 0 {
+	if repository == nil || repository.database == nil || repository.jobs == nil || ctx == nil || run.Scope.Validate() != nil || !validID(run.ID) || !validID(run.JobID) || run.JobID != value.ID || run.Scope != value.Scope || run.Status != RunQueued || (run.Trigger != RunTriggerManual && run.Trigger != RunTriggerScheduled && run.Trigger != RunTriggerRetry) || !isUTC(run.CreatedAt) || validateRunIdempotency(RunIdempotency{Actor: run.IdempotencyActor, Operation: run.IdempotencyOperation, Key: run.IdempotencyKey, Fingerprint: run.IdempotencyFingerprint}) != nil || run.IdempotencyActor != run.InitiatedBy || run.TargetCount != len(targets) || len(targets) == 0 || len(targets) > maxSnapshotTargets || len(messages) != len(targets) || len(run.ItemSnapshot) == 0 || run.TargetTimeout < time.Second || run.TargetTimeout > time.Hour || run.MaxConcurrency < 1 || run.MaxConcurrency > 1000 || run.TargetTimeout != value.TargetTimeout || run.MaxConcurrency != value.MaxConcurrency {
 		return ErrInvalid
 	}
 	seenTargets := make(map[string]struct{}, len(targets))
@@ -778,7 +790,11 @@ func validateRunCreation(repository *PostgresRepository, ctx context.Context, ru
 }
 
 func validateClaimedRun(policy Policy, run Run) error {
-	if policy.Claim == nil || policy.Schedule == nil || policy.Scope != run.Scope || policy.ID != run.PolicyID || policy.Version != run.PolicyVersion || run.Trigger != RunTriggerScheduled || run.ScheduledFor == nil || !run.ScheduledFor.Equal(policy.Claim.Occurrence) || policy.NextRunAt == nil || !policy.NextRunAt.Equal(policy.Claim.Occurrence) || !canonicalText(policy.Claim.Token) || run.OccurrenceKey != scheduledOccurrenceKey(policy, policy.Claim.Occurrence) {
+	if policy.Claim == nil || policy.Schedule == nil || policy.Scope != run.Scope || policy.ID != run.PolicyID || policy.Version != run.PolicyVersion || run.Trigger != RunTriggerScheduled || run.ScheduledFor == nil || !run.ScheduledFor.Equal(policy.Claim.Occurrence) || policy.NextRunAt == nil || !policy.NextRunAt.Equal(policy.Claim.ClaimedOccurrence) || !canonicalText(policy.Claim.Token) || !isUTC(policy.Claim.ClaimedOccurrence) || !isUTC(policy.Claim.Occurrence) || !isUTC(policy.Claim.NextOccurrence) || policy.Claim.Occurrence.Before(policy.Claim.ClaimedOccurrence) || run.OccurrenceKey != scheduledOccurrenceKey(policy, policy.Claim.Occurrence) {
+		return ErrConflict
+	}
+	next, err := NextScheduledOccurrence(*policy.Schedule, policy.Claim.Occurrence)
+	if err != nil || !next.Equal(policy.Claim.NextOccurrence) {
 		return ErrConflict
 	}
 	return nil
@@ -816,6 +832,8 @@ func runInsertArgs(run Run, policySnapshot, itemSnapshot []byte) []any {
 		run.Status, run.Trigger, nullableText(run.OccurrenceKey), nullableTime(run.ScheduledFor), nullableJSON(policySnapshot), itemSnapshot,
 		run.TargetCount, run.CompletedTargetCount, run.FailedTargetCount, nullableText(run.ReportID), run.AuditCorrelation, nullableText(run.IdempotencyKey),
 		run.InitiatedBy, run.RequestID, run.TraceID, nullableTime(run.StartedAt), nullableTime(run.FinishedAt), run.CreatedAt.UTC(),
+		int64(run.TargetTimeout / time.Second), run.MaxConcurrency,
+		run.IdempotencyActor, run.IdempotencyOperation, run.IdempotencyFingerprint,
 	}
 }
 
@@ -1043,17 +1061,23 @@ func scanRunClaim(scanner interface{ Scan(...any) error }) (Run, time.Time, erro
 	var policyID, retryID, occurrence, reportID, idempotency sql.NullString
 	var policyVersion sql.NullInt64
 	var scheduledFor, startedAt, finishedAt, reportGeneratedAt sql.NullTime
+	var targetTimeoutSeconds int64
 	var policySnapshot, itemSnapshot []byte
 	err := scanner.Scan(
 		&value.Scope.TenantID, &value.Scope.ProjectID, &value.ID, &policyID, &policyVersion, &retryID, &value.JobID,
 		&value.Status, &value.Trigger, &occurrence, &scheduledFor, &policySnapshot, &itemSnapshot,
 		&value.TargetCount, &value.CompletedTargetCount, &value.FailedTargetCount, &reportID, &value.AuditCorrelation, &idempotency,
-		&value.InitiatedBy, &value.RequestID, &value.TraceID, &startedAt, &finishedAt, &value.CreatedAt, &reportGeneratedAt,
+		&value.InitiatedBy, &value.RequestID, &value.TraceID, &startedAt, &finishedAt, &value.CreatedAt,
+		&targetTimeoutSeconds, &value.MaxConcurrency, &value.IdempotencyActor, &value.IdempotencyOperation, &value.IdempotencyFingerprint, &reportGeneratedAt,
 	)
 	if err != nil {
 		return Run{}, time.Time{}, err
 	}
 	value.PolicyID, value.PolicyVersion, value.RetryOfRunID, value.OccurrenceKey, value.ReportID, value.IdempotencyKey = policyID.String, policyVersion.Int64, retryID.String, occurrence.String, reportID.String, idempotency.String
+	value.TargetTimeout = time.Duration(targetTimeoutSeconds) * time.Second
+	if value.TargetTimeout < time.Second || value.TargetTimeout > time.Hour || value.MaxConcurrency < 1 || value.MaxConcurrency > 1000 || validatePersistedRunIdempotency(value) != nil {
+		return Run{}, time.Time{}, ErrInvalid
+	}
 	if scheduledFor.Valid {
 		value.ScheduledFor = timePointerValueUTC(scheduledFor.Time)
 	}
@@ -1383,6 +1407,19 @@ func (repository *PostgresRepository) ReleaseRun(ctx context.Context, claim RunC
 	}
 	run := claim.Detail.Run
 	_, err := repository.database.ExecContext(ctx, "UPDATE inspection_runs SET worker_claim_token = NULL, worker_lease_expires_at = NULL WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND worker_claim_token = $4", run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token)
+	return err
+}
+
+func (repository *PostgresRepository) FailReport(ctx context.Context, claim RunClaim, at time.Time) error {
+	if !validWorkerClaim(repository, ctx, claim) || claim.Detail.Run.Status != RunGeneratingReport || at.IsZero() {
+		return ErrInvalid
+	}
+	run := claim.Detail.Run
+	var runID string
+	err := repository.database.QueryRowContext(ctx, "UPDATE inspection_runs SET status = 'failed', finished_at = $1, worker_claim_token = NULL, worker_lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND status = 'generating_report' AND worker_claim_token = $5 RETURNING id", at.UTC(), run.Scope.TenantID, run.Scope.ProjectID, run.ID, claim.Token).Scan(&runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrConflict
+	}
 	return err
 }
 

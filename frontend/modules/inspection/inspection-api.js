@@ -41,7 +41,7 @@ export function createInspectionApi({ baseUrl = '', available = true, controlPla
     retryRun: (scope, id, key, signal) => write(scope, 'retryInspectionRun', { runId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
     listReports: (scope, page = {}, signal) => read(scope, 'listInspectionReports', pageParams(page), signal),
     getReport: (scope, id, signal) => read(scope, 'getInspectionReport', { reportId: requiredID(id) }, signal),
-    downloadReport: (scope, id, key, signal) => write(scope, 'createInspectionReportDownload', { reportId: requiredID(id), idempotencyKey: key }, { idempotencyKey: key, signal }),
+    downloadReport: (scope, id, format, key, signal) => write(scope, 'createInspectionReportDownload', { reportId: requiredID(id), idempotencyKey: key, inspectionReportDownloadRequest: generatedModel({ format: inspectionReportFormat(format) }) }, { idempotencyKey: key, signal }),
   };
 }
 
@@ -62,7 +62,7 @@ function demoInspectionApi() {
     async getOverview() { return { source: 'demo', target_count: 2, online_target_count: 1, finding_level_counts: { healthy: 1, warning: 0, critical: 0, unsupported: 0, missing_data: 1 }, latest_run_status_counts: { partial: 1 } }; },
     async listItems() { return page([item]); }, async listTargets() { return page([target]); }, async listPolicies() { return page([policy]); }, async getPolicy() { return { ...policy, source: 'demo' }; },
     async listRuns() { return page([run]); }, async getRun() { return { ...run, source: 'demo' }; }, async listReports() { return page([report]); }, async getReport() { return { ...report, source: 'demo' }; },
-    async createItem() { return { ...item, source: 'demo' }; }, async createPolicy() { return { ...policy, source: 'demo' }; }, async updatePolicy() { return { ...policy, source: 'demo' }; }, async runPolicy() { return { ...run, source: 'demo' }; }, async createRun() { return { ...run, source: 'demo' }; }, async cancelRun() { return { ...run, source: 'demo' }; }, async retryRun() { return { ...run, source: 'demo' }; }, async downloadReport() { return { source: 'demo', url: '#demo-inspection-report', expires_at: now }; },
+    async createItem() { return { ...item, source: 'demo' }; }, async createPolicy() { return { ...policy, source: 'demo' }; }, async updatePolicy() { return { ...policy, source: 'demo' }; }, async runPolicy() { return { ...run, source: 'demo' }; }, async createRun() { return { ...run, source: 'demo' }; }, async cancelRun() { return { ...run, source: 'demo' }; }, async retryRun() { return { ...run, source: 'demo' }; }, async downloadReport(_scope, _id, format) { return { source: 'demo', url: `#demo-inspection-report-${inspectionReportFormat(format)}`, expires_at: now }; },
   };
 }
 
@@ -135,6 +135,12 @@ function inspectionRunRequest(value = {}) {
     targetTimeoutSeconds: value.target_timeout_seconds,
     maxConcurrency: value.max_concurrency,
   });
+}
+
+function inspectionReportFormat(value) {
+  const format = String(value ?? '').trim().toLowerCase();
+  if (format !== 'html' && format !== 'json') throw Object.assign(new Error('invalid inspection report format'), { kind: 'validation' });
+  return format;
 }
 
 function copyRecord(value) {

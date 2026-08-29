@@ -28,6 +28,21 @@ func TestCommandVerifierRejectsInvalidEnvelopeBeforeReservingNonce(t *testing.T)
 	require.NoError(t, verifier.Verify(context.Background(), valid), "an invalid signature must not consume its nonce")
 }
 
+func TestCommandVerifierAcceptsVersionedCollectorAdvertisementsWithoutTreatingThemAsCommandKinds(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Unix(1_725_000_000, 0).UTC()
+	verifier, err := NewCommandVerifier("agent-a", publicKey, []string{"collect_now", CapabilityCollectNowDependenciesV1, CapabilityCollectNowHostV1})
+	require.NoError(t, err)
+	verifier.now = func() time.Time { return now }
+	require.NoError(t, verifier.Verify(context.Background(), signedCollectNowEnvelope(t, privateKey, "versioned", "agent-a", []byte("nonce-versioned"), now, now.Add(time.Minute))))
+
+	withoutGeneric, err := NewCommandVerifier("agent-a", publicKey, []string{CapabilityCollectNowHostV1})
+	require.NoError(t, err)
+	withoutGeneric.now = func() time.Time { return now }
+	require.ErrorIs(t, withoutGeneric.Verify(context.Background(), signedCollectNowEnvelope(t, privateKey, "generic-required", "agent-a", []byte("nonce-generic-required"), now, now.Add(time.Minute))), ErrCommandCapabilityUnavailable)
+}
+
 func TestCommandVerifierRejectsExpiredMismatchedAndUnadvertisedCommands(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)

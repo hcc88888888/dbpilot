@@ -13,6 +13,8 @@
  */
 import { InspectionFindingFromJSON, InspectionFindingToJSON, } from './InspectionFinding.js';
 import { InspectionReportStatusFromJSON, InspectionReportStatusToJSON, } from './InspectionReportStatus.js';
+import { InspectionReportTargetFromJSON, InspectionReportTargetToJSON, } from './InspectionReportTarget.js';
+import { InspectionReportReferencesFromJSON, InspectionReportReferencesToJSON, } from './InspectionReportReferences.js';
 import { ArtifactReferenceFromJSON, ArtifactReferenceToJSON, } from './ArtifactReference.js';
 /**
  * Check if a given object implements the InspectionReport interface.
@@ -47,6 +49,8 @@ export function InspectionReportFromJSONTyped(json, ignoreDiscriminator) {
         'status': InspectionReportStatusFromJSON(json['status']),
         'summary': json['summary'],
         'findings': json['findings'] == null ? undefined : (json['findings'].map(InspectionFindingFromJSON)),
+        'targets': json['targets'] == null ? undefined : (json['targets'].map(InspectionReportTargetFromJSON)),
+        'references': json['references'] == null ? undefined : InspectionReportReferencesFromJSON(json['references']),
         'artifacts': (json['artifacts'].map(ArtifactReferenceFromJSON)),
         'generatedAt': (new Date(json['generated_at'])),
     };
@@ -66,6 +70,8 @@ export function InspectionReportToJSONTyped(value, ignoreDiscriminator = false) 
         'status': InspectionReportStatusToJSON(value['status']),
         'summary': value['summary'],
         'findings': value['findings'] == null ? undefined : (value['findings'].map(InspectionFindingToJSON)),
+        'targets': value['targets'] == null ? undefined : (value['targets'].map(InspectionReportTargetToJSON)),
+        'references': InspectionReportReferencesToJSON(value['references']),
         'artifacts': (value['artifacts'].map(ArtifactReferenceToJSON)),
         'generated_at': ((value['generatedAt']).toISOString()),
     };

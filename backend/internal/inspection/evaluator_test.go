@@ -167,11 +167,12 @@ func TestEvaluatorUsesBuiltinMetadataAndLogSemantics(t *testing.T) {
 		Targets: []TargetRun{{TargetID: "target-1", AgentID: "agent-1", Status: TargetPending}},
 	}
 	canonicalTarget := TargetRun{
-		TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating, TrustedProcessAllowlist: false,
+		TargetID: "target-1", AgentID: "agent-1", Status: TargetEvaluating,
 		AdvertisedSources: []SourceType{SourceMetadata, SourceLogSummary},
 		Observations: []Observation{
 			metadataObservation("oom", "dbpilot.inspection.host.oom.count", 1, now),
 			metadataObservation("sync", "dbpilot.inspection.host.time.synchronized", 0, now),
+			metadataObservation("process-availability", "dbpilot.inspection.host.database.process_allowlist_available", 0, now),
 			metadataObservation("process", "dbpilot.inspection.host.database.required_process_count", 0, now),
 			{ID: "errors", TargetID: "target-1", Name: "dbpilot.inspection.host.log.error_count", SourceType: SourceLogSummary, Value: 0, ObservedAt: now},
 			{ID: "warnings", TargetID: "target-1", Name: "dbpilot.inspection.host.log.warning_count", SourceType: SourceLogSummary, Value: 1, ObservedAt: now},
@@ -188,6 +189,30 @@ func TestEvaluatorUsesBuiltinMetadataAndLogSemantics(t *testing.T) {
 		if finding.Level != want[finding.ItemID] {
 			t.Fatalf("%s = %q, want %q", finding.ItemID, finding.Level, want[finding.ItemID])
 		}
+	}
+}
+
+func TestEvaluatorUsesSnapshotMetricsForProcessAllowlistAvailabilityAndMatches(t *testing.T) {
+	now := testTime()
+	for _, test := range []struct {
+		name         string
+		availability float64
+		matches      float64
+		want         FindingLevel
+	}{
+		{name: "unconfigured allowlist is unsupported", availability: 0, matches: 0, want: LevelUnsupported},
+		{name: "configured with zero matches is critical", availability: 1, matches: 0, want: LevelCritical},
+		{name: "configured with a match is healthy", availability: 1, matches: 2, want: LevelHealthy},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := metadataSnapshot("database.process.presence", []Observation{
+				metadataObservation("allowlist", "dbpilot.inspection.host.database.process_allowlist_available", test.availability, now),
+				metadataObservation("matches", "dbpilot.inspection.host.database.required_process_count", test.matches, now),
+			})
+			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
+			require.NoError(t, err)
+			require.Equal(t, test.want, findings[0].Level)
+		})
 	}
 }
 
@@ -260,22 +285,24 @@ func TestEvaluatorTreatsMalformedMetadataEvidenceAsMissingData(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		itemID  string
-		trusted bool
 		observe Observation
 	}{
-		{"negative oom count", "host.oom.evidence", false, metadataObservation("oom-negative", "dbpilot.inspection.host.oom.count", -1, now)},
-		{"fractional oom count", "host.oom.evidence", false, metadataObservation("oom-fraction", "dbpilot.inspection.host.oom.count", 0.5, now)},
-		{"invalid time sync value", "host.time.synchronization", false, metadataObservation("sync-invalid", "dbpilot.inspection.host.time.synchronized", 2, now)},
-		{"fractional time sync value", "host.time.synchronization", false, metadataObservation("sync-fraction", "dbpilot.inspection.host.time.synchronized", 0.5, now)},
-		{"negative process count", "database.process.presence", true, metadataObservation("process-negative", "dbpilot.inspection.host.database.required_process_count", -1, now)},
-		{"fractional process count", "database.process.presence", true, metadataObservation("process-fraction", "dbpilot.inspection.host.database.required_process_count", 0.5, now)},
-		{"non utc metadata", "host.oom.evidence", false, metadataObservation("oom-time", "dbpilot.inspection.host.oom.count", 0, invalidTime)},
-		{"wrong metadata source", "host.oom.evidence", false, Observation{ID: "oom-source", TargetID: "target-1", Name: "dbpilot.inspection.host.oom.count", SourceType: SourceMetric, Labels: map[string]string{}, Value: 0, ObservedAt: now}},
-		{"wrong metadata name", "host.oom.evidence", false, metadataObservation("oom-name", "dbpilot.inspection.host.unknown_count", 0, now)},
+		{"negative oom count", "host.oom.evidence", metadataObservation("oom-negative", "dbpilot.inspection.host.oom.count", -1, now)},
+		{"fractional oom count", "host.oom.evidence", metadataObservation("oom-fraction", "dbpilot.inspection.host.oom.count", 0.5, now)},
+		{"invalid time sync value", "host.time.synchronization", metadataObservation("sync-invalid", "dbpilot.inspection.host.time.synchronized", 2, now)},
+		{"fractional time sync value", "host.time.synchronization", metadataObservation("sync-fraction", "dbpilot.inspection.host.time.synchronized", 0.5, now)},
+		{"negative process count", "database.process.presence", metadataObservation("process-negative", "dbpilot.inspection.host.database.required_process_count", -1, now)},
+		{"fractional process count", "database.process.presence", metadataObservation("process-fraction", "dbpilot.inspection.host.database.required_process_count", 0.5, now)},
+		{"non utc metadata", "host.oom.evidence", metadataObservation("oom-time", "dbpilot.inspection.host.oom.count", 0, invalidTime)},
+		{"wrong metadata source", "host.oom.evidence", Observation{ID: "oom-source", TargetID: "target-1", Name: "dbpilot.inspection.host.oom.count", SourceType: SourceMetric, Labels: map[string]string{}, Value: 0, ObservedAt: now}},
+		{"wrong metadata name", "host.oom.evidence", metadataObservation("oom-name", "dbpilot.inspection.host.unknown_count", 0, now)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			snapshot := metadataSnapshot(tc.itemID, []Observation{tc.observe})
-			snapshot.Targets[0].TrustedProcessAllowlist = tc.trusted
+			observations := []Observation{tc.observe}
+			if tc.itemID == "database.process.presence" {
+				observations = append(observations, metadataObservation("process-availability", "dbpilot.inspection.host.database.process_allowlist_available", 1, now))
+			}
+			snapshot := metadataSnapshot(tc.itemID, observations)
 			findings, err := (&Evaluator{Now: func() time.Time { return now }}).EvaluateTarget(context.Background(), snapshot, metricTarget())
 			if err != nil {
 				t.Fatal(err)

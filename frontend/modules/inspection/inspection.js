@@ -3,6 +3,9 @@ const TERMINAL_RUNS = new Set(['completed', 'partial', 'failed', 'cancelled']);
 const RUN_LABELS = { queued: '排队中', collecting: '采集中', evaluating: '评估中', generating_report: '生成报告', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消' };
 const FINDING_LABELS = { healthy: '健康', warning: '警告', critical: '严重', unsupported: '不支持', missing_data: '数据缺失' };
 const TARGET_LABELS = { pending: '等待中', collecting: '采集中', evaluating: '评估中', succeeded: '成功', failed: '失败', unsupported: '不支持', cancelled: '已取消' };
+const INSPECTION_PAGE_LIMIT = 100;
+const MAX_POLICY_TARGETS = 10000;
+const MAX_POLICY_ITEMS = 200;
 
 export function inspectionFailureMessage(error, subject = '巡检数据') {
   if (error?.kind === 'forbidden') return '当前账号没有该项目的巡检查看权限';
@@ -70,7 +73,11 @@ export function renderInspectionPolicyMarkup(value = {}, permissions = {}) {
     <button type="submit" class="ins-primary" data-inspection-policy-save>${editing ? '更新策略' : '保存策略'}</button>
   </form>` : '';
   const list = policies.length ? policies.map((policy) => `<article class="ins-policy-row"><div><span class="ins-state ${policy.enabled ? 'enabled' : 'disabled'}">${policy.enabled ? '已启用' : '已停用'}</span><h3>${safe(policy.name)}</h3><p>v${Number(policy.version)} · ${policy.target_ids?.length ?? 0} 个目标 · ${policy.item_versions?.length ?? 0} 个巡检项</p></div><div class="ins-row-actions">${permissions.manage === true ? `<button type="button" class="ins-secondary" data-inspection-policy-edit="${safe(policy.id)}">编辑</button>` : ''}${permissions.execute === true ? `<button type="button" class="ins-primary" data-inspection-policy-run="${safe(policy.id)}">立即执行</button>` : ''}</div></article>`).join('') : '<div class="ins-empty"><h3>暂无巡检策略</h3><p>创建策略后可按计划调度或立即执行。</p></div>';
-  return `<div class="ins-policy-layout"><section class="ins-panel"><div class="ins-panel-head"><div><span class="ins-kicker">POLICIES</span><h3>巡检策略</h3></div></div>${list}</section>${form}</div>`;
+  const page = value.policy_page ?? {};
+  const previous = value.policy_has_previous === true;
+  const next = page.has_more === true && Boolean(page.next_cursor);
+  const pager = previous || next ? `<nav class="ins-pager" aria-label="巡检策略分页">${previous ? '<button type="button" class="ins-secondary" data-inspection-policy-page="previous">上一页</button>' : ''}${next ? '<button type="button" class="ins-secondary" data-inspection-policy-page="next">下一页</button>' : ''}</nav>` : '';
+  return `<div class="ins-policy-layout"><section class="ins-panel"><div class="ins-panel-head"><div><span class="ins-kicker">POLICIES</span><h3>巡检策略</h3></div></div>${list}${pager}</section>${form}</div>`;
 }
 
 export function renderInspectionRunMarkup(run = {}, permissions = {}) {
@@ -93,8 +100,15 @@ export function renderInspectionRunMarkup(run = {}, permissions = {}) {
 export function renderInspectionReportMarkup(report = {}) {
   if (!report.id) return '<div class="ins-empty"><h3>报告不存在</h3></div>';
   const findings = Array.isArray(report.findings) ? report.findings : [];
-  return `<article class="ins-panel ins-report-detail"><div class="ins-panel-head"><div><span class="ins-kicker">IMMUTABLE REPORT</span><h3>${safe(report.id)}</h3><p>${safe(report.summary)}</p></div><button type="button" class="ins-primary" data-inspection-report-download="${safe(report.id)}">下载 HTML / JSON</button></div>
-    <dl class="ins-report-meta"><div><dt>执行</dt><dd>${safe(report.run_id)}</dd></div><div><dt>状态</dt><dd>${safe(report.status === 'completed' ? '已完成' : report.status)}</dd></div><div><dt>生成时间</dt><dd>${safe(formatTime(report.generated_at))}</dd></div><div><dt>格式</dt><dd>HTML / JSON</dd></div></dl>
+  const targets = Array.isArray(report.targets) ? report.targets : [];
+  const references = report.references ?? {};
+  const formats = new Set((report.artifacts ?? []).map((artifact) => String(artifact.artifact_id ?? '').toLowerCase().split('.').at(-1)));
+  const downloads = ['html', 'json'].filter((format) => formats.has(format)).map((format) => `<button type="button" class="ins-primary" data-inspection-report-download="${safe(report.id)}" data-inspection-report-format="${format}">下载 ${format.toUpperCase()}</button>`).join('');
+  const targetNavigation = targets.length ? `<nav class="ins-target-navigation" aria-label="报告目标">${targets.map((target) => `<a href="#inspection-report-target-${safe(target.target_id)}">${safe(target.display_name || target.target_id)}</a>`).join('')}</nav><div class="ins-report-targets">${targets.map((target) => `<article id="inspection-report-target-${safe(target.target_id)}"><b>${safe(target.display_name || target.target_id)}</b><span>${safe(target.host)}</span><span>${safe(TARGET_LABELS[target.status] ?? target.status)}</span><code>${safe(target.command_id)}</code></article>`).join('')}</div>` : '';
+  const commandReferences = Array.isArray(references.commands) ? references.commands : [];
+  return `<article class="ins-panel ins-report-detail"><div class="ins-panel-head"><div><span class="ins-kicker">IMMUTABLE REPORT</span><h3>${safe(report.id)}</h3><p>${safe(report.summary)}</p></div><div class="ins-row-actions">${downloads}</div></div>
+    <dl class="ins-report-meta"><div><dt>执行</dt><dd>${safe(report.run_id)}</dd></div><div><dt>状态</dt><dd>${safe(report.status === 'completed' ? '已完成' : report.status)}</dd></div><div><dt>生成时间</dt><dd>${safe(formatTime(report.generated_at))}</dd></div><div><dt>Job</dt><dd>${safe(references.job_id)}</dd></div><div><dt>Audit</dt><dd>${safe(references.audit_correlation)}</dd></div><div><dt>命令</dt><dd>${commandReferences.map((reference) => `${safe(reference.target_id)}: ${safe(reference.command_id)}`).join('<br>')}</dd></div></dl>
+    ${targetNavigation}
     <div class="ins-findings">${findings.map(renderFinding).join('') || '<p class="ins-empty">报告中暂无发现。</p>'}</div>
   </article>`;
 }
@@ -102,23 +116,24 @@ export function renderInspectionReportMarkup(report = {}) {
 export function createInspectionCenter({ root, api, scope, permissions = {}, onToast = () => {} } = {}) {
   if (!root || typeof root.addEventListener !== 'function') throw new TypeError('inspection root is required');
   if (!api) throw new TypeError('inspection api is required');
-  const state = { view: 'overview', scope: normalizeScope(scope), permissions: { view: permissions.view !== false, manage: permissions.manage === true, execute: permissions.execute === true }, loading: false, error: null, data: null, selectedReport: null, editingPolicy: null };
+  const state = { view: 'overview', scope: normalizeScope(scope), permissions: { view: permissions.view !== false, manage: permissions.manage === true, execute: permissions.execute === true }, loading: false, error: null, data: null, selectedReport: null, editingPolicy: null, policyCursor: '', policyHistory: [] };
   let active = null;
   let version = 0;
 
   root.addEventListener('click', (event) => {
-    const target = event.target?.closest?.('[data-inspection-view],[data-inspection-retry-load],[data-inspection-policy-run],[data-inspection-policy-edit],[data-inspection-policy-edit-cancel],[data-inspection-run],[data-inspection-report],[data-inspection-cancel],[data-inspection-retry],[data-inspection-report-download]');
+    const target = event.target?.closest?.('[data-inspection-view],[data-inspection-retry-load],[data-inspection-policy-run],[data-inspection-policy-edit],[data-inspection-policy-edit-cancel],[data-inspection-policy-page],[data-inspection-run],[data-inspection-report],[data-inspection-cancel],[data-inspection-retry],[data-inspection-report-download]');
     if (!target) return;
     if (target.dataset.inspectionView) open(target.dataset.inspectionView);
     else if (target.hasAttribute('data-inspection-retry-load')) reload();
     else if (target.dataset.inspectionPolicyRun) action(() => api.runPolicy(state.scope, target.dataset.inspectionPolicyRun, newKey('policy-run')), '巡检已开始');
+    else if (target.dataset.inspectionPolicyPage) pagePolicies(target.dataset.inspectionPolicyPage);
     else if (target.dataset.inspectionPolicyEdit) editPolicy(target.dataset.inspectionPolicyEdit);
     else if (target.hasAttribute('data-inspection-policy-edit-cancel')) cancelPolicyEdit();
     else if (target.dataset.inspectionRun) openRun(target.dataset.inspectionRun);
     else if (target.dataset.inspectionReport) openReport(target.dataset.inspectionReport);
     else if (target.dataset.inspectionCancel) action(() => api.cancelRun(state.scope, target.dataset.inspectionCancel, newKey('cancel')), '已提交取消请求');
     else if (target.dataset.inspectionRetry) action(() => api.retryRun(state.scope, target.dataset.inspectionRetry, newKey('retry')), '已创建重试执行');
-    else if (target.dataset.inspectionReportDownload) download(target.dataset.inspectionReportDownload);
+    else if (target.dataset.inspectionReportDownload) download(target.dataset.inspectionReportDownload, target.dataset.inspectionReportFormat);
   });
   root.addEventListener('submit', (event) => {
     const form = event.target?.closest?.('[data-inspection-policy-form]');
@@ -129,12 +144,11 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     const items = data.getAll('item_version').map((value) => { const [item_id, raw] = String(value).split(':'); return { item_id, version: Number(raw) }; });
     const cron = String(data.get('cron') ?? '').trim();
     const value = { name: String(data.get('name') ?? '').trim(), enabled: data.get('enabled') === 'on', target_ids: targets, item_versions: items, labels_text: String(data.get('labels') ?? ''), target_timeout_seconds: Number(data.get('target_timeout_seconds')), max_concurrency: Number(data.get('max_concurrency')), ...(cron ? { schedule: { cron, timezone: String(data.get('timezone') ?? '').trim() } } : {}) };
-    if (!value.name || !targets.length || !items.length) { onToast('请填写策略名称并选择目标与巡检项'); return; }
     submitPolicy(value);
   });
 
-  function open(view = 'overview') { state.view = VIEWS.has(view) ? view : 'overview'; if (state.view !== 'report-detail') state.selectedReport = null; if (state.view !== 'policies') state.editingPolicy = null; reload(); }
-  function setScope(next) { active?.abort(); state.scope = normalizeScope(next); state.view = 'overview'; state.data = null; state.selectedReport = null; state.editingPolicy = null; reload(); }
+  function open(view = 'overview') { const next = VIEWS.has(view) ? view : 'overview'; if (next === 'policies' && state.view !== 'policies') { state.policyCursor = ''; state.policyHistory = []; } state.view = next; if (state.view !== 'report-detail') state.selectedReport = null; if (state.view !== 'policies') state.editingPolicy = null; return reload(); }
+  function setScope(next) { active?.abort(); state.scope = normalizeScope(next); state.view = 'overview'; state.data = null; state.selectedReport = null; state.editingPolicy = null; state.policyCursor = ''; state.policyHistory = []; return reload(); }
   function openRun(id) { state.view = 'runs'; state.data = { selectedRunId: String(id) }; reload(); }
   function openReport(id) { state.view = 'report-detail'; state.selectedReport = String(id); state.data = null; reload(); }
   async function reload() {
@@ -152,8 +166,12 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     try {
       let value;
       if (state.view === 'policies') {
-        const [policies, targets, items] = await Promise.all([api.listPolicies(state.scope, { limit: 100 }, controller.signal), api.listTargets(state.scope, { limit: 100 }, controller.signal), api.listItems(state.scope, { limit: 100 }, controller.signal)]);
-        value = { source: policies.source, policies: policies.items ?? [], targets: targets.items ?? [], items: items.items ?? [], editing_policy: state.editingPolicy };
+        const [policies, targets, items] = await Promise.all([
+          api.listPolicies(state.scope, { limit: INSPECTION_PAGE_LIMIT, ...(state.policyCursor ? { cursor: state.policyCursor } : {}) }, controller.signal),
+          loadInspectionSelectionPages(api.listTargets.bind(api), state.scope, controller.signal, MAX_POLICY_TARGETS),
+          loadInspectionSelectionPages(api.listItems.bind(api), state.scope, controller.signal, MAX_POLICY_ITEMS),
+        ]);
+        value = { source: policies.source, policies: policies.items ?? [], policy_page: policies.page ?? {}, policy_has_previous: state.policyHistory.length > 0, targets: targets.items, items: items.items, editing_policy: state.editingPolicy };
       } else if (state.view === 'runs') {
         const selected = state.data?.selectedRunId;
         value = selected ? await api.getRun(state.scope, selected, controller.signal) : await api.listRuns(state.scope, { limit: 50 }, controller.signal);
@@ -221,11 +239,30 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     }
     const value = { ...input, labels: parsed.labels };
     delete value.labels_text;
+    const targets = Array.isArray(value.target_ids) ? value.target_ids : [];
+    const items = Array.isArray(value.item_versions) ? value.item_versions : [];
+    if (!String(value.name ?? '').trim() || items.length === 0 || (targets.length === 0 && Object.keys(value.labels).length === 0)) {
+      onToast('请填写策略名称、选择巡检项，并配置目标或标签');
+      return Promise.resolve();
+    }
     if (state.editingPolicy) return savePolicy(value);
     return action(() => api.createPolicy(state.scope, value, newKey('policy')), '巡检策略已创建');
   }
+  function pagePolicies(direction) {
+    if (state.view !== 'policies') return Promise.resolve();
+    if (direction === 'next') {
+      const next = state.data?.policy_page?.next_cursor;
+      if (!next || state.data?.policy_page?.has_more !== true) return Promise.resolve();
+      state.policyHistory.push(state.policyCursor);
+      state.policyCursor = String(next);
+    } else if (direction === 'previous') {
+      if (state.policyHistory.length === 0) return Promise.resolve();
+      state.policyCursor = state.policyHistory.pop();
+    } else return Promise.resolve();
+    return reload();
+  }
   function action(callback, message) { return Promise.resolve().then(callback).then(() => { onToast(message); return reload(); }).catch((error) => onToast(inspectionFailureMessage(error, '操作'))); }
-  function download(id) { action(async () => { const descriptor = await api.downloadReport(state.scope, id, newKey('download')); if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer'); }, '报告下载已授权'); }
+  function download(id, format) { action(async () => { const descriptor = await api.downloadReport(state.scope, id, format, newKey(`download-${format}`)); if (descriptor?.url && typeof globalThis.open === 'function') globalThis.open(descriptor.url, '_blank', 'noopener,noreferrer'); }, '报告下载已授权'); }
   function render() {
     const source = state.data?.source;
     const sourceBadge = source ? `<span class="ins-shell-source ${safe(source)}">${safe(sourceLabel(source))}</span>` : '';
@@ -244,11 +281,35 @@ export function createInspectionCenter({ root, api, scope, permissions = {}, onT
     }
     return renderInspectionOverviewMarkup(state.data ?? {});
   }
-  return { open, setScope, reload, editPolicy, savePolicy, submitPolicy, openRun, openReport };
+  return { open, setScope, reload, editPolicy, savePolicy, submitPolicy, pagePolicies, openRun, openReport };
 }
 
+async function loadInspectionSelectionPages(load, scope, signal, cap) {
+  const items = [];
+  const seen = new Set();
+  let cursor = '';
+  let source;
+  while (true) {
+    if (signal?.aborted) throw abortInspectionLoad();
+    const page = await load(scope, { limit: INSPECTION_PAGE_LIMIT, ...(cursor ? { cursor } : {}) }, signal);
+    if (signal?.aborted) throw abortInspectionLoad();
+    if (source === undefined) source = page?.source;
+    else if (page?.source !== source) throw Object.assign(new Error('inspection page source changed'), { kind: 'validation' });
+    items.push(...(Array.isArray(page?.items) ? page.items : []));
+    if (items.length > cap) throw Object.assign(new Error('inspection selection exceeds contract cap'), { kind: 'validation' });
+    if (page?.page?.has_more !== true) return { source, items };
+    const next = String(page?.page?.next_cursor ?? '');
+    if (!next || seen.has(next)) throw Object.assign(new Error('invalid inspection cursor chain'), { kind: 'validation' });
+    seen.add(next);
+    cursor = next;
+  }
+}
+
+function abortInspectionLoad() { return Object.assign(new Error('inspection load aborted'), { name: 'AbortError' }); }
+
 function overviewCard(label, value, note, tone) { return `<article class="ins-overview-card ${tone}"><span>${label}</span><strong>${Number(value)}</strong><p>${note}</p></article>`; }
-function renderFinding(finding) { return `<article class="ins-finding ${safe(finding.level)}"><div><span class="ins-state ${safe(finding.level)}">${safe(FINDING_LABELS[finding.level] ?? '未知')}</span><b>${safe(finding.item_id)} v${Number(finding.item_version)}</b><small>${safe(finding.target_id)}</small></div><p>${safe(finding.summary)}</p><p class="ins-recommendation">${safe(finding.recommendation)}</p></article>`; }
+function renderFinding(finding) { const evidence = finding.evidence_fields && typeof finding.evidence_fields === 'object' ? finding.evidence_fields : parseFindingEvidence(finding.evidence); return `<article class="ins-finding ${safe(finding.level)}"><div><span class="ins-state ${safe(finding.level)}">${safe(FINDING_LABELS[finding.level] ?? '未知')}</span><b>${safe(finding.item_id)} v${Number(finding.item_version)}</b><small>${safe(finding.target_id)}</small></div><dl><div><dt>警告阈值</dt><dd>${safe(finding.warning_threshold ?? '—')}</dd></div><div><dt>严重阈值</dt><dd>${safe(finding.critical_threshold ?? '—')}</dd></div>${Object.entries(evidence).map(([key, value]) => `<div><dt>${safe(key)}</dt><dd>${safe(value)}</dd></div>`).join('')}</dl><p>${safe(finding.summary)}</p><p class="ins-recommendation">${safe(finding.recommendation)}</p></article>`; }
+function parseFindingEvidence(value) { try { const parsed = JSON.parse(String(value ?? '{}')); return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; } }
 function targetLabel(target) { if (target.error_code === 'missing_data') return FINDING_LABELS.missing_data; if (target.error_code === 'unsupported') return FINDING_LABELS.unsupported; return TARGET_LABELS[target.status] ?? '未知'; }
 function sourceLabel(source) { return source === 'demo' ? '演示数据 · 非生产' : source === 'control-plane' ? '控制面服务' : '来源未确认'; }
 function safe(value) { return String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }

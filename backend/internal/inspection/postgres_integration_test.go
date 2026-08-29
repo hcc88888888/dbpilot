@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -162,6 +163,39 @@ func TestSchedulerRestartReclaimsExpiredLeaseWithoutLosingOccurrence(t *testing.
 	require.NotEqual(t, first[0].Claim.Token, second[0].Claim.Token)
 }
 
+func TestSchedulerLongOutageCreatesOnlyLatestOccurrenceAndAdvancesPastNow(t *testing.T) {
+	ctx, database, repository, _ := openInspectionIntegration(t, "coalesce-outage")
+	now := time.Date(2026, 8, 29, 12, 34, 45, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-coalesce", ProjectID: "project-coalesce"}
+	seedInspectionItem(t, ctx, repository, scope, now)
+	stale := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	policy := livePolicyFixture("policy-coalesce", scope, stale, now)
+	require.NoError(t, repository.CreatePolicy(ctx, policy))
+	targets, err := NewConfiguredTargetResolver([]HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "Agent 1", Host: "agent-1.example", Labels: map[string]string{}}})
+	require.NoError(t, err)
+	ids := []string{"run-coalesced", "job-coalesced", "command-coalesced"}
+	service := Service{
+		Repository: repository, Targets: targets, Now: func() time.Time { return now }, ClaimLimit: 1, ClaimLease: time.Minute,
+		NewID: func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil },
+	}
+
+	created, err := service.ScheduleDue(ctx, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	latest := time.Date(2026, 8, 29, 12, 34, 0, 0, time.UTC)
+	next := latest.Add(time.Minute)
+	var runCount int
+	var scheduledFor, nextRunAt time.Time
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*), min(scheduled_for) FROM inspection_runs WHERE tenant_id = $1 AND project_id = $2 AND policy_id = $3", scope.TenantID, scope.ProjectID, policy.ID).Scan(&runCount, &scheduledFor))
+	require.Equal(t, 1, runCount)
+	require.Equal(t, latest, scheduledFor.UTC())
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT next_run_at FROM inspection_policies WHERE tenant_id = $1 AND project_id = $2 AND id = $3", scope.TenantID, scope.ProjectID, policy.ID).Scan(&nextRunAt))
+	require.Equal(t, next, nextRunAt.UTC())
+	created, err = service.ScheduleDue(ctx, now)
+	require.NoError(t, err)
+	require.Zero(t, created)
+}
+
 func TestSchedulerDuplicateOccurrenceReturnsExistingRun(t *testing.T) {
 	// Break caught: replaying a durably created occurrence after uncertain
 	// controller delivery must not create a second Run, Job, or command.
@@ -175,12 +209,13 @@ func TestSchedulerDuplicateOccurrenceReturnsExistingRun(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	policy = claimed[0]
+	coalescePolicyClaim(t, &policy, now)
 	run, targets, value, messages := liveRunFixture("first", scope, now)
 	makeScheduled(&run, &value, policy)
 	first, err := repository.CreateClaimedRunWithJob(ctx, policy, run, targets, value, messages)
 	require.NoError(t, err)
 
-	_, err = database.ExecContext(ctx, "UPDATE inspection_policies SET next_run_at = $1, claim_token = $2, lease_expires_at = $3 WHERE tenant_id = $4 AND project_id = $5 AND id = $6", policy.Claim.Occurrence, "claim-replay", now.Add(time.Minute), scope.TenantID, scope.ProjectID, policy.ID)
+	_, err = database.ExecContext(ctx, "UPDATE inspection_policies SET next_run_at = $1, claim_token = $2, lease_expires_at = $3 WHERE tenant_id = $4 AND project_id = $5 AND id = $6", policy.Claim.ClaimedOccurrence, "claim-replay", now.Add(time.Minute), scope.TenantID, scope.ProjectID, policy.ID)
 	require.NoError(t, err)
 	policy.Claim.Token = "claim-replay"
 	run2, targets2, value2, messages2 := liveRunFixture("second", scope, now.Add(time.Second))
@@ -311,7 +346,7 @@ func TestPostgresIntegrationFullBuiltinCatalogHydratesOneAcceptedHostSnapshot(t 
 	target := TargetRun{
 		TargetID: agentID, AgentID: agentID, CommandID: "command-full-snapshot", Status: TargetEvaluating,
 		DisplayName: "Full snapshot", Host: "db-a", AdvertisedSources: []SourceType{SourceMetric, SourceMetadata, SourceLogSummary},
-		TrustedProcessAllowlist: true, ObservedAt: evidence.SampledAt, Observations: evidence.Observations,
+		ObservedAt: evidence.SampledAt, Observations: evidence.Observations,
 	}
 	snapshot := RunSnapshot{ID: "run-full-snapshot", Scope: scope, CreatedAt: createdAt, Items: items, Targets: []TargetRun{target}}
 	findings, err := (&Evaluator{Evidence: repository, Now: func() time.Time { return deadline }}).EvaluateTarget(ctx, snapshot, target)
@@ -543,6 +578,36 @@ func TestPostgresIntegrationServiceCreatesOneRunTargetJobAndUnsignedOutbox(t *te
 	}, envelope))
 }
 
+func TestPostgresIntegrationRunIdempotencyScopesActorOperationAndRejectsFingerprintConflict(t *testing.T) {
+	ctx, _, repository, _ := openInspectionIntegration(t, "run-idempotency-v2")
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	scope := platformscope.Scope{TenantID: "tenant-idempotency-v2", ProjectID: "project-idempotency-v2"}
+	seedInspectionItem(t, ctx, repository, scope, now)
+	create := func(suffix, actor, operation, key, fingerprint string) (Run, error) {
+		run, targets, value, messages := liveRunFixture(suffix, scope, now)
+		run.IdempotencyActor, run.IdempotencyOperation, run.IdempotencyKey, run.IdempotencyFingerprint = actor, operation, key, fingerprint
+		run.InitiatedBy, value.InitiatedBy = actor, actor
+		value.IdempotencyKey = "inspection-run:" + run.ID
+		return run, repository.CreateRunWithJob(ctx, run, targets, value, messages)
+	}
+	fingerprintA := "sha256:" + strings.Repeat("a", 64)
+	fingerprintB := "sha256:" + strings.Repeat("b", 64)
+	first, err := create("idem-first", "operator-a", "CreateInspectionRun", "same-key", fingerprintA)
+	require.NoError(t, err)
+	second, err := create("idem-actor", "operator-b", "CreateInspectionRun", "same-key", fingerprintA)
+	require.NoError(t, err)
+	third, err := create("idem-operation", "operator-a", "RunInspectionPolicy", "same-key", fingerprintA)
+	require.NoError(t, err)
+	_, err = create("idem-conflict", "operator-a", "CreateInspectionRun", "same-key", fingerprintB)
+	require.ErrorIs(t, err, ErrIdempotencyConflict)
+
+	for _, expected := range []Run{first, second, third} {
+		found, err := repository.GetRunByIdempotency(ctx, scope, RunIdempotency{Actor: expected.IdempotencyActor, Operation: expected.IdempotencyOperation, Key: expected.IdempotencyKey, Fingerprint: expected.IdempotencyFingerprint})
+		require.NoError(t, err)
+		require.Equal(t, expected.ID, found.ID)
+	}
+}
+
 func TestPostgresIntegrationRetryRunPreservesOriginalScheduledSnapshots(t *testing.T) {
 	// Break caught: a retry issued after policy/inventory changes must repeat the
 	// original pinned operation, not silently adopt the latest configuration.
@@ -591,7 +656,7 @@ func TestPostgresIntegrationRetryRunPreservesOriginalScheduledSnapshots(t *testi
 		Repository: repository, Targets: changedResolver, Now: func() time.Time { return now.Add(2 * time.Minute) },
 		NewID: func() (string, error) { id := retryIDs[0]; retryIDs = retryIDs[1:]; return id, nil },
 	}
-	retry, err := retryService.RetryRun(ctx, scope, original.Run.ID, "retry-snapshot-key", "operator-2")
+	retry, err := retryService.RetryRun(ctx, scope, original.Run.ID, "retry-snapshot-key", "operator-2", "request-retry-snapshot", "trace-retry-snapshot", RunIdempotency{}, "")
 	require.NoError(t, err)
 	require.Equal(t, "run-original", retry.RetryOfRunID)
 	require.NotEqual(t, original.Run.JobID, retry.JobID)
@@ -748,7 +813,9 @@ func liveRunFixture(suffix string, scope platformscope.Scope, now time.Time) (Ru
 	run := Run{
 		Scope: scope, ID: "run-" + suffix, JobID: "job-" + suffix, Status: RunQueued, Trigger: RunTriggerManual,
 		ItemSnapshot: []Item{item}, TargetCount: 1, AuditCorrelation: "inspection-run:run-" + suffix,
-		IdempotencyKey: "run-key-" + suffix, InitiatedBy: "integration", RequestID: "request-" + suffix, CreatedAt: now,
+		IdempotencyKey: "run-key-" + suffix, IdempotencyActor: "integration", IdempotencyOperation: "CreateInspectionRun", IdempotencyFingerprint: "sha256:" + strings.Repeat("a", 64),
+		InitiatedBy: "integration", RequestID: "request-" + suffix,
+		TargetTimeout: time.Minute, MaxConcurrency: 1, CreatedAt: now,
 	}
 	commandID := "command-" + suffix
 	targets := []TargetRun{{TargetID: "agent-1", AgentID: "agent-1", CommandID: commandID, DisplayName: "Agent 1", Host: "agent-1.example", Status: TargetPending}}
@@ -757,6 +824,7 @@ func liveRunFixture(suffix string, scope platformscope.Scope, now time.Time) (Ru
 		ID: run.JobID, Type: "inspection.collect", Scope: scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
 		TargetResourceIDs: []string{"agent-1"}, InitiatedBy: "integration", SourceResource: job.ResourceReference{ResourceType: "inspection_run", ResourceID: run.ID},
 		IdempotencyKey: run.IdempotencyKey, Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: now, TimeoutAt: &timeout,
+		TargetTimeout: time.Minute, MaxConcurrency: 1,
 		RequestID: run.RequestID, TraceID: run.TraceID,
 	}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(&agentv1.CommandEnvelope{
@@ -777,6 +845,18 @@ func makeScheduled(run *Run, value *job.Job, policy Policy) {
 	run.PolicySnapshot = clonePolicy(&policy)
 	run.IdempotencyKey = run.OccurrenceKey
 	value.IdempotencyKey = run.OccurrenceKey
+}
+
+func coalescePolicyClaim(t *testing.T, policy *Policy, now time.Time) {
+	t.Helper()
+	require.NotNil(t, policy)
+	require.NotNil(t, policy.Claim)
+	claimed := policy.Claim.Occurrence.UTC()
+	latest, next, err := CoalescedScheduledOccurrences(*policy.Schedule, claimed, now.UTC())
+	require.NoError(t, err)
+	policy.Claim.ClaimedOccurrence = claimed
+	policy.Claim.Occurrence = latest
+	policy.Claim.NextOccurrence = next
 }
 
 func fullBuiltinHostSamples(scope platformscope.Scope, agentID string, sampledAt time.Time) []alert.MetricSample {

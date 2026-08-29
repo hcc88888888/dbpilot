@@ -127,11 +127,13 @@ func equalBytes(first, second []byte) bool {
 }
 
 type LocalBlobStore struct {
-	rootPath      string
-	mu            sync.RWMutex
-	root          *os.Root
-	closed        bool
-	syncDirectory func(*os.Root, string) error
+	rootPath       string
+	mu             sync.RWMutex
+	root           *os.Root
+	closed         bool
+	syncDirectory  func(*os.Root, string) error
+	readyProbeHook func(string) error
+	readyLink      func(*os.Root, string, string) error
 }
 
 func NewLocalBlobStore(root string) *LocalBlobStore { return &LocalBlobStore{rootPath: root} }
@@ -152,8 +154,91 @@ func (store *LocalBlobStore) Ready() error {
 	if err != nil {
 		return ErrInvalid
 	}
+	if err := store.probeWritableRoot(root); err != nil {
+		_ = root.Close()
+		return fmt.Errorf("artifact storage readiness probe: %w", err)
+	}
 	store.root = root
 	return nil
+}
+
+func (store *LocalBlobStore) probeWritableRoot(root *os.Root) error {
+	if root == nil {
+		return ErrInvalid
+	}
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return err
+	}
+	base := ".dbpilot-ready-" + hex.EncodeToString(random)
+	temporary, published := base+".tmp", base+".probe"
+	var file *os.File
+	defer func() {
+		if file != nil {
+			_ = file.Close()
+		}
+		_ = root.Remove(published)
+		_ = root.Remove(temporary)
+	}()
+	if err := store.readyProbeStep("create"); err != nil {
+		return err
+	}
+	created, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	file = created
+	if err := store.readyProbeStep("write"); err != nil {
+		return err
+	}
+	if _, err := file.Write([]byte("dbpilot artifact readiness\n")); err != nil {
+		return err
+	}
+	if err := store.readyProbeStep("file_sync"); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	file = nil
+	if err := store.readyProbeStep("publish"); err != nil {
+		return err
+	}
+	link := root.Link
+	if store.readyLink != nil {
+		link = func(oldName, newName string) error { return store.readyLink(root, oldName, newName) }
+	}
+	linked := link(temporary, published) == nil
+	if !linked {
+		if err := root.Rename(temporary, published); err != nil {
+			return err
+		}
+	}
+	if err := store.readyProbeStep("remove"); err != nil {
+		return err
+	}
+	if err := root.Remove(published); err != nil {
+		return err
+	}
+	if linked {
+		if err := root.Remove(temporary); err != nil {
+			return err
+		}
+	}
+	if err := store.readyProbeStep("directory_sync"); err != nil {
+		return err
+	}
+	return store.syncRetainedDirectoryAt(root, ".")
+}
+
+func (store *LocalBlobStore) readyProbeStep(step string) error {
+	if store.readyProbeHook == nil {
+		return nil
+	}
+	return store.readyProbeHook(step)
 }
 
 func (store *LocalBlobStore) Close() error {
@@ -322,13 +407,17 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 }
 
 func (store *LocalBlobStore) syncRetainedDirectory(name string) error {
+	return store.syncRetainedDirectoryAt(store.root, name)
+}
+
+func (store *LocalBlobStore) syncRetainedDirectoryAt(root *os.Root, name string) error {
 	if store.syncDirectory != nil {
-		return store.syncDirectory(store.root, name)
+		return store.syncDirectory(root, name)
 	}
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	directory, err := store.root.Open(name)
+	directory, err := root.Open(name)
 	if err != nil {
 		return err
 	}

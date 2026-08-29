@@ -659,6 +659,71 @@ func createPreparedIntegrationCommand(t *testing.T, ctx context.Context, reposit
 	return value, message, digest
 }
 
+func TestPostgresIntegrationPrepareSlotsSurviveConcurrentDispatchersRestartAndRelease(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	scope := platformscope.Scope{TenantID: "tenant-prepare-slots", ProjectID: "project-prepare-slots"}
+	value, first := integrationPersistenceFixture("prepare-slot-a", scope, now)
+	value.Type = "inspection.collect"
+	value.TargetResourceIDs = []string{"target-prepare-slot-a", "target-prepare-slot-b"}
+	value.Progress = Progress{TotalTargets: 2}
+	value.MaxConcurrency = 1
+	value.TargetTimeout = 30 * time.Second
+	batchDeadline := now.Add(time.Minute)
+	value.TimeoutAt = &batchDeadline
+	first.JobID, first.Scope, first.TargetID = value.ID, scope, value.TargetResourceIDs[0]
+	first.Payload = mustUnsignedCollectPayload(first.TargetID)
+	second := first
+	second.ID = "message-prepare-slot-b"
+	second.TargetID = value.TargetResourceIDs[1]
+	second.Payload = mustUnsignedCollectPayload(second.TargetID)
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{first, second}))
+	claimed, err := repository.ClaimOutbox(ctx, 2, now)
+	require.NoError(t, err)
+	require.Len(t, claimed, 2)
+
+	type outcome struct {
+		id       string
+		reserved bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, 2)
+	for _, message := range claimed {
+		message := message
+		go func() {
+			<-start
+			reserved, reserveErr := NewPostgresRepository(database).ReservePrepareSlot(ctx, message.Scope, message.ID, now)
+			results <- outcome{id: message.ID, reserved: reserved, err: reserveErr}
+		}()
+	}
+	close(start)
+	firstResult, secondResult := <-results, <-results
+	require.NoError(t, firstResult.err)
+	require.NoError(t, secondResult.err)
+	reserved := []outcome{firstResult, secondResult}
+	if !reserved[0].reserved {
+		reserved[0], reserved[1] = reserved[1], reserved[0]
+	}
+	require.True(t, reserved[0].reserved)
+	require.False(t, reserved[1].reserved)
+	var active int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM command_outbox WHERE job_id = $1 AND command_phase IN ('preparing','prepared','start_authorized','running','cancelling')", value.ID).Scan(&active))
+	require.Equal(t, 1, active)
+
+	restarted := NewPostgresRepository(database)
+	resumed, err := restarted.ReservePrepareSlot(ctx, scope, reserved[0].id, now.Add(time.Second))
+	require.NoError(t, err)
+	require.True(t, resumed, "the already reserved command must resume after dispatcher restart")
+	blocked, err := restarted.ReservePrepareSlot(ctx, scope, reserved[1].id, now.Add(time.Second))
+	require.NoError(t, err)
+	require.False(t, blocked)
+	require.NoError(t, restarted.MarkCommandTerminal(ctx, scope, reserved[0].id, CommandSucceeded, now.Add(2*time.Second)))
+	released, err := restarted.ReservePrepareSlot(ctx, scope, reserved[1].id, now.Add(3*time.Second))
+	require.NoError(t, err)
+	require.True(t, released)
+}
+
 func openTwoPhaseIntegrationRepository(t *testing.T) (context.Context, *sql.DB, *PostgresRepository) {
 	t.Helper()
 	if os.Getenv("DBPILOT_JOB_POSTGRES_INTEGRATION") != "1" {

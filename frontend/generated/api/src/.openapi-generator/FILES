@@ -32,8 +32,13 @@ models/InspectionPolicy.ts
 models/InspectionPolicyItem.ts
 models/InspectionPolicyPage.ts
 models/InspectionReport.ts
+models/InspectionReportCommandReference.ts
+models/InspectionReportDownloadRequest.ts
+models/InspectionReportFormat.ts
 models/InspectionReportPage.ts
+models/InspectionReportReferences.ts
 models/InspectionReportStatus.ts
+models/InspectionReportTarget.ts
 models/InspectionRun.ts
 models/InspectionRunPage.ts
 models/InspectionRunStatus.ts

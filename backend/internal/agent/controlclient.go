@@ -83,12 +83,23 @@ func (r *ExecutorRegistry) RegisterProcess(processID string, executor CommandExe
 func (r *ExecutorRegistry) Capabilities() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	capabilities := make([]string, 0, len(r.executors))
-	for kind := range r.executors {
-		capabilities = append(capabilities, string(kind))
+	set := make(map[string]struct{}, len(r.executors)+2)
+	for kind, executor := range r.executors {
+		set[string(kind)] = struct{}{}
+		if provider, ok := executor.(interface{ AdditionalCapabilities() []string }); ok {
+			for _, capability := range provider.AdditionalCapabilities() {
+				if strings.TrimSpace(capability) != "" {
+					set[capability] = struct{}{}
+				}
+			}
+		}
 	}
 	if len(r.processExecutors) > 0 {
-		capabilities = append(capabilities, string(CommandKindExecuteRegisteredProcess))
+		set[string(CommandKindExecuteRegisteredProcess)] = struct{}{}
+	}
+	capabilities := make([]string, 0, len(set))
+	for capability := range set {
+		capabilities = append(capabilities, capability)
 	}
 	sort.Strings(capabilities)
 	return capabilities

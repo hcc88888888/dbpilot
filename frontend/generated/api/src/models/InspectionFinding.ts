@@ -72,6 +72,12 @@ export interface InspectionFinding {
     evidence: string;
     /**
      *
+     * @type {{ [key: string]: string; }}
+     * @memberof InspectionFinding
+     */
+    evidenceFields?: { [key: string]: string; };
+    /**
+     *
      * @type {number}
      * @memberof InspectionFinding
      */
@@ -132,6 +138,7 @@ export function InspectionFindingFromJSONTyped(json: any, ignoreDiscriminator: b
         'level': InspectionFindingLevelFromJSON(json['level']),
         'observedAt': (new Date(json['observed_at'])),
         'evidence': json['evidence'],
+        'evidenceFields': json['evidence_fields'] == null ? undefined : json['evidence_fields'],
         'warningThreshold': json['warning_threshold'] == null ? undefined : json['warning_threshold'],
         'criticalThreshold': json['critical_threshold'] == null ? undefined : json['critical_threshold'],
         'summary': json['summary'],
@@ -158,6 +165,7 @@ export function InspectionFindingToJSONTyped(value?: InspectionFinding | null, i
         'level': InspectionFindingLevelToJSON(value['level']),
         'observed_at': ((value['observedAt']).toISOString()),
         'evidence': value['evidence'],
+        'evidence_fields': value['evidenceFields'],
         'warning_threshold': value['warningThreshold'],
         'critical_threshold': value['criticalThreshold'],
         'summary': value['summary'],

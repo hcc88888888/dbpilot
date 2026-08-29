@@ -3,17 +3,41 @@ package inspection
 import (
 	"context"
 	"errors"
+	"regexp"
+	"strings"
 	"time"
 
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
 
+var runFingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+func validRunFingerprint(value string) bool { return runFingerprintPattern.MatchString(value) }
+
+func validateRunIdempotency(value RunIdempotency) error {
+	if !canonicalText(value.Actor) || !canonicalText(value.Operation) || !canonicalText(value.Key) || !validRunFingerprint(value.Fingerprint) || strings.ContainsAny(value.Operation, "\r\n") {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validatePersistedRunIdempotency(value Run) error {
+	if value.IdempotencyKey != "" {
+		return validateRunIdempotency(RunIdempotency{Actor: value.IdempotencyActor, Operation: value.IdempotencyOperation, Key: value.IdempotencyKey, Fingerprint: value.IdempotencyFingerprint})
+	}
+	if !canonicalText(value.IdempotencyActor) || !canonicalText(value.IdempotencyOperation) || !validRunFingerprint(value.IdempotencyFingerprint) {
+		return ErrInvalid
+	}
+	return nil
+}
+
 var (
-	ErrInvalid   = errors.New("invalid inspection value")
-	ErrNotFound  = errors.New("inspection value not found")
-	ErrConflict  = errors.New("inspection version conflict")
-	ErrDuplicate = errors.New("inspection request already exists")
+	ErrInvalid             = errors.New("invalid inspection value")
+	ErrNotFound            = errors.New("inspection value not found")
+	ErrConflict            = errors.New("inspection version conflict")
+	ErrDuplicate           = errors.New("inspection request already exists")
+	ErrIdempotencyConflict = errors.New("inspection idempotency fingerprint conflict")
 )
 
 type Schedule struct {
@@ -32,9 +56,11 @@ type TargetSelector struct {
 }
 
 type PolicyClaim struct {
-	Token          string
-	Occurrence     time.Time
-	LeaseExpiresAt time.Time
+	Token             string
+	ClaimedOccurrence time.Time
+	Occurrence        time.Time
+	NextOccurrence    time.Time
+	LeaseExpiresAt    time.Time
 }
 
 type Policy struct {
@@ -63,30 +89,42 @@ const (
 )
 
 type Run struct {
-	Scope                platformscope.Scope `json:"scope"`
-	ID                   string              `json:"id"`
-	PolicyID             string              `json:"policy_id,omitempty"`
-	PolicyVersion        int64               `json:"policy_version,omitempty"`
-	RetryOfRunID         string              `json:"retry_of_run_id,omitempty"`
-	JobID                string              `json:"job_id"`
-	Status               RunStatus           `json:"status"`
-	Trigger              RunTrigger          `json:"trigger"`
-	OccurrenceKey        string              `json:"occurrence_key,omitempty"`
-	ScheduledFor         *time.Time          `json:"scheduled_for,omitempty"`
-	PolicySnapshot       *Policy             `json:"policy_snapshot,omitempty"`
-	ItemSnapshot         []Item              `json:"item_snapshot"`
-	TargetCount          int                 `json:"target_count"`
-	CompletedTargetCount int                 `json:"completed_target_count"`
-	FailedTargetCount    int                 `json:"failed_target_count"`
-	ReportID             string              `json:"report_id,omitempty"`
-	AuditCorrelation     string              `json:"audit_correlation"`
-	IdempotencyKey       string              `json:"-"`
-	InitiatedBy          string              `json:"initiated_by"`
-	RequestID            string              `json:"request_id"`
-	TraceID              string              `json:"trace_id,omitempty"`
-	StartedAt            *time.Time          `json:"started_at,omitempty"`
-	FinishedAt           *time.Time          `json:"finished_at,omitempty"`
-	CreatedAt            time.Time           `json:"created_at"`
+	Scope                  platformscope.Scope `json:"scope"`
+	ID                     string              `json:"id"`
+	PolicyID               string              `json:"policy_id,omitempty"`
+	PolicyVersion          int64               `json:"policy_version,omitempty"`
+	RetryOfRunID           string              `json:"retry_of_run_id,omitempty"`
+	JobID                  string              `json:"job_id"`
+	Status                 RunStatus           `json:"status"`
+	Trigger                RunTrigger          `json:"trigger"`
+	OccurrenceKey          string              `json:"occurrence_key,omitempty"`
+	ScheduledFor           *time.Time          `json:"scheduled_for,omitempty"`
+	PolicySnapshot         *Policy             `json:"policy_snapshot,omitempty"`
+	ItemSnapshot           []Item              `json:"item_snapshot"`
+	TargetCount            int                 `json:"target_count"`
+	CompletedTargetCount   int                 `json:"completed_target_count"`
+	FailedTargetCount      int                 `json:"failed_target_count"`
+	ReportID               string              `json:"report_id,omitempty"`
+	AuditCorrelation       string              `json:"audit_correlation"`
+	IdempotencyKey         string              `json:"-"`
+	IdempotencyActor       string              `json:"-"`
+	IdempotencyOperation   string              `json:"-"`
+	IdempotencyFingerprint string              `json:"-"`
+	InitiatedBy            string              `json:"initiated_by"`
+	RequestID              string              `json:"request_id"`
+	TraceID                string              `json:"trace_id,omitempty"`
+	TargetTimeout          time.Duration       `json:"target_timeout"`
+	MaxConcurrency         int                 `json:"max_concurrency"`
+	StartedAt              *time.Time          `json:"started_at,omitempty"`
+	FinishedAt             *time.Time          `json:"finished_at,omitempty"`
+	CreatedAt              time.Time           `json:"created_at"`
+}
+
+type RunIdempotency struct {
+	Actor       string
+	Operation   string
+	Key         string
+	Fingerprint string
 }
 
 type ReportStatus string
@@ -168,7 +206,7 @@ type Repository interface {
 	CreateRunWithJob(context.Context, Run, []TargetRun, job.Job, []job.OutboxMessage) error
 	CreateClaimedRunWithJob(context.Context, Policy, Run, []TargetRun, job.Job, []job.OutboxMessage) (Run, error)
 	GetRun(context.Context, platformscope.Scope, string) (RunDetail, error)
-	GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (Run, error)
+	GetRunByIdempotency(context.Context, platformscope.Scope, RunIdempotency) (Run, error)
 	ListRuns(context.Context, platformscope.Scope, RunFilter) (RunPage, error)
 	GetReport(context.Context, platformscope.Scope, string) (ReportSnapshot, error)
 	ListReports(context.Context, platformscope.Scope, ReportFilter) (ReportPage, error)

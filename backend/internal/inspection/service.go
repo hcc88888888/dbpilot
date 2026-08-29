@@ -3,6 +3,7 @@ package inspection
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -23,24 +24,27 @@ var (
 )
 
 type CreateRunRequest struct {
-	Scope          platformscope.Scope
-	PolicyID       string
-	PolicyVersion  int64
-	RetryOfRunID   string
-	Selector       TargetSelector
-	Items          []PolicyItem
-	TargetTimeout  time.Duration
-	MaxConcurrency int
-	IdempotencyKey string
-	InitiatedBy    string
-	RequestID      string
-	TraceID        string
-	Trigger        RunTrigger
-	ScheduledFor   *time.Time
-	OccurrenceKey  string
-	PolicySnapshot *Policy
-	pinnedItems    []Item
-	pinnedTargets  []TargetRun
+	RunID                  string
+	Scope                  platformscope.Scope
+	PolicyID               string
+	PolicyVersion          int64
+	RetryOfRunID           string
+	Selector               TargetSelector
+	Items                  []PolicyItem
+	TargetTimeout          time.Duration
+	MaxConcurrency         int
+	IdempotencyKey         string
+	IdempotencyOperation   string
+	IdempotencyFingerprint string
+	InitiatedBy            string
+	RequestID              string
+	TraceID                string
+	Trigger                RunTrigger
+	ScheduledFor           *time.Time
+	OccurrenceKey          string
+	PolicySnapshot         *Policy
+	pinnedItems            []Item
+	pinnedTargets          []TargetRun
 }
 
 type Service struct {
@@ -56,8 +60,11 @@ func (service *Service) CreateRun(ctx context.Context, request CreateRunRequest)
 	return service.createRun(ctx, request, nil)
 }
 
-func (service *Service) RetryRun(ctx context.Context, scope platformscope.Scope, runID, idempotencyKey, actor string) (Run, error) {
-	if service == nil || service.Repository == nil || scope.Validate() != nil || !validID(runID) || !canonicalText(idempotencyKey) || !canonicalText(actor) {
+func (service *Service) RetryRun(ctx context.Context, scope platformscope.Scope, runID, idempotencyKey, actor, requestID, traceID string, correlation RunIdempotency, newRunID string) (Run, error) {
+	if service == nil || service.Repository == nil || service.Targets == nil || scope.Validate() != nil || !validID(runID) || !canonicalText(idempotencyKey) || !canonicalText(actor) || !canonicalText(requestID) || (traceID != "" && !canonicalText(traceID)) {
+		return Run{}, ErrInvalid
+	}
+	if correlation.Actor != "" && correlation.Actor != actor {
 		return Run{}, ErrInvalid
 	}
 	detail, err := service.Repository.GetRun(ctx, scope, runID)
@@ -75,18 +82,40 @@ func (service *Service) RetryRun(ctx context.Context, scope platformscope.Scope,
 	for index, target := range detail.Targets {
 		agentIDs[index] = target.AgentID
 	}
-	timeout := time.Minute
-	maxConcurrency := 1
-	if detail.Run.PolicySnapshot != nil {
-		timeout = detail.Run.PolicySnapshot.TargetTimeout
-		maxConcurrency = detail.Run.PolicySnapshot.MaxConcurrency
+	liveTargets, err := service.Targets.Resolve(ctx, scope, TargetSelector{AgentIDs: agentIDs})
+	if err != nil {
+		return Run{}, err
+	}
+	liveByAgent := make(map[string]HostTarget, len(liveTargets))
+	for _, target := range liveTargets {
+		liveByAgent[target.AgentID] = target
+	}
+	refreshedTargets := cloneTargetRuns(detail.Targets)
+	for index := range refreshedTargets {
+		live, ok := liveByAgent[refreshedTargets[index].AgentID]
+		if !ok {
+			return Run{}, ErrUnknownTarget
+		}
+		refreshedTargets[index].Connectivity = live.Connectivity
+		refreshedTargets[index].Capabilities = append([]string(nil), live.Capabilities...)
+		refreshedTargets[index].AdvertisedSources = append([]SourceType(nil), live.AdvertisedSources...)
+	}
+	timeout := detail.Run.TargetTimeout
+	maxConcurrency := detail.Run.MaxConcurrency
+	if timeout == 0 || maxConcurrency == 0 {
+		timeout, maxConcurrency = time.Minute, 1
+		if detail.Run.PolicySnapshot != nil {
+			timeout = detail.Run.PolicySnapshot.TargetTimeout
+			maxConcurrency = detail.Run.PolicySnapshot.MaxConcurrency
+		}
 	}
 	return service.createRun(ctx, CreateRunRequest{
-		Scope: scope, PolicyID: detail.Run.PolicyID, PolicyVersion: detail.Run.PolicyVersion,
+		RunID: newRunID, Scope: scope, PolicyID: detail.Run.PolicyID, PolicyVersion: detail.Run.PolicyVersion,
 		RetryOfRunID: runID, Selector: TargetSelector{AgentIDs: agentIDs}, Items: items,
 		TargetTimeout: timeout, MaxConcurrency: maxConcurrency, IdempotencyKey: idempotencyKey,
-		InitiatedBy: actor, RequestID: "retry-" + idempotencyKey, Trigger: RunTriggerRetry,
-		PolicySnapshot: clonePolicy(detail.Run.PolicySnapshot), pinnedItems: cloneItems(detail.Run.ItemSnapshot), pinnedTargets: cloneTargetRuns(detail.Targets),
+		IdempotencyOperation: correlation.Operation, IdempotencyFingerprint: correlation.Fingerprint,
+		InitiatedBy: actor, RequestID: requestID, TraceID: traceID, Trigger: RunTriggerRetry,
+		PolicySnapshot: clonePolicy(detail.Run.PolicySnapshot), pinnedItems: cloneItems(detail.Run.ItemSnapshot), pinnedTargets: refreshedTargets,
 	}, nil)
 }
 
@@ -108,12 +137,19 @@ func (service *Service) ScheduleDue(ctx context.Context, now time.Time) (int, er
 	}
 	created := 0
 	for _, policy := range policies {
-		if policy.Claim == nil || policy.NextRunAt == nil || !policy.Claim.Occurrence.Equal(*policy.NextRunAt) {
+		if policy.Claim == nil || policy.Schedule == nil || policy.NextRunAt == nil || !policy.Claim.Occurrence.Equal(*policy.NextRunAt) {
 			return created, ErrConflict
 		}
-		occurrence := policy.Claim.Occurrence.UTC()
+		claimedOccurrence := policy.Claim.Occurrence.UTC()
+		occurrence, nextOccurrence, err := CoalescedScheduledOccurrences(*policy.Schedule, claimedOccurrence, now)
+		if err != nil {
+			return created, err
+		}
+		policy.Claim.ClaimedOccurrence = claimedOccurrence
+		policy.Claim.Occurrence = occurrence
+		policy.Claim.NextOccurrence = nextOccurrence
 		key := scheduledOccurrenceKey(policy, occurrence)
-		_, err := service.createRun(ctx, CreateRunRequest{
+		_, err = service.createRun(ctx, CreateRunRequest{
 			Scope: policy.Scope, PolicyID: policy.ID, PolicyVersion: policy.Version,
 			Selector: policy.Selector, Items: policy.Items, TargetTimeout: policy.TargetTimeout, MaxConcurrency: policy.MaxConcurrency,
 			IdempotencyKey: key, InitiatedBy: "inspection-scheduler", RequestID: key, Trigger: RunTriggerScheduled,
@@ -128,6 +164,7 @@ func (service *Service) ScheduleDue(ctx context.Context, now time.Time) (int, er
 }
 
 func (service *Service) createRun(ctx context.Context, request CreateRunRequest, claimed *Policy) (Run, error) {
+	request = normalizeRunCorrelation(request)
 	if err := service.validateCreateRequest(ctx, request); err != nil {
 		return Run{}, err
 	}
@@ -135,10 +172,16 @@ func (service *Service) createRun(ctx context.Context, request CreateRunRequest,
 	if err != nil {
 		return Run{}, err
 	}
-	now := service.now().UTC()
-	runID, err := service.newID()
-	if err != nil {
+	if _, err := estimateReportBudget(items, targetTemplates); err != nil {
 		return Run{}, err
+	}
+	now := service.now().UTC()
+	runID := request.RunID
+	if runID == "" {
+		runID, err = service.newID()
+		if err != nil {
+			return Run{}, err
+		}
 	}
 	jobID, err := service.newID()
 	if err != nil {
@@ -178,27 +221,45 @@ func (service *Service) createRun(ctx context.Context, request CreateRunRequest,
 		RetryOfRunID: request.RetryOfRunID, JobID: jobID, Status: RunQueued, Trigger: trigger,
 		OccurrenceKey: request.OccurrenceKey, ScheduledFor: utcCopy(request.ScheduledFor), PolicySnapshot: clonePolicy(request.PolicySnapshot),
 		ItemSnapshot: cloneItems(items), TargetCount: len(targetRuns), AuditCorrelation: "inspection-run:" + runID,
-		IdempotencyKey: request.IdempotencyKey, InitiatedBy: request.InitiatedBy, RequestID: request.RequestID, TraceID: request.TraceID, CreatedAt: now,
+		IdempotencyKey: request.IdempotencyKey, IdempotencyActor: request.InitiatedBy, IdempotencyOperation: request.IdempotencyOperation,
+		IdempotencyFingerprint: request.IdempotencyFingerprint, InitiatedBy: request.InitiatedBy, RequestID: request.RequestID, TraceID: request.TraceID,
+		TargetTimeout: request.TargetTimeout, MaxConcurrency: request.MaxConcurrency, CreatedAt: now,
 	}
-	timeoutAt := now.Add(request.TargetTimeout)
+	batchTimeout, err := checkedBatchTimeout(len(targetRuns), request.MaxConcurrency, request.TargetTimeout)
+	if err != nil {
+		return Run{}, err
+	}
+	timeoutAt := now.Add(batchTimeout)
 	value := job.Job{
 		ID: jobID, Type: "inspection.collect", Scope: request.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone,
 		TargetResourceIDs: jobTargets, InitiatedBy: request.InitiatedBy,
 		SourceResource: job.ResourceReference{ResourceType: "inspection_run", ResourceID: runID},
-		IdempotencyKey: request.IdempotencyKey, Version: 1, Progress: job.Progress{TotalTargets: len(jobTargets)}, Artifacts: []job.ArtifactReference{},
-		CreatedAt: now, TimeoutAt: &timeoutAt, RequestID: request.RequestID, TraceID: request.TraceID,
+		IdempotencyKey: "inspection-run:" + runID, Version: 1, Progress: job.Progress{TotalTargets: len(jobTargets)}, Artifacts: []job.ArtifactReference{},
+		CreatedAt: now, TimeoutAt: &timeoutAt, MaxConcurrency: request.MaxConcurrency, TargetTimeout: request.TargetTimeout,
+		RequestID: request.RequestID, TraceID: request.TraceID,
 	}
 	if claimed != nil {
 		return service.Repository.CreateClaimedRunWithJob(ctx, *claimed, run, targetRuns, value, messages)
 	}
 	err = service.Repository.CreateRunWithJob(ctx, run, targetRuns, value, messages)
 	if errors.Is(err, ErrDuplicate) {
-		return service.Repository.GetRunByIdempotencyKey(ctx, request.Scope, request.IdempotencyKey)
+		return service.Repository.GetRunByIdempotency(ctx, request.Scope, RunIdempotency{Actor: request.InitiatedBy, Operation: request.IdempotencyOperation, Key: request.IdempotencyKey, Fingerprint: request.IdempotencyFingerprint})
 	}
 	if err != nil {
 		return Run{}, err
 	}
 	return run, nil
+}
+
+func checkedBatchTimeout(targets, maxConcurrency int, targetTimeout time.Duration) (time.Duration, error) {
+	if targets < 1 || maxConcurrency < 1 || targetTimeout < time.Second {
+		return 0, ErrInvalid
+	}
+	waves := (targets + maxConcurrency - 1) / maxConcurrency
+	if waves < 1 || time.Duration(waves) > time.Duration(1<<63-1)/targetTimeout {
+		return 0, ErrInvalid
+	}
+	return time.Duration(waves) * targetTimeout, nil
 }
 
 func (service *Service) snapshotRunInputs(ctx context.Context, request CreateRunRequest) ([]Item, []TargetRun, error) {
@@ -232,15 +293,15 @@ func (service *Service) snapshotRunInputs(ctx context.Context, request CreateRun
 	for index, target := range targets {
 		templates[index] = TargetRun{
 			TargetID: target.AgentID, AgentID: target.AgentID,
-			DisplayName: target.DisplayName, Host: target.Host, Labels: cloneLabels(target.Labels), Status: TargetPending,
-			AdvertisedSources: append([]SourceType(nil), target.AdvertisedSources...), Capabilities: append([]string(nil), target.Capabilities...), TrustedProcessAllowlist: target.TrustedProcessAllowlist,
+			DisplayName: target.DisplayName, Host: target.Host, Labels: cloneLabels(target.Labels), Connectivity: target.Connectivity, Status: TargetPending,
+			AdvertisedSources: append([]SourceType(nil), target.AdvertisedSources...), Capabilities: append([]string(nil), target.Capabilities...),
 		}
 	}
 	return items, templates, nil
 }
 
 func (service *Service) validateCreateRequest(ctx context.Context, request CreateRunRequest) error {
-	if service == nil || service.Repository == nil || service.Targets == nil || ctx == nil || request.Scope.Validate() != nil || len(request.Items) < 1 || len(request.Items) > maxSnapshotItems || request.TargetTimeout < time.Second || request.TargetTimeout > time.Hour || request.MaxConcurrency < 1 || request.MaxConcurrency > 1000 || !canonicalText(request.IdempotencyKey) || !canonicalText(request.InitiatedBy) || !canonicalText(request.RequestID) {
+	if service == nil || service.Repository == nil || service.Targets == nil || ctx == nil || request.Scope.Validate() != nil || (request.RunID != "" && !validID(request.RunID)) || len(request.Items) < 1 || len(request.Items) > maxSnapshotItems || request.TargetTimeout < time.Second || request.TargetTimeout > time.Hour || request.MaxConcurrency < 1 || request.MaxConcurrency > 1000 || !canonicalText(request.IdempotencyKey) || !canonicalText(request.IdempotencyOperation) || !validRunFingerprint(request.IdempotencyFingerprint) || !canonicalText(request.InitiatedBy) || !canonicalText(request.RequestID) {
 		return ErrInvalid
 	}
 	if request.Trigger == RunTriggerRetry {
@@ -260,6 +321,26 @@ func (service *Service) validateCreateRequest(ctx context.Context, request Creat
 		return ErrInvalid
 	}
 	return nil
+}
+
+func normalizeRunCorrelation(request CreateRunRequest) CreateRunRequest {
+	if request.IdempotencyOperation == "" {
+		switch {
+		case request.Trigger == RunTriggerRetry:
+			request.IdempotencyOperation = "RetryInspectionRun"
+		case request.Trigger == RunTriggerScheduled:
+			request.IdempotencyOperation = "ScheduleInspectionPolicy"
+		case request.PolicyID != "":
+			request.IdempotencyOperation = "RunInspectionPolicy"
+		default:
+			request.IdempotencyOperation = "CreateInspectionRun"
+		}
+	}
+	if request.IdempotencyFingerprint == "" {
+		digest := sha256.Sum256([]byte(request.Scope.Key() + "\x00" + request.InitiatedBy + "\x00" + request.IdempotencyOperation + "\x00" + request.IdempotencyKey))
+		request.IdempotencyFingerprint = "sha256:" + hex.EncodeToString(digest[:])
+	}
+	return request
 }
 
 func (service *Service) snapshotItems(ctx context.Context, scope platformscope.Scope, requested []PolicyItem) ([]Item, error) {
@@ -298,20 +379,58 @@ func (service *Service) snapshotItems(ctx context.Context, scope platformscope.S
 }
 
 func NextScheduledOccurrence(schedule Schedule, after time.Time) (time.Time, error) {
-	zone := strings.TrimSpace(schedule.Timezone)
-	if len(strings.Fields(schedule.Cron)) != 5 || zone == "" || strings.EqualFold(zone, "Local") || after.IsZero() {
+	parsed, location, err := parseSchedule(schedule)
+	if err != nil || after.IsZero() {
 		return time.Time{}, ErrInvalidSchedule
+	}
+	return parsed.Next(after.In(location)).UTC(), nil
+}
+
+func CoalescedScheduledOccurrences(schedule Schedule, claimed, now time.Time) (time.Time, time.Time, error) {
+	if !isUTC(claimed) || !isUTC(now) || claimed.After(now) {
+		return time.Time{}, time.Time{}, ErrInvalidSchedule
+	}
+	parsed, location, err := parseSchedule(schedule)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if candidate := parsed.Next(claimed.Add(-time.Minute).In(location)).UTC(); !candidate.Equal(claimed) {
+		return time.Time{}, time.Time{}, ErrInvalidSchedule
+	}
+	latest := claimed.UTC()
+	low, high := claimed.Unix()-1, now.Unix()
+	for high-low > 1 {
+		middle := low + (high-low)/2
+		candidate := parsed.Next(time.Unix(middle, 0).In(location)).UTC()
+		if candidate.After(now) {
+			high = middle
+			continue
+		}
+		latest = candidate
+		low = middle
+	}
+	next := parsed.Next(now.In(location)).UTC()
+	if latest.Before(claimed) || latest.After(now) || !next.After(now) {
+		return time.Time{}, time.Time{}, ErrInvalidSchedule
+	}
+	return latest, next, nil
+}
+
+func parseSchedule(schedule Schedule) (cron.Schedule, *time.Location, error) {
+	zone := strings.TrimSpace(schedule.Timezone)
+	if len(strings.Fields(schedule.Cron)) != 5 || zone == "" || strings.EqualFold(zone, "Local") {
+		return nil, nil, ErrInvalidSchedule
 	}
 	location, err := time.LoadLocation(zone)
 	if err != nil {
-		return time.Time{}, ErrInvalidSchedule
+		return nil, nil, ErrInvalidSchedule
 	}
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	parsed, err := parser.Parse(schedule.Cron)
 	if err != nil {
-		return time.Time{}, ErrInvalidSchedule
+		return nil, nil, ErrInvalidSchedule
 	}
-	return parsed.Next(after.In(location)).UTC(), nil
+	return parsed, location, nil
 }
 
 func scheduledOccurrenceKey(policy Policy, occurrence time.Time) string {

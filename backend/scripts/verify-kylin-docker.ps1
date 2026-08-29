@@ -96,6 +96,7 @@ $fixtureSource = Join-Path $temporaryRoot 'main.go'
 $protocolProbeSource = Join-Path $temporaryRoot 'protocol-probe.go'
 $probeGatewaySource = Join-Path $temporaryRoot 'probe-gateway.go'
 $spoolProbeSource = Join-Path $temporaryRoot 'spool-probe.go'
+$artifactProbeSource = Join-Path $temporaryRoot 'artifact-probe.go'
 $container = $null
 $containerName = New-DBPilotOwnedContainerName -Prefix 'dbpilot-kylin-smoke'
 $anonymousVolumes = @()
@@ -246,6 +247,31 @@ func main() {
 }
 '@
 	[System.IO.File]::WriteAllText($spoolProbeSource, $spoolProbe, [Text.UTF8Encoding]::new($false))
+	$artifactProbe = @'
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"dbpilot.local/platform/internal/artifact"
+)
+
+func main() {
+	if len(os.Args) != 2 { panic("artifact root argument is required") }
+	store := artifact.NewLocalBlobStore(os.Args[1])
+	if err := store.Ready(); err != nil { panic(err) }
+	entries, err := os.ReadDir(os.Args[1]); if err != nil { panic(err) }
+	for _, entry := range entries { if strings.HasPrefix(entry.Name(), ".dbpilot-ready-") { panic("readiness probe file leaked") } }
+	if err := store.Close(); err != nil { panic(err) }
+	readOnly := artifact.NewLocalBlobStore("/proc")
+	if err := readOnly.Ready(); err == nil { _ = readOnly.Close(); panic("read-only artifact root was accepted") }
+	_ = readOnly.Close()
+	fmt.Println("Kylin artifact readiness evidence: writable_probe=true cleanup=true read_only_rejected=true")
+}
+'@
+	[System.IO.File]::WriteAllText($artifactProbeSource, $artifactProbe, [Text.UTF8Encoding]::new($false))
 	$probeGateway = @'
 package main
 
@@ -291,6 +317,8 @@ func contains(values []string, want string) bool {
 
 func (probe *controlProbe) execute(stream grpc.BidiStreamingServer[agentv1.AgentMessage, agentv1.ServerMessage], id string, kinds []string, requireJMX bool) error {
 	now := time.Now().UTC()
+	expectedSummary := "dependency telemetry collection completed"
+	if contains(kinds, "host") { expectedSummary = "host telemetry collection completed" }
 	initialJMXCalls := probe.jmxCalls.Load()
 	envelope := &agentv1.CommandEnvelope{
 		CommandId:id, JobId:"kylin-protocol-job", AgentId:"kylin-smoke-agent", Nonce:[]byte("kylin-protocol-nonce-"+id), LeaseSeconds:30,
@@ -301,27 +329,31 @@ func (probe *controlProbe) execute(stream grpc.BidiStreamingServer[agentv1.Agent
 	encodedEnvelope, err := proto.MarshalOptions{Deterministic:true}.Marshal(envelope); if err != nil { return err }
 	envelopeDigest := sha256.Sum256(encodedEnvelope)
 	if err := stream.Send(&agentv1.ServerMessage{MessageId:id, SentAt:timestamppb.New(now), Message:&agentv1.ServerMessage_Command{Command:envelope}}); err != nil { return err }
+	fmt.Printf("Kylin command stage: id=%s kinds=%v prepare_sent=true\n", id, kinds)
 	for {
 		message, receiveErr := stream.Recv(); if receiveErr != nil { return receiveErr }
 		prepared := message.GetCommandPrepared()
 		if prepared == nil { continue }
 		if prepared.GetCommandId() != id || !bytes.Equal(prepared.GetEnvelopeDigest(), envelopeDigest[:]) { return status.Error(codes.FailedPrecondition, "Prepared digest mismatch") }
+		fmt.Printf("Kylin command stage: id=%s prepared=true\n", id)
 		break
 	}
 	token := make([]byte, sha256.Size); if _, err := rand.Read(token); err != nil { return err }
 	start := &agentv1.CommandStart{CommandId:id, ExecutionToken:token, LeaseRevision:1, LeaseSeconds:30, StartDeadline:timestamppb.New(time.Now().UTC().Add(20*time.Second))}
 	if err := stream.Send(&agentv1.ServerMessage{MessageId:"start-"+id, Message:&agentv1.ServerMessage_CommandStart{CommandStart:start}}); err != nil { return err }
+	fmt.Printf("Kylin command stage: id=%s start_sent=true\n", id)
 	var resultDigest [sha256.Size]byte
 	for {
 		message, receiveErr := stream.Recv(); if receiveErr != nil { return receiveErr }
 		result := message.GetCommandResult()
 		if result == nil { continue }
-		if result.GetCommandId() != id || result.GetState() != agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED || result.GetSummary() != "dependency telemetry collection completed" || len(result.GetArtifacts()) != 0 || !bytes.Equal(result.GetExecutionToken(), token) || result.GetLeaseRevision() != 1 {
+		if result.GetCommandId() != id || result.GetState() != agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED || result.GetSummary() != expectedSummary || len(result.GetArtifacts()) != 0 || !bytes.Equal(result.GetExecutionToken(), token) || result.GetLeaseRevision() != 1 {
 			return status.Error(codes.FailedPrecondition, "CollectNow result is invalid")
 		}
 		if requireJMX && probe.jmxCalls.Load() <= initialJMXCalls { return status.Error(codes.FailedPrecondition, "dependency CollectNow did not reach the JMX fixture") }
 		encodedResult, marshalErr := proto.MarshalOptions{Deterministic:true}.Marshal(result); if marshalErr != nil { return marshalErr }
 		resultDigest = sha256.Sum256(encodedResult)
+		fmt.Printf("Kylin command stage: id=%s result=true summary=%q\n", id, result.GetSummary())
 		break
 	}
 	ack := &agentv1.CommandResultAcknowledgement{CommandId:id, Persisted:true, ReasonCode:"PERSISTED", ResultDigest:resultDigest[:]}
@@ -331,9 +363,10 @@ func (probe *controlProbe) execute(stream grpc.BidiStreamingServer[agentv1.Agent
 func (probe *controlProbe) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, agentv1.ServerMessage]) error {
 	first, err := stream.Recv(); if err != nil { return err }
 	hello := first.GetHello()
-	if hello == nil || hello.GetAgentId() != "kylin-smoke-agent" || hello.GetProtocolVersion() != agentcontrol.ProtocolVersion || !contains(hello.GetCapabilities(), "collect_now") {
-		return status.Error(codes.FailedPrecondition, "production Agent did not advertise collect_now")
+	if hello == nil || hello.GetAgentId() != "kylin-smoke-agent" || hello.GetProtocolVersion() != agentcontrol.ProtocolVersion || !contains(hello.GetCapabilities(), "collect_now") || !contains(hello.GetCapabilities(), "collect_now.host.v1") || !contains(hello.GetCapabilities(), "collect_now.dependencies.v1") {
+		return status.Error(codes.FailedPrecondition, "production Agent did not advertise generic and versioned CollectNow capabilities")
 	}
+	fmt.Printf("Kylin hello evidence: capabilities=%v\n", hello.GetCapabilities())
 	initialDeadline := time.Now().Add(5*time.Second)
 	for probe.jmxCalls.Load() == 0 {
 		if time.Now().After(initialDeadline) { return status.Error(codes.FailedPrecondition, "periodic DependencyCollector did not reach the JMX fixture") }
@@ -462,6 +495,7 @@ artifact:
 	$protocolProbeBinary = Join-Path $binaryDirectory "dbpilot-protocol-smoke-linux-$Architecture"
 	$probeGatewayBinary = Join-Path $binaryDirectory "dbpilot-probe-gateway-linux-$Architecture"
 	$spoolProbeBinary = Join-Path $binaryDirectory "dbpilot-spool-probe-linux-$Architecture"
+	$artifactProbeBinary = Join-Path $binaryDirectory "dbpilot-artifact-probe-linux-$Architecture"
 	$hadCGOEnabled = Test-Path Env:CGO_ENABLED
 	$previousCGOEnabled = $env:CGO_ENABLED
 	$hadGOOS = Test-Path Env:GOOS
@@ -477,7 +511,8 @@ artifact:
 			foreach ($helper in @(
 				@{ Source = $protocolProbeSource; Output = $protocolProbeBinary; Name = 'protocol journal probe' },
 				@{ Source = $probeGatewaySource; Output = $probeGatewayBinary; Name = 'AgentControl probe gateway' },
-				@{ Source = $spoolProbeSource; Output = $spoolProbeBinary; Name = 'host metric spool probe' }
+				@{ Source = $spoolProbeSource; Output = $spoolProbeBinary; Name = 'host metric spool probe' },
+				@{ Source = $artifactProbeSource; Output = $artifactProbeBinary; Name = 'Artifact readiness probe' }
 			)) {
 				& $GoBinary build -trimpath -o $helper.Output $helper.Source
 				if ($LASTEXITCODE -ne 0) { throw "Kylin $($helper.Name) build failed." }
@@ -511,6 +546,7 @@ artifact:
 	Invoke-Docker @('cp', $protocolProbeBinary, "${container}:/opt/dbpilot-protocol-smoke")
 	Invoke-Docker @('cp', $probeGatewayBinary, "${container}:/opt/dbpilot-probe-gateway")
 	Invoke-Docker @('cp', $spoolProbeBinary, "${container}:/opt/dbpilot-spool-probe")
+	Invoke-Docker @('cp', $artifactProbeBinary, "${container}:/opt/dbpilot-artifact-probe")
     Invoke-Docker @('cp', (Join-Path $fixtureDirectory '.'), "${container}:/runtime")
     Invoke-Docker @('start', $container)
 
@@ -525,7 +561,7 @@ case "${DBPILOT_EXPECTED_ARCH}" in
   amd64) test "$arch" = x86_64 ;;
   arm64) test "$arch" = aarch64 ;;
 esac
-chmod 0755 /opt/dbpilot-agent /opt/dbpilot-controlplane /opt/dbpilot-protocol-smoke /opt/dbpilot-probe-gateway /opt/dbpilot-spool-probe
+    chmod 0755 /opt/dbpilot-agent /opt/dbpilot-controlplane /opt/dbpilot-protocol-smoke /opt/dbpilot-probe-gateway /opt/dbpilot-spool-probe /opt/dbpilot-artifact-probe
 chmod 0600 /runtime/*.pem /runtime/*.json /runtime/*.yaml
 mkdir -p /runtime/data
 chmod 0700 /runtime/data
@@ -583,6 +619,7 @@ if grep -E 'parse configuration|load control-plane command public key|no usable 
 fi
 /opt/dbpilot-protocol-smoke /runtime/data/command-journal.db
 /opt/dbpilot-spool-probe /runtime/data
+/opt/dbpilot-artifact-probe /runtime/data/artifacts
 
 export DBPILOT_COMMAND_SIGNING_PRIVATE_KEY="$(cat /runtime/command-private.pem)"
 export DBPILOT_COMMAND_EXECUTION_TOKEN_KEY='0123456789abcdef0123456789abcdef'
@@ -593,7 +630,7 @@ controlplane_status=$?
 set -e
 test "$controlplane_status" -ne 0
 grep 'database readiness' /runtime/controlplane-startup.log >/dev/null
-printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s journal=opened policy=parsed protocol=two-phase host_snapshot=decoded native_reader=true\n' "${ID}" "${VERSION_ID:-unknown}" "$arch"
+printf 'Kylin validation passed: ID=%s VERSION=%s ARCH=%s journal=opened policy=parsed protocol=two-phase host_snapshot=decoded artifact_readiness=write_fsync_publish_remove native_reader=true\n' "${ID}" "${VERSION_ID:-unknown}" "$arch"
 '@
     $smoke = $smoke.Replace("`r`n", "`n").Replace("`r", "`n")
     $encodedSmoke = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($smoke))

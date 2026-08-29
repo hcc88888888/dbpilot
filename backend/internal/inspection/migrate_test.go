@@ -71,6 +71,18 @@ func TestMigrationAppliesThroughSharedRegistryExactlyOnce(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE inspection_runs.*worker_claim_token.*report_audit_pending.*inspection_runs_worker_claim_idx.*inspection_runs_report_audit_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0005_worker_reports.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0006_run_concurrency.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE inspection_runs.*target_timeout_seconds.*max_concurrency").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0006_run_concurrency.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("inspection/migrations/0007_run_idempotency.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE inspection_runs.*idempotency_actor.*idempotency_operation.*idempotency_fingerprint.*DROP INDEX inspection_runs_idempotency_idx.*inspection_runs_idempotency_v2_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("inspection/migrations/0007_run_idempotency.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -144,6 +156,24 @@ func TestMigrationAddsDurableWorkerAndReportAuditRepairState(t *testing.T) {
 		"inspection_runs_worker_claim_idx", "inspection_runs_report_audit_idx",
 		"OLD.report_audit_event IS NOT NULL", "OLD.report_audit_dedupe_key IS NOT NULL",
 	} {
+		require.Contains(t, schema, required)
+	}
+}
+
+func TestMigrationAddsDurableRunConcurrencyWithoutEditingHistoricalMigrations(t *testing.T) {
+	content, err := migrationFiles.ReadFile("migrations/0006_run_concurrency.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{"target_timeout_seconds", "max_concurrency", "ALTER COLUMN target_timeout_seconds SET NOT NULL", "ALTER COLUMN max_concurrency SET NOT NULL"} {
+		require.Contains(t, schema, required)
+	}
+}
+
+func TestMigrationBackfillsAndScopesStableRunIdempotency(t *testing.T) {
+	content, err := migrationFiles.ReadFile("migrations/0007_run_idempotency.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{"idempotency_actor", "idempotency_operation", "idempotency_fingerprint", "initiated_by", "RetryInspectionRun", "RunInspectionPolicy", "CreateInspectionRun", "inspection_runs_idempotency_v2_idx", "tenant_id, project_id, idempotency_actor, idempotency_operation, idempotency_key"} {
 		require.Contains(t, schema, required)
 	}
 }

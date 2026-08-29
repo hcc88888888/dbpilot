@@ -10,7 +10,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, DownloadDescriptor, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, UpdateInspectionPolicyRequest } from '../models/index.js';
+import type { Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, DownloadDescriptor, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, UpdateInspectionPolicyRequest } from '../models/index.js';
 export interface CancelInspectionRunRequest {
     runId: string;
     idempotencyKey: string;
@@ -35,6 +35,7 @@ export interface CreateInspectionPolicyOperationRequest {
 export interface CreateInspectionReportDownloadRequest {
     reportId: string;
     idempotencyKey: string;
+    inspectionReportDownloadRequest: InspectionReportDownloadRequest;
 }
 export interface CreateInspectionRunOperationRequest {
     idempotencyKey: string;

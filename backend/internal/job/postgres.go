@@ -24,10 +24,10 @@ import (
 const DefaultOutboxLease = 30 * time.Second
 const DefaultCancellationRetry = 30 * time.Second
 
-const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id"
+const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id, max_concurrency, target_timeout_seconds"
 const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at, terminal_audit_pending, terminal_audit_dedupe_key, terminal_audit_action, terminal_audit_result, terminal_audit_detail, terminal_audit_lease_expires_at, terminal_audit_attempts, terminal_audit_recorded_at"
 const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at, o.terminal_audit_pending, o.terminal_audit_dedupe_key, o.terminal_audit_action, o.terminal_audit_result, o.terminal_audit_detail, o.terminal_audit_lease_expires_at, o.terminal_audit_attempts, o.terminal_audit_recorded_at"
-const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)"
+const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)"
 const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
 const insertOutboxSQL = "INSERT INTO command_outbox (id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
@@ -415,6 +415,112 @@ func (repository *PostgresRepository) ClaimOutbox(ctx context.Context, limit int
 		return nil, fmt.Errorf("iterate claimed outbox: %w", err)
 	}
 	return messages, nil
+}
+
+// ReservePrepareSlot serializes prepare admission on the durable Job row. A
+// command already in an active phase owns its prior reservation after restart;
+// a pending command is admitted only when the persisted active-phase count is
+// below the Job's configured maximum.
+func (repository *PostgresRepository) ReservePrepareSlot(ctx context.Context, scope platformscope.Scope, commandID string, at time.Time) (bool, error) {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || at.IsZero() {
+		return false, ErrInvalidCommandPayload
+	}
+	tx, err := repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin prepare slot reservation: %w", err)
+	}
+	rollback := func(cause error) (bool, error) { _ = tx.Rollback(); return false, cause }
+	var jobID string
+	var phase CommandPhase
+	var cancellation sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT job_id, command_phase, cancellation_requested_at
+		FROM command_outbox
+		WHERE tenant_id = $1 AND project_id = $2 AND id = $3
+		FOR UPDATE
+	`, scope.TenantID, scope.ProjectID, commandID).Scan(&jobID, &phase, &cancellation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(ErrNotFound)
+	}
+	if err != nil {
+		return rollback(fmt.Errorf("lock command for prepare slot: %w", err))
+	}
+	if cancellation.Valid {
+		return rollback(ErrConflict)
+	}
+	var maxConcurrency sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT max_concurrency FROM jobs WHERE tenant_id = $1 AND project_id = $2 AND id = $3 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID).Scan(&maxConcurrency)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(ErrNotFound)
+	}
+	if err != nil {
+		return rollback(fmt.Errorf("lock Job for prepare slot: %w", err))
+	}
+	if !maxConcurrency.Valid {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit unrestricted prepare slot: %w", err)
+		}
+		return true, nil
+	}
+	if maxConcurrency.Int64 < 1 || maxConcurrency.Int64 > 1000 {
+		return rollback(ErrInvalidTransition)
+	}
+	if activePreparePhase(phase) {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit resumed prepare slot: %w", err)
+		}
+		return true, nil
+	}
+	if phase != "" && phase != CommandPhasePending {
+		return rollback(ErrConflict)
+	}
+	var active int
+	err = tx.QueryRowContext(ctx, `
+		SELECT count(*) FROM command_outbox
+		WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3
+			AND command_phase IN ('preparing', 'prepared', 'start_authorized', 'running', 'cancelling')
+	`, scope.TenantID, scope.ProjectID, jobID).Scan(&active)
+	if err != nil {
+		return rollback(fmt.Errorf("count active prepare slots: %w", err))
+	}
+	if int64(active) >= maxConcurrency.Int64 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE command_outbox SET lease_expires_at = NULL, available_at = GREATEST(available_at, $1)
+			WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND command_phase = 'pending'
+		`, at.UTC().Add(time.Second), scope.TenantID, scope.ProjectID, commandID); err != nil {
+			return rollback(fmt.Errorf("defer full prepare slot: %w", err))
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit full prepare slot deferral: %w", err)
+		}
+		return false, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE command_outbox SET command_phase = 'preparing'
+		WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND command_phase = 'pending' AND cancellation_requested_at IS NULL
+	`, scope.TenantID, scope.ProjectID, commandID)
+	if err != nil {
+		return rollback(fmt.Errorf("reserve prepare slot: %w", err))
+	}
+	if !exactlyOneAffected(result) {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit prepare slot reservation: %w", err)
+	}
+	return true, nil
+}
+
+func activePreparePhase(phase CommandPhase) bool {
+	return phase == CommandPhasePreparing || phase == CommandPhasePrepared || phase == CommandPhaseStartAuthorized || phase == CommandPhaseRunning || phase == CommandPhaseCancelling
+}
+
+func exactlyOneAffected(result sql.Result) bool {
+	if result == nil {
+		return false
+	}
+	rows, err := result.RowsAffected()
+	return err == nil && rows == 1
 }
 
 func (repository *PostgresRepository) MarkOutboxPublished(ctx context.Context, scope platformscope.Scope, id string, at time.Time) error {
@@ -1289,12 +1395,13 @@ func scanJob(row rowScanner) (Job, error) {
 	var value Job
 	var artifacts []byte
 	var dispatched, started, finished, timeout, cancelRequested sql.NullTime
+	var maxConcurrency, targetTimeoutSeconds sql.NullInt64
 	err := row.Scan(
 		&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.Type, &value.Status, &value.Outcome, &value.InstanceID,
 		&value.InitiatedBy, &value.SourceResource.ResourceType, &value.SourceResource.ResourceID, &value.IdempotencyKey, &value.Version,
 		&value.Progress.TotalTargets, &value.Progress.CompletedTargets, &value.Progress.FailedTargets, &value.Progress.SkippedTargets,
 		&value.ErrorSummary, &value.ResultSummary, &artifacts, &value.CreatedAt, &dispatched, &started, &finished, &timeout,
-		&value.CancelRequestedBy, &cancelRequested, &value.RequestID, &value.TraceID,
+		&value.CancelRequestedBy, &cancelRequested, &value.RequestID, &value.TraceID, &maxConcurrency, &targetTimeoutSeconds,
 	)
 	if err != nil {
 		return Job{}, err
@@ -1307,7 +1414,17 @@ func scanJob(row rowScanner) (Job, error) {
 	value.FinishedAt = nullTimePointer(finished)
 	value.TimeoutAt = nullTimePointer(timeout)
 	value.CancelRequestedAt = nullTimePointer(cancelRequested)
-	return normalizeJobUTC(value), nil
+	if maxConcurrency.Valid {
+		value.MaxConcurrency = int(maxConcurrency.Int64)
+	}
+	if targetTimeoutSeconds.Valid {
+		value.TargetTimeout = time.Duration(targetTimeoutSeconds.Int64) * time.Second
+	}
+	value = normalizeJobUTC(value)
+	if err := validateExecutionLimits(value); err != nil {
+		return Job{}, fmt.Errorf("validate persisted job execution limits: %w", err)
+	}
+	return value, nil
 }
 
 func scanOutbox(row rowScanner) (OutboxMessage, error) {
@@ -1450,7 +1567,15 @@ func jobInsertArgs(value Job, artifacts []byte) []any {
 		value.InitiatedBy, value.SourceResource.ResourceType, value.SourceResource.ResourceID, value.IdempotencyKey, value.Version,
 		value.Progress.TotalTargets, value.Progress.CompletedTargets, value.Progress.FailedTargets, value.Progress.SkippedTargets,
 		value.ErrorSummary, value.ResultSummary, artifacts, value.CreatedAt, nullableTime(value.DispatchedAt), nullableTime(value.StartedAt), nullableTime(value.FinishedAt), nullableTime(value.TimeoutAt), value.CancelRequestedBy, nullableTime(value.CancelRequestedAt), value.RequestID, value.TraceID,
+		nullablePositiveInt(value.MaxConcurrency), nullablePositiveInt(int(value.TargetTimeout / time.Second)),
 	}
+}
+
+func nullablePositiveInt(value int) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
 }
 
 func targetArgs(scope platformscope.Scope, jobID string, value TargetResult, artifacts []byte) []any {

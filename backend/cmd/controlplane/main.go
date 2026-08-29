@@ -23,6 +23,7 @@ import (
 	"time"
 
 	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agentcontrol"
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/artifact"
@@ -939,7 +940,7 @@ func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.H
 		targets[index].Connectivity = "online"
 		targets[index].Capabilities = append([]string(nil), session.Capabilities...)
 		for _, capability := range session.Capabilities {
-			if capability == "collect_now" {
+			if capability == agent.CapabilityCollectNowHostV1 {
 				targets[index].AdvertisedSources = []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}
 				break
 			}

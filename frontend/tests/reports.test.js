@@ -299,14 +299,14 @@ test('configured report center maps real inspection reports through the generate
   const signal = new AbortController().signal;
   const page = await api.listReports(scope, { limit: 10 }, signal);
   const detail = await api.getReport(scope, 'inspection-report-run-1', signal);
-  const download = await api.downloadReport(scope, 'inspection-report-run-1', 'download-key', signal);
+  const download = await api.downloadReport(scope, 'inspection-report-run-1', 'json', 'download-key', signal);
 
   assert.equal(page.items[0].inspection_artifact, true);
   assert.equal(page.items[0].format, 'html/json');
   assert.equal(detail.inspection_artifact, true);
   assert.equal(download.url, 'https://control.example/download');
   assert.deepEqual(calls.find((call) => call.method === 'list').value, { limit: 10 });
-  assert.deepEqual(calls.find((call) => call.method === 'download').value, { reportId: 'inspection-report-run-1', idempotencyKey: 'download-key' });
+  assert.deepEqual(calls.find((call) => call.method === 'download').value, { reportId: 'inspection-report-run-1', idempotencyKey: 'download-key', inspectionReportDownloadRequest: { format: 'json' } });
   assert.deepEqual(options.at(-1), { idempotencyKey: 'download-key', signal });
 });
 
@@ -316,7 +316,8 @@ test('real inspection report detail removes PDF Word and email actions', () => {
     generated_at: '2026-08-29T08:00:00Z', highlights: ['warning=1'], issues_count: 1,
   }, { manage: true });
   assert.match(markup, /HTML \/ JSON/);
-  assert.match(markup, /data-reports-download/);
+  assert.match(markup, /data-reports-download="inspection-report-run-1" data-reports-format="html"/);
+  assert.match(markup, /data-reports-download="inspection-report-run-1" data-reports-format="json"/);
   assert.doesNotMatch(markup, /PDF|Word|data-reports-email|邮件分发/);
 });
 

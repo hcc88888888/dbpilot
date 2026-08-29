@@ -15,6 +15,7 @@
 - Work only in the isolated `codex/contract-foundation` worktree; do not modify the dirty `main` checkout.
 - Functional correctness is the priority. Fix wrong findings, wrong data, failed core workflows, and incorrect command execution immediately; ledger non-blocking hardening and cleanup for later.
 - Host inspection covers every configured Agent target. SQL/database probes are outside this plan.
+- This MVP ships exactly the 13 version-one items listed in Task 2. Read-only/growth filesystem checks, network connectivity/error checks, critical-port checks, and Agent policy-state checks are queued for the next host-function phase and are not completion claims for this plan.
 - No arbitrary Shell, raw SQL, or user-provided executable expression may reach the Agent.
 - `healthy`, `warning`, `critical`, `unsupported`, and `missing_data` remain distinct; unknown or stale data is never healthy.
 - Immediate and scheduled execution use the same persisted Run/Target/Job path.

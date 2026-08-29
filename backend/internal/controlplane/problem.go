@@ -67,6 +67,8 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 	switch {
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets):
 		status, code, title = http.StatusBadRequest, "invalid_request", "Request validation failed"
+	case errors.Is(err, inspection.ErrReportBudgetExceeded), errors.Is(err, inspection.ErrReportBudgetOverflow):
+		status, code, title = http.StatusUnprocessableEntity, "inspection_report_budget_exceeded", "Inspection run exceeds report limits"
 	case errors.Is(err, ErrUnauthenticated):
 		status, code, title = http.StatusUnauthorized, "unauthenticated", "Authentication is required"
 	case errors.Is(err, ErrForbidden):
@@ -77,7 +79,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusNotFound, "not_found", "Resource was not found"
 	case errors.Is(err, ErrPreconditionFailed):
 		status, code, title = http.StatusPreconditionFailed, "precondition_failed", "Request precondition failed"
-	case errors.Is(err, idempotency.ErrKeyConflict):
+	case errors.Is(err, idempotency.ErrKeyConflict), errors.Is(err, inspection.ErrIdempotencyConflict):
 		status, code, title = http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the request"
 	case errors.Is(err, idempotency.ErrInProgress):
 		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"

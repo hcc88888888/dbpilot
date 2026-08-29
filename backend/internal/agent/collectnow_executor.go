@@ -43,13 +43,43 @@ func (executor *CollectNowExecutor) Execute(ctx context.Context, envelope *agent
 		}
 		return &agentv1.CommandResult{
 			State:   agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED,
-			Summary: "dependency telemetry collection failed", ErrorCode: "COLLECT_NOW_FAILED",
+			Summary: collectNowSummary(request.Kinds, false), ErrorCode: "COLLECT_NOW_FAILED",
 		}, nil
 	}
 	return &agentv1.CommandResult{
 		State:   agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED,
-		Summary: "dependency telemetry collection completed",
+		Summary: collectNowSummary(request.Kinds, true),
 	}, nil
+}
+
+func (executor *CollectNowExecutor) AdditionalCapabilities() []string {
+	if executor == nil {
+		return nil
+	}
+	provider, ok := executor.collector.(interface{ CollectNowCapabilities() []string })
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), provider.CollectNowCapabilities()...)
+}
+
+func collectNowSummary(kinds []string, succeeded bool) string {
+	action := "failed"
+	if succeeded {
+		action = "completed"
+	}
+	host := containsCollectionKind(kinds, CollectionKindHost)
+	dependencies := containsCollectionKind(kinds, CollectionKindDependencies)
+	switch {
+	case host && dependencies:
+		return "host and dependency telemetry collection " + action
+	case host:
+		return "host telemetry collection " + action
+	case dependencies:
+		return "dependency telemetry collection " + action
+	default:
+		return "telemetry collection " + action
+	}
 }
 
 var _ CommandExecutor = (*CollectNowExecutor)(nil)

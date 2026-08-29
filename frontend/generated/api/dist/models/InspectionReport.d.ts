@@ -11,6 +11,8 @@
  */
 import type { InspectionFinding } from './InspectionFinding.js';
 import type { InspectionReportStatus } from './InspectionReportStatus.js';
+import type { InspectionReportTarget } from './InspectionReportTarget.js';
+import type { InspectionReportReferences } from './InspectionReportReferences.js';
 import type { ArtifactReference } from './ArtifactReference.js';
 /**
  *
@@ -55,6 +57,18 @@ export interface InspectionReport {
      * @memberof InspectionReport
      */
     findings?: Array<InspectionFinding>;
+    /**
+     *
+     * @type {Array<InspectionReportTarget>}
+     * @memberof InspectionReport
+     */
+    targets?: Array<InspectionReportTarget>;
+    /**
+     *
+     * @type {InspectionReportReferences}
+     * @memberof InspectionReport
+     */
+    references?: InspectionReportReferences;
     /**
      *
      * @type {Array<ArtifactReference>}

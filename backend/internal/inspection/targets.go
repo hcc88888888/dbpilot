@@ -15,15 +15,14 @@ var (
 )
 
 type HostTarget struct {
-	Scope                   platformscope.Scope `json:"scope"`
-	AgentID                 string              `json:"agent_id"`
-	DisplayName             string              `json:"display_name"`
-	Host                    string              `json:"host"`
-	Labels                  map[string]string   `json:"labels"`
-	Connectivity            string              `json:"connectivity"`
-	Capabilities            []string            `json:"capabilities"`
-	AdvertisedSources       []SourceType        `json:"advertised_sources,omitempty"`
-	TrustedProcessAllowlist bool                `json:"trusted_process_allowlist"`
+	Scope             platformscope.Scope `json:"scope"`
+	AgentID           string              `json:"agent_id"`
+	DisplayName       string              `json:"display_name"`
+	Host              string              `json:"host"`
+	Labels            map[string]string   `json:"labels"`
+	Connectivity      string              `json:"connectivity"`
+	Capabilities      []string            `json:"capabilities"`
+	AdvertisedSources []SourceType        `json:"advertised_sources,omitempty"`
 }
 
 type TargetResolver interface {

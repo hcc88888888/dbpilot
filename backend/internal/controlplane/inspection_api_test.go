@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -37,7 +38,7 @@ func TestInspectionStrictHandlersCoverGeneratedOperationsWithURLScope(t *testing
 		{name: "run policy", method: http.MethodPost, path: "/inspection-policies/policy-1/run", permission: openapi.PermissionRunInspectionPolicy, status: http.StatusAccepted, headers: map[string]string{"Idempotency-Key": "run-policy-1"}},
 		{name: "list reports", method: http.MethodGet, path: "/inspection-reports?cursor=report-cursor&limit=20", permission: openapi.PermissionListInspectionReports, status: http.StatusOK},
 		{name: "get report", method: http.MethodGet, path: "/inspection-reports/report-1", permission: openapi.PermissionGetInspectionReport, status: http.StatusOK},
-		{name: "download report", method: http.MethodPost, path: "/inspection-reports/report-1/download", permission: openapi.PermissionCreateInspectionReportDownload, status: http.StatusOK, headers: map[string]string{"Idempotency-Key": "download-report-1"}},
+		{name: "download report", method: http.MethodPost, path: "/inspection-reports/report-1/download", body: `{"format":"html"}`, permission: openapi.PermissionCreateInspectionReportDownload, status: http.StatusOK, headers: map[string]string{"Idempotency-Key": "download-report-1"}},
 		{name: "list runs", method: http.MethodGet, path: "/inspection-runs?cursor=run-cursor&limit=20", permission: openapi.PermissionListInspectionRuns, status: http.StatusOK},
 		{name: "create run", method: http.MethodPost, path: "/inspection-runs", body: validInspectionRunBody(), permission: openapi.PermissionCreateInspectionRun, status: http.StatusAccepted, headers: map[string]string{"Idempotency-Key": "create-run-1"}},
 		{name: "get run", method: http.MethodGet, path: "/inspection-runs/run-1", permission: openapi.PermissionGetInspectionRun, status: http.StatusOK},
@@ -226,8 +227,115 @@ func TestInspectionCancelCrashRetryUsesImmutableSnapshotCorrelation(t *testing.T
 	require.Equal(t, 1, audits.recordCalls)
 }
 
+func TestInspectionCreateRunCrashReplayAuditsActualRunWithOriginalCorrelation(t *testing.T) {
+	now := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
+	item := inspection.BuiltinHostItems()[0]
+	item.Scope, item.Enabled, item.CreatedAt, item.UpdatedAt = platformTestScope, true, now, now
+	repository := &applicationInspectionRepository{items: map[string]inspection.Item{platformTestScope.Key() + "\x00" + item.ID + "\x001": item}, runsByCorrelation: map[string]inspection.Run{}}
+	targets, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{{Scope: platformTestScope, AgentID: "agent-1", DisplayName: "Agent 1", Host: "agent-1.example", Labels: map[string]string{}, Connectivity: "online", Capabilities: []string{"collect_now.host.v1"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}}})
+	require.NoError(t, err)
+	ids := []string{"job-created-run", "command-created-run"}
+	runs := &inspection.Service{Repository: repository, Targets: targets, Now: func() time.Time { return now }, NewID: func() (string, error) { id := ids[0]; ids = ids[1:]; return id, nil }}
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("crash after Run transaction")
+	application := &inspectionApplicationService{repository: repository, runs: runs, targets: targets, audit: audits, idempotency: idempotency.NewService(store), now: func() time.Time { return now }}
+	services := Services{Inspection: application}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateInspectionRun)
+	request := func(requestID, traceparent string) *http.Request {
+		body := strings.Replace(validInspectionRunBody(), "custom.cpu", item.ID, 1)
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/inspection-runs", strings.NewReader(body))
+		value.Header.Set("Content-Type", "application/json")
+		value.Header.Set("Idempotency-Key", "create-run-crash")
+		value.Header.Set("X-Request-ID", requestID)
+		value.Header.Set("traceparent", traceparent)
+		return value
+	}
+	originalTrace := "11111111111111111111111111111111"
+	first := servePlatformRequest(services, principal, request("request-original-run", "00-"+originalTrace+"-2222222222222222-01"))
+	requireProblem(t, first, http.StatusInternalServerError, "internal_error", "request-original-run")
+	require.Equal(t, 1, repository.runCreates)
+	require.Zero(t, audits.recordCalls)
+
+	store.completeErr = nil
+	retry := servePlatformRequest(services, principal, request("request-retry-run", "00-33333333333333333333333333333333-4444444444444444-01"))
+	require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+	require.Equal(t, 1, repository.runCreates, "crash replay must recover the exact persisted Run")
+	require.Len(t, audits.records, 1)
+	createdID := deterministicInspectionID("inspection-run", platformTestScope, "trusted-user", "CreateInspectionRun", "create-run-crash")
+	require.Equal(t, createdID, audits.records[0].Resource.ID)
+	require.Equal(t, "request-original-run", audits.records[0].RequestID)
+	require.Equal(t, originalTrace, audits.records[0].TraceID)
+	replay := servePlatformRequest(services, principal, request("request-third-run", "00-55555555555555555555555555555555-6666666666666666-01"))
+	require.Equal(t, retry.Body.Bytes(), replay.Body.Bytes())
+	require.Equal(t, 1, audits.recordCalls)
+}
+
+func TestOpenAPIInspectionReportMapsImmutableTargetsEvidenceAndOperationalReferences(t *testing.T) {
+	generated := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	value := inspection.ReportSnapshot{
+		Scope: platformTestScope, ID: "inspection-report-run-1", RunID: "run-1", Status: inspection.ReportCompleted, Summary: "warning=1", GeneratedAt: generated,
+		Artifacts: []job.ArtifactReference{{ArtifactID: "inspection-report-run-1.html", Kind: "inspection-report"}, {ArtifactID: "inspection-report-run-1.json", Kind: "inspection-report"}},
+		Document: &inspection.ReportDocument{
+			ReportID: "inspection-report-run-1", RunID: "run-1", Status: inspection.RunCompleted, Summary: "warning=1", GeneratedAt: generated,
+			Items:      []inspection.ReportItem{{ID: "cpu", Version: 1, Name: "CPU", Category: "host"}},
+			Targets:    []inspection.ReportTarget{{TargetID: "agent-1", DisplayName: "<Primary>", Host: "db.example", Status: inspection.TargetSucceeded, CommandID: "command-1"}},
+			Findings:   []inspection.ReportFinding{{ID: "finding-1", TargetID: "agent-1", ItemID: "cpu", ItemVersion: 1, Level: inspection.LevelWarning, ObservedAt: generated, Evidence: map[string]string{"metric": "system.cpu.utilization", "value": "82"}, Summary: "CPU <high>", Recommendation: "Review"}},
+			References: inspection.ReportReferences{JobID: "job-1", AuditCorrelation: "inspection-run:run-1", Commands: []inspection.ReportCommandReference{{TargetID: "agent-1", CommandID: "command-1"}}},
+		},
+	}
+
+	mapped, err := openAPIInspectionReport(value, platformTestScope, true)
+	require.NoError(t, err)
+	encoded, err := json.Marshal(mapped)
+	require.NoError(t, err)
+	text := string(encoded)
+	for _, expected := range []string{`"targets"`, `"display_name":"\u003cPrimary\u003e"`, `"evidence_fields"`, `"metric":"system.cpu.utilization"`, `"references"`, `"job_id":"job-1"`, `"command_id":"command-1"`, `"audit_correlation":"inspection-run:run-1"`} {
+		require.Contains(t, text, expected)
+	}
+	require.NotContains(t, text, platformTestScope.TenantID)
+}
+
+func TestInspectionArtifactByFormatSelectsExactArtifactAndRejectsUnavailable(t *testing.T) {
+	artifacts := []job.ArtifactReference{{ArtifactID: "inspection-report-run-1.html", Kind: "inspection-report"}, {ArtifactID: "inspection-report-run-1.json", Kind: "inspection-report"}}
+	html, err := inspectionArtifactByFormat(artifacts, "html")
+	require.NoError(t, err)
+	require.Equal(t, "inspection-report-run-1.html", html)
+	jsonID, err := inspectionArtifactByFormat(artifacts, "json")
+	require.NoError(t, err)
+	require.Equal(t, "inspection-report-run-1.json", jsonID)
+	_, err = inspectionArtifactByFormat(artifacts[:1], "json")
+	require.ErrorIs(t, err, artifact.ErrNotFound)
+	_, err = inspectionArtifactByFormat(artifacts, "pdf")
+	require.ErrorIs(t, err, inspection.ErrInvalid)
+}
+
+func TestInspectionApplicationDownloadSelectsRequestedJSONArtifact(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	repository := &applicationInspectionRepository{items: map[string]inspection.Item{}, reportValue: inspection.ReportSnapshot{
+		Scope: platformTestScope, ID: "inspection-report-run-1", RunID: "run-1", Status: inspection.ReportCompleted, Summary: "healthy=1", GeneratedAt: now,
+		Artifacts: []job.ArtifactReference{{ArtifactID: "inspection-report-run-1.html", Kind: "inspection-report"}, {ArtifactID: "inspection-report-run-1.json", Kind: "inspection-report"}},
+	}}
+	artifacts := &recordingArtifactService{downloadValue: artifact.Download{URL: "https://control.example/report.json", ExpiresAt: now.Add(time.Minute)}}
+	application := &inspectionApplicationService{repository: repository, artifacts: artifacts, audit: &recordingAuditService{}, idempotency: idempotency.NewService(newHTTPIdempotencyStore()), now: func() time.Time { return now }}
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/inspection-reports/inspection-report-run-1/download", strings.NewReader(`{"format":"json"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "download-json")
+	response := servePlatformRequest(Services{Inspection: application}, principalWith(platformTestScope, openapi.PermissionCreateInspectionReportDownload), request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Equal(t, "inspection-report-run-1.json", artifacts.downloadID)
+}
+
+func TestInspectionRunBudgetFailureIsClassifiedBeforeSideEffect(t *testing.T) {
+	require.True(t, inspectionWriteFailedBeforeSideEffect(inspection.ErrReportBudgetExceeded))
+	require.True(t, inspectionWriteFailedBeforeSideEffect(inspection.ErrReportBudgetOverflow))
+	require.True(t, inspectionWriteFailedBeforeSideEffect(inspection.ErrIdempotencyConflict))
+}
+
 type inspectionServiceCall struct {
 	operation, actor, key, id string
+	format                    string
 	scope                     platformscope.Scope
 	filter                    inspection.CursorFilter
 }
@@ -285,8 +393,9 @@ func (service *recordingInspectionService) GetReport(_ context.Context, scope pl
 	err := service.record("get-report", scope, "", "", id, inspection.CursorFilter{})
 	return service.report(), err
 }
-func (service *recordingInspectionService) CreateReportDownload(_ context.Context, scope platformscope.Scope, actor, key, id string) (artifact.Download, error) {
+func (service *recordingInspectionService) CreateReportDownload(_ context.Context, scope platformscope.Scope, actor, key, id, format string) (artifact.Download, error) {
 	err := service.record("download-report", scope, actor, key, id, inspection.CursorFilter{})
+	service.calls[len(service.calls)-1].format = format
 	return artifact.Download{URL: "https://control.example/download", ExpiresAt: service.time().Add(time.Minute)}, err
 }
 func (service *recordingInspectionService) ListRuns(_ context.Context, scope platformscope.Scope, filter inspection.RunFilter) (inspection.RunPage, error) {
@@ -330,7 +439,13 @@ func (service *recordingInspectionService) run() inspection.Run {
 	return inspection.Run{Scope: platformTestScope, ID: "run-1", JobID: "job-1", Status: inspection.RunCompleted, Trigger: inspection.RunTriggerManual, ItemSnapshot: []inspection.Item{service.item()}, TargetCount: 1, CompletedTargetCount: 1, ReportID: "report-1", AuditCorrelation: "inspection-run:run-1", InitiatedBy: "trusted-user", RequestID: "request-1", CreatedAt: service.time(), FinishedAt: timePointer(service.time())}
 }
 func (service *recordingInspectionService) report() inspection.ReportSnapshot {
-	return inspection.ReportSnapshot{Scope: platformTestScope, ID: "report-1", RunID: "run-1", Status: inspection.ReportCompleted, Summary: "healthy=1", Artifacts: []job.ArtifactReference{{ArtifactID: "report-1.json", Kind: "inspection-report"}}, GeneratedAt: service.time(), Document: &inspection.ReportDocument{ReportID: "report-1", RunID: "run-1", Status: inspection.RunCompleted, Summary: "healthy=1", GeneratedAt: service.time()}}
+	document := &inspection.ReportDocument{
+		ReportID: "report-1", RunID: "run-1", Status: inspection.RunCompleted, Summary: "healthy=1", GeneratedAt: service.time(),
+		Items:      []inspection.ReportItem{{ID: "custom.cpu", Version: 1, Name: "CPU", Category: "host"}},
+		Targets:    []inspection.ReportTarget{{TargetID: "agent-1", DisplayName: "Agent 1", Host: "agent-1.example", Status: inspection.TargetSucceeded, CommandID: "command-1"}},
+		References: inspection.ReportReferences{JobID: "job-1", AuditCorrelation: "inspection-run:run-1", Commands: []inspection.ReportCommandReference{{TargetID: "agent-1", CommandID: "command-1"}}},
+	}
+	return inspection.ReportSnapshot{Scope: platformTestScope, ID: "report-1", RunID: "run-1", Status: inspection.ReportCompleted, Summary: "healthy=1", Artifacts: []job.ArtifactReference{{ArtifactID: "report-1.json", Kind: "inspection-report"}}, GeneratedAt: service.time(), Document: document}
 }
 
 func validInspectionItemBody() string {
@@ -346,9 +461,12 @@ func validInspectionRunBody() string {
 func timePointer(value time.Time) *time.Time { return &value }
 
 type applicationInspectionRepository struct {
-	items     map[string]inspection.Item
-	creates   int
-	runDetail inspection.RunDetail
+	items             map[string]inspection.Item
+	creates           int
+	runDetail         inspection.RunDetail
+	runsByCorrelation map[string]inspection.Run
+	runCreates        int
+	reportValue       inspection.ReportSnapshot
 }
 
 func (repository *applicationInspectionRepository) CreateItem(_ context.Context, value inspection.Item) error {
@@ -384,7 +502,13 @@ func (*applicationInspectionRepository) UpdatePolicy(context.Context, inspection
 func (*applicationInspectionRepository) ClaimDuePolicies(context.Context, time.Time, int, time.Duration) ([]inspection.Policy, error) {
 	return nil, nil
 }
-func (*applicationInspectionRepository) CreateRunWithJob(context.Context, inspection.Run, []inspection.TargetRun, job.Job, []job.OutboxMessage) error {
+func (repository *applicationInspectionRepository) CreateRunWithJob(_ context.Context, run inspection.Run, targets []inspection.TargetRun, _ job.Job, _ []job.OutboxMessage) error {
+	repository.runCreates++
+	repository.runDetail = inspection.RunDetail{Run: run, Targets: append([]inspection.TargetRun(nil), targets...)}
+	if repository.runsByCorrelation == nil {
+		repository.runsByCorrelation = map[string]inspection.Run{}
+	}
+	repository.runsByCorrelation[run.IdempotencyActor+"\x00"+run.IdempotencyOperation+"\x00"+run.IdempotencyKey] = run
 	return nil
 }
 func (*applicationInspectionRepository) CreateClaimedRunWithJob(context.Context, inspection.Policy, inspection.Run, []inspection.TargetRun, job.Job, []job.OutboxMessage) (inspection.Run, error) {
@@ -396,14 +520,24 @@ func (repository *applicationInspectionRepository) GetRun(_ context.Context, sco
 	}
 	return repository.runDetail, nil
 }
-func (*applicationInspectionRepository) GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (inspection.Run, error) {
-	return inspection.Run{}, inspection.ErrNotFound
+func (repository *applicationInspectionRepository) GetRunByIdempotency(_ context.Context, scope platformscope.Scope, correlation inspection.RunIdempotency) (inspection.Run, error) {
+	value, ok := repository.runsByCorrelation[correlation.Actor+"\x00"+correlation.Operation+"\x00"+correlation.Key]
+	if !ok || value.Scope != scope {
+		return inspection.Run{}, inspection.ErrNotFound
+	}
+	if value.IdempotencyFingerprint != correlation.Fingerprint {
+		return inspection.Run{}, inspection.ErrIdempotencyConflict
+	}
+	return value, nil
 }
 func (*applicationInspectionRepository) ListRuns(context.Context, platformscope.Scope, inspection.RunFilter) (inspection.RunPage, error) {
 	return inspection.RunPage{}, nil
 }
-func (*applicationInspectionRepository) GetReport(context.Context, platformscope.Scope, string) (inspection.ReportSnapshot, error) {
-	return inspection.ReportSnapshot{}, inspection.ErrNotFound
+func (repository *applicationInspectionRepository) GetReport(_ context.Context, scope platformscope.Scope, id string) (inspection.ReportSnapshot, error) {
+	if repository.reportValue.Scope != scope || repository.reportValue.ID != id {
+		return inspection.ReportSnapshot{}, inspection.ErrNotFound
+	}
+	return repository.reportValue, nil
 }
 func (*applicationInspectionRepository) ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error) {
 	return inspection.ReportPage{}, nil

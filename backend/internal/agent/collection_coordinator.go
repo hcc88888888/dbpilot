@@ -11,6 +11,10 @@ import (
 const (
 	CollectionKindDependencies = "dependencies"
 	CollectionKindHost         = "host"
+	CollectionKindHealth       = "health"
+
+	CapabilityCollectNowDependenciesV1 = "collect_now.dependencies.v1"
+	CapabilityCollectNowHostV1         = "collect_now.host.v1"
 )
 
 type CollectionRequest struct {
@@ -76,11 +80,27 @@ func (c *CollectionCoordinator) Available() bool {
 	return c != nil && (!isNilDependencyBoundary(c.Host) || !isNilDependencyBoundary(c.Dependencies))
 }
 
+func (c *CollectionCoordinator) CollectNowCapabilities() []string {
+	if c == nil {
+		return nil
+	}
+	capabilities := make([]string, 0, 2)
+	if !isNilDependencyBoundary(c.Dependencies) {
+		capabilities = append(capabilities, CapabilityCollectNowDependenciesV1)
+	}
+	if !isNilDependencyBoundary(c.Host) {
+		capabilities = append(capabilities, CapabilityCollectNowHostV1)
+	}
+	return capabilities
+}
+
 func normalizeCollectionRequest(request CollectionRequest) (CollectionRequest, error) {
 	kinds := make(map[string]struct{}, len(request.Kinds))
 	for _, raw := range request.Kinds {
 		kind := strings.ToLower(strings.TrimSpace(raw))
 		switch kind {
+		case CollectionKindHealth:
+			kinds[CollectionKindDependencies] = struct{}{}
 		case CollectionKindDependencies, CollectionKindHost:
 			kinds[kind] = struct{}{}
 		default:

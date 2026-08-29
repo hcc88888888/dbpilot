@@ -33,6 +33,19 @@ func TestCollectionCoordinatorSelectsOnlyRequestedCollector(t *testing.T) {
 	}
 }
 
+func TestCollectionCoordinatorKeepsLegacyHealthAliasOnlyForDependencies(t *testing.T) {
+	calls := []string{}
+	withDependencies := &CollectionCoordinator{Dependencies: recordingRequestCollector{name: "dependencies", calls: &calls}}
+	require.NoError(t, withDependencies.Collect(context.Background(), CollectionRequest{Kinds: []string{"health"}}))
+	require.Equal(t, []string{"dependencies"}, calls)
+
+	calls = nil
+	hostOnly := &CollectionCoordinator{Host: recordingRequestCollector{name: "host", calls: &calls}}
+	err := hostOnly.Collect(context.Background(), CollectionRequest{Kinds: []string{"health"}})
+	require.ErrorContains(t, err, "unavailable")
+	require.Empty(t, calls)
+}
+
 func TestCollectionCoordinatorSortsAndDeduplicatesKinds(t *testing.T) {
 	calls := []string{}
 	coordinator := &CollectionCoordinator{

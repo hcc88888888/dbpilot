@@ -61,6 +61,14 @@ export interface InspectionFinding {
     evidence: string;
     /**
      *
+     * @type {{ [key: string]: string; }}
+     * @memberof InspectionFinding
+     */
+    evidenceFields?: {
+        [key: string]: string;
+    };
+    /**
+     *
      * @type {number}
      * @memberof InspectionFinding
      */

@@ -220,6 +220,13 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 	if err != nil {
 		return false, err
 	}
+	reserved, err := lifecycle.dispatchRepository.ReservePrepareSlot(ctx, message.Scope, message.ID, at)
+	if err != nil {
+		return false, err
+	}
+	if !reserved {
+		return false, nil
+	}
 	proposed := append([]byte(nil), message.PreparedEnvelope...)
 	if len(proposed) == 0 {
 		envelope := proto.Clone(unsigned).(*agentv1.CommandEnvelope)

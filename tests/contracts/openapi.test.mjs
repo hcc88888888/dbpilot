@@ -126,6 +126,7 @@ test('inspection operations protect reads and writes with the documented permiss
 test('inspection DTOs bound host data, status vocabularies, and public examples', async () => {
   const document = await bundleContract();
   const schemas = document.components.schemas;
+  const operations = allOperations(document);
 
   assert.deepEqual(resolveComponentSchema(document, schemas.InspectionFinding.properties.level).enum, [
     'healthy', 'warning', 'critical', 'unsupported', 'missing_data',
@@ -141,6 +142,21 @@ test('inspection DTOs bound host data, status vocabularies, and public examples'
   assert.deepEqual(resolveComponentSchema(document, schemas.InspectionMetricRule.properties.aggregation).enum, ['latest', 'avg', 'max', 'min']);
   assert.deepEqual(resolveComponentSchema(document, schemas.InspectionMetricRule.properties.operator).enum, ['gt', 'gte', 'lt', 'lte']);
   assert.equal(schemas.CreateInspectionRunRequest.properties.target_ids.maxItems, 10000);
+  assert.equal(schemas.InspectionRun.properties.findings.maxItems, 10000);
+  assert.equal(schemas.InspectionReport.properties.findings.maxItems, 10000);
+  assert.ok(schemas.InspectionFinding.properties.evidence_fields);
+  assert.ok(schemas.InspectionReport.properties.targets);
+  assert.ok(schemas.InspectionReport.properties.references);
+  assert.deepEqual(schemas.InspectionReportDownloadRequest.required, ['format']);
+  assert.deepEqual(resolveComponentSchema(document, schemas.InspectionReportDownloadRequest.properties.format).enum, ['html', 'json']);
+  const downloadOperation = operations.get('createInspectionReportDownload');
+  assert.equal(downloadOperation.requestBody.required, true);
+  assert.equal(downloadOperation.requestBody.content['application/json'].schema.$ref, '#/components/schemas/InspectionReportDownloadRequest');
+  assert.match(schemas.CreateInspectionRunRequest.description, /10,000 findings/);
+  assert.match(schemas.CreateInspectionRunRequest.description, /1 MiB/);
+  for (const operationId of ['createInspectionRun', 'runInspectionPolicy', 'retryInspectionRun']) {
+    assert.ok(operations.get(operationId).responses['422'], `${operationId} documents cross-field budget rejection`);
+  }
   assert.equal(schemas.InspectionPolicy.properties.item_versions.maxItems, 200);
   assert.deepEqual(schemas.InspectionScopeType.enum, ['host']);
   assert.deepEqual(schemas.InspectionSourceType.enum, ['metric', 'metadata', 'log_summary']);

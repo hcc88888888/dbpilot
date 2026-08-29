@@ -526,6 +526,8 @@
         $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
       '409':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '422':
+        $ref: ../common/errors.yaml#/ProblemResponse
 /inspection-runs:
   get:
     operationId: listInspectionRuns
@@ -594,6 +596,8 @@
       '405':
         $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
       '409':
+        $ref: ../common/errors.yaml#/ProblemResponse
+      '422':
         $ref: ../common/errors.yaml#/ProblemResponse
 /inspection-runs/{run_id}:
   get:
@@ -698,6 +702,8 @@
         $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
       '409':
         $ref: ../common/errors.yaml#/ProblemResponse
+      '422':
+        $ref: ../common/errors.yaml#/ProblemResponse
 /inspection-reports:
   get:
     operationId: listInspectionReports
@@ -780,6 +786,12 @@
         schema:
           type: string
           minLength: 1
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../common/inspection.yaml#/InspectionReportDownloadRequest
     responses:
       '200':
         description: Short-lived authorized report download descriptor; never report bytes.

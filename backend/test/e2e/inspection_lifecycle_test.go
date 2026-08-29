@@ -80,8 +80,8 @@ func TestHostInspectionLifecycle(t *testing.T) {
 	}
 	cpuItem := items[0]
 	targets, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{
-		{Scope: scope, AgentID: "agent-a", DisplayName: "Primary host", Host: "db-a.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, TrustedProcessAllowlist: true},
-		{Scope: scope, AgentID: "agent-b", DisplayName: "Standby host", Host: "db-b.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, TrustedProcessAllowlist: true},
+		{Scope: scope, AgentID: "agent-a", DisplayName: "Primary host", Host: "db-a.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now", "collect_now.host.v1"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}},
+		{Scope: scope, AgentID: "agent-b", DisplayName: "Standby host", Host: "db-b.internal", Labels: map[string]string{"role": "database"}, Connectivity: "online", Capabilities: []string{"collect_now", "collect_now.host.v1"}, AdvertisedSources: []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}},
 	})
 	require.NoError(t, err)
 	var idCounter atomic.Int32

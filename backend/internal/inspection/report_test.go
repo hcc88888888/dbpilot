@@ -46,7 +46,7 @@ func TestRenderHTMLEscapesEveryExternalStringAndOmitsScopeInternals(t *testing.T
 	for _, escaped := range []string{"&lt;script&gt;", "&lt;img", "CPU &lt;utilization&gt;"} {
 		require.Contains(t, text, escaped)
 	}
-	for _, required := range []string{"policy-a", "version 7", "cpu.utilization", "version 3", "job-a", "command-agent-a", "inspection-run:run-a"} {
+	for _, required := range []string{"policy-a", "version 7", "cpu.utilization", "version 3", "job-a", "command-agent-a", "inspection-run:run-a", "Warning threshold", "Critical threshold", "system.disk.utilization", "82"} {
 		require.Contains(t, text, required)
 	}
 	for _, forbidden := range []string{"tenant-a", "project-a", `"scope"`, "raw_log", "connection_string"} {
@@ -75,6 +75,20 @@ func TestRenderersRejectCredentialConnectionAndRawLogMaterial(t *testing.T) {
 			require.ErrorIs(t, htmlErr, ErrUnsafeReport)
 		})
 	}
+}
+
+func TestRenderersAllowHTTPSDocumentationAndLongRecommendationText(t *testing.T) {
+	snapshot := reportRendererFixture()
+	recommendation := "See https://docs.example.test/inspection/filesystems?view=host&lang=en - " + strings.Repeat("review capacity; ", 200)
+	snapshot.Document.Findings[0].Recommendation = recommendation
+
+	jsonReport, jsonErr := RenderJSON(snapshot)
+	htmlReport, htmlErr := RenderHTML(snapshot)
+
+	require.NoError(t, jsonErr)
+	require.NoError(t, htmlErr)
+	require.Contains(t, string(jsonReport), "https://docs.example.test/inspection/filesystems")
+	require.Contains(t, string(htmlReport), "https://docs.example.test/inspection/filesystems")
 }
 
 func TestRenderersBoundReportOutput(t *testing.T) {
@@ -130,7 +144,7 @@ func reportRendererFixture() ReportSnapshot {
 			{TargetID: "agent-a", DisplayName: "Host A", Host: "a.internal", Status: TargetFailed, ErrorCode: "collection_failed", CommandID: "command-agent-a"},
 		},
 		Findings: []ReportFinding{
-			{TargetID: "agent-b", ItemID: "disk.utilization", ItemVersion: 2, Level: LevelWarning, ObservedAt: generated.Add(-time.Minute), Evidence: map[string]string{"metric": "system.disk.utilization", "value": "82"}, Summary: "Disk <warning>", Recommendation: "Review <mount>"},
+			{ID: "finding-disk", TargetID: "agent-b", ItemID: "disk.utilization", ItemVersion: 2, Level: LevelWarning, ObservedAt: generated.Add(-time.Minute), WarningThreshold: floatPointer(80), CriticalThreshold: floatPointer(90), Evidence: map[string]string{"metric": "system.disk.utilization", "value": "82"}, Summary: "Disk <warning>", Recommendation: "Review <mount>"},
 			{TargetID: "agent-b", ItemID: "cpu.utilization", ItemVersion: 3, Level: LevelHealthy, ObservedAt: generated.Add(-time.Minute), Evidence: map[string]string{"metric": "system.cpu.utilization", "value": "12"}},
 		},
 		References: ReportReferences{
@@ -140,6 +154,8 @@ func reportRendererFixture() ReportSnapshot {
 	}
 	return ReportSnapshot{ID: document.ReportID, RunID: document.RunID, PolicyID: document.Policy.ID, Status: ReportCompleted, Document: document, GeneratedAt: generated}
 }
+
+func floatPointer(value float64) *float64 { return &value }
 
 func minInt(first, second int) int {
 	if first < second {

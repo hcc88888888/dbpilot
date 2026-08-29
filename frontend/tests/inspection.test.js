@@ -103,13 +103,13 @@ test('real generated client projects item, run, cancel, retry and report downloa
   await api.createRun(scope, run, 'run-key');
   await api.cancelRun(scope, 'run-1', 'cancel-key');
   await api.retryRun(scope, 'run-1', 'retry-key');
-  await api.downloadReport(scope, 'report-1', 'download-key');
+  await api.downloadReport(scope, 'report-1', 'json', 'download-key');
   assert.deepEqual(seen[0].body, item);
   assert.deepEqual(seen[1].body, run);
   for (const [index, key] of [[2, 'cancel-key'], [3, 'retry-key'], [4, 'download-key']]) assert.equal(seen[index].init.headers['Idempotency-Key'], key);
   assert.equal(seen[2].body, null);
   assert.equal(seen[3].body, null);
-  assert.equal(seen[4].body, null);
+  assert.deepEqual(seen[4].body, { format: 'json' });
 });
 
 test('configured inspection errors never fall back to demo data', async () => {
@@ -227,6 +227,97 @@ test('valid policy labels reach the real generated create boundary exactly', asy
   assert.deepEqual(created.body.item_versions, [{ item_id: 'cpu', version: 1 }]);
 });
 
+test('label-only policy is valid while both explicit targets and labels empty is rejected', async () => {
+  const created = [];
+  const toasts = [];
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({
+    root,
+    api: { async createPolicy(_scope, value) { created.push(value); } },
+    scope: { tenantId: 't', projectId: 'p' }, permissions: { view: true, manage: true }, onToast: (value) => toasts.push(value),
+  });
+
+  await center.submitPolicy({ name: 'Labels', enabled: true, target_ids: [], item_versions: [{ item_id: 'cpu', version: 1 }], labels_text: 'role=database', target_timeout_seconds: 60, max_concurrency: 1 });
+  assert.equal(created.length, 1);
+  assert.deepEqual(created[0].target_ids, []);
+  assert.deepEqual(created[0].labels, { role: 'database' });
+
+  await center.submitPolicy({ name: 'Empty', enabled: true, target_ids: [], item_versions: [{ item_id: 'cpu', version: 1 }], labels_text: '', target_timeout_seconds: 60, max_concurrency: 1 });
+  assert.equal(created.length, 1);
+  assert.equal(toasts.at(-1), '请填写策略名称、选择巡检项，并配置目标或标签');
+});
+
+test('policy selection follows target and item cursors beyond the first 100', async () => {
+  const calls = [];
+  const page = (prefix, start, total, next) => ({
+    source: 'control-plane',
+    items: Array.from({ length: Math.min(100, total - start) }, (_, offset) => prefix === 'target'
+      ? { agent_id: `agent-${start + offset}`, display_name: `Target ${start + offset}`, host: `db-${start + offset}.example` }
+      : { id: `item-${start + offset}`, version: 1, name: `Item ${start + offset}`, category: 'host' }),
+    page: { limit: 100, has_more: Boolean(next), ...(next ? { next_cursor: next } : {}) },
+  });
+  const api = {
+    async listPolicies(_scope, request, signal) { calls.push({ kind: 'policy', request, signal }); return { source: 'control-plane', items: [], page: { limit: 100, has_more: false } }; },
+    async listTargets(_scope, request, signal) { calls.push({ kind: 'target', request, signal }); return request.cursor ? page('target', 100, 150, '') : page('target', 0, 150, 'opaque-target-2'); },
+    async listItems(_scope, request, signal) { calls.push({ kind: 'item', request, signal }); return request.cursor ? page('item', 100, 150, '') : page('item', 0, 150, 'opaque-item-2'); },
+  };
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 't', projectId: 'p' }, permissions: { view: true, manage: true } });
+
+  center.open('policies');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.match(root.innerHTML, /Target 149/);
+  assert.match(root.innerHTML, /Item 149/);
+  assert.deepEqual(calls.filter((call) => call.kind === 'target').map((call) => call.request.cursor ?? ''), ['', 'opaque-target-2']);
+  assert.deepEqual(calls.filter((call) => call.kind === 'item').map((call) => call.request.cursor ?? ''), ['', 'opaque-item-2']);
+  assert.equal(calls.every((call) => call.signal instanceof AbortSignal), true);
+});
+
+test('scope change aborts a cursor-chain selection load', async () => {
+  let secondSignal;
+  const api = {
+    async listPolicies() { return { source: 'control-plane', items: [], page: { limit: 100, has_more: false } }; },
+    async listItems() { return { source: 'control-plane', items: [], page: { limit: 100, has_more: false } }; },
+    listTargets(_scope, request, signal) {
+      if (!request.cursor) return Promise.resolve({ source: 'control-plane', items: [{ agent_id: 'agent-1' }], page: { limit: 100, has_more: true, next_cursor: 'opaque-next' } });
+      secondSignal = signal;
+      return new Promise(() => {});
+    },
+    async getOverview() { return { source: 'control-plane', finding_level_counts: {}, latest_run_status_counts: {} }; },
+  };
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 't1', projectId: 'p1' }, permissions: { view: true, manage: true } });
+  center.open('policies');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  center.setScope({ tenantId: 't2', projectId: 'p2' });
+  assert.equal(secondSignal.aborted, true);
+});
+
+test('policy list navigates opaque cursors forward and back', async () => {
+  const cursors = [];
+  const api = {
+    async listPolicies(_scope, request) {
+      cursors.push(request.cursor ?? '');
+      if (request.cursor === 'opaque-policy-2') return { source: 'control-plane', items: [{ id: 'policy-2', name: 'Second', version: 1 }], page: { limit: 100, has_more: false } };
+      return { source: 'control-plane', items: [{ id: 'policy-1', name: 'First', version: 1 }], page: { limit: 100, has_more: true, next_cursor: 'opaque-policy-2' } };
+    },
+    async listTargets() { return { source: 'control-plane', items: [], page: { limit: 100, has_more: false } }; },
+    async listItems() { return { source: 'control-plane', items: [], page: { limit: 100, has_more: false } }; },
+  };
+  const root = { innerHTML: '', addEventListener() {} };
+  const center = createInspectionCenter({ root, api, scope: { tenantId: 't', projectId: 'p' }, permissions: { view: true } });
+  center.open('policies');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(root.innerHTML, /data-inspection-policy-page="next"/);
+  await center.pagePolicies('next');
+  assert.match(root.innerHTML, /Second/);
+  assert.match(root.innerHTML, /data-inspection-policy-page="previous"/);
+  await center.pagePolicies('previous');
+  assert.deepEqual(cursors, ['', 'opaque-policy-2', '']);
+});
+
 test('policy editing updates with exact ETag and refreshes instead of overwriting on 412', async () => {
   const calls = [];
   const toasts = [];
@@ -337,15 +428,19 @@ test('run detail renders progress, partial unsupported missing data and permissi
   assert.doesNotMatch(markup, /<script>alert/);
 });
 
-test('report detail renders immutable findings and only HTML JSON download affordance', () => {
+test('report detail renders evidence thresholds target navigation references and separate safe downloads', () => {
   const markup = renderInspectionReportMarkup({
     id: 'report-1', run_id: 'run-1', status: 'completed', summary: 'warning=1', generated_at: '2026-08-29T08:00:00Z',
     artifacts: [{ artifact_id: 'report-1.html', kind: 'inspection-report' }, { artifact_id: 'report-1.json', kind: 'inspection-report' }],
-    findings: [{ id: 'finding-1', target_id: 'agent-1', item_id: 'cpu', item_version: 1, level: 'warning', summary: 'CPU high', recommendation: 'Reduce load' }],
+    targets: [{ target_id: 'agent-1', display_name: '<Primary>', host: 'db.example', status: 'succeeded', command_id: 'command-1' }],
+    references: { job_id: 'job-1', audit_correlation: 'inspection-run:run-1', commands: [{ target_id: 'agent-1', command_id: 'command-1' }] },
+    findings: [{ id: 'finding-1', target_id: 'agent-1', item_id: 'cpu', item_version: 1, level: 'warning', warning_threshold: 80, critical_threshold: 90, evidence_fields: { metric: 'system.cpu.utilization', value: '<script>82</script>' }, summary: 'CPU high', recommendation: 'Reduce load' }],
   });
-  assert.match(markup, /HTML \/ JSON/);
-  assert.match(markup, /CPU high/);
-  assert.match(markup, /data-inspection-report-download="report-1"/);
+  for (const expected of ['CPU high', 'system.cpu.utilization', '80', '90', 'job-1', 'command-1', 'inspection-run:run-1', 'agent-1']) assert.match(markup, new RegExp(expected));
+  assert.match(markup, /data-inspection-report-download="report-1" data-inspection-report-format="html"/);
+  assert.match(markup, /data-inspection-report-download="report-1" data-inspection-report-format="json"/);
+  assert.doesNotMatch(markup, /<script>82/);
+  assert.match(markup, /&lt;script&gt;82/);
   assert.doesNotMatch(markup, /PDF|Word|邮件/);
 });
 

@@ -547,6 +547,41 @@ func TestDispatchPendingOverridesAuthoritySignsEnqueuesWithoutPublishingAndAudit
 	assertTraceFields(t, fixture.audit.events[0], fixture.value, "command-a")
 }
 
+func TestDispatchPendingHonorsDurablePerJobPrepareSlotAndReleasesItAtTerminal(t *testing.T) {
+	fixture := newCommandLifecycleFixture(t)
+	fixture.value.Type = "inspection.collect"
+	fixture.value.MaxConcurrency = 1
+	fixture.value.TargetTimeout = time.Minute
+	batchDeadline := fixture.now.Add(2 * time.Minute)
+	fixture.value.TimeoutAt = &batchDeadline
+	fixture.persistence.jobs[fixture.value.ID] = fixture.value
+	first := fixture.message(t, "command-a", "agent-a")
+	second := fixture.message(t, "command-b", "agent-b")
+	first.Phase = CommandPhasePending
+	second.Phase = CommandPhasePending
+	fixture.persistence.messages[first.ID] = first
+	fixture.persistence.messages[second.ID] = second
+	fixture.persistence.claimed = []OutboxMessage{first, second}
+
+	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, dispatched)
+	require.Len(t, fixture.agents.envelopes, 1)
+	require.Equal(t, CommandPhasePreparing, fixture.persistence.messages[first.ID].Phase)
+	require.Equal(t, CommandPhasePending, fixture.persistence.messages[second.ID].Phase)
+
+	terminal := fixture.persistence.messages[first.ID]
+	terminal.Phase = CommandPhaseSucceeded
+	terminal.CommandStatus = CommandSucceeded
+	fixture.persistence.messages[first.ID] = terminal
+	fixture.persistence.claimed = []OutboxMessage{second}
+	dispatched, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 1, dispatched)
+	require.Len(t, fixture.agents.envelopes, 2)
+}
+
 func TestDispatchRetryUsesByteIdenticalPreparedEnvelopeAndJournalDeduplicates(t *testing.T) {
 	fixture := newCommandLifecycleFixture(t)
 	fixture.lifecycle.nonceReader = bytes.NewReader(bytes.Repeat([]byte{0x24}, commandNonceBytes))
@@ -1180,6 +1215,39 @@ func (store *memoryCommandPersistence) ClaimOutbox(context.Context, int, time.Ti
 		claimed[index].PreparedEnvelope = append([]byte(nil), store.prepared[claimed[index].ID]...)
 	}
 	return claimed, nil
+}
+func (store *memoryCommandPersistence) ReservePrepareSlot(_ context.Context, scope platformscope.Scope, id string, _ time.Time) (bool, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message, exists := store.messages[id]
+	if !exists {
+		return true, nil
+	}
+	if message.Scope != scope {
+		return false, ErrNotFound
+	}
+	value, exists := store.jobs[message.JobID]
+	if !exists {
+		return false, ErrNotFound
+	}
+	if value.MaxConcurrency == 0 {
+		return true, nil
+	}
+	if activePreparePhase(message.Phase) {
+		return true, nil
+	}
+	active := 0
+	for _, candidate := range store.messages {
+		if candidate.JobID == message.JobID && activePreparePhase(candidate.Phase) {
+			active++
+		}
+	}
+	if active >= value.MaxConcurrency {
+		return false, nil
+	}
+	message.Phase = CommandPhasePreparing
+	store.messages[id] = message
+	return true, nil
 }
 func (store *memoryCommandPersistence) MarkOutboxPublished(_ context.Context, scope platformscope.Scope, id string, _ time.Time) error {
 	store.mu.Lock()

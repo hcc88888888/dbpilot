@@ -27,10 +27,15 @@ func TestCreateRunSnapshotsTargetsAndBuildsExactUnsignedHostCommands(t *testing.
 	require.Equal(t, RunTriggerManual, run.Trigger)
 	require.Equal(t, []string{"agent-a", "agent-b"}, fixture.repository.job.TargetResourceIDs)
 	require.Equal(t, "run-1", fixture.repository.job.SourceResource.ResourceID)
-	require.Equal(t, "request-key-1", fixture.repository.job.IdempotencyKey)
+	require.Equal(t, "inspection-run:run-1", fixture.repository.job.IdempotencyKey)
 	require.Equal(t, []string{"agent-a", "agent-b"}, []string{fixture.repository.targets[0].AgentID, fixture.repository.targets[1].AgentID})
 	require.Equal(t, []string{"command-a", "command-b"}, []string{fixture.repository.targets[0].CommandID, fixture.repository.targets[1].CommandID})
 	require.Equal(t, fixture.repository.run.ItemSnapshot[0].ID, "host.cpu.utilization")
+	require.Equal(t, 2, fixture.repository.run.MaxConcurrency)
+	require.Equal(t, time.Minute, fixture.repository.run.TargetTimeout)
+	require.Equal(t, 2, fixture.repository.job.MaxConcurrency)
+	require.Equal(t, time.Minute, fixture.repository.job.TargetTimeout)
+	require.Equal(t, fixture.now.Add(time.Minute), *fixture.repository.job.TimeoutAt)
 
 	require.Len(t, fixture.repository.messages, 2)
 	for index, message := range fixture.repository.messages {
@@ -45,6 +50,21 @@ func TestCreateRunSnapshotsTargetsAndBuildsExactUnsignedHostCommands(t *testing.
 		require.Empty(t, envelope.JobId)
 		require.Empty(t, envelope.Signature)
 	}
+}
+
+func TestCreateRunBatchTimeoutCoversCheckedConcurrencyWaves(t *testing.T) {
+	fixture := newServiceFixture(t)
+
+	_, err := fixture.service.CreateRun(context.Background(), CreateRunRequest{
+		Scope: fixture.scope, Selector: TargetSelector{Labels: map[string]string{"role": "db"}},
+		Items: []PolicyItem{{ItemID: "host.cpu.utilization", Version: 1}}, TargetTimeout: 45 * time.Second, MaxConcurrency: 1,
+		IdempotencyKey: "wave-timeout", InitiatedBy: "operator-1", RequestID: "request-wave",
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, fixture.now.Add(90*time.Second), *fixture.repository.job.TimeoutAt)
+	require.Equal(t, 1, fixture.repository.job.MaxConcurrency)
+	require.Equal(t, 45*time.Second, fixture.repository.job.TargetTimeout)
 }
 
 func TestScheduleParserRejectsDescriptorsSecondsAndImplicitOrInvalidZones(t *testing.T) {
@@ -72,6 +92,35 @@ func TestScheduleParserRejectsDescriptorsSecondsAndImplicitOrInvalidZones(t *tes
 	}
 }
 
+func TestCoalescedScheduledOccurrencesSelectLatestDueAndFirstFutureWithoutWalkingBacklog(t *testing.T) {
+	t.Run("multi-year every-minute outage", func(t *testing.T) {
+		claimed := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+		now := time.Date(2026, 8, 29, 12, 34, 45, 0, time.UTC)
+		latest, next, err := CoalescedScheduledOccurrences(Schedule{Cron: "* * * * *", Timezone: "UTC"}, claimed, now)
+		require.NoError(t, err)
+		require.Equal(t, time.Date(2026, 8, 29, 12, 34, 0, 0, time.UTC), latest)
+		require.Equal(t, time.Date(2026, 8, 29, 12, 35, 0, 0, time.UTC), next)
+	})
+
+	t.Run("annual Asia Shanghai schedule", func(t *testing.T) {
+		claimed := time.Date(2019, 12, 31, 18, 0, 0, 0, time.UTC)
+		now := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
+		latest, next, err := CoalescedScheduledOccurrences(Schedule{Cron: "0 2 1 1 *", Timezone: "Asia/Shanghai"}, claimed, now)
+		require.NoError(t, err)
+		require.Equal(t, time.Date(2025, 12, 31, 18, 0, 0, 0, time.UTC), latest)
+		require.Equal(t, time.Date(2026, 12, 31, 18, 0, 0, 0, time.UTC), next)
+	})
+
+	t.Run("DST spring gap skips nonexistent local occurrence", func(t *testing.T) {
+		claimed := time.Date(2026, 3, 7, 7, 30, 0, 0, time.UTC)
+		now := time.Date(2026, 3, 8, 16, 0, 0, 0, time.UTC)
+		latest, next, err := CoalescedScheduledOccurrences(Schedule{Cron: "30 2 * * *", Timezone: "America/New_York"}, claimed, now)
+		require.NoError(t, err)
+		require.Equal(t, claimed, latest)
+		require.Equal(t, time.Date(2026, 3, 9, 6, 30, 0, 0, time.UTC), next)
+	})
+}
+
 func TestRetryRunRequiresFailedOrPartialAndCreatesFreshIdentity(t *testing.T) {
 	// Break caught: an operator retry must not reuse the original Run, Job, or
 	// Command IDs, and must retain retry_of_run_id for audit correlation.
@@ -80,7 +129,7 @@ func TestRetryRunRequiresFailedOrPartialAndCreatesFreshIdentity(t *testing.T) {
 		Scope: fixture.scope, ID: "run-old", JobID: "job-old", Status: RunFailed, Trigger: RunTriggerManual,
 		ItemSnapshot: []Item{builtinItem("host.cpu.utilization")}, TargetCount: 1, CreatedAt: fixture.now,
 	}, Targets: []TargetRun{{TargetID: "agent-a", AgentID: "agent-a", CommandID: "command-old", Status: TargetFailed}}}
-	run, err := fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "retry-key", "operator-2")
+	run, err := fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "retry-key", "operator-2", "request-retry-1", "trace-retry-1", RunIdempotency{}, "")
 	require.NoError(t, err)
 	require.Equal(t, "run-1", run.ID)
 	require.Equal(t, "run-old", run.RetryOfRunID)
@@ -88,9 +137,11 @@ func TestRetryRunRequiresFailedOrPartialAndCreatesFreshIdentity(t *testing.T) {
 	require.Equal(t, "job-1", run.JobID)
 	require.Equal(t, "command-a", fixture.repository.targets[0].CommandID)
 	require.NotEqual(t, "command-old", fixture.repository.targets[0].CommandID)
+	require.Equal(t, "request-retry-1", run.RequestID)
+	require.Equal(t, "trace-retry-1", run.TraceID)
 
 	fixture.repository.detail.Run.Status = RunCompleted
-	_, err = fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "another-key", "operator-2")
+	_, err = fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "another-key", "operator-2", "request-retry-2", "trace-retry-2", RunIdempotency{}, "")
 	require.ErrorIs(t, err, ErrRunNotRetryable)
 }
 
@@ -106,15 +157,21 @@ func TestRetryRunDeepClonesOriginalScheduledPolicyItemAndTargetSnapshots(t *test
 	target := TargetRun{
 		TargetID: "agent-a", AgentID: "agent-a", CommandID: "command-old", Status: TargetFailed,
 		DisplayName: "Original Agent", Host: "original.example", Labels: map[string]string{"environment": "original"},
-		Capabilities: []string{"host.metrics"}, AdvertisedSources: []SourceType{SourceMetric},
+		Connectivity: "offline", Capabilities: []string{"collect_now"}, AdvertisedSources: nil,
 	}
+	live, err := NewConfiguredTargetResolver([]HostTarget{
+		{Scope: fixture.scope, AgentID: "agent-a", DisplayName: "Current Agent", Host: "current.example", Labels: map[string]string{"environment": "current"}, Connectivity: "online", Capabilities: []string{"collect_now", "collect_now.host.v1"}, AdvertisedSources: []SourceType{SourceMetric, SourceMetadata, SourceLogSummary}},
+		{Scope: fixture.scope, AgentID: "agent-b", DisplayName: "New Agent", Host: "new.example", Labels: map[string]string{}, Connectivity: "online", Capabilities: []string{"collect_now.host.v1"}, AdvertisedSources: []SourceType{SourceMetric}},
+	})
+	require.NoError(t, err)
+	fixture.service.Targets = live
 	fixture.repository.detail = RunDetail{Run: Run{
 		Scope: fixture.scope, ID: "run-old", PolicyID: policy.ID, PolicyVersion: policy.Version,
 		JobID: "job-old", Status: RunPartial, Trigger: RunTriggerScheduled,
 		PolicySnapshot: &policy, ItemSnapshot: []Item{item}, TargetCount: 1, CreatedAt: fixture.now,
 	}, Targets: []TargetRun{target}}
 
-	run, err := fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "retry-snapshot-key", "operator-2")
+	run, err := fixture.service.RetryRun(context.Background(), fixture.scope, "run-old", "retry-snapshot-key", "operator-2", "request-retry-live", "trace-retry-live", RunIdempotency{}, "")
 	require.NoError(t, err)
 	require.Equal(t, RunTriggerRetry, run.Trigger)
 	require.Equal(t, "run-old", run.RetryOfRunID)
@@ -126,6 +183,12 @@ func TestRetryRunDeepClonesOriginalScheduledPolicyItemAndTargetSnapshots(t *test
 	require.True(t, run.ItemSnapshot[0].Enabled)
 	require.Equal(t, "original.example", fixture.repository.targets[0].Host)
 	require.Equal(t, "original", fixture.repository.targets[0].Labels["environment"])
+	require.Equal(t, "online", fixture.repository.targets[0].Connectivity)
+	require.Equal(t, []string{"collect_now", "collect_now.host.v1"}, fixture.repository.targets[0].Capabilities)
+	require.Equal(t, []SourceType{SourceMetric, SourceMetadata, SourceLogSummary}, fixture.repository.targets[0].AdvertisedSources)
+	require.Len(t, fixture.repository.targets, 1, "retry target set must remain fixed even when new Agents exist")
+	require.Equal(t, "request-retry-live", run.RequestID)
+	require.Equal(t, "trace-retry-live", run.TraceID)
 
 	fixture.repository.detail.Run.PolicySnapshot.Name = "later policy"
 	fixture.repository.detail.Run.ItemSnapshot[0].MetricRule.WarningThreshold = 1
@@ -141,6 +204,7 @@ func TestScheduleDueUsesClaimAwareCreationAndAdvancesFromClaimedOccurrence(t *te
 	fixture := newServiceFixture(t)
 	occurrence := fixture.now.Add(-time.Hour)
 	policy := policyFixture()
+	policy.Schedule = &Schedule{Cron: "* * * * *", Timezone: "UTC"}
 	policy.Scope = fixture.scope
 	policy.Selector = TargetSelector{AgentIDs: []string{"agent-a"}}
 	policy.NextRunAt = &occurrence
@@ -151,10 +215,12 @@ func TestScheduleDueUsesClaimAwareCreationAndAdvancesFromClaimedOccurrence(t *te
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 	require.True(t, fixture.repository.claimAware)
-	require.Equal(t, occurrence, fixture.repository.claimedPolicy.Claim.Occurrence)
+	require.Equal(t, occurrence, fixture.repository.claimedPolicy.Claim.ClaimedOccurrence)
+	require.Equal(t, fixture.now, fixture.repository.claimedPolicy.Claim.Occurrence)
+	require.Equal(t, fixture.now.Add(time.Minute), fixture.repository.claimedPolicy.Claim.NextOccurrence)
 	require.Equal(t, RunTriggerScheduled, fixture.repository.run.Trigger)
-	require.Equal(t, scheduledOccurrenceKey(policy, occurrence), fixture.repository.run.OccurrenceKey)
-	require.Equal(t, fixture.repository.run.OccurrenceKey, fixture.repository.job.IdempotencyKey)
+	require.Equal(t, scheduledOccurrenceKey(policy, fixture.now), fixture.repository.run.OccurrenceKey)
+	require.Equal(t, "inspection-run:"+fixture.repository.run.ID, fixture.repository.job.IdempotencyKey)
 }
 
 func TestCreateRunRejectsForgedRetryLinkOnManualRequest(t *testing.T) {
@@ -244,7 +310,7 @@ func (repository *memoryInspectionRepository) CreateClaimedRunWithJob(_ context.
 func (repository *memoryInspectionRepository) GetRun(context.Context, platformscope.Scope, string) (RunDetail, error) {
 	return repository.detail, nil
 }
-func (repository *memoryInspectionRepository) GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (Run, error) {
+func (repository *memoryInspectionRepository) GetRunByIdempotency(context.Context, platformscope.Scope, RunIdempotency) (Run, error) {
 	return Run{}, ErrNotFound
 }
 func (repository *memoryInspectionRepository) ListRuns(context.Context, platformscope.Scope, RunFilter) (RunPage, error) {

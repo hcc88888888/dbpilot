@@ -27,6 +27,20 @@ import {
     InspectionReportStatusToJSON,
     InspectionReportStatusToJSONTyped,
 } from './InspectionReportStatus.js';
+import type { InspectionReportTarget } from './InspectionReportTarget.js';
+import {
+    InspectionReportTargetFromJSON,
+    InspectionReportTargetFromJSONTyped,
+    InspectionReportTargetToJSON,
+    InspectionReportTargetToJSONTyped,
+} from './InspectionReportTarget.js';
+import type { InspectionReportReferences } from './InspectionReportReferences.js';
+import {
+    InspectionReportReferencesFromJSON,
+    InspectionReportReferencesFromJSONTyped,
+    InspectionReportReferencesToJSON,
+    InspectionReportReferencesToJSONTyped,
+} from './InspectionReportReferences.js';
 import type { ArtifactReference } from './ArtifactReference.js';
 import {
     ArtifactReferenceFromJSON,
@@ -80,6 +94,18 @@ export interface InspectionReport {
     findings?: Array<InspectionFinding>;
     /**
      *
+     * @type {Array<InspectionReportTarget>}
+     * @memberof InspectionReport
+     */
+    targets?: Array<InspectionReportTarget>;
+    /**
+     *
+     * @type {InspectionReportReferences}
+     * @memberof InspectionReport
+     */
+    references?: InspectionReportReferences;
+    /**
+     *
      * @type {Array<ArtifactReference>}
      * @memberof InspectionReport
      */
@@ -124,6 +150,8 @@ export function InspectionReportFromJSONTyped(json: any, ignoreDiscriminator: bo
         'status': InspectionReportStatusFromJSON(json['status']),
         'summary': json['summary'],
         'findings': json['findings'] == null ? undefined : ((json['findings'] as Array<any>).map(InspectionFindingFromJSON)),
+        'targets': json['targets'] == null ? undefined : ((json['targets'] as Array<any>).map(InspectionReportTargetFromJSON)),
+        'references': json['references'] == null ? undefined : InspectionReportReferencesFromJSON(json['references']),
         'artifacts': ((json['artifacts'] as Array<any>).map(ArtifactReferenceFromJSON)),
         'generatedAt': (new Date(json['generated_at'])),
     };
@@ -147,6 +175,8 @@ export function InspectionReportToJSONTyped(value?: InspectionReport | null, ign
         'status': InspectionReportStatusToJSON(value['status']),
         'summary': value['summary'],
         'findings': value['findings'] == null ? undefined : ((value['findings'] as Array<any>).map(InspectionFindingToJSON)),
+        'targets': value['targets'] == null ? undefined : ((value['targets'] as Array<any>).map(InspectionReportTargetToJSON)),
+        'references': InspectionReportReferencesToJSON(value['references']),
         'artifacts': ((value['artifacts'] as Array<any>).map(ArtifactReferenceToJSON)),
         'generated_at': ((value['generatedAt']).toISOString()),
     };

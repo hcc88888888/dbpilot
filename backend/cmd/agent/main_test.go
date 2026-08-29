@@ -24,7 +24,7 @@ func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testi
 
 	withHost, err := configuredCommandExecutors(&mainHostCollector{}, nil)
 	require.NoError(t, err)
-	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withHost.Capabilities())
+	require.Equal(t, []string{string(agent.CommandKindCollectNow), agent.CapabilityCollectNowHostV1}, withHost.Capabilities())
 
 	store, err := spool.Open(t.TempDir(), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 64 << 10})
 	require.NoError(t, err)
@@ -42,7 +42,7 @@ func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testi
 	require.NoError(t, err)
 	withCollector, err := configuredCommandExecutors(&mainHostCollector{}, collector)
 	require.NoError(t, err)
-	require.Equal(t, []string{string(agent.CommandKindCollectNow)}, withCollector.Capabilities())
+	require.Equal(t, []string{string(agent.CommandKindCollectNow), agent.CapabilityCollectNowDependenciesV1, agent.CapabilityCollectNowHostV1}, withCollector.Capabilities())
 }
 
 func TestProductionHostSnapshotCollectorSharesEngineLimitAndLogIndex(t *testing.T) {

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +45,7 @@ type ReportTarget struct {
 }
 
 type ReportFinding struct {
+	ID                string            `json:"id,omitempty"`
 	TargetID          string            `json:"target_id"`
 	ItemID            string            `json:"item_id"`
 	ItemVersion       int               `json:"item_version"`
@@ -209,7 +212,7 @@ func validateReportDocument(document ReportDocument) error {
 		}
 	}
 	for _, finding := range document.Findings {
-		if _, ok := seenTargets[finding.TargetID]; !ok || !validID(finding.ItemID) || finding.ItemVersion < 1 || !validFindingLevel(finding.Level) || !isUTC(finding.ObservedAt) || (finding.WarningThreshold == nil) != (finding.CriticalThreshold == nil) {
+		if _, ok := seenTargets[finding.TargetID]; !ok || (finding.ID != "" && !validID(finding.ID)) || !validID(finding.ItemID) || finding.ItemVersion < 1 || !validFindingLevel(finding.Level) || !isUTC(finding.ObservedAt) || (finding.WarningThreshold == nil) != (finding.CriticalThreshold == nil) {
 			return ErrInvalidReport
 		}
 		for key, value := range finding.Evidence {
@@ -250,12 +253,49 @@ func validateReportText(value string) error {
 		return ErrReportTooLarge
 	}
 	normalized := strings.ToLower(value)
-	for _, marker := range []string{"password=", "passwd=", "pwd=", "authorization:", "bearer ", "://", "jdbc:", "connection_string", "connection uri", "raw_log", "raw log", "-----begin private key-----"} {
+	for _, marker := range []string{"password=", "passwd=", "pwd=", "authorization:", "bearer ", "connection_string", "connection uri", "raw_log", "raw log", "-----begin private key-----"} {
 		if strings.Contains(normalized, marker) {
 			return ErrUnsafeReport
 		}
 	}
+	if containsCredentialBearingConnectionMaterial(value) {
+		return ErrUnsafeReport
+	}
 	return nil
+}
+
+var reportURI = regexp.MustCompile(`(?i)(?:jdbc:)?[a-z][a-z0-9+.-]*://[^\s<>"']+`)
+
+func containsCredentialBearingConnectionMaterial(value string) bool {
+	if strings.Contains(strings.ToLower(value), "jdbc:") {
+		return true
+	}
+	databaseSchemes := map[string]struct{}{
+		"postgres": {}, "postgresql": {}, "mysql": {}, "mariadb": {}, "mongodb": {}, "mongodb+srv": {},
+		"oracle": {}, "sqlserver": {}, "mssql": {}, "redis": {},
+	}
+	for _, candidate := range reportURI.FindAllString(value, -1) {
+		candidate = strings.TrimRight(candidate, ".,;:)]}")
+		if strings.HasPrefix(strings.ToLower(candidate), "jdbc:") {
+			return true
+		}
+		parsed, err := url.Parse(candidate)
+		if err != nil || parsed.Scheme == "" {
+			continue
+		}
+		if _, database := databaseSchemes[strings.ToLower(parsed.Scheme)]; database {
+			return true
+		}
+		if parsed.User != nil && parsed.User.Username() != "" {
+			return true
+		}
+		for key := range parsed.Query() {
+			if containsSecretMarker(key) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validTerminalTargetStatus(status TargetStatus) bool {
@@ -288,6 +328,6 @@ var inspectionReportTemplate = template.Must(template.New("inspection-report").P
 <dl><dt>Run</dt><dd>{{.RunID}}</dd><dt>Status</dt><dd>{{.Status}}</dd><dt>Generated</dt><dd>{{.GeneratedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}</dd><dt>Policy</dt><dd>{{.Policy.ID}} version {{.Policy.Version}} — {{.Policy.Name}}</dd><dt>Job</dt><dd>{{.References.JobID}}</dd><dt>Audit correlation</dt><dd>{{.References.AuditCorrelation}}</dd></dl>
 <h2>Items</h2><table><thead><tr><th>ID</th><th>Version</th><th>Name</th><th>Category</th></tr></thead><tbody>{{range .Items}}<tr><td>{{.ID}}</td><td>version {{.Version}}</td><td>{{.Name}}</td><td>{{.Category}}</td></tr>{{end}}</tbody></table>
 <h2>Targets</h2><table><thead><tr><th>Target</th><th>Host</th><th>Status</th><th>Command</th><th>Error</th></tr></thead><tbody>{{range .Targets}}<tr><td>{{.TargetID}} — {{.DisplayName}}</td><td>{{.Host}}</td><td>{{.Status}}</td><td>{{.CommandID}}</td><td>{{.ErrorCode}}</td></tr>{{end}}</tbody></table>
-<h2>Findings</h2><table><thead><tr><th>Target</th><th>Item version</th><th>Level</th><th>Observed</th><th>Evidence</th><th>Summary</th><th>Recommendation</th></tr></thead><tbody>{{range .Findings}}<tr><td>{{.TargetID}}</td><td>{{.ItemID}} version {{.ItemVersion}}</td><td>{{.Level}}</td><td>{{.ObservedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}</td><td>{{range $key,$value := .Evidence}}<div><code>{{$key}}</code>: {{$value}}</div>{{end}}</td><td>{{.Summary}}</td><td>{{.Recommendation}}</td></tr>{{end}}</tbody></table>
+<h2>Findings</h2><table><thead><tr><th>Target</th><th>Item version</th><th>Level</th><th>Observed</th><th>Warning threshold</th><th>Critical threshold</th><th>Evidence</th><th>Summary</th><th>Recommendation</th></tr></thead><tbody>{{range .Findings}}<tr><td>{{.TargetID}}</td><td>{{.ItemID}} version {{.ItemVersion}}</td><td>{{.Level}}</td><td>{{.ObservedAt.Format "2006-01-02T15:04:05.999999999Z07:00"}}</td><td>{{if .WarningThreshold}}{{.WarningThreshold}}{{end}}</td><td>{{if .CriticalThreshold}}{{.CriticalThreshold}}{{end}}</td><td>{{range $key,$value := .Evidence}}<div><code>{{$key}}</code>: {{$value}}</div>{{end}}</td><td>{{.Summary}}</td><td>{{.Recommendation}}</td></tr>{{end}}</tbody></table>
 <h2>Command references</h2><ul>{{range .References.Commands}}<li>{{.TargetID}} — {{.CommandID}}</li>{{end}}</ul></body></html>
 `))

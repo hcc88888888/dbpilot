@@ -73,7 +73,7 @@ type InspectionService interface {
 	RunPolicy(context.Context, platformscope.Scope, string, string, string) (inspection.Run, error)
 	ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error)
 	GetReport(context.Context, platformscope.Scope, string) (inspection.ReportSnapshot, error)
-	CreateReportDownload(context.Context, platformscope.Scope, string, string, string) (artifact.Download, error)
+	CreateReportDownload(context.Context, platformscope.Scope, string, string, string, string) (artifact.Download, error)
 	ListRuns(context.Context, platformscope.Scope, inspection.RunFilter) (inspection.RunPage, error)
 	CreateRun(context.Context, inspection.CreateRunRequest) (inspection.Run, error)
 	GetRun(context.Context, platformscope.Scope, string) (inspection.RunDetail, error)

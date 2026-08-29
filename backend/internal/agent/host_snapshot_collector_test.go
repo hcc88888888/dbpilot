@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/internal/spool"
 	"dbpilot.local/platform/internal/telemetry"
+	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
@@ -68,12 +70,17 @@ func TestHostSnapshotCollectorAppendsBoundedCanonicalOTLPMetrics(t *testing.T) {
 	t.Logf("decoded metric evidence: batch=%s payload_bytes=%d cpu=%.1f memory=%.1f load_per_cpu=%.1f required_processes=%.0f filesystems=%d",
 		batches[0].ID, len(batches[0].Payload), firstMetricValue(t, points, "system.cpu.utilization"),
 		firstMetricValue(t, points, "system.memory.utilization"), firstMetricValue(t, points, "system.cpu.load_average.1m_per_cpu"),
-		firstMetricValue(t, points, "dbpilot.inspection.host.database.required_process_count"), len(points["system.filesystem.utilization"]))
+		firstMetricValue(t, points, "dbpilot.inspection.host.database.required_process_count"), len(points["dbpilot.inspection.host.filesystem.utilization"]))
 
-	filesystemPoints := points["system.filesystem.utilization"]
+	require.Len(t, points["system.filesystem.utilization"], 1)
+	require.Len(t, points["system.filesystem.inode_utilization"], 1)
+	requireMetricValue(t, points, "system.filesystem.utilization", 80)
+	requireMetricValue(t, points, "system.filesystem.inode_utilization", 40)
+	filesystemPoints := points["dbpilot.inspection.host.filesystem.utilization"]
 	require.Len(t, filesystemPoints, MaxHostFilesystems)
 	require.Equal(t, "/mnt/00", filesystemPoints[0].attributes["mountpoint"])
 	require.Equal(t, "/mnt/63", filesystemPoints[len(filesystemPoints)-1].attributes["mountpoint"])
+	require.Len(t, points["dbpilot.inspection.host.filesystem.inode_utilization"], MaxHostFilesystems)
 	require.Len(t, points["system.disk.io"], MaxHostDisks*2)
 	require.Len(t, points["system.network.io"], MaxHostInterfaces*2)
 	for _, values := range points {
@@ -89,6 +96,93 @@ func TestHostSnapshotCollectorAppendsBoundedCanonicalOTLPMetrics(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, batches, 2)
 	require.NotEqual(t, batches[0].ID, batches[1].ID)
+}
+
+func TestHostSnapshotCollectorUsesWorstFilesystemBeforeAndAfterDetailCap(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		mountpoint string
+	}{
+		{name: "critical mount sorts before healthy detail", mountpoint: "/mnt/00"},
+		{name: "critical mount sorts after detail cap", mountpoint: "/mnt/65"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := completeHostSnapshot(now)
+			for index := range snapshot.Filesystems {
+				if snapshot.Filesystems[index].Mountpoint == test.mountpoint {
+					snapshot.Filesystems[index].UsedPercent = 97
+					snapshot.Filesystems[index].InodesUsedPercent = 96
+				}
+			}
+			store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1 << 20}}
+			collector := &HostSnapshotCollector{
+				AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: snapshot},
+				BatchLimits: &mutableBatchLimit{value: 1 << 20}, Now: func() time.Time { return now },
+			}
+
+			require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
+			decoded, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(store.batches[0].Payload)
+			require.NoError(t, err)
+			points := decodedMetricPoints(t, decoded)
+			require.Len(t, points["system.filesystem.utilization"], 1)
+			require.Len(t, points["system.filesystem.inode_utilization"], 1)
+			requireMetricValue(t, points, "system.filesystem.utilization", 97)
+			requireMetricValue(t, points, "system.filesystem.inode_utilization", 96)
+		})
+	}
+}
+
+func TestHostSnapshotCollectorOmitsFilesystemCompletenessMetricsAfterPartialReadFailure(t *testing.T) {
+	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
+	snapshot := completeHostSnapshot(now)
+	snapshot.FilesystemReadIncomplete = true
+	store := &capturingHostStore{stats: spool.Stats{MaxBytes: 1 << 20}}
+	collector := &HostSnapshotCollector{
+		AgentID: "agent-a", Store: store, Reader: staticHostReader{snapshot: snapshot},
+		BatchLimits: &mutableBatchLimit{value: 1 << 20}, Now: func() time.Time { return now },
+	}
+
+	require.NoError(t, collector.Collect(context.Background(), CollectionRequest{Kinds: []string{"host"}}))
+	decoded, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(store.batches[0].Payload)
+	require.NoError(t, err)
+	points := decodedMetricPoints(t, decoded)
+	require.NotContains(t, points, "system.filesystem.utilization")
+	require.NotContains(t, points, "system.filesystem.inode_utilization")
+	require.NotEmpty(t, points["dbpilot.inspection.host.filesystem.utilization"], "successful mounts remain available as optional detail")
+}
+
+func TestReadFilesystemObservationsMarksPartialFailureAndFallsBackToRoot(t *testing.T) {
+	t.Run("partial discovered mount failure", func(t *testing.T) {
+		partitions := []disk.PartitionStat{
+			{Device: "/dev/a", Mountpoint: "/healthy", Fstype: "xfs"},
+			{Device: "/dev/b", Mountpoint: "/failed", Fstype: "xfs"},
+		}
+		filesystems, incomplete, err := readFilesystemObservations(context.Background(), partitions, func(_ context.Context, mountpoint string) (*disk.UsageStat, error) {
+			if mountpoint == "/failed" {
+				return nil, errors.New("permission denied")
+			}
+			return &disk.UsageStat{Path: mountpoint, Total: 1000, Used: 250, UsedPercent: 25, InodesUsedPercent: 30}, nil
+		})
+
+		require.NoError(t, err)
+		require.True(t, incomplete)
+		require.Len(t, filesystems, 1)
+		require.Equal(t, "/healthy", filesystems[0].Mountpoint)
+	})
+
+	t.Run("Kylin container empty partition list reads root", func(t *testing.T) {
+		var requested string
+		filesystems, incomplete, err := readFilesystemObservations(context.Background(), nil, func(_ context.Context, mountpoint string) (*disk.UsageStat, error) {
+			requested = mountpoint
+			return &disk.UsageStat{Path: mountpoint, Total: 1000, Used: 400, UsedPercent: 40, InodesUsedPercent: 20}, nil
+		})
+
+		require.NoError(t, err)
+		require.False(t, incomplete)
+		require.Equal(t, string(filepath.Separator), requested)
+		require.Equal(t, []FilesystemObservation{{Device: string(filepath.Separator), Mountpoint: string(filepath.Separator), Type: "rootfs", UsedBytes: 400, TotalBytes: 1000, UsedPercent: 40, InodesUsedPercent: 20}}, filesystems)
+	})
 }
 
 func TestHostSnapshotCollectorEmptyLogWindowEmitsAvailabilityNotHealthyZeros(t *testing.T) {

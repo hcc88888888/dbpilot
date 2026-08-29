@@ -502,10 +502,15 @@ func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabiliti
 	require.Empty(t, withoutCollectNow[0].AdvertisedSources)
 
 	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "host.inspect"}}
+	rollingOld, err := resolver.List(context.Background(), scope)
+	require.NoError(t, err)
+	require.Equal(t, "online", rollingOld[0].Connectivity)
+	require.Equal(t, []string{"collect_now", "host.inspect"}, rollingOld[0].Capabilities)
+	require.Empty(t, rollingOld[0].AdvertisedSources, "generic rolling Agent capability must not overclaim host sources")
+
+	registry.sessions["agent-1"] = agentcontrol.SessionInfo{AgentID: "agent-1", Capabilities: []string{"collect_now", "collect_now.host.v1", "host.inspect"}}
 	online, err := resolver.List(context.Background(), scope)
 	require.NoError(t, err)
-	require.Equal(t, "online", online[0].Connectivity)
-	require.Equal(t, []string{"collect_now", "host.inspect"}, online[0].Capabilities)
 	require.Equal(t, []inspection.SourceType{inspection.SourceMetric, inspection.SourceMetadata, inspection.SourceLogSummary}, online[0].AdvertisedSources)
 }
 
@@ -514,7 +519,7 @@ func TestLiveInspectionResolverCreateRunEvaluatorKeepsCollectNowSources(t *testi
 	now := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
 	configured, err := inspection.NewConfiguredTargetResolver([]inspection.HostTarget{{Scope: scope, AgentID: "agent-1", DisplayName: "Primary", Host: "db-1.example", Labels: map[string]string{"role": "database"}, Connectivity: "unknown", Capabilities: []string{}}})
 	require.NoError(t, err)
-	registry := &staticInspectionSessionRegistry{sessions: map[string]agentcontrol.SessionInfo{"agent-1": {AgentID: "agent-1", Capabilities: []string{"collect_now"}}}}
+	registry := &staticInspectionSessionRegistry{sessions: map[string]agentcontrol.SessionInfo{"agent-1": {AgentID: "agent-1", Capabilities: []string{"collect_now", "collect_now.host.v1"}}}}
 	resolver := liveInspectionTargetResolver{configured: configured, registry: registry}
 	selected := make([]inspection.Item, 0, 3)
 	for _, item := range inspection.BuiltinHostItems() {
@@ -615,7 +620,7 @@ func (*inspectionWorkflowRepository) CreateClaimedRunWithJob(context.Context, in
 func (*inspectionWorkflowRepository) GetRun(context.Context, platformscope.Scope, string) (inspection.RunDetail, error) {
 	return inspection.RunDetail{}, inspection.ErrNotFound
 }
-func (*inspectionWorkflowRepository) GetRunByIdempotencyKey(context.Context, platformscope.Scope, string) (inspection.Run, error) {
+func (*inspectionWorkflowRepository) GetRunByIdempotency(context.Context, platformscope.Scope, inspection.RunIdempotency) (inspection.Run, error) {
 	return inspection.Run{}, inspection.ErrNotFound
 }
 func (*inspectionWorkflowRepository) ListRuns(context.Context, platformscope.Scope, inspection.RunFilter) (inspection.RunPage, error) {

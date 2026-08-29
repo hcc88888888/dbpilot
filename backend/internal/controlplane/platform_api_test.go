@@ -19,6 +19,7 @@ import (
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/idempotency"
+	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -731,6 +732,7 @@ func TestProblemMappingsAreStableAndNeverExposeInternalErrors(t *testing.T) {
 		code   string
 	}{
 		{name: "validation", err: artifact.ErrInvalid, status: http.StatusBadRequest, code: "invalid_request"},
+		{name: "inspection report budget", err: inspection.ErrReportBudgetExceeded, status: http.StatusUnprocessableEntity, code: "inspection_report_budget_exceeded"},
 		{name: "not found", err: job.ErrNotFound, status: http.StatusNotFound, code: "not_found"},
 		{name: "conflict", err: job.ErrInvalidTransition, status: http.StatusConflict, code: "conflict"},
 		{name: "precondition", err: ErrPreconditionFailed, status: http.StatusPreconditionFailed, code: "precondition_failed"},

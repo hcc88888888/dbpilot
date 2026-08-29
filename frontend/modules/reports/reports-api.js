@@ -70,10 +70,12 @@ function createInspectionReportsAdapter(client) {
       const value = await read(scope, 'getInspectionReport', { reportId: requiredReportID(id) }, signal);
       return { ...mapInspectionReport(value), source: 'control-plane', scope: cleanScope(scope) };
     },
-    async downloadReport(scope, id, idempotencyKey, signal) {
+    async downloadReport(scope, id, format, idempotencyKey, signal) {
+      const selectedFormat = String(format ?? '').toLowerCase();
+      if (selectedFormat !== 'html' && selectedFormat !== 'json') throw reportsFailure('validation');
       const scoped = boundary(scope);
       return scoped.inspection.createInspectionReportDownload(
-        { reportId: requiredReportID(id), idempotencyKey },
+        { reportId: requiredReportID(id), idempotencyKey, inspectionReportDownloadRequest: { format: selectedFormat } },
         scoped.requestOptions({ idempotencyKey, signal }),
       );
     },

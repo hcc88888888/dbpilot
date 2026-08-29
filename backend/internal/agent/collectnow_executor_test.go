@@ -25,7 +25,7 @@ func TestCollectNowExecutorValidatesAndCollectsExactlyOnce(t *testing.T) {
 	require.Equal(t, int32(1), collector.calls)
 	require.Equal(t, CollectionRequest{Kinds: []string{"host"}}, collector.request)
 	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, result.GetState())
-	require.Equal(t, "dependency telemetry collection completed", result.GetSummary())
+	require.Equal(t, "host telemetry collection completed", result.GetSummary())
 	require.Empty(t, result.GetArtifacts(), "CollectNow stores telemetry in the spool and must not invent an Artifact ID")
 }
 
@@ -78,10 +78,32 @@ func TestCollectNowExecutorReturnsFixedFailureWithoutCollectorErrorLeakage(t *te
 	require.Equal(t, int32(1), collector.calls)
 	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, result.GetState())
 	require.Equal(t, "COLLECT_NOW_FAILED", result.GetErrorCode())
-	require.Equal(t, "dependency telemetry collection failed", result.GetSummary())
+	require.Equal(t, "host telemetry collection failed", result.GetSummary())
 	require.NotContains(t, result.String(), "secret")
 	require.NotContains(t, result.String(), "db.internal")
 	require.Empty(t, result.GetArtifacts())
+}
+
+func TestCollectNowExecutorSummariesDistinguishDependencyAndCombinedCollection(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		kinds   []string
+		summary string
+	}{
+		{name: "dependencies", kinds: []string{"health"}, summary: "dependency telemetry collection completed"},
+		{name: "combined", kinds: []string{"host", "dependencies"}, summary: "host and dependency telemetry collection completed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			collector := &recordingCollectNowCollector{}
+			executor, err := NewCollectNowExecutor(collector)
+			require.NoError(t, err)
+			result, err := executor.Execute(context.Background(), &agentv1.CommandEnvelope{
+				AgentId: "agent-a", Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: test.kinds}},
+			}, nil)
+			require.NoError(t, err)
+			require.Equal(t, test.summary, result.GetSummary())
+		})
+	}
 }
 
 type recordingCollectNowCollector struct {

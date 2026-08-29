@@ -62,6 +62,7 @@ type RunWorkerRepository interface {
 	LoadHostSnapshot(context.Context, platformscope.Scope, string, []Item, time.Time, time.Time, int) (HostSnapshotEvidence, error)
 	SaveEvaluation(context.Context, RunClaim, []TargetRun, []Finding, time.Time) (RunClaim, error)
 	ReleaseRun(context.Context, RunClaim) error
+	FailReport(context.Context, RunClaim, time.Time) error
 	FinalizeReport(context.Context, RunClaim, ReportSnapshot, RunStatus, audit.Event, time.Time) (ReportAuditClaim, error)
 	ClaimPendingReportAudits(context.Context, time.Time, int, time.Duration) ([]ReportAuditClaim, error)
 	MarkReportAuditRecorded(context.Context, ReportAuditClaim, time.Time) error
@@ -127,7 +128,9 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 	if value.ID != run.JobID || value.Scope != run.Scope || value.TimeoutAt == nil || value.TimeoutAt.IsZero() {
 		return ErrInvalid
 	}
-	deadline := value.TimeoutAt.UTC()
+	if value.TargetTimeout < time.Second || value.TargetTimeout > time.Hour || value.MaxConcurrency < 1 || value.MaxConcurrency > 1000 {
+		return ErrInvalid
+	}
 	if run.Status == RunQueued {
 		claim, err = worker.Runs.MarkCollecting(ctx, claim, now)
 		if err != nil {
@@ -143,9 +146,15 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 	}
 	results := jobResultsByTarget(value.TargetResults)
 	hostSnapshots := make(map[string]HostSnapshotEvidence, len(claim.Detail.Targets))
+	targetDeadlines := make(map[string]time.Time, len(claim.Detail.Targets))
 	for _, target := range claim.Detail.Targets {
 		result, ok := results[target.TargetID]
 		if ok && result.Status == job.TargetSucceeded {
+			deadline, err := targetEvidenceDeadline(value, result)
+			if err != nil {
+				return err
+			}
+			targetDeadlines[target.TargetID] = deadline
 			evidence, err := worker.Runs.LoadHostSnapshot(ctx, run.Scope, target.AgentID, run.ItemSnapshot, run.CreatedAt.UTC(), deadline, maxTargetObservations)
 			if err != nil {
 				return err
@@ -162,7 +171,7 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 			return err
 		}
 	}
-	targets, findings, err := worker.evaluateTargets(ctx, claim, value, results, hostSnapshots, deadline, now)
+	targets, findings, err := worker.evaluateTargets(ctx, claim, value, results, hostSnapshots, targetDeadlines, now)
 	if err != nil {
 		return err
 	}
@@ -173,14 +182,8 @@ func (worker *Worker) processRun(ctx context.Context, claim RunClaim, now time.T
 	return worker.generateReport(ctx, claim, now)
 }
 
-func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value job.Job, results map[string]job.TargetResult, hostSnapshots map[string]HostSnapshotEvidence, deadline, now time.Time) ([]TargetRun, []Finding, error) {
+func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value job.Job, results map[string]job.TargetResult, hostSnapshots map[string]HostSnapshotEvidence, deadlines map[string]time.Time, now time.Time) ([]TargetRun, []Finding, error) {
 	run := claim.Detail.Run
-	evaluationAt := now.UTC()
-	if deadline.Before(evaluationAt) {
-		evaluationAt = deadline.UTC()
-	}
-	evaluator := *worker.Evaluator
-	evaluator.Now = func() time.Time { return evaluationAt }
 	targets := append([]TargetRun(nil), claim.Detail.Targets...)
 	for index := range targets {
 		targets[index].Status = TargetEvaluating
@@ -203,6 +206,16 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 		}
 		switch result.Status {
 		case job.TargetSucceeded:
+			deadline, ok := deadlines[target.TargetID]
+			if !ok {
+				return nil, nil, ErrInvalid
+			}
+			evaluationAt := now.UTC()
+			if deadline.Before(evaluationAt) {
+				evaluationAt = deadline.UTC()
+			}
+			evaluator := *worker.Evaluator
+			evaluator.Now = func() time.Time { return evaluationAt }
 			evaluated, err := evaluator.EvaluateTarget(ctx, snapshot, target)
 			if err != nil {
 				return nil, nil, err
@@ -219,7 +232,11 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 		case job.TargetSkipped:
 			targets[index].Status, targets[index].ErrorCode = TargetUnsupported, "collection_unsupported"
 		case job.TargetFailed:
-			targets[index].Status, targets[index].ErrorCode = TargetFailed, "collection_failed"
+			errorCode := "collection_failed"
+			if target.Connectivity == "offline" {
+				errorCode = "agent_offline"
+			}
+			targets[index].Status, targets[index].ErrorCode = TargetFailed, errorCode
 		default:
 			return nil, nil, ErrInvalid
 		}
@@ -237,6 +254,17 @@ func (worker *Worker) evaluateTargets(ctx context.Context, claim RunClaim, value
 	return targets, findings, nil
 }
 
+func targetEvidenceDeadline(value job.Job, result job.TargetResult) (time.Time, error) {
+	if value.TimeoutAt == nil || value.TimeoutAt.IsZero() || value.TargetTimeout < time.Second || result.FinishedAt == nil || result.FinishedAt.IsZero() {
+		return time.Time{}, ErrInvalid
+	}
+	deadline := result.FinishedAt.UTC().Add(value.TargetTimeout)
+	if value.TimeoutAt.UTC().Before(deadline) {
+		deadline = value.TimeoutAt.UTC()
+	}
+	return deadline, nil
+}
+
 func (worker *Worker) generateReport(ctx context.Context, claim RunClaim, now time.Time) error {
 	if claim.Detail.Run.Status != RunGeneratingReport || claim.ReportGeneratedAt.IsZero() {
 		return ErrInvalid
@@ -249,10 +277,16 @@ func (worker *Worker) generateReport(ctx context.Context, claim RunClaim, now ti
 	}
 	jsonBytes, err := RenderJSON(report)
 	if err != nil {
+		if permanentReportRendererError(err) {
+			return worker.Runs.FailReport(ctx, claim, now)
+		}
 		return err
 	}
 	htmlBytes, err := RenderHTML(report)
 	if err != nil {
+		if permanentReportRendererError(err) {
+			return worker.Runs.FailReport(ctx, claim, now)
+		}
 		return err
 	}
 	jsonArtifact, err := worker.Artifacts.Put(ctx, reportArtifact(claim.Detail.Run, report, "json", "application/json", jsonBytes), jsonBytes)
@@ -279,6 +313,10 @@ func (worker *Worker) generateReport(ctx context.Context, claim RunClaim, now ti
 		return nil
 	}
 	return worker.Runs.MarkReportAuditRecorded(ctx, auditClaim, now)
+}
+
+func permanentReportRendererError(err error) bool {
+	return errors.Is(err, ErrInvalidReport) || errors.Is(err, ErrUnsafeReport) || errors.Is(err, ErrReportTooLarge)
 }
 
 func (worker *Worker) repairAudit(ctx context.Context, claim ReportAuditClaim, now time.Time) error {
@@ -357,7 +395,7 @@ func buildReportDocument(detail RunDetail, terminal RunStatus, generatedAt time.
 	}
 	for _, finding := range detail.Findings {
 		document.Findings = append(document.Findings, ReportFinding{
-			TargetID: finding.TargetID, ItemID: finding.ItemID, ItemVersion: finding.ItemVersion, Level: finding.Level, ObservedAt: finding.ObservedAt.UTC(),
+			ID: finding.ID, TargetID: finding.TargetID, ItemID: finding.ItemID, ItemVersion: finding.ItemVersion, Level: finding.Level, ObservedAt: finding.ObservedAt.UTC(),
 			WarningThreshold: finding.WarningThreshold, CriticalThreshold: finding.CriticalThreshold, Evidence: cloneEvidence(finding.Evidence), Summary: finding.Summary, Recommendation: finding.Recommendation,
 		})
 	}

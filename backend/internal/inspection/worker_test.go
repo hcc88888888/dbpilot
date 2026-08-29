@@ -95,6 +95,35 @@ func TestWorkerEvaluationNeverUsesEvidenceAfterJobDeadline(t *testing.T) {
 	require.Equal(t, fixture.deadline.Add(-time.Second), fixture.repository.detail.Findings[0].ObservedAt)
 }
 
+func TestWorkerEvidenceDeadlineStartsAtEachTargetCollectionTerminalAndCapsAtBatchTimeout(t *testing.T) {
+	targets := []TargetRun{workerTarget("agent-a"), workerTarget("agent-b")}
+	firstFinished := time.Date(2026, 8, 29, 10, 0, 10, 0, time.UTC)
+	secondFinished := time.Date(2026, 8, 29, 10, 0, 50, 0, time.UTC)
+	results := []job.TargetResult{
+		{TargetID: "agent-a", Status: job.TargetSucceeded, FinishedAt: &firstFinished},
+		{TargetID: "agent-b", Status: job.TargetSucceeded, FinishedAt: &secondFinished},
+	}
+	fixture := newWorkerFixture(t, targets, results)
+	fixture.deadline = fixture.created.Add(time.Minute)
+	fixture.now = fixture.created.Add(70 * time.Second)
+	fixture.jobs.value.TargetTimeout = 30 * time.Second
+	fixture.jobs.value.MaxConcurrency = 1
+	fixture.repository.hostComplete = map[string]bool{"agent-a": true, "agent-b": true}
+	fixture.repository.freshAt = map[string]time.Time{"agent-a": firstFinished, "agent-b": secondFinished}
+	fixture.evidence.observations = map[string][]Observation{
+		"agent-a": {{ID: "sample-a", TargetID: "agent-a", Name: "system.cpu.utilization", SourceType: SourceMetric, Value: 12, ObservedAt: firstFinished}},
+		"agent-b": {{ID: "sample-b", TargetID: "agent-b", Name: "system.cpu.utilization", SourceType: SourceMetric, Value: 13, ObservedAt: secondFinished}},
+	}
+
+	_, err := fixture.worker().Process(context.Background(), fixture.now, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, []freshnessRequest{
+		{TargetID: "agent-a", SourceID: hostSnapshotSourceID, From: fixture.created, To: firstFinished.Add(30 * time.Second)},
+		{TargetID: "agent-b", SourceID: hostSnapshotSourceID, From: fixture.created, To: fixture.deadline},
+	}, fixture.repository.freshnessRequests)
+}
+
 func TestWorkerFailedTargetDoesNotFabricateFindingsAndSiblingContinues(t *testing.T) {
 	// Break caught: mapping one executor failure must not synthesize health or
 	// cancel evaluation of a successful sibling.
@@ -121,6 +150,19 @@ func TestWorkerFailedTargetDoesNotFabricateFindingsAndSiblingContinues(t *testin
 	require.Equal(t, "agent-b", fixture.repository.detail.Findings[0].TargetID)
 	require.Equal(t, 1, fixture.evidence.calls)
 	require.Len(t, fixture.repository.report.Artifacts, 2)
+}
+
+func TestWorkerFailedAuthenticatedOfflineTargetUsesStableAgentOfflineCode(t *testing.T) {
+	target := workerTarget("agent-a")
+	target.Connectivity = "offline"
+	fixture := newWorkerFixture(t, []TargetRun{target}, []job.TargetResult{workerJobResult("agent-a", job.TargetFailed)})
+
+	_, err := fixture.worker().Process(context.Background(), fixture.now, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, RunFailed, fixture.repository.detail.Run.Status)
+	require.Equal(t, "agent_offline", fixture.repository.detail.Targets[0].ErrorCode)
+	require.Empty(t, fixture.repository.detail.Findings)
 }
 
 func TestWorkerMapsCancelledTargetWithoutCancellingSibling(t *testing.T) {
@@ -186,6 +228,28 @@ func TestWorkerArtifactFailureRetriesReportWithoutRepeatingEvaluation(t *testing
 	require.Equal(t, 1, fixture.evidence.calls, "report repair must not evaluate again")
 	require.Equal(t, jobCalls, fixture.jobs.calls, "report repair must not load the Job")
 	require.Equal(t, firstJSONChecksum, fixture.artifacts.values[1].Checksum, "stable persisted generation time must keep retry bytes identical")
+}
+
+func TestWorkerPermanentRendererFailureTerminalizesRunWithoutArtifactRetry(t *testing.T) {
+	fixture := newWorkerFixture(t, []TargetRun{workerTarget("agent-a")}, nil)
+	fixture.repository.detail.Run.Status = RunGeneratingReport
+	fixture.repository.detail.Run.ItemSnapshot[0].RecommendationTemplate = "postgres://operator:secret@db.internal/app"
+	fixture.repository.detail.Targets[0].Status = TargetSucceeded
+	fixture.repository.detail.Findings = []Finding{{
+		Scope: fixture.repository.detail.Run.Scope, RunID: fixture.repository.detail.Run.ID, TargetID: "agent-a",
+		ItemID: fixture.repository.detail.Run.ItemSnapshot[0].ID, ItemVersion: fixture.repository.detail.Run.ItemSnapshot[0].Version,
+		Level: LevelHealthy, ObservedAt: fixture.created.Add(time.Second), Evidence: map[string]string{"value": "12"},
+		Recommendation: "postgres://operator:secret@db.internal/app",
+	}}
+	fixture.repository.reportGeneratedAt = fixture.now
+
+	processed, err := fixture.worker().Process(context.Background(), fixture.now, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, processed)
+	require.Equal(t, RunFailed, fixture.repository.detail.Run.Status)
+	require.Equal(t, 1, fixture.repository.failedReports)
+	require.Empty(t, fixture.artifacts.values)
 }
 
 func TestFindingCompletenessControlsTargetAndRunOutcome(t *testing.T) {
@@ -290,7 +354,7 @@ func newWorkerFixture(t *testing.T, targets []TargetRun, results []job.TargetRes
 	run := Run{
 		Scope: scope, ID: "run-a", PolicyID: "policy-a", PolicyVersion: 7, JobID: "job-a", Status: RunCollecting,
 		Trigger: RunTriggerManual, ItemSnapshot: []Item{item}, TargetCount: len(targets), AuditCorrelation: "inspection-run:run-a",
-		InitiatedBy: "operator-a", RequestID: "request-a", TraceID: "trace-a", CreatedAt: created,
+		InitiatedBy: "operator-a", RequestID: "request-a", TraceID: "trace-a", TargetTimeout: 5 * time.Minute, MaxConcurrency: 1, CreatedAt: created,
 	}
 	for index := range targets {
 		targets[index].Status = TargetCollecting
@@ -299,7 +363,7 @@ func newWorkerFixture(t *testing.T, targets []TargetRun, results []job.TargetRes
 	value := job.Job{
 		ID: run.JobID, Scope: scope, Type: "inspection", Status: job.StatusSucceeded, Outcome: job.AggregateOutcome(results),
 		TargetResourceIDs: targetIDs(targets), TargetResults: results, TimeoutAt: &deadline, FinishedAt: timePointerValue(deadline.Add(-time.Second)),
-		CreatedAt: created, RequestID: run.RequestID, TraceID: run.TraceID,
+		CreatedAt: created, TargetTimeout: 5 * time.Minute, MaxConcurrency: 1, RequestID: run.RequestID, TraceID: run.TraceID,
 	}
 	return &workerFixture{
 		created: created, now: created.Add(2 * time.Minute), deadline: deadline, repository: repository,
@@ -359,6 +423,7 @@ type memoryRunWorkerRepository struct {
 	pendingAudit        *ReportAuditClaim
 	recordedAuditDedupe string
 	reportGeneratedAt   time.Time
+	failedReports       int
 }
 
 func (repository *memoryRunWorkerRepository) ClaimRuns(_ context.Context, now time.Time, limit int, lease time.Duration) ([]RunClaim, error) {
@@ -421,6 +486,12 @@ func (repository *memoryRunWorkerRepository) SaveEvaluation(_ context.Context, c
 
 func (repository *memoryRunWorkerRepository) ReleaseRun(context.Context, RunClaim) error {
 	repository.released++
+	return nil
+}
+
+func (repository *memoryRunWorkerRepository) FailReport(_ context.Context, _ RunClaim, _ time.Time) error {
+	repository.failedReports++
+	repository.detail.Run.Status = RunFailed
 	return nil
 }
 

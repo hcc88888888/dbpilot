@@ -98,6 +98,8 @@ type Job struct {
 	StartedAt         *time.Time          `json:"started_at,omitempty"`
 	FinishedAt        *time.Time          `json:"finished_at,omitempty"`
 	TimeoutAt         *time.Time          `json:"timeout_at,omitempty"`
+	MaxConcurrency    int                 `json:"max_concurrency,omitempty"`
+	TargetTimeout     time.Duration       `json:"target_timeout,omitempty"`
 	CancelRequestedBy string              `json:"cancel_requested_by,omitempty"`
 	CancelRequestedAt *time.Time          `json:"cancel_requested_at,omitempty"`
 	RequestID         string              `json:"request_id"`
@@ -402,6 +404,9 @@ func AggregateProgressForTargets(expected []string, results []TargetResult) Prog
 // transitions. It bounds fan-out, rejects duplicate/unknown targets, and keeps
 // persisted counters derived from target rows.
 func ValidateTargets(value Job) error {
+	if err := validateExecutionLimits(value); err != nil {
+		return err
+	}
 	if len(value.TargetResourceIDs) > MaximumTargetsPerJob || value.Progress.TotalTargets != len(value.TargetResourceIDs) {
 		return ErrInvalidTransition
 	}
@@ -426,6 +431,19 @@ func ValidateTargets(value Job) error {
 		seen[result.TargetID] = struct{}{}
 	}
 	if value.Progress != AggregateProgressForTargets(value.TargetResourceIDs, value.TargetResults) {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
+func validateExecutionLimits(value Job) error {
+	if value.MaxConcurrency == 0 && value.TargetTimeout == 0 {
+		if value.Type == "inspection.collect" {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	if value.MaxConcurrency < 1 || value.MaxConcurrency > 1000 || value.TargetTimeout < time.Second || value.TargetTimeout > time.Hour {
 		return ErrInvalidTransition
 	}
 	return nil

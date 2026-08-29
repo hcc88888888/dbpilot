@@ -12,7 +12,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import { ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, DownloadDescriptorFromJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, UpdateInspectionPolicyRequestToJSON, } from '../models/index.js';
+import { ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, DownloadDescriptorFromJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, UpdateInspectionPolicyRequestToJSON, } from '../models/index.js';
 /**
  *
  */
@@ -230,8 +230,12 @@ export class DefaultApi extends runtime.BaseAPI {
         if (requestParameters['idempotencyKey'] == null) {
             throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createInspectionReportDownload().');
         }
+        if (requestParameters['inspectionReportDownloadRequest'] == null) {
+            throw new runtime.RequiredError('inspectionReportDownloadRequest', 'Required parameter "inspectionReportDownloadRequest" was null or undefined when calling createInspectionReportDownload().');
+        }
         const queryParameters = {};
         const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
         if (requestParameters['idempotencyKey'] != null) {
             headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
         }
@@ -249,6 +253,7 @@ export class DefaultApi extends runtime.BaseAPI {
             method: 'POST',
             headers: headerParameters,
             query: queryParameters,
+            body: InspectionReportDownloadRequestToJSON(requestParameters['inspectionReportDownloadRequest']),
         }, initOverrides);
         return new runtime.JSONApiResponse(response, (jsonValue) => DownloadDescriptorFromJSON(jsonValue));
     }

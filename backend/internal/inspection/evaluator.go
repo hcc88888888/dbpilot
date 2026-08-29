@@ -113,8 +113,15 @@ func (e *Evaluator) evaluateMetric(ctx context.Context, snapshot RunSnapshot, ta
 }
 
 func evaluateMetadata(snapshot RunSnapshot, target TargetRun, item Item, now time.Time) Finding {
-	if item.ID == "database.process.presence" && !target.TrustedProcessAllowlist {
-		return baseFinding(snapshot, target, item, LevelUnsupported, now, map[string]string{"reason": "process_allowlist_unconfigured"})
+	if item.ID == "database.process.presence" {
+		availabilityName := "dbpilot.inspection.host.database.process_allowlist_available"
+		availability, ok, malformed := latestObservation(target.Observations, target.TargetID, SourceMetadata, availabilityName, now.Add(-5*time.Minute), now)
+		if !ok || malformed || (availability.Value != 0 && availability.Value != 1) {
+			return baseFinding(snapshot, target, item, LevelMissingData, now, map[string]string{"metric": availabilityName, "samples": "0"})
+		}
+		if availability.Value == 0 {
+			return baseFinding(snapshot, target, item, LevelUnsupported, availability.ObservedAt.UTC(), map[string]string{"reason": "process_allowlist_unconfigured"})
+		}
 	}
 	name := map[string]string{
 		"host.oom.evidence":         "dbpilot.inspection.host.oom.count",

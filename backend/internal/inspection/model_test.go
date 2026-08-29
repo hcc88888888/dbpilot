@@ -1,12 +1,23 @@
 package inspection
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
+	"github.com/stretchr/testify/require"
 )
+
+func TestLegacyTargetSnapshotIgnoresRemovedControlPlaneProcessTrustFlag(t *testing.T) {
+	var target TargetRun
+	require.NoError(t, json.Unmarshal([]byte(`{"target_id":"agent-a","agent_id":"agent-a","status":"pending","trusted_process_allowlist":true}`), &target))
+	require.NoError(t, target.Validate())
+	encoded, err := json.Marshal(target)
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "trusted_process_allowlist")
+}
 
 func TestTransitionAllowsOnlyForwardRunStates(t *testing.T) {
 	// Break caught: allowing a terminal run to re-enter evaluation would rewrite immutable history.

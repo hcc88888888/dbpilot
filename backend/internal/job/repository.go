@@ -30,6 +30,7 @@ type CancellationSnapshotRepository interface {
 // subsequent mutations must present that exact scope.
 type DispatchRepository interface {
 	ClaimOutbox(context.Context, int, time.Time) ([]OutboxMessage, error)
+	ReservePrepareSlot(context.Context, platformscope.Scope, string, time.Time) (bool, error)
 	LookupCommand(context.Context, string) (OutboxMessage, error)
 	PrepareCommandEnvelope(context.Context, platformscope.Scope, string, []byte) ([]byte, error)
 	ClaimPreparedCommands(context.Context, int, time.Time) ([]OutboxMessage, error)

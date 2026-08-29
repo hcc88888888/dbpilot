@@ -161,6 +161,68 @@ func TestReadyRootReplacementNeverReadsReplacementDirectory(t *testing.T) {
 	require.NotEqual(t, "replacement-secret", string(payload))
 }
 
+func TestLocalBlobReadyProbesWritableRetainedRootAndCleansUniqueHiddenFiles(t *testing.T) {
+	root := t.TempDir()
+	sentinel := filepath.Join(root, "existing-report.blob")
+	require.NoError(t, os.WriteFile(sentinel, []byte("do not alter"), 0o600))
+	store := NewLocalBlobStore(root)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	require.NoError(t, store.Ready())
+	require.NotNil(t, store.root)
+	require.Equal(t, "do not alter", string(requireFileContents(t, sentinel)))
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Equal(t, []string{"existing-report.blob"}, []string{entries[0].Name()})
+}
+
+func TestLocalBlobReadyFailureBoundariesNeverRetainRootOrLeaveProbeFiles(t *testing.T) {
+	for _, step := range []string{"create", "write", "file_sync", "publish", "remove", "directory_sync"} {
+		t.Run(step, func(t *testing.T) {
+			root := t.TempDir()
+			sentinel := filepath.Join(root, "existing-report.blob")
+			require.NoError(t, os.WriteFile(sentinel, []byte("unchanged"), 0o600))
+			store := NewLocalBlobStore(root)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			store.readyProbeHook = func(current string) error {
+				if current == step {
+					return errors.New("injected " + step + " failure")
+				}
+				return nil
+			}
+
+			err := store.Ready()
+
+			require.ErrorContains(t, err, "injected")
+			require.Nil(t, store.root)
+			entries, readErr := os.ReadDir(root)
+			require.NoError(t, readErr)
+			require.Len(t, entries, 1)
+			require.Equal(t, "existing-report.blob", entries[0].Name())
+			require.Equal(t, "unchanged", string(requireFileContents(t, sentinel)))
+		})
+	}
+}
+
+func TestLocalBlobReadyFallsBackToAtomicRenameWhenHardLinkUnavailable(t *testing.T) {
+	root := t.TempDir()
+	store := NewLocalBlobStore(root)
+	store.readyLink = func(*os.Root, string, string) error { return errors.New("hard links unavailable") }
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	require.NoError(t, store.Ready())
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+func requireFileContents(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return contents
+}
+
 func TestLocalBlobPutUsesRetainedRootAfterConfiguredPathReplacement(t *testing.T) {
 	// Break caught: reopening the configured path for writes after Ready lets a
 	// path replacement redirect immutable report bytes outside the retained root.

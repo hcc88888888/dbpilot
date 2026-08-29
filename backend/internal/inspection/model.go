@@ -192,23 +192,23 @@ func (o Observation) Validate() error {
 // TargetRun records immutable target identity plus the Agent-advertised
 // source types and normalized non-metric evidence for a particular run.
 type TargetRun struct {
-	TargetID                string            `json:"target_id"`
-	AgentID                 string            `json:"agent_id"`
-	CommandID               string            `json:"command_id,omitempty"`
-	DisplayName             string            `json:"display_name,omitempty"`
-	Host                    string            `json:"host,omitempty"`
-	Labels                  map[string]string `json:"labels,omitempty"`
-	Status                  TargetStatus      `json:"status"`
-	ErrorCode               string            `json:"error_code,omitempty"`
-	ObservedAt              time.Time         `json:"observed_at,omitempty"`
-	AdvertisedSources       []SourceType      `json:"advertised_sources,omitempty"`
-	Capabilities            []string          `json:"capabilities,omitempty"`
-	TrustedProcessAllowlist bool              `json:"trusted_process_allowlist"`
-	Observations            []Observation     `json:"observations,omitempty"`
+	TargetID          string            `json:"target_id"`
+	AgentID           string            `json:"agent_id"`
+	CommandID         string            `json:"command_id,omitempty"`
+	DisplayName       string            `json:"display_name,omitempty"`
+	Host              string            `json:"host,omitempty"`
+	Labels            map[string]string `json:"labels,omitempty"`
+	Connectivity      string            `json:"connectivity,omitempty"`
+	Status            TargetStatus      `json:"status"`
+	ErrorCode         string            `json:"error_code,omitempty"`
+	ObservedAt        time.Time         `json:"observed_at,omitempty"`
+	AdvertisedSources []SourceType      `json:"advertised_sources,omitempty"`
+	Capabilities      []string          `json:"capabilities,omitempty"`
+	Observations      []Observation     `json:"observations,omitempty"`
 }
 
 func (t TargetRun) Validate() error {
-	if !validID(t.TargetID) || !validID(t.AgentID) || !validTargetStatus(t.Status) || (!t.ObservedAt.IsZero() && !isUTC(t.ObservedAt)) || !validCapabilities(t.Capabilities) || len(t.Observations) > maxTargetObservations {
+	if !validID(t.TargetID) || !validID(t.AgentID) || !validTargetStatus(t.Status) || !validConnectivity(t.Connectivity) || (!t.ObservedAt.IsZero() && !isUTC(t.ObservedAt)) || !validCapabilities(t.Capabilities) || len(t.Observations) > maxTargetObservations {
 		return ErrInvalidTargetRun
 	}
 	seenSources := make(map[SourceType]struct{}, len(t.AdvertisedSources))
@@ -469,6 +469,10 @@ func validTargetStatus(value TargetStatus) bool {
 	default:
 		return false
 	}
+}
+
+func validConnectivity(value string) bool {
+	return value == "" || value == "unknown" || value == "online" || value == "offline"
 }
 
 func validFindingLevel(value FindingLevel) bool {

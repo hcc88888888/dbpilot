@@ -79,11 +79,15 @@ type HostSnapshot struct {
 	MemoryUsedPercent float64
 	SwapUsedPercent   float64
 	Filesystems       []FilesystemObservation
-	Disks             []DiskObservation
-	Networks          []NetworkObservation
-	Processes         []ProcessObservation
-	BootTime          time.Time
-	TimeSync          TimeSyncObservation
+	// FilesystemReadIncomplete records that at least one discovered mount could
+	// not be read. Optional per-mount detail may still be emitted, but aggregate
+	// catalog metrics must be omitted because they would not be complete.
+	FilesystemReadIncomplete bool
+	Disks                    []DiskObservation
+	Networks                 []NetworkObservation
+	Processes                []ProcessObservation
+	BootTime                 time.Time
+	TimeSync                 TimeSyncObservation
 }
 
 type HostReader interface {
@@ -132,29 +136,9 @@ func (GopsutilHostReader) Read(ctx context.Context) (HostSnapshot, error) {
 	if err != nil {
 		return HostSnapshot{}, fmt.Errorf("read filesystem partitions: %w", err)
 	}
-	filesystems := make([]FilesystemObservation, 0, len(partitions))
-	for _, partition := range partitions {
-		usage, usageErr := disk.UsageWithContext(ctx, partition.Mountpoint)
-		if usageErr != nil || usage.Total == 0 {
-			continue
-		}
-		filesystems = append(filesystems, FilesystemObservation{
-			Device: partition.Device, Mountpoint: partition.Mountpoint, Type: partition.Fstype,
-			UsedBytes: usage.Used, TotalBytes: usage.Total, UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
-		})
-	}
-	if len(filesystems) == 0 {
-		usage, usageErr := disk.UsageWithContext(ctx, string(filepath.Separator))
-		if usageErr != nil {
-			return HostSnapshot{}, fmt.Errorf("read root filesystem usage: %w", usageErr)
-		}
-		if usage.Total == 0 {
-			return HostSnapshot{}, errors.New("read root filesystem usage: zero capacity")
-		}
-		filesystems = append(filesystems, FilesystemObservation{
-			Device: string(filepath.Separator), Mountpoint: string(filepath.Separator), Type: "rootfs",
-			UsedBytes: usage.Used, TotalBytes: usage.Total, UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
-		})
+	filesystems, filesystemReadIncomplete, err := readFilesystemObservations(ctx, partitions, disk.UsageWithContext)
+	if err != nil {
+		return HostSnapshot{}, err
 	}
 	diskCounters, err := disk.IOCountersWithContext(ctx)
 	if err != nil {
@@ -188,9 +172,48 @@ func (GopsutilHostReader) Read(ctx context.Context) (HostSnapshot, error) {
 	}
 	return HostSnapshot{
 		Hostname: hostname.Hostname, OSType: runtime.GOOS, CPUUtilization: cpuPercent[0], LogicalCPUs: logicalCPUs, Load1: loadAverage.Load1,
-		MemoryUsedPercent: memory.UsedPercent, SwapUsedPercent: swap.UsedPercent, Filesystems: filesystems, Disks: disks, Networks: networks,
+		MemoryUsedPercent: memory.UsedPercent, SwapUsedPercent: swap.UsedPercent, Filesystems: filesystems, FilesystemReadIncomplete: filesystemReadIncomplete, Disks: disks, Networks: networks,
 		Processes: processObservations, BootTime: time.Unix(int64(hostname.BootTime), 0).UTC(), TimeSync: readTimeSync(ctx),
 	}, nil
+}
+
+type filesystemUsageReader func(context.Context, string) (*disk.UsageStat, error)
+
+func readFilesystemObservations(ctx context.Context, partitions []disk.PartitionStat, readUsage filesystemUsageReader) ([]FilesystemObservation, bool, error) {
+	if ctx == nil || readUsage == nil {
+		return nil, false, errors.New("filesystem reader context and usage reader are required")
+	}
+	if len(partitions) == 0 {
+		root := string(filepath.Separator)
+		usage, err := readUsage(ctx, root)
+		if err != nil {
+			return nil, false, fmt.Errorf("read root filesystem usage: %w", err)
+		}
+		if usage == nil || usage.Total == 0 {
+			return nil, false, errors.New("read root filesystem usage: zero capacity")
+		}
+		return []FilesystemObservation{{
+			Device: root, Mountpoint: root, Type: "rootfs", UsedBytes: usage.Used, TotalBytes: usage.Total,
+			UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
+		}}, false, nil
+	}
+	filesystems := make([]FilesystemObservation, 0, len(partitions))
+	incomplete := false
+	for _, partition := range partitions {
+		usage, err := readUsage(ctx, partition.Mountpoint)
+		if err != nil || usage == nil || usage.Total == 0 {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return nil, false, contextErr
+			}
+			incomplete = true
+			continue
+		}
+		filesystems = append(filesystems, FilesystemObservation{
+			Device: partition.Device, Mountpoint: partition.Mountpoint, Type: partition.Fstype,
+			UsedBytes: usage.Used, TotalBytes: usage.Total, UsedPercent: usage.UsedPercent, InodesUsedPercent: usage.InodesUsedPercent,
+		})
+	}
+	return filesystems, incomplete, nil
 }
 
 type HostSnapshotStore interface {
@@ -315,9 +338,21 @@ func (c *HostSnapshotCollector) buildMetrics(snapshot HostSnapshot, stats spool.
 	addInt("dbpilot.inspection.host.boot_time_unix_seconds", "s", snapshot.BootTime.UTC().Unix(), false, nil)
 
 	filesystems := append([]FilesystemObservation(nil), snapshot.Filesystems...)
+	var maximumFilesystemUtilization float64
+	var maximumFilesystemInodeUtilization float64
 	for _, filesystem := range filesystems {
 		if filesystem.TotalBytes == 0 || filesystem.UsedBytes > filesystem.TotalBytes || !validHostPercent(filesystem.UsedPercent) || !validHostPercent(filesystem.InodesUsedPercent) {
 			return pmetric.Metrics{}, errors.New("invalid filesystem observation")
+		}
+		maximumFilesystemUtilization = math.Max(maximumFilesystemUtilization, filesystem.UsedPercent)
+		maximumFilesystemInodeUtilization = math.Max(maximumFilesystemInodeUtilization, filesystem.InodesUsedPercent)
+	}
+	if len(filesystems) > 0 && !snapshot.FilesystemReadIncomplete {
+		if err := addFloat("system.filesystem.utilization", "%", maximumFilesystemUtilization, nil); err != nil {
+			return pmetric.Metrics{}, err
+		}
+		if err := addFloat("system.filesystem.inode_utilization", "%", maximumFilesystemInodeUtilization, nil); err != nil {
+			return pmetric.Metrics{}, err
 		}
 	}
 	sort.Slice(filesystems, func(i, j int) bool {
@@ -331,10 +366,10 @@ func (c *HostSnapshotCollector) buildMetrics(snapshot HostSnapshot, stats spool.
 	}
 	for _, filesystem := range filesystems {
 		attributes := boundedHostAttributes(map[string]string{"device": filesystem.Device, "mountpoint": filesystem.Mountpoint, "type": filesystem.Type})
-		if err := addFloat("system.filesystem.utilization", "%", filesystem.UsedPercent, attributes); err != nil {
+		if err := addFloat("dbpilot.inspection.host.filesystem.utilization", "%", filesystem.UsedPercent, attributes); err != nil {
 			return pmetric.Metrics{}, err
 		}
-		if err := addFloat("system.filesystem.inode_utilization", "%", filesystem.InodesUsedPercent, attributes); err != nil {
+		if err := addFloat("dbpilot.inspection.host.filesystem.inode_utilization", "%", filesystem.InodesUsedPercent, attributes); err != nil {
 			return pmetric.Metrics{}, err
 		}
 		usedAttributes := cloneStringMap(attributes)
