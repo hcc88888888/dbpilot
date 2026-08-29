@@ -9,7 +9,7 @@ WORKDIR /work
 
 COPY --chown=pwuser:pwuser backend/test/e2e/full-stack/package.json backend/test/e2e/full-stack/package-lock.json ./
 RUN npm ci --ignore-scripts
-COPY --chown=pwuser:pwuser backend/test/e2e/full-stack/playwright.config.mjs backend/test/e2e/full-stack/acceptance.spec.mjs ./
+COPY --chown=pwuser:pwuser backend/test/e2e/full-stack/playwright.config.mjs backend/test/e2e/full-stack/acceptance.spec.mjs backend/test/e2e/full-stack/support.mjs ./
 
 USER pwuser
 CMD ["npx", "playwright", "test", "--config", "playwright.config.mjs"]

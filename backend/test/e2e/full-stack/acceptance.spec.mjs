@@ -1,6 +1,13 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import https from 'node:https';
+import {
+  assertNoSecretExposure,
+  createFailureArtifacts,
+  findingEvidenceIsComplete,
+  renderedFindingMatches,
+  verifyArtifactDownload,
+} from './support.mjs';
 
 if (process.env.NODE_TEST_CONTEXT === undefined) {
 const environment = requireEnvironment([
@@ -27,6 +34,7 @@ let tokens;
 let acceptedPolicy;
 let acceptedRun;
 let acceptedReport;
+const consoleByPage = new WeakMap();
 
 test.describe.configure({ mode: 'serial' });
 
@@ -44,28 +52,47 @@ test.beforeAll(async () => {
   });
 });
 
+test.beforeEach(async ({ page }) => {
+  const entries = [];
+  consoleByPage.set(page, entries);
+  page.on('console', (message) => entries.push(message.text()));
+});
+
 test.afterEach(async ({ page }, testInfo) => {
-  const body = await page.locator('body').textContent().catch(() => '');
+  const html = await page.content().catch(() => '<html><body>DOM unavailable</body></html>');
   const currentURL = page.url();
-  for (const token of Object.values(tokens ?? {})) {
-    expect(body).not.toContain(token);
-    expect(currentURL).not.toContain(token);
+  const consoleEntries = consoleByPage.get(page) ?? [];
+  const secrets = retainedSecrets();
+  let exposure;
+  try {
+    assertNoSecretExposure({ secrets, body: html, url: currentURL, consoleEntries });
+  } catch (error) {
+    exposure = error;
   }
-  if (testInfo.status !== testInfo.expectedStatus) {
-    const html = await page.content().catch(() => '<html><body>DOM unavailable</body></html>');
+  if (exposure || testInfo.status !== testInfo.expectedStatus) {
+    const artifacts = createFailureArtifacts({ secrets, html, consoleEntries });
     await testInfo.attach('dom.html', {
-      body: Buffer.from(redactSecrets(html), 'utf8'),
+      body: Buffer.from(artifacts.dom, 'utf8'),
       contentType: 'text/html',
     });
+    await testInfo.attach('console.log', {
+      body: Buffer.from(artifacts.console, 'utf8'),
+      contentType: 'text/plain',
+    });
+    const replaced = await page.setContent(artifacts.screenshotMarkup).then(() => true).catch(() => false);
+    if (replaced) {
+      const screenshot = await page.screenshot({ type: 'png', fullPage: true }).catch(() => undefined);
+      if (screenshot) await testInfo.attach('failure.png', { body: screenshot, contentType: 'image/png' });
+    }
   }
+  if (exposure) throw exposure;
 });
 
 test('real Agent readiness, label policy, partial inspection, report and downloads complete through the browser', async ({ page }) => {
-  const browserConsole = [];
-  page.on('console', (message) => browserConsole.push(message.text()));
   await installBootstrap(page, tokens.valid, fullPermissions);
 
   const readiness = await waitForAgentReadiness(tokens.valid);
+  auditValueForSecrets(readiness);
   expect(readiness.targets).toHaveLength(2);
   expect(readiness.online.connectivity).toBe('online');
   expect(readiness.online.capabilities).toContain('collect_now.host.v1');
@@ -73,15 +100,17 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   expect(readiness.items).toHaveLength(13);
 
   await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
-  await expect(page.locator('.ins-shell-source.control-plane')).toHaveText('控制面服务');
-  await expect(page.locator('.ins-shell-source.demo')).toHaveCount(0);
-  await expect(page.locator('.ins-scope')).toContainText(`${environment.TENANT_ID} / ${environment.PROJECT_ID}`);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('.ins-shell-source.control-plane'), '控制面服务', 'configured source was not rendered');
+  await requireCount(page.locator('.ins-shell-source.demo'), 0, 'demo source was rendered in configured mode');
+  await requireText(page.locator('.ins-scope'), `${environment.TENANT_ID} / ${environment.PROJECT_ID}`, 'authenticated scope was not rendered');
 
   await page.getByRole('button', { name: '巡检策略' }).click();
   const targetInputs = page.locator('fieldset[aria-label="巡检目标"] input[name="target_id"]');
   const itemInputs = page.locator('fieldset[aria-label="巡检项"] input[name="item_version"]');
-  await expect(targetInputs).toHaveCount(2);
-  await expect(itemInputs).toHaveCount(13);
+  await auditBrowserLeaks(page);
+  await requireCount(targetInputs, 2, 'expected targets were not rendered');
+  await requireCount(itemInputs, 13, 'expected inspection items were not rendered');
   expect(await targetInputs.evaluateAll((inputs) => inputs.map((input) => input.value).sort())).toEqual([
     environment.EXPECTED_OFFLINE_AGENT_ID,
     environment.EXPECTED_ONLINE_AGENT_ID,
@@ -98,13 +127,16 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   const createResponse = await createResponsePromise;
   expect(createResponse.status()).toBe(201);
   acceptedPolicy = await createResponse.json();
+  auditValueForSecrets(acceptedPolicy);
   expect(acceptedPolicy.target_ids ?? []).toHaveLength(0);
   expect(acceptedPolicy.labels).toEqual({ environment: 'acceptance' });
-  await expect(page.locator('#toast')).toHaveText('巡检策略已创建');
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('#toast'), '巡检策略已创建', 'policy creation confirmation was not rendered');
 
   const policyRow = page.locator('.ins-policy-row', { hasText: policyName });
   await policyRow.locator('[data-inspection-policy-edit]').click();
-  await expect(form).toHaveAttribute('data-inspection-policy-etag', /.+/);
+  await auditBrowserLeaks(page);
+  await requireCondition(async () => Boolean(await form.getAttribute('data-inspection-policy-etag')), 'policy ETag was not rendered');
   const etag = await form.getAttribute('data-inspection-policy-etag');
   expect(etag).toBeTruthy();
   const updatedPolicyName = `${policyName} updated`;
@@ -115,7 +147,9 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   expect(updateResponse.status()).toBe(200);
   expect(updateResponse.request().headers()['if-match']).toBe(etag);
   acceptedPolicy = await updateResponse.json();
-  await expect(page.locator('#toast')).toHaveText('巡检策略已更新');
+  auditValueForSecrets(acceptedPolicy);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('#toast'), '巡检策略已更新', 'policy update confirmation was not rendered');
 
   const updatedPolicyRow = page.locator('.ins-policy-row', { hasText: updatedPolicyName });
   const runResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/inspection-policies/${encodeURIComponent(acceptedPolicy.id)}/run`));
@@ -123,9 +157,12 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   const runResponse = await runResponsePromise;
   expect(runResponse.status()).toBe(202);
   acceptedRun = await runResponse.json();
-  await expect(page.locator('#toast')).toHaveText('巡检已开始');
+  auditValueForSecrets(acceptedRun);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('#toast'), '巡检已开始', 'inspection start confirmation was not rendered');
 
   acceptedRun = await pollJSON(`${scopePath}/inspection-runs/${encodeURIComponent(acceptedRun.id)}`, tokens.valid, (value) => value?.status === 'partial');
+  auditValueForSecrets(acceptedRun);
   expect(acceptedRun.target_count).toBe(2);
   expect(acceptedRun.status).toBe('partial');
   expect(acceptedRun.targets).toEqual(expect.arrayContaining([
@@ -135,23 +172,29 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
 
   await page.getByRole('button', { name: '执行记录' }).click();
   await page.locator(`[data-inspection-run="${acceptedRun.id}"]`).click();
-  await expect(page.locator('.ins-run-detail')).toContainText('部分完成');
-  await expect(page.locator('.ins-run-detail')).toContainText(environment.EXPECTED_ONLINE_AGENT_ID);
-  await expect(page.locator('.ins-run-detail')).toContainText(environment.EXPECTED_OFFLINE_AGENT_ID);
-  await expect(page.locator('.ins-finding')).toHaveCount(13);
-  await expect(page.locator('.ins-finding.missing_data, .ins-finding.unsupported')).toHaveCount(0);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('.ins-run-detail'), '部分完成', 'partial Run state was not rendered');
+  await requireText(page.locator('.ins-run-detail'), environment.EXPECTED_ONLINE_AGENT_ID, 'online target was not rendered');
+  await requireText(page.locator('.ins-run-detail'), environment.EXPECTED_OFFLINE_AGENT_ID, 'offline target was not rendered');
+  await requireCount(page.locator('.ins-finding'), 13, 'expected Findings were not rendered');
+  await requireCount(page.locator('.ins-finding.missing_data, .ins-finding.unsupported'), 0, 'invalid Finding levels were rendered');
 
   await page.locator(`[data-inspection-report="${acceptedRun.report_id}"]`).click();
-  await expect(page.locator('.ins-report-detail')).toBeVisible();
+  await auditBrowserLeaks(page);
+  await requireCondition(() => page.locator('.ins-report-detail').isVisible(), 'inspection report was not rendered');
   acceptedReport = await apiJSON(`${scopePath}/inspection-reports/${encodeURIComponent(acceptedRun.report_id)}`, tokens.valid);
+  auditValueForSecrets(acceptedReport);
   expect(acceptedReport.run_id).toBe(acceptedRun.id);
   expect(acceptedReport.findings).toHaveLength(13);
   expect(acceptedReport.findings.every((finding) => finding.target_id === environment.EXPECTED_ONLINE_AGENT_ID)).toBe(true);
   expect(acceptedReport.findings.every((finding) => !['missing_data', 'unsupported'].includes(finding.level))).toBe(true);
-  expect(acceptedReport.findings.every((finding) => safeFindingEvidence(finding))).toBe(true);
+  expect(acceptedReport.findings.every((finding) => findingEvidenceIsComplete(finding))).toBe(true);
   const thresholdFindings = acceptedReport.findings.filter((finding) => finding.warning_threshold !== undefined || finding.critical_threshold !== undefined);
   expect(thresholdFindings.length).toBeGreaterThan(0);
   expect(thresholdFindings.every((finding) => Number.isFinite(finding.warning_threshold) && Number.isFinite(finding.critical_threshold))).toBe(true);
+  const representative = thresholdFindings[0];
+  const representativeMarkup = await page.locator('.ins-finding', { hasText: representative.item_id }).first().textContent().catch(() => '');
+  expect(renderedFindingMatches(representativeMarkup, representative)).toBe(true);
   expect(acceptedReport.references?.job_id).toBeTruthy();
   expect(acceptedReport.references?.audit_correlation).toBeTruthy();
   expect(acceptedReport.references?.commands).toEqual(expect.arrayContaining([
@@ -162,6 +205,7 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
     apiJSON(`${scopePath}/jobs/${encodeURIComponent(acceptedReport.references.job_id)}`, tokens.valid),
     apiJSON(`${scopePath}/audit-events?limit=100`, tokens.valid),
   ]);
+  auditValueForSecrets({ job, auditPage });
   expect(job.id).toBe(acceptedReport.references.job_id);
   expect(job.progress?.total_targets).toBe(2);
   expect(auditPage.items).toEqual(expect.arrayContaining([
@@ -170,38 +214,38 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   for (const command of acceptedReport.references.commands) {
     expect(auditPage.items.some((event) => event.command_id === command.command_id)).toBe(true);
   }
-  await expect(page.locator('.ins-report-meta')).toContainText(acceptedReport.references.job_id);
-  await expect(page.locator('.ins-report-meta')).toContainText(acceptedReport.references.audit_correlation);
-  for (const command of acceptedReport.references.commands) await expect(page.locator('.ins-report-meta')).toContainText(command.command_id);
-  await expect(page.locator('.ins-target-navigation')).toContainText(environment.EXPECTED_ONLINE_AGENT_ID);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('.ins-report-meta'), acceptedReport.references.job_id, 'Job reference was not rendered');
+  await requireText(page.locator('.ins-report-meta'), acceptedReport.references.audit_correlation, 'Audit reference was not rendered');
+  for (const command of acceptedReport.references.commands) await requireText(page.locator('.ins-report-meta'), command.command_id, 'Command reference was not rendered');
+  await requireText(page.locator('.ins-target-navigation'), environment.EXPECTED_ONLINE_AGENT_ID, 'report target navigation was not rendered');
 
   const artifacts = await Promise.all(acceptedReport.artifacts.map((reference) => apiJSON(`${scopePath}/artifacts/${encodeURIComponent(reference.artifact_id)}`, tokens.valid)));
+  auditValueForSecrets(artifacts);
   expect(artifacts).toHaveLength(2);
   expect(new Set(artifacts.map((artifact) => artifact.content_type))).toEqual(new Set(['text/html; charset=utf-8', 'application/json']));
   expect(artifacts.every((artifact) => /^sha256:[a-f0-9]{64}$/.test(artifact.checksum))).toBe(true);
 
   const htmlDownload = await openReportDownload(page, 'html');
   const jsonDownload = await openReportDownload(page, 'json');
-  expect(htmlDownload.contentType).toContain('text/html');
-  expect(jsonDownload.contentType).toContain('application/json');
-  expect(htmlDownload.body).toContain(acceptedRun.id);
-  expect(jsonDownload.body).toContain(acceptedRun.id);
-
-  const exposed = JSON.stringify({ body: await page.locator('body').textContent(), url: page.url(), console: browserConsole });
-  for (const token of Object.values(tokens)) expect(exposed).not.toContain(token);
+  verifyArtifactDownload({ format: 'html', ...htmlDownload, metadata: artifactForFormat(artifacts, 'html'), runId: acceptedRun.id });
+  verifyArtifactDownload({ format: 'json', ...jsonDownload, metadata: artifactForFormat(artifacts, 'json'), runId: acceptedRun.id });
+  await auditBrowserLeaks(page);
 });
 
 test('missing execute permission produces a fixed 403 state without demo fallback', async ({ page }) => {
   await installBootstrap(page, tokens.missingPermission, fullPermissions);
   await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
-  await expect(page.locator('.ins-shell-source.control-plane')).toHaveText('控制面服务');
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('.ins-shell-source.control-plane'), '控制面服务', 'configured source was not rendered');
   await page.getByRole('button', { name: '巡检策略' }).click();
   const policyRow = page.locator('.ins-policy-row', { hasText: acceptedPolicy.name });
   const forbiddenResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/inspection-policies/${encodeURIComponent(acceptedPolicy.id)}/run`));
   await policyRow.locator('[data-inspection-policy-run]').click();
   expect((await forbiddenResponsePromise).status()).toBe(403);
-  await expect(page.locator('#toast')).toHaveText('当前账号没有该项目的巡检查看权限');
-  await expect(page.locator('.ins-shell-source.demo')).toHaveCount(0);
+  await auditBrowserLeaks(page);
+  await requireText(page.locator('#toast'), '当前账号没有该项目的巡检查看权限', 'fixed forbidden state was not rendered');
+  await requireCount(page.locator('.ins-shell-source.demo'), 0, 'demo source was rendered after 403');
 });
 
 for (const [variant, tokenName] of [['wrong audience', 'wrongAudience'], ['expired', 'expired']]) {
@@ -210,8 +254,9 @@ for (const [variant, tokenName] of [['wrong audience', 'wrongAudience'], ['expir
     const unauthorizedResponsePromise = page.waitForResponse((response) => response.request().method() === 'GET' && response.url().endsWith('/inspection-overview'));
     await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
     expect((await unauthorizedResponsePromise).status()).toBe(401);
-    await expect(page.locator('.ins-state-page[role="alert"]')).toContainText('登录状态已失效，请重新登录');
-    await expect(page.locator('.ins-shell-source.demo')).toHaveCount(0);
+    await auditBrowserLeaks(page);
+    await requireText(page.locator('.ins-state-page[role="alert"]'), '登录状态已失效，请重新登录', 'fixed unauthorized state was not rendered');
+    await requireCount(page.locator('.ins-shell-source.demo'), 0, 'demo source was rendered after 401');
   });
 }
 
@@ -326,18 +371,22 @@ function httpsJSON(url, { method = 'GET', headers = {}, body } = {}) {
 }
 
 async function openReportDownload(page, format) {
-  const popupPromise = page.waitForEvent('popup');
-  await page.locator(`[data-inspection-report-format="${format}"]`).click();
-  const popup = await popupPromise;
-  await popup.waitForLoadState('domcontentloaded');
-  const value = await popup.evaluate(() => ({ contentType: document.contentType, body: document.body.textContent ?? '' }));
-  await popup.close();
-  return value;
-}
-
-function safeFindingEvidence(finding) {
-  const serialized = JSON.stringify({ evidence: finding.evidence, evidence_fields: finding.evidence_fields, summary: finding.summary, recommendation: finding.recommendation });
-  return serialized.length <= 80_000 && !/(?:authorization|bearer\s+eyJ|password|private key|postgres:\/\/)/i.test(serialized);
+  try {
+    const responsePromise = page.context().waitForEvent('response', {
+      predicate: (response) => response.request().resourceType() === 'document' && new URL(response.url()).pathname.startsWith('/api/v1/artifact-downloads/'),
+      timeout: 15_000,
+    });
+    const popupPromise = page.waitForEvent('popup', { timeout: 15_000 });
+    await page.locator(`[data-inspection-report-format="${format}"]`).click();
+    const [response, popup] = await Promise.all([responsePromise, popupPromise]);
+    if (response.status() !== 200) throw new Error('download failed');
+    const bytes = await response.body();
+    const responseContentType = response.headers()['content-type'] ?? '';
+    await popup.close().catch(() => {});
+    return { bytes, responseContentType };
+  } catch {
+    throw new Error('artifact browser download failed');
+  }
 }
 
 function decodeJWT(accessToken) {
@@ -350,15 +399,54 @@ function decodeJWT(accessToken) {
   }
 }
 
-function redactSecrets(value) {
-  let redacted = String(value ?? '');
-  if (credential) redacted = redacted.replaceAll(credential, '[REDACTED]');
-  for (const token of Object.values(tokens ?? {})) redacted = redacted.replaceAll(token, '[REDACTED]');
-  return redacted.replace(/Bearer\s+[^\s<"']+/gi, 'Bearer [REDACTED]');
+function safeError(error) {
+  return String(error?.code || error?.name || 'request failed');
 }
 
-function safeError(error) {
-  return redactSecrets(error?.code || error?.name || 'request failed');
+async function auditBrowserLeaks(page) {
+  assertNoSecretExposure({
+    secrets: retainedSecrets(),
+    body: await page.content().catch(() => '<html><body>DOM unavailable</body></html>'),
+    url: page.url(),
+    consoleEntries: consoleByPage.get(page) ?? [],
+  });
+}
+
+function auditValueForSecrets(value) {
+  assertNoSecretExposure({ secrets: retainedSecrets(), body: JSON.stringify(value) });
+}
+
+function retainedSecrets() {
+  return [credential, ...Object.values(tokens ?? {})].filter(Boolean);
+}
+
+async function requireText(locator, expected, message) {
+  return requireCondition(async () => String(await locator.first().textContent() ?? '').includes(expected), message);
+}
+
+async function requireCount(locator, expected, message) {
+  return requireCondition(async () => await locator.count() === expected, message);
+}
+
+async function requireCondition(load, message) {
+  try {
+    await expect.poll(async () => {
+      try {
+        return await load();
+      } catch {
+        return false;
+      }
+    }, { timeout: 15_000 }).toBe(true);
+  } catch {
+    throw new Error(message);
+  }
+}
+
+function artifactForFormat(artifacts, format) {
+  const expected = format === 'html' ? 'text/html; charset=utf-8' : 'application/json';
+  const matches = artifacts.filter((artifact) => String(artifact.content_type).toLowerCase() === expected);
+  if (matches.length !== 1) throw new Error('artifact metadata format mapping failed');
+  return matches[0];
 }
 
 function requireEnvironment(names) {

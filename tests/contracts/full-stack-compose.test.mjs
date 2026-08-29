@@ -380,7 +380,7 @@ test('runner image pins Playwright 1.62.0 and stages only the dedicated Task 3 i
   assert.match(dockerfile, /^FROM mcr\.microsoft\.com\/playwright:v1\.62\.0-noble$/m);
   assert.match(dockerfile, /COPY .*backend\/test\/e2e\/full-stack\/package\.json .*backend\/test\/e2e\/full-stack\/package-lock\.json/);
   assert.match(dockerfile, /RUN npm ci --ignore-scripts/);
-  assert.match(dockerfile, /COPY .*playwright\.config\.mjs .*acceptance\.spec\.mjs/);
+  assert.match(dockerfile, /COPY .*playwright\.config\.mjs .*acceptance\.spec\.mjs .*support\.mjs/);
   assert.doesNotMatch(dockerfile, /COPY\s+\.\s/);
   assert.match(dockerfile, /^USER pwuser$/m);
 });

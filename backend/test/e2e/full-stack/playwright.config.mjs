@@ -12,7 +12,7 @@ export default defineConfig({
   reporter: [['line']],
   use: {
     ignoreHTTPSErrors: true,
-    screenshot: 'only-on-failure',
+    screenshot: 'off',
     trace: 'off',
     video: 'off',
   },
