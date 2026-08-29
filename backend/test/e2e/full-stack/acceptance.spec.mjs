@@ -1,8 +1,10 @@
 import { test, expect } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
+import { readFile, rename, writeFile } from 'node:fs/promises';
 import https from 'node:https';
+import path from 'node:path';
 import {
   assertNoSecretExposure,
+  browserPhaseState,
   createFailureArtifacts,
   findingEvidenceIsComplete,
   renderedFindingMatches,
@@ -19,7 +21,9 @@ const environment = requireEnvironment([
   'PROJECT_ID',
   'EXPECTED_ONLINE_AGENT_ID',
   'EXPECTED_OFFLINE_AGENT_ID',
+  'ACCEPTANCE_STATE_FILE',
 ]);
+const acceptancePhase = requireAcceptancePhase(process.env.DBPILOT_ACCEPTANCE_PHASE);
 const scopePath = `/api/v1/tenants/${encodeURIComponent(environment.TENANT_ID)}/projects/${encodeURIComponent(environment.PROJECT_ID)}`;
 const fullPermissions = Object.freeze({
   manage: true,
@@ -44,12 +48,19 @@ test.beforeAll(async () => {
     readFile(environment.OIDC_CREDENTIAL_FILE, 'utf8').then((value) => value.trim()),
   ]);
   if (!credential) throw new Error('OIDC credential file is empty');
-  tokens = Object.freeze({
-    valid: await issueToken('valid'),
-    missingPermission: await issueToken('missing_permission'),
-    wrongAudience: await issueToken('wrong_audience'),
-    expired: await issueToken('expired'),
-  });
+  tokens = acceptancePhase === 'normal'
+    ? Object.freeze({ valid: await issueToken('valid') })
+    : Object.freeze({
+        valid: await issueToken('valid'),
+        missingPermission: await issueToken('missing_permission'),
+        wrongAudience: await issueToken('wrong_audience'),
+        expired: await issueToken('expired'),
+      });
+  if (acceptancePhase === 'unauthorized') {
+    const state = JSON.parse(await readFile(environment.ACCEPTANCE_STATE_FILE, 'utf8'));
+    if (typeof state?.policy_id !== 'string' || !state.policy_id.trim()) throw new Error('browser phase state is invalid');
+    acceptedPolicy = { id: state.policy_id };
+  }
 });
 
 test.beforeEach(async ({ page }) => {
@@ -88,7 +99,7 @@ test.afterEach(async ({ page }, testInfo) => {
   if (exposure) throw exposure;
 });
 
-test('real Agent readiness, label policy, partial inspection, report and downloads complete through the browser', async ({ page }) => {
+phaseTest('normal', 'real Agent readiness, label policy, partial inspection, report and downloads complete through the browser', async ({ page }) => {
   await installBootstrap(page, tokens.valid, fullPermissions);
 
   const readiness = await waitForAgentReadiness(tokens.valid);
@@ -231,17 +242,25 @@ test('real Agent readiness, label policy, partial inspection, report and downloa
   verifyArtifactDownload({ format: 'html', ...htmlDownload, metadata: artifactForFormat(artifacts, 'html'), runId: acceptedRun.id });
   verifyArtifactDownload({ format: 'json', ...jsonDownload, metadata: artifactForFormat(artifacts, 'json'), runId: acceptedRun.id });
   await auditBrowserLeaks(page);
+  await writeBrowserState(browserPhaseState({
+    tenantID: environment.TENANT_ID,
+    projectID: environment.PROJECT_ID,
+    onlineAgentID: environment.EXPECTED_ONLINE_AGENT_ID,
+    offlineAgentID: environment.EXPECTED_OFFLINE_AGENT_ID,
+    policy: acceptedPolicy,
+    run: acceptedRun,
+    report: acceptedReport,
+  }));
 });
 
-test('missing execute permission produces a fixed 403 state without demo fallback', async ({ page }) => {
+phaseTest('unauthorized', 'missing execute permission produces a fixed 403 state without demo fallback', async ({ page }) => {
   await installBootstrap(page, tokens.missingPermission, fullPermissions);
   await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
   await auditBrowserLeaks(page);
   await requireText(page.locator('.ins-shell-source.control-plane'), '控制面服务', 'configured source was not rendered');
   await page.getByRole('button', { name: '巡检策略' }).click();
-  const policyRow = page.locator('.ins-policy-row', { hasText: acceptedPolicy.name });
   const forbiddenResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith(`/inspection-policies/${encodeURIComponent(acceptedPolicy.id)}/run`));
-  await policyRow.locator('[data-inspection-policy-run]').click();
+  await page.locator(`[data-inspection-policy-run="${acceptedPolicy.id}"]`).click();
   expect((await forbiddenResponsePromise).status()).toBe(403);
   await auditBrowserLeaks(page);
   await requireText(page.locator('#toast'), '当前账号没有该项目的巡检查看权限', 'fixed forbidden state was not rendered');
@@ -249,7 +268,7 @@ test('missing execute permission produces a fixed 403 state without demo fallbac
 });
 
 for (const [variant, tokenName] of [['wrong audience', 'wrongAudience'], ['expired', 'expired']]) {
-  test(`${variant} token produces fixed 401 state`, async ({ page }) => {
+  phaseTest('unauthorized', `${variant} token produces fixed 401 state`, async ({ page }) => {
     await installBootstrap(page, tokens[tokenName], fullPermissions);
     const unauthorizedResponsePromise = page.waitForResponse((response) => response.request().method() === 'GET' && response.url().endsWith('/inspection-overview'));
     await page.goto(new URL('/#inspection', environment.FRONTEND_URL).href);
@@ -457,5 +476,21 @@ function requireEnvironment(names) {
     values[name] = value;
   }
   return Object.freeze(values);
+}
+
+function requireAcceptancePhase(value) {
+  if (value === 'normal' || value === 'unauthorized') return value;
+  throw new Error('browser acceptance phase is invalid');
+}
+
+function phaseTest(expectedPhase, name, body) {
+  return acceptancePhase === expectedPhase ? test(name, body) : test.skip(name, body);
+}
+
+async function writeBrowserState(state) {
+  if (!path.isAbsolute(environment.ACCEPTANCE_STATE_FILE)) throw new Error('browser phase state path is invalid');
+  const temporary = `${environment.ACCEPTANCE_STATE_FILE}.browser.tmp`;
+  await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'w' });
+  await rename(temporary, environment.ACCEPTANCE_STATE_FILE);
 }
 }

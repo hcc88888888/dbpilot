@@ -160,13 +160,23 @@ func runJournalAssertions(arguments []string, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	journalPath := flags.String("path", "", "absolute Agent journal path")
 	assertionsFile := flags.String("assertions-file", "", "absolute journal assertion options file")
-	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*journalPath) || !filepath.IsAbs(*assertionsFile) {
+	phaseStateFile := flags.String("phase-state-file", "", "absolute full-stack phase state file")
+	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 || !filepath.IsAbs(*journalPath) || (filepath.IsAbs(*assertionsFile) == filepath.IsAbs(*phaseStateFile)) {
 		return 2
 	}
 	var assertion JournalAssertion
-	if err := decodeJSONFile(*assertionsFile, 64<<10, &assertion); err != nil {
-		fmt.Fprintln(stderr, "journal assertion options are unavailable or invalid")
-		return 2
+	if filepath.IsAbs(*phaseStateFile) {
+		var phase AssertionOptions
+		if err := decodeJSONFile(*phaseStateFile, 64<<10, &phase); err != nil || phase.JournalCommandID == "" {
+			fmt.Fprintln(stderr, "journal phase state is unavailable or invalid")
+			return 2
+		}
+		assertion.CommandID = phase.JournalCommandID
+	} else {
+		if err := decodeJSONFile(*assertionsFile, 64<<10, &assertion); err != nil {
+			fmt.Fprintln(stderr, "journal assertion options are unavailable or invalid")
+			return 2
+		}
 	}
 	if err := AssertJournal(*journalPath, assertion); err != nil {
 		fmt.Fprintln(stderr, err)

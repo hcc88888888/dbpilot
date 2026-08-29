@@ -15,15 +15,30 @@ import (
 )
 
 type AssertionOptions struct {
-	TenantID         string   `json:"tenant_id"`
-	ProjectID        string   `json:"project_id"`
-	RunID            string   `json:"run_id"`
-	JobID            string   `json:"job_id"`
-	ReportID         string   `json:"report_id"`
-	OnlineAgentID    string   `json:"online_agent_id"`
-	OfflineAgentID   string   `json:"offline_agent_id"`
-	AuditCorrelation string   `json:"audit_correlation"`
-	SensitiveValues  []string `json:"-"`
+	Version               int       `json:"version"`
+	TenantID              string    `json:"tenant_id"`
+	ProjectID             string    `json:"project_id"`
+	PolicyID              string    `json:"policy_id"`
+	RunID                 string    `json:"run_id"`
+	JobID                 string    `json:"job_id"`
+	ReportID              string    `json:"report_id"`
+	OnlineAgentID         string    `json:"online_agent_id"`
+	OfflineAgentID        string    `json:"offline_agent_id"`
+	OnlineCommandID       string    `json:"online_command_id"`
+	OfflineCommandID      string    `json:"offline_command_id"`
+	JournalCommandID      string    `json:"journal_command_id"`
+	AuditCorrelation      string    `json:"audit_correlation"`
+	AcceptedAt            time.Time `json:"accepted_at"`
+	HeartbeatAt           time.Time `json:"heartbeat_at"`
+	PreRestartAcceptedAt  time.Time `json:"pre_restart_accepted_at"`
+	PostRestartAcceptedAt time.Time `json:"post_restart_accepted_at"`
+	AcceptedCount         int       `json:"accepted_count"`
+	SpoolObservedCount    int       `json:"spool_observed_count"`
+	SpoolPendingCount     int       `json:"spool_pending_count"`
+	ReportCount           int       `json:"report_count"`
+	FindingCount          int       `json:"finding_count"`
+	AuditCount            int       `json:"audit_count"`
+	SensitiveValues       []string  `json:"-"`
 }
 
 type JournalAssertion struct {
@@ -40,6 +55,7 @@ const (
 	assertArtifactsSQL = "SELECT id, job_id, source_resource_type, source_resource_id, content_type, size_bytes, checksum, storage_reference FROM artifacts WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 ORDER BY id"
 	assertAuditsSQL    = "SELECT id, action, resource_type, resource_id, request_id, trace_id, job_id, command_id, dedupe_key FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND (resource_id = $4 OR (job_id = $3 AND action IN ('inspection.report.completed', 'command.result', 'command.delivery_timed_out', 'command.prepared_timed_out', 'command.prepared_envelope_expired', 'command.execution_timed_out', 'command.skipped_terminal_job', 'command.prepared_terminal_job'))) ORDER BY id"
 	assertMetricsSQL   = "SELECT agent_id, metric, series_fingerprint, labels->>'dbpilot_source_id' AS source_id, sampled_at, accepted_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3 ORDER BY sampled_at, metric, series_fingerprint"
+	assertRogueRowsSQL = "SELECT (SELECT COUNT(*) FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM inspection_target_runs WHERE tenant_id = $1 AND project_id = $2 AND agent_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM command_outbox WHERE tenant_id = $1 AND project_id = $2 AND target_id IN ($3, $4, $5)), (SELECT COUNT(*) FROM audit_events WHERE tenant_id = $1 AND project_id = $2 AND resource_id IN ($3, $4, $5))"
 )
 
 func AssertDatabase(ctx context.Context, database *sql.DB, options AssertionOptions) error {
@@ -80,11 +96,14 @@ func AssertDatabase(ctx context.Context, database *sql.DB, options AssertionOpti
 	if err := assertMetrics(ctx, database, options); err != nil {
 		return redactAssertionError(err, options.SensitiveValues)
 	}
+	if err := assertRogueRows(ctx, database, options); err != nil {
+		return redactAssertionError(err, options.SensitiveValues)
+	}
 	return nil
 }
 
 func validateAssertionOptions(options AssertionOptions) error {
-	values := []string{options.TenantID, options.ProjectID, options.RunID, options.JobID, options.ReportID, options.OnlineAgentID, options.OfflineAgentID, options.AuditCorrelation}
+	values := []string{options.TenantID, options.ProjectID, options.RunID, options.JobID, options.ReportID, options.OnlineAgentID, options.OfflineAgentID, options.OnlineCommandID, options.OfflineCommandID, options.JournalCommandID, options.AuditCorrelation}
 	for _, value := range values {
 		if value == "" || value != strings.TrimSpace(value) || strings.ContainsAny(value, "\r\n\t") {
 			return errors.New("database assertion identifiers are invalid")
@@ -92,6 +111,12 @@ func validateAssertionOptions(options AssertionOptions) error {
 	}
 	if options.OnlineAgentID == options.OfflineAgentID {
 		return errors.New("database assertion Agent IDs must differ")
+	}
+	if options.OnlineCommandID == options.OfflineCommandID || options.JournalCommandID != options.OnlineCommandID {
+		return errors.New("database assertion Command IDs are invalid")
+	}
+	if options.PreRestartAcceptedAt.IsZero() != options.PostRestartAcceptedAt.IsZero() || (!options.PreRestartAcceptedAt.IsZero() && !options.PostRestartAcceptedAt.After(options.PreRestartAcceptedAt)) {
+		return errors.New("database assertion restart timestamps are invalid")
 	}
 	return nil
 }
@@ -153,10 +178,16 @@ func assertTargets(ctx context.Context, database *sql.DB, options AssertionOptio
 		seenAgents[agentID] = struct{}{}
 		switch agentID {
 		case options.OnlineAgentID:
+			if commandID != options.OnlineCommandID {
+				return nil, errors.New("online TargetRun does not match the phase state Command identity")
+			}
 			if status != "succeeded" || errorCode != "" || !observedAt.Valid {
 				return nil, errors.New("online TargetRun did not succeed with an observation")
 			}
 		case options.OfflineAgentID:
+			if commandID != options.OfflineCommandID {
+				return nil, errors.New("offline TargetRun does not match the phase state Command identity")
+			}
 			if status != "failed" || errorCode != "agent_offline" {
 				return nil, errors.New("offline TargetRun did not fail with agent_offline")
 			}
@@ -402,6 +433,7 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 	defer rows.Close()
 	seen := make(map[string]struct{})
 	count := 0
+	postRestartReplay := options.PostRestartAcceptedAt.IsZero()
 	for rows.Next() {
 		var agentID, metric, seriesFingerprint, sourceID string
 		var sampledAt, acceptedAt time.Time
@@ -421,6 +453,9 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 			return errors.New("metric sample is duplicated")
 		}
 		seen[key] = struct{}{}
+		if !options.PostRestartAcceptedAt.IsZero() && sampledAt.Equal(options.PostRestartAcceptedAt) && acceptedAt.After(options.PreRestartAcceptedAt) {
+			postRestartReplay = true
+		}
 		count++
 	}
 	if err := rows.Err(); err != nil {
@@ -428,6 +463,25 @@ func assertMetrics(ctx context.Context, database *sql.DB, options AssertionOptio
 	}
 	if count == 0 {
 		return errors.New("accepted online metric sample is missing")
+	}
+	if !postRestartReplay {
+		return errors.New("post-restart replay sample is missing")
+	}
+	return nil
+}
+
+func assertRogueRows(ctx context.Context, database *sql.DB, options AssertionOptions) error {
+	const untrustedID = "agent-untrusted"
+	const claimedID = "agent-claimed-id"
+	const certificateID = "agent-certificate-id"
+	var metricRows, monitoringRows, targetRows, commandRows, auditRows int
+	err := database.QueryRowContext(ctx, assertRogueRowsSQL, options.TenantID, options.ProjectID, untrustedID, claimedID, certificateID).
+		Scan(&metricRows, &monitoringRows, &targetRows, &commandRows, &auditRows)
+	if err != nil {
+		return fmt.Errorf("query rogue Agent persistence: %w", err)
+	}
+	if metricRows != 0 || monitoringRows != 0 || targetRows != 0 || commandRows != 0 || auditRows != 0 {
+		return errors.New("rogue Agent created persistent rows")
 	}
 	return nil
 }

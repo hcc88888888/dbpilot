@@ -3,6 +3,31 @@ import { createHash } from 'node:crypto';
 const SCREENSHOT_MARKUP = '<main><h1>DBPilot acceptance failed</h1><p>Sanitized diagnostics are attached.</p></main>';
 const SENSITIVE_EVIDENCE = /(?:authorization|bearer\s+\S+|password|private key|postgres:\/\/|credential|access[_ -]?token)/i;
 
+export function browserPhaseState({ tenantID, projectID, onlineAgentID, offlineAgentID, policy, run, report } = {}) {
+  const commands = Array.isArray(report?.references?.commands) ? report.references.commands : [];
+  const onlineCommand = commands.find((command) => command?.target_id === onlineAgentID)?.command_id;
+  const offlineCommand = commands.find((command) => command?.target_id === offlineAgentID)?.command_id;
+  const state = {
+    version: 1,
+    tenant_id: tenantID,
+    project_id: projectID,
+    online_agent_id: onlineAgentID,
+    offline_agent_id: offlineAgentID,
+    policy_id: policy?.id,
+    run_id: run?.id,
+    job_id: report?.references?.job_id,
+    report_id: report?.id,
+    online_command_id: onlineCommand,
+    offline_command_id: offlineCommand,
+    journal_command_id: onlineCommand,
+    audit_correlation: report?.references?.audit_correlation,
+  };
+  if (report?.id !== run?.report_id || onlineCommand === offlineCommand || Object.entries(state).some(([name, value]) => (
+    name !== 'version' && (typeof value !== 'string' || !value || value !== value.trim() || /[\r\n\t]/.test(value))
+  ))) throw new Error('browser phase state is invalid');
+  return Object.freeze(state);
+}
+
 export function assertNoSecretExposure({ secrets = [], body = '', url = '', consoleEntries = [] } = {}) {
   const retained = [body, url, ...consoleEntries].map(String);
   if (normalizedSecrets(secrets).some((secret) => retained.some((value) => value.includes(secret)))) {

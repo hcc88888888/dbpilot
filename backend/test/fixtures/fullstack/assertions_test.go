@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -65,6 +68,9 @@ func TestAssertDatabaseRequiresScopedRunTargetsFindingsReportArtifactsAuditsAndM
 		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
 		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
 			AddRow(options.OnlineAgentID, "system.cpu.utilization", "cpu-total", "inspection-host-snapshot", now, now.Add(time.Second)))
+	mock.ExpectQuery(regexp.QuoteMeta(assertRogueRowsSQL)).
+		WithArgs(options.TenantID, options.ProjectID, "agent-untrusted", "agent-claimed-id", "agent-certificate-id").
+		WillReturnRows(sqlmock.NewRows([]string{"metric_rows", "monitoring_rows", "target_rows", "command_rows", "audit_rows"}).AddRow(0, 0, 0, 0, 0))
 
 	require.NoError(t, AssertDatabase(context.Background(), database, options))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -134,6 +140,38 @@ func TestAssertJournalRejectsPendingResultAndRedactsPath(t *testing.T) {
 	require.NotContains(t, err.Error(), sensitivePath)
 	require.NotContains(t, err.Error(), "token-secret")
 	require.Contains(t, err.Error(), "[REDACTED]")
+}
+
+func TestRunJournalAssertionsReadsCommandIDFromPhaseState(t *testing.T) {
+	root := t.TempDir()
+	journalPath := filepath.Join(root, "command-journal.db")
+	now := time.Now().UTC()
+	journal, err := commandjournal.Open(journalPath)
+	require.NoError(t, err)
+	envelope := &agentv1.CommandEnvelope{
+		CommandId: "command-online", JobId: "job-acceptance", AgentId: "agent-online", Nonce: []byte("nonce-command-online"),
+		IssuedAt: timestamppb.New(now), ExpiresAt: timestamppb.New(now.Add(time.Hour)),
+		Command: &agentv1.CommandEnvelope_CollectNow{CollectNow: &agentv1.CollectNow{CollectionKinds: []string{"host"}}},
+	}
+	inserted, err := journal.Prepare(context.Background(), envelope, now)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	token := bytes.Repeat([]byte{0x42}, sha256.Size)
+	require.NoError(t, journal.AuthorizeStart(context.Background(), "command-online", token, 1, now.Add(30*time.Minute)))
+	result := &agentv1.CommandResult{CommandId: "command-online", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: token, LeaseRevision: 1}
+	require.NoError(t, journal.Complete(context.Background(), "command-online", result, now.Add(time.Minute)))
+	pending, err := journal.PendingResults(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, journal.MarkReported(context.Background(), "command-online", pending[0].ResultDigest, now.Add(2*time.Minute)))
+	require.NoError(t, journal.Close())
+
+	phasePath := filepath.Join(root, "phase-state.json")
+	phaseBody, err := json.Marshal(validAssertionOptions())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(phasePath, phaseBody, 0o600))
+	stderr := &bytes.Buffer{}
+	code := run([]string{"journal", "--path", journalPath, "--phase-state-file", phasePath}, io.Discard, stderr)
+	require.Zero(t, code, stderr.String())
 }
 
 func TestAssertDatabaseHonorsCancelledContext(t *testing.T) {
@@ -247,10 +285,62 @@ func TestAssertCommandsRejectsMissingOrNonterminalRows(t *testing.T) {
 	}
 }
 
+func TestAssertTargetsRequiresExactPhaseStateCommandIDs(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	now := time.Now().UTC()
+	mock.ExpectQuery("SELECT target_id, agent_id, command_id").
+		WithArgs(options.TenantID, options.ProjectID, options.RunID).
+		WillReturnRows(sqlmock.NewRows([]string{"target_id", "agent_id", "command_id", "status", "error_code", "observed_at"}).
+			AddRow("agent-offline", options.OfflineAgentID, "different-offline-command", "failed", "agent_offline", nil).
+			AddRow("agent-online", options.OnlineAgentID, options.OnlineCommandID, "succeeded", "", now))
+
+	_, err = assertTargets(context.Background(), database, options)
+	require.ErrorContains(t, err, "phase state Command identity")
+}
+
+func TestAssertMetricsRequiresPostRestartReplaySample(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	options.PreRestartAcceptedAt = time.Date(2026, 8, 29, 4, 0, 0, 0, time.UTC)
+	options.PostRestartAcceptedAt = options.PreRestartAcceptedAt.Add(time.Minute)
+	mock.ExpectQuery("SELECT agent_id, metric, series_fingerprint").
+		WithArgs(options.TenantID, options.ProjectID, options.OnlineAgentID).
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "series_fingerprint", "source_id", "sampled_at", "accepted_at"}).
+			AddRow(options.OnlineAgentID, "system.cpu.utilization", "cpu-total", "inspection-host-snapshot", options.PreRestartAcceptedAt, options.PreRestartAcceptedAt.Add(time.Second)))
+
+	err = assertMetrics(context.Background(), database, options)
+	require.ErrorContains(t, err, "post-restart replay sample")
+}
+
+func TestAssertRogueAgentsRequireZeroPersistentRows(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	options := validAssertionOptions()
+	mock.ExpectQuery("SELECT").
+		WithArgs(options.TenantID, options.ProjectID, "agent-untrusted", "agent-claimed-id", "agent-certificate-id").
+		WillReturnRows(sqlmock.NewRows([]string{"metric_rows", "monitoring_rows", "target_rows", "command_rows", "audit_rows"}).AddRow(0, 0, 0, 0, 0))
+	require.NoError(t, assertRogueRows(context.Background(), database, options))
+	require.NoError(t, mock.ExpectationsWereMet())
+
+	database2, mock2, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database2.Close() })
+	mock2.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"metric_rows", "monitoring_rows", "target_rows", "command_rows", "audit_rows"}).AddRow(0, 1, 0, 0, 0))
+	err = assertRogueRows(context.Background(), database2, options)
+	require.ErrorContains(t, err, "rogue Agent created persistent rows")
+}
+
 func validAssertionOptions() AssertionOptions {
 	return AssertionOptions{
 		TenantID: "tenant-acceptance", ProjectID: "project-acceptance", RunID: "run-acceptance", JobID: "job-acceptance",
 		ReportID: "report-acceptance", OnlineAgentID: "agent-online", OfflineAgentID: "agent-offline", AuditCorrelation: "acceptance-correlation",
+		OnlineCommandID: "command-online", OfflineCommandID: "command-offline", JournalCommandID: "command-online",
 	}
 }
 

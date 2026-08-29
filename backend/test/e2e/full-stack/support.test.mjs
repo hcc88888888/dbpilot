@@ -4,11 +4,34 @@ import { createHash } from 'node:crypto';
 import playwrightConfig from './playwright.config.mjs';
 import {
   assertNoSecretExposure,
+  browserPhaseState,
   createFailureArtifacts,
   findingEvidenceIsComplete,
   renderedFindingMatches,
   verifyArtifactDownload,
 } from './support.mjs';
+
+test('browser phase state contains only non-secret scope and durable workflow identities', () => {
+  const state = browserPhaseState({
+    tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
+    policy: { id: 'policy-1' },
+    run: { id: 'run-1', report_id: 'report-1' },
+    report: { id: 'report-1', references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [
+      { target_id: 'agent-online', command_id: 'command-online' },
+      { target_id: 'agent-offline', command_id: 'command-offline' },
+    ] } },
+  });
+  assert.deepEqual(state, {
+    version: 1, tenant_id: 'tenant-acceptance', project_id: 'project-acceptance', online_agent_id: 'agent-online', offline_agent_id: 'agent-offline', policy_id: 'policy-1',
+    run_id: 'run-1', job_id: 'job-1', report_id: 'report-1', online_command_id: 'command-online',
+    offline_command_id: 'command-offline', journal_command_id: 'command-online', audit_correlation: 'correlation-1',
+  });
+  assert.equal(JSON.stringify(state).includes('token'), false);
+  assert.throws(() => browserPhaseState({
+    tenantID: 'tenant-acceptance', projectID: 'project-acceptance', onlineAgentID: 'agent-online', offlineAgentID: 'agent-offline',
+    policy: { id: 'policy-1' }, run: { id: 'run-1', report_id: 'report-1' }, report: { id: 'report-1', references: { job_id: 'job-1', audit_correlation: 'correlation-1', commands: [] } },
+  }), /browser phase state is invalid/);
+});
 
 test('simulated token leak reports a fixed message and redacts every retained text artifact', () => {
   const token = 'eyJhbGciOiJSUzI1NiJ9.acceptance-payload.acceptance-signature';

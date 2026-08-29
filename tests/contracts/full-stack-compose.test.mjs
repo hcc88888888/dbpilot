@@ -34,6 +34,8 @@ const volumeNames = [
   'acceptance-bin',
   'acceptance-config',
   'acceptance-go-cache',
+  'acceptance-rogue-mismatch-data',
+  'acceptance-rogue-untrusted-data',
   'acceptance-runner-node-modules',
   'acceptance-secrets',
   'acceptance-state',
@@ -237,10 +239,12 @@ test('runtime mounts keep source, binaries, config, and secrets read-only while 
   const config = loadCompose();
   const writableTargets = {
     'asset-builder': ['/acceptance/bin', '/go-cache'],
-    bootstrap: ['/volumes/config', '/volumes/secrets', '/volumes/state', '/volumes/artifacts', '/volumes/agent-data'],
+    bootstrap: ['/volumes/config', '/volumes/secrets', '/volumes/state', '/volumes/artifacts', '/volumes/agent-data', '/volumes/rogue-untrusted-data', '/volumes/rogue-mismatch-data'],
     controlplane: ['/acceptance/state/artifacts'],
     agent: ['/acceptance/state/agent-online'],
-    'acceptance-runner': ['/acceptance/artifacts', '/work/node_modules'],
+    'acceptance-runner': ['/acceptance/artifacts', '/acceptance/state', '/work/node_modules'],
+    'rogue-untrusted': ['/acceptance/state/agent-untrusted'],
+    'rogue-mismatch': ['/acceptance/state/agent-mismatch'],
   };
 
   for (const [name, service] of Object.entries(config.services)) {
@@ -309,7 +313,7 @@ test('Kylin production runtimes verify OS, architecture, and binary version befo
     assert.match(command, /uname -m/);
     assert.match(command, /x86_64/);
     assert.match(command, /dbpilot-(?:controlplane|agent) --version/);
-    assert.match(command, /exec \/acceptance\/bin\/dbpilot-(?:controlplane|agent)/);
+    assert.match(command, /exec (?:timeout[^\n]+ )?\/acceptance\/bin\/dbpilot-(?:controlplane|agent)/);
   }
 });
 
@@ -359,9 +363,10 @@ test('generated Artifact descriptor origin and path are served by the checked-in
   assert.match(nginx, /proxy_pass\s+https:\/\/controlplane:8443/);
 });
 
-test('runner exports the complete exact Task 3 environment interface over read-only fixture mounts', () => {
+test('runner exports the complete phase environment interface over bounded fixture mounts', () => {
   const runner = loadCompose().services['acceptance-runner'];
   assert.deepEqual(runner.environment, {
+    ACCEPTANCE_STATE_FILE: '/acceptance/state/phase-state.json',
     EXPECTED_OFFLINE_AGENT_ID: 'agent-offline',
     EXPECTED_ONLINE_AGENT_ID: 'agent-online',
     FRONTEND_URL: 'https://frontend:8443',
@@ -373,16 +378,19 @@ test('runner exports the complete exact Task 3 environment interface over read-o
   });
   assert.equal(mountAt(runner, '/acceptance/config').read_only, true);
   assert.equal(mountAt(runner, '/acceptance/secrets').read_only, true);
+  assert.notEqual(mountAt(runner, '/acceptance/state').read_only, true);
 });
 
-test('runner image pins Playwright 1.62.0 and stages only the dedicated Task 3 inputs', async () => {
+test('runner image pins Playwright 1.62.0 and stages only the dedicated phase inputs', async () => {
   const dockerfile = await readFile(runnerFile, 'utf8');
   assert.match(dockerfile, /^FROM mcr\.microsoft\.com\/playwright:v1\.62\.0-noble$/m);
   assert.match(dockerfile, /COPY .*backend\/test\/e2e\/full-stack\/package\.json .*backend\/test\/e2e\/full-stack\/package-lock\.json/);
   assert.match(dockerfile, /RUN npm ci --ignore-scripts/);
   assert.match(dockerfile, /COPY .*playwright\.config\.mjs .*acceptance\.spec\.mjs .*support\.mjs/);
+  assert.match(dockerfile, /COPY .*communication\.mjs/);
   assert.doesNotMatch(dockerfile, /COPY\s+\.\s/);
   assert.match(dockerfile, /^USER pwuser$/m);
+  assert.match(dockerfile, /^ENTRYPOINT \["node", "communication\.mjs"\]$/m);
 });
 
 test('runner package contract rejects every unapproved root dependency group', () => {
