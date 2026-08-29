@@ -46,7 +46,7 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 		"agent_online_cert", "agent_online_key", "agent_untrusted_cert", "agent_untrusted_config",
 		"agent_untrusted_key", "artifact_key", "ca_cert", "command_private_key", "command_public_key",
 		"controlplane_config", "controlplane_grpc_cert", "controlplane_grpc_key", "controlplane_http_cert",
-		"controlplane_http_key", "execution_key", "jwks", "manifest", "oidc_cert", "oidc_config",
+		"controlplane_http_key", "execution_key", "frontend_cert", "frontend_key", "jwks", "manifest", "oidc_cert", "oidc_config",
 		"oidc_key", "oidc_signing_key", "policy", "policy_private_key", "policy_public_key", "postgres_password",
 		"token_credential", "untrusted_ca_cert",
 	}
@@ -68,7 +68,7 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 	require.Equal(t, wantFiles, gotFiles)
 
 	if runtime.GOOS != "windows" {
-		for _, name := range []string{"agent_mismatch_key", "agent_online_key", "agent_untrusted_key", "artifact_key", "command_private_key", "controlplane_config", "execution_key", "oidc_key", "oidc_signing_key", "policy_private_key", "postgres_password", "token_credential"} {
+		for _, name := range []string{"agent_mismatch_key", "agent_online_key", "agent_untrusted_key", "artifact_key", "command_private_key", "controlplane_config", "execution_key", "frontend_key", "oidc_key", "oidc_signing_key", "policy_private_key", "postgres_password", "token_credential"} {
 			info, statErr := os.Stat(manifest.Files[name])
 			require.NoError(t, statErr)
 			require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), name)
@@ -89,7 +89,7 @@ func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing
 	var stored BootstrapManifest
 	require.NoError(t, json.Unmarshal(manifestBody, &stored))
 	require.Equal(t, manifest, stored)
-	for _, name := range []string{"agent_online_key", "artifact_key", "command_private_key", "execution_key", "oidc_signing_key", "policy_private_key", "postgres_password", "token_credential"} {
+	for _, name := range []string{"agent_online_key", "artifact_key", "command_private_key", "execution_key", "frontend_key", "oidc_signing_key", "policy_private_key", "postgres_password", "token_credential"} {
 		secret := bytes.TrimSpace(mustRead(t, manifest.Files[name]))
 		require.NotEmpty(t, secret, name)
 		require.NotContains(t, string(manifestBody), string(secret), name)
@@ -112,6 +112,14 @@ func TestGenerateBootstrapUsesExactCertificateIdentitiesAndKeyAlgorithms(t *test
 	require.Equal(t, []string{"oidc"}, oidcCertificate.DNSNames)
 	require.Empty(t, oidcCertificate.URIs)
 	require.IsType(t, ed25519.PublicKey{}, oidcCertificate.PublicKey)
+	frontendCertificate := mustCertificate(t, manifest.Files["frontend_cert"])
+	require.Equal(t, []string{"frontend"}, frontendCertificate.DNSNames)
+	require.Empty(t, frontendCertificate.URIs)
+	require.IsType(t, ed25519.PublicKey{}, frontendCertificate.PublicKey)
+	require.NoError(t, frontendCertificate.CheckSignatureFrom(ca))
+	frontendKey, ok := mustPrivateKey(t, manifest.Files["frontend_key"]).(ed25519.PrivateKey)
+	require.True(t, ok)
+	require.Equal(t, ed25519.PublicKey(frontendKey.Public().(ed25519.PublicKey)), frontendCertificate.PublicKey)
 
 	wantAgentURIs := map[string]string{
 		"agent_online_cert":    "spiffe://dbpilot.local/agent/agent-online",
@@ -160,7 +168,7 @@ func TestGenerateBootstrapProducesBoundedPolicyInventoryAndOIDCConfig(t *testing
 	require.Equal(t, "oidc", nestedString(t, controlplane, "identity", "mode"))
 	require.Equal(t, "https://oidc:9444", nestedString(t, controlplane, "identity", "issuer"))
 	require.Equal(t, "dbpilot-control-plane", nestedString(t, controlplane, "identity", "audience"))
-	require.Equal(t, "http://frontend:8080", controlplane["event_url_base"])
+	require.Equal(t, "https://frontend:8443", controlplane["event_url_base"])
 	agents := controlplane["agents"].(map[string]any)
 	require.ElementsMatch(t, []string{"agent-online", "agent-offline"}, mapKeys(agents))
 	for _, id := range []string{"agent-online", "agent-offline"} {

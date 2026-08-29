@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -45,6 +47,25 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
 	require.Equal(t, "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", config.Command.SigningPrivateKeyRef)
 	require.Equal(t, "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY", config.Command.ExecutionTokenKeyRef)
+}
+
+func TestFullStackFixtureGeneratedConfigPassesProductionValidation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	root := filepath.Join(t.TempDir(), "acceptance")
+	fixture, err := filepath.Abs(filepath.Join("..", "..", "test", "fixtures", "fullstack"))
+	require.NoError(t, err)
+	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go")
+	if runtime.GOOS == "windows" {
+		goBinary += ".exe"
+	}
+	command := exec.CommandContext(ctx, goBinary, "run", fixture, "bootstrap", "--root", root)
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, string(output))
+	config, err := loadConfig(filepath.Join(root, "secrets", "controlplane.yaml"))
+	require.NoError(t, err)
+	require.Equal(t, "https://frontend:8443", config.EventURLBase)
+	require.NoError(t, validateConfig(config))
 }
 
 func TestNewServerRejectsExecutionTokenProtectionKeysOtherThan32RawBytes(t *testing.T) {

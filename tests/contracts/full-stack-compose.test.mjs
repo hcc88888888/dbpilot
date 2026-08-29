@@ -69,6 +69,19 @@ function lines(value) {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+function assertExactRunnerPackageContract(packageMetadata, lock, imageVersion) {
+  const lockRoot = lock.packages?.[''];
+  assert.ok(lockRoot, 'package-lock.json must contain its root package entry');
+  for (const group of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    const expected = group === 'devDependencies' ? { '@playwright/test': '1.62.0' } : {};
+    assert.deepEqual(packageMetadata[group] ?? {}, expected, `package.json ${group}`);
+    assert.deepEqual(lockRoot[group] ?? {}, expected, `package-lock root ${group}`);
+  }
+  assert.equal(packageMetadata.scripts?.postinstall, undefined);
+  assert.equal(lock.packages?.['node_modules/@playwright/test']?.version, '1.62.0');
+  assert.equal(imageVersion, '1.62.0');
+}
+
 test('Compose resolves the exact isolated full-stack service, image, network, and volume topology', () => {
   const config = loadCompose();
   assert.deepEqual(Object.keys(config.services).sort(), serviceNames);
@@ -255,7 +268,7 @@ test('only frontend publishes a Docker-assigned loopback port and runtime depend
     if (name === 'frontend') {
       assert.equal(service.ports.length, 1);
       assert.equal(service.ports[0].host_ip, '127.0.0.1');
-      assert.equal(service.ports[0].target, 8080);
+      assert.equal(service.ports[0].target, 8443);
       assert.equal(service.ports[0].published, '0');
     } else {
       assert.equal(service.ports, undefined, `${name} must not publish a host port`);
@@ -265,6 +278,8 @@ test('only frontend publishes a Docker-assigned loopback port and runtime depend
   assert.ok(config.services.oidc.healthcheck);
   assert.ok(config.services.controlplane.healthcheck);
   assert.ok(config.services.frontend.healthcheck);
+  assert.match(config.services.frontend.healthcheck.test.join(' '), /https:\/\/frontend:8443\/healthz/);
+  assert.match(config.services.frontend.healthcheck.test.join(' '), /\/acceptance\/config\/ca\.pem/);
   assert.equal(config.services.bootstrap.depends_on['asset-builder'].condition, 'service_completed_successfully');
   assert.equal(config.services.postgres.depends_on.bootstrap.condition, 'service_completed_successfully');
   assert.equal(config.services.oidc.depends_on.bootstrap.condition, 'service_completed_successfully');
@@ -296,7 +311,10 @@ test('Kylin production runtimes verify OS, architecture, and binary version befo
 
 test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream without exposing OIDC', async () => {
   const nginx = await readFile(nginxFile, 'utf8');
-  assert.match(nginx, /listen\s+8080/);
+  assert.match(nginx, /listen\s+8443\s+ssl/);
+  assert.match(nginx, /ssl_certificate\s+\/acceptance\/config\/frontend\.pem/);
+  assert.match(nginx, /ssl_certificate_key\s+\/acceptance\/secrets\/frontend-key\.pem/);
+  assert.match(nginx, /ssl_protocols\s+TLSv1\.2\s+TLSv1\.3/);
   assert.match(nginx, /location\s*=\s*\/healthz/);
   assert.match(nginx, /root\s+\/srv\/dbpilot\/frontend/);
   assert.match(nginx, /location\s+\/api\//);
@@ -304,11 +322,13 @@ test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream
   assert.match(nginx, /proxy_ssl_verify\s+on/);
   assert.match(nginx, /proxy_ssl_server_name\s+on/);
   assert.match(nginx, /proxy_ssl_name\s+controlplane/);
+  assert.match(nginx, /proxy_set_header\s+X-Forwarded-Proto\s+https/);
   assert.match(nginx, /proxy_ssl_trusted_certificate\s+\/acceptance\/config\/ca\.pem/);
   assert.match(nginx, /proxy_buffering\s+off/);
   assert.match(nginx, /client_max_body_size\s+\d+[km]/i);
   assert.match(nginx, /proxy_(?:connect|read|send)_timeout\s+\d+s/);
-  assert.doesNotMatch(nginx, /oidc|\/token|acceptance\/secrets/i);
+  assert.equal(nginx.match(/\/acceptance\/secrets\//g)?.length, 1, 'only the frontend TLS key may be read from secrets');
+  assert.doesNotMatch(nginx, /oidc|location\s+[^\n]*\/token|proxy_pass[^\n]*\/token/i);
 });
 
 test('generated Artifact descriptor origin and path are served by the checked-in frontend proxy', async () => {
@@ -316,13 +336,16 @@ test('generated Artifact descriptor origin and path are served by the checked-in
   const match = bootstrap.match(/"event_url_base":\s*"([^"]+)"/);
   assert.ok(match, 'bootstrap must generate an explicit Artifact descriptor base');
   const descriptor = new URL('/api/v1/artifact-downloads/artifact-acceptance?signature=redacted', match[1]);
-  assert.equal(descriptor.protocol, 'http:');
+  assert.equal(descriptor.protocol, 'https:');
   assert.equal(descriptor.hostname, 'frontend');
-  assert.equal(descriptor.port, '8080');
+  assert.equal(descriptor.port, '8443');
   assert.equal(descriptor.pathname, '/api/v1/artifact-downloads/artifact-acceptance');
 
   const frontend = loadCompose().services.frontend;
   assert.deepEqual(Object.keys(frontend.networks), ['acceptance']);
+  assert.equal(frontend.user, '10001:10001');
+  assert.equal(mountAt(frontend, '/acceptance/config').read_only, true);
+  assert.equal(mountAt(frontend, '/acceptance/secrets').read_only, true);
   assert.equal(frontend.ports[0].target, Number(descriptor.port));
   assert.match(nginx, new RegExp(`listen\\s+${descriptor.port}`));
   assert.match(nginx, /location\s+\/api\//);
@@ -334,7 +357,7 @@ test('runner exports the complete exact Task 3 environment interface over read-o
   assert.deepEqual(runner.environment, {
     EXPECTED_OFFLINE_AGENT_ID: 'agent-offline',
     EXPECTED_ONLINE_AGENT_ID: 'agent-online',
-    FRONTEND_URL: 'http://frontend:8080',
+    FRONTEND_URL: 'https://frontend:8443',
     OIDC_CA_FILE: '/acceptance/config/ca.pem',
     OIDC_CREDENTIAL_FILE: '/acceptance/secrets/oidc-token-credential',
     OIDC_URL: 'https://oidc:9444',
@@ -355,6 +378,24 @@ test('runner image pins Playwright 1.62.0 and stages only the dedicated Task 3 i
   assert.match(dockerfile, /^USER pwuser$/m);
 });
 
+test('runner package contract rejects every unapproved root dependency group', () => {
+  const validPackage = { devDependencies: { '@playwright/test': '1.62.0' } };
+  const validLock = { packages: {
+    '': { devDependencies: { '@playwright/test': '1.62.0' } },
+    'node_modules/@playwright/test': { version: '1.62.0' },
+  } };
+  assert.doesNotThrow(() => assertExactRunnerPackageContract(validPackage, validLock, '1.62.0'));
+  for (const group of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    const packageWithExtra = structuredClone(validPackage);
+    packageWithExtra[group] = { ...(packageWithExtra[group] ?? {}), 'unexpected-runtime': '9.9.9' };
+    assert.throws(() => assertExactRunnerPackageContract(packageWithExtra, validLock, '1.62.0'), undefined, `package ${group}`);
+
+    const lockWithExtra = structuredClone(validLock);
+    lockWithExtra.packages[''][group] = { ...(lockWithExtra.packages[''][group] ?? {}), 'unexpected-runtime': '9.9.9' };
+    assert.throws(() => assertExactRunnerPackageContract(validPackage, lockWithExtra, '1.62.0'), undefined, `lock ${group}`);
+  }
+});
+
 test('runner package and lock resolve exactly @playwright/test 1.62.0 when Task 3 assets exist', {
   skip: !existsSync(runnerPackageFile) && !existsSync(runnerLockFile),
 }, async () => {
@@ -365,12 +406,6 @@ test('runner package and lock resolve exactly @playwright/test 1.62.0 when Task 
   ]);
   const packageMetadata = JSON.parse(packageBody);
   const lock = JSON.parse(lockBody);
-  assert.deepEqual(packageMetadata.dependencies ?? {}, {});
-  assert.deepEqual(packageMetadata.devDependencies, { '@playwright/test': '1.62.0' });
-  assert.equal(packageMetadata.scripts?.postinstall, undefined);
-  assert.deepEqual(lock.packages?.['']?.dependencies ?? {}, {});
-  assert.deepEqual(lock.packages?.['']?.devDependencies, { '@playwright/test': '1.62.0' });
-  assert.equal(lock.packages?.['node_modules/@playwright/test']?.version, '1.62.0');
   const imageVersion = dockerfile.match(/^FROM mcr\.microsoft\.com\/playwright:v([0-9.]+)-noble$/m)?.[1];
-  assert.equal(imageVersion, '1.62.0');
+  assertExactRunnerPackageContract(packageMetadata, lock, imageVersion);
 });

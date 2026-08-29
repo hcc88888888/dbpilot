@@ -240,7 +240,7 @@ services:
 
   frontend:
     image: nginx:1.29.1-alpine
-    user: "101:101"
+    user: "10001:10001"
     depends_on:
       controlplane:
         condition: service_healthy
@@ -251,14 +251,15 @@ services:
       - ../../../frontend:/srv/dbpilot/frontend:ro
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     ports:
-      - target: 8080
+      - target: 8443
         published: "0"
         host_ip: 127.0.0.1
         protocol: tcp
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "wget", "--quiet", "--spider", "--ca-certificate", "/acceptance/config/ca.pem", "https://frontend:8443/healthz"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -277,7 +278,7 @@ services:
     profiles: ["acceptance-runner"]
     user: "10001:10001"
     environment:
-      FRONTEND_URL: http://frontend:8080
+      FRONTEND_URL: https://frontend:8443
       OIDC_URL: https://oidc:9444
       OIDC_CA_FILE: /acceptance/config/ca.pem
       OIDC_CREDENTIAL_FILE: /acceptance/secrets/oidc-token-credential
