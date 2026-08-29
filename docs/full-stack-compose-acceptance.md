@@ -9,7 +9,7 @@ journal state.
 ## Prerequisites
 
 - Windows Docker Desktop with Docker Compose v2 and an amd64 Linux runtime.
-- PowerShell 7 and Go 1.27.0.
+- Windows PowerShell 5.1 or PowerShell 7+, and Go 1.27.0.
 - The exact private image
   `cr.kylinos.cn/kylin/kylin-server-platform:v10sp1` already available locally.
 - Network access for the pinned public Go, PostgreSQL, Nginx, and Playwright

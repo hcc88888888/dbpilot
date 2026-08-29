@@ -43,16 +43,51 @@ function Remove-DBPilotOwnedContainer {
     }
 }
 
+function ConvertTo-DBPilotNativeArgument {
+    param([AllowEmptyString()][string]$Value)
+    if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
+    if ($Value -notmatch '[\s"]') { return $Value }
+    $builder = [Text.StringBuilder]::new()
+    $null = $builder.Append([char]34)
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') { $backslashes++; continue }
+        if ($character -eq '"') {
+            if ($backslashes -gt 0) { $null = $builder.Append(('\' * ($backslashes * 2))) }
+            $null = $builder.Append('\"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) { $null = $builder.Append(('\' * $backslashes)); $backslashes = 0 }
+        $null = $builder.Append($character)
+    }
+    if ($backslashes -gt 0) { $null = $builder.Append(('\' * ($backslashes * 2))) }
+    $null = $builder.Append([char]34)
+    return $builder.ToString()
+}
+
+function Invoke-DBPilotSafetyDocker {
+    param(
+        [Parameter(Mandatory = $true)][string]$DockerBinary,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [scriptblock]$Invoker
+    )
+    if ($null -ne $Invoker) { return & $Invoker $Arguments }
+    $stdout = (& $DockerBinary @Arguments 2>$null | Out-String).Trim()
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Stdout = $stdout }
+}
+
 function Get-DBPilotOwnedContainerRecord {
     param(
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$ContainerID,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $body = (& $DockerBinary inspect $ContainerID | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect recorded container '$ContainerID'." }
-    $items = @($body | ConvertFrom-Json)
+    $result = Invoke-DBPilotSafetyDocker $DockerBinary @('inspect', $ContainerID) $InvokeDocker
+    if ($result.ExitCode -ne 0) { throw "Unable to inspect recorded container '$ContainerID'." }
+    $items = @($result.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Id -cne $ContainerID -or
         $items[0].Config.Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Config.Labels.'dbpilot.run' -cne $RunLabel) {
@@ -69,11 +104,12 @@ function Get-DBPilotOwnedNetworkRecord {
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$NetworkID,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $body = (& $DockerBinary network inspect $NetworkID | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect recorded network '$NetworkID'." }
-    $items = @($body | ConvertFrom-Json)
+    $result = Invoke-DBPilotSafetyDocker $DockerBinary @('network', 'inspect', $NetworkID) $InvokeDocker
+    if ($result.ExitCode -ne 0) { throw "Unable to inspect recorded network '$NetworkID'." }
+    $items = @($result.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Id -cne $NetworkID -or
         $items[0].Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Labels.'dbpilot.run' -cne $RunLabel) {
@@ -87,11 +123,12 @@ function Get-DBPilotOwnedVolumeRecord {
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$VolumeName,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $body = (& $DockerBinary volume inspect $VolumeName | Out-String)
-    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect recorded volume '$VolumeName'." }
-    $items = @($body | ConvertFrom-Json)
+    $result = Invoke-DBPilotSafetyDocker $DockerBinary @('volume', 'inspect', $VolumeName) $InvokeDocker
+    if ($result.ExitCode -ne 0) { throw "Unable to inspect recorded volume '$VolumeName'." }
+    $items = @($result.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Name -cne $VolumeName -or
         $items[0].Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Labels.'dbpilot.run' -cne $RunLabel) {
@@ -105,18 +142,19 @@ function Remove-DBPilotRecordedContainer {
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$ContainerID,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $inspection = (& $DockerBinary inspect $ContainerID 2>$null | Out-String)
-    if ($LASTEXITCODE -ne 0) { return }
-    $items = @($inspection | ConvertFrom-Json)
+    $inspection = Invoke-DBPilotSafetyDocker $DockerBinary @('inspect', $ContainerID) $InvokeDocker
+    if ($inspection.ExitCode -ne 0) { return }
+    $items = @($inspection.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Id -cne $ContainerID -or
         $items[0].Config.Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Config.Labels.'dbpilot.run' -cne $RunLabel) {
         throw "Refusing to remove container '$ContainerID' because its ownership labels do not match."
     }
-    & $DockerBinary rm -f -v $ContainerID | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Unable to remove recorded container '$ContainerID'." }
+    $removal = Invoke-DBPilotSafetyDocker $DockerBinary @('rm', '-f', '-v', $ContainerID) $InvokeDocker
+    if ($removal.ExitCode -ne 0) { throw "Unable to remove recorded container '$ContainerID'." }
 }
 
 function Remove-DBPilotRecordedNetwork {
@@ -124,18 +162,19 @@ function Remove-DBPilotRecordedNetwork {
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$NetworkID,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $inspection = (& $DockerBinary network inspect $NetworkID 2>$null | Out-String)
-    if ($LASTEXITCODE -ne 0) { return }
-    $items = @($inspection | ConvertFrom-Json)
+    $inspection = Invoke-DBPilotSafetyDocker $DockerBinary @('network', 'inspect', $NetworkID) $InvokeDocker
+    if ($inspection.ExitCode -ne 0) { return }
+    $items = @($inspection.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Id -cne $NetworkID -or
         $items[0].Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Labels.'dbpilot.run' -cne $RunLabel) {
         throw "Refusing to remove network '$NetworkID' because its ownership labels do not match."
     }
-    & $DockerBinary network rm $NetworkID | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Unable to remove recorded network '$NetworkID'." }
+    $removal = Invoke-DBPilotSafetyDocker $DockerBinary @('network', 'rm', $NetworkID) $InvokeDocker
+    if ($removal.ExitCode -ne 0) { throw "Unable to remove recorded network '$NetworkID'." }
 }
 
 function Remove-DBPilotRecordedVolume {
@@ -143,16 +182,17 @@ function Remove-DBPilotRecordedVolume {
         [Parameter(Mandatory = $true)][string]$DockerBinary,
         [Parameter(Mandatory = $true)][string]$VolumeName,
         [Parameter(Mandatory = $true)][string]$Verifier,
-        [Parameter(Mandatory = $true)][string]$RunLabel
+        [Parameter(Mandatory = $true)][string]$RunLabel,
+        [scriptblock]$InvokeDocker
     )
-    $inspection = (& $DockerBinary volume inspect $VolumeName 2>$null | Out-String)
-    if ($LASTEXITCODE -ne 0) { return }
-    $items = @($inspection | ConvertFrom-Json)
+    $inspection = Invoke-DBPilotSafetyDocker $DockerBinary @('volume', 'inspect', $VolumeName) $InvokeDocker
+    if ($inspection.ExitCode -ne 0) { return }
+    $items = @($inspection.Stdout | ConvertFrom-Json)
     if ($items.Count -ne 1 -or $items[0].Name -cne $VolumeName -or
         $items[0].Labels.'dbpilot.verifier' -cne $Verifier -or
         $items[0].Labels.'dbpilot.run' -cne $RunLabel) {
         throw "Refusing to remove volume '$VolumeName' because its ownership labels do not match."
     }
-    & $DockerBinary volume rm $VolumeName | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Unable to remove recorded volume '$VolumeName'." }
+    $removal = Invoke-DBPilotSafetyDocker $DockerBinary @('volume', 'rm', $VolumeName) $InvokeDocker
+    if ($removal.ExitCode -ne 0) { throw "Unable to remove recorded volume '$VolumeName'." }
 }

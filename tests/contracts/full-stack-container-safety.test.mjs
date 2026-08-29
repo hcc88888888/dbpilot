@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +10,9 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const verifier = join(repoRoot, 'backend', 'scripts', 'verify-full-stack-compose.ps1');
 const workflow = join(repoRoot, '.github', 'workflows', 'contracts.yml');
+const containerSafetyHelper = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const approvedImage = 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1';
+const windowsPowerShellBinary = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 
 function pwsh(args, env = {}) {
   return spawnSync('pwsh', ['-NoProfile', ...args], {
@@ -20,11 +23,22 @@ function pwsh(args, env = {}) {
   });
 }
 
-async function fakeRuntime(mode = 'success') {
+function windowsPowerShell(args, env = {}) {
+  return spawnSync(windowsPowerShellBinary, ['-NoProfile', ...args], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+    timeout: 180_000,
+  });
+}
+
+async function fakeRuntime(mode = 'success', { withSpaces = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dbpilot-full-stack-fake-'));
-  const docker = join(root, 'docker.ps1');
-  const go = join(root, 'go.ps1');
-  const log = join(root, 'docker.log');
+  const runtimeRoot = withSpaces ? join(root, 'runtime with spaces') : root;
+  if (withSpaces) await mkdir(runtimeRoot);
+  const docker = join(runtimeRoot, 'docker fake.ps1');
+  const go = join(runtimeRoot, 'go fake.ps1');
+  const log = join(runtimeRoot, 'docker calls.log');
   const source = String.raw`
 $line = $args -join ' '
 [IO.File]::AppendAllText($env:DOCKER_LOG, $line + [Environment]::NewLine)
@@ -37,11 +51,43 @@ function Present([string]$kind, [string]$id) {
   if ($kind -eq 'network') { return $history -notmatch "(?m)^network rm $([regex]::Escape($id))\r?$" }
   return $history -notmatch "(?m)^volume rm $([regex]::Escape($id))\r?$"
 }
+function CreatedContainer([string]$id) {
+  switch ($id) {
+    'builder-id' { return $history -match ' up -d --no-deps asset-builder' }
+    'bootstrap-id' { return $history -match ' up -d --no-deps bootstrap' }
+    'postgres-id' { return $history -match ' up -d --no-deps postgres oidc' }
+    'oidc-id' { return $history -match ' up -d --no-deps postgres oidc' }
+    'controlplane-id' { return $history -match ' up -d --no-deps controlplane' }
+    'agent-id' { return $history -match ' up -d --no-deps agent' }
+    'frontend-id' { return $history -match ' up -d --no-deps frontend' }
+    'runner-normal-id' { return $history -match 'acceptance-runner normal' }
+    'runner-unauthorized-id' { return $history -match 'acceptance-runner unauthorized' }
+    'assertion-initial-id' { return ([regex]::Matches($history, 'DBPILOT_ASSERTION_PHASE=database.*assertions')).Count -ge 1 }
+    'runner-post-id' { return $history -match 'acceptance-runner post-restart' }
+    'rogue-untrusted-id' { return $history -match 'run -d --no-deps rogue-untrusted' }
+    'runner-rogue-untrusted-id' { return $history -match 'ROGUE_KIND=untrusted.*acceptance-runner rogue' }
+    'rogue-mismatch-id' { return $history -match 'run -d --no-deps rogue-mismatch' }
+    'runner-rogue-mismatch-id' { return $history -match 'ROGUE_KIND=mismatch.*acceptance-runner rogue' }
+    'assertion-replay-id' { return $history -match 'DBPILOT_ASSERTION_PHASE=replay.*assertions' }
+    'assertion-journal-id' { return $history -match 'DBPILOT_ASSERTION_PHASE=journal.*assertions' }
+    'assertion-final-id' { return ([regex]::Matches($history, 'DBPILOT_ASSERTION_PHASE=database.*assertions')).Count -ge 2 }
+    default { return $false }
+  }
+}
+function CreatedNetwork([string]$id) {
+  if ($id -eq 'network-builder') { return $history -match ' up -d --no-deps asset-builder' }
+  return $history -match ' up -d --no-deps bootstrap'
+}
+function CreatedVolume([string]$id) {
+  if ($id -in @('volume-bin','volume-go-cache')) { return $history -match ' up -d --no-deps asset-builder' }
+  return $history -match ' up -d --no-deps bootstrap'
+}
 if ($args[0] -eq 'version') { Write-Output '29.7.2'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'info') { Write-Output 'amd64'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'image' -and $args[1] -eq 'inspect') { Write-Output 'sha256:kylin'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'compose') {
   if ($args -contains 'version') { Write-Output 'Docker Compose version v5.3.1'; $global:LASTEXITCODE=0; return }
+  if ($args -contains 'build' -and $env:DOCKER_MODE -eq 'build-hang') { Start-Sleep -Seconds 30; $global:LASTEXITCODE=0; return }
   if ($args -contains 'config' -or $args -contains 'build' -or $args -contains 'up') { $global:LASTEXITCODE=0; return }
   if ($args -contains 'ps') {
     $service = $args[-1]
@@ -69,34 +115,75 @@ if ($args[0] -eq 'compose') {
   }
 }
 if ($args[0] -eq 'ps') {
+  if ($env:DOCKER_MODE -eq 'runid-collision') {
+    $sentinel = Join-Path $env:COLLISION_TEMP_PARENT ('.tmp-full-stack-' + $env:DBPILOT_ACCEPTANCE_RUN_ID)
+    New-Item -ItemType Directory -Path $sentinel -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $sentinel 'sentinel.txt'), 'pre-existing sentinel')
+    Write-Output 'collision-existing-id'
+    $global:LASTEXITCODE=0; return
+  }
   if ($args -contains 'label=dbpilot.verifier=full-stack-compose') {
+    if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
+    if ($env:DOCKER_MODE -eq 'one-shot-hang') {
+      if ($history -match ' up -d --no-deps asset-builder' -and (Present 'container' 'builder-id')) { Write-Output 'builder-id' }
+      $global:LASTEXITCODE=0; return
+    }
     if ($history -match '(?m)^rm -f -v agent-id\r?$') { $global:LASTEXITCODE=0; return }
-    foreach ($id in $containers) { if (Present 'container' $id) { Write-Output $id } }
+    foreach ($id in $containers) {
+      if ($env:DOCKER_MODE -eq 'container-label-mismatch' -and $id -eq 'runner-normal-id' -and $history -notmatch 'acceptance-runner normal') { continue }
+      if ((CreatedContainer $id) -and (Present 'container' $id)) { Write-Output $id }
+    }
   }
   $global:LASTEXITCODE=0; return
 }
 if ($args[0] -eq 'network' -and $args[1] -eq 'ls') {
+  if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
+  if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
+  if ($env:DOCKER_MODE -eq 'one-shot-hang') {
+    if ($history -match ' up -d --no-deps asset-builder' -and (Present 'network' 'network-builder')) { Write-Output 'network-builder' }
+    $global:LASTEXITCODE=0; return
+  }
   if ($history -match '(?m)^network rm network-acceptance\r?$') { $global:LASTEXITCODE=0; return }
-  foreach ($id in $networks) { if (Present 'network' $id) { Write-Output $id } }
+  foreach ($id in $networks) { if ((CreatedNetwork $id) -and (Present 'network' $id)) { Write-Output $id } }
   $global:LASTEXITCODE=0; return
 }
 if ($args[0] -eq 'volume' -and $args[1] -eq 'ls') {
+  if ($args -notcontains 'label=dbpilot.verifier=full-stack-compose') { $global:LASTEXITCODE=0; return }
+  if ($env:DOCKER_MODE -eq 'build-hang') { $global:LASTEXITCODE=0; return }
+  if ($env:DOCKER_MODE -eq 'one-shot-hang') {
+    if ($history -match ' up -d --no-deps asset-builder') {
+      foreach ($id in @('volume-bin','volume-go-cache')) { if (Present 'volume' $id) { Write-Output $id } }
+    }
+    $global:LASTEXITCODE=0; return
+  }
   if ($history -match '(?m)^volume rm volume-agent\r?$') { $global:LASTEXITCODE=0; return }
-  foreach ($id in $volumes) { if (Present 'volume' $id) { Write-Output $id } }
+  foreach ($id in $volumes) { if ((CreatedVolume $id) -and (Present 'volume' $id)) { Write-Output $id } }
   $global:LASTEXITCODE=0; return
 }
 if ($args[0] -eq 'inspect') {
+  if ($args -contains '{{json .State}}') {
+    $id = $args[-1]
+    if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $id -eq 'builder-id') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
+    $code = if ($env:DOCKER_MODE -eq 'phase-failure' -and $id -eq 'runner-normal-id') { 19 }
+      elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $id -eq 'assertion-replay-id') { 23 }
+      elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $id -eq 'assertion-final-id') { 29 }
+      elseif ($id -in @('rogue-untrusted-id','rogue-mismatch-id')) { 1 }
+      else { 0 }
+    Write-Output ('{"Status":"exited","ExitCode":' + $code + '}'); $global:LASTEXITCODE=0; return
+  }
   if ($args -contains '--format') { Write-Output 'healthy'; $global:LASTEXITCODE=0; return }
   $id = $args[-1]
   if (-not (Present 'container' $id)) { $global:LASTEXITCODE=1; return }
   $mounts = if ($id -eq 'agent-id') { @(@{Type='volume';Name='volume-agent'}) } else { @() }
-  @{Id=$id;Config=@{Labels=@{'dbpilot.verifier'='full-stack-compose';'dbpilot.run'=$env:DBPILOT_ACCEPTANCE_RUN_ID}};Mounts=$mounts} | ConvertTo-Json -Depth 5
+  $run = if ($env:DOCKER_MODE -eq 'container-label-mismatch' -and $id -eq 'runner-normal-id') { 'other-run' } else { $env:DBPILOT_ACCEPTANCE_RUN_ID }
+  @{Id=$id;Config=@{Labels=@{'dbpilot.verifier'='full-stack-compose';'dbpilot.run'=$run}};Mounts=$mounts} | ConvertTo-Json -Depth 5
   $global:LASTEXITCODE=0; return
 }
 if ($args[0] -eq 'network' -and $args[1] -eq 'inspect') {
   $id = $args[-1]
   if (-not (Present 'network' $id)) { $global:LASTEXITCODE=1; return }
-  @{Id=$id;Labels=@{'dbpilot.verifier'='full-stack-compose';'dbpilot.run'=$env:DBPILOT_ACCEPTANCE_RUN_ID}} | ConvertTo-Json -Depth 4
+  $run = if ($env:DOCKER_MODE -eq 'network-label-mismatch' -and $id -eq 'network-acceptance') { 'other-run' } else { $env:DBPILOT_ACCEPTANCE_RUN_ID }
+  @{Id=$id;Labels=@{'dbpilot.verifier'='full-stack-compose';'dbpilot.run'=$run}} | ConvertTo-Json -Depth 4
   $global:LASTEXITCODE=0; return
 }
 if ($args[0] -eq 'volume' -and $args[1] -eq 'inspect') {
@@ -108,6 +195,7 @@ if ($args[0] -eq 'volume' -and $args[1] -eq 'inspect') {
 }
 if ($args[0] -eq 'port') { Write-Output '127.0.0.1:49177'; $global:LASTEXITCODE=0; return }
 if ($args[0] -eq 'wait') {
+  if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $args[1] -eq 'builder-id') { Start-Sleep -Seconds 30; Write-Output '0'; $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'phase-failure' -and $args[1] -eq 'runner-normal-id') { Write-Output '19' }
   elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $args[1] -eq 'assertion-replay-id') { Write-Output '23' }
   elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $args[1] -eq 'assertion-final-id') { Write-Output '29' }
@@ -128,13 +216,23 @@ if ($args[0] -eq 'network' -and $args[1] -eq 'rm') { $global:LASTEXITCODE=0; ret
 if ($args[0] -eq 'volume' -and $args[1] -eq 'rm') { $global:LASTEXITCODE=0; return }
 $global:LASTEXITCODE=42
 `;
-  await writeFile(docker, source);
+  const executableSource = source
+    .replaceAll('$global:LASTEXITCODE=0; return', 'exit 0')
+    .replaceAll('$global:LASTEXITCODE=1; return', 'exit 1')
+    .replaceAll('$global:LASTEXITCODE=17; return', 'exit 17')
+    .replaceAll('$global:LASTEXITCODE=41; return', 'exit 41')
+    .replaceAll('$global:LASTEXITCODE=42', 'exit 42');
+  await writeFile(docker, executableSource);
   await writeFile(go, "Write-Output 'go version go1.27.0 windows/amd64'\n$global:LASTEXITCODE=0\n");
   return { root, docker, go, log, mode };
 }
 
 function verifierArguments(fixture, image = approvedImage) {
   return ['-File', verifier, '-Image', image, '-Architecture', 'amd64', '-DockerBinary', fixture.docker, '-GoBinary', fixture.go, '-OutageSeconds', '0', '-FailureArtifactRoot', fixture.root];
+}
+
+function boundedVerifierArguments(fixture) {
+  return [...verifierArguments(fixture), '-DockerCommandTimeoutSeconds', '2', '-BuildTimeoutSeconds', '1', '-JobTimeoutSeconds', '1'];
 }
 
 test('verifier rejects an unapproved Kylin image before invoking Docker', async () => {
@@ -145,6 +243,31 @@ test('verifier rejects an unapproved Kylin image before invoking Docker', async 
     assert.match(result.stderr, new RegExp(approvedImage.replaceAll('.', '\\.')));
     await assert.rejects(readFile(fixture.log, 'utf8'), { code: 'ENOENT' });
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier refuses an exact run-label collision before creation and preserves the colliding sentinel directory', async () => {
+  const fixture = await fakeRuntime('runid-collision');
+  let sentinel;
+  try {
+    const collisionParent = join(repoRoot, 'backend');
+    const result = pwsh(verifierArguments(fixture), {
+      DOCKER_LOG: fixture.log,
+      DOCKER_MODE: fixture.mode,
+      DBPILOT_FULL_STACK_TEST_MODE: '1',
+      COLLISION_TEMP_PARENT: collisionParent,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /run ownership collision/i);
+    const invocations = await readFile(fixture.log, 'utf8');
+    const run = invocations.match(/label=dbpilot\.run=([0-9a-f]{32})/)?.[1];
+    assert.ok(run, invocations);
+    sentinel = join(collisionParent, `.tmp-full-stack-${run}`);
+    assert.equal(await readFile(join(sentinel, 'sentinel.txt'), 'utf8'), 'pre-existing sentinel');
+    assert.doesNotMatch(invocations, /^compose .* (?:build|up|run) |^(?:start|stop|rm|network rm|volume rm) /m);
+  } finally {
+    if (sentinel) await rm(sentinel, { recursive: true, force: true });
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
@@ -208,7 +331,7 @@ test('verifier owns one unique project, preserves phase order, records the ephem
       assert.match(invocations, new RegExp(`^volume rm ${id}$`, 'm'));
     }
     assert.doesNotMatch(invocations, /preexisting-similar-id|\bdown\b|\bprune\b|\*.*(?:rm|remove)|(?:rm|remove).*\*/i);
-    assert.match(result.stdout, /Full-stack cleanup audit passed/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Full-stack cleanup audit passed/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -241,6 +364,34 @@ test('verifier never removes a recorded volume whose ownership labels do not mat
     const invocations = await readFile(fixture.log, 'utf8');
     assert.doesNotMatch(invocations, /^volume rm volume-agent$/m);
     assert.doesNotMatch(invocations, /\bdown\b|\bprune\b/i);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier audits but never removes a newly observed container whose ownership labels mismatch', async () => {
+  const fixture = await fakeRuntime('container-label-mismatch');
+  try {
+    const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Recorded container 'runner-normal-id' remains after cleanup/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.doesNotMatch(invocations, /^rm -f -v runner-normal-id$/m);
+    assert.match(invocations, /inspect runner-normal-id/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier audits but never removes an observed network whose ownership labels mismatch', async () => {
+  const fixture = await fakeRuntime('network-label-mismatch');
+  try {
+    const result = pwsh(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Recorded network 'network-acceptance' remains after cleanup/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.doesNotMatch(invocations, /^network rm network-acceptance$/m);
+    assert.match(invocations, /network inspect network-acceptance/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -283,6 +434,44 @@ test('verifier restores caller Compose environment values after failure', async 
   }
 });
 
+test('verifier owns and terminates a hung Compose build before restoring its environment', async () => {
+  const fixture = await fakeRuntime('build-hang');
+  try {
+    const call = `& '${verifier}' ${boundedVerifierArguments(fixture).slice(2).map((value) => value.startsWith('-') ? value : `'${value.replaceAll("'", "''")}'`).join(' ')}`;
+    const command = `$env:DBPILOT_ACCEPTANCE_PROJECT='sentinel-project'; $env:DBPILOT_ACCEPTANCE_RUN_ID='sentinel-run'; try { ${call} } catch { Write-Output ('FIXED=' + $_.Exception.Message) }; Write-Output ('RESTORED=' + $env:DBPILOT_ACCEPTANCE_PROJECT + '|' + $env:DBPILOT_ACCEPTANCE_RUN_ID)`;
+    const started = Date.now();
+    const result = pwsh(['-Command', command], { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    const elapsed = Date.now() - started;
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(elapsed < 15_000, `hung build was not terminated: ${elapsed}ms`);
+    assert.match(result.stdout, /FIXED=The acceptance-runner image build timed out\./);
+    assert.match(result.stdout, /RESTORED=sentinel-project\|sentinel-run/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, /compose .* build acceptance-runner/);
+    assert.doesNotMatch(invocations, /compose .* up /);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('verifier times out a running one-shot container without docker wait and cleans its exact resources', async () => {
+  const fixture = await fakeRuntime('one-shot-hang');
+  try {
+    const started = Date.now();
+    const result = pwsh(boundedVerifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    const elapsed = Date.now() - started;
+    assert.notEqual(result.status, 0);
+    assert.ok(elapsed < 35_000, `one-shot wait was not bounded: ${elapsed}ms`);
+    assert.match(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.doesNotMatch(invocations, /^wait /m);
+    assert.match(invocations, /^rm -f -v builder-id$/m);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Full-stack cleanup audit passed/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('CI always runs fake-Docker safety and exposes the live verifier only as an explicit Windows opt-in', async () => {
   const source = await readFile(workflow, 'utf8');
   assert.match(source, /workflow_dispatch:\s*[\s\S]*run_full_stack:/);
@@ -290,4 +479,58 @@ test('CI always runs fake-Docker safety and exposes the live verifier only as an
   assert.match(source, /docker compose -f backend\/docker\/full-stack\/docker-compose\.yml --profile '\*' config --quiet/);
   assert.match(source, /full-stack-acceptance:[\s\S]*if:.*run_full_stack[\s\S]*runs-on:\s*\[self-hosted, Windows, X64\]/);
   assert.match(source, /verify-full-stack-compose\.ps1[\s\S]*cr\.kylinos\.cn\/kylin\/kylin-server-platform:v10sp1/);
+  assert.equal((source.match(/backend\/docker\/full-stack\/\*\*/g) ?? []).length, 2, 'topology changes must trigger both pull_request and push');
+  assert.equal((source.match(/backend\/test\/e2e\/full-stack\/\*\*/g) ?? []).length, 2, 'runner changes must trigger both pull_request and push');
+});
+
+test('Windows PowerShell 5.1 runs fake success from tool paths containing spaces', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
+  const fixture = await fakeRuntime('success', { withSpaces: true });
+  try {
+    const result = windowsPowerShell(boundedVerifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /Full-stack cleanup audit passed/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.match(invocations, /compose .* acceptance-runner normal/);
+    assert.doesNotMatch(invocations, /^wait /m);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('Windows PowerShell 5.1 native quoting preserves empty, spaces, quotes, and trailing backslashes', { skip: !existsSync(windowsPowerShellBinary) }, () => {
+  const escapedHelper = containerSafetyHelper.replaceAll("'", "''");
+  const command = `. '${escapedHelper}'; @('', 'plain', 'with space', 'a"b', 'C:\\path with space\\') | ForEach-Object { ConvertTo-DBPilotNativeArgument $_ } | ConvertTo-Json -Compress`;
+  const encoded = Buffer.from(command, 'utf16le').toString('base64');
+  const result = windowsPowerShell(['-EncodedCommand', encoded]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout.trim()), ['""', 'plain', '"with space"', '"a\\"b"', '"C:\\path with space\\\\"']);
+});
+
+test('Windows PowerShell 5.1 kills a hung build and restores caller environment', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
+  const fixture = await fakeRuntime('build-hang', { withSpaces: true });
+  try {
+    const tokens = boundedVerifierArguments(fixture).slice(2).map((value) => value.startsWith('-') ? value : `'${value.replaceAll("'", "''")}'`).join(' ');
+    const command = `$env:DBPILOT_ACCEPTANCE_PROJECT='sentinel-project'; $env:DBPILOT_ACCEPTANCE_RUN_ID='sentinel-run'; try { & '${verifier}' ${tokens} } catch { Write-Output ('FIXED=' + $_.Exception.Message) }; Write-Output ('RESTORED=' + $env:DBPILOT_ACCEPTANCE_PROJECT + '|' + $env:DBPILOT_ACCEPTANCE_RUN_ID)`;
+    const result = windowsPowerShell(['-Command', command], { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /FIXED=The acceptance-runner image build timed out\./);
+    assert.match(result.stdout, /RESTORED=sentinel-project\|sentinel-run/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('Windows PowerShell 5.1 bounds a running one-shot and cleans exact resources', { skip: !existsSync(windowsPowerShellBinary) }, async () => {
+  const fixture = await fakeRuntime('one-shot-hang', { withSpaces: true });
+  try {
+    const result = windowsPowerShell(boundedVerifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}\n${result.stderr}`, /asset-builder did not exit before the deadline/);
+    assert.match(result.stdout, /Full-stack cleanup audit passed/);
+    const invocations = await readFile(fixture.log, 'utf8');
+    assert.doesNotMatch(invocations, /^wait /m);
+    assert.match(invocations, /^rm -f -v builder-id$/m);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
 });
