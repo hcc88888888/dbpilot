@@ -364,6 +364,7 @@ function Redact-Text {
     $value = [regex]::Replace($value, '(?i)Bearer\s+\S+', 'Bearer [REDACTED]')
     $value = [regex]::Replace($value, '(?i)eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED JWT]')
     $value = [regex]::Replace($value, '(?i)postgres(?:ql)?://[^\s]+', 'postgres://[REDACTED]')
+    $value = [regex]::Replace($value, '(?i)(signature=)[^&\s"''<>#;]+', '$1[REDACTED]')
     $value = [regex]::Replace($value, '(?i)(password|credential|token|secret)\s*[=:]\s*[^\s]+', '$1=[REDACTED]')
     return $value
 }

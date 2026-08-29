@@ -162,6 +162,7 @@ if ($args[0] -eq 'inspect') {
     }
     if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $id -eq 'bootstrap-id') { Write-Output '{"Status":"running","ExitCode":0}'; $global:LASTEXITCODE=0; return }
     $code = if ($env:DOCKER_MODE -eq 'phase-failure' -and $id -eq 'runner-normal-id') { 19 }
+      elseif ($env:DOCKER_MODE -eq 'post-download-failure' -and $id -eq 'assertion-initial-id') { 31 }
       elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $id -eq 'assertion-replay-id') { 23 }
       elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $id -eq 'assertion-final-id') { 29 }
       elseif ($id -in @('rogue-untrusted-id','rogue-mismatch-id')) { 1 }
@@ -194,6 +195,7 @@ if ($args[0] -eq 'port') { Write-Output '127.0.0.1:49177'; $global:LASTEXITCODE=
 if ($args[0] -eq 'wait') {
   if ($env:DOCKER_MODE -eq 'one-shot-hang' -and $args[1] -eq 'bootstrap-id') { Start-Sleep -Seconds 30; Write-Output '0'; $global:LASTEXITCODE=0; return }
   if ($env:DOCKER_MODE -eq 'phase-failure' -and $args[1] -eq 'runner-normal-id') { Write-Output '19' }
+  elseif ($env:DOCKER_MODE -eq 'post-download-failure' -and $args[1] -eq 'assertion-initial-id') { Write-Output '31' }
   elseif ($env:DOCKER_MODE -eq 'replay-failure' -and $args[1] -eq 'assertion-replay-id') { Write-Output '23' }
   elseif ($env:DOCKER_MODE -eq 'final-database-failure' -and $args[1] -eq 'assertion-final-id') { Write-Output '29' }
   elseif ($args[1] -in @('rogue-untrusted-id','rogue-mismatch-id')) { Write-Output '1' }
@@ -203,6 +205,8 @@ if ($args[0] -eq 'wait') {
 if ($args[0] -eq 'logs') {
   if ($args[-1] -eq 'rogue-untrusted-id') { Write-Output 'x509: certificate signed by unknown authority' }
   elseif ($args[-1] -eq 'rogue-mismatch-id') { Write-Output 'rpc error: code = PermissionDenied Hello Agent ID differs from verified SPIFFE identity' }
+  elseif ($args[-1] -eq 'frontend-id' -and $env:DOCKER_MODE -eq 'post-download-failure') { Write-Output '10.0.0.8 - - [30/Aug/2026:05:00:00 +0800] "GET /api/v1/artifact-downloads/artifact-acceptance?signature=9f97e5c83aef729d06e8078ec2a458102a70b024f4501a366c0f24e93626a0d1 HTTP/1.1" 200 128 "-" "Chromium"' }
+  elseif ($args[-1] -eq 'assertion-initial-id' -and $env:DOCKER_MODE -eq 'post-download-failure') { [Console]::Error.WriteLine('post-download assertion failed safely') }
   elseif ($args[-1] -eq 'assertion-summary-id' -and $env:DOCKER_MODE -eq 'summary-leak') { Write-Output '{"run_id":"run-1","job_id":"job-1","online_command_id":"command-online","offline_command_id":"command-offline","report_id":"report-1","target_count":2,"finding_count":13,"report_count":1,"artifact_count":2,"audit_count":4,"controlplane_stopped_at":"2026-08-29T04:00:10Z","controlplane_restarted_at":"2026-08-29T04:01:00Z","token":"Bearer eyJsecret.payload.signature"}' }
   elseif ($args[-1] -eq 'assertion-summary-id') { Write-Output '{"run_id":"run-1","job_id":"job-1","online_command_id":"command-online","offline_command_id":"command-offline","report_id":"report-1","target_count":2,"finding_count":13,"report_count":1,"artifact_count":2,"audit_count":4,"controlplane_stopped_at":"2026-08-29T04:00:10Z","controlplane_restarted_at":"2026-08-29T04:01:00Z"}' }
   elseif ($env:DOCKER_MODE -eq 'phase-failure') { [Console]::Error.WriteLine('browser stderr diagnostic Bearer eyJsecret.header.signature postgres://user:password@postgres/db') }
@@ -236,6 +240,33 @@ function boundedVerifierArguments(fixture) {
 
 function coldStartVerifierArguments(fixture, { materialize = 1, assetBuild = 4 } = {}) {
   return [...boundedVerifierArguments(fixture), '-MaterializeTimeoutSeconds', String(materialize), '-AssetBuildTimeoutSeconds', String(assetBuild)];
+}
+
+async function assertSignatureRedaction(shell) {
+  const source = await readFile(verifier, 'utf8');
+  const start = source.indexOf('function Redact-Text {');
+  const end = source.indexOf('function Save-BoundedContainerLog {', start);
+  assert.ok(start >= 0 && end > start, 'Redact-Text function boundary is unavailable');
+  const root = await mkdtemp(join(tmpdir(), 'dbpilot-redactor-test-'));
+  const script = join(root, 'redact.ps1');
+  try {
+    await writeFile(script, `${source.slice(start, end)}\n[Console]::Out.Write((Redact-Text ([Console]::In.ReadToEnd())))\n`);
+    const cases = [
+      ['GET /download?signature=abc123 HTTP/1.1', 'GET /download?signature=[REDACTED] HTTP/1.1'],
+      ['SIGNATURE=AbC%2BDef%3D&format=json', 'SIGNATURE=[REDACTED]&format=json'],
+      ['?format=html&Signature=middle_value-9&download=1', '?format=html&Signature=[REDACTED]&download=1'],
+      ['prefix signature=value; status=403', 'prefix signature=[REDACTED]; status=403'],
+      ['fixed diagnostic: signature verification failed safely', 'fixed diagnostic: signature verification failed safely'],
+    ];
+    for (const [input, expected] of cases) {
+      const result = spawnSync(shell, ['-NoProfile', '-File', script], { encoding: 'utf8', input, timeout: 10_000 });
+      if (result.status !== 0 || result.stdout !== expected || result.stderr !== '') {
+        assert.fail('signature redaction produced an unsafe or damaged fixed diagnostic');
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 test('verifier rejects an unapproved Kylin image before invoking Docker', async () => {
@@ -380,11 +411,51 @@ test('verifier propagates a phase failure, emits only redacted failure artifacts
   }
 });
 
+async function assertPostDownloadFailureArtifacts(runVerifier) {
+  const fixture = await fakeRuntime('post-download-failure');
+  const hmac = '9f97e5c83aef729d06e8078ec2a458102a70b024f4501a366c0f24e93626a0d1';
+  try {
+    const result = runVerifier(verifierArguments(fixture), { DOCKER_LOG: fixture.log, DOCKER_MODE: fixture.mode, DBPILOT_FULL_STACK_TEST_MODE: '1' });
+    assert.notEqual(result.status, 0);
+    const failureDirectory = (await readdir(fixture.root, { withFileTypes: true }))
+      .find((entry) => entry.isDirectory() && entry.name.startsWith('dbpilot-full-stack-failure-'));
+    assert.ok(failureDirectory, 'post-download failure artifacts were not retained');
+    const failurePath = join(fixture.root, failureDirectory.name);
+    const retained = await readdir(failurePath, { recursive: true, withFileTypes: true });
+    const retainedBodies = await Promise.all(retained.filter((entry) => entry.isFile()).map((entry) => readFile(join(entry.parentPath, entry.name))));
+    const retainedBytes = Buffer.concat(retainedBodies);
+    const retainedText = retainedBytes.toString('utf8');
+    assert.equal(retainedBytes.includes(Buffer.from(hmac)), false, 'retained failure artifact contains the Artifact HMAC');
+    assert.doesNotMatch(retainedText, /signature=(?!\[REDACTED\])[^&\s"'<>#;]+/i);
+    assert.match(retainedText, /GET \/api\/v1\/artifact-downloads\/artifact-acceptance\?signature=\[REDACTED\] HTTP\/1\.1" 200/);
+    assert.match(retainedText, /post-download assertion failed safely/);
+    assert.match(`${result.stdout}\n${result.stderr}`, /Full-stack cleanup audit passed/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+}
+
+test('post-download failure retains a safe Artifact path and status without signature query values', async () => {
+  await assertPostDownloadFailureArtifacts(pwsh);
+});
+
+test('Windows PowerShell 5.1 redacts signed Artifact URLs from post-download failure artifacts', async () => {
+  await assertPostDownloadFailureArtifacts(windowsPowerShell);
+});
+
 test('bounded Docker failures retain redacted stderr diagnostics', async () => {
   const source = await readFile(verifier, 'utf8');
   assert.match(source, /function Get-DockerFailureMessage/);
   assert.match(source, /Get-DockerFailureMessage[^]*\.Stdout[^]*\.Stderr[^]*Redact-Text/);
   assert.match(source, /Get-DockerFailureMessage[^]*4096/);
+});
+
+test('Redact-Text removes signed URL values without damaging fixed diagnostics', async () => {
+  await assertSignatureRedaction('pwsh');
+});
+
+test('Windows PowerShell 5.1 Redact-Text removes signed URL values without damaging fixed diagnostics', async () => {
+  await assertSignatureRedaction(windowsPowerShellBinary);
 });
 
 test('verifier never removes a recorded volume whose ownership labels do not match', async () => {

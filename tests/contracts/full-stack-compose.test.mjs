@@ -376,6 +376,14 @@ test('Nginx serves the repository UI and verifies the same-origin HTTPS upstream
   assert.match(nginx, /proxy_buffering\s+off/);
   assert.match(nginx, /client_max_body_size\s+\d+[km]/i);
   assert.match(nginx, /proxy_(?:connect|read|send)_timeout\s+\d+s/);
+  const accessFormat = nginx.match(/log_format\s+dbpilot_safe\s+'([^']+)'\s*;/);
+  assert.ok(accessFormat, 'Nginx must use a dedicated query-free access log format');
+  assert.deepEqual(
+    [...accessFormat[1].matchAll(/\$[A-Za-z0-9_]+/g)].map((match) => match[0]),
+    ['$remote_addr', '$request_method', '$uri', '$status', '$body_bytes_sent', '$request_time'],
+  );
+  assert.match(nginx, /access_log\s+\/dev\/stdout\s+dbpilot_safe\s*;/);
+  assert.doesNotMatch(accessFormat[1], /\$(?:args|query_string|request_uri|http_[A-Za-z0-9_]+|upstream_http_[A-Za-z0-9_]+|arg_[A-Za-z0-9_]+)\b|\$request(?!_method)\b/);
   for (const temporaryPath of ['client_body', 'proxy', 'fastcgi', 'uwsgi', 'scgi']) {
     assert.match(nginx, new RegExp(`${temporaryPath}_temp_path\\s+\\/tmp\\/`), `${temporaryPath} temp output must stay off the read-only root`);
   }

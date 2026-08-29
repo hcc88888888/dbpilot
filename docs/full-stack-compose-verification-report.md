@@ -92,6 +92,34 @@ Full-stack cleanup audit passed
 No raw rogue log, JWT, credential, private key, database password, complete DSN,
 log body, evidence value or signature is retained in this report.
 
+### Post-review signed URL log hardening
+
+The final whole-branch review found that the original live run's Nginx default
+access format could write an Artifact HMAC query parameter to Docker stdout and
+that a later verifier failure could retain it. The signed URL behavior and the
+successful live evidence above remain unchanged, but the checked-in Nginx
+configuration now uses a dedicated access format containing only remote address,
+request method, query-free `$uri`, status, response byte count and request time.
+It contains no `$request`, `$request_uri`, `$args`, query-string, Referer/header
+or upstream-header variable. `Redact-Text` also defensively replaces
+case-insensitive URL/form `signature=<value>` while preserving the surrounding
+fixed diagnostic.
+
+A deliberate fake-runtime failure after the browser download phase injected a
+realistic signed Artifact GET into frontend stdout. Under both PowerShell 7 and
+Windows PowerShell 5.1, the verifier retained failure artifacts, recursively
+scanned every retained file (including binary files), preserved the safe Artifact
+path/status and unrelated failure diagnostic, removed the HMAC/query value, and
+completed exact cleanup. Direct production-function tests also covered mixed
+case, encoded values, first/middle/final query positions and bounded surrounding
+text without echoing a failing secret.
+
+No second live run was performed: the original production workflow passed, and
+the post-review change is limited to query-free Nginx access formatting,
+defensive failure-text redaction and their fake-runtime/static contracts. The
+broader Compose/communication/container-safety gate below is fresh after this
+hardening.
+
 ## Regression and production gates
 
 | Gate | Result |
@@ -103,7 +131,7 @@ log body, evidence value or signature is retained in this report.
 | `go test ./... -count=1` | PASS for every backend package |
 | `go vet ./...` | PASS |
 | `docker compose -f backend/docker/full-stack/docker-compose.yml config --quiet` | PASS |
-| Three-file Compose/communication/container-safety gate | PASS: 55 total, 54 passed, 1 intentional clean-cache skip, 0 failed |
+| Three-file Compose/communication/container-safety gate | PASS after post-review hardening: 59 total, 58 passed, 1 intentional clean-cache skip, 0 failed |
 | `verify-inspection-postgres.ps1` | PASS; built-ins sampled=18, hydrated=9, findings=13 |
 | `verify-contract-foundation.ps1` | PASS; Node 357/355/2/0, Go/vet, PostgreSQL E2E, Linux builds and exact cleanup |
 | `verify-kylin-docker.ps1` with the exact Kylin image | PASS; production binaries, protocol, host snapshot, journal, policy and Artifact readiness |
@@ -114,6 +142,10 @@ The first bare final `contracts:verify` invocation could not locate `go` because
 the repository-local toolchain directory was not on that shell's `PATH`.
 Prepending the required repository Go 1.27 directory produced the passing result
 above; this was an environment invocation error, not contract drift.
+
+The complete 359-entry Node run predates the four-file post-review hardening
+diff; every affected Compose, communication, Nginx, verifier, failure-retention,
+cleanup and dual-PowerShell contract was rerun in the fresh 59-entry gate.
 
 ## Cleanup and residual audit
 
@@ -127,7 +159,9 @@ Independent final label queries found zero verifier containers, networks and
 volumes, and the repository contained zero `.tmp-*` verifier directories. One
 fake-Docker directory left by an interrupted Task 6 test was removed by exact
 validated path; an older unrelated fake-test directory was preserved. The dirty
-main checkout was not touched.
+main checkout was not touched. The post-review audit likewise removed one exact
+inactive verifier directory left when the review's fake-runtime gate was stopped,
+after confirming zero owning processes and zero run-labelled Docker resources.
 
 ## Deferred technical debt
 
@@ -135,5 +169,9 @@ main checkout was not touched.
 | --- | --- | --- | --- | --- |
 | Frontend npm dependencies | Running `npm audit` during foundation setup | No current workflow failure; 16 moderate and 1 high advisory remain | Medium | Consolidated dependency-hardening cycle before production rollout |
 | OpenAPI metadata | Running Redocly lint | No API/runtime or generated-client failure; `info.license` is absent | Low | Documentation cleanup before external API publication |
+| Frontend Compose secret mount | Nginx or a loaded module is compromised or misconfigured | The process can read the complete acceptance secret volume although normal acceptance and retained logs are now query-safe | Medium hardening | Provide a dedicated frontend TLS-key mount before production rollout |
+| Full-stack image references | An accepted registry tag is mutated after review | Exact-tag checks alone do not guarantee future supply-chain immutability; reviewed local IDs/digests were exact | Medium hardening | Pin and verify image digests/signatures before production rollout |
 | Full-stack runner images | Repeated verifier runs create unique Compose runner tags | No acceptance correctness impact; 42 exact runner tags currently consume image metadata/storage | Minor | Add exact run-owned image removal before making the live gate routine; never prune or wildcard-delete |
+| Bootstrap/JWKS hardening | A hostile concurrent output writer or malformed same-modulus JWKS exponent is introduced | Current isolated fixture output remains correct; exceptional validation is less defensive than it could be | Low hardening | Consolidated fixture hardening before production rollout |
+| Browser audit pagination and retained fixture naming | More than 100 unrelated Audits precede the Run, or retained runs are compared | Possible false-negative diagnosis or non-deterministic fixture naming; no production data error | Low test resilience | Follow Audit cursors and derive fixture names from the verifier run ID when expanding scenarios |
 | Formal deployment boundaries | Production release outside the isolated Compose acceptance network | Compose does not prove frontend PKCE, PostgreSQL TLS, external secret management, HA/load/soak, or Kylin VM/bare-metal system integration | Medium | Execute the separate documented release gates before production rollout |
