@@ -173,7 +173,9 @@ func TestDiscoveryPostgresIntegrationIncompleteDockerSourceDoesNotAgeCandidates(
 	require.NoError(t, err)
 	require.Len(t, page, 2)
 	for _, candidate := range page {
-		if candidate.Source == SourceDocker { require.Equal(t, "127.0.0.1:59272", candidate.NormalizedEndpoint) }
+		if candidate.Source == SourceDocker {
+			require.Equal(t, "127.0.0.1:59272", candidate.NormalizedEndpoint)
+		}
 	}
 	stored, err := NewPostgresRepository(database).SourceResults(ctx, scope, hostID)
 	require.NoError(t, err)

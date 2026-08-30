@@ -140,7 +140,9 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 	}
 	sourceResults := effectiveSourceResults(report)
 	for _, sourceResult := range sourceResults {
-		if sourceResult.Status == SourceNotRequested { continue }
+		if sourceResult.Status == SourceNotRequested {
+			continue
+		}
 		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_scan_sources (tenant_id,project_id,host_id,discovery_source,result_status,reason_code,observation_revision,rule_revision,rule_set_digest,observed_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (tenant_id,project_id,host_id,discovery_source) DO UPDATE SET result_status=EXCLUDED.result_status,reason_code=EXCLUDED.reason_code,observation_revision=EXCLUDED.observation_revision,rule_revision=EXCLUDED.rule_revision,rule_set_digest=EXCLUDED.rule_set_digest,observed_at=EXCLUDED.observed_at,updated_at=EXCLUDED.updated_at WHERE discovery_scan_sources.observation_revision < EXCLUDED.observation_revision`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, string(sourceResult.Source), string(sourceResult.Status), string(sourceResult.Reason), report.ObservationRevision, report.RuleRevision, report.RuleAttestation.Digest[:], sourceResult.ObservedAt, receivedAt)
 		if err != nil {
 			rollback()
