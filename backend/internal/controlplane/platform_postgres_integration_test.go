@@ -2,19 +2,25 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/enrollment"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformdb"
@@ -22,6 +28,112 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+func TestPostgresReplacementMarkerRecoveryAndAuditRollback(t *testing.T) {
+	if os.Getenv("DBPILOT_HTTP_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_HTTP_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_HTTP_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_HTTP_POSTGRES_DSN is required")
+	}
+	for _, test := range []struct {
+		name           string
+		commitThenFail bool
+	}{
+		{name: "marker failed before persistence"},
+		{name: "marker commit acknowledgement lost", commitThenFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			database := openHTTPIntegrationDatabase(t, ctx, dsn, "enrollment_replace_"+strings.ReplaceAll(test.name, " ", "_"))
+			require.NoError(t, hostinventory.RunMigrations(ctx, database))
+			require.NoError(t, enrollment.RunMigrations(ctx, database))
+			repository := enrollment.NewPostgresRepository(database)
+			application := enrollment.ApplicationService{Tokens: repository}
+			initial, err := application.Create(ctx, platformTestScope, enrollment.CreateRequest{
+				HostID: "host-1", AgentID: "agent-1", DisplayName: "Primary", Labels: map[string]string{}, ExpiresIn: time.Hour,
+				IssuedBy: "trusted-user", IdempotencyKey: "seed", RequestFingerprint: "sha256:" + strings.Repeat("1", 64),
+				Audit: enrollment.EnrollmentAudit{Actor: "trusted-user", RequestID: "request-seed", OperationID: "createHostEnrollment", IdempotencyKey: "seed"},
+			})
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), initial.Generation)
+			gap := &commitSideEffectGapStore{inner: idempotency.NewPostgresStore(database), fail: true, commitThenFail: test.commitThenFail}
+			services := Services{Enrollment: application, Idempotency: idempotency.NewService(gap)}
+			principal := principalWith(platformTestScope, openapi.PermissionCreateHostEnrollment)
+			idempotencyKey := "replace-postgres-" + strings.ReplaceAll(test.name, " ", "-")
+
+			failed := servePlatformRequest(services, principal, newEnrollmentReplacementRequest(idempotencyKey, `"1"`, "Primary"))
+			requireProblem(t, failed, http.StatusInternalServerError, "internal_error", failed.Header().Get("X-Request-ID"))
+			var generation int64
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT generation FROM agent_enrollment_tokens WHERE tenant_id=$1 AND project_id=$2 AND host_id='host-1' AND agent_id='agent-1' AND consumed_at IS NULL`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&generation))
+			require.Equal(t, int64(2), generation)
+			gap.fail = false
+
+			const consumers = 12
+			responses := make(chan *httptest.ResponseRecorder, consumers)
+			var wait sync.WaitGroup
+			for index := 0; index < consumers; index++ {
+				wait.Add(1)
+				go func() {
+					defer wait.Done()
+					responses <- servePlatformRequest(services, principal, newEnrollmentReplacementRequest(idempotencyKey, `"1"`, "Primary"))
+				}()
+			}
+			wait.Wait()
+			close(responses)
+			for response := range responses {
+				requireProblem(t, response, http.StatusConflict, "enrollment_token_not_replayable", response.Header().Get("X-Request-ID"))
+				require.Equal(t, `"2"`, response.Header().Get("ETag"))
+			}
+
+			next := servePlatformRequest(services, principal, newEnrollmentReplacementRequest(idempotencyKey+"-next", `"2"`, "Primary"))
+			require.Equal(t, http.StatusCreated, next.Code, next.Body.String())
+			var body openapi.HostEnrollment
+			require.NoError(t, decodeJSONBytes(next.Body.Bytes(), &body))
+			raw, err := base64.RawURLEncoding.DecodeString(body.EnrollmentToken)
+			require.NoError(t, err)
+			replayed := servePlatformRequest(services, principal, newEnrollmentReplacementRequest(idempotencyKey+"-next", `"2"`, "Primary"))
+			requireProblem(t, replayed, http.StatusConflict, "enrollment_token_not_replayable", replayed.Header().Get("X-Request-ID"))
+			require.Equal(t, `"3"`, replayed.Header().Get("ETag"))
+			csrDigest := sha256.Sum256([]byte("replacement-active-proof"))
+			_, err = repository.Resolve(ctx, enrollment.EnrollmentAttemptKey{TokenHash: enrollment.HashToken(raw), CSRDigest: csrDigest, AgentID: "agent-1", HostID: "host-1"})
+			require.NoError(t, err, "the only returned replacement token must remain active after exact retries")
+			var auditCount int
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND action IN ('host.enrollment_created','host.enrollment_replaced')`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&auditCount))
+			require.Equal(t, 3, auditCount)
+		})
+	}
+
+	t.Run("Audit insert failure rolls back generation", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		database := openHTTPIntegrationDatabase(t, ctx, dsn, "enrollment_replace_audit_rollback")
+		require.NoError(t, hostinventory.RunMigrations(ctx, database))
+		require.NoError(t, enrollment.RunMigrations(ctx, database))
+		application := enrollment.ApplicationService{Tokens: enrollment.NewPostgresRepository(database)}
+		_, err := application.Create(ctx, platformTestScope, enrollment.CreateRequest{
+			HostID: "host-1", AgentID: "agent-1", DisplayName: "Primary", Labels: map[string]string{}, ExpiresIn: time.Hour,
+			IssuedBy: "trusted-user", IdempotencyKey: "seed", RequestFingerprint: "sha256:" + strings.Repeat("2", 64),
+			Audit: enrollment.EnrollmentAudit{Actor: "trusted-user", RequestID: "request-seed", OperationID: "createHostEnrollment", IdempotencyKey: "seed"},
+		})
+		require.NoError(t, err)
+		require.NoError(t, func() error {
+			_, renameErr := database.ExecContext(ctx, `ALTER TABLE audit_events RENAME TO audit_events_unavailable`)
+			return renameErr
+		}())
+		response := servePlatformRequest(Services{Enrollment: application, Idempotency: idempotency.NewService(idempotency.NewPostgresStore(database))}, principalWith(platformTestScope, openapi.PermissionCreateHostEnrollment), newEnrollmentReplacementRequest("replace-audit-failure", `"1"`, "Primary"))
+		requireProblem(t, response, http.StatusInternalServerError, "internal_error", response.Header().Get("X-Request-ID"))
+		var generation int64
+		require.NoError(t, database.QueryRowContext(ctx, `SELECT generation FROM agent_enrollment_tokens WHERE tenant_id=$1 AND project_id=$2 AND host_id='host-1' AND agent_id='agent-1' AND consumed_at IS NULL`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&generation))
+		require.Equal(t, int64(1), generation)
+		require.NoError(t, func() error {
+			_, renameErr := database.ExecContext(ctx, `ALTER TABLE audit_events_unavailable RENAME TO audit_events`)
+			return renameErr
+		}())
+	})
+}
 
 func TestPostgresReconcileAmbiguousAuditAndMarkFailureUsesOriginalAuditPayload(t *testing.T) {
 	if os.Getenv("DBPILOT_HTTP_POSTGRES_INTEGRATION") != "1" {
@@ -216,9 +328,10 @@ type markAuditedErrorStore struct {
 }
 
 type commitSideEffectGapStore struct {
-	inner     idempotency.Store
-	fail      bool
-	attempted *idempotency.Response
+	inner          idempotency.Store
+	fail           bool
+	commitThenFail bool
+	attempted      *idempotency.Response
 }
 
 func (store *commitSideEffectGapStore) Claim(ctx context.Context, request idempotency.ClaimRequest) (idempotency.Claim, error) {
@@ -229,9 +342,25 @@ func (store *commitSideEffectGapStore) CommitSideEffect(ctx context.Context, key
 	copyResponse := idempotency.Response{Status: response.Status, Header: response.Header.Clone(), Body: append([]byte(nil), response.Body...)}
 	store.attempted = &copyResponse
 	if store.fail {
+		if store.commitThenFail {
+			if _, err := store.inner.CommitSideEffect(ctx, key, fingerprint, owner, response, reconciliation, at); err != nil {
+				return idempotency.Response{}, err
+			}
+			return idempotency.Response{}, errors.New("injected marker commit outcome unknown")
+		}
 		return idempotency.Response{}, errors.New("injected crash before CommitSideEffect")
 	}
 	return store.inner.CommitSideEffect(ctx, key, fingerprint, owner, response, reconciliation, at)
+}
+
+func (store *commitSideEffectGapStore) RepairIncompleteSideEffect(ctx context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, at time.Time) (idempotency.Response, error) {
+	repairable, ok := store.inner.(interface {
+		RepairIncompleteSideEffect(context.Context, idempotency.Key, string, string, idempotency.Response, []byte, time.Time) (idempotency.Response, error)
+	})
+	if !ok {
+		return idempotency.Response{}, idempotency.ErrInvalid
+	}
+	return repairable.RepairIncompleteSideEffect(ctx, key, fingerprint, owner, response, reconciliation, at)
 }
 
 func (store *commitSideEffectGapStore) MarkAudited(ctx context.Context, key idempotency.Key, fingerprint, owner string, at time.Time) error {

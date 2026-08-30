@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
 
@@ -91,6 +92,10 @@ func (store *attemptMemoryStore) Create(context.Context, EnrollmentToken) (Enrol
 
 func (store *attemptMemoryStore) Replace(_ context.Context, _ EnrollmentToken, expected uint64) (EnrollmentTokenCreation, error) {
 	return EnrollmentTokenCreation{Generation: expected + 1, Replaced: true}, nil
+}
+
+func (store *attemptMemoryStore) ResolveReplacement(context.Context, platformscope.Scope, ReplacementLookup) (ReplacementState, error) {
+	return ReplacementState{}, ErrEnrollmentNotFound
 }
 
 func (store *attemptMemoryStore) Resolve(_ context.Context, key EnrollmentAttemptKey) (EnrollmentResolution, error) {

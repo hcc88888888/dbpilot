@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"dbpilot.local/platform/internal/hostinventory"
+	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
 )
 
@@ -32,6 +33,12 @@ const replaceEnrollmentTokenSQL = `UPDATE agent_enrollment_tokens SET
     issued_by = $10, idempotency_key = $11, request_fingerprint = $12
 WHERE token_hash = $13 AND generation = $14 AND consumed_at IS NULL
 RETURNING token_hash, generation`
+
+const resolveReplacementSQL = `SELECT enrollment_revision, generation
+FROM agent_enrollment_tokens
+WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3 AND agent_id = $4
+  AND issued_by = $5 AND idempotency_key = $6 AND request_fingerprint = $7
+  AND consumed_at IS NULL`
 
 const resolveEnrollmentSQL = `SELECT
     t.tenant_id, t.project_id, t.host_id, t.agent_id, t.display_name, t.labels, t.enrollment_revision,
@@ -175,6 +182,28 @@ func (repository *PostgresRepository) Replace(ctx context.Context, token Enrollm
 		return EnrollmentTokenCreation{}, err
 	}
 	return EnrollmentTokenCreation{Generation: uint64(generation), Replaced: true}, nil
+}
+
+func (repository *PostgresRepository) ResolveReplacement(ctx context.Context, scope platformscope.Scope, request ReplacementLookup) (ReplacementState, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || request.Validate() != nil {
+		return ReplacementState{}, ErrEnrollmentRequestInvalid
+	}
+	state := ReplacementState{HostID: request.HostID, AgentID: request.AgentID}
+	var revision, generation int64
+	err := repository.database.QueryRowContext(ctx, resolveReplacementSQL,
+		scope.TenantID, scope.ProjectID, request.HostID, request.AgentID, request.IssuedBy, request.IdempotencyKey, request.RequestFingerprint,
+	).Scan(&revision, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReplacementState{}, ErrEnrollmentNotFound
+	}
+	if err != nil {
+		return ReplacementState{}, mapPostgresError(err)
+	}
+	if revision < 1 || generation < 1 {
+		return ReplacementState{}, ErrEnrollmentRequestInvalid
+	}
+	state.EnrollmentRevision, state.Generation = uint64(revision), uint64(generation)
+	return state, nil
 }
 
 func insertEnrollmentAudit(ctx context.Context, transaction *sql.Tx, token EnrollmentToken, generation uint64, replaced bool) error {

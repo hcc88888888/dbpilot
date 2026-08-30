@@ -36,6 +36,7 @@ type enrollmentRecoveryPayload struct {
 	TraceID            string            `json:"trace_id,omitempty"`
 	IdempotencyKey     string            `json:"idempotency_key"`
 	RequestFingerprint string            `json:"request_fingerprint"`
+	ExpectedGeneration uint64            `json:"expected_generation,omitempty"`
 }
 
 func (api platformAPI) CreateHostEnrollment(ctx context.Context, request openapi.CreateHostEnrollmentRequestObject) (openapi.CreateHostEnrollmentResponseObject, error) {
@@ -148,18 +149,62 @@ func (api platformAPI) ReplaceHostEnrollment(ctx context.Context, request openap
 		HostID: request.HostId, AgentID: request.Body.AgentId, DisplayName: request.Body.DisplayName,
 		Labels: enrollmentLabels(request.Body.Labels), ExpiresInSeconds: request.Body.ExpiresInSeconds,
 		Actor: principal.Subject, RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx),
-		IdempotencyKey: key.IdempotencyKey, RequestFingerprint: fingerprint,
+		IdempotencyKey: key.IdempotencyKey, RequestFingerprint: fingerprint, ExpectedGeneration: uint64(expected),
 	}
 	reconciliation, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.Begin(ctx, key, fingerprint, validateEnrollmentRecovery(payload))
+	var recovered *enrollment.CreatedEnrollment
+	claim, err := api.services.Idempotency.BeginUnreturnedRecoverable(ctx, key, fingerprint, reconciliation, validateEnrollmentRecovery(payload), func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		var stored enrollmentRecoveryPayload
+		if json.Unmarshal(processing.Reconciliation, &stored) != nil || !sameEnrollmentRecoveryRequest(stored, payload) || stored.ExpectedGeneration == 0 {
+			return idempotency.Response{}, errors.New("stored enrollment replacement recovery payload is invalid")
+		}
+		lookup := enrollmentReplacementLookup(stored)
+		if processing.Response != nil {
+			marker, markerErr := decodeEnrollmentMarker(*processing.Response)
+			if markerErr != nil {
+				return idempotency.Response{}, markerErr
+			}
+			state, resolveErr := api.services.Enrollment.ResolveReplacement(recoveryContext, scope, lookup)
+			if resolveErr != nil {
+				return idempotency.Response{}, resolveErr
+			}
+			if marker.HostID != state.HostID || marker.AgentID != state.AgentID || marker.EnrollmentRevision != state.EnrollmentRevision || marker.Generation != state.Generation {
+				return idempotency.Response{}, errors.New("stored enrollment replacement marker does not match the correlated generation")
+			}
+			return enrollmentReplacementMarkerResponse(state)
+		}
+		created, replaceErr := api.services.Enrollment.Replace(recoveryContext, scope, enrollmentCreateRequest(stored, key.OperationID), stored.ExpectedGeneration)
+		if replaceErr == nil {
+			recovered = &created
+			return enrollmentMarkerResponse(created)
+		}
+		if !errors.Is(replaceErr, enrollment.ErrEnrollmentGenerationConflict) {
+			return idempotency.Response{}, replaceErr
+		}
+		state, resolveErr := api.services.Enrollment.ResolveReplacement(recoveryContext, scope, lookup)
+		if resolveErr != nil {
+			return idempotency.Response{}, resolveErr
+		}
+		if state.Generation != stored.ExpectedGeneration+1 {
+			return idempotency.Response{}, ErrPreconditionFailed
+		}
+		return enrollmentReplacementMarkerResponse(state)
+	})
 	if err != nil {
 		return nil, err
 	}
 	if claim.Response != nil {
-		return nil, ErrEnrollmentTokenNotReplayable
+		marker, markerErr := decodeEnrollmentMarker(*claim.Response)
+		if markerErr != nil {
+			return nil, markerErr
+		}
+		if recovered != nil {
+			return replaceEnrollmentResponse(*recovered)
+		}
+		return replaceEnrollmentNonReplayableResponse(ctx, marker), nil
 	}
 	created, err := api.services.Enrollment.Replace(ctx, scope, enrollmentCreateRequest(payload, key.OperationID), uint64(expected))
 	if errors.Is(err, enrollment.ErrEnrollmentGenerationConflict) {
@@ -178,13 +223,7 @@ func (api platformAPI) ReplaceHostEnrollment(ctx context.Context, request openap
 	if _, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, marker, reconciliation, validateEnrollmentRecovery(payload)); err != nil {
 		return nil, err
 	}
-	body, err := enrollmentContract(created)
-	if err != nil {
-		return nil, err
-	}
-	return openapi.ReplaceHostEnrollment201JSONResponse{
-		Body: body, Headers: openapi.ReplaceHostEnrollment201ResponseHeaders{ETag: entityTag(int64(created.Generation))},
-	}, nil
+	return replaceEnrollmentResponse(created)
 }
 
 func enrollmentCreateRequest(payload enrollmentRecoveryPayload, operationID string) enrollment.CreateRequest {
@@ -220,23 +259,63 @@ func sameEnrollmentRecoveryRequest(stored, expected enrollmentRecoveryPayload) b
 	return stored.HostID == expected.HostID && stored.AgentID == expected.AgentID && stored.DisplayName == expected.DisplayName &&
 		reflect.DeepEqual(stored.Labels, expected.Labels) && stored.ExpiresInSeconds == expected.ExpiresInSeconds &&
 		stored.Actor == expected.Actor && stored.IdempotencyKey == expected.IdempotencyKey && stored.RequestFingerprint == expected.RequestFingerprint &&
+		stored.ExpectedGeneration == expected.ExpectedGeneration &&
 		canonicalAuditIdentity(stored.RequestID) && (stored.TraceID == "" || canonicalAuditIdentity(stored.TraceID))
+}
+
+func enrollmentReplacementLookup(payload enrollmentRecoveryPayload) enrollment.ReplacementLookup {
+	return enrollment.ReplacementLookup{
+		HostID: payload.HostID, AgentID: payload.AgentID, IssuedBy: payload.Actor,
+		IdempotencyKey: payload.IdempotencyKey, RequestFingerprint: payload.RequestFingerprint,
+	}
 }
 
 func enrollmentMarkerResponse(created enrollment.CreatedEnrollment) (idempotency.Response, error) {
 	if err := validateCreatedEnrollment(created); err != nil {
 		return idempotency.Response{}, err
 	}
-	body, err := json.Marshal(enrollmentDeliveryMarker{
+	return enrollmentDeliveryMarkerResponse(enrollmentDeliveryMarker{
 		HostID: created.HostID, AgentID: created.AgentID, EnrollmentRevision: created.EnrollmentRevision,
 		Generation: created.Generation, TokenPersisted: false,
 	})
+}
+
+func enrollmentReplacementMarkerResponse(state enrollment.ReplacementState) (idempotency.Response, error) {
+	if state.Validate() != nil {
+		return idempotency.Response{}, errors.New("enrollment service returned an invalid replacement state")
+	}
+	return enrollmentDeliveryMarkerResponse(enrollmentDeliveryMarker{
+		HostID: state.HostID, AgentID: state.AgentID, EnrollmentRevision: state.EnrollmentRevision,
+		Generation: state.Generation, TokenPersisted: false,
+	})
+}
+
+func enrollmentDeliveryMarkerResponse(marker enrollmentDeliveryMarker) (idempotency.Response, error) {
+	body, err := json.Marshal(marker)
 	if err != nil {
 		return idempotency.Response{}, err
 	}
 	response := idempotency.Response{Status: http.StatusCreated, Header: make(http.Header), Body: body}
 	response.Header.Set("Content-Type", "application/json")
 	return response, nil
+}
+
+func replaceEnrollmentNonReplayableResponse(ctx context.Context, marker enrollmentDeliveryMarker) openapi.ReplaceHostEnrollment409ApplicationProblemPlusJSONResponse {
+	problem := problemForError(ErrEnrollmentTokenNotReplayable, requestIDFromContext(ctx), "")
+	etag := entityTag(int64(marker.Generation))
+	return openapi.ReplaceHostEnrollment409ApplicationProblemPlusJSONResponse{
+		Body: problem, Headers: openapi.ReplaceHostEnrollment409ResponseHeaders{ETag: &etag},
+	}
+}
+
+func replaceEnrollmentResponse(created enrollment.CreatedEnrollment) (openapi.ReplaceHostEnrollmentResponseObject, error) {
+	body, err := enrollmentContract(created)
+	if err != nil {
+		return nil, err
+	}
+	return openapi.ReplaceHostEnrollment201JSONResponse{
+		Body: body, Headers: openapi.ReplaceHostEnrollment201ResponseHeaders{ETag: entityTag(int64(created.Generation))},
+	}, nil
 }
 
 func decodeEnrollmentMarker(response idempotency.Response) (enrollmentDeliveryMarker, error) {

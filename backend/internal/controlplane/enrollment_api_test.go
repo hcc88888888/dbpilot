@@ -193,6 +193,78 @@ func TestConcurrentExactRecoveryReturnsAtMostOneReplacementToken(t *testing.T) {
 	require.Equal(t, uint64(2), service.currentGeneration())
 }
 
+func TestReplaceHostEnrollmentFinalizesCommittedGenerationAfterMarkerFailureOrUnknownOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		fail    func(*httpIdempotencyStore)
+		release func(*httpIdempotencyStore)
+	}{
+		{
+			name:    "marker failed before persistence",
+			fail:    func(store *httpIdempotencyStore) { store.completeErr = errors.New("marker unavailable") },
+			release: func(store *httpIdempotencyStore) { store.completeErr = nil },
+		},
+		{
+			name: "marker commit outcome was unknown",
+			fail: func(store *httpIdempotencyStore) {
+				store.commitUnknownErr = errors.New("connection lost after marker commit")
+			},
+			release: func(store *httpIdempotencyStore) { store.commitUnknownErr = nil },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := newGenerationFencedEnrollmentService(1)
+			store := newHTTPIdempotencyStore()
+			test.fail(store)
+			services := Services{Enrollment: service, Idempotency: idempotency.NewService(store)}
+			principal := principalWith(platformTestScope, openapi.PermissionCreateHostEnrollment)
+
+			failed := servePlatformRequest(services, principal, newEnrollmentReplacementRequest("replace-recover", `"1"`, "Primary"))
+			requireProblem(t, failed, http.StatusInternalServerError, "internal_error", failed.Header().Get("X-Request-ID"))
+			require.Equal(t, uint64(2), service.currentGeneration(), "token and Audit commit precedes public marker persistence")
+			test.release(store)
+
+			recovered := servePlatformRequest(services, principal, newEnrollmentReplacementRequest("replace-recover", `"1"`, "Primary"))
+			requireProblem(t, recovered, http.StatusConflict, "enrollment_token_not_replayable", recovered.Header().Get("X-Request-ID"))
+			require.Equal(t, `"2"`, recovered.Header().Get("ETag"))
+			require.Equal(t, uint64(2), service.currentGeneration(), "marker recovery must not rotate the committed replacement")
+			require.Equal(t, 1, service.replacementCallCount())
+		})
+	}
+}
+
+func TestConcurrentExactReplacementRecoveryConvergesWithoutInvalidatingTheCommittedToken(t *testing.T) {
+	service := newGenerationFencedEnrollmentService(1)
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("marker unavailable")
+	services := Services{Enrollment: service, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionCreateHostEnrollment)
+	failed := servePlatformRequest(services, principal, newEnrollmentReplacementRequest("replace-concurrent", `"1"`, "Primary"))
+	requireProblem(t, failed, http.StatusInternalServerError, "internal_error", failed.Header().Get("X-Request-ID"))
+	activeToken := service.activeToken()
+	store.completeErr = nil
+
+	const consumers = 16
+	responses := make(chan *httptest.ResponseRecorder, consumers)
+	var wait sync.WaitGroup
+	for index := 0; index < consumers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			responses <- servePlatformRequest(services, principal, newEnrollmentReplacementRequest("replace-concurrent", `"1"`, "Primary"))
+		}()
+	}
+	wait.Wait()
+	close(responses)
+	for response := range responses {
+		requireProblem(t, response, http.StatusConflict, "enrollment_token_not_replayable", response.Header().Get("X-Request-ID"))
+		require.Equal(t, `"2"`, response.Header().Get("ETag"))
+	}
+	require.Equal(t, uint64(2), service.currentGeneration())
+	require.Equal(t, 1, service.replacementCallCount())
+	require.Equal(t, activeToken, service.activeToken(), "exact recovery may not invalidate the committed replacement token")
+}
+
 func newEnrollmentAPIRequest(idempotencyKey, displayName string) *http.Request {
 	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/host-enrollments", bytes.NewBufferString(`{"host_id":"host-1","agent_id":"agent-1","display_name":"`+displayName+`","expires_in_seconds":600}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -209,19 +281,31 @@ func newEnrollmentReplacementRequest(idempotencyKey, ifMatch, displayName string
 }
 
 type recordingEnrollmentService struct {
-	scope         platformscope.Scope
-	request       enrollment.CreateRequest
-	created       enrollment.CreatedEnrollment
-	createdValues []enrollment.CreatedEnrollment
-	err           error
-	calls         int
+	scope            platformscope.Scope
+	request          enrollment.CreateRequest
+	created          enrollment.CreatedEnrollment
+	createdValues    []enrollment.CreatedEnrollment
+	err              error
+	calls            int
+	replacementState enrollment.ReplacementState
 }
 
 type generationFencedEnrollmentService struct {
-	mu         sync.Mutex
-	now        time.Time
-	generation uint64
-	token      []byte
+	mu           sync.Mutex
+	now          time.Time
+	generation   uint64
+	token        []byte
+	replacements int
+	scope        platformscope.Scope
+	request      enrollment.CreateRequest
+}
+
+func newGenerationFencedEnrollmentService(generation uint64) *generationFencedEnrollmentService {
+	service := &generationFencedEnrollmentService{now: time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC), generation: generation}
+	if generation > 0 {
+		service.token = bytes.Repeat([]byte{byte(0x50 + generation)}, enrollment.EnrollmentTokenBytes)
+	}
+	return service
 }
 
 func (service *generationFencedEnrollmentService) Create(_ context.Context, _ platformscope.Scope, _ enrollment.CreateRequest) (enrollment.CreatedEnrollment, error) {
@@ -235,15 +319,27 @@ func (service *generationFencedEnrollmentService) Create(_ context.Context, _ pl
 	return service.createdLocked(false), nil
 }
 
-func (service *generationFencedEnrollmentService) Replace(_ context.Context, _ platformscope.Scope, _ enrollment.CreateRequest, expected uint64) (enrollment.CreatedEnrollment, error) {
+func (service *generationFencedEnrollmentService) Replace(_ context.Context, scope platformscope.Scope, request enrollment.CreateRequest, expected uint64) (enrollment.CreatedEnrollment, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	if expected != service.generation {
 		return enrollment.CreatedEnrollment{}, enrollment.ErrEnrollmentGenerationConflict
 	}
+	service.replacements++
 	service.generation++
 	service.token = bytes.Repeat([]byte{byte(0x50 + service.generation)}, enrollment.EnrollmentTokenBytes)
+	service.scope, service.request = scope, request
 	return service.createdLocked(true), nil
+}
+
+func (service *generationFencedEnrollmentService) ResolveReplacement(_ context.Context, scope platformscope.Scope, request enrollment.ReplacementLookup) (enrollment.ReplacementState, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if scope != service.scope || request.HostID != service.request.HostID || request.AgentID != service.request.AgentID || request.IssuedBy != service.request.IssuedBy ||
+		request.IdempotencyKey != service.request.IdempotencyKey || request.RequestFingerprint != service.request.RequestFingerprint {
+		return enrollment.ReplacementState{}, enrollment.ErrEnrollmentNotFound
+	}
+	return enrollment.ReplacementState{HostID: request.HostID, AgentID: request.AgentID, EnrollmentRevision: 1, Generation: service.generation}, nil
 }
 
 func (service *generationFencedEnrollmentService) createdLocked(replaced bool) enrollment.CreatedEnrollment {
@@ -261,6 +357,18 @@ func (service *generationFencedEnrollmentService) currentGeneration() uint64 {
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	return service.generation
+}
+
+func (service *generationFencedEnrollmentService) replacementCallCount() int {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.replacements
+}
+
+func (service *generationFencedEnrollmentService) activeToken() string {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return base64.RawURLEncoding.EncodeToString(service.token)
 }
 
 func (service *recordingEnrollmentService) Create(_ context.Context, scope platformscope.Scope, request enrollment.CreateRequest) (enrollment.CreatedEnrollment, error) {
@@ -286,4 +394,13 @@ func (service *recordingEnrollmentService) Replace(_ context.Context, scope plat
 	created.Generation = expected + 1
 	created.Replaced = true
 	return created, service.err
+}
+
+func (service *recordingEnrollmentService) ResolveReplacement(_ context.Context, _ platformscope.Scope, request enrollment.ReplacementLookup) (enrollment.ReplacementState, error) {
+	if service.replacementState.Generation == 0 {
+		return enrollment.ReplacementState{}, enrollment.ErrEnrollmentNotFound
+	}
+	state := service.replacementState
+	state.HostID, state.AgentID = request.HostID, request.AgentID
+	return state, nil
 }

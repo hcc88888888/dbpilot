@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sync"
 	"testing"
@@ -14,7 +15,7 @@ import (
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -178,18 +179,13 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 	if dsn == "" {
 		t.Fatal("DBPILOT_ENROLLMENT_POSTGRES_DSN is required")
 	}
-	database, err := sql.Open("postgres", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = database.Close() })
 	ctx := context.Background()
-	require.NoError(t, database.PingContext(ctx))
+	database, schema := openEnrollmentUpgradeDatabase(t, ctx, dsn)
+	var currentSchema string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&currentSchema))
+	require.Equal(t, schema, currentSchema)
 	require.NoError(t, platformdb.RunMigrations(ctx, database))
 	require.NoError(t, hostinventory.RunMigrations(ctx, database))
-	_, err = database.ExecContext(ctx, `
-        DROP TABLE IF EXISTS agent_enrollment_issuances;
-        DROP TABLE IF EXISTS agent_enrollment_tokens;
-        DELETE FROM dbpilot_schema_migrations WHERE name LIKE 'enrollment/%';`)
-	require.NoError(t, err)
 	original, err := os.ReadFile("testdata/0001_agent_enrollment_original.sql")
 	require.NoError(t, err)
 	_, err = database.ExecContext(ctx, string(original))
@@ -243,12 +239,30 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 	completed, err := repository.Complete(ctx, EnrollmentCompletion{Key: key, Grant: resolved.Grant, Observation: observation, Result: result, CompletedAt: now})
 	require.NoError(t, err)
 	require.Equal(t, result, completed)
+}
+
+func openEnrollmentUpgradeDatabase(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {
+	t.Helper()
+	admin, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	require.NoError(t, admin.PingContext(ctx))
+	schema := fmt.Sprintf("enrollment_upgrade_%d", time.Now().UnixNano())
+	quotedSchema := pq.QuoteIdentifier(schema)
+	_, err = admin.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM audit_events WHERE tenant_id = $1 AND project_id = $2", token.Scope.TenantID, token.Scope.ProjectID)
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_issuances WHERE token_hash = $1", token.TokenHash[:])
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM host_observations WHERE tenant_id = $1 AND project_id = $2", token.Scope.TenantID, token.Scope.ProjectID)
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2", token.Scope.TenantID, token.Scope.ProjectID)
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_tokens WHERE token_hash = $1", token.TokenHash[:])
-		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_tokens WHERE tenant_id = $1 AND project_id = $2", legacyScope.TenantID, legacyScope.ProjectID)
+		_, cleanupErr := admin.ExecContext(context.Background(), "DROP SCHEMA IF EXISTS "+quotedSchema+" CASCADE")
+		require.NoError(t, cleanupErr)
+		require.NoError(t, admin.Close())
 	})
+	parsed, err := url.Parse(dsn)
+	require.NoError(t, err)
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	database, err := sql.Open("postgres", parsed.String())
+	require.NoError(t, err)
+	require.NoError(t, database.PingContext(ctx))
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	return database, schema
 }

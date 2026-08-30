@@ -158,6 +158,8 @@ test('host enrollment replacement is explicit and generation fenced', async () =
   requiredHeader(replace, 'If-Match');
   assert.equal(replace.requestBody.content['application/json'].schema.$ref, '#/components/schemas/ReplaceHostEnrollmentRequest');
   assert.equal(replace.responses['201'].content['application/json'].schema.$ref, '#/components/schemas/HostEnrollment');
+  assert.ok(replace.responses['409'].headers.ETag);
+  assert.notEqual(replace.responses['409'].headers.ETag.required, true, 'generic idempotency conflicts have no correlated generation');
   assert.ok(document.components.schemas.HostEnrollment.required.includes('generation'));
   assert.equal(document.components.schemas.HostEnrollment.properties.generation.minimum, 1);
 });

@@ -180,6 +180,7 @@ type EnrollmentCompletion struct {
 type EnrollmentStore interface {
 	Create(context.Context, EnrollmentToken) (EnrollmentTokenCreation, error)
 	Replace(context.Context, EnrollmentToken, uint64) (EnrollmentTokenCreation, error)
+	ResolveReplacement(context.Context, platformscope.Scope, ReplacementLookup) (ReplacementState, error)
 	Resolve(context.Context, EnrollmentAttemptKey) (EnrollmentResolution, error)
 	Complete(context.Context, EnrollmentCompletion) (EnrollResult, error)
 }
@@ -187,6 +188,37 @@ type EnrollmentStore interface {
 type EnrollmentTokenCreation struct {
 	Generation uint64
 	Replaced   bool
+}
+
+type ReplacementLookup struct {
+	HostID             string
+	AgentID            string
+	IssuedBy           string
+	IdempotencyKey     string
+	RequestFingerprint string
+}
+
+func (request ReplacementLookup) Validate() error {
+	if !identifierPattern.MatchString(request.HostID) || !identifierPattern.MatchString(request.AgentID) ||
+		!bounded(request.IssuedBy, 256, true) || !bounded(request.IdempotencyKey, 128, true) ||
+		!fingerprintPattern.MatchString(request.RequestFingerprint) {
+		return ErrEnrollmentRequestInvalid
+	}
+	return nil
+}
+
+type ReplacementState struct {
+	HostID             string
+	AgentID            string
+	EnrollmentRevision uint64
+	Generation         uint64
+}
+
+func (state ReplacementState) Validate() error {
+	if !identifierPattern.MatchString(state.HostID) || !identifierPattern.MatchString(state.AgentID) || state.EnrollmentRevision == 0 || state.Generation == 0 {
+		return ErrEnrollmentRequestInvalid
+	}
+	return nil
 }
 
 type CertificateIssuer interface {

@@ -39,6 +39,20 @@ func (service ApplicationService) Replace(ctx context.Context, scope platformsco
 	return service.createToken(ctx, scope, request, expectedGeneration, true)
 }
 
+func (service ApplicationService) ResolveReplacement(ctx context.Context, scope platformscope.Scope, request ReplacementLookup) (ReplacementState, error) {
+	if ctx == nil || service.Tokens == nil || scope.Validate() != nil || request.Validate() != nil {
+		return ReplacementState{}, ErrEnrollmentRequestInvalid
+	}
+	state, err := service.Tokens.ResolveReplacement(ctx, scope, request)
+	if err != nil {
+		return ReplacementState{}, err
+	}
+	if state.Validate() != nil || state.HostID != request.HostID || state.AgentID != request.AgentID {
+		return ReplacementState{}, ErrEnrollmentRequestInvalid
+	}
+	return state, nil
+}
+
 func (service ApplicationService) createToken(ctx context.Context, scope platformscope.Scope, request CreateRequest, expectedGeneration uint64, replacing bool) (CreatedEnrollment, error) {
 	if ctx == nil || service.Tokens == nil || scope.Validate() != nil {
 		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid

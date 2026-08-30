@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,26 @@ func TestPostgresReplacementAuditFailureRollsBackTokenGeneration(t *testing.T) {
 	_, err = NewPostgresRepository(database).Replace(context.Background(), token, 1)
 
 	require.ErrorContains(t, err, "record enrollment Audit")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresResolveReplacementRequiresExactScopeAndOperationCorrelation(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	request := ReplacementLookup{
+		HostID: "host-1", AgentID: "agent-1", IssuedBy: "operator-1", IdempotencyKey: "replace-1",
+		RequestFingerprint: "sha256:" + strings.Repeat("1", 64),
+	}
+	mock.ExpectQuery(`(?s)SELECT enrollment_revision, generation.*tenant_id = \$1.*project_id = \$2.*host_id = \$3.*agent_id = \$4.*issued_by = \$5.*idempotency_key = \$6.*request_fingerprint = \$7.*consumed_at IS NULL`).
+		WithArgs(scope.TenantID, scope.ProjectID, request.HostID, request.AgentID, request.IssuedBy, request.IdempotencyKey, request.RequestFingerprint).
+		WillReturnRows(sqlmock.NewRows([]string{"enrollment_revision", "generation"}).AddRow(3, 8))
+
+	state, err := NewPostgresRepository(database).ResolveReplacement(context.Background(), scope, request)
+
+	require.NoError(t, err)
+	require.Equal(t, ReplacementState{HostID: "host-1", AgentID: "agent-1", EnrollmentRevision: 3, Generation: 8}, state)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

@@ -222,6 +222,10 @@ func (store *memoryTokenStore) Replace(context.Context, EnrollmentToken, uint64)
 	return EnrollmentTokenCreation{}, ErrEnrollmentConflict
 }
 
+func (store *memoryTokenStore) ResolveReplacement(context.Context, platformscope.Scope, ReplacementLookup) (ReplacementState, error) {
+	return ReplacementState{}, ErrEnrollmentNotFound
+}
+
 type rejectingIssuer struct{}
 
 func (rejectingIssuer) SignAgentCSR(context.Context, EnrollmentGrant, []byte) ([]byte, []byte, time.Time, error) {

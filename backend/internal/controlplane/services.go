@@ -51,6 +51,7 @@ type IdempotencyService interface {
 type EnrollmentService interface {
 	Create(context.Context, platformscope.Scope, enrollment.CreateRequest) (enrollment.CreatedEnrollment, error)
 	Replace(context.Context, platformscope.Scope, enrollment.CreateRequest, uint64) (enrollment.CreatedEnrollment, error)
+	ResolveReplacement(context.Context, platformscope.Scope, enrollment.ReplacementLookup) (enrollment.ReplacementState, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host

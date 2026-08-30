@@ -93,7 +93,13 @@ HostEnrollmentReplace:
       '403': { $ref: ../common/errors.yaml#/ProblemResponse }
       '404': { $ref: ../common/errors.yaml#/ProblemResponse }
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
-      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '409':
+        description: The one-time replacement response cannot be replayed. A correlated completed generation is returned as ETag.
+        headers:
+          ETag: { schema: { type: string, minLength: 3, maxLength: 128 } }
+        content:
+          application/problem+json:
+            schema: { $ref: ../common/errors.yaml#/Problem }
       '412': { $ref: ../common/errors.yaml#/ProblemResponse }
 HostItem:
   get:

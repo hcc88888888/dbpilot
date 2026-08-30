@@ -178,6 +178,10 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 		}
 		completed, completeErr := service.Complete(ctx, key, fingerprint, claim.OwnerToken, response, storedReconciliation, reconcile)
 		if completeErr != nil {
+			if recoverIncomplete && errors.Is(completeErr, ErrOwnershipConflict) {
+				correlated := cloneResponse(response)
+				return Claim{State: StateSideEffectCommitted, CreatedAt: claim.CreatedAt.UTC(), Response: &correlated}, nil
+			}
 			return Claim{}, completeErr
 		}
 		return Claim{State: StateCompleted, CreatedAt: claim.CreatedAt.UTC(), Response: &completed}, nil
@@ -208,6 +212,10 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 		}
 		response, err = repairStore.RepairIncompleteSideEffect(ctx, key, fingerprint, claim.OwnerToken, repaired, phaseReconciliation, service.currentTime())
 		if err != nil {
+			if errors.Is(err, ErrOwnershipConflict) {
+				correlated := cloneResponse(repaired)
+				return Claim{State: StateSideEffectCommitted, CreatedAt: claim.CreatedAt.UTC(), Response: &correlated}, nil
+			}
 			return Claim{}, err
 		}
 		if validateResponse(response) != nil {
@@ -229,6 +237,10 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 			return Claim{}, err
 		}
 		if err := service.store.MarkAudited(ctx, key, fingerprint, claim.OwnerToken, service.currentTime()); err != nil {
+			if recoverIncomplete && errors.Is(err, ErrOwnershipConflict) {
+				correlated := cloneResponse(response)
+				return Claim{State: StateSideEffectCommitted, CreatedAt: claim.CreatedAt.UTC(), Response: &correlated}, nil
+			}
 			return Claim{}, err
 		}
 	case StateAudited:
@@ -240,6 +252,10 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 	}
 	completed, err := service.store.Complete(ctx, key, fingerprint, claim.OwnerToken, response, service.currentTime())
 	if err != nil {
+		if recoverIncomplete && errors.Is(err, ErrOwnershipConflict) {
+			correlated := cloneResponse(response)
+			return Claim{State: StateSideEffectCommitted, CreatedAt: claim.CreatedAt.UTC(), Response: &correlated}, nil
+		}
 		return Claim{}, err
 	}
 	if validateResponse(completed) != nil {
