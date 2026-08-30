@@ -9,6 +9,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
@@ -108,6 +109,7 @@ type Services struct {
 	Hosts                      hostinventory.Service
 	Enrollment                 EnrollmentService
 	Discovery                  discovery.Service
+	DatabaseInstances          databaseinstance.Service
 	PluginCatalog              plugincatalog.CatalogService
 	PluginUploadRemove         func(string) error
 	PluginUploadCleanupFailure func(error)

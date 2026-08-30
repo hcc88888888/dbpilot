@@ -11,10 +11,6 @@ import (
 // when platformAPI gains the real implementation.
 type unimplementedPlatformAPI struct{}
 
-func (unimplementedPlatformAPI) AcceptDiscoveryCandidate(context.Context, openapi.AcceptDiscoveryCandidateRequestObject) (openapi.AcceptDiscoveryCandidateResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) ApproveMetricTemplateRevision(context.Context, openapi.ApproveMetricTemplateRevisionRequestObject) (openapi.ApproveMetricTemplateRevisionResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
@@ -27,15 +23,7 @@ func (unimplementedPlatformAPI) CreateMetricTemplateRevision(context.Context, op
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) GetDatabaseInstance(context.Context, openapi.GetDatabaseInstanceRequestObject) (openapi.GetDatabaseInstanceResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) GetPluginAssignment(context.Context, openapi.GetPluginAssignmentRequestObject) (openapi.GetPluginAssignmentResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) ListDatabaseInstances(context.Context, openapi.ListDatabaseInstancesRequestObject) (openapi.ListDatabaseInstancesResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
@@ -63,19 +51,7 @@ func (unimplementedPlatformAPI) RediscoverHost(context.Context, openapi.Rediscov
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) RetireDatabaseInstance(context.Context, openapi.RetireDatabaseInstanceRequestObject) (openapi.RetireDatabaseInstanceResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) TestDatabaseInstanceConnection(context.Context, openapi.TestDatabaseInstanceConnectionRequestObject) (openapi.TestDatabaseInstanceConnectionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) TrialMetricTemplateRevision(context.Context, openapi.TrialMetricTemplateRevisionRequestObject) (openapi.TrialMetricTemplateRevisionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) UpdateDatabaseInstance(context.Context, openapi.UpdateDatabaseInstanceRequestObject) (openapi.UpdateDatabaseInstanceResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 

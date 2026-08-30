@@ -27,6 +27,9 @@ export class DefaultApi extends runtime.BaseAPI {
         if (requestParameters['idempotencyKey'] == null) {
             throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling acceptDiscoveryCandidate().');
         }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling acceptDiscoveryCandidate().');
+        }
         if (requestParameters['acceptDiscoveryCandidateRequest'] == null) {
             throw new runtime.RequiredError('acceptDiscoveryCandidateRequest', 'Required parameter "acceptDiscoveryCandidateRequest" was null or undefined when calling acceptDiscoveryCandidate().');
         }
@@ -35,6 +38,9 @@ export class DefaultApi extends runtime.BaseAPI {
         headerParameters['Content-Type'] = 'application/json';
         if (requestParameters['idempotencyKey'] != null) {
             headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
         }
         if (this.configuration && this.configuration.accessToken) {
             const token = this.configuration.accessToken;

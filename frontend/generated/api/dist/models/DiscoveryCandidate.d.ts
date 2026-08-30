@@ -145,6 +145,12 @@ export interface DiscoveryCandidate {
      */
     ruleRevision: number;
     /**
+     *
+     * @type {number}
+     * @memberof DiscoveryCandidate
+     */
+    observationRevision: number;
+    /**
      * RFC 3339 timestamp in UTC, represented with a Z suffix.
      * @type {Date}
      * @memberof DiscoveryCandidate
@@ -162,6 +168,12 @@ export interface DiscoveryCandidate {
      * @memberof DiscoveryCandidate
      */
     status: DiscoveryCandidateStatus;
+    /**
+     *
+     * @type {string}
+     * @memberof DiscoveryCandidate
+     */
+    etag: string;
 }
 /**
  * Check if a given object implements the DiscoveryCandidate interface.

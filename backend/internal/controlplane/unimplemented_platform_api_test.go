@@ -15,23 +15,17 @@ import (
 )
 
 var task1UnimplementedOperationNames = []string{
-	"AcceptDiscoveryCandidate",
 	"ApproveMetricTemplateRevision",
 	"CreateMetricTemplate",
 	"CreateMetricTemplateRevision",
-	"GetDatabaseInstance",
 	"GetPluginAssignment",
-	"ListDatabaseInstances",
 	"ListMetricTemplateRevisions",
 	"ListMetricTemplates",
 	"ListPluginAssignments",
 	"PublishMetricTemplateRevision",
 	"ReconcilePluginAssignment",
 	"RediscoverHost",
-	"RetireDatabaseInstance",
-	"TestDatabaseInstanceConnection",
 	"TrialMetricTemplateRevision",
-	"UpdateDatabaseInstance",
 	"UpdatePluginAssignment",
 	"ValidateMetricTemplateRevision",
 }

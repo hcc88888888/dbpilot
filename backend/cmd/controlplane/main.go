@@ -37,6 +37,7 @@ import (
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
@@ -301,18 +302,19 @@ func composeMigrations(steps ...func(context.Context) error) func(context.Contex
 }
 
 type defaultMigrationSteps struct {
-	alert      func(context.Context) error
-	job        func(context.Context) error
-	platform   func(context.Context) error
-	enrollment func(context.Context) error
-	host       func(context.Context) error
-	discovery  func(context.Context) error
-	plugin     func(context.Context) error
-	inspection func(context.Context) error
+	alert            func(context.Context) error
+	job              func(context.Context) error
+	platform         func(context.Context) error
+	enrollment       func(context.Context) error
+	host             func(context.Context) error
+	discovery        func(context.Context) error
+	databaseInstance func(context.Context) error
+	plugin           func(context.Context) error
+	inspection       func(context.Context) error
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.enrollment}
+	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.databaseInstance, steps.enrollment}
 	if steps.plugin != nil {
 		pipeline = append(pipeline, steps.plugin)
 	}
@@ -431,8 +433,9 @@ func NewServer(config Config) (*Server, error) {
 			enrollment: func(ctx context.Context) error {
 				return enrollment.RunMigrations(ctx, database)
 			},
-			host:      func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
-			discovery: func(ctx context.Context) error { return discovery.RunMigrations(ctx, database) },
+			host:             func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
+			discovery:        func(ctx context.Context) error { return discovery.RunMigrations(ctx, database) },
+			databaseInstance: func(ctx context.Context) error { return databaseinstance.RunMigrations(ctx, database) },
 			inspection: func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
@@ -559,6 +562,7 @@ func NewServer(config Config) (*Server, error) {
 		return nil, policyErr
 	}
 	discoveryService.Policies = discovery.StaticRulePolicyRegistry{Allowed: discoveryPolicies}
+	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepository(database))
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -662,6 +666,7 @@ func NewServer(config Config) (*Server, error) {
 		Hosts:                      hostInventoryService,
 		Enrollment:                 enrollmentService,
 		Discovery:                  discoveryService,
+		DatabaseInstances:          databaseInstanceService,
 		PluginCatalog:              pluginCatalogService,
 		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {

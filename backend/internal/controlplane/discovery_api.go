@@ -176,7 +176,7 @@ func openAPIDiscoveryCandidate(value discovery.Candidate) (openapi.DiscoveryCand
 		}
 		evidence[index] = openapi.DiscoveryEvidence{Kind: kind, Value: item.Value}
 	}
-	result := openapi.DiscoveryCandidate{CandidateId: value.ID, TenantId: value.Scope.TenantID, ProjectId: value.Scope.ProjectID, HostId: value.HostID, AgentId: value.AgentID, DiscoverySource: openapi.DiscoverySource(value.Source), DatabaseFamily: value.DatabaseFamily, DatabaseVariant: value.DatabaseVariant, Confidence: float32(value.Confidence), EvidenceSummary: evidence, Fingerprint: hex.EncodeToString(value.Fingerprint[:]), RuleRevision: int64(value.RuleRevision), FirstSeenAt: value.FirstSeenAt.UTC(), LastSeenAt: value.LastSeenAt.UTC(), Status: openapi.DiscoveryCandidateStatus(value.Status)}
+	result := openapi.DiscoveryCandidate{CandidateId: value.ID, TenantId: value.Scope.TenantID, ProjectId: value.Scope.ProjectID, HostId: value.HostID, AgentId: value.AgentID, DiscoverySource: openapi.DiscoverySource(value.Source), DatabaseFamily: value.DatabaseFamily, DatabaseVariant: value.DatabaseVariant, Confidence: float32(value.Confidence), EvidenceSummary: evidence, Fingerprint: hex.EncodeToString(value.Fingerprint[:]), RuleRevision: int64(value.RuleRevision), ObservationRevision: int64(value.ObservationRevision), FirstSeenAt: value.FirstSeenAt.UTC(), LastSeenAt: value.LastSeenAt.UTC(), Status: openapi.DiscoveryCandidateStatus(value.Status), Etag: entityTag(int64(value.ObservationRevision))}
 	if value.VersionHint != "" {
 		result.VersionHint = stringPointer(value.VersionHint)
 	}

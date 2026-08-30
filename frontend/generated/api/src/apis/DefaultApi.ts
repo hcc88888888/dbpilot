@@ -187,6 +187,7 @@ import {
 export interface AcceptDiscoveryCandidateOperationRequest {
     candidateId: string;
     idempotencyKey: string;
+    ifMatch: string;
     acceptDiscoveryCandidateRequest: AcceptDiscoveryCandidateRequest;
 }
 
@@ -510,6 +511,13 @@ export class DefaultApi extends runtime.BaseAPI {
             );
         }
 
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError(
+                'ifMatch',
+                'Required parameter "ifMatch" was null or undefined when calling acceptDiscoveryCandidate().'
+            );
+        }
+
         if (requestParameters['acceptDiscoveryCandidateRequest'] == null) {
             throw new runtime.RequiredError(
                 'acceptDiscoveryCandidateRequest',
@@ -525,6 +533,10 @@ export class DefaultApi extends runtime.BaseAPI {
 
         if (requestParameters['idempotencyKey'] != null) {
             headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
         }
 
         if (this.configuration && this.configuration.accessToken) {

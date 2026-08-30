@@ -564,18 +564,19 @@ func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {
 func TestDefaultMigrationSequenceRunsHostBeforeInspectionAndStopsOnHostFailure(t *testing.T) {
 	var order []string
 	steps := defaultMigrationSteps{
-		alert:      func(context.Context) error { order = append(order, "alert"); return nil },
-		job:        func(context.Context) error { order = append(order, "job"); return nil },
-		platform:   func(context.Context) error { order = append(order, "platform"); return nil },
-		enrollment: func(context.Context) error { order = append(order, "enrollment"); return nil },
-		host:       func(context.Context) error { order = append(order, "host"); return nil },
-		discovery:  func(context.Context) error { order = append(order, "discovery"); return nil },
-		inspection: func(context.Context) error { order = append(order, "inspection"); return nil },
+		alert:            func(context.Context) error { order = append(order, "alert"); return nil },
+		job:              func(context.Context) error { order = append(order, "job"); return nil },
+		platform:         func(context.Context) error { order = append(order, "platform"); return nil },
+		enrollment:       func(context.Context) error { order = append(order, "enrollment"); return nil },
+		host:             func(context.Context) error { order = append(order, "host"); return nil },
+		discovery:        func(context.Context) error { order = append(order, "discovery"); return nil },
+		databaseInstance: func(context.Context) error { order = append(order, "database-instance"); return nil },
+		inspection:       func(context.Context) error { order = append(order, "inspection"); return nil },
 	}
 	migrate := composeDefaultMigrations(steps)
 
 	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "enrollment", "inspection"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "database-instance", "enrollment", "inspection"}, order)
 
 	want := errors.New("host migration failed")
 	order = nil

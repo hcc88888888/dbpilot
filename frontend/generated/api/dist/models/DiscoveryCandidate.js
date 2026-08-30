@@ -42,11 +42,15 @@ export function instanceOfDiscoveryCandidate(value) {
         return false;
     if (!('ruleRevision' in value) || value['ruleRevision'] === undefined)
         return false;
+    if (!('observationRevision' in value) || value['observationRevision'] === undefined)
+        return false;
     if (!('firstSeenAt' in value) || value['firstSeenAt'] === undefined)
         return false;
     if (!('lastSeenAt' in value) || value['lastSeenAt'] === undefined)
         return false;
     if (!('status' in value) || value['status'] === undefined)
+        return false;
+    if (!('etag' in value) || value['etag'] === undefined)
         return false;
     return true;
 }
@@ -79,9 +83,11 @@ export function DiscoveryCandidateFromJSONTyped(json, ignoreDiscriminator) {
         'fingerprint': json['fingerprint'],
         'possibleDuplicateOf': json['possible_duplicate_of'] == null ? undefined : json['possible_duplicate_of'],
         'ruleRevision': json['rule_revision'],
+        'observationRevision': json['observation_revision'],
         'firstSeenAt': (new Date(json['first_seen_at'])),
         'lastSeenAt': (new Date(json['last_seen_at'])),
         'status': DiscoveryCandidateStatusFromJSON(json['status']),
+        'etag': json['etag'],
     };
 }
 export function DiscoveryCandidateToJSON(json) {
@@ -113,8 +119,10 @@ export function DiscoveryCandidateToJSONTyped(value, ignoreDiscriminator = false
         'fingerprint': value['fingerprint'],
         'possible_duplicate_of': value['possibleDuplicateOf'],
         'rule_revision': value['ruleRevision'],
+        'observation_revision': value['observationRevision'],
         'first_seen_at': ((value['firstSeenAt']).toISOString()),
         'last_seen_at': ((value['lastSeenAt']).toISOString()),
         'status': DiscoveryCandidateStatusToJSON(value['status']),
+        'etag': value['etag'],
     };
 }

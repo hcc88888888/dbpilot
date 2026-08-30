@@ -14,6 +14,7 @@ import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Arti
 export interface AcceptDiscoveryCandidateOperationRequest {
     candidateId: string;
     idempotencyKey: string;
+    ifMatch: string;
     acceptDiscoveryCandidateRequest: AcceptDiscoveryCandidateRequest;
 }
 export interface ApproveMetricTemplateRevisionRequest {

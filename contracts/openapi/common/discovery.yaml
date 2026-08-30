@@ -49,9 +49,11 @@ DiscoveryCandidate:
     - evidence_summary
     - fingerprint
     - rule_revision
+    - observation_revision
     - first_seen_at
     - last_seen_at
     - status
+    - etag
   properties:
     candidate_id:
       $ref: '#/CandidateId'
@@ -114,12 +116,20 @@ DiscoveryCandidate:
       type: integer
       format: int64
       minimum: 1
+    observation_revision:
+      type: integer
+      format: int64
+      minimum: 1
     first_seen_at:
       $ref: ./identifiers.yaml#/UtcTimestamp
     last_seen_at:
       $ref: ./identifiers.yaml#/UtcTimestamp
     status:
       $ref: '#/DiscoveryCandidateStatus'
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
 DiscoveryCandidatePage:
   type: object
   additionalProperties: false

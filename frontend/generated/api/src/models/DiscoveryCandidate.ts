@@ -168,6 +168,12 @@ export interface DiscoveryCandidate {
      */
     ruleRevision: number;
     /**
+     *
+     * @type {number}
+     * @memberof DiscoveryCandidate
+     */
+    observationRevision: number;
+    /**
      * RFC 3339 timestamp in UTC, represented with a Z suffix.
      * @type {Date}
      * @memberof DiscoveryCandidate
@@ -185,6 +191,12 @@ export interface DiscoveryCandidate {
      * @memberof DiscoveryCandidate
      */
     status: DiscoveryCandidateStatus;
+    /**
+     *
+     * @type {string}
+     * @memberof DiscoveryCandidate
+     */
+    etag: string;
 }
 
 
@@ -205,9 +217,11 @@ export function instanceOfDiscoveryCandidate(value: object): value is DiscoveryC
     if (!('evidenceSummary' in value) || value['evidenceSummary'] === undefined) return false;
     if (!('fingerprint' in value) || value['fingerprint'] === undefined) return false;
     if (!('ruleRevision' in value) || value['ruleRevision'] === undefined) return false;
+    if (!('observationRevision' in value) || value['observationRevision'] === undefined) return false;
     if (!('firstSeenAt' in value) || value['firstSeenAt'] === undefined) return false;
     if (!('lastSeenAt' in value) || value['lastSeenAt'] === undefined) return false;
     if (!('status' in value) || value['status'] === undefined) return false;
+    if (!('etag' in value) || value['etag'] === undefined) return false;
     return true;
 }
 
@@ -241,9 +255,11 @@ export function DiscoveryCandidateFromJSONTyped(json: any, ignoreDiscriminator: 
         'fingerprint': json['fingerprint'],
         'possibleDuplicateOf': json['possible_duplicate_of'] == null ? undefined : json['possible_duplicate_of'],
         'ruleRevision': json['rule_revision'],
+        'observationRevision': json['observation_revision'],
         'firstSeenAt': (new Date(json['first_seen_at'])),
         'lastSeenAt': (new Date(json['last_seen_at'])),
         'status': DiscoveryCandidateStatusFromJSON(json['status']),
+        'etag': json['etag'],
     };
 }
 
@@ -278,8 +294,10 @@ export function DiscoveryCandidateToJSONTyped(value?: DiscoveryCandidate | null,
         'fingerprint': value['fingerprint'],
         'possible_duplicate_of': value['possibleDuplicateOf'],
         'rule_revision': value['ruleRevision'],
+        'observation_revision': value['observationRevision'],
         'first_seen_at': ((value['firstSeenAt']).toISOString()),
         'last_seen_at': ((value['lastSeenAt']).toISOString()),
         'status': DiscoveryCandidateStatusToJSON(value['status']),
+        'etag': value['etag'],
     };
 }
