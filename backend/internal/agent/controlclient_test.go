@@ -476,6 +476,7 @@ func TestControlClientNegotiatesDiscoverySourceResultsIndependently(t *testing.T
 			}
 			stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: capabilities}}}
 			client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open)
+			require.NoError(t, client.executors.Register(CommandKindCollectNow, sourceResultsExecutor{}))
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() { done <- client.Run(ctx) }()
@@ -495,6 +496,7 @@ func TestControlClientRenegotiatesDiscoverySourceResultsOnReconnect(t *testing.T
 	oldServer.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: base}}}
 	newServer.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: append(base, CapabilityDiscoverySourceResultsV1)}}}
 	client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{oldServer, newServer}}).Open)
+	require.NoError(t, client.executors.Register(CommandKindCollectNow, sourceResultsExecutor{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- client.Run(ctx) }()
@@ -1268,6 +1270,12 @@ type immediateExecutor struct{}
 
 func (immediateExecutor) Execute(_ context.Context, envelope *agentv1.CommandEnvelope, _ ProgressReporter) (*agentv1.CommandResult, error) {
 	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED}, nil
+}
+
+type sourceResultsExecutor struct{ immediateExecutor }
+
+func (sourceResultsExecutor) AdditionalCapabilities() []string {
+	return []string{CapabilityDiscoverySourceResultsV1}
 }
 
 type cancellationExecutor struct {

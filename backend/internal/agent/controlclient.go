@@ -351,6 +351,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	}
 	capabilities := append(c.executors.Capabilities(), CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1)
 	sort.Strings(capabilities)
+	advertisesSourceResults := hasCapabilities(capabilities, CapabilityDiscoverySourceResultsV1)
 	hello := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Hello{Hello: &agentv1.Hello{
 		ProtocolVersion: ControlProtocolVersion, AgentId: c.agentID, AgentVersion: c.agentVersion,
 		OperatingSystem: c.operatingSystem, Architecture: c.architecture, Capabilities: capabilities,
@@ -402,7 +403,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
-	c.discoverySourceResults.Store(hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoverySourceResultsV1))
+	c.discoverySourceResults.Store(advertisesSourceResults && hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoverySourceResultsV1))
 	if hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1) {
 		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
 	} else {

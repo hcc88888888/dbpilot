@@ -107,7 +107,16 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, compatibility: config.Compatibility, sourceResultsSupported: config.SourceResultsSupported}, nil
+	pending, err := config.ReportStore.Load(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if pending != nil {
+		if _, err := reportVariant(pending); err != nil {
+			return nil, err
+		}
+	}
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, pendingReport: pending, unavailable: config.InitialUnavailable, compatibility: config.Compatibility, sourceResultsSupported: config.SourceResultsSupported}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -202,6 +211,13 @@ func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative,
 		coordinator.pendingReport = pending
 	}
 	if coordinator.pendingReport != nil {
+		variant, err := reportVariant(coordinator.pendingReport)
+		if err != nil {
+			return err
+		}
+		if variant == reportProtocolSourceResults && !coordinator.sourceResultsSupported() {
+			return ErrDiscoverySourceResultsPaused
+		}
 		pendingError := requestedSourceError(coordinator.pendingReport, includeNative, includeDocker)
 		if err := coordinator.deliverPending(ctx); err != nil {
 			return err
@@ -360,6 +376,28 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 var ErrDiscoveryUnavailable = errors.New("native discovery unavailable until restart or policy reload")
 var ErrDiscoveryCompatibilityUnknown = errors.New("native discovery waiting for control compatibility")
 var ErrDiscoveryCompatibilityPaused = errors.New("native discovery paused for incompatible control plane")
+var ErrDiscoverySourceResultsPaused = errors.New("discovery source-results report paused for compatible control plane")
+
+type reportProtocolVariant uint8
+
+const (
+	reportProtocolOldShape reportProtocolVariant = iota + 1
+	reportProtocolSourceResults
+)
+
+func reportVariant(report *agentv1.DiscoveryReport) (reportProtocolVariant, error) {
+	if report == nil {
+		return 0, domain.ErrInvalid
+	}
+	switch len(report.GetSourceResults()) {
+	case 0:
+		return reportProtocolOldShape, nil
+	case 2:
+		return reportProtocolSourceResults, nil
+	default:
+		return 0, domain.ErrInvalid
+	}
+}
 
 func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ interface {
 	Report(*agentv1.CommandProgress) error
@@ -378,7 +416,17 @@ func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.C
 }
 
 func (coordinator *Coordinator) AdditionalCapabilities() []string {
-	capabilities := []string{"discovery_source_results_v1", "docker_discovery_v1", "native_discovery_v1"}
+	capabilities := []string{"docker_discovery_v1", "native_discovery_v1"}
+	coordinator.mu.Lock()
+	pending := coordinator.pendingReport
+	coordinator.mu.Unlock()
+	variant := reportProtocolSourceResults
+	if pending != nil {
+		variant, _ = reportVariant(pending)
+	}
+	if variant != reportProtocolOldShape {
+		capabilities = append(capabilities, "discovery_source_results_v1")
+	}
 	if coordinator.dockerDetector != nil {
 		capabilities = append(capabilities, "docker_discovery_configured")
 	}

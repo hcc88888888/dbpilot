@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,6 +338,94 @@ func TestDiscoveryReportDigestCoversPerSourceCompleteness(t *testing.T) {
 	rightDigest, err := ReportDigest(right)
 	require.NoError(t, err)
 	require.NotEqual(t, leftDigest, rightDigest)
+}
+
+func TestDurableNewShapePausesOnOldServerAndReplaysExactlyAfterRestart(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "pending.pb")
+	store, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	rules, attestation := testRules(t)
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	native := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
+	revisions := &countingRevisionStore{}
+	var original []byte
+	first, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: native, DockerDetector: errorDetector{err: ErrDockerDiscoveryUnavailable}, RuleSet: rules, Attestation: attestation, RevisionStore: revisions, ReportStore: store, Now: func() time.Time { return now }, Reporter: func(_ context.Context, report *agentv1.DiscoveryReport) error {
+		original, _ = proto.MarshalOptions{Deterministic: true}.Marshal(report)
+		return errors.New("commit persisted but ACK lost")
+	}})
+	require.NoError(t, err)
+	require.Error(t, first.Scan(context.Background(), ScanPeriodic))
+	require.NotEmpty(t, original)
+	require.Equal(t, 1, revisions.calls)
+	require.Equal(t, 1, native.calls)
+
+	oldStore, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	oldDetector := &recordingDetector{}
+	oldSends := 0
+	oldServer, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: oldDetector, RuleSet: rules, Attestation: attestation, RevisionStore: revisions, ReportStore: oldStore, SourceResultsSupported: func() bool { return false }, Now: func() time.Time { return now }, Reporter: func(context.Context, *agentv1.DiscoveryReport) error { oldSends++; return nil }})
+	require.NoError(t, err)
+	require.Contains(t, oldServer.AdditionalCapabilities(), "discovery_source_results_v1", "new-shape pending must keep advertising its exact protocol while an old Server declines it")
+	require.ErrorIs(t, oldServer.Scan(context.Background(), ScanPeriodic), ErrDiscoverySourceResultsPaused)
+	require.Zero(t, oldSends)
+	require.Zero(t, oldDetector.calls)
+	require.Equal(t, 1, revisions.calls)
+	paused, err := oldStore.Load(context.Background())
+	require.NoError(t, err)
+	pausedBytes, err := proto.MarshalOptions{Deterministic: true}.Marshal(paused)
+	require.NoError(t, err)
+	require.Equal(t, original, pausedBytes)
+
+	newStore, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	newDetector := &recordingDetector{}
+	var replayed []byte
+	newServer, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: newDetector, RuleSet: rules, Attestation: attestation, RevisionStore: revisions, ReportStore: newStore, SourceResultsSupported: func() bool { return true }, Now: func() time.Time { return now }, Reporter: func(_ context.Context, report *agentv1.DiscoveryReport) error {
+		replayed, _ = proto.MarshalOptions{Deterministic: true}.Marshal(report)
+		return nil
+	}})
+	require.NoError(t, err)
+	require.Contains(t, newServer.AdditionalCapabilities(), "discovery_source_results_v1")
+	require.NoError(t, newServer.Scan(context.Background(), ScanPeriodic))
+	require.Equal(t, original, replayed)
+	require.Zero(t, newDetector.calls)
+	require.Equal(t, 1, revisions.calls)
+	cleared, err := newStore.Load(context.Background())
+	require.NoError(t, err)
+	require.Nil(t, cleared)
+}
+
+func TestDurableOldShapeContinuesToOldServer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending.pb")
+	store, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	pending := validPendingReportFixture()
+	pending.SourceResults = nil
+	require.NoError(t, store.Save(context.Background(), pending))
+	rules, attestation := testRules(t)
+	sends := 0
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: &recordingDetector{}, RuleSet: rules, Attestation: attestation, ReportStore: store, SourceResultsSupported: func() bool { return false }, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(context.Context, *agentv1.DiscoveryReport) error { sends++; return nil }})
+	require.NoError(t, err)
+	require.NotContains(t, coordinator.AdditionalCapabilities(), "discovery_source_results_v1")
+	require.NoError(t, coordinator.Scan(context.Background(), ScanPeriodic))
+	require.Equal(t, 1, sends)
+}
+
+func TestPendingNewShapePauseUsesBoundedBackoffWithoutSending(t *testing.T) {
+	store := &memoryReportStore{report: validPendingReportFixture()}
+	rules, attestation := testRules(t)
+	var checks atomic.Int32
+	sends := 0
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: &recordingDetector{}, RuleSet: rules, Attestation: attestation, ReportStore: store, RetryBackoff: 20 * time.Millisecond, SourceResultsSupported: func() bool { checks.Add(1); return false }, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(context.Context, *agentv1.DiscoveryReport) error { sends++; return nil }})
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 65*time.Millisecond)
+	defer cancel()
+	require.NoError(t, coordinator.Run(ctx))
+	require.Zero(t, sends)
+	require.GreaterOrEqual(t, checks.Load(), int32(2))
+	require.LessOrEqual(t, checks.Load(), int32(5), "pause must poll only on bounded retry backoff")
+	require.NotNil(t, store.report)
 }
 
 type recordingDetector struct {
