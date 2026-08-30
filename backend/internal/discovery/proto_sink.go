@@ -19,7 +19,7 @@ func (sink ProtoSink) RecordDiscoveryReport(ctx context.Context, agentID string,
 	if !ok {
 		return ErrInvalid
 	}
-	converted := Report{HostID: report.GetHostId(), AgentID: agentID, ObservationRevision: report.GetObservationRevision(), RuleRevision: report.GetRuleRevision(), ObservedAt: observedAt, Candidates: make([]CandidateObservation, 0, len(report.GetCandidates()))}
+	converted := Report{HostID: report.GetHostId(), AgentID: agentID, ObservationRevision: report.GetObservationRevision(), RuleRevision: report.GetRuleRevision(), ObservedAt: observedAt, Candidates: make([]CandidateObservation, 0, len(report.GetCandidates())), SourceResults: make([]SourceResult, 0, len(report.GetSourceResults()))}
 	issuedAt, issuedOK := protobufTime(report.GetRuleIssuedAt())
 	expiresAt, expiresOK := protobufTime(report.GetRuleExpiresAt())
 	if !issuedOK || !expiresOK || len(report.GetRuleSetDigest()) != 32 {
@@ -41,8 +41,51 @@ func (sink ProtoSink) RecordDiscoveryReport(ctx context.Context, agentID string,
 		}
 		converted.Candidates = append(converted.Candidates, value)
 	}
+	for _, sourceResult := range report.GetSourceResults() {
+		value, err := sourceResultFromProto(sourceResult)
+		if err != nil {
+			return err
+		}
+		converted.SourceResults = append(converted.SourceResults, value)
+	}
 	_, err := sink.Service.RecordReport(ctx, converted)
 	return err
+}
+
+func sourceResultFromProto(value *agentv1.DiscoverySourceResult) (SourceResult, error) {
+	if value == nil {
+		return SourceResult{}, ErrInvalid
+	}
+	observedAt, ok := protobufTime(value.GetObservedAt())
+	if !ok {
+		return SourceResult{}, ErrInvalid
+	}
+	source := Source("")
+	if value.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE {
+		source = SourceNative
+	}
+	if value.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER {
+		source = SourceDocker
+	}
+	statuses := map[agentv1.DiscoverySourceResultStatus]SourceResultStatus{
+		agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED:      SourceCompleted,
+		agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE:    SourceUnavailable,
+		agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED: SourceNotConfigured,
+		agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED:  SourceNotRequested,
+	}
+	reasons := map[agentv1.DiscoverySourceReason]SourceReason{
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY:            SourceHealthy,
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE: SourceHelperUnavailable,
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED:  SourcePermissionDenied,
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR:     SourceDetectorError,
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_CONFIGURED:     SourceReasonNotConfigured,
+		agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED:      SourceReasonNotRequested,
+	}
+	result := SourceResult{Source: source, Status: statuses[value.GetStatus()], Reason: reasons[value.GetReason()], ObservedAt: observedAt}
+	if result.Validate() != nil {
+		return SourceResult{}, ErrInvalid
+	}
+	return result, nil
 }
 
 func candidateFromProto(value *agentv1.DiscoveryCandidateObservation) (CandidateObservation, error) {
@@ -75,7 +118,7 @@ func candidateFromProto(value *agentv1.DiscoveryCandidateObservation) (Candidate
 }
 
 func evidenceKindFromProto(kind agentv1.DiscoveryEvidenceKind) (EvidenceKind, bool) {
-	values := map[agentv1.DiscoveryEvidenceKind]EvidenceKind{agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME: EvidenceProcessName, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH: EvidenceExecutablePath, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT: EvidenceSystemdUnit, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT: EvidenceListenEndpoint, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET: EvidenceUnixSocket, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE: EvidenceContainerImage, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL: EvidenceContainerLabel, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT: EvidenceContainerPort, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT: EvidenceVersionHint}
+	values := map[agentv1.DiscoveryEvidenceKind]EvidenceKind{agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME: EvidenceProcessName, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH: EvidenceExecutablePath, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT: EvidenceSystemdUnit, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT: EvidenceListenEndpoint, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET: EvidenceUnixSocket, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE: EvidenceContainerImage, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL: EvidenceContainerLabel, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT: EvidenceContainerPort, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT: EvidenceVersionHint, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_ID: EvidenceContainerID}
 	value, ok := values[kind]
 	return value, ok
 }
@@ -99,10 +142,28 @@ func reportToProto(report Report) (*agentv1.DiscoveryReport, error) {
 		}
 		candidates = append(candidates, &agentv1.DiscoveryCandidateObservation{ObservationId: candidate.ObservationID, Source: source, DatabaseFamily: candidate.DatabaseFamily, DatabaseVariant: candidate.DatabaseVariant, VersionHint: candidate.VersionHint, NormalizedEndpoint: candidate.NormalizedEndpoint, UnixSocket: candidate.UnixSocket, ProcessIdentity: candidate.ProcessIdentity, ServiceName: candidate.ServiceName, ContainerIdentity: candidate.ContainerIdentity, ContainerImage: candidate.ContainerImage, DiscoveredRole: candidate.DiscoveredRole, Confidence: candidate.Confidence, Evidence: evidence, Fingerprint: append([]byte(nil), candidate.Fingerprint[:]...), ObservedAt: timestamppb.New(candidate.ObservedAt)})
 	}
-	return &agentv1.DiscoveryReport{HostId: report.HostID, AgentId: report.AgentID, ObservationRevision: report.ObservationRevision, RuleRevision: report.RuleRevision, Candidates: candidates, ObservedAt: timestamppb.New(report.ObservedAt), RuleSetDigest: append([]byte(nil), report.RuleAttestation.Digest[:]...), DisappearanceGraceSeconds: uint64(report.RuleAttestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(report.RuleAttestation.IssuedAt), RuleExpiresAt: timestamppb.New(report.RuleAttestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), report.RuleAttestation.Signature...), RuleAttestationVersion: report.RuleAttestation.Version, RuleAttestationAlgorithm: report.RuleAttestation.Algorithm, RuleAttestationKeyId: report.RuleAttestation.KeyID}, nil
+	sourceResults := make([]*agentv1.DiscoverySourceResult, 0, len(report.SourceResults))
+	for _, value := range report.SourceResults {
+		wire, err := sourceResultToProto(value)
+		if err != nil {
+			return nil, err
+		}
+		sourceResults = append(sourceResults, wire)
+	}
+	return &agentv1.DiscoveryReport{HostId: report.HostID, AgentId: report.AgentID, ObservationRevision: report.ObservationRevision, RuleRevision: report.RuleRevision, Candidates: candidates, SourceResults: sourceResults, ObservedAt: timestamppb.New(report.ObservedAt), RuleSetDigest: append([]byte(nil), report.RuleAttestation.Digest[:]...), DisappearanceGraceSeconds: uint64(report.RuleAttestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(report.RuleAttestation.IssuedAt), RuleExpiresAt: timestamppb.New(report.RuleAttestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), report.RuleAttestation.Signature...), RuleAttestationVersion: report.RuleAttestation.Version, RuleAttestationAlgorithm: report.RuleAttestation.Algorithm, RuleAttestationKeyId: report.RuleAttestation.KeyID}, nil
+}
+
+func sourceResultToProto(value SourceResult) (*agentv1.DiscoverySourceResult, error) {
+	if value.Validate() != nil {
+		return nil, ErrInvalid
+	}
+	sources := map[Source]agentv1.DiscoverySource{SourceNative: agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, SourceDocker: agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER}
+	statuses := map[SourceResultStatus]agentv1.DiscoverySourceResultStatus{SourceCompleted: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, SourceUnavailable: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, SourceNotConfigured: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED, SourceNotRequested: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED}
+	reasons := map[SourceReason]agentv1.DiscoverySourceReason{SourceHealthy: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY, SourceHelperUnavailable: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE, SourcePermissionDenied: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED, SourceDetectorError: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR, SourceReasonNotConfigured: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_CONFIGURED, SourceReasonNotRequested: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED}
+	return &agentv1.DiscoverySourceResult{Source: sources[value.Source], Status: statuses[value.Status], Reason: reasons[value.Reason], ObservedAt: timestamppb.New(value.ObservedAt)}, nil
 }
 func evidenceKindToProto(kind EvidenceKind) (agentv1.DiscoveryEvidenceKind, bool) {
-	values := map[EvidenceKind]agentv1.DiscoveryEvidenceKind{EvidenceProcessName: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME, EvidenceExecutablePath: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH, EvidenceSystemdUnit: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT, EvidenceListenEndpoint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT, EvidenceUnixSocket: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET, EvidenceContainerImage: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE, EvidenceContainerLabel: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL, EvidenceContainerPort: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT, EvidenceVersionHint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT}
+	values := map[EvidenceKind]agentv1.DiscoveryEvidenceKind{EvidenceProcessName: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME, EvidenceExecutablePath: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH, EvidenceSystemdUnit: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT, EvidenceListenEndpoint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT, EvidenceUnixSocket: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET, EvidenceContainerImage: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE, EvidenceContainerLabel: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL, EvidenceContainerPort: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT, EvidenceVersionHint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT, EvidenceContainerID: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_ID}
 	value, ok := values[kind]
 	return value, ok
 }

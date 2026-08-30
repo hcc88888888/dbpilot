@@ -262,3 +262,9 @@ try {
     if ($volumeCreated) { Remove-DBPilotRecordedVolume -DockerBinary $docker -VolumeName $volumeName -Verifier 'docker-discovery' -RunLabel $runLabel }
     if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force }
 }
+
+$remainingContainers = @(& $docker ps -a --filter 'label=dbpilot.verifier=docker-discovery' --filter "label=dbpilot.run=$runLabel" --format '{{.ID}}')
+$remainingVolumes = @(& $docker volume ls --filter 'label=dbpilot.verifier=docker-discovery' --filter "label=dbpilot.run=$runLabel" --format '{{.Name}}')
+if (@($remainingContainers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne 0 -or @($remainingVolumes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) {
+    throw 'Docker discovery verifier left labelled resources after cleanup.'
+}

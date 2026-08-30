@@ -52,7 +52,7 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
 	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
-	firstReport := Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation}
+	firstReport := Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, SourceResults: []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: now}, {Source: SourceDocker, Status: SourceNotConfigured, Reason: SourceReasonNotConfigured, ObservedAt: now}}, ObservedAt: now, RuleAttestation: attestation}
 	start := make(chan struct{})
 	results := make(chan []Candidate, 2)
 	failures := make(chan error, 2)
@@ -89,7 +89,7 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	service.Now = func() time.Time { return now }
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
 	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
-	replayed, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation})
+	replayed, err := service.RecordReport(ctx, firstReport)
 	require.NoError(t, err)
 	require.Len(t, replayed, 1)
 	require.Equal(t, firstSeen, replayed[0].FirstSeenAt)
@@ -104,8 +104,70 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	_, err = database.ExecContext(ctx, "UPDATE discovery_candidates SET first_seen_at=CURRENT_TIMESTAMP-INTERVAL '11 minutes',last_seen_at=CURRENT_TIMESTAMP-INTERVAL '11 minutes' WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3", scope.TenantID, scope.ProjectID, hostID)
 	require.NoError(t, err)
 	secondObserved := time.Now().UTC().Truncate(time.Microsecond)
-	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, ObservedAt: secondObserved, RuleAttestation: attestation})
+	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, ObservedAt: secondObserved, SourceResults: []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: secondObserved}, {Source: SourceDocker, Status: SourceNotConfigured, Reason: SourceReasonNotConfigured, ObservedAt: secondObserved}}, RuleAttestation: attestation})
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	require.Equal(t, StatusDisappeared, page[0].Status)
+}
+
+func TestDiscoveryPostgresIntegrationIncompleteDockerSourceDoesNotAgeCandidates(t *testing.T) {
+	if os.Getenv("DBPILOT_DISCOVERY_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_DISCOVERY_POSTGRES_INTEGRATION=1 to run")
+	}
+	database, err := sql.Open("postgres", os.Getenv("DBPILOT_DISCOVERY_POSTGRES_DSN"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	require.NoError(t, database.PingContext(ctx))
+	require.NoError(t, hostinventory.RunMigrations(ctx, database))
+	require.NoError(t, RunMigrations(ctx, database))
+	suffix := time.Now().UTC().Format("150405.000000000")
+	scope := platformscope.Scope{TenantID: "tenant-source-" + suffix, ProjectID: "project-source-" + suffix}
+	hostID, agentID := "host-source-"+suffix, "agent-source-"+suffix
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM discovery_candidates WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM discovery_scan_state WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM host_observations WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, err = hostinventory.NewPostgresRepository(database).RecordObservation(ctx, scope, hostinventory.Observation{HostID: hostID, AgentID: agentID, Revision: 1, AgentVersion: "test", Hostname: "source.example", OS: "linux", Architecture: "amd64", LogicalCPUCount: 1, MemoryCapacityBytes: 1024, NetworkAddresses: []string{}, Capabilities: []string{"native_discovery_v1", "docker_discovery_v1"}, ObservedAt: now}, now)
+	require.NoError(t, err)
+	native := CandidateObservation{ObservationID: "native-1", Source: SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .8, Evidence: []Evidence{{Kind: EvidenceProcessName, Value: "mysqld"}}, ObservedAt: now}
+	docker := CandidateObservation{ObservationID: "docker-1", Source: SourceDocker, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:49161", ContainerIdentity: "orders-db", ContainerImage: "mysql:8.4", Confidence: .9, Evidence: []Evidence{{Kind: EvidenceContainerImage, Value: "mysql:8.4"}}, ObservedAt: now}
+	native.Fingerprint, err = Fingerprint(hostID, native)
+	require.NoError(t, err)
+	docker.Fingerprint, err = Fingerprint(hostID, docker)
+	require.NoError(t, err)
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service := NewService(NewPostgresRepository(database))
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
+	results := []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: now}, {Source: SourceDocker, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: now}}
+	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{native, docker}, SourceResults: results, ObservedAt: now, RuleAttestation: attestation})
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	_, err = database.ExecContext(ctx, "UPDATE discovery_candidates SET first_seen_at=CURRENT_TIMESTAMP-INTERVAL '20 minutes',last_seen_at=CURRENT_TIMESTAMP-INTERVAL '20 minutes' WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3", scope.TenantID, scope.ProjectID, hostID)
+	require.NoError(t, err)
+
+	outageAt := time.Now().UTC().Truncate(time.Microsecond)
+	native.ObservedAt = outageAt
+	outageResults := []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: outageAt}, {Source: SourceDocker, Status: SourceUnavailable, Reason: SourceHelperUnavailable, ObservedAt: outageAt}}
+	page, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, Candidates: []CandidateObservation{native}, SourceResults: outageResults, ObservedAt: outageAt, RuleAttestation: attestation})
+	require.NoError(t, err)
+	bySource := map[Source]Candidate{}
+	for _, candidate := range page {
+		bySource[candidate.Source] = candidate
+	}
+	require.Equal(t, StatusAwaitingConfirmation, bySource[SourceDocker].Status, "incomplete Docker source must not age or disappear")
+
+	recoveryAt := time.Now().UTC().Truncate(time.Microsecond)
+	native.ObservedAt, docker.ObservedAt = recoveryAt, recoveryAt
+	recoveryResults := []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: recoveryAt}, {Source: SourceDocker, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: recoveryAt}}
+	page, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 3, RuleRevision: 4, Candidates: []CandidateObservation{native, docker}, SourceResults: recoveryResults, ObservedAt: recoveryAt, RuleAttestation: attestation})
+	require.NoError(t, err)
+	require.Len(t, page, 2)
+	stored, err := NewPostgresRepository(database).SourceResults(ctx, scope, hostID)
+	require.NoError(t, err)
+	require.Equal(t, recoveryResults, stored)
 }

@@ -18,17 +18,20 @@ func Fingerprint(hostID string, observation CandidateObservation) ([32]byte, err
 		return [32]byte{}, err
 	}
 	socket := normalizeSocket(observation.UnixSocket)
-	if endpoint == "" && socket == "" {
-		return [32]byte{}, ErrInvalid
-	}
 	identity := strings.TrimSpace(observation.ServiceName)
 	if observation.Source == SourceDocker {
 		identity = strings.TrimSpace(observation.ContainerIdentity)
+		if endpoint != "" {
+			identity = ""
+		}
 	}
 	if identity == "" {
 		identity = strings.TrimSpace(observation.ProcessIdentity)
 	}
-	if identity == "" {
+	if endpoint == "" && socket == "" && (observation.Source != SourceDocker || identity == "") {
+		return [32]byte{}, ErrInvalid
+	}
+	if identity == "" && endpoint == "" {
 		return [32]byte{}, ErrInvalid
 	}
 	payload := struct {
@@ -36,7 +39,7 @@ func Fingerprint(hostID string, observation CandidateObservation) ([32]byte, err
 		Family   string `json:"family"`
 		Endpoint string `json:"endpoint,omitempty"`
 		Socket   string `json:"socket,omitempty"`
-		Identity string `json:"identity"`
+		Identity string `json:"identity,omitempty"`
 	}{HostID: hostID, Family: observation.DatabaseFamily, Identity: identity}
 	if endpoint != "" {
 		payload.Endpoint = endpoint

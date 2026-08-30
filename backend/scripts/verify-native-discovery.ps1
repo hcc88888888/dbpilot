@@ -11,7 +11,6 @@ $probeId = [Guid]::NewGuid().ToString('N')
 $relativeOutput = ".tmp/native-discovery-$probeId"
 $outputRoot = Join-Path $backendRoot ".tmp\native-discovery-$probeId"
 $buildName = "dbpilot-native-build-$probeId"
-$modernName = "dbpilot-native-modern-$probeId"
 $legacyName = "dbpilot-native-legacy-$probeId"
 $probePort = 43307
 $spoofPort = $probePort + 1
@@ -38,16 +37,22 @@ try {
     $baseUnit = Join-Path $backendRoot 'packaging\systemd\dbpilot-agent.service'
     Assert-Directive $baseUnit 'User' 'dbpilot'
     Assert-Directive $baseUnit 'Group' 'dbpilot'
-    Assert-Directive $baseUnit 'CapabilityBoundingSet' 'CAP_SYS_PTRACE'
-    Assert-Directive $baseUnit 'AmbientCapabilities' 'CAP_SYS_PTRACE'
+    Assert-Directive $baseUnit 'CapabilityBoundingSet' ''
+    Assert-Directive $baseUnit 'AmbientCapabilities' ''
     Assert-Directive $baseUnit 'NoNewPrivileges' 'true'
 
     $helperUnit = Join-Path $backendRoot 'packaging\systemd\dbpilot-agent-proc-helper.service'
-    Assert-Directive $helperUnit 'User' 'root'
-    Assert-Directive $helperUnit 'CapabilityBoundingSet' 'CAP_SYS_PTRACE CAP_DAC_READ_SEARCH'
+    Assert-Directive $helperUnit 'User' 'dbpilot-proc'
+    Assert-Directive $helperUnit 'Group' 'dbpilot-proc'
+    Assert-Directive $helperUnit 'CapabilityBoundingSet' 'CAP_SYS_PTRACE'
+    Assert-Directive $helperUnit 'AmbientCapabilities' 'CAP_SYS_PTRACE'
     Assert-Directive $helperUnit 'NoNewPrivileges' 'true'
     Assert-Directive $helperUnit 'RestrictAddressFamilies' 'AF_UNIX'
     Assert-Directive $helperUnit 'PrivateNetwork' 'true'
+	$helperBody = Get-Content -Raw $helperUnit
+	if ($helperBody -notmatch '(?m)^SystemCallFilter=@system-service\r?$' -or $helperBody -notmatch '(?m)^SystemCallFilter=~ptrace process_vm_readv process_vm_writev pidfd_getfd kcmp mount umount2 reboot\r?$') {
+		throw 'modern proc helper must deny process injection and mutation syscalls'
+	}
 
     $socketUnit = Join-Path $backendRoot 'packaging\systemd\dbpilot-agent-proc-helper.socket'
     Assert-Directive $socketUnit 'SocketUser' 'dbpilot'
@@ -55,9 +60,13 @@ try {
     Assert-Directive $socketUnit 'SocketMode' '0600'
 
     $legacyDropIn = Get-Content -Raw (Join-Path $backendRoot 'packaging\systemd\dbpilot-agent.service.d\centos7-proc-helper.conf')
-    if ($legacyDropIn -notmatch '(?m)^CapabilityBoundingSet=$' -or $legacyDropIn -notmatch '(?m)^AmbientCapabilities=$') {
+    if ($legacyDropIn -notmatch '(?m)^CapabilityBoundingSet=\r?$' -or $legacyDropIn -notmatch '(?m)^AmbientCapabilities=\r?$') {
         throw 'CentOS 7 Agent drop-in must clear Agent bounding and ambient capabilities'
     }
+	$legacyHelperDropIn = Get-Content -Raw (Join-Path $backendRoot 'packaging\systemd\dbpilot-agent-proc-helper.service.d\centos7.conf')
+	if ($legacyHelperDropIn -notmatch '(?m)^User=root\r?$' -or $legacyHelperDropIn -notmatch '(?m)^CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH\r?$') {
+		throw 'CentOS 7 proc-helper drop-in must carry only the documented legacy capability profile'
+	}
 
     New-Item -ItemType Directory -Path $outputRoot | Out-Null
     $goModuleCache = (& $GoBinary env GOMODCACHE).Trim()
@@ -65,19 +74,17 @@ try {
     $sourceMount = "${backendRoot}:/src"
     $moduleMount = "${goModuleCache}:/go/pkg/mod:ro"
     $buildCommand = "/usr/local/go/bin/go build -trimpath -o $relativeOutput/dbpilot-agent ./cmd/agent && /usr/local/go/bin/go build -trimpath -o $relativeOutput/mysqld-dbp ./test/fixtures/native-discovery-mysqld && cp $relativeOutput/mysqld-dbp $relativeOutput/not-a-database && /usr/local/go/bin/go build -trimpath -o $relativeOutput/native-discovery-probe ./test/fixtures/native-discovery-mysqld/probe"
-    $null = Invoke-DockerChecked -Arguments @('run', '--rm', '--name', $buildName, '--label', 'dbpilot.verifier=native-build', '-v', $sourceMount, '-v', $moduleMount, '-w', '/src', '-e', 'CGO_ENABLED=0', $GoImage, '/bin/bash', '-lc', $buildCommand) -Failure 'native Linux verifier build failed'
+    $null = Invoke-DockerChecked -Arguments @('run', '--rm', '--name', $buildName, '--label', 'dbpilot.verifier=native-build', '--label', "dbpilot.run=$probeId", '-v', $sourceMount, '-v', $moduleMount, '-w', '/src', '-e', 'CGO_ENABLED=0', $GoImage, '/bin/bash', '-lc', $buildCommand) -Failure 'native Linux verifier build failed'
 
     $probeMount = "${outputRoot}:/probe:ro"
-    $modernCommand = "set -euo pipefail; grep -q '^VERSION_ID=.*V10' /etc/os-release; setpriv --reuid=19002 --regid=19002 --clear-groups /probe/mysqld-dbp --port=$probePort --password=dbpilot-probe-secret >/tmp/dbpilot-fixture.log 2>&1 & fixture=`$!; setpriv --reuid=19002 --regid=19002 --clear-groups /bin/bash -c 'exec -a mysqld-dbp /probe/not-a-database --comm=mysqld-dbp --port=$spoofPort --password=dbpilot-spoof-secret' >/tmp/dbpilot-spoof.log 2>&1 & spoof=`$!; trap 'kill `$fixture `$spoof 2>/dev/null || true; wait `$fixture `$spoof 2>/dev/null || true' EXIT; sleep 1; timeout 15 capsh --keep=1 --gid=19001 --groups= --uid=19001 --caps=cap_sys_ptrace,cap_setpcap+eip --inh=cap_sys_ptrace --addamb=cap_sys_ptrace --drop=cap_setuid,cap_setgid,cap_setpcap,cap_kill --caps=cap_sys_ptrace+eip -- -c '/probe/native-discovery-probe --mode=positive --port=$probePort'; timeout 15 capsh --keep=1 --gid=19001 --groups= --uid=19001 --caps=cap_setpcap+eip --drop=cap_setuid,cap_setgid,cap_setpcap,cap_kill,cap_sys_ptrace --caps= --noamb -- -c '/probe/native-discovery-probe --mode=permission'"
-    $modernOutput = Invoke-DockerChecked -Arguments @('run', '--rm', '--name', $modernName, '--label', 'dbpilot.verifier=native-modern', '--stop-timeout', '3', '--cap-drop', 'ALL', '--cap-add', 'SYS_PTRACE', '--cap-add', 'SETUID', '--cap-add', 'SETGID', '--cap-add', 'SETPCAP', '--cap-add', 'KILL', '--security-opt', 'no-new-privileges:true', '-v', $probeMount, $Image, '/bin/bash', '-lc', $modernCommand) -Failure 'modern Kylin probe failed'
+    $modernVerifier = Join-Path $PSScriptRoot 'verify-docker-discovery.ps1'
+    $modernOutput = @(& $modernVerifier -GoBinary $GoBinary -DockerBinary $DockerBinary)
     $modernText = $modernOutput -join "`n"
-    if ([regex]::Matches($modernText, '(?m)^PASS POSITIVE PATH=modern ').Count -ne 1) { throw 'modern positive probe did not execute exactly once' }
-    if ([regex]::Matches($modernText, '(?m)^PASS NEGATIVE ').Count -ne 1) { throw 'modern no-capability probe did not execute exactly once' }
-    if ($modernText -notmatch 'CAP_BND=0000000000080000 CAP_AMB=0000000000080000 CAP_EFF=0000000000080000') { throw 'modern Agent did not retain exactly CAP_SYS_PTRACE' }
-    if ($modernText -notmatch 'CAPABILITY_STATE=unavailable REASON=permission_denied') { throw 'modern no-capability probe did not report permission_denied' }
-    if ([regex]::Matches($modernText, '"database_family":"mysql"').Count -ne 1) { throw 'modern probe did not emit exactly one MySQL candidate' }
+    if ($modernText -notmatch 'PASS: distinct Agent/proc/Docker identities, zero Agent capabilities, process isolation') {
+        throw 'modern proc-helper boundary verifier did not produce exact runtime evidence'
+    }
 
-    $null = Invoke-DockerChecked -Arguments @('run', '-d', '--name', $legacyName, '--label', 'dbpilot.verifier=native-legacy', '--stop-timeout', '3', '--cap-drop', 'ALL', '--cap-add', 'SYS_PTRACE', '--cap-add', 'DAC_READ_SEARCH', '--cap-add', 'CHOWN', '--cap-add', 'SETPCAP', '--cap-add', 'SETUID', '--cap-add', 'SETGID', '--security-opt', 'no-new-privileges:true', '-v', $probeMount, $Image, 'sleep', '60') -Failure 'legacy Kylin container failed to start'
+    $null = Invoke-DockerChecked -Arguments @('run', '-d', '--name', $legacyName, '--label', 'dbpilot.verifier=native-legacy', '--label', "dbpilot.run=$probeId", '--stop-timeout', '3', '--cap-drop', 'ALL', '--cap-add', 'SYS_PTRACE', '--cap-add', 'DAC_READ_SEARCH', '--cap-add', 'CHOWN', '--cap-add', 'SETPCAP', '--cap-add', 'SETUID', '--cap-add', 'SETGID', '--security-opt', 'no-new-privileges:true', '-v', $probeMount, $Image, 'sleep', '60') -Failure 'legacy Kylin container failed to start'
     $null = Invoke-DockerChecked -Arguments @('exec', '-d', '--user', '19002:19002', $legacyName, '/probe/mysqld-dbp', "--port=$probePort", '--password=dbpilot-probe-secret') -Failure 'legacy fixture failed to start'
     $null = Invoke-DockerChecked -Arguments @('exec', '-d', '--user', '19002:19002', $legacyName, '/bin/bash', '-c', "exec -a mysqld-dbp /probe/not-a-database --comm=mysqld-dbp --port=$spoofPort --password=dbpilot-spoof-secret") -Failure 'legacy spoof fixture failed to start'
     $null = Invoke-DockerChecked -Arguments @('exec', '-d', $legacyName, '/bin/bash', '-c', '/probe/native-discovery-probe --mode=activate-helper >/tmp/helper.log 2>&1') -Failure 'legacy helper activator failed to start'
@@ -106,11 +113,11 @@ try {
 
     $allOutput = "$modernText`n$legacyText"
     if ($allOutput -match 'dbpilot-probe-secret|dbpilot-spoof-secret|not-a-database') { throw 'native discovery verification leaked a secret or accepted the spoof executable' }
-    Write-Host 'PASS: modern and CentOS 7 helper Kylin native discovery paths completed with exact capability, redaction, peer and protocol evidence.'
+    Write-Host 'PASS: modern isolated helper boundary and CentOS 7 Kylin native discovery helper completed exact capability, redaction, peer and protocol evidence.'
 }
 finally {
     if ($dockerAvailable) {
-        foreach ($name in @($buildName, $modernName, $legacyName)) {
+        foreach ($name in @($buildName, $legacyName)) {
             try {
                 & $DockerBinary rm -f $name 2>$null | Out-Null
             }
@@ -127,4 +134,9 @@ finally {
         }
         Remove-Item -LiteralPath $resolved -Recurse -Force
     }
+}
+
+$remaining = @(& $DockerBinary ps -a --filter "label=dbpilot.run=$probeId" --format '{{.ID}}')
+if (@($remaining | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -ne 0) {
+    throw 'native discovery verifier left labelled containers after cleanup'
 }

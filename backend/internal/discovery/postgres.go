@@ -138,6 +138,15 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		rollback()
 		return nil, mapPostgresError(err)
 	}
+	sourceResults := effectiveSourceResults(report)
+	for _, sourceResult := range sourceResults {
+		if sourceResult.Status == SourceNotRequested { continue }
+		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_scan_sources (tenant_id,project_id,host_id,discovery_source,result_status,reason_code,observation_revision,rule_revision,rule_set_digest,observed_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (tenant_id,project_id,host_id,discovery_source) DO UPDATE SET result_status=EXCLUDED.result_status,reason_code=EXCLUDED.reason_code,observation_revision=EXCLUDED.observation_revision,rule_revision=EXCLUDED.rule_revision,rule_set_digest=EXCLUDED.rule_set_digest,observed_at=EXCLUDED.observed_at,updated_at=EXCLUDED.updated_at WHERE discovery_scan_sources.observation_revision < EXCLUDED.observation_revision`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, string(sourceResult.Source), string(sourceResult.Status), string(sourceResult.Reason), report.ObservationRevision, report.RuleRevision, report.RuleAttestation.Digest[:], sourceResult.ObservedAt, receivedAt)
+		if err != nil {
+			rollback()
+			return nil, mapPostgresError(err)
+		}
+	}
 	for _, observation := range report.Candidates {
 		evidence, err := json.Marshal(observation.Evidence)
 		if err != nil {
@@ -151,10 +160,15 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 			return nil, mapPostgresError(err)
 		}
 	}
-	_, err = transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='disappeared', updated_at=$5 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND status IN ('discovered','awaiting_confirmation') AND last_seen_at <= $4`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, receivedAt.Add(-grace), receivedAt)
-	if err != nil {
-		rollback()
-		return nil, mapPostgresError(err)
+	for _, sourceResult := range sourceResults {
+		if sourceResult.Status != SourceCompleted {
+			continue
+		}
+		_, err = transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='disappeared', updated_at=$6 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND discovery_source=$4 AND status IN ('discovered','awaiting_confirmation') AND last_seen_at <= $5`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, string(sourceResult.Source), receivedAt.Add(-grace), receivedAt)
+		if err != nil {
+			rollback()
+			return nil, mapPostgresError(err)
+		}
 	}
 	page, err := listCandidatesTx(ctx, transaction, report.Scope, Filter{HostID: report.HostID, Limit: 100})
 	if err != nil {
@@ -165,6 +179,49 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		return nil, mapPostgresError(err)
 	}
 	return page.Items, nil
+}
+
+func effectiveSourceResults(report Report) []SourceResult {
+	if len(report.SourceResults) > 0 {
+		return append([]SourceResult(nil), report.SourceResults...)
+	}
+	seen := map[Source]struct{}{}
+	results := make([]SourceResult, 0, 2)
+	for _, candidate := range report.Candidates {
+		if _, exists := seen[candidate.Source]; exists {
+			continue
+		}
+		seen[candidate.Source] = struct{}{}
+		results = append(results, SourceResult{Source: candidate.Source, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: report.ObservedAt})
+	}
+	return results
+}
+
+func (repository *PostgresRepository) SourceResults(ctx context.Context, scope platformscope.Scope, hostID string) ([]SourceResult, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) {
+		return nil, ErrInvalid
+	}
+	rows, err := repository.database.QueryContext(ctx, `SELECT discovery_source,result_status,reason_code,observed_at FROM discovery_scan_sources WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 ORDER BY CASE discovery_source WHEN 'native' THEN 1 ELSE 2 END`, scope.TenantID, scope.ProjectID, hostID)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	results := make([]SourceResult, 0, 2)
+	for rows.Next() {
+		var result SourceResult
+		if err := rows.Scan(&result.Source, &result.Status, &result.Reason, &result.ObservedAt); err != nil {
+			return nil, mapPostgresError(err)
+		}
+		result.ObservedAt = result.ObservedAt.UTC()
+		if result.Validate() != nil {
+			return nil, ErrInvalid
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPostgresError(err)
+	}
+	return results, nil
 }
 
 func newReportActiveAt(report Report, databaseNow time.Time) bool {

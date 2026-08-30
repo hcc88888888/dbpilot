@@ -160,6 +160,7 @@ func TestDockerClientExtractsBoundedCgroupAssociation(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, "42", "cgroup"), []byte(strings.Repeat("x", maximumCgroupFileBytes+1)), 0o600))
 	_, err = readCgroupAt(root, 42)
 	require.Error(t, err)
+	require.Empty(t, optionalCgroupAt(root, 42), "hidepid/oversized cgroup data degrades this container only")
 }
 
 func TestDockerClientEventsUsesBoundedExactFiltersAndRedactsActorData(t *testing.T) {
@@ -188,7 +189,7 @@ func TestDockerClientEventsUsesBoundedExactFiltersAndRedactsActorData(t *testing
 func TestDockerClientAcceptsModernActorOnlyContainerEvent(t *testing.T) {
 	const id = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		_, _ = writer.Write([]byte(`{"Type":"container","Action":"start","Actor":{"ID":"` + id + `","Attributes":{"name":"mysql-a","image":"mysql:8.4","secret":"never-return"}},"time":1788148801}` + "\n"))
+		_, _ = writer.Write([]byte(`{"Type":"container","Action":"start","Actor":{"ID":"` + id + `","Attributes":{"name":"mysql-a","image":"mysql:8.4","secret":"never-return"}},"time":1788148801,"timeNano":1788148801123456789}` + "\n"))
 	}))
 	defer server.Close()
 	client := newHTTPClient(server.Client(), server.URL)
@@ -198,5 +199,6 @@ func TestDockerClientAcceptsModernActorOnlyContainerEvent(t *testing.T) {
 	require.Equal(t, "start", event.Action)
 	require.Equal(t, "mysql-a", event.Name)
 	require.Equal(t, "mysql:8.4", event.Image)
+	require.Equal(t, int64(1788148801123456789), event.OccurredAt.UnixNano())
 	require.NoError(t, <-errs)
 }

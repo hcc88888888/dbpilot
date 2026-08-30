@@ -289,15 +289,46 @@ func (lane *discoveryLane) retire() bool {
 	return true
 }
 func validDiscoveryReport(agentID string, report *agentv1.DiscoveryReport) bool {
-	if !hostObservationAgentID.MatchString(agentID) || report == nil || report.GetAgentId() != agentID || !hostObservationAgentID.MatchString(report.GetHostId()) || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || report.GetObservedAt() == nil || !report.GetObservedAt().IsValid() || len(report.GetCandidates()) > 1024 || len(report.GetRuleSetDigest()) != sha256.Size || report.GetDisappearanceGraceSeconds() == 0 || report.GetRuleIssuedAt() == nil || !report.GetRuleIssuedAt().IsValid() || report.GetRuleExpiresAt() == nil || !report.GetRuleExpiresAt().IsValid() || len(report.GetRuleAttestationSignature()) != 64 || report.GetRuleAttestationVersion() == 0 || report.GetRuleAttestationAlgorithm() == "" || report.GetRuleAttestationKeyId() == "" {
+	if !hostObservationAgentID.MatchString(agentID) || report == nil || report.GetAgentId() != agentID || !hostObservationAgentID.MatchString(report.GetHostId()) || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || report.GetObservedAt() == nil || !report.GetObservedAt().IsValid() || len(report.GetCandidates()) > 1024 || len(report.GetSourceResults()) != 2 || len(report.GetRuleSetDigest()) != sha256.Size || report.GetDisappearanceGraceSeconds() == 0 || report.GetRuleIssuedAt() == nil || !report.GetRuleIssuedAt().IsValid() || report.GetRuleExpiresAt() == nil || !report.GetRuleExpiresAt().IsValid() || len(report.GetRuleAttestationSignature()) != 64 || report.GetRuleAttestationVersion() == 0 || report.GetRuleAttestationAlgorithm() == "" || report.GetRuleAttestationKeyId() == "" {
+		return false
+	}
+	completed := map[agentv1.DiscoverySource]bool{}
+	for _, result := range report.GetSourceResults() {
+		if result == nil || result.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_UNSPECIFIED || result.GetStatus() == agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED || result.GetReason() == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_UNSPECIFIED || result.GetObservedAt() == nil || !result.GetObservedAt().IsValid() || !result.GetObservedAt().AsTime().Equal(report.GetObservedAt().AsTime()) {
+			return false
+		}
+		if _, duplicate := completed[result.GetSource()]; duplicate || !validSourceOutcome(result.GetStatus(), result.GetReason()) {
+			return false
+		}
+		completed[result.GetSource()] = result.GetStatus() == agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED
+	}
+	if _, ok := completed[agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE]; !ok {
+		return false
+	}
+	if _, ok := completed[agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER]; !ok {
 		return false
 	}
 	for _, candidate := range report.GetCandidates() {
-		if candidate == nil || candidate.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_UNSPECIFIED || candidate.GetDatabaseFamily() == "" || candidate.GetDatabaseVariant() == "" || len(candidate.GetFingerprint()) != 32 || candidate.GetObservedAt() == nil || !candidate.GetObservedAt().IsValid() || len(candidate.GetEvidence()) > 32 {
+		if candidate == nil || candidate.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_UNSPECIFIED || !completed[candidate.GetSource()] || candidate.GetDatabaseFamily() == "" || candidate.GetDatabaseVariant() == "" || len(candidate.GetFingerprint()) != 32 || candidate.GetObservedAt() == nil || !candidate.GetObservedAt().IsValid() || len(candidate.GetEvidence()) > 32 {
 			return false
 		}
 	}
 	return true
+}
+
+func validSourceOutcome(statusValue agentv1.DiscoverySourceResultStatus, reason agentv1.DiscoverySourceReason) bool {
+	switch statusValue {
+	case agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED:
+		return reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY
+	case agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE:
+		return reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE || reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED || reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR
+	case agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED:
+		return reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_CONFIGURED
+	case agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED:
+		return reason == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED
+	default:
+		return false
+	}
 }
 
 type noopDiscoveryObserver struct{}

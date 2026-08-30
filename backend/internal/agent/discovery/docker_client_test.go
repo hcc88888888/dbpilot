@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,8 @@ import (
 	domain "dbpilot.local/platform/internal/discovery"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -33,6 +37,45 @@ func TestDockerDetectorMatchesSignedImageAndOwnershipLabels(t *testing.T) {
 	require.ElementsMatch(t, []string{"dbpilot.discovery.family", "dbpilot.run"}, client.request.AllowedLabelKeys)
 }
 
+func TestDockerDetectorUsesStableIdentityLabelAndKeepsContainerIDAsEvidence(t *testing.T) {
+	const ephemeralID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	client := &fakeDockerRPCClient{snapshot: &discoveryv1.DockerSnapshotResponse{Containers: []*discoveryv1.DockerContainerObservation{{ContainerId: ephemeralID, Name: "generated-name", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING, Labels: map[string]string{"dbpilot.discovery.family": "mysql", "dbpilot.instance_id": "orders-db"}, Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}}}}}}
+	detector, err := NewDockerDetector(DockerDetectorConfig{Client: client, RuleRevision: 7, AllowedLabelKeys: []string{"dbpilot.discovery.family", "dbpilot.instance_id"}})
+	require.NoError(t, err)
+	rules := []domain.Rule{{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:8\.4$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DockerIdentityLabel: "dbpilot.instance_id", DefaultPorts: []uint16{3306}}}
+	candidates, err := detector.Discover(context.Background(), rules)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, "orders-db", candidates[0].ContainerIdentity)
+	require.Contains(t, candidates[0].Evidence, domain.Evidence{Kind: domain.EvidenceContainerID, Value: ephemeralID})
+}
+
+func TestDockerRecreateWithNewContainerIDKeepsStableFingerprint(t *testing.T) {
+	firstID := "1111111111111111111111111111111111111111111111111111111111111111"
+	secondID := "2222222222222222222222222222222222222222222222222222222222222222"
+	client := &fakeDockerRPCClient{}
+	detector, err := NewDockerDetector(DockerDetectorConfig{Client: client, RuleRevision: 7, AllowedLabelKeys: []string{"dbpilot.discovery.family", "dbpilot.instance_id"}})
+	require.NoError(t, err)
+	rules := []domain.Rule{{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:8\.4$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DockerIdentityLabel: "dbpilot.instance_id", DefaultPorts: []uint16{3306}}}
+	fixture := func(id string) *discoveryv1.DockerSnapshotResponse {
+		return &discoveryv1.DockerSnapshotResponse{Containers: []*discoveryv1.DockerContainerObservation{{ContainerId: id, Name: "generated", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING, Labels: map[string]string{"dbpilot.discovery.family": "mysql", "dbpilot.instance_id": "orders-db"}, Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}}}}}
+	}
+	client.snapshot = fixture(firstID)
+	first, err := detector.Discover(context.Background(), rules)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	client.snapshot = fixture(secondID)
+	second, err := detector.Discover(context.Background(), rules)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	firstFingerprint, err := domain.Fingerprint("host-1", first[0])
+	require.NoError(t, err)
+	secondFingerprint, err := domain.Fingerprint("host-1", second[0])
+	require.NoError(t, err)
+	require.Equal(t, firstFingerprint, secondFingerprint)
+	require.NotEqual(t, first[0].Evidence, second[0].Evidence, "ephemeral ID remains observation evidence")
+}
+
 func TestDockerDetectorRejectsMismatchedOwnershipLabelAndUntrustedHelperData(t *testing.T) {
 	client := &fakeDockerRPCClient{snapshot: &discoveryv1.DockerSnapshotResponse{Containers: []*discoveryv1.DockerContainerObservation{{ContainerId: "short", Image: "mysql:8.4", Labels: map[string]string{"dbpilot.discovery.family": "mysql"}, CommandSummary: "--password=raw", Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}}}}}}
 	detector, err := NewDockerDetector(DockerDetectorConfig{Client: client, RuleRevision: 7, AllowedLabelKeys: []string{"dbpilot.discovery.family"}})
@@ -49,19 +92,53 @@ func TestDockerDetectorAcceptsCredentialSummaryOnlyAfterHelperRedaction(t *testi
 	require.Error(t, validateDockerObservation(container, []string{"dbpilot.discovery.family"}))
 }
 
+func TestAgentIndependentlyRejectsUnredactedDockerCredentialForms(t *testing.T) {
+	base := &discoveryv1.DockerContainerObservation{ContainerId: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Name: "mysql-a", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING, Labels: map[string]string{"dbpilot.discovery.family": "mysql"}, Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}}}
+	unsafe := []string{"mysql -p raw", "app --dsn=alice:secret@tcp(db)/app", "app --endpoint=mysql://alice:secret@db/app?token=raw", "app -H Authorization:raw"}
+	for _, summary := range unsafe {
+		clone := proto.Clone(base).(*discoveryv1.DockerContainerObservation)
+		clone.CommandSummary = summary
+		require.Error(t, validateDockerObservation(clone, []string{"dbpilot.discovery.family"}), summary)
+	}
+	for _, summary := range []string{"mysql -p [REDACTED]", "app --dsn=[REDACTED]", "app --endpoint=mysql://%5BREDACTED%5D@db/app?token=%5BREDACTED%5D"} {
+		clone := proto.Clone(base).(*discoveryv1.DockerContainerObservation)
+		clone.CommandSummary = summary
+		require.NoError(t, validateDockerObservation(clone, []string{"dbpilot.discovery.family"}), summary)
+	}
+}
+
 func TestCoordinatorKeepsNativeDiscoveryWhenDockerHelperUnavailable(t *testing.T) {
 	native := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
 	docker := errorDetector{err: ErrDockerDiscoveryUnavailable}
 	rules, attestation := testRules(t)
-	reports := make(chan int, 1)
+	reports := make(chan *agentv1.DiscoveryReport, 1)
 	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: native, DockerDetector: docker, RuleSet: rules, Attestation: attestation, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(_ context.Context, report *agentv1.DiscoveryReport) error {
-		reports <- len(report.GetCandidates())
+		reports <- report
 		return nil
 	}})
 	require.NoError(t, err)
 	require.NoError(t, coordinator.Scan(context.Background(), ScanEnrollment))
-	require.Equal(t, 1, <-reports)
-	require.Contains(t, coordinator.AdditionalCapabilities(), "docker_discovery_unavailable")
+	report := <-reports
+	require.Len(t, report.GetCandidates(), 1)
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, report.GetSourceResults()[0].GetStatus())
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, report.GetSourceResults()[1].GetStatus())
+	require.Equal(t, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE, report.GetSourceResults()[1].GetReason())
+	require.NotContains(t, coordinator.AdditionalCapabilities(), "docker_discovery_unavailable")
+	require.Contains(t, coordinator.AdditionalCapabilities(), "docker_discovery_configured")
+}
+
+func TestDockerLiveSourceStatusRecoversWithoutControlSessionReconnect(t *testing.T) {
+	native := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
+	docker := &recoveringDetector{err: ErrDockerDiscoveryUnavailable}
+	rules, attestation := testRules(t)
+	reports := make(chan *agentv1.DiscoveryReport, 2)
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: native, DockerDetector: docker, RuleSet: rules, Attestation: attestation, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(_ context.Context, report *agentv1.DiscoveryReport) error { reports <- report; return nil }})
+	require.NoError(t, err)
+	require.NoError(t, coordinator.Scan(context.Background(), ScanPeriodic))
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, (<-reports).GetSourceResults()[1].GetStatus())
+	docker.err = nil
+	require.NoError(t, coordinator.Scan(context.Background(), ScanPeriodic))
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, (<-reports).GetSourceResults()[1].GetStatus())
 }
 
 func TestDockerOnlyCommandFailsHonestlyWhenHelperUnavailable(t *testing.T) {
@@ -74,9 +151,36 @@ func TestDockerOnlyCommandFailsHonestlyWhenHelperUnavailable(t *testing.T) {
 	require.Zero(t, native.calls)
 }
 
+func TestDockerWatchEveryReadyReconnectTriggersFullReconciliationWithoutEvent(t *testing.T) {
+	client := &reconnectingDockerRPCClient{}
+	detector, err := NewDockerDetector(DockerDetectorConfig{Client: client, RuleRevision: 7, ReconnectBackoff: 10 * time.Millisecond})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	notifications := make(chan struct{}, 4)
+	go detector.Watch(ctx, func() error { notifications <- struct{}{}; return nil })
+	select {
+	case <-notifications:
+	case <-time.After(time.Second):
+		t.Fatal("initial ready stream did not trigger reconciliation")
+	}
+	select {
+	case <-notifications:
+	case <-time.After(time.Second):
+		t.Fatal("reconnected ready stream did not trigger reconciliation")
+	}
+	cancel()
+	require.Eventually(t, func() bool { return client.calls.Load() >= 2 }, time.Second, time.Millisecond)
+}
+
 type errorDetector struct{ err error }
 
 func (detector errorDetector) Discover(context.Context, []domain.Rule) ([]domain.CandidateObservation, error) {
+	return nil, detector.err
+}
+
+type recoveringDetector struct{ err error }
+
+func (detector *recoveringDetector) Discover(context.Context, []domain.Rule) ([]domain.CandidateObservation, error) {
 	return nil, detector.err
 }
 
@@ -93,3 +197,25 @@ func (client *fakeDockerRPCClient) Snapshot(_ context.Context, request *discover
 func (client *fakeDockerRPCClient) Watch(context.Context, *discoveryv1.DockerWatchRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[discoveryv1.DockerEvent], error) {
 	return nil, errors.New("unused")
 }
+
+type reconnectingDockerRPCClient struct{ calls atomic.Int32 }
+
+func (*reconnectingDockerRPCClient) Snapshot(context.Context, *discoveryv1.DockerSnapshotRequest, ...grpc.CallOption) (*discoveryv1.DockerSnapshotResponse, error) {
+	return nil, errors.New("unused")
+}
+func (client *reconnectingDockerRPCClient) Watch(context.Context, *discoveryv1.DockerWatchRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[discoveryv1.DockerEvent], error) {
+	client.calls.Add(1)
+	return readyEOFStream{}, nil
+}
+
+type readyEOFStream struct{}
+
+func (readyEOFStream) Recv() (*discoveryv1.DockerEvent, error) { return nil, io.EOF }
+func (readyEOFStream) Header() (metadata.MD, error) {
+	return metadata.Pairs("dbpilot-docker-watch-ready", "1"), nil
+}
+func (readyEOFStream) Trailer() metadata.MD     { return nil }
+func (readyEOFStream) CloseSend() error         { return nil }
+func (readyEOFStream) Context() context.Context { return context.Background() }
+func (readyEOFStream) SendMsg(any) error        { return nil }
+func (readyEOFStream) RecvMsg(any) error        { return io.EOF }

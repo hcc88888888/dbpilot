@@ -6,22 +6,30 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	discoveryv1 "dbpilot.local/platform/gen/discovery/v1"
 	domain "dbpilot.local/platform/internal/discovery"
 	dockerhelper "dbpilot.local/platform/internal/dockerdiscovery"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
-	ErrDockerDiscoveryUnavailable = errors.New("docker_discovery_unavailable")
-	dockerContainerIDPattern      = regexp.MustCompile(`^[a-f0-9]{64}$`)
-	dockerSecretPattern           = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|credential|authorization)(=|:)`)
+	ErrDockerDiscoveryUnavailable      = errors.New("docker_discovery_unavailable")
+	ErrDockerDiscoveryPermissionDenied = errors.New("docker_discovery_permission_denied")
+	dockerContainerIDPattern           = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	dockerSecretPattern                = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|credential|authorization)(=|:)`)
+	dockerDSNPattern                   = regexp.MustCompile(`[^\s:]+:[^\s@]+@(?:tcp\(|[^\s]+)`)
 )
+
+const dockerSnapshotTimeout = 8 * time.Second
 
 type DockerDetectorConfig struct {
 	Client           discoveryv1.DockerDiscoveryClient
@@ -76,8 +84,13 @@ func NewDockerDetectorAt(ctx context.Context, socketPath string, ruleRevision ui
 }
 
 func (detector *DockerDetector) Discover(ctx context.Context, rules []domain.Rule) ([]domain.CandidateObservation, error) {
-	response, err := detector.client.Snapshot(ctx, &discoveryv1.DockerSnapshotRequest{RuleRevision: detector.revision, AllowedLabelKeys: append([]string(nil), detector.allowed...)}, grpc.MaxCallRecvMsgSize(4<<20))
+	snapshotContext, cancel := context.WithTimeout(ctx, dockerSnapshotTimeout)
+	defer cancel()
+	response, err := detector.client.Snapshot(snapshotContext, &discoveryv1.DockerSnapshotRequest{RuleRevision: detector.revision, AllowedLabelKeys: append([]string(nil), detector.allowed...)}, grpc.MaxCallRecvMsgSize(4<<20))
 	if err != nil {
+		if status.Code(err) == codes.PermissionDenied {
+			return nil, ErrDockerDiscoveryPermissionDenied
+		}
 		return nil, fmt.Errorf("%w: helper snapshot", ErrDockerDiscoveryUnavailable)
 	}
 	if response.GetErrorCode() != "" {
@@ -103,7 +116,11 @@ func (detector *DockerDetector) Discover(ctx context.Context, rules []domain.Rul
 					continue
 				}
 				endpoint := net.JoinHostPort(port.GetHostAddress(), fmt.Sprintf("%d", port.GetHostPort()))
-				observation := domain.CandidateObservation{ObservationID: "docker-" + container.GetContainerId()[:16], Source: domain.SourceDocker, DatabaseFamily: rule.DatabaseFamily, DatabaseVariant: rule.DatabaseVariant, NormalizedEndpoint: endpoint, ContainerIdentity: container.GetContainerId(), ContainerImage: container.GetImage(), Confidence: .95, Evidence: []domain.Evidence{{Kind: domain.EvidenceContainerImage, Value: container.GetImage()}, {Kind: domain.EvidenceContainerPort, Value: fmt.Sprintf("%d/tcp", port.GetContainerPort())}}}
+				stableIdentity, identityErr := stableDockerIdentity(container, rule)
+				if identityErr != nil {
+					return nil, identityErr
+				}
+				observation := domain.CandidateObservation{ObservationID: "docker-" + container.GetContainerId()[:16], Source: domain.SourceDocker, DatabaseFamily: rule.DatabaseFamily, DatabaseVariant: rule.DatabaseVariant, NormalizedEndpoint: endpoint, ContainerIdentity: stableIdentity, ContainerImage: container.GetImage(), Confidence: .95, Evidence: []domain.Evidence{{Kind: domain.EvidenceContainerImage, Value: container.GetImage()}, {Kind: domain.EvidenceContainerPort, Value: fmt.Sprintf("%d/tcp", port.GetContainerPort())}, {Kind: domain.EvidenceContainerID, Value: container.GetContainerId()}}}
 				for _, selector := range rule.DockerLabelSelectors {
 					key, _, _ := strings.Cut(selector, "=")
 					observation.Evidence = append(observation.Evidence, domain.Evidence{Kind: domain.EvidenceContainerLabel, Value: key})
@@ -116,11 +133,33 @@ func (detector *DockerDetector) Discover(ctx context.Context, rules []domain.Rul
 	return result, nil
 }
 
-func (detector *DockerDetector) Watch(ctx context.Context, notify func()) {
+func stableDockerIdentity(container *discoveryv1.DockerContainerObservation, rule domain.Rule) (string, error) {
+	value := ""
+	if rule.DockerIdentityLabel != "" {
+		value = container.GetLabels()[rule.DockerIdentityLabel]
+	}
+	if value == "" {
+		value = strings.ToLower(strings.TrimSpace(container.GetName()))
+	}
+	if value == "" || len(value) > 128 || !controlIdentifier.MatchString(value) {
+		return "", domain.ErrInvalid
+	}
+	return value, nil
+}
+
+func (detector *DockerDetector) Watch(ctx context.Context, reconcile func() error) {
 	for ctx.Err() == nil {
 		stream, err := detector.client.Watch(ctx, &discoveryv1.DockerWatchRequest{RuleRevision: detector.revision, AllowedLabelKeys: append([]string(nil), detector.allowed...)}, grpc.MaxCallRecvMsgSize(4<<20))
 		if err == nil {
+			if _, headerErr := stream.Header(); headerErr != nil {
+				err = headerErr
+			} else if reconcile != nil {
+				err = reconcile()
+			}
 			for {
+				if err != nil {
+					break
+				}
 				_, receiveErr := stream.Recv()
 				if receiveErr != nil {
 					if receiveErr == io.EOF {
@@ -129,8 +168,11 @@ func (detector *DockerDetector) Watch(ctx context.Context, notify func()) {
 					err = receiveErr
 					break
 				}
-				if notify != nil {
-					notify()
+				if reconcile != nil {
+					if reconcileErr := reconcile(); reconcileErr != nil {
+						err = reconcileErr
+						break
+					}
 				}
 			}
 		}
@@ -145,7 +187,7 @@ func (detector *DockerDetector) Watch(ctx context.Context, notify func()) {
 }
 
 func validateDockerObservation(container *discoveryv1.DockerContainerObservation, allowed []string) error {
-	if container == nil || !dockerContainerIDPattern.MatchString(container.GetContainerId()) || container.GetName() == "" || len(container.GetName()) > 256 || container.GetImage() == "" || len(container.GetImage()) > 512 || len(container.GetPorts()) > 256 || len(container.GetLabels()) > len(allowed) || len(container.GetCommandSummary()) > 512 || dockerhelper.RedactCommand(strings.Fields(container.GetCommandSummary())) != container.GetCommandSummary() || strings.ContainsAny(container.GetName()+container.GetImage()+container.GetCommandSummary()+container.GetCgroup(), "\x00\r\n") {
+	if container == nil || !dockerContainerIDPattern.MatchString(container.GetContainerId()) || container.GetName() == "" || len(container.GetName()) > 256 || container.GetImage() == "" || len(container.GetImage()) > 512 || len(container.GetPorts()) > 256 || len(container.GetLabels()) > len(allowed) || len(container.GetCommandSummary()) > 512 || !validRedactedCommandSummary(container.GetCommandSummary()) || strings.ContainsAny(container.GetName()+container.GetImage()+container.GetCommandSummary()+container.GetCgroup(), "\x00\r\n") {
 		return domain.ErrInvalid
 	}
 	allowedSet := make(map[string]struct{}, len(allowed))
@@ -153,7 +195,7 @@ func validateDockerObservation(container *discoveryv1.DockerContainerObservation
 		allowedSet[key] = struct{}{}
 	}
 	for key, value := range container.GetLabels() {
-		if _, ok := allowedSet[key]; !ok || len(value) > 256 || dockerSecretPattern.MatchString(key+"="+value) && value != "[REDACTED]" {
+		if _, ok := allowedSet[key]; !ok || len(value) > 256 || !validRedactedExternalValue(value) || dockerSecretPattern.MatchString(key+"="+value) && value != "[REDACTED]" {
 			return domain.ErrInvalid
 		}
 	}
@@ -164,6 +206,102 @@ func validateDockerObservation(container *discoveryv1.DockerContainerObservation
 	}
 	return nil
 }
+
+func validRedactedCommandSummary(summary string) bool {
+	if !utf8.ValidString(summary) || strings.TrimSpace(summary) != summary || strings.ContainsAny(summary, "\x00\r\n") {
+		return false
+	}
+	tokens := strings.Fields(summary)
+	pending := false
+	for _, token := range tokens {
+		if pending {
+			if token != "[REDACTED]" {
+				return false
+			}
+			pending = false
+			continue
+		}
+		lower := strings.ToLower(token)
+		if token == "-H" || agentSensitiveFlag(lower) {
+			pending = true
+			continue
+		}
+		key, value, equal := strings.Cut(token, "=")
+		if equal && (key == "-H" || agentSensitiveFlag(strings.ToLower(key))) {
+			if value != "[REDACTED]" {
+				return false
+			}
+			continue
+		}
+		if strings.HasPrefix(token, "-p") && len(token) > 2 {
+			if token != "-p[REDACTED]" {
+				return false
+			}
+			continue
+		}
+		if strings.HasPrefix(token, "-H") && len(token) > 2 {
+			if token != "-H[REDACTED]" {
+				return false
+			}
+			continue
+		}
+		if equal {
+			if !validRedactedExternalValue(value) {
+				return false
+			}
+		} else if !validRedactedExternalValue(token) {
+			return false
+		}
+	}
+	return !pending
+}
+
+func agentSensitiveFlag(value string) bool {
+	switch value {
+	case "-p", "--password", "--passwd", "--pwd", "--token", "--secret", "--credential", "--authorization", "--header", "--database-url", "--database_url", "--dsn", "--uri", "--url", "--connection", "--connection-string", "--connection_string":
+		return true
+	default:
+		return false
+	}
+}
+
+func validRedactedExternalValue(value string) bool {
+	if !utf8.ValidString(value) || strings.ContainsAny(value, "\x00\r\n") {
+		return false
+	}
+	if !strings.Contains(value, "://") {
+		if dockerDSNPattern.MatchString(value) {
+			return false
+		}
+		return !dockerSecretPattern.MatchString(value) || value == "[REDACTED]"
+	}
+	parsed, err := url.Parse(strings.ReplaceAll(value, "[REDACTED]", "REDACTED"))
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	if parsed.User != nil {
+		if !redactionMarker(parsed.User.Username()) {
+			return false
+		}
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return false
+		}
+	}
+	query := parsed.Query()
+	for key, values := range query {
+		if !dockerSecretPattern.MatchString(key + "=") {
+			continue
+		}
+		for _, item := range values {
+			if !redactionMarker(item) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func redactionMarker(value string) bool { return value == "REDACTED" || value == "[REDACTED]" }
 
 func matchesDockerRule(container *discoveryv1.DockerContainerObservation, rule domain.Rule) bool {
 	imageMatch := false
@@ -206,6 +344,9 @@ func DockerAllowedLabelKeys(rules []domain.Rule) []string {
 			if ok {
 				seen[key] = struct{}{}
 			}
+		}
+		if rule.DockerIdentityLabel != "" {
+			seen[rule.DockerIdentityLabel] = struct{}{}
 		}
 	}
 	result := make([]string, 0, len(seen))

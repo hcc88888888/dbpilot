@@ -22,7 +22,7 @@ func TestDiscoveryRuleValidationIsDeclarativeAndRE2Compatible(t *testing.T) {
 }
 
 func TestDockerDiscoveryRuleRequiresExactOwnershipSelector(t *testing.T) {
-	rule := Rule{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:(8\.4|8)$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DefaultPorts: []uint16{3306}}
+	rule := Rule{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:(8\.4|8)$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DockerIdentityLabel: "dbpilot.instance_id", DefaultPorts: []uint16{3306}}
 	require.NoError(t, rule.Validate())
 
 	missingOwnership := rule
@@ -33,6 +33,9 @@ func TestDockerDiscoveryRuleRequiresExactOwnershipSelector(t *testing.T) {
 	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
 	unsafe = rule
 	unsafe.DockerImagePatterns = []string{`^(a+)\1$`}
+	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
+	unsafe = rule
+	unsafe.DockerIdentityLabel = "dbpilot.instance/id"
 	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
 }
 

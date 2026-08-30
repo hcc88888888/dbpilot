@@ -42,6 +42,60 @@ const (
 	SourceDocker Source = "docker"
 )
 
+type SourceResultStatus string
+
+const (
+	SourceCompleted     SourceResultStatus = "completed"
+	SourceUnavailable   SourceResultStatus = "unavailable"
+	SourceNotConfigured SourceResultStatus = "not_configured"
+	SourceNotRequested  SourceResultStatus = "not_requested"
+)
+
+type SourceReason string
+
+const (
+	SourceHealthy             SourceReason = "healthy"
+	SourceHelperUnavailable   SourceReason = "helper_unavailable"
+	SourcePermissionDenied    SourceReason = "permission_denied"
+	SourceDetectorError       SourceReason = "detector_error"
+	SourceReasonNotConfigured SourceReason = "not_configured"
+	SourceReasonNotRequested  SourceReason = "not_requested"
+)
+
+type SourceResult struct {
+	Source     Source             `json:"source"`
+	Status     SourceResultStatus `json:"status"`
+	Reason     SourceReason       `json:"reason"`
+	ObservedAt time.Time          `json:"observed_at"`
+}
+
+func (result SourceResult) Validate() error {
+	if (result.Source != SourceNative && result.Source != SourceDocker) || !validUTC(result.ObservedAt) {
+		return ErrInvalid
+	}
+	switch result.Status {
+	case SourceCompleted:
+		if result.Reason != SourceHealthy {
+			return ErrInvalid
+		}
+	case SourceUnavailable:
+		if result.Reason != SourceHelperUnavailable && result.Reason != SourcePermissionDenied && result.Reason != SourceDetectorError {
+			return ErrInvalid
+		}
+	case SourceNotConfigured:
+		if result.Reason != SourceReasonNotConfigured {
+			return ErrInvalid
+		}
+	case SourceNotRequested:
+		if result.Reason != SourceReasonNotRequested {
+			return ErrInvalid
+		}
+	default:
+		return ErrInvalid
+	}
+	return nil
+}
+
 type Status string
 
 const (
@@ -66,6 +120,7 @@ const (
 	EvidenceContainerLabel EvidenceKind = "container_label"
 	EvidenceContainerPort  EvidenceKind = "container_port"
 	EvidenceVersionHint    EvidenceKind = "version_hint"
+	EvidenceContainerID    EvidenceKind = "container_id"
 )
 
 type Evidence struct {
@@ -131,11 +186,22 @@ type Report struct {
 	Candidates          []CandidateObservation
 	ObservedAt          time.Time
 	RuleAttestation     RuleAttestation
+	SourceResults       []SourceResult
 }
 
 func (report Report) Validate() error {
-	if report.Scope.Validate() != nil || !identifierPattern.MatchString(report.HostID) || !identifierPattern.MatchString(report.AgentID) || report.ObservationRevision == 0 || report.RuleRevision == 0 || !validUTC(report.ObservedAt) || len(report.Candidates) > 1024 || report.RuleAttestation.Revision != report.RuleRevision {
+	if report.Scope.Validate() != nil || !identifierPattern.MatchString(report.HostID) || !identifierPattern.MatchString(report.AgentID) || report.ObservationRevision == 0 || report.RuleRevision == 0 || !validUTC(report.ObservedAt) || len(report.Candidates) > 1024 || len(report.SourceResults) > 2 || report.RuleAttestation.Revision != report.RuleRevision {
 		return ErrInvalid
+	}
+	completed := make(map[Source]bool, len(report.SourceResults))
+	for _, result := range report.SourceResults {
+		if result.Validate() != nil || !result.ObservedAt.Equal(report.ObservedAt) {
+			return ErrInvalid
+		}
+		if _, duplicate := completed[result.Source]; duplicate {
+			return ErrInvalid
+		}
+		completed[result.Source] = result.Status == SourceCompleted
 	}
 	seen := make(map[[32]byte]struct{}, len(report.Candidates))
 	for _, candidate := range report.Candidates {
@@ -146,6 +212,9 @@ func (report Report) Validate() error {
 			return ErrInvalid
 		}
 		seen[candidate.Fingerprint] = struct{}{}
+		if len(report.SourceResults) > 0 && !completed[candidate.Source] {
+			return ErrInvalid
+		}
 	}
 	return nil
 }
@@ -194,7 +263,7 @@ type Page struct {
 
 func validEvidenceKind(kind EvidenceKind) bool {
 	switch kind {
-	case EvidenceProcessName, EvidenceExecutablePath, EvidenceSystemdUnit, EvidenceListenEndpoint, EvidenceUnixSocket, EvidenceContainerImage, EvidenceContainerLabel, EvidenceContainerPort, EvidenceVersionHint:
+	case EvidenceProcessName, EvidenceExecutablePath, EvidenceSystemdUnit, EvidenceListenEndpoint, EvidenceUnixSocket, EvidenceContainerImage, EvidenceContainerLabel, EvidenceContainerPort, EvidenceVersionHint, EvidenceContainerID:
 		return true
 	default:
 		return false

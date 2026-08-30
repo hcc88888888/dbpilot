@@ -304,6 +304,9 @@ test('agent commands and leases are typed without arbitrary execution or persist
   for (const message of ['HostObservation', 'DiscoveryReport', 'PluginObservation']) {
     assert.match(inventory, new RegExp(`message ${message} \\{`));
   }
+  assert.match(inventory, /message DiscoveryReport \{[\s\S]*?repeated DiscoverySourceResult source_results = 32;/);
+  assert.match(inventory, /message DiscoverySourceResult \{[\s\S]*?DiscoverySource source = 1;[\s\S]*?DiscoverySourceResultStatus status = 2;[\s\S]*?DiscoverySourceReason reason = 3;/);
+  assert.match(inventory, /DISCOVERY_EVIDENCE_KIND_CONTAINER_ID = 10;/);
   assert.match(enrollment, /service AgentEnrollment \{[\s\S]*?rpc Enroll\(EnrollAgentRequest\) returns \(EnrollAgentResponse\);/);
 });
 

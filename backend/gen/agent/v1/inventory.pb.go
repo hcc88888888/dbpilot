@@ -22,6 +22,122 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type DiscoverySourceResultStatus int32
+
+const (
+	DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED    DiscoverySourceResultStatus = 0
+	DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED      DiscoverySourceResultStatus = 1
+	DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE    DiscoverySourceResultStatus = 2
+	DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED DiscoverySourceResultStatus = 3
+	DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED  DiscoverySourceResultStatus = 4
+)
+
+// Enum value maps for DiscoverySourceResultStatus.
+var (
+	DiscoverySourceResultStatus_name = map[int32]string{
+		0: "DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED",
+		1: "DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED",
+		2: "DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE",
+		3: "DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED",
+		4: "DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED",
+	}
+	DiscoverySourceResultStatus_value = map[string]int32{
+		"DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED":    0,
+		"DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED":      1,
+		"DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE":    2,
+		"DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED": 3,
+		"DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED":  4,
+	}
+)
+
+func (x DiscoverySourceResultStatus) Enum() *DiscoverySourceResultStatus {
+	p := new(DiscoverySourceResultStatus)
+	*p = x
+	return p
+}
+
+func (x DiscoverySourceResultStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DiscoverySourceResultStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_agent_v1_inventory_proto_enumTypes[0].Descriptor()
+}
+
+func (DiscoverySourceResultStatus) Type() protoreflect.EnumType {
+	return &file_agent_v1_inventory_proto_enumTypes[0]
+}
+
+func (x DiscoverySourceResultStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DiscoverySourceResultStatus.Descriptor instead.
+func (DiscoverySourceResultStatus) EnumDescriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{0}
+}
+
+type DiscoverySourceReason int32
+
+const (
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_UNSPECIFIED        DiscoverySourceReason = 0
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY            DiscoverySourceReason = 1
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE DiscoverySourceReason = 2
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED  DiscoverySourceReason = 3
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR     DiscoverySourceReason = 4
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_CONFIGURED     DiscoverySourceReason = 5
+	DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED      DiscoverySourceReason = 6
+)
+
+// Enum value maps for DiscoverySourceReason.
+var (
+	DiscoverySourceReason_name = map[int32]string{
+		0: "DISCOVERY_SOURCE_REASON_UNSPECIFIED",
+		1: "DISCOVERY_SOURCE_REASON_HEALTHY",
+		2: "DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE",
+		3: "DISCOVERY_SOURCE_REASON_PERMISSION_DENIED",
+		4: "DISCOVERY_SOURCE_REASON_DETECTOR_ERROR",
+		5: "DISCOVERY_SOURCE_REASON_NOT_CONFIGURED",
+		6: "DISCOVERY_SOURCE_REASON_NOT_REQUESTED",
+	}
+	DiscoverySourceReason_value = map[string]int32{
+		"DISCOVERY_SOURCE_REASON_UNSPECIFIED":        0,
+		"DISCOVERY_SOURCE_REASON_HEALTHY":            1,
+		"DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE": 2,
+		"DISCOVERY_SOURCE_REASON_PERMISSION_DENIED":  3,
+		"DISCOVERY_SOURCE_REASON_DETECTOR_ERROR":     4,
+		"DISCOVERY_SOURCE_REASON_NOT_CONFIGURED":     5,
+		"DISCOVERY_SOURCE_REASON_NOT_REQUESTED":      6,
+	}
+)
+
+func (x DiscoverySourceReason) Enum() *DiscoverySourceReason {
+	p := new(DiscoverySourceReason)
+	*p = x
+	return p
+}
+
+func (x DiscoverySourceReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DiscoverySourceReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_agent_v1_inventory_proto_enumTypes[1].Descriptor()
+}
+
+func (DiscoverySourceReason) Type() protoreflect.EnumType {
+	return &file_agent_v1_inventory_proto_enumTypes[1]
+}
+
+func (x DiscoverySourceReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DiscoverySourceReason.Descriptor instead.
+func (DiscoverySourceReason) EnumDescriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{1}
+}
+
 type DiscoverySource int32
 
 const (
@@ -55,11 +171,11 @@ func (x DiscoverySource) String() string {
 }
 
 func (DiscoverySource) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[0].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[2].Descriptor()
 }
 
 func (DiscoverySource) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[0]
+	return &file_agent_v1_inventory_proto_enumTypes[2]
 }
 
 func (x DiscoverySource) Number() protoreflect.EnumNumber {
@@ -68,7 +184,7 @@ func (x DiscoverySource) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DiscoverySource.Descriptor instead.
 func (DiscoverySource) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{0}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{2}
 }
 
 type DiscoveryEvidenceKind int32
@@ -84,21 +200,23 @@ const (
 	DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL DiscoveryEvidenceKind = 7
 	DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT  DiscoveryEvidenceKind = 8
 	DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT    DiscoveryEvidenceKind = 9
+	DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_ID    DiscoveryEvidenceKind = 10
 )
 
 // Enum value maps for DiscoveryEvidenceKind.
 var (
 	DiscoveryEvidenceKind_name = map[int32]string{
-		0: "DISCOVERY_EVIDENCE_KIND_UNSPECIFIED",
-		1: "DISCOVERY_EVIDENCE_KIND_PROCESS_NAME",
-		2: "DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH",
-		3: "DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT",
-		4: "DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT",
-		5: "DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET",
-		6: "DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE",
-		7: "DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL",
-		8: "DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT",
-		9: "DISCOVERY_EVIDENCE_KIND_VERSION_HINT",
+		0:  "DISCOVERY_EVIDENCE_KIND_UNSPECIFIED",
+		1:  "DISCOVERY_EVIDENCE_KIND_PROCESS_NAME",
+		2:  "DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH",
+		3:  "DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT",
+		4:  "DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT",
+		5:  "DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET",
+		6:  "DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE",
+		7:  "DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL",
+		8:  "DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT",
+		9:  "DISCOVERY_EVIDENCE_KIND_VERSION_HINT",
+		10: "DISCOVERY_EVIDENCE_KIND_CONTAINER_ID",
 	}
 	DiscoveryEvidenceKind_value = map[string]int32{
 		"DISCOVERY_EVIDENCE_KIND_UNSPECIFIED":     0,
@@ -111,6 +229,7 @@ var (
 		"DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL": 7,
 		"DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT":  8,
 		"DISCOVERY_EVIDENCE_KIND_VERSION_HINT":    9,
+		"DISCOVERY_EVIDENCE_KIND_CONTAINER_ID":    10,
 	}
 )
 
@@ -125,11 +244,11 @@ func (x DiscoveryEvidenceKind) String() string {
 }
 
 func (DiscoveryEvidenceKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[1].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[3].Descriptor()
 }
 
 func (DiscoveryEvidenceKind) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[1]
+	return &file_agent_v1_inventory_proto_enumTypes[3]
 }
 
 func (x DiscoveryEvidenceKind) Number() protoreflect.EnumNumber {
@@ -138,7 +257,7 @@ func (x DiscoveryEvidenceKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DiscoveryEvidenceKind.Descriptor instead.
 func (DiscoveryEvidenceKind) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{1}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{3}
 }
 
 type PluginActiveSlot int32
@@ -177,11 +296,11 @@ func (x PluginActiveSlot) String() string {
 }
 
 func (PluginActiveSlot) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[2].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[4].Descriptor()
 }
 
 func (PluginActiveSlot) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[2]
+	return &file_agent_v1_inventory_proto_enumTypes[4]
 }
 
 func (x PluginActiveSlot) Number() protoreflect.EnumNumber {
@@ -190,7 +309,7 @@ func (x PluginActiveSlot) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PluginActiveSlot.Descriptor instead.
 func (PluginActiveSlot) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{2}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{4}
 }
 
 type PluginProcessState int32
@@ -283,11 +402,11 @@ func (x PluginProcessState) String() string {
 }
 
 func (PluginProcessState) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[3].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[5].Descriptor()
 }
 
 func (PluginProcessState) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[3]
+	return &file_agent_v1_inventory_proto_enumTypes[5]
 }
 
 func (x PluginProcessState) Number() protoreflect.EnumNumber {
@@ -296,7 +415,7 @@ func (x PluginProcessState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PluginProcessState.Descriptor instead.
 func (PluginProcessState) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{3}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{5}
 }
 
 type PluginHealthState int32
@@ -335,11 +454,11 @@ func (x PluginHealthState) String() string {
 }
 
 func (PluginHealthState) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[4].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[6].Descriptor()
 }
 
 func (PluginHealthState) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[4]
+	return &file_agent_v1_inventory_proto_enumTypes[6]
 }
 
 func (x PluginHealthState) Number() protoreflect.EnumNumber {
@@ -348,7 +467,7 @@ func (x PluginHealthState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PluginHealthState.Descriptor instead.
 func (PluginHealthState) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{4}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{6}
 }
 
 type PluginCircuitState int32
@@ -387,11 +506,11 @@ func (x PluginCircuitState) String() string {
 }
 
 func (PluginCircuitState) Descriptor() protoreflect.EnumDescriptor {
-	return file_agent_v1_inventory_proto_enumTypes[5].Descriptor()
+	return file_agent_v1_inventory_proto_enumTypes[7].Descriptor()
 }
 
 func (PluginCircuitState) Type() protoreflect.EnumType {
-	return &file_agent_v1_inventory_proto_enumTypes[5]
+	return &file_agent_v1_inventory_proto_enumTypes[7]
 }
 
 func (x PluginCircuitState) Number() protoreflect.EnumNumber {
@@ -400,7 +519,7 @@ func (x PluginCircuitState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PluginCircuitState.Descriptor instead.
 func (PluginCircuitState) EnumDescriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{5}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{7}
 }
 
 type Inventory struct {
@@ -787,6 +906,7 @@ type DiscoveryReport struct {
 	RuleAttestationVersion    uint32                           `protobuf:"varint,25,opt,name=rule_attestation_version,json=ruleAttestationVersion,proto3" json:"rule_attestation_version,omitempty"`
 	RuleAttestationAlgorithm  string                           `protobuf:"bytes,26,opt,name=rule_attestation_algorithm,json=ruleAttestationAlgorithm,proto3" json:"rule_attestation_algorithm,omitempty"`
 	RuleAttestationKeyId      string                           `protobuf:"bytes,27,opt,name=rule_attestation_key_id,json=ruleAttestationKeyId,proto3" json:"rule_attestation_key_id,omitempty"`
+	SourceResults             []*DiscoverySourceResult         `protobuf:"bytes,32,rep,name=source_results,json=sourceResults,proto3" json:"source_results,omitempty"`
 	unknownFields             protoimpl.UnknownFields
 	sizeCache                 protoimpl.SizeCache
 }
@@ -919,6 +1039,81 @@ func (x *DiscoveryReport) GetRuleAttestationKeyId() string {
 	return ""
 }
 
+func (x *DiscoveryReport) GetSourceResults() []*DiscoverySourceResult {
+	if x != nil {
+		return x.SourceResults
+	}
+	return nil
+}
+
+type DiscoverySourceResult struct {
+	state         protoimpl.MessageState      `protogen:"open.v1"`
+	Source        DiscoverySource             `protobuf:"varint,1,opt,name=source,proto3,enum=dbpilot.agent.v1.DiscoverySource" json:"source,omitempty"`
+	Status        DiscoverySourceResultStatus `protobuf:"varint,2,opt,name=status,proto3,enum=dbpilot.agent.v1.DiscoverySourceResultStatus" json:"status,omitempty"`
+	Reason        DiscoverySourceReason       `protobuf:"varint,3,opt,name=reason,proto3,enum=dbpilot.agent.v1.DiscoverySourceReason" json:"reason,omitempty"`
+	ObservedAt    *timestamppb.Timestamp      `protobuf:"bytes,4,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DiscoverySourceResult) Reset() {
+	*x = DiscoverySourceResult{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiscoverySourceResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiscoverySourceResult) ProtoMessage() {}
+
+func (x *DiscoverySourceResult) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiscoverySourceResult.ProtoReflect.Descriptor instead.
+func (*DiscoverySourceResult) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DiscoverySourceResult) GetSource() DiscoverySource {
+	if x != nil {
+		return x.Source
+	}
+	return DiscoverySource_DISCOVERY_SOURCE_UNSPECIFIED
+}
+
+func (x *DiscoverySourceResult) GetStatus() DiscoverySourceResultStatus {
+	if x != nil {
+		return x.Status
+	}
+	return DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED
+}
+
+func (x *DiscoverySourceResult) GetReason() DiscoverySourceReason {
+	if x != nil {
+		return x.Reason
+	}
+	return DiscoverySourceReason_DISCOVERY_SOURCE_REASON_UNSPECIFIED
+}
+
+func (x *DiscoverySourceResult) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
 type DiscoveryCandidateObservation struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
 	ObservationId      string                 `protobuf:"bytes,1,opt,name=observation_id,json=observationId,proto3" json:"observation_id,omitempty"`
@@ -943,7 +1138,7 @@ type DiscoveryCandidateObservation struct {
 
 func (x *DiscoveryCandidateObservation) Reset() {
 	*x = DiscoveryCandidateObservation{}
-	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	mi := &file_agent_v1_inventory_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -955,7 +1150,7 @@ func (x *DiscoveryCandidateObservation) String() string {
 func (*DiscoveryCandidateObservation) ProtoMessage() {}
 
 func (x *DiscoveryCandidateObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	mi := &file_agent_v1_inventory_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -968,7 +1163,7 @@ func (x *DiscoveryCandidateObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiscoveryCandidateObservation.ProtoReflect.Descriptor instead.
 func (*DiscoveryCandidateObservation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{5}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *DiscoveryCandidateObservation) GetObservationId() string {
@@ -1093,7 +1288,7 @@ type DiscoveryEvidence struct {
 
 func (x *DiscoveryEvidence) Reset() {
 	*x = DiscoveryEvidence{}
-	mi := &file_agent_v1_inventory_proto_msgTypes[6]
+	mi := &file_agent_v1_inventory_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1105,7 +1300,7 @@ func (x *DiscoveryEvidence) String() string {
 func (*DiscoveryEvidence) ProtoMessage() {}
 
 func (x *DiscoveryEvidence) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_inventory_proto_msgTypes[6]
+	mi := &file_agent_v1_inventory_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1118,7 +1313,7 @@ func (x *DiscoveryEvidence) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiscoveryEvidence.ProtoReflect.Descriptor instead.
 func (*DiscoveryEvidence) Descriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{6}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *DiscoveryEvidence) GetKind() DiscoveryEvidenceKind {
@@ -1148,7 +1343,7 @@ type PluginObservation struct {
 
 func (x *PluginObservation) Reset() {
 	*x = PluginObservation{}
-	mi := &file_agent_v1_inventory_proto_msgTypes[7]
+	mi := &file_agent_v1_inventory_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1160,7 +1355,7 @@ func (x *PluginObservation) String() string {
 func (*PluginObservation) ProtoMessage() {}
 
 func (x *PluginObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_inventory_proto_msgTypes[7]
+	mi := &file_agent_v1_inventory_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1173,7 +1368,7 @@ func (x *PluginObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginObservation.ProtoReflect.Descriptor instead.
 func (*PluginObservation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{7}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PluginObservation) GetHostId() string {
@@ -1235,7 +1430,7 @@ type PluginAssignmentObservation struct {
 
 func (x *PluginAssignmentObservation) Reset() {
 	*x = PluginAssignmentObservation{}
-	mi := &file_agent_v1_inventory_proto_msgTypes[8]
+	mi := &file_agent_v1_inventory_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1247,7 +1442,7 @@ func (x *PluginAssignmentObservation) String() string {
 func (*PluginAssignmentObservation) ProtoMessage() {}
 
 func (x *PluginAssignmentObservation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_inventory_proto_msgTypes[8]
+	mi := &file_agent_v1_inventory_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1260,7 +1455,7 @@ func (x *PluginAssignmentObservation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginAssignmentObservation.ProtoReflect.Descriptor instead.
 func (*PluginAssignmentObservation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{8}
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PluginAssignmentObservation) GetAssignmentId() string {
@@ -1422,7 +1617,7 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"\vmount_point\x18\x01 \x01(\tR\n" +
 	"mountPoint\x12%\n" +
 	"\x0ecapacity_bytes\x18\x02 \x01(\x04R\rcapacityBytes\x12'\n" +
-	"\x0favailable_bytes\x18\x03 \x01(\x04R\x0eavailableBytes\"\x92\x06\n" +
+	"\x0favailable_bytes\x18\x03 \x01(\x04R\x0eavailableBytes\"\xe2\x06\n" +
 	"\x0fDiscoveryReport\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
@@ -1440,7 +1635,14 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"\x1arule_attestation_signature\x18\x18 \x01(\fR\x18ruleAttestationSignature\x128\n" +
 	"\x18rule_attestation_version\x18\x19 \x01(\rR\x16ruleAttestationVersion\x12<\n" +
 	"\x1arule_attestation_algorithm\x18\x1a \x01(\tR\x18ruleAttestationAlgorithm\x125\n" +
-	"\x17rule_attestation_key_id\x18\x1b \x01(\tR\x14ruleAttestationKeyIdJ\x04\b\a\x10\x14J\x04\b\x1c\x10 \"\xdf\x05\n" +
+	"\x17rule_attestation_key_id\x18\x1b \x01(\tR\x14ruleAttestationKeyId\x12N\n" +
+	"\x0esource_results\x18  \x03(\v2'.dbpilot.agent.v1.DiscoverySourceResultR\rsourceResultsJ\x04\b\a\x10\x14J\x04\b\x1c\x10 \"\x97\x02\n" +
+	"\x15DiscoverySourceResult\x129\n" +
+	"\x06source\x18\x01 \x01(\x0e2!.dbpilot.agent.v1.DiscoverySourceR\x06source\x12E\n" +
+	"\x06status\x18\x02 \x01(\x0e2-.dbpilot.agent.v1.DiscoverySourceResultStatusR\x06status\x12?\n" +
+	"\x06reason\x18\x03 \x01(\x0e2'.dbpilot.agent.v1.DiscoverySourceReasonR\x06reason\x12;\n" +
+	"\vobserved_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAt\"\xdf\x05\n" +
 	"\x1dDiscoveryCandidateObservation\x12%\n" +
 	"\x0eobservation_id\x18\x01 \x01(\tR\robservationId\x129\n" +
 	"\x06source\x18\x02 \x01(\x0e2!.dbpilot.agent.v1.DiscoverySourceR\x06source\x12'\n" +
@@ -1494,11 +1696,25 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"\x0flast_error_code\x18\x0e \x01(\tR\rlastErrorCode\x12;\n" +
 	"\vobserved_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"observedAt\x12I\n" +
-	"\rcircuit_state\x18\x10 \x01(\x0e2$.dbpilot.agent.v1.PluginCircuitStateR\fcircuitStateJ\x04\b\x11\x10 *m\n" +
+	"\rcircuit_state\x18\x10 \x01(\x0e2$.dbpilot.agent.v1.PluginCircuitStateR\fcircuitStateJ\x04\b\x11\x10 *\x90\x02\n" +
+	"\x1bDiscoverySourceResultStatus\x12.\n" +
+	"*DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED\x10\x00\x12,\n" +
+	"(DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED\x10\x01\x12.\n" +
+	"*DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE\x10\x02\x121\n" +
+	"-DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED\x10\x03\x120\n" +
+	",DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED\x10\x04*\xc7\x02\n" +
+	"\x15DiscoverySourceReason\x12'\n" +
+	"#DISCOVERY_SOURCE_REASON_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fDISCOVERY_SOURCE_REASON_HEALTHY\x10\x01\x12.\n" +
+	"*DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE\x10\x02\x12-\n" +
+	")DISCOVERY_SOURCE_REASON_PERMISSION_DENIED\x10\x03\x12*\n" +
+	"&DISCOVERY_SOURCE_REASON_DETECTOR_ERROR\x10\x04\x12*\n" +
+	"&DISCOVERY_SOURCE_REASON_NOT_CONFIGURED\x10\x05\x12)\n" +
+	"%DISCOVERY_SOURCE_REASON_NOT_REQUESTED\x10\x06*m\n" +
 	"\x0fDiscoverySource\x12 \n" +
 	"\x1cDISCOVERY_SOURCE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17DISCOVERY_SOURCE_NATIVE\x10\x01\x12\x1b\n" +
-	"\x17DISCOVERY_SOURCE_DOCKER\x10\x02*\xc7\x03\n" +
+	"\x17DISCOVERY_SOURCE_DOCKER\x10\x02*\xf1\x03\n" +
 	"\x15DiscoveryEvidenceKind\x12'\n" +
 	"#DISCOVERY_EVIDENCE_KIND_UNSPECIFIED\x10\x00\x12(\n" +
 	"$DISCOVERY_EVIDENCE_KIND_PROCESS_NAME\x10\x01\x12+\n" +
@@ -1509,7 +1725,9 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"'DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE\x10\x06\x12+\n" +
 	"'DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL\x10\a\x12*\n" +
 	"&DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT\x10\b\x12(\n" +
-	"$DISCOVERY_EVIDENCE_KIND_VERSION_HINT\x10\t*\x87\x01\n" +
+	"$DISCOVERY_EVIDENCE_KIND_VERSION_HINT\x10\t\x12(\n" +
+	"$DISCOVERY_EVIDENCE_KIND_CONTAINER_ID\x10\n" +
+	"*\x87\x01\n" +
 	"\x10PluginActiveSlot\x12\"\n" +
 	"\x1ePLUGIN_ACTIVE_SLOT_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17PLUGIN_ACTIVE_SLOT_NONE\x10\x01\x12\x18\n" +
@@ -1562,54 +1780,62 @@ func file_agent_v1_inventory_proto_rawDescGZIP() []byte {
 	return file_agent_v1_inventory_proto_rawDescData
 }
 
-var file_agent_v1_inventory_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_agent_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_agent_v1_inventory_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_agent_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_agent_v1_inventory_proto_goTypes = []any{
-	(DiscoverySource)(0),                  // 0: dbpilot.agent.v1.DiscoverySource
-	(DiscoveryEvidenceKind)(0),            // 1: dbpilot.agent.v1.DiscoveryEvidenceKind
-	(PluginActiveSlot)(0),                 // 2: dbpilot.agent.v1.PluginActiveSlot
-	(PluginProcessState)(0),               // 3: dbpilot.agent.v1.PluginProcessState
-	(PluginHealthState)(0),                // 4: dbpilot.agent.v1.PluginHealthState
-	(PluginCircuitState)(0),               // 5: dbpilot.agent.v1.PluginCircuitState
-	(*Inventory)(nil),                     // 6: dbpilot.agent.v1.Inventory
-	(*InstanceInventory)(nil),             // 7: dbpilot.agent.v1.InstanceInventory
-	(*HostObservation)(nil),               // 8: dbpilot.agent.v1.HostObservation
-	(*FilesystemObservation)(nil),         // 9: dbpilot.agent.v1.FilesystemObservation
-	(*DiscoveryReport)(nil),               // 10: dbpilot.agent.v1.DiscoveryReport
-	(*DiscoveryCandidateObservation)(nil), // 11: dbpilot.agent.v1.DiscoveryCandidateObservation
-	(*DiscoveryEvidence)(nil),             // 12: dbpilot.agent.v1.DiscoveryEvidence
-	(*PluginObservation)(nil),             // 13: dbpilot.agent.v1.PluginObservation
-	(*PluginAssignmentObservation)(nil),   // 14: dbpilot.agent.v1.PluginAssignmentObservation
-	nil,                                   // 15: dbpilot.agent.v1.InstanceInventory.AttributesEntry
-	(*timestamppb.Timestamp)(nil),         // 16: google.protobuf.Timestamp
+	(DiscoverySourceResultStatus)(0),      // 0: dbpilot.agent.v1.DiscoverySourceResultStatus
+	(DiscoverySourceReason)(0),            // 1: dbpilot.agent.v1.DiscoverySourceReason
+	(DiscoverySource)(0),                  // 2: dbpilot.agent.v1.DiscoverySource
+	(DiscoveryEvidenceKind)(0),            // 3: dbpilot.agent.v1.DiscoveryEvidenceKind
+	(PluginActiveSlot)(0),                 // 4: dbpilot.agent.v1.PluginActiveSlot
+	(PluginProcessState)(0),               // 5: dbpilot.agent.v1.PluginProcessState
+	(PluginHealthState)(0),                // 6: dbpilot.agent.v1.PluginHealthState
+	(PluginCircuitState)(0),               // 7: dbpilot.agent.v1.PluginCircuitState
+	(*Inventory)(nil),                     // 8: dbpilot.agent.v1.Inventory
+	(*InstanceInventory)(nil),             // 9: dbpilot.agent.v1.InstanceInventory
+	(*HostObservation)(nil),               // 10: dbpilot.agent.v1.HostObservation
+	(*FilesystemObservation)(nil),         // 11: dbpilot.agent.v1.FilesystemObservation
+	(*DiscoveryReport)(nil),               // 12: dbpilot.agent.v1.DiscoveryReport
+	(*DiscoverySourceResult)(nil),         // 13: dbpilot.agent.v1.DiscoverySourceResult
+	(*DiscoveryCandidateObservation)(nil), // 14: dbpilot.agent.v1.DiscoveryCandidateObservation
+	(*DiscoveryEvidence)(nil),             // 15: dbpilot.agent.v1.DiscoveryEvidence
+	(*PluginObservation)(nil),             // 16: dbpilot.agent.v1.PluginObservation
+	(*PluginAssignmentObservation)(nil),   // 17: dbpilot.agent.v1.PluginAssignmentObservation
+	nil,                                   // 18: dbpilot.agent.v1.InstanceInventory.AttributesEntry
+	(*timestamppb.Timestamp)(nil),         // 19: google.protobuf.Timestamp
 }
 var file_agent_v1_inventory_proto_depIdxs = []int32{
-	7,  // 0: dbpilot.agent.v1.Inventory.instances:type_name -> dbpilot.agent.v1.InstanceInventory
-	16, // 1: dbpilot.agent.v1.Inventory.observed_at:type_name -> google.protobuf.Timestamp
-	15, // 2: dbpilot.agent.v1.InstanceInventory.attributes:type_name -> dbpilot.agent.v1.InstanceInventory.AttributesEntry
-	9,  // 3: dbpilot.agent.v1.HostObservation.filesystems:type_name -> dbpilot.agent.v1.FilesystemObservation
-	16, // 4: dbpilot.agent.v1.HostObservation.observed_at:type_name -> google.protobuf.Timestamp
-	11, // 5: dbpilot.agent.v1.DiscoveryReport.candidates:type_name -> dbpilot.agent.v1.DiscoveryCandidateObservation
-	16, // 6: dbpilot.agent.v1.DiscoveryReport.observed_at:type_name -> google.protobuf.Timestamp
-	16, // 7: dbpilot.agent.v1.DiscoveryReport.rule_issued_at:type_name -> google.protobuf.Timestamp
-	16, // 8: dbpilot.agent.v1.DiscoveryReport.rule_expires_at:type_name -> google.protobuf.Timestamp
-	0,  // 9: dbpilot.agent.v1.DiscoveryCandidateObservation.source:type_name -> dbpilot.agent.v1.DiscoverySource
-	12, // 10: dbpilot.agent.v1.DiscoveryCandidateObservation.evidence:type_name -> dbpilot.agent.v1.DiscoveryEvidence
-	16, // 11: dbpilot.agent.v1.DiscoveryCandidateObservation.observed_at:type_name -> google.protobuf.Timestamp
-	1,  // 12: dbpilot.agent.v1.DiscoveryEvidence.kind:type_name -> dbpilot.agent.v1.DiscoveryEvidenceKind
-	14, // 13: dbpilot.agent.v1.PluginObservation.assignments:type_name -> dbpilot.agent.v1.PluginAssignmentObservation
-	16, // 14: dbpilot.agent.v1.PluginObservation.observed_at:type_name -> google.protobuf.Timestamp
-	2,  // 15: dbpilot.agent.v1.PluginAssignmentObservation.active_slot:type_name -> dbpilot.agent.v1.PluginActiveSlot
-	3,  // 16: dbpilot.agent.v1.PluginAssignmentObservation.process_state:type_name -> dbpilot.agent.v1.PluginProcessState
-	16, // 17: dbpilot.agent.v1.PluginAssignmentObservation.started_at:type_name -> google.protobuf.Timestamp
-	4,  // 18: dbpilot.agent.v1.PluginAssignmentObservation.health:type_name -> dbpilot.agent.v1.PluginHealthState
-	16, // 19: dbpilot.agent.v1.PluginAssignmentObservation.observed_at:type_name -> google.protobuf.Timestamp
-	5,  // 20: dbpilot.agent.v1.PluginAssignmentObservation.circuit_state:type_name -> dbpilot.agent.v1.PluginCircuitState
-	21, // [21:21] is the sub-list for method output_type
-	21, // [21:21] is the sub-list for method input_type
-	21, // [21:21] is the sub-list for extension type_name
-	21, // [21:21] is the sub-list for extension extendee
-	0,  // [0:21] is the sub-list for field type_name
+	9,  // 0: dbpilot.agent.v1.Inventory.instances:type_name -> dbpilot.agent.v1.InstanceInventory
+	19, // 1: dbpilot.agent.v1.Inventory.observed_at:type_name -> google.protobuf.Timestamp
+	18, // 2: dbpilot.agent.v1.InstanceInventory.attributes:type_name -> dbpilot.agent.v1.InstanceInventory.AttributesEntry
+	11, // 3: dbpilot.agent.v1.HostObservation.filesystems:type_name -> dbpilot.agent.v1.FilesystemObservation
+	19, // 4: dbpilot.agent.v1.HostObservation.observed_at:type_name -> google.protobuf.Timestamp
+	14, // 5: dbpilot.agent.v1.DiscoveryReport.candidates:type_name -> dbpilot.agent.v1.DiscoveryCandidateObservation
+	19, // 6: dbpilot.agent.v1.DiscoveryReport.observed_at:type_name -> google.protobuf.Timestamp
+	19, // 7: dbpilot.agent.v1.DiscoveryReport.rule_issued_at:type_name -> google.protobuf.Timestamp
+	19, // 8: dbpilot.agent.v1.DiscoveryReport.rule_expires_at:type_name -> google.protobuf.Timestamp
+	13, // 9: dbpilot.agent.v1.DiscoveryReport.source_results:type_name -> dbpilot.agent.v1.DiscoverySourceResult
+	2,  // 10: dbpilot.agent.v1.DiscoverySourceResult.source:type_name -> dbpilot.agent.v1.DiscoverySource
+	0,  // 11: dbpilot.agent.v1.DiscoverySourceResult.status:type_name -> dbpilot.agent.v1.DiscoverySourceResultStatus
+	1,  // 12: dbpilot.agent.v1.DiscoverySourceResult.reason:type_name -> dbpilot.agent.v1.DiscoverySourceReason
+	19, // 13: dbpilot.agent.v1.DiscoverySourceResult.observed_at:type_name -> google.protobuf.Timestamp
+	2,  // 14: dbpilot.agent.v1.DiscoveryCandidateObservation.source:type_name -> dbpilot.agent.v1.DiscoverySource
+	15, // 15: dbpilot.agent.v1.DiscoveryCandidateObservation.evidence:type_name -> dbpilot.agent.v1.DiscoveryEvidence
+	19, // 16: dbpilot.agent.v1.DiscoveryCandidateObservation.observed_at:type_name -> google.protobuf.Timestamp
+	3,  // 17: dbpilot.agent.v1.DiscoveryEvidence.kind:type_name -> dbpilot.agent.v1.DiscoveryEvidenceKind
+	17, // 18: dbpilot.agent.v1.PluginObservation.assignments:type_name -> dbpilot.agent.v1.PluginAssignmentObservation
+	19, // 19: dbpilot.agent.v1.PluginObservation.observed_at:type_name -> google.protobuf.Timestamp
+	4,  // 20: dbpilot.agent.v1.PluginAssignmentObservation.active_slot:type_name -> dbpilot.agent.v1.PluginActiveSlot
+	5,  // 21: dbpilot.agent.v1.PluginAssignmentObservation.process_state:type_name -> dbpilot.agent.v1.PluginProcessState
+	19, // 22: dbpilot.agent.v1.PluginAssignmentObservation.started_at:type_name -> google.protobuf.Timestamp
+	6,  // 23: dbpilot.agent.v1.PluginAssignmentObservation.health:type_name -> dbpilot.agent.v1.PluginHealthState
+	19, // 24: dbpilot.agent.v1.PluginAssignmentObservation.observed_at:type_name -> google.protobuf.Timestamp
+	7,  // 25: dbpilot.agent.v1.PluginAssignmentObservation.circuit_state:type_name -> dbpilot.agent.v1.PluginCircuitState
+	26, // [26:26] is the sub-list for method output_type
+	26, // [26:26] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_inventory_proto_init() }
@@ -1622,8 +1848,8 @@ func file_agent_v1_inventory_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_inventory_proto_rawDesc), len(file_agent_v1_inventory_proto_rawDesc)),
-			NumEnums:      6,
-			NumMessages:   10,
+			NumEnums:      8,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

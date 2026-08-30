@@ -37,6 +37,7 @@ func (err responseStatusError) Error() string {
 }
 
 type Engine interface {
+	Info(context.Context) (EngineInfo, error)
 	ListContainers(context.Context) ([]ContainerObservation, error)
 	InspectContainer(context.Context, string) (ContainerObservation, error)
 	Events(context.Context, time.Time) (<-chan ContainerEvent, <-chan error)
@@ -110,7 +111,7 @@ func (client *Client) Info(ctx context.Context) (EngineInfo, error) {
 	if err := client.getJSON(ctx, "/info", nil, &raw); err != nil {
 		return EngineInfo{}, err
 	}
-	if len(raw.ID) > 128 || strings.ContainsAny(raw.ID, "\x00\r\n") {
+	if raw.ID == "" || len(raw.ID) > 128 || strings.ContainsAny(raw.ID, "\x00\r\n") {
 		return EngineInfo{}, errors.New("invalid Docker engine identity")
 	}
 	return EngineInfo{ID: raw.ID}, nil
@@ -175,11 +176,13 @@ func (client *Client) InspectContainer(ctx context.Context, id string) (Containe
 		return ContainerObservation{}, err
 	}
 	arguments := append(append([]string(nil), raw.Config.Entrypoint...), raw.Config.Cmd...)
-	cgroup, err := readCgroupAt("/proc", raw.State.Pid)
-	if err != nil {
-		return ContainerObservation{}, err
-	}
+	cgroup := optionalCgroupAt("/proc", raw.State.Pid)
 	return ContainerObservation{ContainerID: id, Name: strings.TrimPrefix(raw.Name, "/"), Image: raw.Config.Image, State: raw.State.Status, Ports: ports, Labels: raw.Config.Labels, CommandSummary: RedactCommand(arguments), HostProcessID: raw.State.Pid, Cgroup: cgroup, ObservedAt: time.Now().UTC()}, nil
+}
+
+func optionalCgroupAt(root string, pid uint32) string {
+	value, _ := readCgroupAt(root, pid)
+	return value
 }
 
 func readCgroupAt(root string, pid uint32) (string, error) {
@@ -278,13 +281,14 @@ func (client *Client) Events(ctx context.Context, since time.Time) (<-chan Conta
 			}
 			if len(strings.TrimSpace(string(line))) > 0 {
 				var raw struct {
-					Type   string `json:"Type"`
-					Action string `json:"Action"`
-					Status string `json:"status"`
-					ID     string `json:"id"`
-					From   string `json:"from"`
-					Time   int64  `json:"time"`
-					Actor  struct {
+					Type     string `json:"Type"`
+					Action   string `json:"Action"`
+					Status   string `json:"status"`
+					ID       string `json:"id"`
+					From     string `json:"from"`
+					Time     int64  `json:"time"`
+					TimeNano int64  `json:"timeNano"`
+					Actor    struct {
 						ID         string            `json:"ID"`
 						Attributes map[string]string `json:"Attributes"`
 					} `json:"Actor"`
@@ -317,8 +321,12 @@ func (client *Client) Events(ctx context.Context, since time.Time) (<-chan Conta
 				if image == "" {
 					image = raw.Actor.Attributes["image"]
 				}
+				occurredAt := time.Unix(raw.Time, 0).UTC()
+				if raw.TimeNano > 0 {
+					occurredAt = time.Unix(0, raw.TimeNano).UTC()
+				}
 				select {
-				case events <- ContainerEvent{ContainerID: containerID, Name: name, Image: image, Action: action, OccurredAt: time.Unix(raw.Time, 0).UTC()}:
+				case events <- ContainerEvent{ContainerID: containerID, Name: name, Image: image, Action: action, OccurredAt: occurredAt}:
 				case <-ctx.Done():
 					errorsChannel <- ctx.Err()
 					return

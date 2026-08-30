@@ -8,6 +8,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,7 +74,6 @@ type Coordinator struct {
 	reports           ReportStore
 	pendingReport     *agentv1.DiscoveryReport
 	unavailable       bool
-	dockerUnavailable bool
 	compatibility     func() CompatibilityState
 }
 
@@ -102,7 +102,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, dockerUnavailable: config.DockerDetector == nil, compatibility: config.Compatibility}, nil
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, compatibility: config.Compatibility}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -115,14 +115,10 @@ func (coordinator *Coordinator) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(coordinator.rules.ScanInterval)
 	defer ticker.Stop()
-	dockerEvents := make(chan struct{}, 1)
-	if watcher, ok := coordinator.dockerDetector.(interface{ Watch(context.Context, func()) }); ok {
-		go watcher.Watch(ctx, func() {
-			select {
-			case dockerEvents <- struct{}{}:
-			default:
-			}
-		})
+	if watcher, ok := coordinator.dockerDetector.(interface {
+		Watch(context.Context, func() error)
+	}); ok {
+		go watcher.Watch(ctx, func() error { return coordinator.scanUntilDelivered(ctx, ScanPeriodic) })
 	}
 	for {
 		select {
@@ -132,10 +128,6 @@ func (coordinator *Coordinator) Run(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			return nil
-		case <-dockerEvents:
-			if err := coordinator.scanUntilDelivered(ctx, ScanPeriodic); err != nil {
-				return nil
-			}
 		}
 	}
 }
@@ -158,10 +150,10 @@ func (coordinator *Coordinator) scanUntilDelivered(ctx context.Context, reason S
 }
 
 func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
-	return coordinator.scanSelected(ctx, true, true)
+	return coordinator.scanSelected(ctx, true, true, false)
 }
 
-func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative, includeDocker bool) error {
+func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative, includeDocker, failUnavailable bool) error {
 	if ctx == nil {
 		return domain.ErrInvalid
 	}
@@ -184,38 +176,60 @@ func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative,
 		coordinator.pendingReport = pending
 	}
 	if coordinator.pendingReport != nil {
-		return coordinator.deliverPending(ctx)
+		pendingError := requestedSourceError(coordinator.pendingReport, includeNative, includeDocker)
+		if err := coordinator.deliverPending(ctx); err != nil {
+			return err
+		}
+		if failUnavailable {
+			return pendingError
+		}
+		return nil
 	}
 	observedAt := coordinator.now().UTC()
 	if coordinator.rules.Active(observedAt) != nil {
 		return domain.ErrInvalid
 	}
 	candidates := make([]domain.CandidateObservation, 0)
+	sourceResults := make([]*agentv1.DiscoverySourceResult, 0, 2)
+	var requestedError error
 	if includeNative {
 		native, err := coordinator.detector.Discover(ctx, coordinator.rules.Rules)
 		if err != nil {
-			return err
+			reason := agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR
+			if permissionDeniedDiscovery(err) {
+				reason = agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED
+			}
+			sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, reason, observedAt))
+			requestedError = err
+		} else {
+			candidates = append(candidates, native...)
+			sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY, observedAt))
 		}
-		candidates = append(candidates, native...)
+	} else {
+		sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED, observedAt))
 	}
 	if includeDocker {
 		if coordinator.dockerDetector == nil {
-			coordinator.dockerUnavailable = true
-			if !includeNative {
-				return ErrDockerDiscoveryUnavailable
-			}
+			sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_CONFIGURED, observedAt))
+			requestedError = ErrDockerDiscoveryUnavailable
 		} else {
 			dockerCandidates, err := coordinator.dockerDetector.Discover(ctx, coordinator.rules.Rules)
 			if err != nil {
-				coordinator.dockerUnavailable = true
-				if !includeNative {
-					return err
+				reason := agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_DETECTOR_ERROR
+				if errors.Is(err, ErrDockerDiscoveryUnavailable) {
+					reason = agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE
+				} else if errors.Is(err, ErrDockerDiscoveryPermissionDenied) {
+					reason = agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED
 				}
+				sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, reason, observedAt))
+				requestedError = err
 			} else {
-				coordinator.dockerUnavailable = false
 				candidates = append(candidates, dockerCandidates...)
+				sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY, observedAt))
 			}
 		}
+	} else {
+		sourceResults = append(sourceResults, protobufSourceResult(agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED, agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED, observedAt))
 	}
 	protobufCandidates := make([]*agentv1.DiscoveryCandidateObservation, 0, len(candidates))
 	seen := make(map[[32]byte]struct{}, len(candidates))
@@ -246,7 +260,7 @@ func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative,
 	sort.Slice(protobufCandidates, func(left, right int) bool {
 		return string(protobufCandidates[left].GetFingerprint()) < string(protobufCandidates[right].GetFingerprint())
 	})
-	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: math.MaxUint64, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
+	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: math.MaxUint64, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, SourceResults: sourceResults, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
 	if err != nil || len(encoded) > domain.MaximumDiscoveryReportBytes {
 		coordinator.unavailable = true
@@ -264,7 +278,17 @@ func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative,
 		return err
 	}
 	coordinator.pendingReport = report
-	return coordinator.deliverPending(ctx)
+	if err := coordinator.deliverPending(ctx); err != nil {
+		return err
+	}
+	if failUnavailable {
+		return requestedError
+	}
+	return nil
+}
+
+func permissionDeniedDiscovery(err error) bool {
+	return errors.Is(err, ErrDockerDiscoveryPermissionDenied) || strings.Contains(err.Error(), "permission_denied")
 }
 
 func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
@@ -303,19 +327,35 @@ func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.C
 	if command == nil || command.GetHostId() != coordinator.hostID || command.GetRuleRevision() != coordinator.rules.Revision || (!command.GetIncludeNative() && !command.GetIncludeDocker()) {
 		return nil, domain.ErrInvalid
 	}
-	if err := coordinator.scanSelected(ctx, command.GetIncludeNative(), command.GetIncludeDocker()); err != nil {
+	if err := coordinator.scanSelected(ctx, command.GetIncludeNative(), command.GetIncludeDocker(), true); err != nil {
 		return nil, err
 	}
 	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database discovery completed"}, nil
 }
 
 func (coordinator *Coordinator) AdditionalCapabilities() []string {
-	coordinator.mu.Lock()
-	defer coordinator.mu.Unlock()
-	if coordinator.dockerUnavailable {
-		return []string{"docker_discovery_unavailable", "native_discovery_v1"}
+	capabilities := []string{"docker_discovery_v1", "native_discovery_v1"}
+	if coordinator.dockerDetector != nil {
+		capabilities = append(capabilities, "docker_discovery_configured")
 	}
-	return []string{"docker_discovery_v1", "native_discovery_v1"}
+	return capabilities
+}
+
+func protobufSourceResult(source agentv1.DiscoverySource, statusValue agentv1.DiscoverySourceResultStatus, reason agentv1.DiscoverySourceReason, observedAt time.Time) *agentv1.DiscoverySourceResult {
+	return &agentv1.DiscoverySourceResult{Source: source, Status: statusValue, Reason: reason, ObservedAt: timestamppb.New(observedAt)}
+}
+
+func requestedSourceError(report *agentv1.DiscoveryReport, includeNative, includeDocker bool) error {
+	for _, result := range report.GetSourceResults() {
+		requested := result.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE && includeNative || result.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER && includeDocker
+		if requested && result.GetStatus() != agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED {
+			if result.GetReason() == agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_PERMISSION_DENIED {
+				return ErrDockerDiscoveryPermissionDenied
+			}
+			return ErrDockerDiscoveryUnavailable
+		}
+	}
+	return nil
 }
 
 func protobufCandidate(candidate domain.CandidateObservation) (*agentv1.DiscoveryCandidateObservation, error) {
@@ -351,6 +391,7 @@ func protobufEvidenceKind(kind domain.EvidenceKind) (agentv1.DiscoveryEvidenceKi
 		domain.EvidenceContainerLabel: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL,
 		domain.EvidenceContainerPort:  agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT,
 		domain.EvidenceVersionHint:    agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT,
+		domain.EvidenceContainerID:    agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_ID,
 	}
 	value, ok := values[kind]
 	return value, ok

@@ -2,6 +2,7 @@ package dockerdiscovery
 
 import (
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 )
@@ -16,6 +17,47 @@ func TestDockerCommandSummaryRedactsCredentialFormsBeforeDTO(t *testing.T) {
 	require.NotContains(t, summary, "-pshort")
 	require.Contains(t, summary, "[REDACTED]")
 	require.LessOrEqual(t, len(summary), maximumCommandSummaryBytes)
+}
+
+func TestDockerRedactionCoversShortFlagsDSNHeadersAndEmbeddedURIs(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments []string
+		forbidden []string
+	}{
+		{name: "short separate", arguments: []string{"mysql", "-p", "short-secret"}, forbidden: []string{"short-secret"}},
+		{name: "long separate", arguments: []string{"mysql", "--password", "long-secret"}, forbidden: []string{"long-secret"}},
+		{name: "dsn equal", arguments: []string{"app", "--dsn=alice:dsn-secret@tcp(db:3306)/app"}, forbidden: []string{"alice", "dsn-secret"}},
+		{name: "database url next", arguments: []string{"app", "--database-url", "mysql://alice:url-secret@db/app?token=query-secret"}, forbidden: []string{"alice", "url-secret", "query-secret"}},
+		{name: "embedded uri", arguments: []string{"app", "--endpoint=mysql://alice:embedded-secret@db/app?password=query-secret&tls=true"}, forbidden: []string{"alice", "embedded-secret", "query-secret"}},
+		{name: "authorization", arguments: []string{"app", "--authorization", "Bearer header-secret"}, forbidden: []string{"header-secret"}},
+		{name: "header", arguments: []string{"app", "-H", "Authorization: header-secret"}, forbidden: []string{"header-secret"}},
+		{name: "attached header", arguments: []string{"app", "-HAuthorization:attached-secret"}, forbidden: []string{"attached-secret"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			summary := RedactCommand(test.arguments)
+			for _, value := range test.forbidden {
+				require.NotContains(t, summary, value)
+			}
+			require.Contains(t, summary, "[REDACTED]")
+		})
+	}
+}
+
+func TestDockerRedactionReturnsValidUTF8AtBoundaries(t *testing.T) {
+	summary := RedactCommand([]string{string([]byte{'x', 0xff, 'y'}), "--endpoint=" + "界" + string(make([]byte, maximumCommandSummaryBytes))})
+	require.True(t, utf8.ValidString(summary))
+	require.LessOrEqual(t, len(summary), maximumCommandSummaryBytes)
+}
+
+func TestDockerLabelValuesScrubEmbeddedURIAndSensitiveQuery(t *testing.T) {
+	labels := FilterLabels(map[string]string{"dbpilot.connection.hint": "mysql://alice:label-secret@db/app?token=query-secret&tls=true"}, []string{"dbpilot.connection.hint"})
+	value := labels["dbpilot.connection.hint"]
+	require.NotContains(t, value, "alice")
+	require.NotContains(t, value, "label-secret")
+	require.NotContains(t, value, "query-secret")
+	require.Contains(t, value, "[REDACTED]")
 }
 
 func TestDockerLabelsAreStrictlyAllowlistedAndCredentialValuesStillRedacted(t *testing.T) {

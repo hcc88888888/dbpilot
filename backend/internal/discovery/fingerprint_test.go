@@ -48,3 +48,27 @@ func TestFingerprintPrefersEndpointWhenSocketEvidenceAppearsLater(t *testing.T) 
 	require.NoError(t, err)
 	require.NotEqual(t, left, fallback, "socket-only identity is necessarily distinct when no stable endpoint exists")
 }
+
+func TestDockerFingerprintUsesStableEndpointNotEphemeralContainerID(t *testing.T) {
+	left := CandidateObservation{Source: SourceDocker, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ContainerIdentity: "container-id-a"}
+	right := left
+	right.ContainerIdentity = "container-id-b"
+	leftFingerprint, err := Fingerprint("host-1", left)
+	require.NoError(t, err)
+	rightFingerprint, err := Fingerprint("host-1", right)
+	require.NoError(t, err)
+	require.Equal(t, leftFingerprint, rightFingerprint)
+	right.NormalizedEndpoint = "127.0.0.1:3307"
+	rightFingerprint, err = Fingerprint("host-1", right)
+	require.NoError(t, err)
+	require.NotEqual(t, leftFingerprint, rightFingerprint)
+}
+
+func TestDockerFingerprintFallsBackToStableOwnershipIdentityWithoutEndpoint(t *testing.T) {
+	observation := CandidateObservation{Source: SourceDocker, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ContainerIdentity: "orders-db"}
+	first, err := Fingerprint("host-1", observation)
+	require.NoError(t, err)
+	second, err := Fingerprint("host-1", observation)
+	require.NoError(t, err)
+	require.Equal(t, first, second)
+}

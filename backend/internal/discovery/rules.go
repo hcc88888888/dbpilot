@@ -30,12 +30,13 @@ type Rule struct {
 	UnixSocketPatterns     []string `json:"unix_socket_patterns,omitempty"`
 	DockerImagePatterns    []string `json:"docker_image_patterns,omitempty"`
 	DockerLabelSelectors   []string `json:"docker_label_selectors,omitempty"`
+	DockerIdentityLabel    string   `json:"docker_identity_label,omitempty"`
 }
 
 func (rule Rule) Validate() error {
 	native := len(rule.ProcessNames)+len(rule.ExecutablePathPatterns)+len(rule.SystemdUnits) > 0
 	docker := len(rule.DockerImagePatterns) > 0 && len(rule.DockerLabelSelectors) > 0
-	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.DockerImagePatterns) > 32 || len(rule.DockerLabelSelectors) > 32 || (!native && !docker) || (len(rule.DockerImagePatterns) > 0) != (len(rule.DockerLabelSelectors) > 0) {
+	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.DockerImagePatterns) > 32 || len(rule.DockerLabelSelectors) > 32 || (!native && !docker) || (len(rule.DockerImagePatterns) > 0) != (len(rule.DockerLabelSelectors) > 0) || (rule.DockerIdentityLabel != "" && (!docker || !safeDockerLabel(rule.DockerIdentityLabel))) {
 		return ErrInvalidRule
 	}
 	for _, value := range append(append([]string{}, rule.ProcessNames...), rule.SystemdUnits...) {

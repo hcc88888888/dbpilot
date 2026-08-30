@@ -324,7 +324,19 @@ func (store *countingRevisionStore) Next(context.Context) (uint64, error) {
 
 func validPendingReportFixture() *agentv1.DiscoveryReport {
 	now := timestamppb.New(time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC))
-	return &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 7, RuleRevision: 4, ObservedAt: now, RuleSetDigest: make([]byte, 32), DisappearanceGraceSeconds: 60, RuleIssuedAt: now, RuleExpiresAt: timestamppb.New(now.AsTime().Add(time.Hour)), RuleAttestationSignature: make([]byte, 64), RuleAttestationVersion: 1, RuleAttestationAlgorithm: "ed25519-sha256", RuleAttestationKeyId: "test"}
+	return &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 7, RuleRevision: 4, ObservedAt: now, SourceResults: []*agentv1.DiscoverySourceResult{{Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, Status: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, Reason: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY, ObservedAt: now}, {Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, Status: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE, Reason: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE, ObservedAt: now}}, RuleSetDigest: make([]byte, 32), DisappearanceGraceSeconds: 60, RuleIssuedAt: now, RuleExpiresAt: timestamppb.New(now.AsTime().Add(time.Hour)), RuleAttestationSignature: make([]byte, 64), RuleAttestationVersion: 1, RuleAttestationAlgorithm: "ed25519-sha256", RuleAttestationKeyId: "test"}
+}
+
+func TestDiscoveryReportDigestCoversPerSourceCompleteness(t *testing.T) {
+	left := validPendingReportFixture()
+	right := proto.Clone(left).(*agentv1.DiscoveryReport)
+	right.SourceResults[1].Status = agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED
+	right.SourceResults[1].Reason = agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY
+	leftDigest, err := ReportDigest(left)
+	require.NoError(t, err)
+	rightDigest, err := ReportDigest(right)
+	require.NoError(t, err)
+	require.NotEqual(t, leftDigest, rightDigest)
 }
 
 type recordingDetector struct {

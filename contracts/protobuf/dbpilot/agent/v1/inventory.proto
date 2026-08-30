@@ -62,8 +62,34 @@ message DiscoveryReport {
   uint32 rule_attestation_version = 25;
   string rule_attestation_algorithm = 26;
   string rule_attestation_key_id = 27;
+  repeated DiscoverySourceResult source_results = 32;
   reserved 7 to 19;
   reserved 28 to 31;
+}
+
+message DiscoverySourceResult {
+  DiscoverySource source = 1;
+  DiscoverySourceResultStatus status = 2;
+  DiscoverySourceReason reason = 3;
+  google.protobuf.Timestamp observed_at = 4;
+}
+
+enum DiscoverySourceResultStatus {
+  DISCOVERY_SOURCE_RESULT_STATUS_UNSPECIFIED = 0;
+  DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED = 1;
+  DISCOVERY_SOURCE_RESULT_STATUS_UNAVAILABLE = 2;
+  DISCOVERY_SOURCE_RESULT_STATUS_NOT_CONFIGURED = 3;
+  DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED = 4;
+}
+
+enum DiscoverySourceReason {
+  DISCOVERY_SOURCE_REASON_UNSPECIFIED = 0;
+  DISCOVERY_SOURCE_REASON_HEALTHY = 1;
+  DISCOVERY_SOURCE_REASON_HELPER_UNAVAILABLE = 2;
+  DISCOVERY_SOURCE_REASON_PERMISSION_DENIED = 3;
+  DISCOVERY_SOURCE_REASON_DETECTOR_ERROR = 4;
+  DISCOVERY_SOURCE_REASON_NOT_CONFIGURED = 5;
+  DISCOVERY_SOURCE_REASON_NOT_REQUESTED = 6;
 }
 
 message DiscoveryCandidateObservation {
@@ -108,6 +134,7 @@ enum DiscoveryEvidenceKind {
   DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL = 7;
   DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT = 8;
   DISCOVERY_EVIDENCE_KIND_VERSION_HINT = 9;
+  DISCOVERY_EVIDENCE_KIND_CONTAINER_ID = 10;
 }
 
 message PluginObservation {
