@@ -36,29 +36,45 @@ import (
 
 func TestTelemetryLifecycleRetainsFailedBatchesAcrossRestartAndDeliversViaMTLS(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll("dbpilot-spool")) })
-	directory := t.TempDir()
+	directory := workingTreeTempDir(t)
 	logPath := filepath.Join(directory, "application.log")
 	require.NoError(t, os.WriteFile(logPath, []byte("runtime collection "+time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o600))
 
 	store, err := spool.Open(filepath.Join(directory, "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 512})
 	require.NoError(t, err)
+	firstStore := store
+	t.Cleanup(func() { require.NoError(t, firstStore.Close()) })
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	envelope, err := policy.Sign(private, policy.Policy{AgentID: "agent-a", Version: 1, IssuedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), Sources: []policy.Source{{ID: "file-log", Kind: policy.SourceFileLog, Path: logPath, Interval: 5 * time.Second, Params: map[string]string{"start_at": "beginning"}}}, Limits: policy.Limits{MaxSpoolBytes: 1 << 20, MaxBatchBytes: 1 << 16, MaxEventsPerSec: 100}})
 	require.NoError(t, err)
+	verifier := agent.Verifier{PublicKey: public, Environment: policy.ValidationEnvironment{AllowedRoots: []string{directory}, ResolvePath: filepath.EvalSymlinks}}
+	_, err = verifier.Verify(context.Background(), envelope)
+	require.NoError(t, err, "test policy must be valid before starting the runtime")
 	runCtx, cancel := context.WithCancel(context.Background())
-	reporter := &recordingHealthReporter{}
+	t.Cleanup(cancel)
+	reporter := newRecordingHealthReporter()
+	appender := newNotifyingSpoolAppender(store)
 	runtime := agent.NewRuntime(agent.Dependencies{
 		AgentID: "agent-a", PolicySource: staticPolicySource{envelope: envelope},
-		PolicyVerifier: agent.Verifier{PublicKey: public, Environment: policy.ValidationEnvironment{AllowedRoots: []string{directory}, ResolvePath: filepath.EvalSymlinks}},
-		Engine:         telemetry.NewEngine(telemetry.NewEmbeddedBuilder(store)), Store: store,
+		PolicyVerifier: verifier,
+		Engine:         telemetry.NewEngine(telemetry.NewEmbeddedBuilder(appender)), Store: store,
 		Exporter: exporter.NewClient(unavailableIngest{}, store, "agent-a"), HealthReporter: reporter,
 		PollInterval: time.Hour, ExportInterval: time.Hour, ShutdownTimeout: 100 * time.Millisecond, OperationTimeout: 20 * time.Millisecond,
 	})
 	runDone := make(chan error, 1)
-	go func() { runDone <- runtime.Run(runCtx) }()
-	require.Eventually(t, func() bool { return len(pending(t, store, spool.Log)) == 1 }, 5*time.Second, 20*time.Millisecond)
-	require.Eventually(t, func() bool { return reporter.HasState(string(telemetry.ApplyActive)) }, time.Second, 10*time.Millisecond)
+	runtimeExited := make(chan struct{})
+	go func() {
+		defer close(runtimeExited)
+		runDone <- runtime.Run(runCtx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-runtimeExited
+	})
+	waitForRuntimeSignal(t, reporter.active, runDone, "active policy")
+	waitForRuntimeSignal(t, appender.appended, runDone, "spooled log batch")
+	require.Len(t, pending(t, store, spool.Log), 1)
 	cancel()
 	require.NoError(t, <-runDone)
 
@@ -76,6 +92,16 @@ func TestTelemetryLifecycleRetainsFailedBatchesAcrossRestartAndDeliversViaMTLS(t
 		require.Equal(t, "file-log", batch.SourceID)
 	}
 	assertClosedPolicySurface(t)
+}
+
+func workingTreeTempDir(t *testing.T) string {
+	t.Helper()
+	workingDirectory, err := os.Getwd()
+	require.NoError(t, err)
+	directory, err := os.MkdirTemp(workingDirectory, ".telemetry-lifecycle-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(directory)) })
+	return directory
 }
 
 func pending(t *testing.T, store *spool.Store, class spool.DataClass) []spool.Batch {
@@ -105,26 +131,51 @@ func (s staticPolicySource) Fetch(ctx context.Context) (policy.SignatureEnvelope
 }
 
 type recordingHealthReporter struct {
-	mu     sync.Mutex
-	states []string
+	once   sync.Once
+	active chan struct{}
+}
+
+func newRecordingHealthReporter() *recordingHealthReporter {
+	return &recordingHealthReporter{active: make(chan struct{})}
 }
 
 func (r *recordingHealthReporter) Report(_ context.Context, status agent.PolicyStatus) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.states = append(r.states, status.State)
+	if status.State == string(telemetry.ApplyActive) {
+		r.once.Do(func() { close(r.active) })
+	}
 	return nil
 }
 
-func (r *recordingHealthReporter) HasState(want string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, state := range r.states {
-		if state == want {
-			return true
-		}
+type notifyingSpoolAppender struct {
+	store    *spool.Store
+	once     sync.Once
+	appended chan struct{}
+}
+
+func newNotifyingSpoolAppender(store *spool.Store) *notifyingSpoolAppender {
+	return &notifyingSpoolAppender{store: store, appended: make(chan struct{})}
+}
+
+func (a *notifyingSpoolAppender) Append(ctx context.Context, class spool.DataClass, batch spool.Batch) error {
+	if err := a.store.Append(ctx, class, batch); err != nil {
+		return err
 	}
-	return false
+	a.once.Do(func() { close(a.appended) })
+	return nil
+}
+
+func waitForRuntimeSignal(t *testing.T, signal <-chan struct{}, runDone <-chan error, description string) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-signal:
+	case err := <-runDone:
+		require.NoError(t, err, "runtime exited before %s", description)
+		require.FailNow(t, "runtime exited before "+description)
+	case <-timer.C:
+		require.FailNow(t, "timed out waiting for "+description)
+	}
 }
 
 func (unavailableIngest) PushLogBatch(context.Context, *telemetryv1.LogBatch, ...grpc.CallOption) (*telemetryv1.BatchAck, error) {
