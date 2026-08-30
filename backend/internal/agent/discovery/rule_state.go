@@ -121,9 +121,15 @@ func olderRuleSlot(path string) (string, error) {
 	left, leftExists, leftErr := readRuleState(path + ".a")
 	right, rightExists, rightErr := readRuleState(path + ".b")
 	if leftErr != nil {
+		if rightErr == nil && rightExists {
+			return path + ".a", nil
+		}
 		return "", leftErr
 	}
 	if rightErr != nil {
+		if leftExists {
+			return path + ".b", nil
+		}
 		return "", rightErr
 	}
 	if !leftExists {
@@ -146,7 +152,9 @@ func recoverRuleSlots(path string) error {
 			if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
-			if err:=syncParentDirectory(path);err!=nil{return err}
+			if err := syncParentDirectory(path); err != nil {
+				return err
+			}
 			continue
 		}
 		if !tempExists {
@@ -167,7 +175,12 @@ func recoverRuleSlots(path string) error {
 				return err
 			}
 		} else {
-			if err:=os.Remove(temporary);err!=nil&&!errors.Is(err,os.ErrNotExist){return err};if err:=syncParentDirectory(path);err!=nil{return err}
+			if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err := syncParentDirectory(path); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

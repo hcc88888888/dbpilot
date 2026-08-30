@@ -781,6 +781,9 @@ func discoveryRulePoliciesForConfig(config Config) ([]discovery.RuleAttestation,
 		if err != nil || len(digest) != 32 || value.Revision == 0 || value.KeyID == "" || value.IssuedAt.Location() != time.UTC || value.ExpiresAt.Location() != time.UTC || !value.ExpiresAt.After(value.IssuedAt) || value.DisappearanceGrace < time.Minute || value.DisappearanceGrace > 24*time.Hour {
 			return nil, errors.New("discovery_rule_policies contains an invalid current policy")
 		}
+		if strings.ToLower(value.Digest) != value.Digest {
+			return nil, errors.New("discovery_rule_policies digest must be canonical lowercase hex")
+		}
 		attestation := discovery.RuleAttestation{Version: discovery.RuleAttestationVersion, Algorithm: discovery.RuleAttestationAlgorithm, KeyID: value.KeyID, Revision: value.Revision, IssuedAt: value.IssuedAt, ExpiresAt: value.ExpiresAt, DisappearanceGrace: value.DisappearanceGrace}
 		copy(attestation.Digest[:], digest)
 		identity := value.KeyID + ":" + fmt.Sprint(value.Revision) + ":" + value.Digest
@@ -910,11 +913,18 @@ func validateConfig(config Config) error {
 	if _, err := publisherKeysForConfig(config); err != nil {
 		return errors.New("plugin_publishers contains an invalid Ed25519 public key")
 	}
-	if _, err := discoveryRuleKeysForConfig(config); err != nil {
+	keys, err := discoveryRuleKeysForConfig(config)
+	if err != nil {
 		return err
 	}
-	if _, err := discoveryRulePoliciesForConfig(config); err != nil {
+	policies, err := discoveryRulePoliciesForConfig(config)
+	if err != nil {
 		return err
+	}
+	for _, policy := range policies {
+		if _, ok := keys[policy.KeyID]; !ok {
+			return errors.New("discovery_rule_policies references an unknown key_id")
+		}
 	}
 	if config.PluginCatalog.Enabled && len(config.PluginPublishers) == 0 {
 		return errors.New("plugin catalog enabled requires at least one publisher")

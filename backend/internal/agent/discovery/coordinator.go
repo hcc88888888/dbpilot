@@ -34,16 +34,17 @@ type Reporter func(context.Context, *agentv1.DiscoveryReport) error
 var controlIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 type CoordinatorConfig struct {
-	HostID        string
-	AgentID       string
-	Detector      Detector
-	RuleSet       domain.RuleSet
-	Attestation   domain.RuleAttestation
-	Reporter      Reporter
-	Now           func() time.Time
-	RetryBackoff  time.Duration
-	RevisionStore RevisionStore
-	ReportStore   ReportStore
+	HostID             string
+	AgentID            string
+	Detector           Detector
+	RuleSet            domain.RuleSet
+	Attestation        domain.RuleAttestation
+	Reporter           Reporter
+	Now                func() time.Time
+	RetryBackoff       time.Duration
+	RevisionStore      RevisionStore
+	ReportStore        ReportStore
+	InitialUnavailable bool
 }
 
 type Coordinator struct {
@@ -61,6 +62,7 @@ type Coordinator struct {
 	pendingRevision uint64
 	reports         ReportStore
 	pendingReport   *agentv1.DiscoveryReport
+	unavailable     bool
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -85,7 +87,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore}, nil
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -114,6 +116,8 @@ func (coordinator *Coordinator) scanUntilDelivered(ctx context.Context, reason S
 	for {
 		if err := coordinator.Scan(ctx, reason); err == nil {
 			return nil
+		} else if errors.Is(err, ErrDiscoveryUnavailable) {
+			return err
 		}
 		timer := time.NewTimer(coordinator.retryBackoff)
 		select {
@@ -131,6 +135,9 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	}
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
+	if coordinator.unavailable {
+		return ErrDiscoveryUnavailable
+	}
 	if coordinator.pendingReport == nil {
 		pending, err := coordinator.reports.Load(ctx)
 		if err != nil {
@@ -181,7 +188,8 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: math.MaxUint64, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
 	if err != nil || len(encoded) > domain.MaximumDiscoveryReportBytes {
-		return domain.ErrInvalid
+		coordinator.unavailable = true
+		return ErrDiscoveryUnavailable
 	}
 	if coordinator.pendingRevision == 0 {
 		revision, err := coordinator.revisionStore.Next(ctx)
@@ -211,6 +219,7 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 			}
 			coordinator.pendingReport = nil
 			coordinator.pendingRevision = 0
+			coordinator.unavailable = true
 		}
 		return err
 	}
@@ -221,6 +230,8 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 	coordinator.pendingRevision = 0
 	return nil
 }
+
+var ErrDiscoveryUnavailable = errors.New("native discovery unavailable until restart or policy reload")
 
 func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ interface {
 	Report(*agentv1.CommandProgress) error

@@ -37,10 +37,6 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 	if report.Validate() != nil {
 		return nil, ErrInvalid
 	}
-	publicKey := service.RuleKeys[report.RuleAttestation.KeyID]
-	if VerifyRuleAttestationSignature(publicKey, report.RuleAttestation) != nil {
-		return nil, ErrInvalidSignature
-	}
 	for _, candidate := range report.Candidates {
 		expected, fingerprintErr := Fingerprint(binding.HostID, candidate)
 		if fingerprintErr != nil {
@@ -54,17 +50,12 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 	if err != nil {
 		return nil, err
 	}
-	now, _, err := service.settings()
-	if err != nil {
-		return nil, err
+	if !committed {
+		publicKey := service.RuleKeys[report.RuleAttestation.KeyID]
+		if VerifyRuleAttestationSignature(publicKey,report.RuleAttestation)!=nil{return nil,ErrInvalidSignature}
+		if service.Policies==nil||service.Policies.Allows(ctx,report.RuleAttestation)!=nil{return nil,ErrConflict}
 	}
-	if !committed && (VerifyRuleAttestation(publicKey, report.RuleAttestation, now) != nil || service.Policies == nil || service.Policies.Allows(ctx, report.RuleAttestation) != nil) {
-		return nil, ErrConflict
-	}
-	if !committed && (report.ObservedAt.Before(now.Add(-5*time.Minute)) || report.ObservedAt.After(now.Add(5*time.Minute))) {
-		return nil, ErrConflict
-	}
-	values, err := service.Repository.RecordReport(ctx, report, now, report.RuleAttestation.DisappearanceGrace)
+	values, err := service.Repository.RecordReport(ctx, report, time.Time{}, report.RuleAttestation.DisappearanceGrace)
 	if err != nil {
 		return nil, err
 	}

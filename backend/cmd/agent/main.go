@@ -305,11 +305,15 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return fmt.Errorf("open discovery report state: %w", storeErr)
 		}
+		if storeErr = revisionStore.EnsureAtLeast(ctx, reportStore.RetiredRevision()); storeErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("migrate discovery pending revision: %w", storeErr)
+		}
 		reader := agentdiscovery.NewProcReader("/proc", nil)
 		if settings.LegacyProcHelper {
 			reader = agentdiscovery.NewLegacyProcReader("/proc", nil)
 		}
-		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, Reporter: func(reportContext context.Context, report *telemetryv1.DiscoveryReport) error {
+		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, InitialUnavailable: reportStore.Unavailable(), Reporter: func(reportContext context.Context, report *telemetryv1.DiscoveryReport) error {
 			if controlClient == nil {
 				return agent.ErrControlStreamDisconnected
 			}
@@ -352,7 +356,13 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	go func() { results <- agentRuntime.Run(serviceContext) }()
 	go func() { results <- controlClient.Run(serviceContext) }()
 	if discoveryCoordinator != nil {
-		go func() { results <- discoveryCoordinator.Run(serviceContext) }()
+		go func() {
+			discoveryErr := discoveryCoordinator.Run(serviceContext)
+			if discoveryErr == nil && serviceContext.Err() == nil {
+				<-serviceContext.Done()
+			}
+			results <- discoveryErr
+		}()
 	}
 	first := <-results
 	cancelServices()

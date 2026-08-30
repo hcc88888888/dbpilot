@@ -3,6 +3,8 @@ package discovery
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -16,6 +18,7 @@ import (
 )
 
 const maximumPendingReportBytes = domain.MaximumDiscoveryReportBytes
+const maximumLegacyPendingReportBytes = 4 << 20
 
 type ReportStore interface {
 	Load(context.Context) (*agentv1.DiscoveryReport, error)
@@ -57,8 +60,15 @@ func (store *memoryReportStore) Clear(_ context.Context, report *agentv1.Discove
 }
 
 type FileReportStore struct {
-	mu   sync.Mutex
-	path string
+	mu              sync.Mutex
+	path            string
+	retiredRevision uint64
+	unavailable     bool
+}
+type reportRetirement struct {
+	Revision uint64 `json:"revision"`
+	Digest   string `json:"digest"`
+	Reason   string `json:"reason"`
 }
 
 func NewFileReportStore(path string) (*FileReportStore, error) {
@@ -69,11 +79,19 @@ func NewFileReportStore(path string) (*FileReportStore, error) {
 		return nil, errors.New("report state parent is unavailable")
 	}
 	store := &FileReportStore{path: path}
+	if marker, exists, err := readReportRetirement(path + ".retired"); err != nil {
+		return nil, err
+	} else if exists {
+		store.retiredRevision = marker.Revision
+		store.unavailable = true
+	}
 	if err := store.recover(); err != nil {
 		return nil, err
 	}
 	return store, nil
 }
+func (store *FileReportStore) RetiredRevision() uint64 { return store.retiredRevision }
+func (store *FileReportStore) Unavailable() bool       { return store.unavailable }
 func (store *FileReportStore) Load(ctx context.Context) (*agentv1.DiscoveryReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -154,6 +172,9 @@ func (store *FileReportStore) load() (*agentv1.DiscoveryReport, error) {
 	return loadReportAt(store.path)
 }
 func loadReportAt(path string) (*agentv1.DiscoveryReport, error) {
+	return loadReportAtLimit(path, maximumPendingReportBytes)
+}
+func loadReportAtLimit(path string, limit int64) (*agentv1.DiscoveryReport, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -161,7 +182,7 @@ func loadReportAt(path string) (*agentv1.DiscoveryReport, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maximumPendingReportBytes {
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > limit {
 		return nil, errors.New("pending discovery report is invalid")
 	}
 	handle, err := os.Open(path)
@@ -169,8 +190,8 @@ func loadReportAt(path string) (*agentv1.DiscoveryReport, error) {
 		return nil, err
 	}
 	defer handle.Close()
-	body, err := io.ReadAll(io.LimitReader(handle, maximumPendingReportBytes+1))
-	if err != nil || len(body) > maximumPendingReportBytes {
+	body, err := io.ReadAll(io.LimitReader(handle, limit+1))
+	if err != nil || int64(len(body)) > limit {
 		return nil, errors.New("pending discovery report is invalid")
 	}
 	var report agentv1.DiscoveryReport
@@ -183,6 +204,16 @@ func (store *FileReportStore) recover() error {
 	final, finalErr := loadReportAt(store.path)
 	temporary, tempErr := loadReportAt(store.path + ".tmp")
 	if finalErr != nil {
+		legacy, legacyErr := loadReportAtLimit(store.path, maximumLegacyPendingReportBytes)
+		if legacyErr == nil && legacy != nil {
+			return store.retireLegacy(legacy)
+		}
+		if info, statErr := os.Lstat(store.path); statErr == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Size() <= maximumLegacyPendingReportBytes {
+			store.unavailable = true
+			_ = os.Remove(store.path)
+			_ = os.Remove(store.path + ".tmp")
+			return syncParentDirectory(store.path)
+		}
 		return finalErr
 	}
 	if final != nil {
@@ -205,6 +236,74 @@ func (store *FileReportStore) recover() error {
 		return syncParentDirectory(store.path)
 	}
 	return nil
+}
+func (store *FileReportStore) retireLegacy(report *agentv1.DiscoveryReport) error {
+	digest, err := ReportDigest(report)
+	if err != nil {
+		return err
+	}
+	marker := reportRetirement{Revision: report.GetObservationRevision(), Digest: hex.EncodeToString(digest[:]), Reason: "legacy_report_exceeds_current_protocol"}
+	encoded, err := json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	temporary := store.path + ".retired.tmp"
+	_ = os.Remove(temporary)
+	handle, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = handle.Write(encoded); err != nil {
+		_ = handle.Close()
+		return err
+	}
+	if err = handle.Sync(); err != nil {
+		_ = handle.Close()
+		return err
+	}
+	if err = handle.Close(); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(store.path + ".retired")
+	}
+	if err = os.Rename(temporary, store.path+".retired"); err != nil {
+		return err
+	}
+	if err = syncParentDirectory(store.path); err != nil {
+		return err
+	}
+	if err = os.Remove(store.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_ = os.Remove(store.path + ".tmp")
+	if err = syncParentDirectory(store.path); err != nil {
+		return err
+	}
+	store.retiredRevision = marker.Revision
+	store.unavailable = true
+	return nil
+}
+func readReportRetirement(path string) (reportRetirement, bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return reportRetirement{}, false, nil
+	}
+	if err != nil {
+		return reportRetirement{}, false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 512 {
+		return reportRetirement{}, false, errors.New("report retirement marker invalid")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return reportRetirement{}, false, err
+	}
+	var marker reportRetirement
+	if json.Unmarshal(body, &marker) != nil || marker.Revision == 0 || len(marker.Digest) != 64 || marker.Reason == "" {
+		return reportRetirement{}, false, errors.New("report retirement marker invalid")
+	}
+	return marker, true, nil
 }
 func syncParentDirectory(path string) error {
 	if runtime.GOOS != "linux" {

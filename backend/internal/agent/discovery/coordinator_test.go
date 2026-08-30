@@ -81,7 +81,7 @@ func TestCoordinatorStopsNewScansAndCommandsWhenRulesExpire(t *testing.T) {
 	require.Equal(t, 1, detector.calls)
 }
 
-func TestCoordinatorRetiresExactTerminallyRejectedPendingReportAndAdvances(t *testing.T) {
+func TestCoordinatorRetiresExactTerminallyRejectedPendingReportAndLatchesUnavailable(t *testing.T) {
 	detector := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
 	rules, attestation := testRules(t)
 	attempts := 0
@@ -96,9 +96,9 @@ func TestCoordinatorRetiresExactTerminallyRejectedPendingReportAndAdvances(t *te
 	}})
 	require.NoError(t, err)
 	require.Error(t, coordinator.Scan(context.Background(), ScanEnrollment))
-	require.NoError(t, coordinator.Scan(context.Background(), ScanPeriodic))
-	require.Equal(t, []uint64{1, 2}, revisions)
-	require.Equal(t, 2, detector.calls)
+	require.ErrorIs(t, coordinator.Scan(context.Background(), ScanPeriodic), ErrDiscoveryUnavailable)
+	require.Equal(t, []uint64{1}, revisions)
+	require.Equal(t, 1, detector.calls)
 }
 
 type terminalReportError struct{}
@@ -189,6 +189,30 @@ func TestFileReportStoreRecoversValidOrphanTempAndDeletesTornTemp(t *testing.T) 
 	require.NoError(t, store.Save(context.Background(), report), "torn orphan must not permanently block later publication")
 }
 
+func TestFileReportStoreRetiresLegacyOversizedPendingWithoutBlockingAgent(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "pending.pb")
+	report := validPendingReportFixture()
+	report.ObservationRevision = 7
+	report.RuleAttestationKeyId = strings.Repeat("k", 2<<20)
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
+	require.NoError(t, err)
+	require.Greater(t, len(encoded), domain.MaximumDiscoveryReportBytes)
+	require.Less(t, len(encoded), maximumLegacyPendingReportBytes)
+	require.NoError(t, os.WriteFile(path, encoded, 0o600))
+	store, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	require.True(t, store.Unavailable())
+	require.Equal(t, uint64(7), store.RetiredRevision())
+	require.NoFileExists(t, path)
+	revisionStore, err := NewFileRevisionStore(filepath.Join(directory, "revision"))
+	require.NoError(t, err)
+	require.NoError(t, revisionStore.EnsureAtLeast(context.Background(), store.RetiredRevision()))
+	next, err := revisionStore.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(8), next)
+}
+
 func TestRuleStateSameParityJumpPreservesPreviousGeneration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rules")
 	store, err := NewRuleStateStore(path)
@@ -223,6 +247,23 @@ func TestRuleStateRecoversValidTempAndRejectsConflictingSlots(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestRuleStateRepairsOneCorruptFinalSlotOnNextRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules")
+	one := sha256.Sum256([]byte("one"))
+	store, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	require.NoError(t, store.Accept(context.Background(), 1, one))
+	require.NoError(t, os.WriteFile(path+".b", []byte("corrupt"), 0o600))
+	restarted, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	two := sha256.Sum256([]byte("two"))
+	require.NoError(t, restarted.Accept(context.Background(), 2, two))
+	verified, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	require.Error(t, verified.Accept(context.Background(), 1, one))
+	require.NoError(t, verified.Accept(context.Background(), 2, two))
+}
+
 func TestCoordinatorRejectsOversizedReportBeforeAllocatingRevision(t *testing.T) {
 	rules, attestation := testRules(t)
 	candidates := make([]domain.CandidateObservation, 1024)
@@ -238,6 +279,7 @@ func TestCoordinatorRejectsOversizedReportBeforeAllocatingRevision(t *testing.T)
 	require.NoError(t, err)
 	require.Error(t, coordinator.Scan(context.Background(), ScanEnrollment))
 	require.Zero(t, revisions.calls)
+	require.ErrorIs(t, coordinator.Scan(context.Background(), ScanPeriodic), ErrDiscoveryUnavailable)
 }
 
 type staticCandidatesDetector []domain.CandidateObservation

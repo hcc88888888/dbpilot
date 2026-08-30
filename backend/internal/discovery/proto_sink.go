@@ -6,6 +6,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type ProtoSink struct{ Service Service }
@@ -75,6 +76,33 @@ func candidateFromProto(value *agentv1.DiscoveryCandidateObservation) (Candidate
 
 func evidenceKindFromProto(kind agentv1.DiscoveryEvidenceKind) (EvidenceKind, bool) {
 	values := map[agentv1.DiscoveryEvidenceKind]EvidenceKind{agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME: EvidenceProcessName, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH: EvidenceExecutablePath, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT: EvidenceSystemdUnit, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT: EvidenceListenEndpoint, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET: EvidenceUnixSocket, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE: EvidenceContainerImage, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL: EvidenceContainerLabel, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT: EvidenceContainerPort, agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT: EvidenceVersionHint}
+	value, ok := values[kind]
+	return value, ok
+}
+
+func reportToProto(report Report) (*agentv1.DiscoveryReport, error) {
+	candidates := make([]*agentv1.DiscoveryCandidateObservation, 0, len(report.Candidates))
+	for _, candidate := range report.Candidates {
+		source := agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE
+		if candidate.Source == SourceDocker {
+			source = agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER
+		} else if candidate.Source != SourceNative {
+			return nil, ErrInvalid
+		}
+		evidence := make([]*agentv1.DiscoveryEvidence, 0, len(candidate.Evidence))
+		for _, item := range candidate.Evidence {
+			kind, ok := evidenceKindToProto(item.Kind)
+			if !ok {
+				return nil, ErrInvalid
+			}
+			evidence = append(evidence, &agentv1.DiscoveryEvidence{Kind: kind, RedactedValue: item.Value})
+		}
+		candidates = append(candidates, &agentv1.DiscoveryCandidateObservation{ObservationId: candidate.ObservationID, Source: source, DatabaseFamily: candidate.DatabaseFamily, DatabaseVariant: candidate.DatabaseVariant, VersionHint: candidate.VersionHint, NormalizedEndpoint: candidate.NormalizedEndpoint, UnixSocket: candidate.UnixSocket, ProcessIdentity: candidate.ProcessIdentity, ServiceName: candidate.ServiceName, ContainerIdentity: candidate.ContainerIdentity, ContainerImage: candidate.ContainerImage, DiscoveredRole: candidate.DiscoveredRole, Confidence: candidate.Confidence, Evidence: evidence, Fingerprint: append([]byte(nil), candidate.Fingerprint[:]...), ObservedAt: timestamppb.New(candidate.ObservedAt)})
+	}
+	return &agentv1.DiscoveryReport{HostId: report.HostID, AgentId: report.AgentID, ObservationRevision: report.ObservationRevision, RuleRevision: report.RuleRevision, Candidates: candidates, ObservedAt: timestamppb.New(report.ObservedAt), RuleSetDigest: append([]byte(nil), report.RuleAttestation.Digest[:]...), DisappearanceGraceSeconds: uint64(report.RuleAttestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(report.RuleAttestation.IssuedAt), RuleExpiresAt: timestamppb.New(report.RuleAttestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), report.RuleAttestation.Signature...), RuleAttestationVersion: report.RuleAttestation.Version, RuleAttestationAlgorithm: report.RuleAttestation.Algorithm, RuleAttestationKeyId: report.RuleAttestation.KeyID}, nil
+}
+func evidenceKindToProto(kind EvidenceKind) (agentv1.DiscoveryEvidenceKind, bool) {
+	values := map[EvidenceKind]agentv1.DiscoveryEvidenceKind{EvidenceProcessName: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME, EvidenceExecutablePath: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH, EvidenceSystemdUnit: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT, EvidenceListenEndpoint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT, EvidenceUnixSocket: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET, EvidenceContainerImage: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE, EvidenceContainerLabel: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL, EvidenceContainerPort: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT, EvidenceVersionHint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT}
 	value, ok := values[kind]
 	return value, ok
 }

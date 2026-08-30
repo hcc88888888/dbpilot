@@ -28,7 +28,15 @@ const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
 const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
-var ErrDiscoveryControlIncompatible = errors.New("discovery unavailable: control plane lacks ACK or policy attestation capability")
+
+type discoveryControlIncompatibleError struct{}
+
+func (discoveryControlIncompatibleError) Error() string {
+	return "discovery unavailable: control plane lacks ACK or policy attestation capability"
+}
+func (discoveryControlIncompatibleError) NonRetryableDiscovery() bool { return true }
+
+var ErrDiscoveryControlIncompatible error = discoveryControlIncompatibleError{}
 
 type nonRetryableDiscoveryError struct{}
 

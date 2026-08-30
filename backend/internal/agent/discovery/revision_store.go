@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +99,73 @@ func (store *FileRevisionStore) Next(ctx context.Context) (uint64, error) {
 	}
 	store.revision = next
 	return next, nil
+}
+
+func (store *FileRevisionStore) EnsureAtLeast(ctx context.Context, target uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if target == 0 {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if target <= store.revision {
+		return nil
+	}
+	slot, err := olderRevisionSlot(store.path)
+	if err != nil {
+		return err
+	}
+	temporary := slot + ".tmp"
+	_ = os.Remove(temporary)
+	handle, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := fmt.Fprintf(handle, "%d\n", target)
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(slot)
+	}
+	if err = os.Rename(temporary, slot); err != nil {
+		return err
+	}
+	if err = syncParentDirectory(store.path); err != nil {
+		return err
+	}
+	store.revision = target
+	return nil
+}
+func olderRevisionSlot(path string) (string, error) {
+	left, leftExists, leftErr := readRevision(path + ".a")
+	right, rightExists, rightErr := readRevision(path + ".b")
+	if leftErr != nil {
+		return "", leftErr
+	}
+	if rightErr != nil {
+		return "", rightErr
+	}
+	if !leftExists {
+		return path + ".a", nil
+	}
+	if !rightExists {
+		return path + ".b", nil
+	}
+	if left <= right {
+		return path + ".a", nil
+	}
+	return path + ".b", nil
 }
 
 func readRevision(path string) (uint64, bool, error) {

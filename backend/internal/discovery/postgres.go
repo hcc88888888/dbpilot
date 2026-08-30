@@ -14,6 +14,7 @@ import (
 
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
+	"google.golang.org/protobuf/proto"
 )
 
 const candidateColumns = "candidate_id, tenant_id, project_id, host_id, agent_id, observation_id, discovery_source, database_family, database_variant, version_hint, normalized_endpoint, unix_socket, process_identity, service_name, container_identity, container_image, discovered_role, confidence, evidence_summary, fingerprint, rule_revision, observation_revision, first_seen_at, last_seen_at, status, ignore_reason"
@@ -93,6 +94,25 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		rollback()
 		return nil, mapPostgresError(err)
 	}
+	if err == nil && report.ObservationRevision == previousRevision {
+		if !equalBytes(previousDigest, digest[:]) {
+			rollback()
+			return nil, ErrConflict
+		}
+		values, listErr := listCandidatesTx(ctx, transaction, report.Scope, Filter{HostID: report.HostID, Limit: 100})
+		if listErr != nil {
+			rollback()
+			return nil, listErr
+		}
+		if commitErr := transaction.Commit(); commitErr != nil {
+			return nil, mapPostgresError(commitErr)
+		}
+		return values.Items, nil
+	}
+	if !newReportActiveAt(report, receivedAt) {
+		rollback()
+		return nil, ErrConflict
+	}
 	if err == nil {
 		if report.RuleRevision < previousRuleRevision {
 			rollback()
@@ -109,21 +129,6 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		if report.ObservationRevision < previousRevision {
 			rollback()
 			return nil, ErrStaleRevision
-		}
-		if report.ObservationRevision == previousRevision {
-			if !equalBytes(previousDigest, digest[:]) {
-				rollback()
-				return nil, ErrConflict
-			}
-			values, err := listCandidatesTx(ctx, transaction, report.Scope, Filter{HostID: report.HostID, Limit: 100})
-			if err != nil {
-				rollback()
-				return nil, err
-			}
-			if err := transaction.Commit(); err != nil {
-				return nil, mapPostgresError(err)
-			}
-			return values.Items, nil
 		}
 		_, err = transaction.ExecContext(ctx, `UPDATE discovery_scan_state SET agent_id=$4,observation_revision=$5,rule_revision=$6,report_digest=$7,observed_at=$8,received_at=$9,rule_set_digest=$10,disappearance_grace_seconds=$11,agent_observed_at=$8 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, report.RuleRevision, digest[:], report.ObservedAt, receivedAt, report.RuleAttestation.Digest[:], int64(grace/time.Second))
 	} else {
@@ -160,6 +165,10 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		return nil, mapPostgresError(err)
 	}
 	return page.Items, nil
+}
+
+func newReportActiveAt(report Report, databaseNow time.Time) bool {
+	return !databaseNow.Before(report.RuleAttestation.IssuedAt) && report.RuleAttestation.ExpiresAt.After(databaseNow) && !report.ObservedAt.Before(databaseNow.Add(-5*time.Minute)) && !report.ObservedAt.After(databaseNow.Add(5*time.Minute))
 }
 
 func (repository *PostgresRepository) List(ctx context.Context, scope platformscope.Scope, filter Filter) (Page, error) {
@@ -260,9 +269,11 @@ func scanCandidate(row scanner) (Candidate, error) {
 }
 
 func reportDigest(report Report) ([32]byte, error) {
-	clone := report
-	clone.Scope = platformscope.Scope{}
-	encoded, err := json.Marshal(clone)
+	wire, err := reportToProto(report)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(wire)
 	if err != nil {
 		return [32]byte{}, ErrInvalid
 	}
