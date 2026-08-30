@@ -11,6 +11,7 @@ const helper = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const kylinVerifier = join(repoRoot, 'backend', 'scripts', 'verify-kylin-docker.ps1');
 const hostInspectionVerifier = join(repoRoot, 'backend', 'scripts', 'verify-host-inspection.ps1');
 const fullStackCompose = join(repoRoot, 'backend', 'docker', 'full-stack', 'docker-compose.yml');
+const dockerDiscoveryVerifier = join(repoRoot, 'backend', 'scripts', 'verify-docker-discovery.ps1');
 
 function pwsh(args, env = {}) {
   return spawnSync('pwsh', ['-NoProfile', ...args], {
@@ -163,4 +164,12 @@ test('full-stack Compose grants no privileged mode, added capabilities, or Docke
   for (const name of ['asset-builder', 'bootstrap', 'oidc', 'controlplane', 'agent', 'frontend', 'acceptance-runner', 'rogue-untrusted', 'rogue-mismatch', 'assertions']) {
     assert.equal(config.services[name].read_only, true, `${name} must have a read-only root filesystem`);
   }
+});
+
+test('only the restricted helper owns the Docker socket boundary', () => {
+  const result = pwsh(['-File', dockerDiscoveryVerifier, '-ContractOnly']);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const lines = result.stdout.trim().split(/\r?\n/);
+  const contract = JSON.parse(lines.at(-1));
+  assert.deepEqual(contract, { Contract: 'restricted-docker-discovery-v1', Status: 'pass', SocketOwner: 'dbpilot-docker-discovery' });
 });

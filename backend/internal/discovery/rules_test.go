@@ -21,6 +21,33 @@ func TestDiscoveryRuleValidationIsDeclarativeAndRE2Compatible(t *testing.T) {
 	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
 }
 
+func TestDockerDiscoveryRuleRequiresExactOwnershipSelector(t *testing.T) {
+	rule := Rule{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:(8\.4|8)$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DefaultPorts: []uint16{3306}}
+	require.NoError(t, rule.Validate())
+
+	missingOwnership := rule
+	missingOwnership.DockerLabelSelectors = nil
+	require.ErrorIs(t, missingOwnership.Validate(), ErrInvalidRule)
+	unsafe := rule
+	unsafe.DockerLabelSelectors = []string{"dbpilot.discovery.family=mysql;evil"}
+	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
+	unsafe = rule
+	unsafe.DockerImagePatterns = []string{`^(a+)\1$`}
+	require.ErrorIs(t, unsafe.Validate(), ErrInvalidRule)
+}
+
+func TestDockerRuleFieldsAreCoveredBySignedCanonicalDigest(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Date(2026, 8, 31, 8, 0, 0, 0, time.UTC)
+	rules := RuleSet{Revision: 11, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), ScanInterval: 5 * time.Minute, DisappearanceGrace: 10 * time.Minute, Rules: []Rule{{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:8\.4$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DefaultPorts: []uint16{3306}}}}
+	envelope, err := SignRuleSet(privateKey, rules)
+	require.NoError(t, err)
+	envelope.RuleSet.Rules[0].DockerLabelSelectors[0] = "dbpilot.discovery.family=postgresql"
+	_, err = VerifyRuleSet(publicKey, envelope, now, 0)
+	require.ErrorIs(t, err, ErrInvalidSignature)
+}
+
 func TestSignedRuleSetRejectsTamperRollbackAndUnsafeIntervals(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)

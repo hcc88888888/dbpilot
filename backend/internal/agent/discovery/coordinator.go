@@ -44,6 +44,7 @@ type CoordinatorConfig struct {
 	HostID             string
 	AgentID            string
 	Detector           Detector
+	DockerDetector     Detector
 	RuleSet            domain.RuleSet
 	Attestation        domain.RuleAttestation
 	Reporter           Reporter
@@ -56,22 +57,24 @@ type CoordinatorConfig struct {
 }
 
 type Coordinator struct {
-	hostID       string
-	agentID      string
-	detector     Detector
-	rules        domain.RuleSet
-	attestation  domain.RuleAttestation
-	reporter     Reporter
-	now          func() time.Time
-	retryBackoff time.Duration
+	hostID         string
+	agentID        string
+	detector       Detector
+	dockerDetector Detector
+	rules          domain.RuleSet
+	attestation    domain.RuleAttestation
+	reporter       Reporter
+	now            func() time.Time
+	retryBackoff   time.Duration
 
-	mu              sync.Mutex
-	revisionStore   RevisionStore
-	pendingRevision uint64
-	reports         ReportStore
-	pendingReport   *agentv1.DiscoveryReport
-	unavailable     bool
-	compatibility   func() CompatibilityState
+	mu                sync.Mutex
+	revisionStore     RevisionStore
+	pendingRevision   uint64
+	reports           ReportStore
+	pendingReport     *agentv1.DiscoveryReport
+	unavailable       bool
+	dockerUnavailable bool
+	compatibility     func() CompatibilityState
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -99,7 +102,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, compatibility: config.Compatibility}, nil
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, dockerUnavailable: config.DockerDetector == nil, compatibility: config.Compatibility}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -112,6 +115,15 @@ func (coordinator *Coordinator) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(coordinator.rules.ScanInterval)
 	defer ticker.Stop()
+	dockerEvents := make(chan struct{}, 1)
+	if watcher, ok := coordinator.dockerDetector.(interface{ Watch(context.Context, func()) }); ok {
+		go watcher.Watch(ctx, func() {
+			select {
+			case dockerEvents <- struct{}{}:
+			default:
+			}
+		})
+	}
 	for {
 		select {
 		case <-ticker.C:
@@ -120,6 +132,10 @@ func (coordinator *Coordinator) Run(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			return nil
+		case <-dockerEvents:
+			if err := coordinator.scanUntilDelivered(ctx, ScanPeriodic); err != nil {
+				return nil
+			}
 		}
 	}
 }
@@ -142,6 +158,10 @@ func (coordinator *Coordinator) scanUntilDelivered(ctx context.Context, reason S
 }
 
 func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
+	return coordinator.scanSelected(ctx, true, true)
+}
+
+func (coordinator *Coordinator) scanSelected(ctx context.Context, includeNative, includeDocker bool) error {
 	if ctx == nil {
 		return domain.ErrInvalid
 	}
@@ -170,9 +190,32 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	if coordinator.rules.Active(observedAt) != nil {
 		return domain.ErrInvalid
 	}
-	candidates, err := coordinator.detector.Discover(ctx, coordinator.rules.Rules)
-	if err != nil {
-		return err
+	candidates := make([]domain.CandidateObservation, 0)
+	if includeNative {
+		native, err := coordinator.detector.Discover(ctx, coordinator.rules.Rules)
+		if err != nil {
+			return err
+		}
+		candidates = append(candidates, native...)
+	}
+	if includeDocker {
+		if coordinator.dockerDetector == nil {
+			coordinator.dockerUnavailable = true
+			if !includeNative {
+				return ErrDockerDiscoveryUnavailable
+			}
+		} else {
+			dockerCandidates, err := coordinator.dockerDetector.Discover(ctx, coordinator.rules.Rules)
+			if err != nil {
+				coordinator.dockerUnavailable = true
+				if !includeNative {
+					return err
+				}
+			} else {
+				coordinator.dockerUnavailable = false
+				candidates = append(candidates, dockerCandidates...)
+			}
+		}
 	}
 	protobufCandidates := make([]*agentv1.DiscoveryCandidateObservation, 0, len(candidates))
 	seen := make(map[[32]byte]struct{}, len(candidates))
@@ -257,17 +300,22 @@ func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.C
 	Report(*agentv1.CommandProgress) error
 }) (*agentv1.CommandResult, error) {
 	command := envelope.GetDiscoverDatabases()
-	if command == nil || command.GetHostId() != coordinator.hostID || command.GetRuleRevision() != coordinator.rules.Revision || !command.GetIncludeNative() || command.GetIncludeDocker() {
+	if command == nil || command.GetHostId() != coordinator.hostID || command.GetRuleRevision() != coordinator.rules.Revision || (!command.GetIncludeNative() && !command.GetIncludeDocker()) {
 		return nil, domain.ErrInvalid
 	}
-	if err := coordinator.Scan(ctx, ScanCommand); err != nil {
+	if err := coordinator.scanSelected(ctx, command.GetIncludeNative(), command.GetIncludeDocker()); err != nil {
 		return nil, err
 	}
-	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "native database discovery completed"}, nil
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database discovery completed"}, nil
 }
 
 func (coordinator *Coordinator) AdditionalCapabilities() []string {
-	return []string{"native_discovery_v1"}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.dockerUnavailable {
+		return []string{"docker_discovery_unavailable", "native_discovery_v1"}
+	}
+	return []string{"docker_discovery_v1", "native_discovery_v1"}
 }
 
 func protobufCandidate(candidate domain.CandidateObservation) (*agentv1.DiscoveryCandidateObservation, error) {

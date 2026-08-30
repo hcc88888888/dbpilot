@@ -3,6 +3,7 @@
 # DBPilot documents delivered by the control plane; do not place policy YAML,
 # Collector YAML, executables, or shell commands in this file.
 agent_id: replace-with-enrolled-agent-id
+host_id: replace-with-enrolled-host-id
 server_address: ingest.dbpilot.example:9443
 ca_file: /etc/dbpilot/tls/ca.pem
 cert_file: /etc/dbpilot/tls/agent.pem
@@ -12,6 +13,13 @@ policy_public_key_file: /etc/dbpilot/policy-public-key.pem
 # bootstrapper. This is never raw Collector/YAML configuration.
 policy_file: /var/lib/dbpilot-agent/policy-envelope.json
 data_directory: /var/lib/dbpilot-agent
+discovery_rule_set_file: /etc/dbpilot/discovery-rules.json
+
+# Local-administrator opt-in only. Install and enable the restricted helper
+# before enrollment; Server cannot install it or grant Docker Socket access.
+# The Agent opens only this private 0600 AF_UNIX socket, never docker.sock.
+docker_discovery: false
+docker_discovery_socket: /run/dbpilot-agent/docker-discovery.sock
 
 # Agent-initiated command control uses the same mTLS connection but an
 # independent Ed25519 command-signing key and a durable bbolt journal.

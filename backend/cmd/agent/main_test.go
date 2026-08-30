@@ -140,6 +140,19 @@ func TestLoadConfigAcceptsDurableControlSettings(t *testing.T) {
 	require.Equal(t, 250*time.Millisecond, config.Control.ReconnectBackoff)
 }
 
+func TestLoadConfigRejectsDockerDiscoveryWithoutHostEnrollmentRules(t *testing.T) {
+	dir := t.TempDir()
+	if runtime.GOOS != "windows" {
+		require.NoError(t, os.Chmod(dir, 0o700))
+	}
+	ca, cert, key := writeSecret(t, dir, "ca.pem"), writeSecret(t, dir, "agent.pem"), writeSecret(t, dir, "key.pem")
+	policyKey, policyFile := writeSecret(t, dir, "policy.pem"), writeSecret(t, dir, "policy.json")
+	body := "agent_id: agent-a\nserver_address: ingest.example:9443\nca_file: " + filepath.ToSlash(ca) + "\ncert_file: " + filepath.ToSlash(cert) + "\nkey_file: " + filepath.ToSlash(key) + "\npolicy_public_key_file: " + filepath.ToSlash(policyKey) + "\npolicy_file: " + filepath.ToSlash(policyFile) + "\ndata_directory: " + filepath.ToSlash(dir) + "\ndocker_discovery: true\ndocker_discovery_socket: /run/dbpilot-agent/docker-discovery.sock\n"
+
+	_, err := loadConfig(writeConfig(t, body))
+	require.ErrorContains(t, err, "host enrollment")
+}
+
 func TestLoadConfigAcceptsComponentCollectorConfiguration(t *testing.T) {
 	dir := t.TempDir()
 	if runtime.GOOS != "windows" {

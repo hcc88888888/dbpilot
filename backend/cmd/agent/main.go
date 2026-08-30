@@ -50,6 +50,8 @@ type agentConfig struct {
 	PolicyFile            string                         `yaml:"policy_file"`
 	DiscoveryRuleSetFile  string                         `yaml:"discovery_rule_set_file,omitempty"`
 	LegacyProcHelper      bool                           `yaml:"legacy_proc_helper,omitempty"`
+	DockerDiscovery       bool                           `yaml:"docker_discovery,omitempty"`
+	DockerDiscoverySocket string                         `yaml:"docker_discovery_socket,omitempty"`
 	DataDirectory         string                         `yaml:"data_directory"`
 	AllowedLogRoots       []string                       `yaml:"allowed_log_roots"`
 	FileCollectionEnabled bool                           `yaml:"file_collection_enabled"`
@@ -160,6 +162,17 @@ func loadConfig(path string) (agentConfig, error) {
 	}
 	if settings.LegacyProcHelper && (settings.DiscoveryRuleSetFile == "" || runtime.GOOS != "linux") {
 		return agentConfig{}, errors.New("legacy_proc_helper requires Linux native discovery")
+	}
+	if settings.DockerDiscovery && settings.DiscoveryRuleSetFile == "" {
+		return agentConfig{}, errors.New("docker discovery requires host enrollment and signed discovery rules")
+	}
+	if settings.DockerDiscovery {
+		if settings.DockerDiscoverySocket == "" {
+			settings.DockerDiscoverySocket = "/run/dbpilot-agent/docker-discovery.sock"
+		}
+		if runtime.GOOS != "linux" || !filepath.IsAbs(settings.DockerDiscoverySocket) || strings.ContainsAny(settings.DockerDiscoverySocket, "\x00\r\n") {
+			return agentConfig{}, errors.New("docker discovery requires Linux and an absolute helper socket")
+		}
 	}
 	for _, secret := range []string{settings.CAFile, settings.CertFile, settings.KeyFile, settings.PolicyPublicKeyFile, settings.PolicyFile} {
 		if !filepath.IsAbs(secret) {
@@ -283,6 +296,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	defer journal.Close()
 	var discoveryCoordinator *agentdiscovery.Coordinator
+	var dockerDiscoveryConnection *grpc.ClientConn
 	var controlClient *agent.ControlClient
 	if settings.DiscoveryRuleSetFile != "" {
 		ruleState, stateErr := agentdiscovery.NewRuleStateStore(filepath.Join(settings.DataDirectory, "discovery-rule-state"))
@@ -317,7 +331,20 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		if settings.LegacyProcHelper {
 			reader = agentdiscovery.NewLegacyProcReader("/proc", nil)
 		}
-		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, InitialUnavailable: reportStore.Unavailable(), Compatibility: func() agentdiscovery.CompatibilityState {
+		var dockerDetector agentdiscovery.Detector
+		if settings.DockerDiscovery {
+			var detector *agentdiscovery.DockerDetector
+			detector, dockerDiscoveryConnection, loadErr = agentdiscovery.NewDockerDetectorAt(ctx, settings.DockerDiscoverySocket, ruleSet.Revision, agentdiscovery.DockerAllowedLabelKeys(ruleSet.Rules))
+			if loadErr != nil {
+				_ = store.Close()
+				return fmt.Errorf("configure Docker discovery: %w", loadErr)
+			}
+			dockerDetector = detector
+		}
+		if dockerDiscoveryConnection != nil {
+			defer dockerDiscoveryConnection.Close()
+		}
+		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), DockerDetector: dockerDetector, RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, InitialUnavailable: reportStore.Unavailable(), Compatibility: func() agentdiscovery.CompatibilityState {
 			if controlClient == nil {
 				return agentdiscovery.CompatibilityUnknown
 			}

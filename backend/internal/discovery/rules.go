@@ -28,10 +28,14 @@ type Rule struct {
 	SystemdUnits           []string `json:"systemd_units,omitempty"`
 	DefaultPorts           []uint16 `json:"default_ports,omitempty"`
 	UnixSocketPatterns     []string `json:"unix_socket_patterns,omitempty"`
+	DockerImagePatterns    []string `json:"docker_image_patterns,omitempty"`
+	DockerLabelSelectors   []string `json:"docker_label_selectors,omitempty"`
 }
 
 func (rule Rule) Validate() error {
-	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.ProcessNames)+len(rule.ExecutablePathPatterns)+len(rule.SystemdUnits) == 0 {
+	native := len(rule.ProcessNames)+len(rule.ExecutablePathPatterns)+len(rule.SystemdUnits) > 0
+	docker := len(rule.DockerImagePatterns) > 0 && len(rule.DockerLabelSelectors) > 0
+	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.DockerImagePatterns) > 32 || len(rule.DockerLabelSelectors) > 32 || (!native && !docker) || (len(rule.DockerImagePatterns) > 0) != (len(rule.DockerLabelSelectors) > 0) {
 		return ErrInvalidRule
 	}
 	for _, value := range append(append([]string{}, rule.ProcessNames...), rule.SystemdUnits...) {
@@ -39,13 +43,25 @@ func (rule Rule) Validate() error {
 			return ErrInvalidRule
 		}
 	}
-	for _, pattern := range append(append([]string{}, rule.ExecutablePathPatterns...), rule.UnixSocketPatterns...) {
+	patterns := append(append(append([]string{}, rule.ExecutablePathPatterns...), rule.UnixSocketPatterns...), rule.DockerImagePatterns...)
+	for _, pattern := range patterns {
 		if pattern == "" || len(pattern) > 512 || strings.ContainsAny(pattern, "\x00\r\n") {
 			return ErrInvalidRule
 		}
 		if _, err := regexp.Compile(pattern); err != nil {
 			return ErrInvalidRule
 		}
+	}
+	seenSelectors := make(map[string]struct{}, len(rule.DockerLabelSelectors))
+	for _, selector := range rule.DockerLabelSelectors {
+		key, value, ok := strings.Cut(selector, "=")
+		if !ok || !safeDockerLabel(key) || !safeDockerLabel(value) {
+			return ErrInvalidRule
+		}
+		if _, duplicate := seenSelectors[selector]; duplicate {
+			return ErrInvalidRule
+		}
+		seenSelectors[selector] = struct{}{}
 	}
 	seenPorts := make(map[uint16]struct{}, len(rule.DefaultPorts))
 	for _, port := range rule.DefaultPorts {
@@ -204,6 +220,8 @@ func canonicalRuleSet(rules RuleSet) ([]byte, error) {
 		clone.Rules[index].ExecutablePathPatterns = sortedStrings(clone.Rules[index].ExecutablePathPatterns)
 		clone.Rules[index].SystemdUnits = sortedStrings(clone.Rules[index].SystemdUnits)
 		clone.Rules[index].UnixSocketPatterns = sortedStrings(clone.Rules[index].UnixSocketPatterns)
+		clone.Rules[index].DockerImagePatterns = sortedStrings(clone.Rules[index].DockerImagePatterns)
+		clone.Rules[index].DockerLabelSelectors = sortedStrings(clone.Rules[index].DockerLabelSelectors)
 		clone.Rules[index].DefaultPorts = append([]uint16(nil), clone.Rules[index].DefaultPorts...)
 		sort.Slice(clone.Rules[index].DefaultPorts, func(left, right int) bool {
 			return clone.Rules[index].DefaultPorts[left] < clone.Rules[index].DefaultPorts[right]
@@ -211,6 +229,10 @@ func canonicalRuleSet(rules RuleSet) ([]byte, error) {
 	}
 	sort.Slice(clone.Rules, func(left, right int) bool { return clone.Rules[left].ID < clone.Rules[right].ID })
 	return json.Marshal(clone)
+}
+
+func safeDockerLabel(value string) bool {
+	return value != "" && len(value) <= 128 && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n;|&$`<>/\\:@")
 }
 
 func sortedStrings(values []string) []string {
