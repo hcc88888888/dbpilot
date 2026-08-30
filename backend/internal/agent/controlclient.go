@@ -845,6 +845,15 @@ func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {
 	return c.sendThroughSession(c.session, message)
 }
 
+// ReportDiscovery sends a bounded discovery report on the authenticated
+// AgentControl stream. Server-side scope is resolved from the mTLS Agent ID.
+func (c *ControlClient) ReportDiscovery(report *agentv1.DiscoveryReport) error {
+	if report == nil || report.GetAgentId() != c.agentID || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || len(report.GetCandidates()) > 1024 {
+		return errors.New("discovery report is invalid")
+	}
+	return c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: report}})
+}
+
 func (c *ControlClient) sendThroughSession(session *controlSession, message *agentv1.AgentMessage) error {
 	if session.ctx.Err() != nil {
 		return ErrControlStreamDisconnected

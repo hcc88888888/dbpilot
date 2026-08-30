@@ -1,0 +1,228 @@
+package discovery
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"sync"
+	"time"
+
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	domain "dbpilot.local/platform/internal/discovery"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+type Detector interface {
+	Discover(context.Context, []domain.Rule) ([]domain.CandidateObservation, error)
+}
+
+type ScanReason string
+
+const (
+	ScanEnrollment ScanReason = "enrollment"
+	ScanPeriodic   ScanReason = "periodic"
+	ScanCommand    ScanReason = "command"
+)
+
+type Reporter func(context.Context, *agentv1.DiscoveryReport) error
+
+var controlIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+type CoordinatorConfig struct {
+	HostID        string
+	AgentID       string
+	Detector      Detector
+	RuleSet       domain.RuleSet
+	Reporter      Reporter
+	Now           func() time.Time
+	RetryBackoff  time.Duration
+	RevisionStore RevisionStore
+}
+
+type Coordinator struct {
+	hostID       string
+	agentID      string
+	detector     Detector
+	rules        domain.RuleSet
+	reporter     Reporter
+	now          func() time.Time
+	retryBackoff time.Duration
+
+	mu              sync.Mutex
+	revisionStore   RevisionStore
+	pendingRevision uint64
+}
+
+func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
+	if !controlIdentifier.MatchString(config.HostID) || !controlIdentifier.MatchString(config.AgentID) || config.Detector == nil || config.Reporter == nil || config.RuleSet.Validate() != nil {
+		return nil, domain.ErrInvalid
+	}
+	if config.Now == nil {
+		config.Now = func() time.Time { return time.Now().UTC() }
+	}
+	if config.RetryBackoff == 0 {
+		config.RetryBackoff = time.Second
+	}
+	if config.RetryBackoff < time.Millisecond || config.RetryBackoff > time.Minute {
+		return nil, domain.ErrInvalid
+	}
+	if config.RevisionStore == nil {
+		config.RevisionStore = &memoryRevisionStore{}
+	}
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore}, nil
+}
+
+// Run performs the enrollment scan before starting the bounded periodic scan.
+func (coordinator *Coordinator) Run(ctx context.Context) error {
+	if ctx == nil {
+		return domain.ErrInvalid
+	}
+	if err := coordinator.scanUntilDelivered(ctx, ScanEnrollment); err != nil {
+		return nil
+	}
+	ticker := time.NewTicker(coordinator.rules.ScanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := coordinator.scanUntilDelivered(ctx, ScanPeriodic); err != nil {
+				return nil
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (coordinator *Coordinator) scanUntilDelivered(ctx context.Context, reason ScanReason) error {
+	for {
+		if err := coordinator.Scan(ctx, reason); err == nil {
+			return nil
+		}
+		timer := time.NewTimer(coordinator.retryBackoff)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+}
+
+func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
+	if ctx == nil {
+		return domain.ErrInvalid
+	}
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	observedAt := coordinator.now().UTC()
+	if observedAt.IsZero() {
+		return domain.ErrInvalid
+	}
+	candidates, err := coordinator.detector.Discover(ctx, coordinator.rules.Rules)
+	if err != nil {
+		return err
+	}
+	protobufCandidates := make([]*agentv1.DiscoveryCandidateObservation, 0, len(candidates))
+	seen := make(map[[32]byte]struct{}, len(candidates))
+	for index := range candidates {
+		candidate := candidates[index]
+		candidate.ObservedAt = observedAt
+		fingerprint, err := domain.Fingerprint(coordinator.hostID, candidate)
+		if err != nil {
+			return fmt.Errorf("fingerprint native discovery candidate: %w", err)
+		}
+		if _, duplicate := seen[fingerprint]; duplicate {
+			continue
+		}
+		seen[fingerprint] = struct{}{}
+		candidate.Fingerprint = fingerprint
+		if candidate.ObservationID == "" {
+			candidate.ObservationID = "native-" + hex.EncodeToString(fingerprint[:8])
+		}
+		if err := candidate.Validate(); err != nil {
+			return err
+		}
+		protobufCandidate, err := protobufCandidate(candidate)
+		if err != nil {
+			return err
+		}
+		protobufCandidates = append(protobufCandidates, protobufCandidate)
+	}
+	sort.Slice(protobufCandidates, func(left, right int) bool {
+		return string(protobufCandidates[left].GetFingerprint()) < string(protobufCandidates[right].GetFingerprint())
+	})
+	if coordinator.pendingRevision == 0 {
+		revision, err := coordinator.revisionStore.Next(ctx)
+		if err != nil {
+			return err
+		}
+		coordinator.pendingRevision = revision
+	}
+	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: coordinator.pendingRevision, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt)}
+	if err := coordinator.reporter(ctx, report); err != nil {
+		return err
+	}
+	coordinator.pendingRevision = 0
+	return nil
+}
+
+func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ interface {
+	Report(*agentv1.CommandProgress) error
+}) (*agentv1.CommandResult, error) {
+	command := envelope.GetDiscoverDatabases()
+	if command == nil || command.GetHostId() != coordinator.hostID || command.GetRuleRevision() != coordinator.rules.Revision || !command.GetIncludeNative() || command.GetIncludeDocker() {
+		return nil, domain.ErrInvalid
+	}
+	if err := coordinator.Scan(ctx, ScanCommand); err != nil {
+		return nil, err
+	}
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "native database discovery completed"}, nil
+}
+
+func (coordinator *Coordinator) AdditionalCapabilities() []string {
+	return []string{"native_discovery_v1"}
+}
+
+func protobufCandidate(candidate domain.CandidateObservation) (*agentv1.DiscoveryCandidateObservation, error) {
+	source := agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE
+	if candidate.Source == domain.SourceDocker {
+		source = agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER
+	}
+	evidence := make([]*agentv1.DiscoveryEvidence, 0, len(candidate.Evidence))
+	for _, value := range candidate.Evidence {
+		kind, ok := protobufEvidenceKind(value.Kind)
+		if !ok {
+			return nil, domain.ErrInvalid
+		}
+		evidence = append(evidence, &agentv1.DiscoveryEvidence{Kind: kind, RedactedValue: value.Value})
+	}
+	return &agentv1.DiscoveryCandidateObservation{
+		ObservationId: candidate.ObservationID, Source: source, DatabaseFamily: candidate.DatabaseFamily, DatabaseVariant: candidate.DatabaseVariant,
+		VersionHint: candidate.VersionHint, NormalizedEndpoint: candidate.NormalizedEndpoint, UnixSocket: candidate.UnixSocket,
+		ProcessIdentity: candidate.ProcessIdentity, ServiceName: candidate.ServiceName, ContainerIdentity: candidate.ContainerIdentity,
+		ContainerImage: candidate.ContainerImage, DiscoveredRole: candidate.DiscoveredRole, Confidence: candidate.Confidence,
+		Evidence: evidence, Fingerprint: append([]byte(nil), candidate.Fingerprint[:]...), ObservedAt: timestamppb.New(candidate.ObservedAt),
+	}, nil
+}
+
+func protobufEvidenceKind(kind domain.EvidenceKind) (agentv1.DiscoveryEvidenceKind, bool) {
+	values := map[domain.EvidenceKind]agentv1.DiscoveryEvidenceKind{
+		domain.EvidenceProcessName:    agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_PROCESS_NAME,
+		domain.EvidenceExecutablePath: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH,
+		domain.EvidenceSystemdUnit:    agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT,
+		domain.EvidenceListenEndpoint: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT,
+		domain.EvidenceUnixSocket:     agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET,
+		domain.EvidenceContainerImage: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE,
+		domain.EvidenceContainerLabel: agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL,
+		domain.EvidenceContainerPort:  agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT,
+		domain.EvidenceVersionHint:    agentv1.DiscoveryEvidenceKind_DISCOVERY_EVIDENCE_KIND_VERSION_HINT,
+	}
+	value, ok := values[kind]
+	return value, ok
+}
+
+var _ = errors.Is

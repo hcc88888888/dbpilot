@@ -33,6 +33,7 @@ const (
 	CommandKindExecuteSQL               CommandKind = "execute_sql"
 	CommandKindExecuteRegisteredProcess CommandKind = "execute_registered_process"
 	CommandKindCollectDiagnostic        CommandKind = "collect_diagnostic"
+	CommandKindDiscoverDatabases        CommandKind = "discover_databases"
 )
 
 type nonceRecord struct {
@@ -163,6 +164,8 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 		return CommandKindExecuteRegisteredProcess, true
 	case *agentv1.CommandEnvelope_CollectDiagnostic:
 		return CommandKindCollectDiagnostic, true
+	case *agentv1.CommandEnvelope_DiscoverDatabases:
+		return CommandKindDiscoverDatabases, true
 	default:
 		return "", false
 	}
@@ -170,7 +173,7 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 
 func knownCommandKind(kind CommandKind) bool {
 	switch kind {
-	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic:
+	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic, CommandKindDiscoverDatabases:
 		return true
 	default:
 		return false

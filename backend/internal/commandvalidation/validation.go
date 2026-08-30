@@ -70,6 +70,11 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 			return ErrInvalidCommand
 		}
 		targets = []string{command.CollectDiagnostic.GetInstanceId()}
+	case *agentv1.CommandEnvelope_DiscoverDatabases:
+		value := command.DiscoverDatabases
+		if value == nil || !validIdentifier(value.GetHostId()) || value.GetRuleRevision() == 0 || (!value.GetIncludeNative() && !value.GetIncludeDocker()) {
+			return ErrInvalidCommand
+		}
 	default:
 		return ErrInvalidCommand
 	}

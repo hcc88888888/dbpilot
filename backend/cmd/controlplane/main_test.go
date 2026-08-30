@@ -569,12 +569,13 @@ func TestDefaultMigrationSequenceRunsHostBeforeInspectionAndStopsOnHostFailure(t
 		platform:   func(context.Context) error { order = append(order, "platform"); return nil },
 		enrollment: func(context.Context) error { order = append(order, "enrollment"); return nil },
 		host:       func(context.Context) error { order = append(order, "host"); return nil },
+		discovery:  func(context.Context) error { order = append(order, "discovery"); return nil },
 		inspection: func(context.Context) error { order = append(order, "inspection"); return nil },
 	}
 	migrate := composeDefaultMigrations(steps)
 
 	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform", "host", "enrollment", "inspection"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "enrollment", "inspection"}, order)
 
 	want := errors.New("host migration failed")
 	order = nil

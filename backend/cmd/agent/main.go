@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -21,7 +22,9 @@ import (
 	telemetryv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	agentdiscovery "dbpilot.local/platform/internal/agent/discovery"
 	"dbpilot.local/platform/internal/database"
+	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/exporter"
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
@@ -38,12 +41,14 @@ var (
 
 type agentConfig struct {
 	AgentID               string                         `yaml:"agent_id"`
+	HostID                string                         `yaml:"host_id,omitempty"`
 	ServerAddress         string                         `yaml:"server_address"`
 	CAFile                string                         `yaml:"ca_file"`
 	CertFile              string                         `yaml:"cert_file"`
 	KeyFile               string                         `yaml:"key_file"`
 	PolicyPublicKeyFile   string                         `yaml:"policy_public_key_file"`
 	PolicyFile            string                         `yaml:"policy_file"`
+	DiscoveryRuleSetFile  string                         `yaml:"discovery_rule_set_file,omitempty"`
 	DataDirectory         string                         `yaml:"data_directory"`
 	AllowedLogRoots       []string                       `yaml:"allowed_log_roots"`
 	FileCollectionEnabled bool                           `yaml:"file_collection_enabled"`
@@ -142,6 +147,12 @@ func loadConfig(path string) (agentConfig, error) {
 	}
 	if strings.TrimSpace(settings.AgentID) == "" || strings.TrimSpace(settings.ServerAddress) == "" {
 		return agentConfig{}, errors.New("agent_id and server_address are required")
+	}
+	if (settings.HostID == "") != (settings.DiscoveryRuleSetFile == "") {
+		return agentConfig{}, errors.New("host_id and discovery_rule_set_file must be configured together")
+	}
+	if settings.HostID != "" && (!filepath.IsAbs(settings.DiscoveryRuleSetFile) || runtime.GOOS != "linux") {
+		return agentConfig{}, errors.New("native discovery requires Linux and an absolute discovery_rule_set_file")
 	}
 	for _, secret := range []string{settings.CAFile, settings.CertFile, settings.KeyFile, settings.PolicyPublicKeyFile, settings.PolicyFile} {
 		if !filepath.IsAbs(secret) {
@@ -264,7 +275,31 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return err
 	}
 	defer journal.Close()
-	executors, err := configuredCommandExecutors(hostCollector, dependencyCollector)
+	var discoveryCoordinator *agentdiscovery.Coordinator
+	var controlClient *agent.ControlClient
+	if settings.DiscoveryRuleSetFile != "" {
+		ruleSet, loadErr := loadDiscoveryRuleSet(settings.DiscoveryRuleSetFile, publicKey, time.Now().UTC())
+		if loadErr != nil {
+			_ = store.Close()
+			return loadErr
+		}
+		revisionStore, storeErr := agentdiscovery.NewFileRevisionStore(filepath.Join(settings.DataDirectory, "discovery-observation-revision"))
+		if storeErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("open discovery revision state: %w", storeErr)
+		}
+		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(agentdiscovery.NewProcReader("/proc", nil)), RuleSet: ruleSet, RevisionStore: revisionStore, Reporter: func(_ context.Context, report *telemetryv1.DiscoveryReport) error {
+			if controlClient == nil {
+				return agent.ErrControlStreamDisconnected
+			}
+			return controlClient.ReportDiscovery(report)
+		}})
+		if loadErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("configure native discovery: %w", loadErr)
+		}
+	}
+	executors, err := configuredCommandExecutors(hostCollector, dependencyCollector, discoveryCoordinator)
 	if err != nil {
 		_ = store.Close()
 		return err
@@ -275,7 +310,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		return err
 	}
 	controlAPI := telemetryv1.NewAgentControlClient(connection)
-	controlClient, err := agent.NewControlClient(agent.ControlClientConfig{
+	controlClient, err = agent.NewControlClient(agent.ControlClientConfig{
 		AgentID: settings.AgentID, AgentVersion: version, StreamOpener: func(streamContext context.Context) (agent.ControlStream, error) {
 			return controlAPI.Connect(streamContext)
 		}, Journal: journal, Verifier: commandVerifier, Executors: executors,
@@ -288,17 +323,29 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetryEngine, Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
 	serviceContext, cancelServices := context.WithCancel(ctx)
 	defer cancelServices()
-	results := make(chan error, 2)
+	serviceCount := 2
+	if discoveryCoordinator != nil {
+		serviceCount++
+	}
+	results := make(chan error, serviceCount)
 	go func() { results <- agentRuntime.Run(serviceContext) }()
 	go func() { results <- controlClient.Run(serviceContext) }()
+	if discoveryCoordinator != nil {
+		go func() { results <- discoveryCoordinator.Run(serviceContext) }()
+	}
 	first := <-results
 	cancelServices()
-	second := <-results
+	remaining := make([]error, 0, serviceCount-1)
+	for index := 1; index < serviceCount; index++ {
+		remaining = append(remaining, <-results)
+	}
 	if first != nil && !errors.Is(first, context.Canceled) {
 		return first
 	}
-	if second != nil && !errors.Is(second, context.Canceled) {
-		return second
+	for _, serviceErr := range remaining {
+		if serviceErr != nil && !errors.Is(serviceErr, context.Canceled) {
+			return serviceErr
+		}
 	}
 	return nil
 }
@@ -310,8 +357,16 @@ func newHostSnapshotCollector(settings agentConfig, store agent.HostSnapshotStor
 	}
 }
 
-func configuredCommandExecutors(host agent.Collector, collector *agent.DependencyCollector) (*agent.ExecutorRegistry, error) {
+func configuredCommandExecutors(host agent.Collector, collector *agent.DependencyCollector, discoveryRunners ...agent.DiscoveryCommandRunner) (*agent.ExecutorRegistry, error) {
 	executors := agent.NewExecutorRegistry()
+	if len(discoveryRunners) > 1 {
+		return nil, errors.New("only one native discovery coordinator is allowed")
+	}
+	if len(discoveryRunners) == 1 && discoveryRunners[0] != nil {
+		if err := executors.Register(agent.CommandKindDiscoverDatabases, agent.DiscoveryCommandExecutor{Runner: discoveryRunners[0]}); err != nil {
+			return nil, fmt.Errorf("register DiscoverDatabases executor: %w", err)
+		}
+	}
 	coordinator := &agent.CollectionCoordinator{Host: host, Dependencies: agent.NewDependencyCollectionAdapter(collector)}
 	if !coordinator.Available() {
 		return executors, nil
@@ -324,6 +379,29 @@ func configuredCommandExecutors(host agent.Collector, collector *agent.Dependenc
 		return nil, fmt.Errorf("register CollectNow executor: %w", err)
 	}
 	return executors, nil
+}
+
+func loadDiscoveryRuleSet(path string, publicKey ed25519.PublicKey, now time.Time) (discoverydomain.RuleSet, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return discoverydomain.RuleSet{}, errors.New("discovery rule set is unavailable")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return discoverydomain.RuleSet{}, errors.New("discovery rule set is unavailable")
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	decoder.DisallowUnknownFields()
+	var envelope discoverydomain.SignedRuleSet
+	if err := decoder.Decode(&envelope); err != nil {
+		return discoverydomain.RuleSet{}, errors.New("parse discovery rule set")
+	}
+	rules, err := discoverydomain.VerifyRuleSet(publicKey, envelope, now, 0)
+	if err != nil {
+		return discoverydomain.RuleSet{}, errors.New("verify discovery rule set")
+	}
+	return rules, nil
 }
 
 func loadPublicKey(path string) (ed25519.PublicKey, error) {

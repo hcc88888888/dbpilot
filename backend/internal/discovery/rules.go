@@ -1,0 +1,144 @@
+package discovery
+
+import (
+	"crypto/ed25519"
+	"encoding/json"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	MinimumScanInterval = time.Minute
+	MaximumScanInterval = time.Hour
+	MaximumRules        = 128
+)
+
+type Rule struct {
+	ID                     string   `json:"rule_id"`
+	Version                uint64   `json:"version"`
+	DatabaseFamily         string   `json:"database_family"`
+	DatabaseVariant        string   `json:"database_variant"`
+	ProcessNames           []string `json:"process_names,omitempty"`
+	ExecutablePathPatterns []string `json:"executable_path_patterns,omitempty"`
+	SystemdUnits           []string `json:"systemd_units,omitempty"`
+	DefaultPorts           []uint16 `json:"default_ports,omitempty"`
+	UnixSocketPatterns     []string `json:"unix_socket_patterns,omitempty"`
+}
+
+func (rule Rule) Validate() error {
+	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.ProcessNames)+len(rule.ExecutablePathPatterns)+len(rule.SystemdUnits) == 0 {
+		return ErrInvalidRule
+	}
+	for _, value := range append(append([]string{}, rule.ProcessNames...), rule.SystemdUnits...) {
+		if !safeRuleLiteral(value) {
+			return ErrInvalidRule
+		}
+	}
+	for _, pattern := range append(append([]string{}, rule.ExecutablePathPatterns...), rule.UnixSocketPatterns...) {
+		if pattern == "" || len(pattern) > 512 || strings.ContainsAny(pattern, "\x00\r\n") {
+			return ErrInvalidRule
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return ErrInvalidRule
+		}
+	}
+	seenPorts := make(map[uint16]struct{}, len(rule.DefaultPorts))
+	for _, port := range rule.DefaultPorts {
+		if port == 0 {
+			return ErrInvalidRule
+		}
+		if _, duplicate := seenPorts[port]; duplicate {
+			return ErrInvalidRule
+		}
+		seenPorts[port] = struct{}{}
+	}
+	return nil
+}
+
+type RuleSet struct {
+	Revision           uint64        `json:"revision"`
+	IssuedAt           time.Time     `json:"issued_at"`
+	ExpiresAt          time.Time     `json:"expires_at"`
+	ScanInterval       time.Duration `json:"scan_interval"`
+	DisappearanceGrace time.Duration `json:"disappearance_grace"`
+	Rules              []Rule        `json:"rules"`
+}
+
+func (rules RuleSet) Validate() error {
+	if rules.Revision == 0 || !validUTC(rules.IssuedAt) || !validUTC(rules.ExpiresAt) || !rules.ExpiresAt.After(rules.IssuedAt) || rules.ScanInterval < MinimumScanInterval || rules.ScanInterval > MaximumScanInterval || rules.DisappearanceGrace < rules.ScanInterval || rules.DisappearanceGrace > 24*time.Hour || len(rules.Rules) == 0 || len(rules.Rules) > MaximumRules {
+		return ErrInvalidRuleSet
+	}
+	seen := make(map[string]struct{}, len(rules.Rules))
+	for _, rule := range rules.Rules {
+		if rule.Validate() != nil {
+			return ErrInvalidRuleSet
+		}
+		if _, duplicate := seen[rule.ID]; duplicate {
+			return ErrInvalidRuleSet
+		}
+		seen[rule.ID] = struct{}{}
+	}
+	return nil
+}
+
+type SignedRuleSet struct {
+	RuleSet   RuleSet `json:"rule_set"`
+	Signature []byte  `json:"signature"`
+}
+
+func SignRuleSet(privateKey ed25519.PrivateKey, rules RuleSet) (SignedRuleSet, error) {
+	if len(privateKey) != ed25519.PrivateKeySize || rules.Validate() != nil {
+		return SignedRuleSet{}, ErrInvalidRuleSet
+	}
+	encoded, err := canonicalRuleSet(rules)
+	if err != nil {
+		return SignedRuleSet{}, ErrInvalidRuleSet
+	}
+	return SignedRuleSet{RuleSet: rules, Signature: ed25519.Sign(privateKey, encoded)}, nil
+}
+
+func VerifyRuleSet(publicKey ed25519.PublicKey, envelope SignedRuleSet, now time.Time, previousRevision uint64) (RuleSet, error) {
+	if len(publicKey) != ed25519.PublicKeySize || !validUTC(now) || envelope.RuleSet.Validate() != nil {
+		return RuleSet{}, ErrInvalidRuleSet
+	}
+	encoded, err := canonicalRuleSet(envelope.RuleSet)
+	if err != nil || len(envelope.Signature) != ed25519.SignatureSize || !ed25519.Verify(publicKey, encoded, envelope.Signature) {
+		return RuleSet{}, ErrInvalidSignature
+	}
+	if !envelope.RuleSet.ExpiresAt.After(now) {
+		return RuleSet{}, ErrInvalidRuleSet
+	}
+	if previousRevision != 0 && envelope.RuleSet.Revision <= previousRevision {
+		return RuleSet{}, ErrRuleRevisionRollback
+	}
+	return envelope.RuleSet, nil
+}
+
+func canonicalRuleSet(rules RuleSet) ([]byte, error) {
+	clone := rules
+	clone.Rules = append([]Rule(nil), rules.Rules...)
+	for index := range clone.Rules {
+		clone.Rules[index].ProcessNames = sortedStrings(clone.Rules[index].ProcessNames)
+		clone.Rules[index].ExecutablePathPatterns = sortedStrings(clone.Rules[index].ExecutablePathPatterns)
+		clone.Rules[index].SystemdUnits = sortedStrings(clone.Rules[index].SystemdUnits)
+		clone.Rules[index].UnixSocketPatterns = sortedStrings(clone.Rules[index].UnixSocketPatterns)
+		clone.Rules[index].DefaultPorts = append([]uint16(nil), clone.Rules[index].DefaultPorts...)
+		sort.Slice(clone.Rules[index].DefaultPorts, func(left, right int) bool {
+			return clone.Rules[index].DefaultPorts[left] < clone.Rules[index].DefaultPorts[right]
+		})
+	}
+	sort.Slice(clone.Rules, func(left, right int) bool { return clone.Rules[left].ID < clone.Rules[right].ID })
+	return json.Marshal(clone)
+}
+
+func sortedStrings(values []string) []string {
+	result := append([]string(nil), values...)
+	sort.Strings(result)
+	return result
+}
+
+func safeRuleLiteral(value string) bool {
+	return value != "" && len(value) <= 256 && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n;|&$`<>") && !strings.Contains(value, "://")
+}

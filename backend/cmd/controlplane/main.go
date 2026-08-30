@@ -36,6 +36,7 @@ import (
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
@@ -179,6 +180,7 @@ type Config struct {
 	EnrollmentServerTLS     *tls.Config                                `yaml:"-"`
 	EnrollmentService       *enrollment.ApplicationService             `yaml:"-"`
 	HostObservationSink     agentcontrol.HostObservationSink           `yaml:"-"`
+	DiscoveryReportSink     agentcontrol.DiscoveryReportSink           `yaml:"-"`
 }
 
 type Server struct {
@@ -212,6 +214,7 @@ type Server struct {
 	inspectionService      *inspection.Service
 	hostInventoryService   *hostinventory.ApplicationService
 	hostObservations       *agentcontrol.HostObservationDispatcher
+	discoveryObservations  *agentcontrol.DiscoveryDispatcher
 	inspectionWorker       *inspection.Worker
 	scheduleInspections    func(context.Context, time.Time) error
 	processInspections     func(context.Context, time.Time) error
@@ -291,12 +294,13 @@ type defaultMigrationSteps struct {
 	platform   func(context.Context) error
 	enrollment func(context.Context) error
 	host       func(context.Context) error
+	discovery  func(context.Context) error
 	plugin     func(context.Context) error
 	inspection func(context.Context) error
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.enrollment}
+	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.enrollment}
 	if steps.plugin != nil {
 		pipeline = append(pipeline, steps.plugin)
 	}
@@ -415,7 +419,8 @@ func NewServer(config Config) (*Server, error) {
 			enrollment: func(ctx context.Context) error {
 				return enrollment.RunMigrations(ctx, database)
 			},
-			host: func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
+			host:      func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
+			discovery: func(ctx context.Context) error { return discovery.RunMigrations(ctx, database) },
 			inspection: func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
@@ -530,6 +535,8 @@ func NewServer(config Config) (*Server, error) {
 	}
 	inspectionTargets := liveInspectionTargetResolver{configured: configuredTargets, registry: agentRegistry}
 	hostInventoryService := hostinventory.NewService(hostRepository, hostRepository)
+	discoveryRepository := discovery.NewPostgresRepository(database)
+	discoveryService := discovery.NewService(discoveryRepository)
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -554,6 +561,23 @@ func NewServer(config Config) (*Server, error) {
 			_ = database.Close()
 		}
 		return nil, fmt.Errorf("configure Host observation delivery: %w", err)
+	}
+	discoverySink := config.DiscoveryReportSink
+	if discoverySink == nil {
+		discoverySink = discovery.ProtoSink{Service: discoveryService}
+	}
+	discoveryObservations, err := agentcontrol.NewDiscoveryDispatcher(discoverySink, agentcontrol.DiscoveryDispatcherConfig{
+		MaximumPendingAgents: maximumPendingHosts, DeliveryTimeout: observationDeliveryTimeout,
+		OnError: func(err error) { log.Printf("discovery report persistence failed: %v", err) },
+	})
+	if err != nil {
+		if artifactBlobs != nil {
+			_ = artifactBlobs.Close()
+		}
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("configure discovery report delivery: %w", err)
 	}
 	enrollmentService := config.EnrollmentService
 	if enrollmentService == nil && config.Enrollment.Listener.Address != "" {
@@ -611,6 +635,7 @@ func NewServer(config Config) (*Server, error) {
 		Idempotency: idempotencyService, Inspection: inspectionApplication,
 		Hosts:                      hostInventoryService,
 		Enrollment:                 enrollmentService,
+		Discovery:                  discoveryService,
 		PluginCatalog:              pluginCatalogService,
 		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {
@@ -655,12 +680,12 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations)))
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations)))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
-		inspectionService: inspectionService, inspectionWorker: inspectionWorker, hostInventoryService: hostInventoryService,
+		inspectionService: inspectionService, inspectionWorker: inspectionWorker, hostInventoryService: hostInventoryService, discoveryObservations: discoveryObservations,
 		scheduleInspections: func(ctx context.Context, at time.Time) error {
 			_, err := inspectionService.ScheduleDue(ctx, at.UTC())
 			return err
@@ -1070,6 +1095,9 @@ func (server *Server) stop(httpListener, grpcListener, enrollmentListener net.Li
 		if report.TotalDiscarded() != 0 {
 			return fmt.Errorf("close Host observation delivery: discarded observation=%d hello=%d heartbeat=%d", report.ObservationDiscarded, report.HelloDiscarded, report.HeartbeatDiscarded)
 		}
+	}
+	if server.discoveryObservations != nil {
+		server.discoveryObservations.Close()
 	}
 	return nil
 }

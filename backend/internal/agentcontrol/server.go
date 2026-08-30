@@ -55,10 +55,11 @@ func (NoopObserver) Result(_ context.Context, _ string, result *agentv1.CommandR
 
 type Server struct {
 	agentv1.UnimplementedAgentControlServer
-	registry *Registry
-	observer Observer
-	hosts    HostObserver
-	now      func() time.Time
+	registry  *Registry
+	observer  Observer
+	hosts     HostObserver
+	discovery DiscoveryObserver
+	now       func() time.Time
 }
 
 type ServerOption func(*Server)
@@ -71,6 +72,14 @@ func WithHostObserver(observer HostObserver) ServerOption {
 	}
 }
 
+func WithDiscoveryObserver(observer DiscoveryObserver) ServerOption {
+	return func(server *Server) {
+		if observer != nil {
+			server.discovery = observer
+		}
+	}
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -78,7 +87,7 @@ func NewServer(registry *Registry, observer Observer, options ...ServerOption) *
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, now: time.Now}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -274,6 +283,20 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		}
 		if err := s.hosts.SubmitObservation(agentID, typed.HostObservation); errors.Is(err, ErrHostObservationInvalid) {
 			return status.Error(codes.InvalidArgument, "Host observation is invalid")
+		}
+	case *agentv1.AgentMessage_DiscoveryReport:
+		if typed.DiscoveryReport == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.DiscoveryReport.GetAgentId())) != 1 {
+			return status.Error(codes.PermissionDenied, "Discovery report Agent ID does not match the session identity")
+		}
+		if err := s.discovery.SubmitDiscovery(agentID, typed.DiscoveryReport); err != nil {
+			switch {
+			case errors.Is(err, ErrDiscoveryObservationInvalid):
+				return status.Error(codes.InvalidArgument, "Discovery report is invalid")
+			case errors.Is(err, ErrDiscoveryObservationCapacity):
+				return status.Error(codes.ResourceExhausted, "Discovery report delivery capacity is exhausted")
+			default:
+				return status.Error(codes.Unavailable, "Discovery report delivery is unavailable")
+			}
 		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")

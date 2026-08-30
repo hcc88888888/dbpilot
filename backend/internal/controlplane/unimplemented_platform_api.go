@@ -31,23 +31,11 @@ func (unimplementedPlatformAPI) GetDatabaseInstance(context.Context, openapi.Get
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) GetDiscoveryCandidate(context.Context, openapi.GetDiscoveryCandidateRequestObject) (openapi.GetDiscoveryCandidateResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) GetPluginAssignment(context.Context, openapi.GetPluginAssignmentRequestObject) (openapi.GetPluginAssignmentResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) IgnoreDiscoveryCandidate(context.Context, openapi.IgnoreDiscoveryCandidateRequestObject) (openapi.IgnoreDiscoveryCandidateResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) ListDatabaseInstances(context.Context, openapi.ListDatabaseInstancesRequestObject) (openapi.ListDatabaseInstancesResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) ListDiscoveryCandidates(context.Context, openapi.ListDiscoveryCandidatesRequestObject) (openapi.ListDiscoveryCandidatesResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
