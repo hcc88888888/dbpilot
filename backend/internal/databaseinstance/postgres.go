@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -91,7 +92,7 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 	}
 	if candidate.status == string(discovery.StatusAccepted) {
 		value, getErr := getInstanceTx(ctx, transaction, scope, candidate.acceptedInstanceID)
-		if getErr != nil || !acceptMatches(value, candidateID, request) {
+		if getErr != nil || value.ManagementStatus == StatusRetired || !acceptMatches(value, candidateID, request) {
 			rollback()
 			if getErr != nil {
 				return Instance{}, getErr
@@ -202,7 +203,15 @@ func (repository *PostgresRepository) List(ctx context.Context, scope platformsc
 	if limit == 0 {
 		limit = DefaultListLimit
 	}
-	rows, err := repository.database.QueryContext(ctx, `SELECT `+instanceColumns+` FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND ($3='' OR instance_id>$3) AND ($4='' OR host_id=$4) AND ($5='' OR database_family=$5) AND ($6='' OR management_status=$6) ORDER BY instance_id LIMIT $7`, scope.TenantID, scope.ProjectID, filter.Cursor, filter.HostID, filter.DatabaseFamily, string(filter.Status), limit+1)
+	afterID := ""
+	if filter.Cursor != "" {
+		var decodeErr error
+		afterID, decodeErr = decodeInstanceCursor(scope, filter)
+		if decodeErr != nil {
+			return Page{}, decodeErr
+		}
+	}
+	rows, err := repository.database.QueryContext(ctx, `SELECT `+instanceColumns+` FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND ($3='' OR instance_id>$3) AND ($4='' OR host_id=$4) AND ($5='' OR database_family=$5) AND ($6='' OR management_status=$6) ORDER BY instance_id LIMIT $7`, scope.TenantID, scope.ProjectID, afterID, filter.HostID, filter.DatabaseFamily, string(filter.Status), limit+1)
 	if err != nil {
 		return Page{}, mapPostgresError(err)
 	}
@@ -220,9 +229,58 @@ func (repository *PostgresRepository) List(ctx context.Context, scope platformsc
 	}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
-		page.NextCursor = page.Items[len(page.Items)-1].ID
+		page.NextCursor, err = encodeInstanceCursor(scope, filter, page.Items[len(page.Items)-1].ID)
+		if err != nil {
+			return Page{}, err
+		}
 	}
 	return page, nil
+}
+
+type instanceCursor struct {
+	Version     int    `json:"v"`
+	AfterID     string `json:"after_id"`
+	QueryDigest string `json:"query_sha256"`
+}
+
+func encodeInstanceCursor(scope platformscope.Scope, filter Filter, afterID string) (string, error) {
+	if scope.Validate() != nil || !identifierPattern.MatchString(afterID) {
+		return "", ErrInvalid
+	}
+	payload := instanceCursor{Version: 1, AfterID: afterID, QueryDigest: instanceCursorQueryDigest(scope, filter)}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", ErrInvalid
+	}
+	result := base64.RawURLEncoding.EncodeToString(encoded)
+	if !cursorPattern.MatchString(result) {
+		return "", ErrInvalid
+	}
+	return result, nil
+}
+
+func decodeInstanceCursor(scope platformscope.Scope, filter Filter) (string, error) {
+	encoded, err := base64.RawURLEncoding.DecodeString(filter.Cursor)
+	if err != nil || len(encoded) > 384 {
+		return "", ErrInvalid
+	}
+	var payload instanceCursor
+	if json.Unmarshal(encoded, &payload) != nil || payload.Version != 1 || !identifierPattern.MatchString(payload.AfterID) || payload.QueryDigest != instanceCursorQueryDigest(scope, filter) {
+		return "", ErrInvalid
+	}
+	return payload.AfterID, nil
+}
+
+func instanceCursorQueryDigest(scope platformscope.Scope, filter Filter) string {
+	encoded, _ := json.Marshal(struct {
+		Scope          platformscope.Scope `json:"scope"`
+		HostID         string              `json:"host_id"`
+		DatabaseFamily string              `json:"database_family"`
+		Status         ManagementStatus    `json:"status"`
+		Sort           string              `json:"sort"`
+	}{scope, filter.HostID, filter.DatabaseFamily, filter.Status, "instance_id:asc"})
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
 }
 
 func (repository *PostgresRepository) Get(ctx context.Context, scope platformscope.Scope, instanceID string) (Instance, error) {
@@ -407,9 +465,7 @@ func sourceIdentity(value candidateState) string {
 		if value.serviceName != "" {
 			return "native-service:" + value.serviceName
 		}
-		if value.processIdentity != "" {
-			return "native-process:" + value.processIdentity
-		}
+		return "native-fingerprint:" + value.fingerprint
 	}
 	return "fingerprint:" + value.fingerprint
 }
@@ -451,12 +507,28 @@ func persistMutationAndAudit(ctx context.Context, transaction *sql.Tx, scope pla
 	if err != nil {
 		return mapPostgresError(err)
 	}
-	digest := sha256.Sum256([]byte(scope.Key() + "\x00" + auditAction + "\x00" + auditSourceID))
+	auditIdentity, marshalErr := json.Marshal(struct {
+		Scope              platformscope.Scope `json:"scope"`
+		Action             string              `json:"action"`
+		AuditAction        string              `json:"audit_action"`
+		Actor              string              `json:"actor"`
+		OperationID        string              `json:"operation_id"`
+		IdempotencyKey     string              `json:"idempotency_key"`
+		RequestFingerprint string              `json:"request_fingerprint"`
+		ResourceID         string              `json:"resource_id"`
+		InstanceID         string              `json:"instance_id"`
+		ExpectedRevision   uint64              `json:"expected_revision"`
+		ResultingRevision  uint64              `json:"resulting_revision"`
+	}{scope, action, auditAction, audit.Actor, audit.OperationID, audit.IdempotencyKey, audit.RequestFingerprint, resourceID, value.ID, expectedRevision, value.Revision})
+	if marshalErr != nil {
+		return ErrInvalid
+	}
+	digest := sha256.Sum256(auditIdentity)
 	candidateID := value.CandidateID
 	if action == "accept" {
 		candidateID = auditSourceID
 	}
-	detail, _ := json.Marshal(map[string]any{"operation_id": audit.OperationID, "candidate_id": candidateID, "database_family": value.DatabaseFamily})
+	detail, _ := json.Marshal(map[string]any{"operation_id": audit.OperationID, "mutation_action": action, "candidate_id": candidateID, "database_family": value.DatabaseFamily, "expected_revision": expectedRevision, "resulting_revision": value.Revision, "change_digest": audit.RequestFingerprint})
 	_, err = transaction.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,$5,'user',$6,'database_instance',$7,'success',$8,$9,'','',$10,$11,$4) ON CONFLICT (tenant_id,project_id,dedupe_key) WHERE dedupe_key<>'' DO NOTHING`, "audit-dbi-"+hex.EncodeToString(digest[:]), scope.TenantID, scope.ProjectID, value.UpdatedAt, auditAction, audit.Actor, value.ID, audit.RequestID, audit.TraceID, "database-instance:"+hex.EncodeToString(digest[:]), detail)
 	return mapPostgresError(err)
 }

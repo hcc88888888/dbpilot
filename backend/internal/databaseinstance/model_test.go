@@ -55,6 +55,8 @@ func TestUpdateValidationRequiresOneMutableFieldAndStrictSecretReferences(t *tes
 	require.NoError(t, (Update{DisplayName: &displayName}).Validate())
 	credential := "file:///etc/mysql/password"
 	require.ErrorIs(t, (Update{CredentialRef: &credential}).Validate(), ErrInvalid)
+	emptyTLS := ""
+	require.ErrorIs(t, (Update{TLSRef: &emptyTLS}).Validate(), ErrInvalid, "v1 does not implicitly clear TLS configuration")
 }
 
 func TestRetiredInstanceRequiresRetirementTimestamp(t *testing.T) {

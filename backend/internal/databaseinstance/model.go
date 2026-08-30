@@ -30,6 +30,7 @@ var variantPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var requestFingerprintPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+var cursorPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,512}$`)
 
 type ManagementStatus string
 
@@ -160,7 +161,7 @@ type Filter struct {
 }
 
 func (value Filter) Validate() error {
-	if value.HostID != "" && !identifierPattern.MatchString(value.HostID) || value.DatabaseFamily != "" && !familyPattern.MatchString(value.DatabaseFamily) || value.Status != "" && !validManagementStatus(value.Status) || value.Cursor != "" && !identifierPattern.MatchString(value.Cursor) || value.Limit < 0 || value.Limit > 100 {
+	if value.HostID != "" && !identifierPattern.MatchString(value.HostID) || value.DatabaseFamily != "" && !familyPattern.MatchString(value.DatabaseFamily) || value.Status != "" && !validManagementStatus(value.Status) || value.Cursor != "" && !cursorPattern.MatchString(value.Cursor) || value.Limit < 0 || value.Limit > 100 {
 		return ErrInvalid
 	}
 	return nil
@@ -185,7 +186,7 @@ func (value Update) Validate() error {
 	if value.DisplayName == nil && value.CredentialRef == nil && value.TLSRef == nil && value.DesiredPluginVersion == nil && value.TemplateProfileID == nil && value.Labels == nil {
 		return ErrInvalid
 	}
-	if value.DisplayName != nil && !bounded(*value.DisplayName, 120, true) || value.CredentialRef != nil && !validSecretReference(*value.CredentialRef, true) || value.TLSRef != nil && !validSecretReference(*value.TLSRef, false) || value.DesiredPluginVersion != nil && !bounded(*value.DesiredPluginVersion, 64, false) || value.TemplateProfileID != nil && !bounded(*value.TemplateProfileID, 128, false) || value.Labels != nil && !validLabels(*value.Labels) {
+	if value.DisplayName != nil && !bounded(*value.DisplayName, 120, true) || value.CredentialRef != nil && !validSecretReference(*value.CredentialRef, true) || value.TLSRef != nil && !validSecretReference(*value.TLSRef, true) || value.DesiredPluginVersion != nil && !bounded(*value.DesiredPluginVersion, 64, false) || value.TemplateProfileID != nil && !bounded(*value.TemplateProfileID, 128, false) || value.Labels != nil && !validLabels(*value.Labels) {
 		return ErrInvalid
 	}
 	if value.Audit != (MutationAudit{}) && value.Audit.Validate() != nil {

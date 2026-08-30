@@ -67,6 +67,7 @@ ManagedDatabaseInstance:
       pattern: '^secret://[^\s]+$'
     tls_ref:
       type: string
+      minLength: 1
       maxLength: 512
       pattern: '^secret://[^\s]+$'
     plugin_id:
@@ -141,8 +142,10 @@ UpdateDatabaseInstanceRequest:
       pattern: '^secret://[^\s]+$'
     tls_ref:
       type: string
+      minLength: 1
       maxLength: 512
       pattern: '^secret://[^\s]+$'
+      description: Replaces the TLS secret reference. Clearing TLS configuration is not supported by the v1 update operation.
     desired_plugin_version:
       type: string
       maxLength: 64

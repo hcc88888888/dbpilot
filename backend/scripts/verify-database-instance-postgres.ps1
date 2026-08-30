@@ -13,6 +13,7 @@ $oldIntegration = $env:DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION
 $oldDSN = $env:DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN
 $oldGoCache = $env:GOCACHE
 $started = $false
+$cache = $null
 
 try {
     & $DockerBinary run --detach --name $containerName --label "dbpilot.test.owner=$probeId" --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=512m -e "POSTGRES_PASSWORD=$password" -e POSTGRES_DB=dbpilot -p 127.0.0.1::5432 $Image | Out-Null
@@ -48,4 +49,10 @@ finally {
     $env:DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN = $oldDSN
     $env:GOCACHE = $oldGoCache
     if ($started) { & $DockerBinary rm -f $containerName 2>$null | Out-Null }
+    if ($cache -and (Test-Path -LiteralPath $cache)) {
+        $resolvedCache = (Resolve-Path -LiteralPath $cache).Path
+        $backendPrefix = $backendRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        if (-not $resolvedCache.StartsWith($backendPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'refusing to remove database-instance cache outside backend root' }
+        Remove-Item -LiteralPath $resolvedCache -Recurse -Force
+    }
 }

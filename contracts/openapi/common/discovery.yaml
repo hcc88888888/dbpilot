@@ -168,6 +168,7 @@ AcceptDiscoveryCandidateRequest:
       pattern: '^secret://[^\s]+$'
     tls_ref:
       type: string
+      minLength: 1
       maxLength: 512
       pattern: '^secret://[^\s]+$'
     labels:

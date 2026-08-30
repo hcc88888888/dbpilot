@@ -28,7 +28,7 @@ export interface UpdateDatabaseInstanceRequest {
      */
     credentialRef?: string;
     /**
-     *
+     * Replaces the TLS secret reference. Clearing TLS configuration is not supported by the v1 update operation.
      * @type {string}
      * @memberof UpdateDatabaseInstanceRequest
      */

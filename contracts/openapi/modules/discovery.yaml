@@ -90,6 +90,7 @@ AcceptDiscoveryCandidate:
       '404': { $ref: ../common/errors.yaml#/ProblemResponse }
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
       '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
       '422': { $ref: ../common/errors.yaml#/ProblemResponse }
 IgnoreDiscoveryCandidate:
   post:

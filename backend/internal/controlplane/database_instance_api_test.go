@@ -38,6 +38,57 @@ func TestDatabaseInstanceAPIAcceptsCurrentCandidateWithCASAndScope(t *testing.T)
 	require.NotEmpty(t, instances.acceptRequest.Audit.RequestFingerprint)
 }
 
+func TestDatabaseInstanceAPIStaleAcceptanceReturnsContractValidPrecondition(t *testing.T) {
+	spec, err := openapi.GetSpec()
+	require.NoError(t, err)
+	pathItem := spec.Paths.Find("/discovery-candidates/{candidate_id}/actions/accept")
+	require.NotNil(t, pathItem)
+	operation := pathItem.Post
+	_, declared := operation.Responses.Map()["412"]
+	require.True(t, declared, "accept contract must declare its runtime precondition response")
+	candidate := discoveryAPICandidate(platformTestScope)
+	candidate.ObservationRevision = 8
+	service := &databaseInstanceAPIService{instance: controlplaneDatabaseInstance()}
+	request := databaseInstanceAcceptHTTPRequest(`"7"`, "accept-stale-read")
+	response := servePlatformRequest(Services{Discovery: &discoveryAPIService{candidate: candidate}, DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionAcceptDiscoveryCandidate), request)
+	requireProblem(t, response, http.StatusPreconditionFailed, "precondition_failed", response.Header().Get("X-Request-ID"))
+	requireOpenAPIResponse(t, request, response)
+
+	candidate.ObservationRevision = 7
+	service.acceptErrors = map[string]error{"accept-raced": databaseinstance.ErrPrecondition}
+	request = databaseInstanceAcceptHTTPRequest(`"7"`, "accept-raced")
+	response = servePlatformRequest(Services{Discovery: &discoveryAPIService{candidate: candidate}, DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionAcceptDiscoveryCandidate), request)
+	requireProblem(t, response, http.StatusPreconditionFailed, "precondition_failed", response.Header().Get("X-Request-ID"))
+	requireOpenAPIResponse(t, request, response)
+	require.NotContains(t, response.Body.String(), "response validation")
+}
+
+func TestDatabaseInstanceAPIRetiredCandidateOnlyReplaysOriginalHistoricalResponse(t *testing.T) {
+	candidate := discoveryAPICandidate(platformTestScope)
+	candidate.ObservationRevision = 7
+	accepted := controlplaneDatabaseInstance()
+	retired := accepted
+	retired.ManagementStatus, retired.Revision = databaseinstance.StatusRetired, 2
+	retired.UpdatedAt = retired.UpdatedAt.Add(time.Second)
+	retiredAt := retired.UpdatedAt
+	retired.RetiredAt = &retiredAt
+	service := &databaseInstanceAPIService{instance: retired, acceptResponses: map[string]databaseinstance.Instance{"accept-original": accepted}, acceptErrors: map[string]error{"accept-new": databaseinstance.ErrConflict}}
+	services := Services{Discovery: &discoveryAPIService{candidate: candidate}, DatabaseInstances: service}
+
+	historical := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionAcceptDiscoveryCandidate), databaseInstanceAcceptHTTPRequest(`"7"`, "accept-original"))
+	require.Equal(t, http.StatusAccepted, historical.Code, historical.Body.String())
+	var historicalBody openapi.ManagedDatabaseInstance
+	require.NoError(t, json.Unmarshal(historical.Body.Bytes(), &historicalBody))
+	require.Equal(t, openapi.DatabaseManagementStatusAccepted, historicalBody.ManagementStatus)
+	newKey := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionAcceptDiscoveryCandidate), databaseInstanceAcceptHTTPRequest(`"7"`, "accept-new"))
+	require.Equal(t, http.StatusConflict, newKey.Code, newKey.Body.String())
+	current := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionGetDatabaseInstance), httptest.NewRequest(http.MethodGet, platformBasePath+"/database-instances/instance-1", nil))
+	require.Equal(t, http.StatusOK, current.Code, current.Body.String())
+	var currentBody openapi.ManagedDatabaseInstance
+	require.NoError(t, json.Unmarshal(current.Body.Bytes(), &currentBody))
+	require.Equal(t, openapi.DatabaseManagementStatusRetired, currentBody.ManagementStatus)
+}
+
 func TestDatabaseInstanceAPIListsUpdatesRetiresAndReturnsFixedPluginMissingProblem(t *testing.T) {
 	instances := &databaseInstanceAPIService{instance: controlplaneDatabaseInstance()}
 	services := Services{DatabaseInstances: instances}
@@ -77,10 +128,18 @@ type databaseInstanceAPIService struct {
 	acceptScope       platformscope.Scope
 	acceptCandidateID string
 	acceptRequest     databaseinstance.AcceptCandidateRequest
+	acceptResponses   map[string]databaseinstance.Instance
+	acceptErrors      map[string]error
 }
 
 func (service *databaseInstanceAPIService) AcceptCandidate(_ context.Context, scope platformscope.Scope, candidateID string, request databaseinstance.AcceptCandidateRequest) (databaseinstance.Instance, error) {
 	service.acceptScope, service.acceptCandidateID, service.acceptRequest = scope, candidateID, request
+	if err := service.acceptErrors[request.Audit.IdempotencyKey]; err != nil {
+		return databaseinstance.Instance{}, err
+	}
+	if value, ok := service.acceptResponses[request.Audit.IdempotencyKey]; ok {
+		return value, nil
+	}
 	return service.instance, nil
 }
 func (service *databaseInstanceAPIService) List(_ context.Context, scope platformscope.Scope, _ databaseinstance.Filter) (databaseinstance.Page, error) {
@@ -97,7 +156,9 @@ func (service *databaseInstanceAPIService) Update(_ context.Context, scope platf
 	value := service.instance
 	value.Scope, value.ID = scope, id
 	value.Revision, value.UpdatedAt = revision+1, value.UpdatedAt.Add(time.Second)
-	if update.DisplayName != nil { value.DisplayName = *update.DisplayName }
+	if update.DisplayName != nil {
+		value.DisplayName = *update.DisplayName
+	}
 	service.instance = value
 	return value, nil
 }
@@ -121,6 +182,14 @@ func controlplaneDatabaseInstance() databaseinstance.Instance {
 		Capabilities: []string{}, CapabilityState: databaseinstance.CapabilityPluginNotInstalled, ConnectionTestStatus: databaseinstance.ConnectionNotTested,
 		ManagementStatus: databaseinstance.StatusAccepted, Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}
+}
+
+func databaseInstanceAcceptHTTPRequest(ifMatch, key string) *http.Request {
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/discovery-candidates/candidate-1/actions/accept", strings.NewReader(`{"display_name":"Orders MySQL","database_family":"mysql","database_variant":"mysql","normalized_endpoint":"127.0.0.1:3306","credential_ref":"secret://vault/database/mysql/orders","labels":{"service":"orders"}}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", key)
+	request.Header.Set("If-Match", ifMatch)
+	return request
 }
 
 var _ databaseinstance.Service = (*databaseInstanceAPIService)(nil)
