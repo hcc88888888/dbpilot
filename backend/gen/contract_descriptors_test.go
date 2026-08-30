@@ -160,10 +160,10 @@ func TestObservationDescriptorsCloseLifecycleEnumsAndExposeCircuitState(t *testi
 		"PLUGIN_PROCESS_STATE_RUNNING":            7,
 		"PLUGIN_PROCESS_STATE_DEGRADED":           8,
 		"PLUGIN_PROCESS_STATE_RESTARTING":         9,
-		"PLUGIN_PROCESS_STATE_DRAINING":          10,
-		"PLUGIN_PROCESS_STATE_STOPPED":           11,
-		"PLUGIN_PROCESS_STATE_UNINSTALLING":      12,
-		"PLUGIN_PROCESS_STATE_DOWNLOAD_FAILED":   13,
+		"PLUGIN_PROCESS_STATE_DRAINING":           10,
+		"PLUGIN_PROCESS_STATE_STOPPED":            11,
+		"PLUGIN_PROCESS_STATE_UNINSTALLING":       12,
+		"PLUGIN_PROCESS_STATE_DOWNLOAD_FAILED":    13,
 		"PLUGIN_PROCESS_STATE_SIGNATURE_REJECTED": 14,
 		"PLUGIN_PROCESS_STATE_MANIFEST_REJECTED":  15,
 		"PLUGIN_PROCESS_STATE_PLATFORM_MISMATCH":  16,
@@ -212,13 +212,13 @@ func TestPluginAndDockerDescriptorsExposeExactServices(t *testing.T) {
 		t.Fatal("PluginRuntime service is absent")
 	}
 	expected := map[protoreflect.Name][3]string{
-		"Handshake":           {"dbpilot.plugin.v1.PluginHandshakeRequest", "dbpilot.plugin.v1.PluginHandshakeResponse", "false"},
+		"Handshake":          {"dbpilot.plugin.v1.PluginHandshakeRequest", "dbpilot.plugin.v1.PluginHandshakeResponse", "false"},
 		"ApplyConfiguration": {"dbpilot.plugin.v1.ApplyPluginConfigurationRequest", "dbpilot.plugin.v1.ApplyPluginConfigurationResponse", "false"},
-		"ValidateInstance":    {"dbpilot.plugin.v1.ValidatePluginInstanceRequest", "dbpilot.plugin.v1.ValidatePluginInstanceResponse", "false"},
-		"CollectNow":          {"dbpilot.plugin.v1.CollectPluginMetricsRequest", "dbpilot.plugin.v1.CollectPluginMetricsResponse", "false"},
-		"StreamMetrics":       {"dbpilot.plugin.v1.StreamPluginMetricsRequest", "dbpilot.plugin.v1.PluginMetricBatch", "true"},
-		"GetHealth":           {"dbpilot.plugin.v1.GetPluginHealthRequest", "dbpilot.plugin.v1.PluginHealth", "false"},
-		"Shutdown":            {"dbpilot.plugin.v1.ShutdownPluginRequest", "dbpilot.plugin.v1.ShutdownPluginResponse", "false"},
+		"ValidateInstance":   {"dbpilot.plugin.v1.ValidatePluginInstanceRequest", "dbpilot.plugin.v1.ValidatePluginInstanceResponse", "false"},
+		"CollectNow":         {"dbpilot.plugin.v1.CollectPluginMetricsRequest", "dbpilot.plugin.v1.CollectPluginMetricsResponse", "false"},
+		"StreamMetrics":      {"dbpilot.plugin.v1.StreamPluginMetricsRequest", "dbpilot.plugin.v1.PluginMetricBatch", "true"},
+		"GetHealth":          {"dbpilot.plugin.v1.GetPluginHealthRequest", "dbpilot.plugin.v1.PluginHealth", "false"},
+		"Shutdown":           {"dbpilot.plugin.v1.ShutdownPluginRequest", "dbpilot.plugin.v1.ShutdownPluginResponse", "false"},
 	}
 	if service.Methods().Len() != len(expected) {
 		t.Fatalf("PluginRuntime method count = %d, want %d", service.Methods().Len(), len(expected))

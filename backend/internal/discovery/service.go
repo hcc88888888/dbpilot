@@ -52,8 +52,12 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 	}
 	if !committed {
 		publicKey := service.RuleKeys[report.RuleAttestation.KeyID]
-		if VerifyRuleAttestationSignature(publicKey,report.RuleAttestation)!=nil{return nil,ErrInvalidSignature}
-		if service.Policies==nil||service.Policies.Allows(ctx,report.RuleAttestation)!=nil{return nil,ErrConflict}
+		if VerifyRuleAttestationSignature(publicKey, report.RuleAttestation) != nil {
+			return nil, ErrInvalidSignature
+		}
+		if service.Policies == nil || service.Policies.Allows(ctx, report.RuleAttestation) != nil {
+			return nil, ErrConflict
+		}
 	}
 	values, err := service.Repository.RecordReport(ctx, report, time.Time{}, report.RuleAttestation.DisappearanceGrace)
 	if err != nil {
