@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"crypto/ed25519"
 	"time"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -13,6 +14,7 @@ type ApplicationService struct {
 	Repository         Repository
 	Now                func() time.Time
 	DisappearanceGrace time.Duration
+	RuleKeys           map[string]ed25519.PublicKey
 }
 
 func NewService(repository Repository) *ApplicationService {
@@ -34,6 +36,10 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 	if report.Validate() != nil {
 		return nil, ErrInvalid
 	}
+	publicKey := service.RuleKeys[report.RuleAttestation.KeyID]
+	if VerifyRuleAttestation(publicKey, report.RuleAttestation, serviceTime(service.Now)) != nil {
+		return nil, ErrInvalidSignature
+	}
 	for _, candidate := range report.Candidates {
 		expected, fingerprintErr := Fingerprint(binding.HostID, candidate)
 		if fingerprintErr != nil {
@@ -43,11 +49,14 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 			return nil, ErrConflict
 		}
 	}
-	now, grace, err := service.settings()
+	now, _, err := service.settings()
 	if err != nil {
 		return nil, err
 	}
-	values, err := service.Repository.RecordReport(ctx, report, now, grace)
+	if report.ObservedAt.Before(now.Add(-5*time.Minute)) || report.ObservedAt.After(now.Add(5*time.Minute)) {
+		return nil, ErrConflict
+	}
+	values, err := service.Repository.RecordReport(ctx, report, now, report.RuleAttestation.DisappearanceGrace)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +69,14 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 		values = []Candidate{}
 	}
 	return values, nil
+}
+
+func serviceTime(now func() time.Time) time.Time {
+	value := time.Now().UTC()
+	if now != nil {
+		value = now().UTC()
+	}
+	return value
 }
 
 func (service ApplicationService) List(ctx context.Context, scope platformscope.Scope, filter Filter) (Page, error) {

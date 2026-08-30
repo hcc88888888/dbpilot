@@ -235,6 +235,8 @@ Agent 禁止：
 - 读取数据库配置中的密码、token 或完整连接串。
 - 上传完整 cmdline；只上报字段白名单和脱敏结果。
 
+生产进程检查分为两个有界 profile：Kylin V10/现代 Linux 默认由非 root `dbpilot` Agent 直接运行，只保留 `CAP_SYS_PTRACE` 的 bounding/ambient/effective capability；无能力时明确上报 `permission_denied`，不得伪装成零候选。CentOS 7 的 3.10 内核缺少 pidfd 能力，不能宣称使用同一 ambient-cap profile。仅在显式 `legacy_proc_helper: true` 时，允许同一 `dbpilot-agent` 二进制以 `proc-helper` 固定模式运行一个 root 本机辅助服务：固定 AF_UNIX `0600` 路径、校验 Agent UID/GID、固定有界请求/响应、只返回 socket inode 等 allowlisted proc facts，无网络、任意路径、环境、shell 或命令接口；systemd bounding set 仅 `CAP_SYS_PTRACE + CAP_DAC_READ_SEARCH`。普通 Agent 仍为非 root，并通过固定 socket 使用该 profile。
+
 ### 8.3 Docker Discovery
 
 `dbpilot-docker-discovery` 是每台 Docker 主机最多一个的可选系统组件，不是数据库插件。它仅在主机 enrollment 时本地管理员明确启用 Docker 发现后运行。
@@ -284,11 +286,13 @@ DiscoveryRule
 ├── unix_socket_patterns
 ├── docker_image_patterns
 ├── docker_label_selectors
-├── version_extractors
-└── confidence_weights
+├── version_extractors             phase 2, not accepted by Native Discovery v1
+└── confidence_weights             phase 2, not accepted by Native Discovery v1
 ```
 
 规则表达式必须兼容 Go RE2，不允许回溯型正则。规则只能描述只读匹配，不允许携带命令、脚本、SQL 或文件内容读取操作。
+
+Task 4 的 Native Discovery v1 只接受 process/executable/systemd/default-port/Unix-Socket 匹配字段，并使用固定、可审计的证据权重。`version_extractors` 和 `confidence_weights` 保留到数据库 family 插件提供可信版本解析后再开放；v1 解码器遇到这些未知字段必须拒绝，不能静默接受尚未实现的签名语义。
 
 ### 8.5 DatabaseCandidate
 
@@ -339,6 +343,14 @@ host_id
 ```
 
 PID 不能作为稳定身份。容器重建、进程重启后，若 endpoint 和实例身份仍一致，应关联原候选；证据不足时标记 `possible_duplicate`，不得自动合并。
+
+### 8.7 发现规则证明与报告确认协议（Task 4 有界修订）
+
+发现规则包使用 versioned attestation：`version + algorithm + key_id + rule_revision + canonical_rule_set_sha256 + issued_at + expires_at + disappearance_grace`。Agent 必须重算完整规则集的 canonical SHA-256 后验证 Ed25519 attestation，并将已接受的 revision/digest 崩溃安全地保存到 Agent 私有状态目录；同 revision 不同 digest 和较低 revision 均拒绝。Server 使用配置的可信 `key_id` 公钥再次验证同一 canonical attestation，不信任 Agent 单独上报的 grace 或时间字段。
+
+`DiscoveryReport` 的一次 observation revision 在首次发送前必须以确定性 protobuf 字节持久化。在收到匹配 `host_id + agent_id + observation_revision + report_digest` 的 `DiscoveryReportAcknowledgement(persisted=true)` 前，Agent 只能重放同一字节，不能重新扫描或改变时间戳。Server 仅在 PostgreSQL 提交成功或确认同 revision/digest 已提交后发送 persisted ACK；进入异步队列不构成 ACK。ACK 丢失时重放由 Server 幂等确认，随后 Agent 才能分配下一 revision。
+
+候选生命周期的 `first_seen_at`、`last_seen_at` 与 disappeared grace 使用 Server 数据库接收时间。Agent `observed_at` 只作为有界证据，必须满足允许的时钟偏差并保持单调。指纹在 endpoint 可用时只使用 canonical endpoint；没有 endpoint 时才使用 canonical Unix Socket，不能同时散列两者。
 
 ## 9. 数据库实例纳管
 

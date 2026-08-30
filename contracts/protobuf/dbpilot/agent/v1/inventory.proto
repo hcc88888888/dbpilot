@@ -54,7 +54,16 @@ message DiscoveryReport {
   uint64 rule_revision = 4;
   repeated DiscoveryCandidateObservation candidates = 5;
   google.protobuf.Timestamp observed_at = 6;
+  bytes rule_set_digest = 20;
+  uint64 disappearance_grace_seconds = 21;
+  google.protobuf.Timestamp rule_issued_at = 22;
+  google.protobuf.Timestamp rule_expires_at = 23;
+  bytes rule_attestation_signature = 24;
+  uint32 rule_attestation_version = 25;
+  string rule_attestation_algorithm = 26;
+  string rule_attestation_key_id = 27;
   reserved 7 to 19;
+  reserved 28 to 31;
 }
 
 message DiscoveryCandidateObservation {

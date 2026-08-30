@@ -128,10 +128,11 @@ type Report struct {
 	RuleRevision        uint64
 	Candidates          []CandidateObservation
 	ObservedAt          time.Time
+	RuleAttestation     RuleAttestation
 }
 
 func (report Report) Validate() error {
-	if report.Scope.Validate() != nil || !identifierPattern.MatchString(report.HostID) || !identifierPattern.MatchString(report.AgentID) || report.ObservationRevision == 0 || report.RuleRevision == 0 || !validUTC(report.ObservedAt) || len(report.Candidates) > 1024 {
+	if report.Scope.Validate() != nil || !identifierPattern.MatchString(report.HostID) || !identifierPattern.MatchString(report.AgentID) || report.ObservationRevision == 0 || report.RuleRevision == 0 || !validUTC(report.ObservedAt) || len(report.Candidates) > 1024 || report.RuleAttestation.Revision != report.RuleRevision {
 		return ErrInvalid
 	}
 	seen := make(map[[32]byte]struct{}, len(report.Candidates))

@@ -174,14 +174,22 @@ type ControlClient struct {
 	resultRetryBackoff time.Duration
 	now                func() time.Time
 
-	sessionMu       sync.RWMutex
-	session         *controlSession
-	sendMu          sync.Mutex
-	runningMu       sync.Mutex
-	running         map[string]runningCommand
-	executorWait    sync.WaitGroup
-	messageSequence atomic.Uint64
-	executionErrors chan error
+	sessionMu        sync.RWMutex
+	session          *controlSession
+	sendMu           sync.Mutex
+	runningMu        sync.Mutex
+	running          map[string]runningCommand
+	executorWait     sync.WaitGroup
+	messageSequence  atomic.Uint64
+	executionErrors  chan error
+	discoveryMu      sync.Mutex
+	discoveryWaiters map[uint64]*discoveryAckWaiter
+}
+
+type discoveryAckWaiter struct {
+	digest [sha256.Size]byte
+	hostID string
+	result chan error
 }
 
 type controlSendRequest struct {
@@ -232,7 +240,8 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		reconnectBackoff:   boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
 		resultRetryBackoff: boundedDuration(config.ResultRetryBackoff, 100*time.Millisecond, 10*time.Millisecond, 5*time.Second),
 		now:                config.Now, running: make(map[string]runningCommand),
-		executionErrors: make(chan error, 1),
+		executionErrors:  make(chan error, 1),
+		discoveryWaiters: make(map[uint64]*discoveryAckWaiter),
 	}, nil
 }
 
@@ -476,6 +485,8 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		// Policy and flow-control consumers are independent runtime boundaries.
 	case *agentv1.ServerMessage_HelloAck:
 		return errors.New("duplicate Hello acknowledgement")
+	case *agentv1.ServerMessage_DiscoveryReportAcknowledgement:
+		return c.handleDiscoveryAcknowledgement(typed.DiscoveryReportAcknowledgement)
 	default:
 		return errors.New("unsupported control-plane message")
 	}
@@ -847,11 +858,74 @@ func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {
 
 // ReportDiscovery sends a bounded discovery report on the authenticated
 // AgentControl stream. Server-side scope is resolved from the mTLS Agent ID.
-func (c *ControlClient) ReportDiscovery(report *agentv1.DiscoveryReport) error {
+func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.DiscoveryReport) error {
 	if report == nil || report.GetAgentId() != c.agentID || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || len(report.GetCandidates()) > 1024 {
 		return errors.New("discovery report is invalid")
 	}
-	return c.sendAgentMessage(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: report}})
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(encoded)
+	waiter := &discoveryAckWaiter{digest: digest, hostID: report.GetHostId(), result: make(chan error, 1)}
+	c.discoveryMu.Lock()
+	if _, exists := c.discoveryWaiters[report.GetObservationRevision()]; exists {
+		c.discoveryMu.Unlock()
+		return errors.New("discovery report revision is already pending")
+	}
+	c.discoveryWaiters[report.GetObservationRevision()] = waiter
+	c.discoveryMu.Unlock()
+	defer func() {
+		c.discoveryMu.Lock()
+		if c.discoveryWaiters[report.GetObservationRevision()] == waiter {
+			delete(c.discoveryWaiters, report.GetObservationRevision())
+		}
+		c.discoveryMu.Unlock()
+	}()
+	c.sessionMu.RLock()
+	session := c.session
+	c.sessionMu.RUnlock()
+	if session == nil {
+		return ErrControlStreamDisconnected
+	}
+	if err := c.sendThroughSession(session, &agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: report}}); err != nil {
+		return err
+	}
+	select {
+	case err := <-waiter.result:
+		return err
+	case <-session.ctx.Done():
+		return ErrControlStreamDisconnected
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *ControlClient) handleDiscoveryAcknowledgement(ack *agentv1.DiscoveryReportAcknowledgement) error {
+	if ack == nil || ack.GetAgentId() != c.agentID || ack.GetObservationRevision() == 0 || len(ack.GetReportDigest()) != sha256.Size {
+		return errors.New("discovery acknowledgement is invalid")
+	}
+	c.discoveryMu.Lock()
+	waiter := c.discoveryWaiters[ack.GetObservationRevision()]
+	c.discoveryMu.Unlock()
+	if waiter == nil {
+		return nil
+	}
+	var outcome error
+	if ack.GetHostId() != waiter.hostID || subtle.ConstantTimeCompare(waiter.digest[:], ack.GetReportDigest()) != 1 {
+		outcome = errors.New("discovery acknowledgement correlation mismatch")
+	} else if ack.GetPersisted() && !ack.GetRetryable() {
+		outcome = nil
+	} else if ack.GetRetryable() {
+		outcome = errors.New("discovery report persistence retry requested")
+	} else {
+		outcome = errors.New("discovery report persistence rejected")
+	}
+	select {
+	case waiter.result <- outcome:
+	default:
+	}
+	return nil
 }
 
 func (c *ControlClient) sendThroughSession(session *controlSession, message *agentv1.AgentMessage) error {

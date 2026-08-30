@@ -45,3 +45,14 @@ func TestSignedRuleSetRejectsTamperRollbackAndUnsafeIntervals(t *testing.T) {
 	_, err = SignRuleSet(privateKey, rules)
 	require.ErrorIs(t, err, ErrInvalidRuleSet)
 }
+
+func TestSignedRuleSetRejectsNotYetActiveIssuance(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	rules := RuleSet{Revision: 1, IssuedAt: now.Add(time.Minute), ExpiresAt: now.Add(time.Hour), ScanInterval: time.Minute, DisappearanceGrace: time.Minute, Rules: []Rule{{ID: "mysql", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ProcessNames: []string{"mysqld"}}}}
+	envelope, err := SignRuleSet(privateKey, rules)
+	require.NoError(t, err)
+	_, err = VerifyRuleSet(publicKey, envelope, now, 0)
+	require.ErrorIs(t, err, ErrInvalidRuleSet)
+}

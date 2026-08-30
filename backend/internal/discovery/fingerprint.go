@@ -37,7 +37,12 @@ func Fingerprint(hostID string, observation CandidateObservation) ([32]byte, err
 		Endpoint string `json:"endpoint,omitempty"`
 		Socket   string `json:"socket,omitempty"`
 		Identity string `json:"identity"`
-	}{hostID, observation.DatabaseFamily, endpoint, socket, identity}
+	}{HostID: hostID, Family: observation.DatabaseFamily, Identity: identity}
+	if endpoint != "" {
+		payload.Endpoint = endpoint
+	} else {
+		payload.Socket = socket
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return [32]byte{}, ErrInvalid

@@ -178,6 +178,13 @@ func (r *Registry) enqueue(agentID string, message *agentv1.ServerMessage) error
 	}
 }
 
+func (r *Registry) AcknowledgeDiscovery(agentID string, acknowledgement *agentv1.DiscoveryReportAcknowledgement) error {
+	if acknowledgement == nil {
+		return ErrAgentUnavailable
+	}
+	return r.enqueue(agentID, &agentv1.ServerMessage{MessageId: "discovery-ack-" + acknowledgement.GetHostId(), Message: &agentv1.ServerMessage_DiscoveryReportAcknowledgement{DiscoveryReportAcknowledgement: acknowledgement}})
+}
+
 func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agentv1.CommandEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err

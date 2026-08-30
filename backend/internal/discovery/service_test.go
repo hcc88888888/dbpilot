@@ -2,6 +2,8 @@ package discovery
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"testing"
 	"time"
 
@@ -13,7 +15,10 @@ func TestServiceResolvesAgentBindingAndPreservesReportScope(t *testing.T) {
 	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	repository := &recordingRepository{binding: AgentBinding{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, HostID: "host-1", AgentID: "agent-1"}}
 	service := NewService(repository)
-	report := Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now}
+	service.Now = func() time.Time { return now }
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	report := Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation}
 	_, err := service.RecordReport(context.Background(), report)
 	require.NoError(t, err)
 	require.Equal(t, repository.binding.Scope, repository.recorded.Scope)
@@ -41,10 +46,39 @@ func TestServiceRejectsAgentSuppliedFingerprintThatDoesNotMatchHostFacts(t *test
 	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
 	repository := &recordingRepository{binding: AgentBinding{Scope: scope, HostID: "host-1", AgentID: "agent-1"}}
 	service := NewService(repository)
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Now = func() time.Time { return now }
 	candidate := candidateFixture(scope).CandidateObservation
 	candidate.Fingerprint[0] ^= 0xff
-	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, Candidates: []CandidateObservation{candidate}})
+	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, Candidates: []CandidateObservation{candidate}, RuleAttestation: attestation})
 	require.ErrorIs(t, err, ErrConflict)
+}
+
+func TestServiceRejectsTamperedRuleGraceBeforeRepositoryWrite(t *testing.T) {
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	repository := &recordingRepository{binding: AgentBinding{Scope: scope, HostID: "host-1", AgentID: "agent-1"}}
+	service := NewService(repository)
+	service.Now = func() time.Time { return now }
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	attestation.DisappearanceGrace = time.Minute
+	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
+	require.ErrorIs(t, err, ErrInvalidSignature)
+	require.Equal(t, uint64(0), repository.recorded.ObservationRevision)
+}
+
+func signedTestAttestation(t *testing.T, now time.Time, revision uint64, grace time.Duration) (RuleAttestation, ed25519.PublicKey) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	rules := RuleSet{Revision: revision, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), ScanInterval: time.Minute, DisappearanceGrace: grace, Rules: []Rule{{ID: "mysql", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ProcessNames: []string{"mysqld"}, DefaultPorts: []uint16{3306}}}}
+	envelope, err := SignRuleSetWithKey(private, "test", rules)
+	require.NoError(t, err)
+	attestation, err := AttestationFor(envelope)
+	require.NoError(t, err)
+	return attestation, public
 }
 
 func candidateFixture(scope platformscope.Scope) Candidate {

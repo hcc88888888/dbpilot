@@ -114,7 +114,8 @@ func TestAgentDescriptorsKeepCommandsAndLeasesInTypedOneofs(t *testing.T) {
 	serverMessage := requireMessage(t, file, "ServerMessage")
 	requireOneofField(t, serverMessage, "credential_lease_response", "message")
 	requireOneofField(t, serverMessage, "plugin_artifact_lease_response", "message")
-	requireReserved(t, serverMessage, 29, 49)
+	requireOneofField(t, serverMessage, "discovery_report_acknowledgement", "message")
+	requireReserved(t, serverMessage, 30, 49)
 
 	service := file.Services().ByName("AgentControl")
 	if service == nil || service.Methods().ByName("Connect") == nil {

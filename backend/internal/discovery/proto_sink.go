@@ -19,6 +19,20 @@ func (sink ProtoSink) RecordDiscoveryReport(ctx context.Context, agentID string,
 		return ErrInvalid
 	}
 	converted := Report{HostID: report.GetHostId(), AgentID: agentID, ObservationRevision: report.GetObservationRevision(), RuleRevision: report.GetRuleRevision(), ObservedAt: observedAt, Candidates: make([]CandidateObservation, 0, len(report.GetCandidates()))}
+	issuedAt, issuedOK := protobufTime(report.GetRuleIssuedAt())
+	expiresAt, expiresOK := protobufTime(report.GetRuleExpiresAt())
+	if !issuedOK || !expiresOK || len(report.GetRuleSetDigest()) != 32 {
+		return ErrInvalid
+	}
+	copy(converted.RuleAttestation.Digest[:], report.GetRuleSetDigest())
+	converted.RuleAttestation.Version = report.GetRuleAttestationVersion()
+	converted.RuleAttestation.Algorithm = report.GetRuleAttestationAlgorithm()
+	converted.RuleAttestation.KeyID = report.GetRuleAttestationKeyId()
+	converted.RuleAttestation.Revision = report.GetRuleRevision()
+	converted.RuleAttestation.IssuedAt = issuedAt
+	converted.RuleAttestation.ExpiresAt = expiresAt
+	converted.RuleAttestation.DisappearanceGrace = time.Duration(report.GetDisappearanceGraceSeconds()) * time.Second
+	converted.RuleAttestation.Signature = append([]byte(nil), report.GetRuleAttestationSignature()...)
 	for _, candidate := range report.GetCandidates() {
 		value, err := candidateFromProto(candidate)
 		if err != nil {

@@ -141,23 +141,24 @@ type PrincipalSettings struct {
 }
 
 type Config struct {
-	DatabaseURL      string                     `yaml:"database_url"`
-	WebhookAllowlist []string                   `yaml:"webhook_allowlist"`
-	HTTP             ListenerConfig             `yaml:"http"`
-	GRPC             ListenerConfig             `yaml:"grpc"`
-	Agents           map[string]AgentAssignment `yaml:"agents"`
-	SMTP             SMTPSettings               `yaml:"smtp"`
-	Monitoring       MonitoringSettings         `yaml:"monitoring,omitempty"`
-	Identity         IdentitySettings           `yaml:"identity"`
-	EventURLBase     string                     `yaml:"event_url_base"`
-	EvaluationScopes []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
-	EvaluationEvery  time.Duration              `yaml:"evaluation_every,omitempty"`
-	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
-	Command          CommandSettings            `yaml:"command"`
-	Artifact         ArtifactSettings           `yaml:"artifact"`
-	PluginCatalog    PluginCatalogSettings      `yaml:"plugin_catalog,omitempty"`
-	PluginPublishers []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
-	Enrollment       EnrollmentSettings         `yaml:"enrollment,omitempty"`
+	DatabaseURL       string                     `yaml:"database_url"`
+	WebhookAllowlist  []string                   `yaml:"webhook_allowlist"`
+	HTTP              ListenerConfig             `yaml:"http"`
+	GRPC              ListenerConfig             `yaml:"grpc"`
+	Agents            map[string]AgentAssignment `yaml:"agents"`
+	SMTP              SMTPSettings               `yaml:"smtp"`
+	Monitoring        MonitoringSettings         `yaml:"monitoring,omitempty"`
+	Identity          IdentitySettings           `yaml:"identity"`
+	EventURLBase      string                     `yaml:"event_url_base"`
+	EvaluationScopes  []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
+	EvaluationEvery   time.Duration              `yaml:"evaluation_every,omitempty"`
+	RetryEvery        time.Duration              `yaml:"retry_every,omitempty"`
+	Command           CommandSettings            `yaml:"command"`
+	Artifact          ArtifactSettings           `yaml:"artifact"`
+	PluginCatalog     PluginCatalogSettings      `yaml:"plugin_catalog,omitempty"`
+	PluginPublishers  []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
+	DiscoveryRuleKeys map[string]string          `yaml:"discovery_rule_keys,omitempty"`
+	Enrollment        EnrollmentSettings         `yaml:"enrollment,omitempty"`
 
 	HTTPServerTLS           *tls.Config                                `yaml:"-"`
 	GRPCServerTLS           *tls.Config                                `yaml:"-"`
@@ -537,6 +538,11 @@ func NewServer(config Config) (*Server, error) {
 	hostInventoryService := hostinventory.NewService(hostRepository, hostRepository)
 	discoveryRepository := discovery.NewPostgresRepository(database)
 	discoveryService := discovery.NewService(discoveryRepository)
+	discoveryKeys, keyErr := discoveryRuleKeysForConfig(config)
+	if keyErr != nil {
+		return nil, keyErr
+	}
+	discoveryService.RuleKeys = discoveryKeys
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -568,7 +574,8 @@ func NewServer(config Config) (*Server, error) {
 	}
 	discoveryObservations, err := agentcontrol.NewDiscoveryDispatcher(discoverySink, agentcontrol.DiscoveryDispatcherConfig{
 		MaximumPendingAgents: maximumPendingHosts, DeliveryTimeout: observationDeliveryTimeout,
-		OnError: func(err error) { log.Printf("discovery report persistence failed: %v", err) },
+		OnError:     func(err error) { log.Printf("discovery report persistence failed: %v", err) },
+		Acknowledge: agentRegistry.AcknowledgeDiscovery,
 	})
 	if err != nil {
 		if artifactBlobs != nil {
@@ -738,6 +745,18 @@ func publisherKeysForConfig(config Config) (*plugincatalog.StaticPublisherKeySto
 	return plugincatalog.NewStaticPublisherKeyStore(keys)
 }
 
+func discoveryRuleKeysForConfig(config Config) (map[string]ed25519.PublicKey, error) {
+	result := make(map[string]ed25519.PublicKey, len(config.DiscoveryRuleKeys))
+	for keyID, encoded := range config.DiscoveryRuleKeys {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || base64.StdEncoding.EncodeToString(decoded) != encoded || len(decoded) != ed25519.PublicKeySize || strings.TrimSpace(keyID) != keyID || keyID == "" || len(keyID) > 128 {
+			return nil, errors.New("discovery_rule_keys contains an invalid Ed25519 public key")
+		}
+		result[keyID] = ed25519.PublicKey(decoded)
+	}
+	return result, nil
+}
+
 func validateConfig(config Config) error {
 	parsed, err := url.Parse(config.DatabaseURL)
 	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" || strings.Trim(parsed.Path, "/") == "" {
@@ -854,6 +873,9 @@ func validateConfig(config Config) error {
 	}
 	if _, err := publisherKeysForConfig(config); err != nil {
 		return errors.New("plugin_publishers contains an invalid Ed25519 public key")
+	}
+	if _, err := discoveryRuleKeysForConfig(config); err != nil {
+		return err
 	}
 	if config.PluginCatalog.Enabled && len(config.PluginPublishers) == 0 {
 		return errors.New("plugin catalog enabled requires at least one publisher")

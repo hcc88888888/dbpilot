@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -51,19 +52,39 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		return nil, mapPostgresError(err)
 	}
 	rollback := func() { _ = transaction.Rollback() }
+	lockDigest := sha256.Sum256([]byte(report.Scope.Key() + "\x00" + report.HostID))
+	if _, err := transaction.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", int64(binary.BigEndian.Uint64(lockDigest[:8]))); err != nil {
+		rollback()
+		return nil, mapPostgresError(err)
+	}
 	digest, err := reportDigest(report)
 	if err != nil {
 		rollback()
 		return nil, err
 	}
 	var previousRevision uint64
+	var previousRuleRevision uint64
 	var previousDigest []byte
-	err = transaction.QueryRowContext(ctx, `SELECT observation_revision, report_digest FROM discovery_scan_state WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 FOR UPDATE`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID).Scan(&previousRevision, &previousDigest)
+	var previousRuleDigest []byte
+	var previousObservedAt sql.NullTime
+	err = transaction.QueryRowContext(ctx, `SELECT observation_revision,rule_revision,report_digest,rule_set_digest,agent_observed_at FROM discovery_scan_state WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 FOR UPDATE`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID).Scan(&previousRevision, &previousRuleRevision, &previousDigest, &previousRuleDigest, &previousObservedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		rollback()
 		return nil, mapPostgresError(err)
 	}
 	if err == nil {
+		if report.RuleRevision < previousRuleRevision {
+			rollback()
+			return nil, ErrStaleRevision
+		}
+		if report.RuleRevision == previousRuleRevision && len(previousRuleDigest) == 32 && !equalBytes(previousRuleDigest, report.RuleAttestation.Digest[:]) {
+			rollback()
+			return nil, ErrConflict
+		}
+		if previousObservedAt.Valid && report.ObservedAt.Before(previousObservedAt.Time) {
+			rollback()
+			return nil, ErrStaleRevision
+		}
 		if report.ObservationRevision < previousRevision {
 			rollback()
 			return nil, ErrStaleRevision
@@ -83,9 +104,9 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 			}
 			return values.Items, nil
 		}
-		_, err = transaction.ExecContext(ctx, `UPDATE discovery_scan_state SET agent_id=$4, observation_revision=$5, rule_revision=$6, report_digest=$7, observed_at=$8, received_at=$9 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, report.RuleRevision, digest[:], report.ObservedAt, receivedAt)
+		_, err = transaction.ExecContext(ctx, `UPDATE discovery_scan_state SET agent_id=$4,observation_revision=$5,rule_revision=$6,report_digest=$7,observed_at=$8,received_at=$9,rule_set_digest=$10,disappearance_grace_seconds=$11,agent_observed_at=$8 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, report.RuleRevision, digest[:], report.ObservedAt, receivedAt, report.RuleAttestation.Digest[:], int64(grace/time.Second))
 	} else {
-		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_scan_state (tenant_id,project_id,host_id,agent_id,observation_revision,rule_revision,report_digest,observed_at,received_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, report.RuleRevision, digest[:], report.ObservedAt, receivedAt)
+		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_scan_state (tenant_id,project_id,host_id,agent_id,observation_revision,rule_revision,report_digest,observed_at,received_at,rule_set_digest,disappearance_grace_seconds,agent_observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$8)`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, report.RuleRevision, digest[:], report.ObservedAt, receivedAt, report.RuleAttestation.Digest[:], int64(grace/time.Second))
 	}
 	if err != nil {
 		rollback()
@@ -98,13 +119,13 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 			return nil, ErrInvalid
 		}
 		candidateID := "candidate-" + hex.EncodeToString(observation.Fingerprint[:])
-		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_candidates (candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,version_hint,normalized_endpoint,unix_socket,process_identity,service_name,container_identity,container_image,discovered_role,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23,'awaiting_confirmation',$24) ON CONFLICT (tenant_id,project_id,host_id,fingerprint) DO UPDATE SET observation_id=EXCLUDED.observation_id, agent_id=EXCLUDED.agent_id, database_family=EXCLUDED.database_family, database_variant=EXCLUDED.database_variant, version_hint=EXCLUDED.version_hint, normalized_endpoint=EXCLUDED.normalized_endpoint, unix_socket=EXCLUDED.unix_socket, process_identity=EXCLUDED.process_identity, service_name=EXCLUDED.service_name, container_identity=EXCLUDED.container_identity, container_image=EXCLUDED.container_image, discovered_role=EXCLUDED.discovered_role, confidence=EXCLUDED.confidence, evidence_summary=EXCLUDED.evidence_summary, rule_revision=EXCLUDED.rule_revision, observation_revision=EXCLUDED.observation_revision, last_seen_at=GREATEST(discovery_candidates.last_seen_at,EXCLUDED.last_seen_at), status=CASE WHEN discovery_candidates.status='disappeared' THEN 'awaiting_confirmation' ELSE discovery_candidates.status END, updated_at=EXCLUDED.updated_at WHERE discovery_candidates.observation_revision < EXCLUDED.observation_revision`, candidateID, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, observation.ObservationID, string(observation.Source), observation.DatabaseFamily, observation.DatabaseVariant, observation.VersionHint, observation.NormalizedEndpoint, observation.UnixSocket, observation.ProcessIdentity, observation.ServiceName, observation.ContainerIdentity, observation.ContainerImage, observation.DiscoveredRole, observation.Confidence, evidence, observation.Fingerprint[:], report.RuleRevision, report.ObservationRevision, report.ObservedAt, receivedAt)
+		_, err = transaction.ExecContext(ctx, `INSERT INTO discovery_candidates (candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,version_hint,normalized_endpoint,unix_socket,process_identity,service_name,container_identity,container_image,discovered_role,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23,'awaiting_confirmation',$23) ON CONFLICT (tenant_id,project_id,host_id,fingerprint) DO UPDATE SET observation_id=EXCLUDED.observation_id, agent_id=EXCLUDED.agent_id, database_family=EXCLUDED.database_family, database_variant=EXCLUDED.database_variant, version_hint=EXCLUDED.version_hint, normalized_endpoint=EXCLUDED.normalized_endpoint, unix_socket=EXCLUDED.unix_socket, process_identity=EXCLUDED.process_identity, service_name=EXCLUDED.service_name, container_identity=EXCLUDED.container_identity, container_image=EXCLUDED.container_image, discovered_role=EXCLUDED.discovered_role, confidence=EXCLUDED.confidence, evidence_summary=EXCLUDED.evidence_summary, rule_revision=EXCLUDED.rule_revision, observation_revision=EXCLUDED.observation_revision, last_seen_at=GREATEST(discovery_candidates.last_seen_at,EXCLUDED.last_seen_at), status=CASE WHEN discovery_candidates.status='disappeared' THEN 'awaiting_confirmation' ELSE discovery_candidates.status END, updated_at=EXCLUDED.updated_at WHERE discovery_candidates.observation_revision < EXCLUDED.observation_revision`, candidateID, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, observation.ObservationID, string(observation.Source), observation.DatabaseFamily, observation.DatabaseVariant, observation.VersionHint, observation.NormalizedEndpoint, observation.UnixSocket, observation.ProcessIdentity, observation.ServiceName, observation.ContainerIdentity, observation.ContainerImage, observation.DiscoveredRole, observation.Confidence, evidence, observation.Fingerprint[:], report.RuleRevision, report.ObservationRevision, receivedAt)
 		if err != nil {
 			rollback()
 			return nil, mapPostgresError(err)
 		}
 	}
-	_, err = transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='disappeared', updated_at=$5 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND status IN ('discovered','awaiting_confirmation') AND last_seen_at <= $4`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.ObservedAt.Add(-grace), receivedAt)
+	_, err = transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='disappeared', updated_at=$5 WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND status IN ('discovered','awaiting_confirmation') AND last_seen_at <= $4`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, receivedAt.Add(-grace), receivedAt)
 	if err != nil {
 		rollback()
 		return nil, mapPostgresError(err)

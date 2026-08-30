@@ -772,15 +772,23 @@ func (x *FilesystemObservation) GetAvailableBytes() uint64 {
 }
 
 type DiscoveryReport struct {
-	state               protoimpl.MessageState           `protogen:"open.v1"`
-	HostId              string                           `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
-	AgentId             string                           `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
-	ObservationRevision uint64                           `protobuf:"varint,3,opt,name=observation_revision,json=observationRevision,proto3" json:"observation_revision,omitempty"`
-	RuleRevision        uint64                           `protobuf:"varint,4,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
-	Candidates          []*DiscoveryCandidateObservation `protobuf:"bytes,5,rep,name=candidates,proto3" json:"candidates,omitempty"`
-	ObservedAt          *timestamppb.Timestamp           `protobuf:"bytes,6,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state                     protoimpl.MessageState           `protogen:"open.v1"`
+	HostId                    string                           `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	AgentId                   string                           `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	ObservationRevision       uint64                           `protobuf:"varint,3,opt,name=observation_revision,json=observationRevision,proto3" json:"observation_revision,omitempty"`
+	RuleRevision              uint64                           `protobuf:"varint,4,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
+	Candidates                []*DiscoveryCandidateObservation `protobuf:"bytes,5,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	ObservedAt                *timestamppb.Timestamp           `protobuf:"bytes,6,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	RuleSetDigest             []byte                           `protobuf:"bytes,20,opt,name=rule_set_digest,json=ruleSetDigest,proto3" json:"rule_set_digest,omitempty"`
+	DisappearanceGraceSeconds uint64                           `protobuf:"varint,21,opt,name=disappearance_grace_seconds,json=disappearanceGraceSeconds,proto3" json:"disappearance_grace_seconds,omitempty"`
+	RuleIssuedAt              *timestamppb.Timestamp           `protobuf:"bytes,22,opt,name=rule_issued_at,json=ruleIssuedAt,proto3" json:"rule_issued_at,omitempty"`
+	RuleExpiresAt             *timestamppb.Timestamp           `protobuf:"bytes,23,opt,name=rule_expires_at,json=ruleExpiresAt,proto3" json:"rule_expires_at,omitempty"`
+	RuleAttestationSignature  []byte                           `protobuf:"bytes,24,opt,name=rule_attestation_signature,json=ruleAttestationSignature,proto3" json:"rule_attestation_signature,omitempty"`
+	RuleAttestationVersion    uint32                           `protobuf:"varint,25,opt,name=rule_attestation_version,json=ruleAttestationVersion,proto3" json:"rule_attestation_version,omitempty"`
+	RuleAttestationAlgorithm  string                           `protobuf:"bytes,26,opt,name=rule_attestation_algorithm,json=ruleAttestationAlgorithm,proto3" json:"rule_attestation_algorithm,omitempty"`
+	RuleAttestationKeyId      string                           `protobuf:"bytes,27,opt,name=rule_attestation_key_id,json=ruleAttestationKeyId,proto3" json:"rule_attestation_key_id,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *DiscoveryReport) Reset() {
@@ -853,6 +861,62 @@ func (x *DiscoveryReport) GetObservedAt() *timestamppb.Timestamp {
 		return x.ObservedAt
 	}
 	return nil
+}
+
+func (x *DiscoveryReport) GetRuleSetDigest() []byte {
+	if x != nil {
+		return x.RuleSetDigest
+	}
+	return nil
+}
+
+func (x *DiscoveryReport) GetDisappearanceGraceSeconds() uint64 {
+	if x != nil {
+		return x.DisappearanceGraceSeconds
+	}
+	return 0
+}
+
+func (x *DiscoveryReport) GetRuleIssuedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RuleIssuedAt
+	}
+	return nil
+}
+
+func (x *DiscoveryReport) GetRuleExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RuleExpiresAt
+	}
+	return nil
+}
+
+func (x *DiscoveryReport) GetRuleAttestationSignature() []byte {
+	if x != nil {
+		return x.RuleAttestationSignature
+	}
+	return nil
+}
+
+func (x *DiscoveryReport) GetRuleAttestationVersion() uint32 {
+	if x != nil {
+		return x.RuleAttestationVersion
+	}
+	return 0
+}
+
+func (x *DiscoveryReport) GetRuleAttestationAlgorithm() string {
+	if x != nil {
+		return x.RuleAttestationAlgorithm
+	}
+	return ""
+}
+
+func (x *DiscoveryReport) GetRuleAttestationKeyId() string {
+	if x != nil {
+		return x.RuleAttestationKeyId
+	}
+	return ""
 }
 
 type DiscoveryCandidateObservation struct {
@@ -1358,7 +1422,7 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"\vmount_point\x18\x01 \x01(\tR\n" +
 	"mountPoint\x12%\n" +
 	"\x0ecapacity_bytes\x18\x02 \x01(\x04R\rcapacityBytes\x12'\n" +
-	"\x0favailable_bytes\x18\x03 \x01(\x04R\x0eavailableBytes\"\xb1\x02\n" +
+	"\x0favailable_bytes\x18\x03 \x01(\x04R\x0eavailableBytes\"\x92\x06\n" +
 	"\x0fDiscoveryReport\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
@@ -1368,7 +1432,15 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"candidates\x18\x05 \x03(\v2/.dbpilot.agent.v1.DiscoveryCandidateObservationR\n" +
 	"candidates\x12;\n" +
 	"\vobserved_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"observedAtJ\x04\b\a\x10\x14\"\xdf\x05\n" +
+	"observedAt\x12&\n" +
+	"\x0frule_set_digest\x18\x14 \x01(\fR\rruleSetDigest\x12>\n" +
+	"\x1bdisappearance_grace_seconds\x18\x15 \x01(\x04R\x19disappearanceGraceSeconds\x12@\n" +
+	"\x0erule_issued_at\x18\x16 \x01(\v2\x1a.google.protobuf.TimestampR\fruleIssuedAt\x12B\n" +
+	"\x0frule_expires_at\x18\x17 \x01(\v2\x1a.google.protobuf.TimestampR\rruleExpiresAt\x12<\n" +
+	"\x1arule_attestation_signature\x18\x18 \x01(\fR\x18ruleAttestationSignature\x128\n" +
+	"\x18rule_attestation_version\x18\x19 \x01(\rR\x16ruleAttestationVersion\x12<\n" +
+	"\x1arule_attestation_algorithm\x18\x1a \x01(\tR\x18ruleAttestationAlgorithm\x125\n" +
+	"\x17rule_attestation_key_id\x18\x1b \x01(\tR\x14ruleAttestationKeyIdJ\x04\b\a\x10\x14J\x04\b\x1c\x10 \"\xdf\x05\n" +
 	"\x1dDiscoveryCandidateObservation\x12%\n" +
 	"\x0eobservation_id\x18\x01 \x01(\tR\robservationId\x129\n" +
 	"\x06source\x18\x02 \x01(\x0e2!.dbpilot.agent.v1.DiscoverySourceR\x06source\x12'\n" +
@@ -1519,23 +1591,25 @@ var file_agent_v1_inventory_proto_depIdxs = []int32{
 	16, // 4: dbpilot.agent.v1.HostObservation.observed_at:type_name -> google.protobuf.Timestamp
 	11, // 5: dbpilot.agent.v1.DiscoveryReport.candidates:type_name -> dbpilot.agent.v1.DiscoveryCandidateObservation
 	16, // 6: dbpilot.agent.v1.DiscoveryReport.observed_at:type_name -> google.protobuf.Timestamp
-	0,  // 7: dbpilot.agent.v1.DiscoveryCandidateObservation.source:type_name -> dbpilot.agent.v1.DiscoverySource
-	12, // 8: dbpilot.agent.v1.DiscoveryCandidateObservation.evidence:type_name -> dbpilot.agent.v1.DiscoveryEvidence
-	16, // 9: dbpilot.agent.v1.DiscoveryCandidateObservation.observed_at:type_name -> google.protobuf.Timestamp
-	1,  // 10: dbpilot.agent.v1.DiscoveryEvidence.kind:type_name -> dbpilot.agent.v1.DiscoveryEvidenceKind
-	14, // 11: dbpilot.agent.v1.PluginObservation.assignments:type_name -> dbpilot.agent.v1.PluginAssignmentObservation
-	16, // 12: dbpilot.agent.v1.PluginObservation.observed_at:type_name -> google.protobuf.Timestamp
-	2,  // 13: dbpilot.agent.v1.PluginAssignmentObservation.active_slot:type_name -> dbpilot.agent.v1.PluginActiveSlot
-	3,  // 14: dbpilot.agent.v1.PluginAssignmentObservation.process_state:type_name -> dbpilot.agent.v1.PluginProcessState
-	16, // 15: dbpilot.agent.v1.PluginAssignmentObservation.started_at:type_name -> google.protobuf.Timestamp
-	4,  // 16: dbpilot.agent.v1.PluginAssignmentObservation.health:type_name -> dbpilot.agent.v1.PluginHealthState
-	16, // 17: dbpilot.agent.v1.PluginAssignmentObservation.observed_at:type_name -> google.protobuf.Timestamp
-	5,  // 18: dbpilot.agent.v1.PluginAssignmentObservation.circuit_state:type_name -> dbpilot.agent.v1.PluginCircuitState
-	19, // [19:19] is the sub-list for method output_type
-	19, // [19:19] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	16, // 7: dbpilot.agent.v1.DiscoveryReport.rule_issued_at:type_name -> google.protobuf.Timestamp
+	16, // 8: dbpilot.agent.v1.DiscoveryReport.rule_expires_at:type_name -> google.protobuf.Timestamp
+	0,  // 9: dbpilot.agent.v1.DiscoveryCandidateObservation.source:type_name -> dbpilot.agent.v1.DiscoverySource
+	12, // 10: dbpilot.agent.v1.DiscoveryCandidateObservation.evidence:type_name -> dbpilot.agent.v1.DiscoveryEvidence
+	16, // 11: dbpilot.agent.v1.DiscoveryCandidateObservation.observed_at:type_name -> google.protobuf.Timestamp
+	1,  // 12: dbpilot.agent.v1.DiscoveryEvidence.kind:type_name -> dbpilot.agent.v1.DiscoveryEvidenceKind
+	14, // 13: dbpilot.agent.v1.PluginObservation.assignments:type_name -> dbpilot.agent.v1.PluginAssignmentObservation
+	16, // 14: dbpilot.agent.v1.PluginObservation.observed_at:type_name -> google.protobuf.Timestamp
+	2,  // 15: dbpilot.agent.v1.PluginAssignmentObservation.active_slot:type_name -> dbpilot.agent.v1.PluginActiveSlot
+	3,  // 16: dbpilot.agent.v1.PluginAssignmentObservation.process_state:type_name -> dbpilot.agent.v1.PluginProcessState
+	16, // 17: dbpilot.agent.v1.PluginAssignmentObservation.started_at:type_name -> google.protobuf.Timestamp
+	4,  // 18: dbpilot.agent.v1.PluginAssignmentObservation.health:type_name -> dbpilot.agent.v1.PluginHealthState
+	16, // 19: dbpilot.agent.v1.PluginAssignmentObservation.observed_at:type_name -> google.protobuf.Timestamp
+	5,  // 20: dbpilot.agent.v1.PluginAssignmentObservation.circuit_state:type_name -> dbpilot.agent.v1.PluginCircuitState
+	21, // [21:21] is the sub-list for method output_type
+	21, // [21:21] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_inventory_proto_init() }

@@ -12,7 +12,7 @@ import (
 
 func TestDiscoveryDispatcherDoesNotBlockControlStreamAndCoalescesPendingRevision(t *testing.T) {
 	sink := &blockingDiscoverySink{entered: make(chan uint64, 3), release: make(chan struct{}, 3)}
-	dispatcher, err := NewDiscoveryDispatcher(sink, DiscoveryDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: time.Second, RetryBackoff: time.Millisecond})
+	dispatcher, err := NewDiscoveryDispatcher(sink, DiscoveryDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: time.Second, RetryBackoff: time.Millisecond, Acknowledge: func(string, *agentv1.DiscoveryReportAcknowledgement) error { return nil }})
 	require.NoError(t, err)
 	t.Cleanup(dispatcher.Close)
 	require.NoError(t, dispatcher.SubmitDiscovery("agent-1", validDiscoveryReportFixture(1)))
@@ -26,7 +26,7 @@ func TestDiscoveryDispatcherDoesNotBlockControlStreamAndCoalescesPendingRevision
 
 func TestDiscoveryDispatcherRejectsIdentityMismatchBeforePersistence(t *testing.T) {
 	sink := &blockingDiscoverySink{entered: make(chan uint64, 1), release: make(chan struct{}, 1)}
-	dispatcher, err := NewDiscoveryDispatcher(sink, DiscoveryDispatcherConfig{})
+	dispatcher, err := NewDiscoveryDispatcher(sink, DiscoveryDispatcherConfig{Acknowledge: func(string, *agentv1.DiscoveryReportAcknowledgement) error { return nil }})
 	require.NoError(t, err)
 	t.Cleanup(dispatcher.Close)
 	report := validDiscoveryReportFixture(1)
@@ -34,9 +34,43 @@ func TestDiscoveryDispatcherRejectsIdentityMismatchBeforePersistence(t *testing.
 	require.ErrorIs(t, dispatcher.SubmitDiscovery("agent-1", report), ErrDiscoveryObservationInvalid)
 }
 
+func TestDiscoveryDispatcherQuarantinesNeverReturningAgentWithoutBlockingPeerOrClose(t *testing.T) {
+	sink := selectiveDiscoverySink{blocked: make(chan struct{})}
+	t.Cleanup(func() { close(sink.blocked) })
+	acknowledged := make(chan string, 2)
+	dispatcher, err := NewDiscoveryDispatcher(sink, DiscoveryDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: 10 * time.Millisecond, RetryBackoff: time.Millisecond, Acknowledge: func(agent string, _ *agentv1.DiscoveryReportAcknowledgement) error { acknowledged <- agent; return nil }})
+	require.NoError(t, err)
+	blocked := validDiscoveryReportFixture(1)
+	blocked.AgentId = "agent-a"
+	blocked.HostId = "host-a"
+	fast := validDiscoveryReportFixture(1)
+	fast.AgentId = "agent-b"
+	fast.HostId = "host-b"
+	require.NoError(t, dispatcher.SubmitDiscovery("agent-a", blocked))
+	require.NoError(t, dispatcher.SubmitDiscovery("agent-b", fast))
+	select {
+	case agent := <-acknowledged:
+		require.Equal(t, "agent-b", agent)
+	case <-time.After(time.Second):
+		t.Fatal("cold Agent was blocked by non-cooperative peer")
+	}
+	started := time.Now()
+	dispatcher.Close()
+	require.Less(t, time.Since(started), 100*time.Millisecond)
+}
+
 type blockingDiscoverySink struct {
 	entered chan uint64
 	release chan struct{}
+}
+
+type selectiveDiscoverySink struct{ blocked chan struct{} }
+
+func (sink selectiveDiscoverySink) RecordDiscoveryReport(_ context.Context, agent string, _ *agentv1.DiscoveryReport) error {
+	if agent == "agent-a" {
+		<-sink.blocked
+	}
+	return nil
 }
 
 func (sink *blockingDiscoverySink) RecordDiscoveryReport(ctx context.Context, _ string, report *agentv1.DiscoveryReport) error {
@@ -51,5 +85,5 @@ func (sink *blockingDiscoverySink) RecordDiscoveryReport(ctx context.Context, _ 
 
 func validDiscoveryReportFixture(revision uint64) *agentv1.DiscoveryReport {
 	now := timestamppb.New(time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC))
-	return &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: revision, RuleRevision: 4, ObservedAt: now, Candidates: []*agentv1.DiscoveryCandidateObservation{{ObservationId: "obs-1", Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, DatabaseFamily: "mysql", DatabaseVariant: "mysql", Fingerprint: make([]byte, 32), ObservedAt: now}}}
+	return &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: revision, RuleRevision: 4, ObservedAt: now, RuleSetDigest: make([]byte, 32), DisappearanceGraceSeconds: 60, RuleIssuedAt: now, RuleExpiresAt: timestamppb.New(now.AsTime().Add(time.Hour)), RuleAttestationSignature: make([]byte, 64), RuleAttestationVersion: 1, RuleAttestationAlgorithm: "ed25519-sha256", RuleAttestationKeyId: "test", Candidates: []*agentv1.DiscoveryCandidateObservation{{ObservationId: "obs-1", Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, DatabaseFamily: "mysql", DatabaseVariant: "mysql", Fingerprint: make([]byte, 32), ObservedAt: now}}}
 }

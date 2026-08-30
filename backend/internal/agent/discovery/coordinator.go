@@ -12,6 +12,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	domain "dbpilot.local/platform/internal/discovery"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -36,10 +37,12 @@ type CoordinatorConfig struct {
 	AgentID       string
 	Detector      Detector
 	RuleSet       domain.RuleSet
+	Attestation   domain.RuleAttestation
 	Reporter      Reporter
 	Now           func() time.Time
 	RetryBackoff  time.Duration
 	RevisionStore RevisionStore
+	ReportStore   ReportStore
 }
 
 type Coordinator struct {
@@ -47,6 +50,7 @@ type Coordinator struct {
 	agentID      string
 	detector     Detector
 	rules        domain.RuleSet
+	attestation  domain.RuleAttestation
 	reporter     Reporter
 	now          func() time.Time
 	retryBackoff time.Duration
@@ -54,6 +58,8 @@ type Coordinator struct {
 	mu              sync.Mutex
 	revisionStore   RevisionStore
 	pendingRevision uint64
+	reports         ReportStore
+	pendingReport   *agentv1.DiscoveryReport
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -72,7 +78,13 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.RevisionStore == nil {
 		config.RevisionStore = &memoryRevisionStore{}
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore}, nil
+	if config.ReportStore == nil {
+		config.ReportStore = &memoryReportStore{}
+	}
+	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
+		return nil, domain.ErrInvalid
+	}
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -118,8 +130,18 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	}
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
+	if coordinator.pendingReport == nil {
+		pending, err := coordinator.reports.Load(ctx)
+		if err != nil {
+			return err
+		}
+		coordinator.pendingReport = pending
+	}
+	if coordinator.pendingReport != nil {
+		return coordinator.deliverPending(ctx)
+	}
 	observedAt := coordinator.now().UTC()
-	if observedAt.IsZero() {
+	if coordinator.rules.Active(observedAt) != nil {
 		return domain.ErrInvalid
 	}
 	candidates, err := coordinator.detector.Discover(ctx, coordinator.rules.Rules)
@@ -162,10 +184,26 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 		}
 		coordinator.pendingRevision = revision
 	}
-	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: coordinator.pendingRevision, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt)}
-	if err := coordinator.reporter(ctx, report); err != nil {
+	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: coordinator.pendingRevision, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
+	if err := coordinator.reports.Save(ctx, report); err != nil {
 		return err
 	}
+	coordinator.pendingReport = report
+	return coordinator.deliverPending(ctx)
+}
+
+func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
+	report := coordinator.pendingReport
+	if report == nil {
+		return nil
+	}
+	if err := coordinator.reporter(ctx, proto.Clone(report).(*agentv1.DiscoveryReport)); err != nil {
+		return err
+	}
+	if err := coordinator.reports.Clear(ctx, report); err != nil {
+		return err
+	}
+	coordinator.pendingReport = nil
 	coordinator.pendingRevision = 0
 	return nil
 }

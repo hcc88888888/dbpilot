@@ -32,7 +32,7 @@ func TestCandidateObservationRejectsUnboundedOrSecretEvidence(t *testing.T) {
 func TestReportRequiresExactScopedMonotonicIdentity(t *testing.T) {
 	report := Report{
 		Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, HostID: "host-1", AgentID: "agent-1",
-		ObservationRevision: 2, RuleRevision: 7, ObservedAt: time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC),
+		ObservationRevision: 2, RuleRevision: 7, ObservedAt: time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC), RuleAttestation: RuleAttestation{Revision: 7},
 	}
 	require.NoError(t, report.Validate())
 	report.ObservationRevision = 0

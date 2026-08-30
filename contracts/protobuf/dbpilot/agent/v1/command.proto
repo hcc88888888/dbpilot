@@ -50,9 +50,20 @@ message ServerMessage {
     CommandStart command_start = 26;
     CredentialLeaseResponse credential_lease_response = 27;
     PluginArtifactLeaseResponse plugin_artifact_lease_response = 28;
+    DiscoveryReportAcknowledgement discovery_report_acknowledgement = 29;
   }
 
-  reserved 29 to 49;
+  reserved 30 to 49;
+}
+
+message DiscoveryReportAcknowledgement {
+  string host_id = 1;
+  string agent_id = 2;
+  uint64 observation_revision = 3;
+  bytes report_digest = 4;
+  bool persisted = 5;
+  bool retryable = 6;
+  string reason_code = 7;
 }
 
 message Hello {

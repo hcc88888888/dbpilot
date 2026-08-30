@@ -49,6 +49,7 @@ type agentConfig struct {
 	PolicyPublicKeyFile   string                         `yaml:"policy_public_key_file"`
 	PolicyFile            string                         `yaml:"policy_file"`
 	DiscoveryRuleSetFile  string                         `yaml:"discovery_rule_set_file,omitempty"`
+	LegacyProcHelper      bool                           `yaml:"legacy_proc_helper,omitempty"`
 	DataDirectory         string                         `yaml:"data_directory"`
 	AllowedLogRoots       []string                       `yaml:"allowed_log_roots"`
 	FileCollectionEnabled bool                           `yaml:"file_collection_enabled"`
@@ -100,6 +101,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "proc-helper" {
+		return runProcHelper(args[1:], stderr)
+	}
 	if len(args) > 0 && args[0] == "enroll" {
 		return runEnroll(args[1:], stdout, stderr)
 	}
@@ -153,6 +157,9 @@ func loadConfig(path string) (agentConfig, error) {
 	}
 	if settings.HostID != "" && (!filepath.IsAbs(settings.DiscoveryRuleSetFile) || runtime.GOOS != "linux") {
 		return agentConfig{}, errors.New("native discovery requires Linux and an absolute discovery_rule_set_file")
+	}
+	if settings.LegacyProcHelper && (settings.DiscoveryRuleSetFile == "" || runtime.GOOS != "linux") {
+		return agentConfig{}, errors.New("legacy_proc_helper requires Linux native discovery")
 	}
 	for _, secret := range []string{settings.CAFile, settings.CertFile, settings.KeyFile, settings.PolicyPublicKeyFile, settings.PolicyFile} {
 		if !filepath.IsAbs(secret) {
@@ -278,7 +285,12 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	var discoveryCoordinator *agentdiscovery.Coordinator
 	var controlClient *agent.ControlClient
 	if settings.DiscoveryRuleSetFile != "" {
-		ruleSet, loadErr := loadDiscoveryRuleSet(settings.DiscoveryRuleSetFile, publicKey, time.Now().UTC())
+		ruleState, stateErr := agentdiscovery.NewRuleStateStore(filepath.Join(settings.DataDirectory, "discovery-rule-state"))
+		if stateErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("open discovery rule state: %w", stateErr)
+		}
+		ruleSet, attestation, loadErr := loadDiscoveryRuleSet(settings.DiscoveryRuleSetFile, publicKey, time.Now().UTC(), ruleState)
 		if loadErr != nil {
 			_ = store.Close()
 			return loadErr
@@ -288,11 +300,20 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return fmt.Errorf("open discovery revision state: %w", storeErr)
 		}
-		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(agentdiscovery.NewProcReader("/proc", nil)), RuleSet: ruleSet, RevisionStore: revisionStore, Reporter: func(_ context.Context, report *telemetryv1.DiscoveryReport) error {
+		reportStore, storeErr := agentdiscovery.NewFileReportStore(filepath.Join(settings.DataDirectory, "discovery-pending-report.pb"))
+		if storeErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("open discovery report state: %w", storeErr)
+		}
+		reader := agentdiscovery.NewProcReader("/proc", nil)
+		if settings.LegacyProcHelper {
+			reader = agentdiscovery.NewLegacyProcReader("/proc", nil)
+		}
+		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, Reporter: func(reportContext context.Context, report *telemetryv1.DiscoveryReport) error {
 			if controlClient == nil {
 				return agent.ErrControlStreamDisconnected
 			}
-			return controlClient.ReportDiscovery(report)
+			return controlClient.ReportDiscovery(reportContext, report)
 		}})
 		if loadErr != nil {
 			_ = store.Close()
@@ -350,6 +371,27 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	return nil
 }
 
+func runProcHelper(arguments []string, stderr io.Writer) int {
+	flags := flag.NewFlagSet("proc-helper", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	allowedUID := flags.Uint("allowed-uid", 0, "numeric dbpilot Agent uid")
+	allowedGID := flags.Uint("allowed-gid", 0, "numeric dbpilot Agent gid")
+	if err := flags.Parse(arguments); err != nil {
+		return 2
+	}
+	if *allowedUID == 0 || *allowedGID == 0 || uint64(*allowedUID) > uint64(^uint32(0)) || uint64(*allowedGID) > uint64(^uint32(0)) {
+		fmt.Fprintln(stderr, "--allowed-uid and --allowed-gid are required uint32 values")
+		return 2
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := agentdiscovery.RunLegacyProcHelper(ctx, uint32(*allowedUID), uint32(*allowedGID)); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
 func newHostSnapshotCollector(settings agentConfig, store agent.HostSnapshotStore, limits agent.BatchLimitProvider, logs agent.LogSummaryProvider) *agent.HostSnapshotCollector {
 	return &agent.HostSnapshotCollector{
 		AgentID: settings.AgentID, Store: store, Reader: agent.NewGopsutilHostReader(), Logs: logs, BatchLimits: limits,
@@ -381,27 +423,38 @@ func configuredCommandExecutors(host agent.Collector, collector *agent.Dependenc
 	return executors, nil
 }
 
-func loadDiscoveryRuleSet(path string, publicKey ed25519.PublicKey, now time.Time) (discoverydomain.RuleSet, error) {
+func loadDiscoveryRuleSet(path string, publicKey ed25519.PublicKey, now time.Time, state *agentdiscovery.RuleStateStore) (discoverydomain.RuleSet, discoverydomain.RuleAttestation, error) {
 	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return discoverydomain.RuleSet{}, errors.New("discovery rule set is unavailable")
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("discovery rule set is unavailable")
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return discoverydomain.RuleSet{}, errors.New("discovery rule set is unavailable")
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("discovery rule set is unavailable")
 	}
 	defer file.Close()
 	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
 	decoder.DisallowUnknownFields()
 	var envelope discoverydomain.SignedRuleSet
 	if err := decoder.Decode(&envelope); err != nil {
-		return discoverydomain.RuleSet{}, errors.New("parse discovery rule set")
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("parse discovery rule set")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("parse discovery rule set")
 	}
 	rules, err := discoverydomain.VerifyRuleSet(publicKey, envelope, now, 0)
 	if err != nil {
-		return discoverydomain.RuleSet{}, errors.New("verify discovery rule set")
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("verify discovery rule set")
 	}
-	return rules, nil
+	attestation, err := discoverydomain.AttestationFor(envelope)
+	if err != nil {
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("verify discovery rule set")
+	}
+	if state == nil || state.Accept(context.Background(), rules.Revision, attestation.Digest) != nil {
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("persist discovery rule state")
+	}
+	return rules, attestation, nil
 }
 
 func loadPublicKey(path string) (ed25519.PublicKey, error) {

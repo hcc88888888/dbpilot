@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"os"
 	"testing"
@@ -48,19 +49,46 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	service := NewService(NewPostgresRepository(database))
 	service.Now = func() time.Time { return now }
 	service.DisappearanceGrace = 10 * time.Minute
-	first, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now})
-	require.NoError(t, err)
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	firstReport := Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation}
+	start := make(chan struct{})
+	results := make(chan []Candidate, 2)
+	failures := make(chan error, 2)
+	for index := 0; index < 2; index++ {
+		go func() {
+			<-start
+			values, recordErr := service.RecordReport(ctx, firstReport)
+			results <- values
+			failures <- recordErr
+		}()
+	}
+	close(start)
+	first := <-results
+	firstErr := <-failures
+	secondConcurrent := <-results
+	secondErr := <-failures
+	require.NoError(t, firstErr)
+	require.NoError(t, secondErr)
 	require.Len(t, first, 1)
+	require.Len(t, secondConcurrent, 1)
 	firstSeen := first[0].FirstSeenAt
-	replayed, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now})
+	require.Equal(t, firstSeen, secondConcurrent[0].FirstSeenAt)
+	replayed, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation})
 	require.NoError(t, err)
 	require.Len(t, replayed, 1)
 	require.Equal(t, firstSeen, replayed[0].FirstSeenAt)
-	_, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 0, RuleRevision: 4, ObservedAt: now})
+	conflicting := firstReport
+	conflicting.Candidates = append([]CandidateObservation(nil), firstReport.Candidates...)
+	conflicting.Candidates[0].VersionHint = "8.4"
+	conflicting.Candidates[0].Evidence = append(conflicting.Candidates[0].Evidence, Evidence{Kind: EvidenceVersionHint, Value: "8.4"})
+	_, err = service.RecordReport(ctx, conflicting)
+	require.ErrorIs(t, err, ErrConflict)
+	_, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 0, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
 	require.Error(t, err)
 	later := now.Add(11 * time.Minute)
 	service.Now = func() time.Time { return later }
-	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, ObservedAt: later})
+	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, ObservedAt: later, RuleAttestation: attestation})
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	require.Equal(t, StatusDisappeared, page[0].Status)

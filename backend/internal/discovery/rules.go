@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"regexp"
 	"sort"
@@ -10,9 +11,11 @@ import (
 )
 
 const (
-	MinimumScanInterval = time.Minute
-	MaximumScanInterval = time.Hour
-	MaximumRules        = 128
+	MinimumScanInterval      = time.Minute
+	MaximumScanInterval      = time.Hour
+	MaximumRules             = 128
+	RuleAttestationVersion   = 1
+	RuleAttestationAlgorithm = "ed25519-sha256"
 )
 
 type Rule struct {
@@ -85,35 +88,105 @@ func (rules RuleSet) Validate() error {
 
 type SignedRuleSet struct {
 	RuleSet   RuleSet `json:"rule_set"`
+	KeyID     string  `json:"key_id"`
 	Signature []byte  `json:"signature"`
 }
 
+type RuleAttestation struct {
+	Version            uint32            `json:"version"`
+	Algorithm          string            `json:"algorithm"`
+	KeyID              string            `json:"key_id"`
+	Revision           uint64            `json:"revision"`
+	Digest             [sha256.Size]byte `json:"digest"`
+	IssuedAt           time.Time         `json:"issued_at"`
+	ExpiresAt          time.Time         `json:"expires_at"`
+	DisappearanceGrace time.Duration     `json:"disappearance_grace"`
+	Signature          []byte            `json:"-"`
+}
+
 func SignRuleSet(privateKey ed25519.PrivateKey, rules RuleSet) (SignedRuleSet, error) {
+	return SignRuleSetWithKey(privateKey, "default", rules)
+}
+
+func SignRuleSetWithKey(privateKey ed25519.PrivateKey, keyID string, rules RuleSet) (SignedRuleSet, error) {
 	if len(privateKey) != ed25519.PrivateKeySize || rules.Validate() != nil {
 		return SignedRuleSet{}, ErrInvalidRuleSet
 	}
-	encoded, err := canonicalRuleSet(rules)
+	digest, err := CanonicalRuleSetDigest(rules)
 	if err != nil {
 		return SignedRuleSet{}, ErrInvalidRuleSet
 	}
-	return SignedRuleSet{RuleSet: rules, Signature: ed25519.Sign(privateKey, encoded)}, nil
+	attestation := RuleAttestation{Version: RuleAttestationVersion, Algorithm: RuleAttestationAlgorithm, KeyID: keyID, Revision: rules.Revision, Digest: digest, IssuedAt: rules.IssuedAt, ExpiresAt: rules.ExpiresAt, DisappearanceGrace: rules.DisappearanceGrace}
+	encoded, err := canonicalAttestation(attestation)
+	if err != nil {
+		return SignedRuleSet{}, ErrInvalidRuleSet
+	}
+	return SignedRuleSet{RuleSet: rules, KeyID: keyID, Signature: ed25519.Sign(privateKey, encoded)}, nil
 }
 
 func VerifyRuleSet(publicKey ed25519.PublicKey, envelope SignedRuleSet, now time.Time, previousRevision uint64) (RuleSet, error) {
 	if len(publicKey) != ed25519.PublicKeySize || !validUTC(now) || envelope.RuleSet.Validate() != nil {
 		return RuleSet{}, ErrInvalidRuleSet
 	}
-	encoded, err := canonicalRuleSet(envelope.RuleSet)
+	digest, err := CanonicalRuleSetDigest(envelope.RuleSet)
+	if err != nil {
+		return RuleSet{}, ErrInvalidRuleSet
+	}
+	attestation := RuleAttestation{Version: RuleAttestationVersion, Algorithm: RuleAttestationAlgorithm, KeyID: envelope.KeyID, Revision: envelope.RuleSet.Revision, Digest: digest, IssuedAt: envelope.RuleSet.IssuedAt, ExpiresAt: envelope.RuleSet.ExpiresAt, DisappearanceGrace: envelope.RuleSet.DisappearanceGrace}
+	encoded, err := canonicalAttestation(attestation)
 	if err != nil || len(envelope.Signature) != ed25519.SignatureSize || !ed25519.Verify(publicKey, encoded, envelope.Signature) {
 		return RuleSet{}, ErrInvalidSignature
 	}
-	if !envelope.RuleSet.ExpiresAt.After(now) {
+	if now.Before(envelope.RuleSet.IssuedAt) || !envelope.RuleSet.ExpiresAt.After(now) {
 		return RuleSet{}, ErrInvalidRuleSet
 	}
 	if previousRevision != 0 && envelope.RuleSet.Revision <= previousRevision {
 		return RuleSet{}, ErrRuleRevisionRollback
 	}
 	return envelope.RuleSet, nil
+}
+
+func AttestationFor(envelope SignedRuleSet) (RuleAttestation, error) {
+	digest, err := CanonicalRuleSetDigest(envelope.RuleSet)
+	if err != nil {
+		return RuleAttestation{}, err
+	}
+	return RuleAttestation{Version: RuleAttestationVersion, Algorithm: RuleAttestationAlgorithm, KeyID: envelope.KeyID, Revision: envelope.RuleSet.Revision, Digest: digest, IssuedAt: envelope.RuleSet.IssuedAt, ExpiresAt: envelope.RuleSet.ExpiresAt, DisappearanceGrace: envelope.RuleSet.DisappearanceGrace, Signature: append([]byte(nil), envelope.Signature...)}, nil
+}
+
+func VerifyRuleAttestation(publicKey ed25519.PublicKey, attestation RuleAttestation, now time.Time) error {
+	if len(publicKey) != ed25519.PublicKeySize || len(attestation.Signature) != ed25519.SignatureSize || attestation.Version != RuleAttestationVersion || attestation.Algorithm != RuleAttestationAlgorithm || !safeRuleLiteral(attestation.KeyID) || attestation.Revision == 0 || !validUTC(attestation.IssuedAt) || !validUTC(attestation.ExpiresAt) || now.Before(attestation.IssuedAt) || !attestation.ExpiresAt.After(now) || attestation.DisappearanceGrace < MinimumScanInterval || attestation.DisappearanceGrace > 24*time.Hour {
+		return ErrInvalidRuleSet
+	}
+	encoded, err := canonicalAttestation(attestation)
+	if err != nil || !ed25519.Verify(publicKey, encoded, attestation.Signature) {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
+func (rules RuleSet) Active(now time.Time) error {
+	if rules.Validate() != nil || !validUTC(now) || now.Before(rules.IssuedAt) || !rules.ExpiresAt.After(now) {
+		return ErrInvalidRuleSet
+	}
+	return nil
+}
+
+func CanonicalRuleSetDigest(rules RuleSet) ([sha256.Size]byte, error) {
+	encoded, err := canonicalRuleSet(rules)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	return sha256.Sum256(encoded), nil
+}
+
+func canonicalAttestation(attestation RuleAttestation) ([]byte, error) {
+	if attestation.Version != RuleAttestationVersion || attestation.Algorithm != RuleAttestationAlgorithm || !safeRuleLiteral(attestation.KeyID) {
+		return nil, ErrInvalidRuleSet
+	}
+	copy := attestation
+	copy.Signature = nil
+	return json.Marshal(copy)
 }
 
 func canonicalRuleSet(rules RuleSet) ([]byte, error) {

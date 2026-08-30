@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,6 +16,12 @@ import (
 	"dbpilot.local/platform/internal/telemetry"
 	"github.com/stretchr/testify/require"
 )
+
+func TestProcHelperRequiresExplicitNonzeroPeerIdentity(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	require.Equal(t, 2, run([]string{"proc-helper"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "--allowed-uid and --allowed-gid")
+}
 
 func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testing.T) {
 	var typedNil *mainHostCollector
