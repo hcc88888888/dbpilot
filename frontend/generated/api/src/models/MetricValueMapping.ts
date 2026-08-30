@@ -27,7 +27,6 @@ import {
  * @interface MetricValueMapping
  */
 export interface MetricValueMapping {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -76,8 +75,6 @@ export function MetricValueMappingFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'sourceColumn': json['source_column'],
         'metricName': json['metric_name'],
         'metricType': MetricValueTypeFromJSON(json['metric_type']),
@@ -95,8 +92,6 @@ export function MetricValueMappingToJSONTyped(value?: MetricValueMapping | null,
     }
 
     return {
-
-            ...value,
         'source_column': value['sourceColumn'],
         'metric_name': value['metricName'],
         'metric_type': MetricValueTypeToJSON(value['metricType']),

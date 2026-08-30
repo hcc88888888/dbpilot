@@ -32,6 +32,14 @@ function operations(document) {
   ));
 }
 
+function operationInventory(document) {
+  return Object.entries(document.paths).flatMap(([path, pathItem]) =>
+    Object.entries(pathItem)
+      .filter(([method]) => ['get', 'post', 'patch'].includes(method))
+      .map(([method, operation]) => ({ path, method, operation })),
+  );
+}
+
 function requiredHeader(operation, name) {
   const header = operation.parameters?.find((parameter) => parameter.in === 'header' && parameter.name === name);
   assert.ok(header, `${operation.operationId} declares ${name}`);
@@ -43,37 +51,111 @@ function resolvedSchema(document, schema) {
   return document.components.schemas[schema.$ref.replace('#/components/schemas/', '')];
 }
 
-test('host and plugin operations expose exact permissions and concurrency headers', async () => {
+function visitResolvedSchema(document, schema, path, visitor, seen = new Set()) {
+  if (!schema) return;
+  if (schema.$ref) {
+    if (seen.has(schema.$ref)) return;
+    const nextSeen = new Set(seen).add(schema.$ref);
+    visitResolvedSchema(document, resolvedSchema(document, schema), path, visitor, nextSeen);
+    return;
+  }
+  visitor(schema, path);
+  for (const [name, property] of Object.entries(schema.properties ?? {})) {
+    visitResolvedSchema(document, property, `${path}.${name}`, visitor, new Set(seen));
+  }
+  if (schema.items) visitResolvedSchema(document, schema.items, `${path}[]`, visitor, new Set(seen));
+  if (typeof schema.additionalProperties === 'object') {
+    visitResolvedSchema(document, schema.additionalProperties, `${path}{}`, visitor, new Set(seen));
+  }
+  for (const [index, alternative] of (schema.oneOf ?? []).entries()) {
+    visitResolvedSchema(document, alternative, `${path}.oneOf[${index}]`, visitor, new Set(seen));
+  }
+}
+
+test('host plugin platform exposes the complete exact operation inventory', async () => {
+  const document = await bundleContract();
+  const prefixes = ['hosts:', 'discovery:', 'database-instances:', 'plugins:', 'metric-templates:'];
+  const actual = operationInventory(document)
+    .filter(({ operation }) => prefixes.some((prefix) => operation['x-dbpilot-permission']?.startsWith(prefix)))
+    .map(({ path, method, operation }) => [path, method, operation.operationId, operation['x-dbpilot-permission']])
+    .sort((left, right) => left[2].localeCompare(right[2]));
+  const expected = [
+    ['/discovery-candidates/{candidate_id}/actions/accept', 'post', 'acceptDiscoveryCandidate', 'discovery:manage'],
+    ['/plugin-versions/{version_id}/actions/approve', 'post', 'approvePluginVersion', 'plugins:approve'],
+    ['/metric-template-revisions/{revision_id}/actions/approve', 'post', 'approveMetricTemplateRevision', 'metric-templates:approve'],
+    ['/metric-templates', 'post', 'createMetricTemplate', 'metric-templates:manage'],
+    ['/metric-templates/{template_id}/revisions', 'post', 'createMetricTemplateRevision', 'metric-templates:manage'],
+    ['/hosts/{host_id}/actions/decommission', 'post', 'decommissionHost', 'hosts:manage'],
+    ['/discovery-candidates/{candidate_id}', 'get', 'getDiscoveryCandidate', 'discovery:view'],
+    ['/database-instances/{instance_id}', 'get', 'getDatabaseInstance', 'database-instances:view'],
+    ['/hosts/{host_id}', 'get', 'getHost', 'hosts:view'],
+    ['/plugin-assignments/{assignment_id}', 'get', 'getPluginAssignment', 'plugins:view'],
+    ['/discovery-candidates/{candidate_id}/actions/ignore', 'post', 'ignoreDiscoveryCandidate', 'discovery:manage'],
+    ['/discovery-candidates', 'get', 'listDiscoveryCandidates', 'discovery:view'],
+    ['/database-instances', 'get', 'listDatabaseInstances', 'database-instances:view'],
+    ['/hosts', 'get', 'listHosts', 'hosts:view'],
+    ['/metric-templates/{template_id}/revisions', 'get', 'listMetricTemplateRevisions', 'metric-templates:view'],
+    ['/metric-templates', 'get', 'listMetricTemplates', 'metric-templates:view'],
+    ['/plugin-assignments', 'get', 'listPluginAssignments', 'plugins:view'],
+    ['/plugin-definitions', 'get', 'listPluginDefinitions', 'plugins:view'],
+    ['/plugin-versions', 'get', 'listPluginVersions', 'plugins:view'],
+    ['/plugin-versions/{version_id}/actions/publish', 'post', 'publishPluginVersion', 'plugins:publish'],
+    ['/metric-template-revisions/{revision_id}/actions/publish', 'post', 'publishMetricTemplateRevision', 'metric-templates:approve'],
+    ['/plugin-assignments/{assignment_id}/actions/reconcile', 'post', 'reconcilePluginAssignment', 'plugins:deploy'],
+    ['/hosts/{host_id}/actions/rediscover', 'post', 'rediscoverHost', 'hosts:discover'],
+    ['/database-instances/{instance_id}/actions/retire', 'post', 'retireDatabaseInstance', 'database-instances:manage'],
+    ['/plugin-versions/{version_id}/actions/revoke', 'post', 'revokePluginVersion', 'plugins:publish'],
+    ['/database-instances/{instance_id}/actions/test-connection', 'post', 'testDatabaseInstanceConnection', 'database-instances:test'],
+    ['/metric-template-revisions/{revision_id}/actions/trial', 'post', 'trialMetricTemplateRevision', 'metric-templates:manage'],
+    ['/database-instances/{instance_id}', 'patch', 'updateDatabaseInstance', 'database-instances:manage'],
+    ['/plugin-assignments/{assignment_id}', 'patch', 'updatePluginAssignment', 'plugins:manage'],
+    ['/plugin-versions', 'post', 'uploadPluginVersionPackage', 'plugins:publish'],
+    ['/metric-template-revisions/{revision_id}/actions/validate', 'post', 'validateMetricTemplateRevision', 'metric-templates:manage'],
+  ].sort((left, right) => left[2].localeCompare(right[2]));
+  assert.deepEqual(actual, expected);
+
+  const writes = actual.filter(([, method]) => method !== 'get').map(([, , operationId]) => operationId);
+  const byId = operations(document);
+  for (const operationId of writes) requiredHeader(byId.get(operationId), 'Idempotency-Key');
+  for (const operationId of [
+    'decommissionHost', 'updateDatabaseInstance', 'retireDatabaseInstance', 'approvePluginVersion',
+    'publishPluginVersion', 'revokePluginVersion', 'updatePluginAssignment', 'validateMetricTemplateRevision',
+    'approveMetricTemplateRevision', 'publishMetricTemplateRevision',
+  ]) requiredHeader(byId.get(operationId), 'If-Match');
+});
+
+test('plugin version upload is bounded streaming and lifecycle actions expose manifest-derived state', async () => {
   const document = await bundleContract();
   const actual = operations(document);
-  const reads = new Map([
-    ['listHosts', 'hosts:view'], ['getHost', 'hosts:view'],
-    ['listDiscoveryCandidates', 'discovery:view'], ['getDiscoveryCandidate', 'discovery:view'],
-    ['listDatabaseInstances', 'database-instances:view'], ['getDatabaseInstance', 'database-instances:view'],
-    ['listPluginDefinitions', 'plugins:view'], ['listPluginVersions', 'plugins:view'],
-    ['listPluginAssignments', 'plugins:view'], ['getPluginAssignment', 'plugins:view'],
-    ['listMetricTemplates', 'metric-templates:view'], ['listMetricTemplateRevisions', 'metric-templates:view'],
-  ]);
-  const writes = new Map([
-    ['rediscoverHost', 'hosts:discover'], ['decommissionHost', 'hosts:manage'],
-    ['acceptDiscoveryCandidate', 'discovery:manage'], ['ignoreDiscoveryCandidate', 'discovery:manage'],
-    ['updateDatabaseInstance', 'database-instances:manage'], ['testDatabaseInstanceConnection', 'database-instances:test'],
-    ['createPluginVersion', 'plugins:publish'], ['approvePluginVersion', 'plugins:approve'],
-    ['updatePluginAssignment', 'plugins:manage'], ['reconcilePluginAssignment', 'plugins:deploy'],
-    ['createMetricTemplate', 'metric-templates:manage'], ['createMetricTemplateRevision', 'metric-templates:manage'],
-    ['validateMetricTemplateRevision', 'metric-templates:manage'], ['trialMetricTemplateRevision', 'metric-templates:manage'],
-    ['approveMetricTemplateRevision', 'metric-templates:approve'], ['publishMetricTemplateRevision', 'metric-templates:approve'],
-  ]);
-
-  for (const [operationId, permission] of [...reads, ...writes]) {
-    assert.ok(actual.has(operationId), `${operationId} is exposed`);
-    assert.equal(actual.get(operationId)['x-dbpilot-permission'], permission);
+  const upload = actual.get('uploadPluginVersionPackage');
+  const body = upload.requestBody.content['application/gzip'].schema;
+  assert.equal(body.type, 'string');
+  assert.equal(body.format, 'binary');
+  assert.equal(body.maxLength, 268435456);
+  const contentLength = upload.parameters.find((item) => item.in === 'header' && item.name === 'Content-Length');
+  assert.equal(contentLength.required, true);
+  assert.equal(contentLength.schema.maximum, 268435456);
+  for (const operationId of ['approvePluginVersion', 'publishPluginVersion', 'revokePluginVersion']) {
+    assert.equal(actual.get(operationId).responses['200'].content['application/json'].schema.$ref, '#/components/schemas/PluginVersion');
   }
-  for (const operationId of writes.keys()) requiredHeader(actual.get(operationId), 'Idempotency-Key');
-  for (const operationId of [
-    'decommissionHost', 'updateDatabaseInstance', 'approvePluginVersion',
-    'updatePluginAssignment', 'approveMetricTemplateRevision', 'publishMetricTemplateRevision',
-  ]) requiredHeader(actual.get(operationId), 'If-Match');
+  const version = document.components.schemas.PluginVersion;
+  for (const field of ['supported_variants', 'database_version_range', 'capabilities', 'metric_template_schema_version']) {
+    assert.ok(version.required.includes(field), `PluginVersion requires manifest-derived ${field}`);
+  }
+  assert.equal(version.properties.supported_variants.maxItems, 16);
+  assert.equal(version.properties.capabilities.maxItems, 64);
+});
+
+test('database retirement and synchronous template validation expose exact CAS responses', async () => {
+  const document = await bundleContract();
+  const actual = operations(document);
+  const retire = actual.get('retireDatabaseInstance');
+  assert.equal(retire.responses['200'].content['application/json'].schema.$ref, '#/components/schemas/ManagedDatabaseInstance');
+  assert.equal(retire.responses['200'].headers.ETag.required, true);
+  const validate = actual.get('validateMetricTemplateRevision');
+  assert.equal(validate.responses['200'].content['application/json'].schema.$ref, '#/components/schemas/MetricTemplateRevision');
+  assert.equal(validate.responses['200'].headers.ETag.required, true);
+  assert.equal(validate.responses['202'], undefined);
 });
 
 test('host database plugin and metric template DTOs are closed and bounded', async () => {
@@ -107,11 +189,18 @@ test('host database plugin and metric template DTOs are closed and bounded', asy
   assert.equal(schemas.ManagedHost.properties.labels.maxProperties, 32);
   assert.equal(schemas.ManagedHost.properties.labels.additionalProperties.maxLength, 128);
   assert.equal(schemas.DiscoveryCandidate.properties.evidence_summary.maxItems, 32);
-  assert.equal(schemas.DiscoveryCandidate.properties.evidence_summary.items.maxLength, 256);
+  const evidence = resolvedSchema(document, schemas.DiscoveryCandidate.properties.evidence_summary.items);
+  assert.equal(evidence.additionalProperties, false);
+  assert.deepEqual(resolvedSchema(document, evidence.properties.kind).enum, [
+    'process_name', 'executable_path', 'systemd_unit', 'listen_endpoint', 'unix_socket',
+    'container_image', 'container_label', 'container_port', 'version_hint',
+  ]);
+  assert.equal(evidence.properties.value.maxLength, 256);
   assert.equal(schemas.ManagedDatabaseInstance.properties.capabilities.maxItems, 64);
   assert.equal(schemas.PluginDefinition.properties.capabilities.maxItems, 64);
   assert.equal(schemas.PluginVersion.properties.platforms.maxItems, 16);
   assert.equal(schemas.PluginAssignment.properties.rollout_percentage.maximum, 100);
+  assert.ok(schemas.PluginObservedState.required.includes('circuit_state'));
   assert.equal(schemas.MetricTemplateRevision.properties.timeout_seconds.maximum, 30);
   assert.equal(schemas.MetricTemplateRevision.properties.max_rows.maximum, 100);
   assert.equal(schemas.MetricTemplateRevision.properties.max_columns.maximum, 32);
@@ -120,14 +209,35 @@ test('host database plugin and metric template DTOs are closed and bounded', asy
   assert.equal(schemas.MetricTemplateRevision.properties.label_mappings.maxItems, 16);
   assert.equal(resolvedSchema(document, schemas.MetricTemplateRevision.properties.label_mappings.items).properties.label.maxLength, 128);
 
-  const forbiddenResponseFields = new Set([
-    'password', 'secret', 'secret_bytes', 'access_token', 'private_key', 'download_url', 'signed_url', 'storage_path',
-  ]);
-  for (const [name, schema] of Object.entries(schemas)) {
-    if (!schema.properties) continue;
-    for (const field of Object.keys(schema.properties)) {
-      assert.equal(forbiddenResponseFields.has(field), false, `${name}.${field} is not a REST response field`);
-    }
+  assert.deepEqual(schemas.MetricQueryKind.enum, ['sql']);
+  for (const name of ['MetricTemplateRevision', 'CreateMetricTemplateRevisionRequest']) {
+    assert.ok(schemas[name].required.includes('query_kind'), `${name} requires query_kind`);
+    assert.ok(schemas[name].required.includes('read_only_statement'), `${name} requires read_only_statement`);
+    assert.equal(schemas[name].properties.structured_query, undefined, `${name} has no unbounded structured query`);
+  }
+
+  const roots = [
+    'ManagedHost', 'DiscoveryCandidate', 'AcceptDiscoveryCandidateRequest', 'ManagedDatabaseInstance',
+    'UpdateDatabaseInstanceRequest', 'PluginVersion', 'PluginAssignment', 'PluginObservedState',
+    'MetricTemplateRevision', 'CreateMetricTemplateRevisionRequest',
+  ];
+  for (const name of roots) {
+    visitResolvedSchema(document, schemas[name], name, (schema, path) => {
+      if (typeof schema.additionalProperties === 'object') {
+        assert.ok(schema.propertyNames, `${path} bounds map property names`);
+        assert.ok(schema.propertyNames.maxLength, `${path} bounds map property-name length`);
+      }
+      if (schema.type === 'array') assert.ok(schema.maxItems, `${path} bounds array length`);
+    });
+  }
+
+  const forbiddenResponseField = /^(?:password|secret|secret_bytes|access_token|private_key|download_url|signed_url|storage_path)$/;
+  for (const name of roots) {
+    visitResolvedSchema(document, schemas[name], name, (schema, path) => {
+      for (const field of Object.keys(schema.properties ?? {})) {
+        assert.doesNotMatch(field, forbiddenResponseField, `${path}.${field} is not a secret-bearing REST field`);
+      }
+    });
   }
 });
 

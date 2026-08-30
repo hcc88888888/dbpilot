@@ -26,7 +26,6 @@ export function UpdatePluginAssignmentRequestFromJSONTyped(json, ignoreDiscrimin
         return json;
     }
     return {
-        ...json,
         'desiredVersion': json['desired_version'] == null ? undefined : json['desired_version'],
         'desiredState': json['desired_state'] == null ? undefined : PluginDesiredStateFromJSON(json['desired_state']),
         'rolloutPercentage': json['rollout_percentage'] == null ? undefined : json['rollout_percentage'],
@@ -40,7 +39,6 @@ export function UpdatePluginAssignmentRequestToJSONTyped(value, ignoreDiscrimina
         return value;
     }
     return {
-        ...value,
         'desired_version': value['desiredVersion'],
         'desired_state': PluginDesiredStateToJSON(value['desiredState']),
         'rollout_percentage': value['rolloutPercentage'],

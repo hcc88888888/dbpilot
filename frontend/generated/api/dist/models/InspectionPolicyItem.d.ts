@@ -15,7 +15,6 @@
  * @interface InspectionPolicyItem
  */
 export interface InspectionPolicyItem {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

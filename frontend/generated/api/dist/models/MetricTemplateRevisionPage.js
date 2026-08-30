@@ -31,7 +31,6 @@ export function MetricTemplateRevisionPageFromJSONTyped(json, ignoreDiscriminato
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(MetricTemplateRevisionFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function MetricTemplateRevisionPageToJSONTyped(value, ignoreDiscriminator
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(MetricTemplateRevisionToJSON)),
         'page': PageToJSON(value['page']),
     };

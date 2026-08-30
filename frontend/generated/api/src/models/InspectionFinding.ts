@@ -27,7 +27,6 @@ import {
  * @interface InspectionFinding
  */
 export interface InspectionFinding {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -129,8 +128,6 @@ export function InspectionFindingFromJSONTyped(json: any, ignoreDiscriminator: b
         return json;
     }
     return {
-
-            ...json,
         'id': json['id'],
         'itemId': json['item_id'],
         'itemVersion': json['item_version'],
@@ -156,8 +153,6 @@ export function InspectionFindingToJSONTyped(value?: InspectionFinding | null, i
     }
 
     return {
-
-            ...value,
         'id': value['id'],
         'item_id': value['itemId'],
         'item_version': value['itemVersion'],

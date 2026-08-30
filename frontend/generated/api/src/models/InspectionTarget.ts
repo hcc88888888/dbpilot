@@ -27,7 +27,6 @@ import {
  * @interface InspectionTarget
  */
 export interface InspectionTarget {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -96,8 +95,6 @@ export function InspectionTargetFromJSONTyped(json: any, ignoreDiscriminator: bo
         return json;
     }
     return {
-
-            ...json,
         'agentId': json['agent_id'],
         'displayName': json['display_name'],
         'host': json['host'],
@@ -118,8 +115,6 @@ export function InspectionTargetToJSONTyped(value?: InspectionTarget | null, ign
     }
 
     return {
-
-            ...value,
         'agent_id': value['agentId'],
         'display_name': value['displayName'],
         'host': value['host'],

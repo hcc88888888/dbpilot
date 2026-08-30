@@ -40,7 +40,6 @@ export function InspectionMetricRuleFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'metricName': json['metric_name'],
         'labels': json['labels'] == null ? undefined : json['labels'],
         'window': InspectionMetricWindowFromJSON(json['window']),
@@ -58,7 +57,6 @@ export function InspectionMetricRuleToJSONTyped(value, ignoreDiscriminator = fal
         return value;
     }
     return {
-        ...value,
         'metric_name': value['metricName'],
         'labels': value['labels'],
         'window': InspectionMetricWindowToJSON(value['window']),

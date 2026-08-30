@@ -15,7 +15,6 @@
  * @interface HostResourceSummary
  */
 export interface HostResourceSummary {
-    [key: string]: any | any;
     /**
      *
      * @type {number}

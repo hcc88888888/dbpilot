@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface HostResourceSummary
  */
 export interface HostResourceSummary {
-    [key: string]: any | any;
     /**
      *
      * @type {number}
@@ -52,8 +51,6 @@ export function HostResourceSummaryFromJSONTyped(json: any, ignoreDiscriminator:
         return json;
     }
     return {
-
-            ...json,
         'capacity': json['capacity'],
         'available': json['available'],
     };
@@ -69,8 +66,6 @@ export function HostResourceSummaryToJSONTyped(value?: HostResourceSummary | nul
     }
 
     return {
-
-            ...value,
         'capacity': value['capacity'],
         'available': value['available'],
     };

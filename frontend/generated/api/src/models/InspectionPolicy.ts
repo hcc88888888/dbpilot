@@ -34,7 +34,6 @@ import {
  * @interface InspectionPolicy
  */
 export interface InspectionPolicy {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -140,8 +139,6 @@ export function InspectionPolicyFromJSONTyped(json: any, ignoreDiscriminator: bo
         return json;
     }
     return {
-
-            ...json,
         'id': json['id'],
         'name': json['name'],
         'enabled': json['enabled'],
@@ -168,8 +165,6 @@ export function InspectionPolicyToJSONTyped(value?: InspectionPolicy | null, ign
     }
 
     return {
-
-            ...value,
         'id': value['id'],
         'name': value['name'],
         'enabled': value['enabled'],

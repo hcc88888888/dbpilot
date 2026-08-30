@@ -20,6 +20,13 @@ import {
     DiscoverySourceToJSON,
     DiscoverySourceToJSONTyped,
 } from './DiscoverySource.js';
+import type { DiscoveryEvidence } from './DiscoveryEvidence.js';
+import {
+    DiscoveryEvidenceFromJSON,
+    DiscoveryEvidenceFromJSONTyped,
+    DiscoveryEvidenceToJSON,
+    DiscoveryEvidenceToJSONTyped,
+} from './DiscoveryEvidence.js';
 import type { DiscoveryCandidateStatus } from './DiscoveryCandidateStatus.js';
 import {
     DiscoveryCandidateStatusFromJSON,
@@ -34,7 +41,6 @@ import {
  * @interface DiscoveryCandidate
  */
 export interface DiscoveryCandidate {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -139,10 +145,10 @@ export interface DiscoveryCandidate {
     confidence: number;
     /**
      *
-     * @type {Set<string>}
+     * @type {Set<DiscoveryEvidence>}
      * @memberof DiscoveryCandidate
      */
-    evidenceSummary: Set<string>;
+    evidenceSummary: Set<DiscoveryEvidence>;
     /**
      *
      * @type {string}
@@ -214,8 +220,6 @@ export function DiscoveryCandidateFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'candidateId': json['candidate_id'],
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
@@ -233,7 +237,7 @@ export function DiscoveryCandidateFromJSONTyped(json: any, ignoreDiscriminator: 
         'containerImage': json['container_image'] == null ? undefined : json['container_image'],
         'discoveredRole': json['discovered_role'] == null ? undefined : json['discovered_role'],
         'confidence': json['confidence'],
-        'evidenceSummary': new Set(json['evidence_summary']),
+        'evidenceSummary': (new Set((json['evidence_summary'] as Array<any>).map(DiscoveryEvidenceFromJSON))),
         'fingerprint': json['fingerprint'],
         'possibleDuplicateOf': json['possible_duplicate_of'] == null ? undefined : json['possible_duplicate_of'],
         'ruleRevision': json['rule_revision'],
@@ -253,8 +257,6 @@ export function DiscoveryCandidateToJSONTyped(value?: DiscoveryCandidate | null,
     }
 
     return {
-
-            ...value,
         'candidate_id': value['candidateId'],
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],
@@ -272,7 +274,7 @@ export function DiscoveryCandidateToJSONTyped(value?: DiscoveryCandidate | null,
         'container_image': value['containerImage'],
         'discovered_role': value['discoveredRole'],
         'confidence': value['confidence'],
-        'evidence_summary': Array.from(value['evidenceSummary'] as Set<any>),
+        'evidence_summary': (Array.from(value['evidenceSummary'] as Set<any>).map(DiscoveryEvidenceToJSON)),
         'fingerprint': value['fingerprint'],
         'possible_duplicate_of': value['possibleDuplicateOf'],
         'rule_revision': value['ruleRevision'],

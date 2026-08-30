@@ -17,7 +17,6 @@ import type { PluginObservedState } from './PluginObservedState.js';
  * @interface PluginAssignment
  */
 export interface PluginAssignment {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

@@ -12,7 +12,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, CreatePluginVersionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
+import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, PublishPluginVersionRequestToJSON, RevokePluginVersionRequestToJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
 /**
  *
  */
@@ -530,46 +530,6 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async createMetricTemplateRevision(requestParameters, initOverrides) {
         const response = await this.createMetricTemplateRevisionRaw(requestParameters, initOverrides);
-        return await response.value();
-    }
-    /**
-     * Register a Server-hosted signed plugin artifact
-     */
-    async createPluginVersionRaw(requestParameters, initOverrides) {
-        if (requestParameters['idempotencyKey'] == null) {
-            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createPluginVersion().');
-        }
-        if (requestParameters['createPluginVersionRequest'] == null) {
-            throw new runtime.RequiredError('createPluginVersionRequest', 'Required parameter "createPluginVersionRequest" was null or undefined when calling createPluginVersion().');
-        }
-        const queryParameters = {};
-        const headerParameters = {};
-        headerParameters['Content-Type'] = 'application/json';
-        if (requestParameters['idempotencyKey'] != null) {
-            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
-        }
-        if (this.configuration && this.configuration.accessToken) {
-            const token = this.configuration.accessToken;
-            const tokenString = await token("bearerAuth", []);
-            if (tokenString) {
-                headerParameters["Authorization"] = `Bearer ${tokenString}`;
-            }
-        }
-        let urlPath = `/plugin-versions`;
-        const response = await this.request({
-            path: urlPath,
-            method: 'POST',
-            headers: headerParameters,
-            query: queryParameters,
-            body: CreatePluginVersionRequestToJSON(requestParameters['createPluginVersionRequest']),
-        }, initOverrides);
-        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
-    }
-    /**
-     * Register a Server-hosted signed plugin artifact
-     */
-    async createPluginVersion(requestParameters, initOverrides) {
-        const response = await this.createPluginVersionRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**
@@ -1598,6 +1558,56 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Publish an approved plugin version for new assignments
+     */
+    async publishPluginVersionRaw(requestParameters, initOverrides) {
+        if (requestParameters['versionId'] == null) {
+            throw new runtime.RequiredError('versionId', 'Required parameter "versionId" was null or undefined when calling publishPluginVersion().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling publishPluginVersion().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling publishPluginVersion().');
+        }
+        if (requestParameters['publishPluginVersionRequest'] == null) {
+            throw new runtime.RequiredError('publishPluginVersionRequest', 'Required parameter "publishPluginVersionRequest" was null or undefined when calling publishPluginVersion().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions/{version_id}/actions/publish`;
+        urlPath = urlPath.replace(`{${"version_id"}}`, encodeURIComponent(String(requestParameters['versionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: PublishPluginVersionRequestToJSON(requestParameters['publishPluginVersionRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
+    }
+    /**
+     * Publish an approved plugin version for new assignments
+     */
+    async publishPluginVersion(requestParameters, initOverrides) {
+        const response = await this.publishPluginVersionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Trigger typed plugin reconciliation
      */
     async reconcilePluginAssignmentRaw(requestParameters, initOverrides) {
@@ -1676,6 +1686,51 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Retire a managed database instance
+     */
+    async retireDatabaseInstanceRaw(requestParameters, initOverrides) {
+        if (requestParameters['instanceId'] == null) {
+            throw new runtime.RequiredError('instanceId', 'Required parameter "instanceId" was null or undefined when calling retireDatabaseInstance().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling retireDatabaseInstance().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling retireDatabaseInstance().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/database-instances/{instance_id}/actions/retire`;
+        urlPath = urlPath.replace(`{${"instance_id"}}`, encodeURIComponent(String(requestParameters['instanceId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedDatabaseInstanceFromJSON(jsonValue));
+    }
+    /**
+     * Retire a managed database instance
+     */
+    async retireDatabaseInstance(requestParameters, initOverrides) {
+        const response = await this.retireDatabaseInstanceRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Retry a terminal inspection run as a new run
      */
     async retryInspectionRunRaw(requestParameters, initOverrides) {
@@ -1712,6 +1767,56 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async retryInspectionRun(requestParameters, initOverrides) {
         const response = await this.retryInspectionRunRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Revoke a plugin version from future assignments
+     */
+    async revokePluginVersionRaw(requestParameters, initOverrides) {
+        if (requestParameters['versionId'] == null) {
+            throw new runtime.RequiredError('versionId', 'Required parameter "versionId" was null or undefined when calling revokePluginVersion().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling revokePluginVersion().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling revokePluginVersion().');
+        }
+        if (requestParameters['revokePluginVersionRequest'] == null) {
+            throw new runtime.RequiredError('revokePluginVersionRequest', 'Required parameter "revokePluginVersionRequest" was null or undefined when calling revokePluginVersion().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions/{version_id}/actions/revoke`;
+        urlPath = urlPath.replace(`{${"version_id"}}`, encodeURIComponent(String(requestParameters['versionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: RevokePluginVersionRequestToJSON(requestParameters['revokePluginVersionRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
+    }
+    /**
+     * Revoke a plugin version from future assignments
+     */
+    async revokePluginVersion(requestParameters, initOverrides) {
+        const response = await this.revokePluginVersionRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**
@@ -1987,6 +2092,52 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Upload a bounded signed plugin package for streaming verification
+     */
+    async uploadPluginVersionPackageRaw(requestParameters, initOverrides) {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling uploadPluginVersionPackage().');
+        }
+        if (requestParameters['contentLength'] == null) {
+            throw new runtime.RequiredError('contentLength', 'Required parameter "contentLength" was null or undefined when calling uploadPluginVersionPackage().');
+        }
+        if (requestParameters['body'] == null) {
+            throw new runtime.RequiredError('body', 'Required parameter "body" was null or undefined when calling uploadPluginVersionPackage().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/gzip';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['contentLength'] != null) {
+            headerParameters['Content-Length'] = String(requestParameters['contentLength']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: requestParameters['body'],
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
+    }
+    /**
+     * Upload a bounded signed plugin package for streaming verification
+     */
+    async uploadPluginVersionPackage(requestParameters, initOverrides) {
+        const response = await this.uploadPluginVersionPackageRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Start static validation for a draft metric template revision
      */
     async validateMetricTemplateRevisionRaw(requestParameters, initOverrides) {
@@ -1996,10 +2147,16 @@ export class DefaultApi extends runtime.BaseAPI {
         if (requestParameters['idempotencyKey'] == null) {
             throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling validateMetricTemplateRevision().');
         }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling validateMetricTemplateRevision().');
+        }
         const queryParameters = {};
         const headerParameters = {};
         if (requestParameters['idempotencyKey'] != null) {
             headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
         }
         if (this.configuration && this.configuration.accessToken) {
             const token = this.configuration.accessToken;
@@ -2016,7 +2173,7 @@ export class DefaultApi extends runtime.BaseAPI {
             headers: headerParameters,
             query: queryParameters,
         }, initOverrides);
-        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateRevisionFromJSON(jsonValue));
     }
     /**
      * Start static validation for a draft metric template revision

@@ -47,6 +47,14 @@ try {
     throw "Redocly bundle failed with exit code $LASTEXITCODE"
   }
 
+  $bundledDocument = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json -Depth 100
+  $closedSchemaNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+  foreach ($schemaProperty in $bundledDocument.components.schemas.PSObject.Properties) {
+    if ($schemaProperty.Value.additionalProperties -eq $false) {
+      $null = $closedSchemaNames.Add($schemaProperty.Name)
+    }
+  }
+
   & node $permissionGenerator $bundlePath $permissionOutput
   if ($LASTEXITCODE -ne 0) {
     throw "Permission generation failed with exit code $LASTEXITCODE"
@@ -113,6 +121,22 @@ export function ${enumName}FromJSONTyped(json: any, ignoreDiscriminator: boolean
         throw "Open enum post-processing could not update ${enumName} in $($typescriptFile.FullName)"
       }
       $source = $updated
+    }
+
+    $modelName = [IO.Path]::GetFileNameWithoutExtension($typescriptFile.Name)
+    if ($closedSchemaNames.Contains($modelName)) {
+      $source = [Text.RegularExpressions.Regex]::Replace(
+        $source,
+        '^\s*\[key: string\]: any \| any;\r?\n',
+        '',
+        [Text.RegularExpressions.RegexOptions]::Multiline
+      )
+      $source = [Text.RegularExpressions.Regex]::Replace(
+        $source,
+        '^\s*\.\.\.(?:json|value),\r?\n',
+        '',
+        [Text.RegularExpressions.RegexOptions]::Multiline
+      )
     }
 
     $source = [Text.RegularExpressions.Regex]::Replace(

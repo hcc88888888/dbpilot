@@ -52,19 +52,23 @@ PluginVersionsCollection:
       '403': { $ref: ../common/errors.yaml#/ProblemResponse }
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
   post:
-    operationId: createPluginVersion
-    summary: Register a Server-hosted signed plugin artifact
+    operationId: uploadPluginVersionPackage
+    summary: Upload a bounded signed plugin package for streaming verification
     x-dbpilot-permission: plugins:publish
     parameters:
       - name: Idempotency-Key
         in: header
         required: true
         schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Content-Length
+        in: header
+        required: true
+        schema: { type: integer, format: int64, minimum: 1, maximum: 268435456 }
     requestBody:
       required: true
       content:
-        application/json:
-          schema: { $ref: ../common/plugins.yaml#/CreatePluginVersionRequest }
+        application/gzip:
+          schema: { type: string, format: binary, minLength: 1, maxLength: 268435456 }
     responses:
       '201':
         description: Registered plugin version metadata.
@@ -105,6 +109,83 @@ ApprovePluginVersion:
     responses:
       '200':
         description: Approved plugin version.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginVersion }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+PublishPluginVersion:
+  post:
+    operationId: publishPluginVersion
+    summary: Publish an approved plugin version for new assignments
+    x-dbpilot-permission: plugins:publish
+    parameters:
+      - name: version_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/plugins.yaml#/PublishPluginVersionRequest }
+    responses:
+      '200':
+        description: Available plugin version.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginVersion }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+RevokePluginVersion:
+  post:
+    operationId: revokePluginVersion
+    summary: Revoke a plugin version from future assignments
+    x-dbpilot-permission: plugins:publish
+    parameters:
+      - name: version_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/plugins.yaml#/RevokePluginVersionRequest }
+    responses:
+      '200':
+        description: Revoked plugin version.
         headers:
           ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
         content:

@@ -15,7 +15,6 @@
  * @interface CreateMetricTemplateRequest
  */
 export interface CreateMetricTemplateRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

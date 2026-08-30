@@ -48,7 +48,6 @@ import {
  * @interface InspectionItem
  */
 export interface InspectionItem {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -177,8 +176,6 @@ export function InspectionItemFromJSONTyped(json: any, ignoreDiscriminator: bool
         return json;
     }
     return {
-
-            ...json,
         'id': json['id'],
         'version': json['version'],
         'name': json['name'],
@@ -208,8 +205,6 @@ export function InspectionItemToJSONTyped(value?: InspectionItem | null, ignoreD
     }
 
     return {
-
-            ...value,
         'id': value['id'],
         'version': value['version'],
         'name': value['name'],

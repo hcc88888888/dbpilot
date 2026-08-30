@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface MetricTemplatePage
  */
 export interface MetricTemplatePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<MetricTemplate>}

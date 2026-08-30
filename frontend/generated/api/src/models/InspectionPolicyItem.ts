@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface InspectionPolicyItem
  */
 export interface InspectionPolicyItem {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -52,8 +51,6 @@ export function InspectionPolicyItemFromJSONTyped(json: any, ignoreDiscriminator
         return json;
     }
     return {
-
-            ...json,
         'itemId': json['item_id'],
         'version': json['version'],
     };
@@ -69,8 +66,6 @@ export function InspectionPolicyItemToJSONTyped(value?: InspectionPolicyItem | n
     }
 
     return {
-
-            ...value,
         'item_id': value['itemId'],
         'version': value['version'],
     };

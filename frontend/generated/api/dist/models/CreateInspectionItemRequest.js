@@ -45,7 +45,6 @@ export function CreateInspectionItemRequestFromJSONTyped(json, ignoreDiscriminat
         return json;
     }
     return {
-        ...json,
         'name': json['name'],
         'description': json['description'],
         'category': json['category'],
@@ -66,7 +65,6 @@ export function CreateInspectionItemRequestToJSONTyped(value, ignoreDiscriminato
         return value;
     }
     return {
-        ...value,
         'name': value['name'],
         'description': value['description'],
         'category': value['category'],

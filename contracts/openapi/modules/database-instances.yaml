@@ -119,3 +119,36 @@ TestDatabaseInstanceConnection:
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
       '409': { $ref: ../common/errors.yaml#/ProblemResponse }
       '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+RetireDatabaseInstance:
+  post:
+    operationId: retireDatabaseInstance
+    summary: Retire a managed database instance
+    x-dbpilot-permission: database-instances:manage
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: { $ref: ../common/identifiers.yaml#/InstanceId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '200':
+        description: Retired database instance.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/database-instances.yaml#/ManagedDatabaseInstance }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }

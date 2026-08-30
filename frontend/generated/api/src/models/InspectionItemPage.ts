@@ -34,7 +34,6 @@ import {
  * @interface InspectionItemPage
  */
 export interface InspectionItemPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionItem>}
@@ -67,8 +66,6 @@ export function InspectionItemPageFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(InspectionItemFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function InspectionItemPageToJSONTyped(value?: InspectionItemPage | null,
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(InspectionItemToJSON)),
         'page': PageToJSON(value['page']),
     };

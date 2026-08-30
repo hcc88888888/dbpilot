@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface ManagedHostPage
  */
 export interface ManagedHostPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<ManagedHost>}

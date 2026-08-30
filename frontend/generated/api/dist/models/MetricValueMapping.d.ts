@@ -16,7 +16,6 @@ import type { MetricValueType } from './MetricValueType.js';
  * @interface MetricValueMapping
  */
 export interface MetricValueMapping {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

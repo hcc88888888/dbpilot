@@ -15,7 +15,6 @@
  * @interface AcceptDiscoveryCandidateRequest
  */
 export interface AcceptDiscoveryCandidateRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

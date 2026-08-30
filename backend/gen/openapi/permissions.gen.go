@@ -15,7 +15,6 @@ const (
 	PermissionCreateInspectionRun            = "inspection:execute"
 	PermissionCreateMetricTemplate           = "metric-templates:manage"
 	PermissionCreateMetricTemplateRevision   = "metric-templates:manage"
-	PermissionCreatePluginVersion            = "plugins:publish"
 	PermissionDecommissionHost               = "hosts:manage"
 	PermissionGetArtifact                    = "platform.artifacts.read"
 	PermissionGetCapabilities                = "platform.capabilities.read"
@@ -44,15 +43,19 @@ const (
 	PermissionListPluginDefinitions          = "plugins:view"
 	PermissionListPluginVersions             = "plugins:view"
 	PermissionPublishMetricTemplateRevision  = "metric-templates:approve"
+	PermissionPublishPluginVersion           = "plugins:publish"
 	PermissionReconcilePluginAssignment      = "plugins:deploy"
 	PermissionRediscoverHost                 = "hosts:discover"
+	PermissionRetireDatabaseInstance         = "database-instances:manage"
 	PermissionRetryInspectionRun             = "inspection:execute"
+	PermissionRevokePluginVersion            = "plugins:publish"
 	PermissionRunInspectionPolicy            = "inspection:execute"
 	PermissionTestDatabaseInstanceConnection = "database-instances:test"
 	PermissionTrialMetricTemplateRevision    = "metric-templates:manage"
 	PermissionUpdateDatabaseInstance         = "database-instances:manage"
 	PermissionUpdateInspectionPolicy         = "inspection:manage"
 	PermissionUpdatePluginAssignment         = "plugins:manage"
+	PermissionUploadPluginVersionPackage     = "plugins:publish"
 	PermissionValidateMetricTemplateRevision = "metric-templates:manage"
 )
 
@@ -69,7 +72,6 @@ var OperationPermissions = map[string]string{
 	"createInspectionRun":            PermissionCreateInspectionRun,
 	"createMetricTemplate":           PermissionCreateMetricTemplate,
 	"createMetricTemplateRevision":   PermissionCreateMetricTemplateRevision,
-	"createPluginVersion":            PermissionCreatePluginVersion,
 	"decommissionHost":               PermissionDecommissionHost,
 	"getArtifact":                    PermissionGetArtifact,
 	"getCapabilities":                PermissionGetCapabilities,
@@ -98,14 +100,18 @@ var OperationPermissions = map[string]string{
 	"listPluginDefinitions":          PermissionListPluginDefinitions,
 	"listPluginVersions":             PermissionListPluginVersions,
 	"publishMetricTemplateRevision":  PermissionPublishMetricTemplateRevision,
+	"publishPluginVersion":           PermissionPublishPluginVersion,
 	"reconcilePluginAssignment":      PermissionReconcilePluginAssignment,
 	"rediscoverHost":                 PermissionRediscoverHost,
+	"retireDatabaseInstance":         PermissionRetireDatabaseInstance,
 	"retryInspectionRun":             PermissionRetryInspectionRun,
+	"revokePluginVersion":            PermissionRevokePluginVersion,
 	"runInspectionPolicy":            PermissionRunInspectionPolicy,
 	"testDatabaseInstanceConnection": PermissionTestDatabaseInstanceConnection,
 	"trialMetricTemplateRevision":    PermissionTrialMetricTemplateRevision,
 	"updateDatabaseInstance":         PermissionUpdateDatabaseInstance,
 	"updateInspectionPolicy":         PermissionUpdateInspectionPolicy,
 	"updatePluginAssignment":         PermissionUpdatePluginAssignment,
+	"uploadPluginVersionPackage":     PermissionUploadPluginVersionPackage,
 	"validateMetricTemplateRevision": PermissionValidateMetricTemplateRevision,
 }

@@ -34,7 +34,6 @@ import {
  * @interface PluginAssignment
  */
 export interface PluginAssignment {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -152,8 +151,6 @@ export function PluginAssignmentFromJSONTyped(json: any, ignoreDiscriminator: bo
         return json;
     }
     return {
-
-            ...json,
         'assignmentId': json['assignment_id'],
         'hostId': json['host_id'],
         'agentId': json['agent_id'],
@@ -181,8 +178,6 @@ export function PluginAssignmentToJSONTyped(value?: PluginAssignment | null, ign
     }
 
     return {
-
-            ...value,
         'assignment_id': value['assignmentId'],
         'host_id': value['hostId'],
         'agent_id': value['agentId'],

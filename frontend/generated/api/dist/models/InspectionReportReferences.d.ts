@@ -16,7 +16,6 @@ import type { InspectionReportCommandReference } from './InspectionReportCommand
  * @interface InspectionReportReferences
  */
 export interface InspectionReportReferences {
-    [key: string]: any | any;
     /**
      * Opaque job identifier.
      * @type {string}

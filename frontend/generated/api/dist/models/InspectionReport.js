@@ -42,7 +42,6 @@ export function InspectionReportFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'id': json['id'],
         'runId': json['run_id'],
         'policyId': json['policy_id'] == null ? undefined : json['policy_id'],
@@ -63,7 +62,6 @@ export function InspectionReportToJSONTyped(value, ignoreDiscriminator = false) 
         return value;
     }
     return {
-        ...value,
         'id': value['id'],
         'run_id': value['runId'],
         'policy_id': value['policyId'],

@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface MetricTemplateApprovalRequest
  */
 export interface MetricTemplateApprovalRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -44,8 +43,6 @@ export function MetricTemplateApprovalRequestFromJSONTyped(json: any, ignoreDisc
         return json;
     }
     return {
-
-            ...json,
         'approvalComment': json['approval_comment'] == null ? undefined : json['approval_comment'],
     };
 }
@@ -60,8 +57,6 @@ export function MetricTemplateApprovalRequestToJSONTyped(value?: MetricTemplateA
     }
 
     return {
-
-            ...value,
         'approval_comment': value['approvalComment'],
     };
 }

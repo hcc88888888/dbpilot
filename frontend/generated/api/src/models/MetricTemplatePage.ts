@@ -34,7 +34,6 @@ import {
  * @interface MetricTemplatePage
  */
 export interface MetricTemplatePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<MetricTemplate>}
@@ -67,8 +66,6 @@ export function MetricTemplatePageFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(MetricTemplateFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function MetricTemplatePageToJSONTyped(value?: MetricTemplatePage | null,
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(MetricTemplateToJSON)),
         'page': PageToJSON(value['page']),
     };

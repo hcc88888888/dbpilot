@@ -16,7 +16,6 @@ import type { PluginDesiredState } from './PluginDesiredState.js';
  * @interface UpdatePluginAssignmentRequest
  */
 export interface UpdatePluginAssignmentRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

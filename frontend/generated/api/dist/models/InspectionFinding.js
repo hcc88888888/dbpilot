@@ -44,7 +44,6 @@ export function InspectionFindingFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'id': json['id'],
         'itemId': json['item_id'],
         'itemVersion': json['item_version'],
@@ -67,7 +66,6 @@ export function InspectionFindingToJSONTyped(value, ignoreDiscriminator = false)
         return value;
     }
     return {
-        ...value,
         'id': value['id'],
         'item_id': value['itemId'],
         'item_version': value['itemVersion'],

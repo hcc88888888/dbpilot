@@ -20,7 +20,6 @@ import type { HostStatus } from './HostStatus.js';
  * @interface ManagedHost
  */
 export interface ManagedHost {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

@@ -30,7 +30,6 @@ export function CreateInspectionRunRequestFromJSONTyped(json, ignoreDiscriminato
         return json;
     }
     return {
-        ...json,
         'targetIds': json['target_ids'],
         'itemVersions': (json['item_versions'].map(InspectionPolicyItemFromJSON)),
         'targetTimeoutSeconds': json['target_timeout_seconds'] == null ? undefined : json['target_timeout_seconds'],
@@ -45,7 +44,6 @@ export function CreateInspectionRunRequestToJSONTyped(value, ignoreDiscriminator
         return value;
     }
     return {
-        ...value,
         'target_ids': value['targetIds'],
         'item_versions': (value['itemVersions'].map(InspectionPolicyItemToJSON)),
         'target_timeout_seconds': value['targetTimeoutSeconds'],

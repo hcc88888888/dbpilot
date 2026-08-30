@@ -833,12 +833,18 @@
   $ref: ./database-instances.yaml#/DatabaseInstanceItem
 /database-instances/{instance_id}/actions/test-connection:
   $ref: ./database-instances.yaml#/TestDatabaseInstanceConnection
+/database-instances/{instance_id}/actions/retire:
+  $ref: ./database-instances.yaml#/RetireDatabaseInstance
 /plugin-definitions:
   $ref: ./plugins.yaml#/PluginDefinitionsCollection
 /plugin-versions:
   $ref: ./plugins.yaml#/PluginVersionsCollection
 /plugin-versions/{version_id}/actions/approve:
   $ref: ./plugins.yaml#/ApprovePluginVersion
+/plugin-versions/{version_id}/actions/publish:
+  $ref: ./plugins.yaml#/PublishPluginVersion
+/plugin-versions/{version_id}/actions/revoke:
+  $ref: ./plugins.yaml#/RevokePluginVersion
 /plugin-assignments:
   $ref: ./plugins.yaml#/PluginAssignmentsCollection
 /plugin-assignments/{assignment_id}:

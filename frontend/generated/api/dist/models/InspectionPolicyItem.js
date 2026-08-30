@@ -29,7 +29,6 @@ export function InspectionPolicyItemFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'itemId': json['item_id'],
         'version': json['version'],
     };
@@ -42,7 +41,6 @@ export function InspectionPolicyItemToJSONTyped(value, ignoreDiscriminator = fal
         return value;
     }
     return {
-        ...value,
         'item_id': value['itemId'],
         'version': value['version'],
     };

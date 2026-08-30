@@ -18,7 +18,6 @@ import type { InspectionRunStatus } from './InspectionRunStatus.js';
  * @interface InspectionRun
  */
 export interface InspectionRun {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

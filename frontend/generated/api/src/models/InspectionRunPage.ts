@@ -34,7 +34,6 @@ import {
  * @interface InspectionRunPage
  */
 export interface InspectionRunPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionRun>}
@@ -67,8 +66,6 @@ export function InspectionRunPageFromJSONTyped(json: any, ignoreDiscriminator: b
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(InspectionRunFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function InspectionRunPageToJSONTyped(value?: InspectionRunPage | null, i
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(InspectionRunToJSON)),
         'page': PageToJSON(value['page']),
     };

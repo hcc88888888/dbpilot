@@ -16,7 +16,6 @@ import type { InspectionReportFormat } from './InspectionReportFormat.js';
  * @interface InspectionReportDownloadRequest
  */
 export interface InspectionReportDownloadRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {InspectionReportFormat}

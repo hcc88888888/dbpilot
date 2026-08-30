@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -167,6 +168,45 @@ func (e DiscoveryCandidateStatus) Valid() bool {
 	case DiscoveryCandidateStatusIgnored:
 		return true
 	case DiscoveryCandidateStatusProvisioning:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for DiscoveryEvidenceKind.
+const (
+	ContainerImage DiscoveryEvidenceKind = "container_image"
+	ContainerLabel DiscoveryEvidenceKind = "container_label"
+	ContainerPort  DiscoveryEvidenceKind = "container_port"
+	ExecutablePath DiscoveryEvidenceKind = "executable_path"
+	ListenEndpoint DiscoveryEvidenceKind = "listen_endpoint"
+	ProcessName    DiscoveryEvidenceKind = "process_name"
+	SystemdUnit    DiscoveryEvidenceKind = "systemd_unit"
+	UnixSocket     DiscoveryEvidenceKind = "unix_socket"
+	VersionHint    DiscoveryEvidenceKind = "version_hint"
+)
+
+// Valid indicates whether the value is a known member of the DiscoveryEvidenceKind enum.
+func (e DiscoveryEvidenceKind) Valid() bool {
+	switch e {
+	case ContainerImage:
+		return true
+	case ContainerLabel:
+		return true
+	case ContainerPort:
+		return true
+	case ExecutablePath:
+		return true
+	case ListenEndpoint:
+		return true
+	case ProcessName:
+		return true
+	case SystemdUnit:
+		return true
+	case UnixSocket:
+		return true
+	case VersionHint:
 		return true
 	default:
 		return false
@@ -568,19 +608,13 @@ func (e JobStatus) Valid() bool {
 
 // Defines values for MetricQueryKind.
 const (
-	Builtin    MetricQueryKind = "builtin"
-	Sql        MetricQueryKind = "sql"
-	Structured MetricQueryKind = "structured"
+	Sql MetricQueryKind = "sql"
 )
 
 // Valid indicates whether the value is a known member of the MetricQueryKind enum.
 func (e MetricQueryKind) Valid() bool {
 	switch e {
-	case Builtin:
-		return true
 	case Sql:
-		return true
-	case Structured:
 		return true
 	default:
 		return false
@@ -692,6 +726,27 @@ func (e PluginArchitecture) Valid() bool {
 	case Amd64:
 		return true
 	case Arm64:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PluginCircuitState.
+const (
+	Closed   PluginCircuitState = "closed"
+	HalfOpen PluginCircuitState = "half_open"
+	Open     PluginCircuitState = "open"
+)
+
+// Valid indicates whether the value is a known member of the PluginCircuitState enum.
+func (e PluginCircuitState) Valid() bool {
+	switch e {
+	case Closed:
+		return true
+	case HalfOpen:
+		return true
+	case Open:
 		return true
 	default:
 		return false
@@ -1044,30 +1099,20 @@ type CreateMetricTemplateRequest struct {
 
 // CreateMetricTemplateRevisionRequest defines model for CreateMetricTemplateRevisionRequest.
 type CreateMetricTemplateRevisionRequest struct {
-	CardinalityLimit          int                     `json:"cardinality_limit"`
-	CollectionIntervalSeconds int                     `json:"collection_interval_seconds"`
-	DatabaseVersionRange      *string                 `json:"database_version_range,omitempty"`
-	Description               *string                 `json:"description,omitempty"`
-	LabelMappings             []MetricLabelMapping    `json:"label_mappings"`
-	MaxColumns                int                     `json:"max_columns"`
-	MaxRows                   int                     `json:"max_rows"`
-	Name                      string                  `json:"name"`
-	PluginVersionRange        *string                 `json:"plugin_version_range,omitempty"`
-	QueryKind                 MetricQueryKind         `json:"query_kind"`
-	ReadOnlyStatement         *string                 `json:"read_only_statement,omitempty"`
-	StructuredQuery           *map[string]interface{} `json:"structured_query,omitempty"`
-	TimeoutSeconds            int                     `json:"timeout_seconds"`
-	ValueMappings             []MetricValueMapping    `json:"value_mappings"`
-	Variants                  []DatabaseVariant       `json:"variants"`
-}
-
-// CreatePluginVersionRequest defines model for CreatePluginVersionRequest.
-type CreatePluginVersionRequest struct {
-	// ArtifactId Opaque artifact identifier.
-	ArtifactId     ArtifactId `json:"artifact_id"`
-	ManifestDigest string     `json:"manifest_digest"`
-	PackageSha256  string     `json:"package_sha256"`
-	PluginId       string     `json:"plugin_id"`
+	CardinalityLimit          int                  `json:"cardinality_limit"`
+	CollectionIntervalSeconds int                  `json:"collection_interval_seconds"`
+	DatabaseVersionRange      *string              `json:"database_version_range,omitempty"`
+	Description               *string              `json:"description,omitempty"`
+	LabelMappings             []MetricLabelMapping `json:"label_mappings"`
+	MaxColumns                int                  `json:"max_columns"`
+	MaxRows                   int                  `json:"max_rows"`
+	Name                      string               `json:"name"`
+	PluginVersionRange        *string              `json:"plugin_version_range,omitempty"`
+	QueryKind                 MetricQueryKind      `json:"query_kind"`
+	ReadOnlyStatement         string               `json:"read_only_statement"`
+	TimeoutSeconds            int                  `json:"timeout_seconds"`
+	ValueMappings             []MetricValueMapping `json:"value_mappings"`
+	Variants                  []DatabaseVariant    `json:"variants"`
 }
 
 // CustomInspectionItemSourceType defines model for CustomInspectionItemSourceType.
@@ -1084,17 +1129,17 @@ type DatabaseVariant = string
 
 // DiscoveryCandidate defines model for DiscoveryCandidate.
 type DiscoveryCandidate struct {
-	AgentId           AgentId         `json:"agent_id"`
-	CandidateId       CandidateId     `json:"candidate_id"`
-	Confidence        float32         `json:"confidence"`
-	ContainerIdentity *string         `json:"container_identity,omitempty"`
-	ContainerImage    *string         `json:"container_image,omitempty"`
-	DatabaseFamily    DatabaseFamily  `json:"database_family"`
-	DatabaseVariant   DatabaseVariant `json:"database_variant"`
-	DiscoveredRole    *string         `json:"discovered_role,omitempty"`
-	DiscoverySource   DiscoverySource `json:"discovery_source"`
-	EvidenceSummary   []string        `json:"evidence_summary"`
-	Fingerprint       string          `json:"fingerprint"`
+	AgentId           AgentId             `json:"agent_id"`
+	CandidateId       CandidateId         `json:"candidate_id"`
+	Confidence        float32             `json:"confidence"`
+	ContainerIdentity *string             `json:"container_identity,omitempty"`
+	ContainerImage    *string             `json:"container_image,omitempty"`
+	DatabaseFamily    DatabaseFamily      `json:"database_family"`
+	DatabaseVariant   DatabaseVariant     `json:"database_variant"`
+	DiscoveredRole    *string             `json:"discovered_role,omitempty"`
+	DiscoverySource   DiscoverySource     `json:"discovery_source"`
+	EvidenceSummary   []DiscoveryEvidence `json:"evidence_summary"`
+	Fingerprint       string              `json:"fingerprint"`
 
 	// FirstSeenAt RFC 3339 timestamp in UTC, represented with a Z suffix.
 	FirstSeenAt UtcTimestamp `json:"first_seen_at"`
@@ -1126,6 +1171,17 @@ type DiscoveryCandidatePage struct {
 
 // DiscoveryCandidateStatus defines model for DiscoveryCandidateStatus.
 type DiscoveryCandidateStatus string
+
+// DiscoveryEvidence defines model for DiscoveryEvidence.
+type DiscoveryEvidence struct {
+	Kind DiscoveryEvidenceKind `json:"kind"`
+
+	// Value Redacted allowlisted evidence value; never a raw command line, environment value, or configuration body.
+	Value string `json:"value"`
+}
+
+// DiscoveryEvidenceKind defines model for DiscoveryEvidenceKind.
+type DiscoveryEvidenceKind string
 
 // DiscoverySource defines model for DiscoverySource.
 type DiscoverySource string
@@ -1650,11 +1706,10 @@ type MetricTemplateRevision struct {
 	PluginVersionRange   *string                      `json:"plugin_version_range,omitempty"`
 	QueryDigest          string                       `json:"query_digest"`
 	QueryKind            MetricQueryKind              `json:"query_kind"`
-	ReadOnlyStatement    *string                      `json:"read_only_statement,omitempty"`
+	ReadOnlyStatement    string                       `json:"read_only_statement"`
 	Revision             int64                        `json:"revision"`
 	RevisionId           string                       `json:"revision_id"`
 	Status               MetricTemplateRevisionStatus `json:"status"`
-	StructuredQuery      *map[string]interface{}      `json:"structured_query,omitempty"`
 	TemplateId           string                       `json:"template_id"`
 	TimeoutSeconds       int                          `json:"timeout_seconds"`
 	ValueMappings        []MetricValueMapping         `json:"value_mappings"`
@@ -1729,6 +1784,9 @@ type PluginAssignmentPage struct {
 	Page  Page               `json:"page"`
 }
 
+// PluginCircuitState defines model for PluginCircuitState.
+type PluginCircuitState string
+
 // PluginDefinition defines model for PluginDefinition.
 type PluginDefinition struct {
 	Capabilities           []string           `json:"capabilities"`
@@ -1759,6 +1817,7 @@ type PluginObservedState struct {
 	ActiveSlot                  *PluginActiveSlot  `json:"active_slot,omitempty"`
 	AssignmentId                string             `json:"assignment_id"`
 	BoundInstanceCount          int                `json:"bound_instance_count"`
+	CircuitState                PluginCircuitState `json:"circuit_state"`
 	Health                      PluginHealthStatus `json:"health"`
 	InstalledVersion            *string            `json:"installed_version,omitempty"`
 	LastErrorCode               *string            `json:"last_error_code,omitempty"`
@@ -1791,13 +1850,16 @@ type PluginVersion struct {
 	ApprovedAt *UtcTimestamp `json:"approved_at,omitempty"`
 
 	// ArtifactId Opaque artifact identifier.
-	ArtifactId ArtifactId `json:"artifact_id"`
+	ArtifactId   ArtifactId `json:"artifact_id"`
+	Capabilities []string   `json:"capabilities"`
 
 	// CreatedAt RFC 3339 timestamp in UTC, represented with a Z suffix.
 	CreatedAt                   UtcTimestamp        `json:"created_at"`
+	DatabaseVersionRange        string              `json:"database_version_range"`
 	Etag                        string              `json:"etag"`
 	ManifestDigest              string              `json:"manifest_digest"`
 	MaximumAgentProtocolVersion *string             `json:"maximum_agent_protocol_version,omitempty"`
+	MetricTemplateSchemaVersion int                 `json:"metric_template_schema_version"`
 	MinimumAgentProtocolVersion *string             `json:"minimum_agent_protocol_version,omitempty"`
 	PackageSha256               string              `json:"package_sha256"`
 	Platforms                   []PluginPlatform    `json:"platforms"`
@@ -1805,6 +1867,7 @@ type PluginVersion struct {
 	PublisherId                 string              `json:"publisher_id"`
 	SigningKeyId                *string             `json:"signing_key_id,omitempty"`
 	Status                      PluginVersionStatus `json:"status"`
+	SupportedVariants           []DatabaseVariant   `json:"supported_variants"`
 	Version                     string              `json:"version"`
 	VersionId                   string              `json:"version_id"`
 }
@@ -1835,6 +1898,11 @@ type Problem struct {
 // ProjectId Opaque project identifier.
 type ProjectId = string
 
+// PublishPluginVersionRequest defines model for PublishPluginVersionRequest.
+type PublishPluginVersionRequest struct {
+	PublicationComment *string `json:"publication_comment,omitempty"`
+}
+
 // RequestId Request correlation identifier.
 type RequestId = string
 
@@ -1846,6 +1914,12 @@ type ResourceReference struct {
 	// ResourceId Opaque business resource identifier.
 	ResourceId   ResourceId `json:"resource_id"`
 	ResourceType string     `json:"resource_type"`
+}
+
+// RevokePluginVersionRequest defines model for RevokePluginVersionRequest.
+type RevokePluginVersionRequest struct {
+	ReasonCode        string  `json:"reason_code"`
+	RevocationComment *string `json:"revocation_comment,omitempty"`
 }
 
 // TenantId Opaque tenant identifier.
@@ -1914,6 +1988,12 @@ type ListDatabaseInstancesParams struct {
 
 // UpdateDatabaseInstanceParams defines parameters for UpdateDatabaseInstance.
 type UpdateDatabaseInstanceParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+	IfMatch        string `json:"If-Match"`
+}
+
+// RetireDatabaseInstanceParams defines parameters for RetireDatabaseInstance.
+type RetireDatabaseInstanceParams struct {
 	IdempotencyKey string `json:"Idempotency-Key"`
 	IfMatch        string `json:"If-Match"`
 }
@@ -2060,6 +2140,7 @@ type TrialMetricTemplateRevisionParams struct {
 // ValidateMetricTemplateRevisionParams defines parameters for ValidateMetricTemplateRevision.
 type ValidateMetricTemplateRevisionParams struct {
 	IdempotencyKey string `json:"Idempotency-Key"`
+	IfMatch        string `json:"If-Match"`
 }
 
 // ListMetricTemplatesParams defines parameters for ListMetricTemplates.
@@ -2119,13 +2200,26 @@ type ListPluginVersionsParams struct {
 	Limit    *int                 `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
-// CreatePluginVersionParams defines parameters for CreatePluginVersion.
-type CreatePluginVersionParams struct {
+// UploadPluginVersionPackageParams defines parameters for UploadPluginVersionPackage.
+type UploadPluginVersionPackageParams struct {
 	IdempotencyKey string `json:"Idempotency-Key"`
+	ContentLength  int64  `json:"Content-Length"`
 }
 
 // ApprovePluginVersionParams defines parameters for ApprovePluginVersion.
 type ApprovePluginVersionParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+	IfMatch        string `json:"If-Match"`
+}
+
+// PublishPluginVersionParams defines parameters for PublishPluginVersion.
+type PublishPluginVersionParams struct {
+	IdempotencyKey string `json:"Idempotency-Key"`
+	IfMatch        string `json:"If-Match"`
+}
+
+// RevokePluginVersionParams defines parameters for RevokePluginVersion.
+type RevokePluginVersionParams struct {
 	IdempotencyKey string `json:"Idempotency-Key"`
 	IfMatch        string `json:"If-Match"`
 }
@@ -2169,11 +2263,14 @@ type CreateMetricTemplateRevisionJSONRequestBody = CreateMetricTemplateRevisionR
 // UpdatePluginAssignmentJSONRequestBody defines body for UpdatePluginAssignment for application/json ContentType.
 type UpdatePluginAssignmentJSONRequestBody = UpdatePluginAssignmentRequest
 
-// CreatePluginVersionJSONRequestBody defines body for CreatePluginVersion for application/json ContentType.
-type CreatePluginVersionJSONRequestBody = CreatePluginVersionRequest
-
 // ApprovePluginVersionJSONRequestBody defines body for ApprovePluginVersion for application/json ContentType.
 type ApprovePluginVersionJSONRequestBody = ApprovePluginVersionRequest
+
+// PublishPluginVersionJSONRequestBody defines body for PublishPluginVersion for application/json ContentType.
+type PublishPluginVersionJSONRequestBody = PublishPluginVersionRequest
+
+// RevokePluginVersionJSONRequestBody defines body for RevokePluginVersion for application/json ContentType.
+type RevokePluginVersionJSONRequestBody = RevokePluginVersionRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -2198,6 +2295,9 @@ type ServerInterface interface {
 	// UpdateDatabaseInstance Update mutable database instance settings
 	// (PATCH /database-instances/{instance_id})
 	UpdateDatabaseInstance(w http.ResponseWriter, r *http.Request, instanceId InstanceId, params UpdateDatabaseInstanceParams)
+	// RetireDatabaseInstance Retire a managed database instance
+	// (POST /database-instances/{instance_id}/actions/retire)
+	RetireDatabaseInstance(w http.ResponseWriter, r *http.Request, instanceId InstanceId, params RetireDatabaseInstanceParams)
 	// TestDatabaseInstanceConnection Start a bounded database connection test job
 	// (POST /database-instances/{instance_id}/actions/test-connection)
 	TestDatabaseInstanceConnection(w http.ResponseWriter, r *http.Request, instanceId InstanceId, params TestDatabaseInstanceConnectionParams)
@@ -2324,12 +2424,18 @@ type ServerInterface interface {
 	// ListPluginVersions List immutable plugin versions
 	// (GET /plugin-versions)
 	ListPluginVersions(w http.ResponseWriter, r *http.Request, params ListPluginVersionsParams)
-	// CreatePluginVersion Register a Server-hosted signed plugin artifact
+	// UploadPluginVersionPackage Upload a bounded signed plugin package for streaming verification
 	// (POST /plugin-versions)
-	CreatePluginVersion(w http.ResponseWriter, r *http.Request, params CreatePluginVersionParams)
+	UploadPluginVersionPackage(w http.ResponseWriter, r *http.Request, params UploadPluginVersionPackageParams)
 	// ApprovePluginVersion Approve a verified plugin version for new assignments
 	// (POST /plugin-versions/{version_id}/actions/approve)
 	ApprovePluginVersion(w http.ResponseWriter, r *http.Request, versionId string, params ApprovePluginVersionParams)
+	// PublishPluginVersion Publish an approved plugin version for new assignments
+	// (POST /plugin-versions/{version_id}/actions/publish)
+	PublishPluginVersion(w http.ResponseWriter, r *http.Request, versionId string, params PublishPluginVersionParams)
+	// RevokePluginVersion Revoke a plugin version from future assignments
+	// (POST /plugin-versions/{version_id}/actions/revoke)
+	RevokePluginVersion(w http.ResponseWriter, r *http.Request, versionId string, params RevokePluginVersionParams)
 }
 
 // ServerInterfaceWrapper converts contexts to parameters.
@@ -2660,6 +2766,83 @@ func (siw *ServerInterfaceWrapper) UpdateDatabaseInstance(w http.ResponseWriter,
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.UpdateDatabaseInstance(w, r, instanceId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RetireDatabaseInstance operation middleware
+func (siw *ServerInterfaceWrapper) RetireDatabaseInstance(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "instance_id" -------------
+	var instanceId InstanceId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "instance_id", r.PathValue("instance_id"), &instanceId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "instance_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RetireDatabaseInstanceParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	// ------------- Required header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = IfMatch
+
+	} else {
+		err := fmt.Errorf("Header parameter If-Match is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "If-Match", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RetireDatabaseInstance(w, r, instanceId, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -4275,6 +4458,29 @@ func (siw *ServerInterfaceWrapper) ValidateMetricTemplateRevision(w http.Respons
 		return
 	}
 
+	// ------------- Required header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = IfMatch
+
+	} else {
+		err := fmt.Errorf("Header parameter If-Match is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "If-Match", Err: err})
+		return
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ValidateMetricTemplateRevision(w, r, revisionId, params)
 	}))
@@ -4859,14 +5065,14 @@ func (siw *ServerInterfaceWrapper) ListPluginVersions(w http.ResponseWriter, r *
 	handler.ServeHTTP(w, r)
 }
 
-// CreatePluginVersion operation middleware
-func (siw *ServerInterfaceWrapper) CreatePluginVersion(w http.ResponseWriter, r *http.Request) {
+// UploadPluginVersionPackage operation middleware
+func (siw *ServerInterfaceWrapper) UploadPluginVersionPackage(w http.ResponseWriter, r *http.Request) {
 
 	var err error
 	_ = err
 
 	// Parameter object where we will unmarshal all parameters from the context
-	var params CreatePluginVersionParams
+	var params UploadPluginVersionPackageParams
 
 	headers := r.Header
 
@@ -4893,8 +5099,31 @@ func (siw *ServerInterfaceWrapper) CreatePluginVersion(w http.ResponseWriter, r 
 		return
 	}
 
+	// ------------- Required header parameter "Content-Length" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Content-Length")]; found {
+		var ContentLength int64
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Content-Length", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Content-Length", valueList[0], &ContentLength, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "integer", Format: "int64"})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Content-Length", Err: err})
+			return
+		}
+
+		params.ContentLength = ContentLength
+
+	} else {
+		err := fmt.Errorf("Header parameter Content-Length is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Content-Length", Err: err})
+		return
+	}
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		siw.Handler.CreatePluginVersion(w, r, params)
+		siw.Handler.UploadPluginVersionPackage(w, r, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -4972,6 +5201,160 @@ func (siw *ServerInterfaceWrapper) ApprovePluginVersion(w http.ResponseWriter, r
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ApprovePluginVersion(w, r, versionId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PublishPluginVersion operation middleware
+func (siw *ServerInterfaceWrapper) PublishPluginVersion(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "version_id" -------------
+	var versionId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "version_id", r.PathValue("version_id"), &versionId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "version_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params PublishPluginVersionParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	// ------------- Required header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = IfMatch
+
+	} else {
+		err := fmt.Errorf("Header parameter If-Match is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "If-Match", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PublishPluginVersion(w, r, versionId, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RevokePluginVersion operation middleware
+func (siw *ServerInterfaceWrapper) RevokePluginVersion(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+	_ = err
+
+	// ------------- Path parameter "version_id" -------------
+	var versionId string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "version_id", r.PathValue("version_id"), &versionId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true, Type: "string", Format: "", ValueIsUnescaped: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "version_id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params RevokePluginVersionParams
+
+	headers := r.Header
+
+	// ------------- Required header parameter "Idempotency-Key" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("Idempotency-Key")]; found {
+		var IdempotencyKey string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "Idempotency-Key", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "Idempotency-Key", valueList[0], &IdempotencyKey, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "Idempotency-Key", Err: err})
+			return
+		}
+
+		params.IdempotencyKey = IdempotencyKey
+
+	} else {
+		err := fmt.Errorf("Header parameter Idempotency-Key is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "Idempotency-Key", Err: err})
+		return
+	}
+
+	// ------------- Required header parameter "If-Match" -------------
+	if valueList, found := headers[http.CanonicalHeaderKey("If-Match")]; found {
+		var IfMatch string
+		n := len(valueList)
+		if n != 1 {
+			siw.ErrorHandlerFunc(w, r, &TooManyValuesForParamError{ParamName: "If-Match", Count: n})
+			return
+		}
+
+		err = runtime.BindStyledParameterWithOptions("simple", "If-Match", valueList[0], &IfMatch, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: true, Type: "string", Format: ""})
+		if err != nil {
+			siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "If-Match", Err: err})
+			return
+		}
+
+		params.IfMatch = IfMatch
+
+	} else {
+		err := fmt.Errorf("Header parameter If-Match is required, but not found")
+		siw.ErrorHandlerFunc(w, r, &RequiredHeaderError{ParamName: "If-Match", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RevokePluginVersion(w, r, versionId, params)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -5108,6 +5491,7 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/database-instances", wrapper.ListDatabaseInstances)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/database-instances/{instance_id}", wrapper.GetDatabaseInstance)
 	m.HandleFunc(http.MethodPatch+" "+options.BaseURL+"/database-instances/{instance_id}", wrapper.UpdateDatabaseInstance)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/database-instances/{instance_id}/actions/retire", wrapper.RetireDatabaseInstance)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/database-instances/{instance_id}/actions/test-connection", wrapper.TestDatabaseInstanceConnection)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/discovery-candidates", wrapper.ListDiscoveryCandidates)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/discovery-candidates/{candidate_id}", wrapper.GetDiscoveryCandidate)
@@ -5150,8 +5534,10 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-assignments/{assignment_id}/actions/reconcile", wrapper.ReconcilePluginAssignment)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/plugin-definitions", wrapper.ListPluginDefinitions)
 	m.HandleFunc(http.MethodGet+" "+options.BaseURL+"/plugin-versions", wrapper.ListPluginVersions)
-	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-versions", wrapper.CreatePluginVersion)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-versions", wrapper.UploadPluginVersionPackage)
 	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-versions/{version_id}/actions/approve", wrapper.ApprovePluginVersion)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-versions/{version_id}/actions/publish", wrapper.PublishPluginVersion)
+	m.HandleFunc(http.MethodPost+" "+options.BaseURL+"/plugin-versions/{version_id}/actions/revoke", wrapper.RevokePluginVersion)
 
 	return m
 }
@@ -5874,6 +6260,140 @@ func (response UpdateDatabaseInstance422ApplicationProblemPlusJSONResponse) Visi
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(422)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstanceRequestObject struct {
+	InstanceId InstanceId `json:"instance_id"`
+	Params     RetireDatabaseInstanceParams
+}
+
+type RetireDatabaseInstanceResponseObject interface {
+	VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error
+}
+
+type RetireDatabaseInstance200ResponseHeaders struct {
+	ETag string
+}
+
+type RetireDatabaseInstance200JSONResponse struct {
+	Body    ManagedDatabaseInstance
+	Headers RetireDatabaseInstance200ResponseHeaders
+}
+
+func (response RetireDatabaseInstance200JSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RetireDatabaseInstance400ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance401ApplicationProblemPlusJSONResponse Problem
+
+func (response RetireDatabaseInstance401ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance403ApplicationProblemPlusJSONResponse Problem
+
+func (response RetireDatabaseInstance403ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance404ApplicationProblemPlusJSONResponse Problem
+
+func (response RetireDatabaseInstance404ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RetireDatabaseInstance405ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance409ApplicationProblemPlusJSONResponse Problem
+
+func (response RetireDatabaseInstance409ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RetireDatabaseInstance412ApplicationProblemPlusJSONResponse Problem
+
+func (response RetireDatabaseInstance412ApplicationProblemPlusJSONResponse) VisitRetireDatabaseInstanceResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(412)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -9264,16 +9784,24 @@ type ValidateMetricTemplateRevisionResponseObject interface {
 	VisitValidateMetricTemplateRevisionResponse(w http.ResponseWriter) error
 }
 
-type ValidateMetricTemplateRevision202JSONResponse Job
+type ValidateMetricTemplateRevision200ResponseHeaders struct {
+	ETag string
+}
 
-func (response ValidateMetricTemplateRevision202JSONResponse) VisitValidateMetricTemplateRevisionResponse(w http.ResponseWriter) error {
+type ValidateMetricTemplateRevision200JSONResponse struct {
+	Body    MetricTemplateRevision
+	Headers ValidateMetricTemplateRevision200ResponseHeaders
+}
+
+func (response ValidateMetricTemplateRevision200JSONResponse) VisitValidateMetricTemplateRevisionResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(202)
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -9363,6 +9891,20 @@ func (response ValidateMetricTemplateRevision409ApplicationProblemPlusJSONRespon
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type ValidateMetricTemplateRevision412ApplicationProblemPlusJSONResponse Problem
+
+func (response ValidateMetricTemplateRevision412ApplicationProblemPlusJSONResponse) VisitValidateMetricTemplateRevisionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(412)
 	_, err := buf.WriteTo(w)
 	return err
 }
@@ -10432,25 +10974,25 @@ func (response ListPluginVersions405ApplicationProblemPlusJSONResponse) VisitLis
 	return err
 }
 
-type CreatePluginVersionRequestObject struct {
-	Params CreatePluginVersionParams
-	Body   *CreatePluginVersionJSONRequestBody
+type UploadPluginVersionPackageRequestObject struct {
+	Params UploadPluginVersionPackageParams
+	Body   io.Reader
 }
 
-type CreatePluginVersionResponseObject interface {
-	VisitCreatePluginVersionResponse(w http.ResponseWriter) error
+type UploadPluginVersionPackageResponseObject interface {
+	VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error
 }
 
-type CreatePluginVersion201ResponseHeaders struct {
+type UploadPluginVersionPackage201ResponseHeaders struct {
 	ETag string
 }
 
-type CreatePluginVersion201JSONResponse struct {
+type UploadPluginVersionPackage201JSONResponse struct {
 	Body    PluginVersion
-	Headers CreatePluginVersion201ResponseHeaders
+	Headers UploadPluginVersionPackage201ResponseHeaders
 }
 
-func (response CreatePluginVersion201JSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage201JSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -10463,11 +11005,11 @@ func (response CreatePluginVersion201JSONResponse) VisitCreatePluginVersionRespo
 	return err
 }
 
-type CreatePluginVersion400ApplicationProblemPlusJSONResponse struct {
+type UploadPluginVersionPackage400ApplicationProblemPlusJSONResponse struct {
 	ProblemResponseApplicationProblemPlusJSONResponse
 }
 
-func (response CreatePluginVersion400ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage400ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -10479,9 +11021,9 @@ func (response CreatePluginVersion400ApplicationProblemPlusJSONResponse) VisitCr
 	return err
 }
 
-type CreatePluginVersion401ApplicationProblemPlusJSONResponse Problem
+type UploadPluginVersionPackage401ApplicationProblemPlusJSONResponse Problem
 
-func (response CreatePluginVersion401ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage401ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -10493,9 +11035,9 @@ func (response CreatePluginVersion401ApplicationProblemPlusJSONResponse) VisitCr
 	return err
 }
 
-type CreatePluginVersion403ApplicationProblemPlusJSONResponse Problem
+type UploadPluginVersionPackage403ApplicationProblemPlusJSONResponse Problem
 
-func (response CreatePluginVersion403ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage403ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -10507,11 +11049,11 @@ func (response CreatePluginVersion403ApplicationProblemPlusJSONResponse) VisitCr
 	return err
 }
 
-type CreatePluginVersion405ApplicationProblemPlusJSONResponse struct {
+type UploadPluginVersionPackage405ApplicationProblemPlusJSONResponse struct {
 	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
 }
 
-func (response CreatePluginVersion405ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage405ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
@@ -10524,9 +11066,9 @@ func (response CreatePluginVersion405ApplicationProblemPlusJSONResponse) VisitCr
 	return err
 }
 
-type CreatePluginVersion409ApplicationProblemPlusJSONResponse Problem
+type UploadPluginVersionPackage409ApplicationProblemPlusJSONResponse Problem
 
-func (response CreatePluginVersion409ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage409ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -10538,9 +11080,9 @@ func (response CreatePluginVersion409ApplicationProblemPlusJSONResponse) VisitCr
 	return err
 }
 
-type CreatePluginVersion422ApplicationProblemPlusJSONResponse Problem
+type UploadPluginVersionPackage422ApplicationProblemPlusJSONResponse Problem
 
-func (response CreatePluginVersion422ApplicationProblemPlusJSONResponse) VisitCreatePluginVersionResponse(w http.ResponseWriter) error {
+func (response UploadPluginVersionPackage422ApplicationProblemPlusJSONResponse) VisitUploadPluginVersionPackageResponse(w http.ResponseWriter) error {
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(response); err != nil {
@@ -10687,6 +11229,290 @@ func (response ApprovePluginVersion412ApplicationProblemPlusJSONResponse) VisitA
 	return err
 }
 
+type PublishPluginVersionRequestObject struct {
+	VersionId string `json:"version_id"`
+	Params    PublishPluginVersionParams
+	Body      *PublishPluginVersionJSONRequestBody
+}
+
+type PublishPluginVersionResponseObject interface {
+	VisitPublishPluginVersionResponse(w http.ResponseWriter) error
+}
+
+type PublishPluginVersion200ResponseHeaders struct {
+	ETag string
+}
+
+type PublishPluginVersion200JSONResponse struct {
+	Body    PluginVersion
+	Headers PublishPluginVersion200ResponseHeaders
+}
+
+func (response PublishPluginVersion200JSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response PublishPluginVersion400ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion401ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion401ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion403ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion403ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion404ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion404ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response PublishPluginVersion405ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion409ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion409ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion412ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion412ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(412)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type PublishPluginVersion422ApplicationProblemPlusJSONResponse Problem
+
+func (response PublishPluginVersion422ApplicationProblemPlusJSONResponse) VisitPublishPluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(422)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersionRequestObject struct {
+	VersionId string `json:"version_id"`
+	Params    RevokePluginVersionParams
+	Body      *RevokePluginVersionJSONRequestBody
+}
+
+type RevokePluginVersionResponseObject interface {
+	VisitRevokePluginVersionResponse(w http.ResponseWriter) error
+}
+
+type RevokePluginVersion200ResponseHeaders struct {
+	ETag string
+}
+
+type RevokePluginVersion200JSONResponse struct {
+	Body    PluginVersion
+	Headers RevokePluginVersion200ResponseHeaders
+}
+
+func (response RevokePluginVersion200JSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", fmt.Sprint(response.Headers.ETag))
+	w.WriteHeader(200)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion400ApplicationProblemPlusJSONResponse struct {
+	ProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RevokePluginVersion400ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(400)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion401ApplicationProblemPlusJSONResponse Problem
+
+func (response RevokePluginVersion401ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(401)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion403ApplicationProblemPlusJSONResponse Problem
+
+func (response RevokePluginVersion403ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(403)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion404ApplicationProblemPlusJSONResponse Problem
+
+func (response RevokePluginVersion404ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(404)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion405ApplicationProblemPlusJSONResponse struct {
+	MethodNotAllowedProblemResponseApplicationProblemPlusJSONResponse
+}
+
+func (response RevokePluginVersion405ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response.Body); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.Header().Set("Allow", fmt.Sprint(response.Headers.Allow))
+	w.WriteHeader(405)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion409ApplicationProblemPlusJSONResponse Problem
+
+func (response RevokePluginVersion409ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(409)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
+type RevokePluginVersion412ApplicationProblemPlusJSONResponse Problem
+
+func (response RevokePluginVersion412ApplicationProblemPlusJSONResponse) VisitRevokePluginVersionResponse(w http.ResponseWriter) error {
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(response); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(412)
+	_, err := buf.WriteTo(w)
+	return err
+}
+
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
 	// GetArtifact Get artifact metadata
@@ -10710,6 +11536,9 @@ type StrictServerInterface interface {
 	// UpdateDatabaseInstance Update mutable database instance settings
 	// (PATCH /database-instances/{instance_id})
 	UpdateDatabaseInstance(ctx context.Context, request UpdateDatabaseInstanceRequestObject) (UpdateDatabaseInstanceResponseObject, error)
+	// RetireDatabaseInstance Retire a managed database instance
+	// (POST /database-instances/{instance_id}/actions/retire)
+	RetireDatabaseInstance(ctx context.Context, request RetireDatabaseInstanceRequestObject) (RetireDatabaseInstanceResponseObject, error)
 	// TestDatabaseInstanceConnection Start a bounded database connection test job
 	// (POST /database-instances/{instance_id}/actions/test-connection)
 	TestDatabaseInstanceConnection(ctx context.Context, request TestDatabaseInstanceConnectionRequestObject) (TestDatabaseInstanceConnectionResponseObject, error)
@@ -10836,12 +11665,18 @@ type StrictServerInterface interface {
 	// ListPluginVersions List immutable plugin versions
 	// (GET /plugin-versions)
 	ListPluginVersions(ctx context.Context, request ListPluginVersionsRequestObject) (ListPluginVersionsResponseObject, error)
-	// CreatePluginVersion Register a Server-hosted signed plugin artifact
+	// UploadPluginVersionPackage Upload a bounded signed plugin package for streaming verification
 	// (POST /plugin-versions)
-	CreatePluginVersion(ctx context.Context, request CreatePluginVersionRequestObject) (CreatePluginVersionResponseObject, error)
+	UploadPluginVersionPackage(ctx context.Context, request UploadPluginVersionPackageRequestObject) (UploadPluginVersionPackageResponseObject, error)
 	// ApprovePluginVersion Approve a verified plugin version for new assignments
 	// (POST /plugin-versions/{version_id}/actions/approve)
 	ApprovePluginVersion(ctx context.Context, request ApprovePluginVersionRequestObject) (ApprovePluginVersionResponseObject, error)
+	// PublishPluginVersion Publish an approved plugin version for new assignments
+	// (POST /plugin-versions/{version_id}/actions/publish)
+	PublishPluginVersion(ctx context.Context, request PublishPluginVersionRequestObject) (PublishPluginVersionResponseObject, error)
+	// RevokePluginVersion Revoke a plugin version from future assignments
+	// (POST /plugin-versions/{version_id}/actions/revoke)
+	RevokePluginVersion(ctx context.Context, request RevokePluginVersionRequestObject) (RevokePluginVersionResponseObject, error)
 }
 
 type StrictHandlerFunc func(ctx context.Context, w http.ResponseWriter, r *http.Request, request any) (any, error)
@@ -11065,6 +11900,33 @@ func (sh *strictHandler) UpdateDatabaseInstance(w http.ResponseWriter, r *http.R
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
 	} else if validResponse, ok := response.(UpdateDatabaseInstanceResponseObject); ok {
 		if err := validResponse.VisitUpdateDatabaseInstanceResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RetireDatabaseInstance operation middleware
+func (sh *strictHandler) RetireDatabaseInstance(w http.ResponseWriter, r *http.Request, instanceId InstanceId, params RetireDatabaseInstanceParams) {
+	var request RetireDatabaseInstanceRequestObject
+
+	request.InstanceId = instanceId
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RetireDatabaseInstance(ctx, request.(RetireDatabaseInstanceRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RetireDatabaseInstance")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RetireDatabaseInstanceResponseObject); ok {
+		if err := validResponse.VisitRetireDatabaseInstanceResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -12265,32 +13127,27 @@ func (sh *strictHandler) ListPluginVersions(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// CreatePluginVersion operation middleware
-func (sh *strictHandler) CreatePluginVersion(w http.ResponseWriter, r *http.Request, params CreatePluginVersionParams) {
-	var request CreatePluginVersionRequestObject
+// UploadPluginVersionPackage operation middleware
+func (sh *strictHandler) UploadPluginVersionPackage(w http.ResponseWriter, r *http.Request, params UploadPluginVersionPackageParams) {
+	var request UploadPluginVersionPackageRequestObject
 
 	request.Params = params
 
-	var body CreatePluginVersionJSONRequestBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
-		return
-	}
-	request.Body = &body
+	request.Body = r.Body
 
 	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
-		return sh.ssi.CreatePluginVersion(ctx, request.(CreatePluginVersionRequestObject))
+		return sh.ssi.UploadPluginVersionPackage(ctx, request.(UploadPluginVersionPackageRequestObject))
 	}
 	for _, middleware := range sh.middlewares {
-		handler = middleware(handler, "CreatePluginVersion")
+		handler = middleware(handler, "UploadPluginVersionPackage")
 	}
 
 	response, err := handler(r.Context(), w, r, request)
 
 	if err != nil {
 		sh.options.ResponseErrorHandlerFunc(w, r, err)
-	} else if validResponse, ok := response.(CreatePluginVersionResponseObject); ok {
-		if err := validResponse.VisitCreatePluginVersionResponse(w); err != nil {
+	} else if validResponse, ok := response.(UploadPluginVersionPackageResponseObject); ok {
+		if err := validResponse.VisitUploadPluginVersionPackageResponse(w); err != nil {
 			sh.options.ResponseErrorHandlerFunc(w, r, err)
 		}
 	} else if response != nil {
@@ -12332,201 +13189,276 @@ func (sh *strictHandler) ApprovePluginVersion(w http.ResponseWriter, r *http.Req
 	}
 }
 
+// PublishPluginVersion operation middleware
+func (sh *strictHandler) PublishPluginVersion(w http.ResponseWriter, r *http.Request, versionId string, params PublishPluginVersionParams) {
+	var request PublishPluginVersionRequestObject
+
+	request.VersionId = versionId
+	request.Params = params
+
+	var body PublishPluginVersionJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PublishPluginVersion(ctx, request.(PublishPluginVersionRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PublishPluginVersion")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PublishPluginVersionResponseObject); ok {
+		if err := validResponse.VisitPublishPluginVersionResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RevokePluginVersion operation middleware
+func (sh *strictHandler) RevokePluginVersion(w http.ResponseWriter, r *http.Request, versionId string, params RevokePluginVersionParams) {
+	var request RevokePluginVersionRequestObject
+
+	request.VersionId = versionId
+	request.Params = params
+
+	var body RevokePluginVersionJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RevokePluginVersion(ctx, request.(RevokePluginVersionRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RevokePluginVersion")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RevokePluginVersionResponseObject); ok {
+		if err := validResponse.VisitRevokePluginVersionResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // Base64 encoded, compressed with deflate, json marshaled OpenAPI spec.
 // Stored as a slice of fixed-width chunks rather than one concatenated
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
+	"Ca/zDEEq3M757OXB5NdNY8lfy0NdXb25+v8DAA==",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

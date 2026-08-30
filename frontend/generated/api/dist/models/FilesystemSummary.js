@@ -31,7 +31,6 @@ export function FilesystemSummaryFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'mountPoint': json['mount_point'],
         'capacityBytes': json['capacity_bytes'],
         'availableBytes': json['available_bytes'],
@@ -45,7 +44,6 @@ export function FilesystemSummaryToJSONTyped(value, ignoreDiscriminator = false)
         return value;
     }
     return {
-        ...value,
         'mount_point': value['mountPoint'],
         'capacity_bytes': value['capacityBytes'],
         'available_bytes': value['availableBytes'],

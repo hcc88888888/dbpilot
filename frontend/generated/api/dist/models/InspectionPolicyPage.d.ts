@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface InspectionPolicyPage
  */
 export interface InspectionPolicyPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionPolicy>}

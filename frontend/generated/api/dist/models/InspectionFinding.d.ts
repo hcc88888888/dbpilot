@@ -16,7 +16,6 @@ import type { InspectionFindingLevel } from './InspectionFindingLevel.js';
  * @interface InspectionFinding
  */
 export interface InspectionFinding {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

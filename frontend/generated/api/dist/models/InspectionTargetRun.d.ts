@@ -16,7 +16,6 @@ import type { InspectionTargetRunStatus } from './InspectionTargetRunStatus.js';
  * @interface InspectionTargetRun
  */
 export interface InspectionTargetRun {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

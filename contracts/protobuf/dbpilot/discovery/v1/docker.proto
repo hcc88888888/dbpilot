@@ -31,13 +31,24 @@ message DockerContainerObservation {
   string container_id = 1;
   string name = 2;
   string image = 3;
-  string status = 4;
+  DockerContainerStatus status = 4;
   repeated DockerPortMapping ports = 5;
   map<string, string> labels = 6;
   string command_summary = 7;
   uint32 host_process_id = 8;
   string cgroup = 9;
   google.protobuf.Timestamp observed_at = 10;
+}
+
+enum DockerContainerStatus {
+  DOCKER_CONTAINER_STATUS_UNSPECIFIED = 0;
+  DOCKER_CONTAINER_STATUS_CREATED = 1;
+  DOCKER_CONTAINER_STATUS_RUNNING = 2;
+  DOCKER_CONTAINER_STATUS_PAUSED = 3;
+  DOCKER_CONTAINER_STATUS_RESTARTING = 4;
+  DOCKER_CONTAINER_STATUS_REMOVING = 5;
+  DOCKER_CONTAINER_STATUS_EXITED = 6;
+  DOCKER_CONTAINER_STATUS_DEAD = 7;
 }
 
 message DockerPortMapping {

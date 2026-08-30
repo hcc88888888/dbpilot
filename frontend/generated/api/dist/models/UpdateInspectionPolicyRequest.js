@@ -35,7 +35,6 @@ export function UpdateInspectionPolicyRequestFromJSONTyped(json, ignoreDiscrimin
         return json;
     }
     return {
-        ...json,
         'name': json['name'],
         'enabled': json['enabled'],
         'schedule': json['schedule'] == null ? undefined : InspectionScheduleFromJSON(json['schedule']),
@@ -54,7 +53,6 @@ export function UpdateInspectionPolicyRequestToJSONTyped(value, ignoreDiscrimina
         return value;
     }
     return {
-        ...value,
         'name': value['name'],
         'enabled': value['enabled'],
         'schedule': InspectionScheduleToJSON(value['schedule']),

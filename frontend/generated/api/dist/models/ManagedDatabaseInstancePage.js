@@ -31,7 +31,6 @@ export function ManagedDatabaseInstancePageFromJSONTyped(json, ignoreDiscriminat
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(ManagedDatabaseInstanceFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function ManagedDatabaseInstancePageToJSONTyped(value, ignoreDiscriminato
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(ManagedDatabaseInstanceToJSON)),
         'page': PageToJSON(value['page']),
     };

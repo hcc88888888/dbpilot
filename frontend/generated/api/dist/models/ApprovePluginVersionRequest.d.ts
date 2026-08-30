@@ -15,7 +15,6 @@
  * @interface ApprovePluginVersionRequest
  */
 export interface ApprovePluginVersionRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

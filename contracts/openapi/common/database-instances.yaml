@@ -81,6 +81,11 @@ ManagedDatabaseInstance:
     labels:
       type: object
       maxProperties: 32
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$'
       additionalProperties:
         type: string
         maxLength: 128
@@ -147,6 +152,11 @@ UpdateDatabaseInstanceRequest:
     labels:
       type: object
       maxProperties: 32
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$'
       additionalProperties:
         type: string
         maxLength: 128

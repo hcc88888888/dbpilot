@@ -17,7 +17,6 @@ import type { InspectionSchedule } from './InspectionSchedule.js';
  * @interface UpdateInspectionPolicyRequest
  */
 export interface UpdateInspectionPolicyRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

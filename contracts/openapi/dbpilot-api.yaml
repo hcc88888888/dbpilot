@@ -167,6 +167,10 @@ components:
       $ref: ./common/discovery.yaml#/DatabaseFamily
     DatabaseVariant:
       $ref: ./common/discovery.yaml#/DatabaseVariant
+    DiscoveryEvidenceKind:
+      $ref: ./common/discovery.yaml#/DiscoveryEvidenceKind
+    DiscoveryEvidence:
+      $ref: ./common/discovery.yaml#/DiscoveryEvidence
     DiscoveryCandidate:
       $ref: ./common/discovery.yaml#/DiscoveryCandidate
     DiscoveryCandidatePage:
@@ -193,6 +197,8 @@ components:
       $ref: ./common/plugins.yaml#/PluginProcessState
     PluginHealthStatus:
       $ref: ./common/plugins.yaml#/PluginHealthStatus
+    PluginCircuitState:
+      $ref: ./common/plugins.yaml#/PluginCircuitState
     PluginActiveSlot:
       $ref: ./common/plugins.yaml#/PluginActiveSlot
     PluginOperatingSystem:
@@ -209,10 +215,12 @@ components:
       $ref: ./common/plugins.yaml#/PluginVersion
     PluginVersionPage:
       $ref: ./common/plugins.yaml#/PluginVersionPage
-    CreatePluginVersionRequest:
-      $ref: ./common/plugins.yaml#/CreatePluginVersionRequest
     ApprovePluginVersionRequest:
       $ref: ./common/plugins.yaml#/ApprovePluginVersionRequest
+    PublishPluginVersionRequest:
+      $ref: ./common/plugins.yaml#/PublishPluginVersionRequest
+    RevokePluginVersionRequest:
+      $ref: ./common/plugins.yaml#/RevokePluginVersionRequest
     PluginObservedState:
       $ref: ./common/plugins.yaml#/PluginObservedState
     PluginAssignment:

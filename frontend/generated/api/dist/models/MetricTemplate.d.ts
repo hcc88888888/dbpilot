@@ -15,7 +15,6 @@
  * @interface MetricTemplate
  */
 export interface MetricTemplate {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

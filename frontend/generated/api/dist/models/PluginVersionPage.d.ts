@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface PluginVersionPage
  */
 export interface PluginVersionPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginVersion>}

@@ -57,7 +57,6 @@ export function ManagedDatabaseInstanceFromJSONTyped(json, ignoreDiscriminator) 
         return json;
     }
     return {
-        ...json,
         'instanceId': json['instance_id'],
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
@@ -94,7 +93,6 @@ export function ManagedDatabaseInstanceToJSONTyped(value, ignoreDiscriminator = 
         return value;
     }
     return {
-        ...value,
         'instance_id': value['instanceId'],
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],

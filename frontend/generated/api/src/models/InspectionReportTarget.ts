@@ -27,7 +27,6 @@ import {
  * @interface InspectionReportTarget
  */
 export interface InspectionReportTarget {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -89,8 +88,6 @@ export function InspectionReportTargetFromJSONTyped(json: any, ignoreDiscriminat
         return json;
     }
     return {
-
-            ...json,
         'targetId': json['target_id'],
         'displayName': json['display_name'],
         'host': json['host'],
@@ -110,8 +107,6 @@ export function InspectionReportTargetToJSONTyped(value?: InspectionReportTarget
     }
 
     return {
-
-            ...value,
         'target_id': value['targetId'],
         'display_name': value['displayName'],
         'host': value['host'],

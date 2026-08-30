@@ -27,7 +27,6 @@ import {
  * @interface InspectionTargetRun
  */
 export interface InspectionTargetRun {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -87,8 +86,6 @@ export function InspectionTargetRunFromJSONTyped(json: any, ignoreDiscriminator:
         return json;
     }
     return {
-
-            ...json,
         'targetId': json['target_id'],
         'agentId': json['agent_id'],
         'status': InspectionTargetRunStatusFromJSON(json['status']),
@@ -108,8 +105,6 @@ export function InspectionTargetRunToJSONTyped(value?: InspectionTargetRun | nul
     }
 
     return {
-
-            ...value,
         'target_id': value['targetId'],
         'agent_id': value['agentId'],
         'status': InspectionTargetRunStatusToJSON(value['status']),

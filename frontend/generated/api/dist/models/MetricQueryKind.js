@@ -16,9 +16,7 @@
  * @export
  */
 export const MetricQueryKind = {
-    Builtin: 'builtin',
     Sql: 'sql',
-    Structured: 'structured',
     UnknownDefaultOpenApi: '11184809'
 };
 export function instanceOfMetricQueryKind(value) {

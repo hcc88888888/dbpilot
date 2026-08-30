@@ -27,7 +27,6 @@ export function InspectionEvidenceSelectorFromJSONTyped(json, ignoreDiscriminato
         return json;
     }
     return {
-        ...json,
         'fields': new Set(json['fields']),
     };
 }
@@ -39,7 +38,6 @@ export function InspectionEvidenceSelectorToJSONTyped(value, ignoreDiscriminator
         return value;
     }
     return {
-        ...value,
         'fields': Array.from(value['fields']),
     };
 }

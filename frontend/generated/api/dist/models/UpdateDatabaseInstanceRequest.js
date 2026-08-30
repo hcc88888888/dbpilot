@@ -25,7 +25,6 @@ export function UpdateDatabaseInstanceRequestFromJSONTyped(json, ignoreDiscrimin
         return json;
     }
     return {
-        ...json,
         'displayName': json['display_name'] == null ? undefined : json['display_name'],
         'credentialRef': json['credential_ref'] == null ? undefined : json['credential_ref'],
         'tlsRef': json['tls_ref'] == null ? undefined : json['tls_ref'],
@@ -42,7 +41,6 @@ export function UpdateDatabaseInstanceRequestToJSONTyped(value, ignoreDiscrimina
         return value;
     }
     return {
-        ...value,
         'display_name': value['displayName'],
         'credential_ref': value['credentialRef'],
         'tls_ref': value['tlsRef'],

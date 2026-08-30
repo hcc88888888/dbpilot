@@ -10,7 +10,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, CreatePluginVersionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
+import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, PublishPluginVersionRequest, RevokePluginVersionRequest, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
 export interface AcceptDiscoveryCandidateOperationRequest {
     candidateId: string;
     idempotencyKey: string;
@@ -66,10 +66,6 @@ export interface CreateMetricTemplateRevisionOperationRequest {
     templateId: string;
     idempotencyKey: string;
     createMetricTemplateRevisionRequest: CreateMetricTemplateRevisionRequest;
-}
-export interface CreatePluginVersionOperationRequest {
-    idempotencyKey: string;
-    createPluginVersionRequest: CreatePluginVersionRequest;
 }
 export interface DecommissionHostRequest {
     hostId: string;
@@ -184,6 +180,12 @@ export interface PublishMetricTemplateRevisionRequest {
     idempotencyKey: string;
     ifMatch: string;
 }
+export interface PublishPluginVersionOperationRequest {
+    versionId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    publishPluginVersionRequest: PublishPluginVersionRequest;
+}
 export interface ReconcilePluginAssignmentRequest {
     assignmentId: string;
     idempotencyKey: string;
@@ -192,9 +194,20 @@ export interface RediscoverHostRequest {
     hostId: string;
     idempotencyKey: string;
 }
+export interface RetireDatabaseInstanceRequest {
+    instanceId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+}
 export interface RetryInspectionRunRequest {
     runId: string;
     idempotencyKey: string;
+}
+export interface RevokePluginVersionOperationRequest {
+    versionId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    revokePluginVersionRequest: RevokePluginVersionRequest;
 }
 export interface RunInspectionPolicyRequest {
     policyId: string;
@@ -227,9 +240,15 @@ export interface UpdatePluginAssignmentOperationRequest {
     ifMatch: string;
     updatePluginAssignmentRequest: UpdatePluginAssignmentRequest;
 }
+export interface UploadPluginVersionPackageRequest {
+    idempotencyKey: string;
+    contentLength: number;
+    body: Blob;
+}
 export interface ValidateMetricTemplateRevisionRequest {
     revisionId: string;
     idempotencyKey: string;
+    ifMatch: string;
 }
 /**
  *
@@ -331,14 +350,6 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Create an immutable custom metric template revision
      */
     createMetricTemplateRevision(requestParameters: CreateMetricTemplateRevisionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
-    /**
-     * Register a Server-hosted signed plugin artifact
-     */
-    createPluginVersionRaw(requestParameters: CreatePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
-    /**
-     * Register a Server-hosted signed plugin artifact
-     */
-    createPluginVersion(requestParameters: CreatePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
     /**
      * Decommission a managed host and revoke Agent enrollment
      */
@@ -564,6 +575,14 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     publishMetricTemplateRevision(requestParameters: PublishMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
     /**
+     * Publish an approved plugin version for new assignments
+     */
+    publishPluginVersionRaw(requestParameters: PublishPluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
+    /**
+     * Publish an approved plugin version for new assignments
+     */
+    publishPluginVersion(requestParameters: PublishPluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
+    /**
      * Trigger typed plugin reconciliation
      */
     reconcilePluginAssignmentRaw(requestParameters: ReconcilePluginAssignmentRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
@@ -580,6 +599,14 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     rediscoverHost(requestParameters: RediscoverHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
     /**
+     * Retire a managed database instance
+     */
+    retireDatabaseInstanceRaw(requestParameters: RetireDatabaseInstanceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedDatabaseInstance>>;
+    /**
+     * Retire a managed database instance
+     */
+    retireDatabaseInstance(requestParameters: RetireDatabaseInstanceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedDatabaseInstance>;
+    /**
      * Retry a terminal inspection run as a new run
      */
     retryInspectionRunRaw(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
@@ -587,6 +614,14 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Retry a terminal inspection run as a new run
      */
     retryInspectionRun(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
+    /**
+     * Revoke a plugin version from future assignments
+     */
+    revokePluginVersionRaw(requestParameters: RevokePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
+    /**
+     * Revoke a plugin version from future assignments
+     */
+    revokePluginVersion(requestParameters: RevokePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
     /**
      * Start an inspection policy immediately
      */
@@ -636,11 +671,19 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     updatePluginAssignment(requestParameters: UpdatePluginAssignmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginAssignment>;
     /**
-     * Start static validation for a draft metric template revision
+     * Upload a bounded signed plugin package for streaming verification
      */
-    validateMetricTemplateRevisionRaw(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    uploadPluginVersionPackageRaw(requestParameters: UploadPluginVersionPackageRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
+    /**
+     * Upload a bounded signed plugin package for streaming verification
+     */
+    uploadPluginVersionPackage(requestParameters: UploadPluginVersionPackageRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
     /**
      * Start static validation for a draft metric template revision
      */
-    validateMetricTemplateRevision(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    validateMetricTemplateRevisionRaw(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplateRevision>>;
+    /**
+     * Start static validation for a draft metric template revision
+     */
+    validateMetricTemplateRevision(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
 }

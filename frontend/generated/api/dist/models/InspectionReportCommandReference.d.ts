@@ -15,7 +15,6 @@
  * @interface InspectionReportCommandReference
  */
 export interface InspectionReportCommandReference {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

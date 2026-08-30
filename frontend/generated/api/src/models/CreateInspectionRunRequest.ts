@@ -27,7 +27,6 @@ import {
  * @interface CreateInspectionRunRequest
  */
 export interface CreateInspectionRunRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<string>}
@@ -72,8 +71,6 @@ export function CreateInspectionRunRequestFromJSONTyped(json: any, ignoreDiscrim
         return json;
     }
     return {
-
-            ...json,
         'targetIds': json['target_ids'],
         'itemVersions': ((json['item_versions'] as Array<any>).map(InspectionPolicyItemFromJSON)),
         'targetTimeoutSeconds': json['target_timeout_seconds'] == null ? undefined : json['target_timeout_seconds'],
@@ -91,8 +88,6 @@ export function CreateInspectionRunRequestToJSONTyped(value?: CreateInspectionRu
     }
 
     return {
-
-            ...value,
         'target_ids': value['targetIds'],
         'item_versions': ((value['itemVersions'] as Array<any>).map(InspectionPolicyItemToJSON)),
         'target_timeout_seconds': value['targetTimeoutSeconds'],

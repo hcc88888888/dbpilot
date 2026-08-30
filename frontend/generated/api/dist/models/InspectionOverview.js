@@ -35,7 +35,6 @@ export function InspectionOverviewFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'targetCount': json['target_count'],
         'onlineTargetCount': json['online_target_count'],
         'latestRunStatusCounts': InspectionOverviewLatestRunStatusCountsFromJSON(json['latest_run_status_counts']),
@@ -50,7 +49,6 @@ export function InspectionOverviewToJSONTyped(value, ignoreDiscriminator = false
         return value;
     }
     return {
-        ...value,
         'target_count': value['targetCount'],
         'online_target_count': value['onlineTargetCount'],
         'latest_run_status_counts': InspectionOverviewLatestRunStatusCountsToJSON(value['latestRunStatusCounts']),

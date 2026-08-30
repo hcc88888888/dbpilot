@@ -17,7 +17,6 @@ import type { PluginArchitecture } from './PluginArchitecture.js';
  * @interface PluginPlatform
  */
 export interface PluginPlatform {
-    [key: string]: any | any;
     /**
      *
      * @type {PluginOperatingSystem}

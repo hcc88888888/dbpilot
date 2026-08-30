@@ -3,7 +3,7 @@ MetricTemplateRevisionStatus:
   enum: [draft, validating, validated, trial_running, trial_passed, approval_pending, approved, published, superseded, validation_failed, trial_failed, rejected]
 MetricQueryKind:
   type: string
-  enum: [builtin, sql, structured]
+  enum: [sql]
 MetricValueType:
   type: string
   enum: [gauge, monotonic_gauge, counter, monotonic_counter]
@@ -87,7 +87,7 @@ MetricLabelMapping:
 MetricTemplateRevision:
   type: object
   additionalProperties: false
-  required: [revision_id, template_id, revision, database_family, variants, name, query_kind, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit, query_digest, status, created_by, created_at, etag]
+  required: [revision_id, template_id, revision, database_family, variants, name, query_kind, read_only_statement, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit, query_digest, status, created_by, created_at, etag]
   properties:
     revision_id:
       type: string
@@ -123,10 +123,6 @@ MetricTemplateRevision:
       type: string
       minLength: 1
       maxLength: 32768
-    structured_query:
-      type: object
-      maxProperties: 32
-      additionalProperties: true
     collection_interval_seconds:
       type: integer
       minimum: 10
@@ -218,7 +214,7 @@ CreateMetricTemplateRequest:
 CreateMetricTemplateRevisionRequest:
   type: object
   additionalProperties: false
-  required: [variants, name, query_kind, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit]
+  required: [variants, name, query_kind, read_only_statement, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit]
   properties:
     variants:
       type: array
@@ -240,10 +236,6 @@ CreateMetricTemplateRevisionRequest:
       type: string
       minLength: 1
       maxLength: 32768
-    structured_query:
-      type: object
-      maxProperties: 32
-      additionalProperties: true
     collection_interval_seconds:
       type: integer
       minimum: 10

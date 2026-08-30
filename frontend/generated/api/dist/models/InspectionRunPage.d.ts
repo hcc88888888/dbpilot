@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface InspectionRunPage
  */
 export interface InspectionRunPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionRun>}

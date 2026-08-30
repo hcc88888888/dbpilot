@@ -16,7 +16,6 @@ import type { InspectionPolicyItem } from './InspectionPolicyItem.js';
  * @interface CreateInspectionRunRequest
  */
 export interface CreateInspectionRunRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<string>}

@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface ApprovePluginVersionRequest
  */
 export interface ApprovePluginVersionRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -44,8 +43,6 @@ export function ApprovePluginVersionRequestFromJSONTyped(json: any, ignoreDiscri
         return json;
     }
     return {
-
-            ...json,
         'approvalComment': json['approval_comment'] == null ? undefined : json['approval_comment'],
     };
 }
@@ -60,8 +57,6 @@ export function ApprovePluginVersionRequestToJSONTyped(value?: ApprovePluginVers
     }
 
     return {
-
-            ...value,
         'approval_comment': value['approvalComment'],
     };
 }

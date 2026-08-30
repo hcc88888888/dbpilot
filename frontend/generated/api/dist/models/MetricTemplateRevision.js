@@ -33,6 +33,8 @@ export function instanceOfMetricTemplateRevision(value) {
         return false;
     if (!('queryKind' in value) || value['queryKind'] === undefined)
         return false;
+    if (!('readOnlyStatement' in value) || value['readOnlyStatement'] === undefined)
+        return false;
     if (!('collectionIntervalSeconds' in value) || value['collectionIntervalSeconds'] === undefined)
         return false;
     if (!('timeoutSeconds' in value) || value['timeoutSeconds'] === undefined)
@@ -67,7 +69,6 @@ export function MetricTemplateRevisionFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'revisionId': json['revision_id'],
         'templateId': json['template_id'],
         'revision': json['revision'],
@@ -76,8 +77,7 @@ export function MetricTemplateRevisionFromJSONTyped(json, ignoreDiscriminator) {
         'name': json['name'],
         'description': json['description'] == null ? undefined : json['description'],
         'queryKind': MetricQueryKindFromJSON(json['query_kind']),
-        'readOnlyStatement': json['read_only_statement'] == null ? undefined : json['read_only_statement'],
-        'structuredQuery': json['structured_query'] == null ? undefined : json['structured_query'],
+        'readOnlyStatement': json['read_only_statement'],
         'collectionIntervalSeconds': json['collection_interval_seconds'],
         'timeoutSeconds': json['timeout_seconds'],
         'maxRows': json['max_rows'],
@@ -103,7 +103,6 @@ export function MetricTemplateRevisionToJSONTyped(value, ignoreDiscriminator = f
         return value;
     }
     return {
-        ...value,
         'revision_id': value['revisionId'],
         'template_id': value['templateId'],
         'revision': value['revision'],
@@ -113,7 +112,6 @@ export function MetricTemplateRevisionToJSONTyped(value, ignoreDiscriminator = f
         'description': value['description'],
         'query_kind': MetricQueryKindToJSON(value['queryKind']),
         'read_only_statement': value['readOnlyStatement'],
-        'structured_query': value['structuredQuery'],
         'collection_interval_seconds': value['collectionIntervalSeconds'],
         'timeout_seconds': value['timeoutSeconds'],
         'max_rows': value['maxRows'],

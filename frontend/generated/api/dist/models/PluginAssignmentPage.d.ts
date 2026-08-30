@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface PluginAssignmentPage
  */
 export interface PluginAssignmentPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginAssignment>}

@@ -19,7 +19,6 @@ import type { MetricLabelMapping } from './MetricLabelMapping.js';
  * @interface MetricTemplateRevision
  */
 export interface MetricTemplateRevision {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -73,15 +72,7 @@ export interface MetricTemplateRevision {
      * @type {string}
      * @memberof MetricTemplateRevision
      */
-    readOnlyStatement?: string;
-    /**
-     *
-     * @type {{ [key: string]: any; }}
-     * @memberof MetricTemplateRevision
-     */
-    structuredQuery?: {
-        [key: string]: any;
-    };
+    readOnlyStatement: string;
     /**
      *
      * @type {number}
@@ -147,7 +138,7 @@ export interface MetricTemplateRevision {
      * @type {string}
      * @memberof MetricTemplateRevision
      */
-    approvedBy?: string;
+    approvedBy?: string | null;
     /**
      *
      * @type {string}

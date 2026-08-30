@@ -55,7 +55,6 @@ import {
  * @interface InspectionReport
  */
 export interface InspectionReport {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -142,8 +141,6 @@ export function InspectionReportFromJSONTyped(json: any, ignoreDiscriminator: bo
         return json;
     }
     return {
-
-            ...json,
         'id': json['id'],
         'runId': json['run_id'],
         'policyId': json['policy_id'] == null ? undefined : json['policy_id'],
@@ -167,8 +164,6 @@ export function InspectionReportToJSONTyped(value?: InspectionReport | null, ign
     }
 
     return {
-
-            ...value,
         'id': value['id'],
         'run_id': value['runId'],
         'policy_id': value['policyId'],

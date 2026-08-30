@@ -12,6 +12,7 @@
  * Do not edit the class manually.
  */
 import { DiscoverySourceFromJSON, DiscoverySourceToJSON, } from './DiscoverySource.js';
+import { DiscoveryEvidenceFromJSON, DiscoveryEvidenceToJSON, } from './DiscoveryEvidence.js';
 import { DiscoveryCandidateStatusFromJSON, DiscoveryCandidateStatusToJSON, } from './DiscoveryCandidateStatus.js';
 /**
  * Check if a given object implements the DiscoveryCandidate interface.
@@ -57,7 +58,6 @@ export function DiscoveryCandidateFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'candidateId': json['candidate_id'],
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
@@ -75,7 +75,7 @@ export function DiscoveryCandidateFromJSONTyped(json, ignoreDiscriminator) {
         'containerImage': json['container_image'] == null ? undefined : json['container_image'],
         'discoveredRole': json['discovered_role'] == null ? undefined : json['discovered_role'],
         'confidence': json['confidence'],
-        'evidenceSummary': new Set(json['evidence_summary']),
+        'evidenceSummary': (new Set(json['evidence_summary'].map(DiscoveryEvidenceFromJSON))),
         'fingerprint': json['fingerprint'],
         'possibleDuplicateOf': json['possible_duplicate_of'] == null ? undefined : json['possible_duplicate_of'],
         'ruleRevision': json['rule_revision'],
@@ -92,7 +92,6 @@ export function DiscoveryCandidateToJSONTyped(value, ignoreDiscriminator = false
         return value;
     }
     return {
-        ...value,
         'candidate_id': value['candidateId'],
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],
@@ -110,7 +109,7 @@ export function DiscoveryCandidateToJSONTyped(value, ignoreDiscriminator = false
         'container_image': value['containerImage'],
         'discovered_role': value['discoveredRole'],
         'confidence': value['confidence'],
-        'evidence_summary': Array.from(value['evidenceSummary']),
+        'evidence_summary': (Array.from(value['evidenceSummary']).map(DiscoveryEvidenceToJSON)),
         'fingerprint': value['fingerprint'],
         'possible_duplicate_of': value['possibleDuplicateOf'],
         'rule_revision': value['ruleRevision'],

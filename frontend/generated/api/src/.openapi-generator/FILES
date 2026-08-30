@@ -18,12 +18,13 @@ models/CreateInspectionPolicyRequest.ts
 models/CreateInspectionRunRequest.ts
 models/CreateMetricTemplateRequest.ts
 models/CreateMetricTemplateRevisionRequest.ts
-models/CreatePluginVersionRequest.ts
 models/CustomInspectionItemSourceType.ts
 models/DatabaseManagementStatus.ts
 models/DiscoveryCandidate.ts
 models/DiscoveryCandidatePage.ts
 models/DiscoveryCandidateStatus.ts
+models/DiscoveryEvidence.ts
+models/DiscoveryEvidenceKind.ts
 models/DiscoverySource.ts
 models/DownloadDescriptor.ts
 models/FieldError.ts
@@ -91,6 +92,7 @@ models/PluginActiveSlot.ts
 models/PluginArchitecture.ts
 models/PluginAssignment.ts
 models/PluginAssignmentPage.ts
+models/PluginCircuitState.ts
 models/PluginDefinition.ts
 models/PluginDefinitionPage.ts
 models/PluginDesiredState.ts
@@ -103,7 +105,9 @@ models/PluginVersion.ts
 models/PluginVersionPage.ts
 models/PluginVersionStatus.ts
 models/Problem.ts
+models/PublishPluginVersionRequest.ts
 models/ResourceReference.ts
+models/RevokePluginVersionRequest.ts
 models/UpdateDatabaseInstanceRequest.ts
 models/UpdateInspectionPolicyRequest.ts
 models/UpdatePluginAssignmentRequest.ts

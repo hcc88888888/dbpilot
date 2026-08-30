@@ -45,7 +45,6 @@ export function InspectionPolicyFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'id': json['id'],
         'name': json['name'],
         'enabled': json['enabled'],
@@ -69,7 +68,6 @@ export function InspectionPolicyToJSONTyped(value, ignoreDiscriminator = false) 
         return value;
     }
     return {
-        ...value,
         'id': value['id'],
         'name': value['name'],
         'enabled': value['enabled'],

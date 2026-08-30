@@ -29,7 +29,6 @@ export function InspectionReportCommandReferenceFromJSONTyped(json, ignoreDiscri
         return json;
     }
     return {
-        ...json,
         'targetId': json['target_id'],
         'commandId': json['command_id'],
     };
@@ -42,7 +41,6 @@ export function InspectionReportCommandReferenceToJSONTyped(value, ignoreDiscrim
         return value;
     }
     return {
-        ...value,
         'target_id': value['targetId'],
         'command_id': value['commandId'],
     };

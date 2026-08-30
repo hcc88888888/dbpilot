@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface MetricLabelMapping
  */
 export interface MetricLabelMapping {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -52,8 +51,6 @@ export function MetricLabelMappingFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'sourceColumn': json['source_column'],
         'label': json['label'],
     };
@@ -69,8 +66,6 @@ export function MetricLabelMappingToJSONTyped(value?: MetricLabelMapping | null,
     }
 
     return {
-
-            ...value,
         'source_column': value['sourceColumn'],
         'label': value['label'],
     };

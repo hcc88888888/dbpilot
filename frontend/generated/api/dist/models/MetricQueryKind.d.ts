@@ -14,9 +14,7 @@
  * @export
  */
 export declare const MetricQueryKind: {
-    readonly Builtin: "builtin";
     readonly Sql: "sql";
-    readonly Structured: "structured";
     readonly UnknownDefaultOpenApi: "11184809";
 };
 export type MetricQueryKind = typeof MetricQueryKind[keyof typeof MetricQueryKind];

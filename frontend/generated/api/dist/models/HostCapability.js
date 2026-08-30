@@ -30,7 +30,6 @@ export function HostCapabilityFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'name': json['name'],
         'available': json['available'],
         'reason': json['reason'] == null ? undefined : HostCapabilityReasonFromJSON(json['reason']),
@@ -44,7 +43,6 @@ export function HostCapabilityToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'name': value['name'],
         'available': value['available'],
         'reason': HostCapabilityReasonToJSON(value['reason']),

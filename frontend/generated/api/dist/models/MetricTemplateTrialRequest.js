@@ -29,7 +29,6 @@ export function MetricTemplateTrialRequestFromJSONTyped(json, ignoreDiscriminato
         return json;
     }
     return {
-        ...json,
         'instanceId': json['instance_id'],
         'pluginVersionId': json['plugin_version_id'],
     };
@@ -42,7 +41,6 @@ export function MetricTemplateTrialRequestToJSONTyped(value, ignoreDiscriminator
         return value;
     }
     return {
-        ...value,
         'instance_id': value['instanceId'],
         'plugin_version_id': value['pluginVersionId'],
     };

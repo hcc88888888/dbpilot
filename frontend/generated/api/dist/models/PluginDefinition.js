@@ -37,7 +37,6 @@ export function PluginDefinitionFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'pluginId': json['plugin_id'],
         'name': json['name'],
         'description': json['description'] == null ? undefined : json['description'],
@@ -56,7 +55,6 @@ export function PluginDefinitionToJSONTyped(value, ignoreDiscriminator = false) 
         return value;
     }
     return {
-        ...value,
         'plugin_id': value['pluginId'],
         'name': value['name'],
         'description': value['description'],

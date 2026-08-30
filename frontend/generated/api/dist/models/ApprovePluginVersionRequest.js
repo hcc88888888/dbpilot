@@ -25,7 +25,6 @@ export function ApprovePluginVersionRequestFromJSONTyped(json, ignoreDiscriminat
         return json;
     }
     return {
-        ...json,
         'approvalComment': json['approval_comment'] == null ? undefined : json['approval_comment'],
     };
 }
@@ -37,7 +36,6 @@ export function ApprovePluginVersionRequestToJSONTyped(value, ignoreDiscriminato
         return value;
     }
     return {
-        ...value,
         'approval_comment': value['approvalComment'],
     };
 }

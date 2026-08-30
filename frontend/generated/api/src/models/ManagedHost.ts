@@ -55,7 +55,6 @@ import {
  * @interface ManagedHost
  */
 export interface ManagedHost {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -236,8 +235,6 @@ export function ManagedHostFromJSONTyped(json: any, ignoreDiscriminator: boolean
         return json;
     }
     return {
-
-            ...json,
         'hostId': json['host_id'],
         'agentId': json['agent_id'],
         'tenantId': json['tenant_id'],
@@ -275,8 +272,6 @@ export function ManagedHostToJSONTyped(value?: ManagedHost | null, ignoreDiscrim
     }
 
     return {
-
-            ...value,
         'host_id': value['hostId'],
         'agent_id': value['agentId'],
         'tenant_id': value['tenantId'],

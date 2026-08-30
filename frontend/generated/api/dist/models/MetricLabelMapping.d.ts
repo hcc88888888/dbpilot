@@ -15,7 +15,6 @@
  * @interface MetricLabelMapping
  */
 export interface MetricLabelMapping {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

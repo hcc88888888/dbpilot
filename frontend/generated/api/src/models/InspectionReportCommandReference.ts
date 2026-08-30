@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface InspectionReportCommandReference
  */
 export interface InspectionReportCommandReference {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -52,8 +51,6 @@ export function InspectionReportCommandReferenceFromJSONTyped(json: any, ignoreD
         return json;
     }
     return {
-
-            ...json,
         'targetId': json['target_id'],
         'commandId': json['command_id'],
     };
@@ -69,8 +66,6 @@ export function InspectionReportCommandReferenceToJSONTyped(value?: InspectionRe
     }
 
     return {
-
-            ...value,
         'target_id': value['targetId'],
         'command_id': value['commandId'],
     };

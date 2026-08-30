@@ -29,7 +29,6 @@ export function InspectionScheduleFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'cron': json['cron'],
         'timezone': json['timezone'],
     };
@@ -42,7 +41,6 @@ export function InspectionScheduleToJSONTyped(value, ignoreDiscriminator = false
         return value;
     }
     return {
-        ...value,
         'cron': value['cron'],
         'timezone': value['timezone'],
     };

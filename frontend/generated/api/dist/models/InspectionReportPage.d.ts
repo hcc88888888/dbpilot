@@ -17,7 +17,6 @@ import type { InspectionReport } from './InspectionReport.js';
  * @interface InspectionReportPage
  */
 export interface InspectionReportPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionReport>}

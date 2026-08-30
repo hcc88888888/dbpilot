@@ -34,7 +34,6 @@ import {
  * @interface InspectionOverview
  */
 export interface InspectionOverview {
-    [key: string]: any | any;
     /**
      *
      * @type {number}
@@ -81,8 +80,6 @@ export function InspectionOverviewFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'targetCount': json['target_count'],
         'onlineTargetCount': json['online_target_count'],
         'latestRunStatusCounts': InspectionOverviewLatestRunStatusCountsFromJSON(json['latest_run_status_counts']),
@@ -100,8 +97,6 @@ export function InspectionOverviewToJSONTyped(value?: InspectionOverview | null,
     }
 
     return {
-
-            ...value,
         'target_count': value['targetCount'],
         'online_target_count': value['onlineTargetCount'],
         'latest_run_status_counts': InspectionOverviewLatestRunStatusCountsToJSON(value['latestRunStatusCounts']),

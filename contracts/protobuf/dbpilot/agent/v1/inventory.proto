@@ -59,7 +59,7 @@ message DiscoveryReport {
 
 message DiscoveryCandidateObservation {
   string observation_id = 1;
-  string source = 2;
+  DiscoverySource source = 2;
   string database_family = 3;
   string database_variant = 4;
   string version_hint = 5;
@@ -71,10 +71,34 @@ message DiscoveryCandidateObservation {
   string container_image = 11;
   string discovered_role = 12;
   double confidence = 13;
-  repeated string evidence = 14;
+  repeated DiscoveryEvidence evidence = 14;
   bytes fingerprint = 15;
   google.protobuf.Timestamp observed_at = 16;
   reserved 17 to 31;
+}
+
+enum DiscoverySource {
+  DISCOVERY_SOURCE_UNSPECIFIED = 0;
+  DISCOVERY_SOURCE_NATIVE = 1;
+  DISCOVERY_SOURCE_DOCKER = 2;
+}
+
+message DiscoveryEvidence {
+  DiscoveryEvidenceKind kind = 1;
+  string redacted_value = 2;
+}
+
+enum DiscoveryEvidenceKind {
+  DISCOVERY_EVIDENCE_KIND_UNSPECIFIED = 0;
+  DISCOVERY_EVIDENCE_KIND_PROCESS_NAME = 1;
+  DISCOVERY_EVIDENCE_KIND_EXECUTABLE_PATH = 2;
+  DISCOVERY_EVIDENCE_KIND_SYSTEMD_UNIT = 3;
+  DISCOVERY_EVIDENCE_KIND_LISTEN_ENDPOINT = 4;
+  DISCOVERY_EVIDENCE_KIND_UNIX_SOCKET = 5;
+  DISCOVERY_EVIDENCE_KIND_CONTAINER_IMAGE = 6;
+  DISCOVERY_EVIDENCE_KIND_CONTAINER_LABEL = 7;
+  DISCOVERY_EVIDENCE_KIND_CONTAINER_PORT = 8;
+  DISCOVERY_EVIDENCE_KIND_VERSION_HINT = 9;
 }
 
 message PluginObservation {
@@ -91,16 +115,62 @@ message PluginAssignmentObservation {
   string plugin_id = 2;
   string database_family = 3;
   string installed_version = 4;
-  string active_slot = 5;
-  string process_state = 6;
+  PluginActiveSlot active_slot = 5;
+  PluginProcessState process_state = 6;
   uint32 process_id = 7;
   google.protobuf.Timestamp started_at = 8;
-  string health = 9;
+  PluginHealthState health = 9;
   uint32 restart_count = 10;
   uint32 bound_instance_count = 11;
   uint64 active_configuration_revision = 12;
   uint64 observed_operation_revision = 13;
   string last_error_code = 14;
   google.protobuf.Timestamp observed_at = 15;
-  reserved 16 to 31;
+  PluginCircuitState circuit_state = 16;
+  reserved 17 to 31;
+}
+
+enum PluginActiveSlot {
+  PLUGIN_ACTIVE_SLOT_UNSPECIFIED = 0;
+  PLUGIN_ACTIVE_SLOT_NONE = 1;
+  PLUGIN_ACTIVE_SLOT_A = 2;
+  PLUGIN_ACTIVE_SLOT_B = 3;
+}
+
+enum PluginProcessState {
+  PLUGIN_PROCESS_STATE_UNSPECIFIED = 0;
+  PLUGIN_PROCESS_STATE_ABSENT = 1;
+  PLUGIN_PROCESS_STATE_DOWNLOADING = 2;
+  PLUGIN_PROCESS_STATE_VERIFYING = 3;
+  PLUGIN_PROCESS_STATE_INSTALLED = 4;
+  PLUGIN_PROCESS_STATE_STARTING = 5;
+  PLUGIN_PROCESS_STATE_HANDSHAKING = 6;
+  PLUGIN_PROCESS_STATE_RUNNING = 7;
+  PLUGIN_PROCESS_STATE_DEGRADED = 8;
+  PLUGIN_PROCESS_STATE_RESTARTING = 9;
+  PLUGIN_PROCESS_STATE_DRAINING = 10;
+  PLUGIN_PROCESS_STATE_STOPPED = 11;
+  PLUGIN_PROCESS_STATE_UNINSTALLING = 12;
+  PLUGIN_PROCESS_STATE_DOWNLOAD_FAILED = 13;
+  PLUGIN_PROCESS_STATE_SIGNATURE_REJECTED = 14;
+  PLUGIN_PROCESS_STATE_MANIFEST_REJECTED = 15;
+  PLUGIN_PROCESS_STATE_PLATFORM_MISMATCH = 16;
+  PLUGIN_PROCESS_STATE_START_FAILED = 17;
+  PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED = 18;
+  PLUGIN_PROCESS_STATE_UPGRADING = 19;
+  PLUGIN_PROCESS_STATE_ROLLBACK = 20;
+}
+
+enum PluginHealthState {
+  PLUGIN_HEALTH_STATE_UNSPECIFIED = 0;
+  PLUGIN_HEALTH_STATE_HEALTHY = 1;
+  PLUGIN_HEALTH_STATE_DEGRADED = 2;
+  PLUGIN_HEALTH_STATE_UNHEALTHY = 3;
+}
+
+enum PluginCircuitState {
+  PLUGIN_CIRCUIT_STATE_UNSPECIFIED = 0;
+  PLUGIN_CIRCUIT_STATE_CLOSED = 1;
+  PLUGIN_CIRCUIT_STATE_OPEN = 2;
+  PLUGIN_CIRCUIT_STATE_HALF_OPEN = 3;
 }

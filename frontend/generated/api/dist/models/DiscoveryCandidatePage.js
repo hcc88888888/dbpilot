@@ -31,7 +31,6 @@ export function DiscoveryCandidatePageFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(DiscoveryCandidateFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function DiscoveryCandidatePageToJSONTyped(value, ignoreDiscriminator = f
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(DiscoveryCandidateToJSON)),
         'page': PageToJSON(value['page']),
     };

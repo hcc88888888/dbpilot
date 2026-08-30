@@ -15,7 +15,6 @@
  * @interface InspectionSchedule
  */
 export interface InspectionSchedule {
-    [key: string]: any | any;
     /**
      * Five-field cron expression; seconds are not accepted.
      * @type {string}

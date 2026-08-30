@@ -32,7 +32,6 @@ export function InspectionReportReferencesFromJSONTyped(json, ignoreDiscriminato
         return json;
     }
     return {
-        ...json,
         'jobId': json['job_id'],
         'commands': (json['commands'].map(InspectionReportCommandReferenceFromJSON)),
         'auditCorrelation': json['audit_correlation'],
@@ -46,7 +45,6 @@ export function InspectionReportReferencesToJSONTyped(value, ignoreDiscriminator
         return value;
     }
     return {
-        ...value,
         'job_id': value['jobId'],
         'commands': (value['commands'].map(InspectionReportCommandReferenceToJSON)),
         'audit_correlation': value['auditCorrelation'],

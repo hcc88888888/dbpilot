@@ -16,7 +16,6 @@ import type { HostCapabilityReason } from './HostCapabilityReason.js';
  * @interface HostCapability
  */
 export interface HostCapability {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

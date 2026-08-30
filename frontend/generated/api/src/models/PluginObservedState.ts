@@ -13,6 +13,13 @@
  */
 
 import { mapValues } from '../runtime.js';
+import type { PluginCircuitState } from './PluginCircuitState.js';
+import {
+    PluginCircuitStateFromJSON,
+    PluginCircuitStateFromJSONTyped,
+    PluginCircuitStateToJSON,
+    PluginCircuitStateToJSONTyped,
+} from './PluginCircuitState.js';
 import type { PluginActiveSlot } from './PluginActiveSlot.js';
 import {
     PluginActiveSlotFromJSON,
@@ -41,7 +48,6 @@ import {
  * @interface PluginObservedState
  */
 export interface PluginObservedState {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -84,6 +90,12 @@ export interface PluginObservedState {
      * @memberof PluginObservedState
      */
     health: PluginHealthStatus;
+    /**
+     *
+     * @type {PluginCircuitState}
+     * @memberof PluginObservedState
+     */
+    circuitState: PluginCircuitState;
     /**
      *
      * @type {number}
@@ -131,6 +143,7 @@ export function instanceOfPluginObservedState(value: object): value is PluginObs
     if (!('assignmentId' in value) || value['assignmentId'] === undefined) return false;
     if (!('processState' in value) || value['processState'] === undefined) return false;
     if (!('health' in value) || value['health'] === undefined) return false;
+    if (!('circuitState' in value) || value['circuitState'] === undefined) return false;
     if (!('restartCount' in value) || value['restartCount'] === undefined) return false;
     if (!('boundInstanceCount' in value) || value['boundInstanceCount'] === undefined) return false;
     if (!('activeConfigurationRevision' in value) || value['activeConfigurationRevision'] === undefined) return false;
@@ -148,8 +161,6 @@ export function PluginObservedStateFromJSONTyped(json: any, ignoreDiscriminator:
         return json;
     }
     return {
-
-            ...json,
         'assignmentId': json['assignment_id'],
         'installedVersion': json['installed_version'] == null ? undefined : json['installed_version'],
         'activeSlot': json['active_slot'] == null ? undefined : PluginActiveSlotFromJSON(json['active_slot']),
@@ -157,6 +168,7 @@ export function PluginObservedStateFromJSONTyped(json: any, ignoreDiscriminator:
         'pid': json['pid'] == null ? undefined : json['pid'],
         'startedAt': json['started_at'] == null ? undefined : (new Date(json['started_at'])),
         'health': PluginHealthStatusFromJSON(json['health']),
+        'circuitState': PluginCircuitStateFromJSON(json['circuit_state']),
         'restartCount': json['restart_count'],
         'boundInstanceCount': json['bound_instance_count'],
         'activeConfigurationRevision': json['active_configuration_revision'],
@@ -176,8 +188,6 @@ export function PluginObservedStateToJSONTyped(value?: PluginObservedState | nul
     }
 
     return {
-
-            ...value,
         'assignment_id': value['assignmentId'],
         'installed_version': value['installedVersion'],
         'active_slot': PluginActiveSlotToJSON(value['activeSlot']),
@@ -185,6 +195,7 @@ export function PluginObservedStateToJSONTyped(value?: PluginObservedState | nul
         'pid': value['pid'],
         'started_at': value['startedAt'] == null ? undefined : ((value['startedAt']).toISOString()),
         'health': PluginHealthStatusToJSON(value['health']),
+        'circuit_state': PluginCircuitStateToJSON(value['circuitState']),
         'restart_count': value['restartCount'],
         'bound_instance_count': value['boundInstanceCount'],
         'active_configuration_revision': value['activeConfigurationRevision'],

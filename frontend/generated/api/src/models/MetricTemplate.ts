@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface MetricTemplate
  */
 export interface MetricTemplate {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -93,8 +92,6 @@ export function MetricTemplateFromJSONTyped(json: any, ignoreDiscriminator: bool
         return json;
     }
     return {
-
-            ...json,
         'templateId': json['template_id'],
         'databaseFamily': json['database_family'],
         'name': json['name'],
@@ -116,8 +113,6 @@ export function MetricTemplateToJSONTyped(value?: MetricTemplate | null, ignoreD
     }
 
     return {
-
-            ...value,
         'template_id': value['templateId'],
         'database_family': value['databaseFamily'],
         'name': value['name'],

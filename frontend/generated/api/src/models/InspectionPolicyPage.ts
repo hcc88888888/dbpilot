@@ -34,7 +34,6 @@ import {
  * @interface InspectionPolicyPage
  */
 export interface InspectionPolicyPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionPolicy>}
@@ -67,8 +66,6 @@ export function InspectionPolicyPageFromJSONTyped(json: any, ignoreDiscriminator
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(InspectionPolicyFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function InspectionPolicyPageToJSONTyped(value?: InspectionPolicyPage | n
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(InspectionPolicyToJSON)),
         'page': PageToJSON(value['page']),
     };

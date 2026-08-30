@@ -27,7 +27,6 @@ import {
  * @interface HostCapability
  */
 export interface HostCapability {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -68,8 +67,6 @@ export function HostCapabilityFromJSONTyped(json: any, ignoreDiscriminator: bool
         return json;
     }
     return {
-
-            ...json,
         'name': json['name'],
         'available': json['available'],
         'reason': json['reason'] == null ? undefined : HostCapabilityReasonFromJSON(json['reason']),
@@ -86,8 +83,6 @@ export function HostCapabilityToJSONTyped(value?: HostCapability | null, ignoreD
     }
 
     return {
-
-            ...value,
         'name': value['name'],
         'available': value['available'],
         'reason': HostCapabilityReasonToJSON(value['reason']),

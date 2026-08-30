@@ -18,7 +18,6 @@ import type { MetricLabelMapping } from './MetricLabelMapping.js';
  * @interface CreateMetricTemplateRevisionRequest
  */
 export interface CreateMetricTemplateRevisionRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {Set<string>}
@@ -48,15 +47,7 @@ export interface CreateMetricTemplateRevisionRequest {
      * @type {string}
      * @memberof CreateMetricTemplateRevisionRequest
      */
-    readOnlyStatement?: string;
-    /**
-     *
-     * @type {{ [key: string]: any; }}
-     * @memberof CreateMetricTemplateRevisionRequest
-     */
-    structuredQuery?: {
-        [key: string]: any;
-    };
+    readOnlyStatement: string;
     /**
      *
      * @type {number}

@@ -17,7 +17,6 @@ import type { PluginPlatform } from './PluginPlatform.js';
  * @interface PluginVersion
  */
 export interface PluginVersion {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -84,6 +83,30 @@ export interface PluginVersion {
      * @memberof PluginVersion
      */
     maximumAgentProtocolVersion?: string;
+    /**
+     *
+     * @type {Set<string>}
+     * @memberof PluginVersion
+     */
+    supportedVariants: Set<string>;
+    /**
+     *
+     * @type {string}
+     * @memberof PluginVersion
+     */
+    databaseVersionRange: string;
+    /**
+     *
+     * @type {Set<string>}
+     * @memberof PluginVersion
+     */
+    capabilities: Set<string>;
+    /**
+     *
+     * @type {number}
+     * @memberof PluginVersion
+     */
+    metricTemplateSchemaVersion: number;
     /**
      *
      * @type {Array<PluginPlatform>}

@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface IgnoreDiscoveryCandidateRequest
  */
 export interface IgnoreDiscoveryCandidateRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -45,8 +44,6 @@ export function IgnoreDiscoveryCandidateRequestFromJSONTyped(json: any, ignoreDi
         return json;
     }
     return {
-
-            ...json,
         'reasonCode': json['reason_code'],
     };
 }
@@ -61,8 +58,6 @@ export function IgnoreDiscoveryCandidateRequestToJSONTyped(value?: IgnoreDiscove
     }
 
     return {
-
-            ...value,
         'reason_code': value['reasonCode'],
     };
 }

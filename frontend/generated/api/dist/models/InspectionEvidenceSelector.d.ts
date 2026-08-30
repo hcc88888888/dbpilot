@@ -15,7 +15,6 @@
  * @interface InspectionEvidenceSelector
  */
 export interface InspectionEvidenceSelector {
-    [key: string]: any | any;
     /**
      *
      * @type {Set<string>}

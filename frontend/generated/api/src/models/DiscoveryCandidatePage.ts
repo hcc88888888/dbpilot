@@ -34,7 +34,6 @@ import {
  * @interface DiscoveryCandidatePage
  */
 export interface DiscoveryCandidatePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<DiscoveryCandidate>}
@@ -67,8 +66,6 @@ export function DiscoveryCandidatePageFromJSONTyped(json: any, ignoreDiscriminat
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(DiscoveryCandidateFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function DiscoveryCandidatePageToJSONTyped(value?: DiscoveryCandidatePage
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(DiscoveryCandidateToJSON)),
         'page': PageToJSON(value['page']),
     };

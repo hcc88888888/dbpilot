@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface UpdateDatabaseInstanceRequest
  */
 export interface UpdateDatabaseInstanceRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -74,8 +73,6 @@ export function UpdateDatabaseInstanceRequestFromJSONTyped(json: any, ignoreDisc
         return json;
     }
     return {
-
-            ...json,
         'displayName': json['display_name'] == null ? undefined : json['display_name'],
         'credentialRef': json['credential_ref'] == null ? undefined : json['credential_ref'],
         'tlsRef': json['tls_ref'] == null ? undefined : json['tls_ref'],
@@ -95,8 +92,6 @@ export function UpdateDatabaseInstanceRequestToJSONTyped(value?: UpdateDatabaseI
     }
 
     return {
-
-            ...value,
         'display_name': value['displayName'],
         'credential_ref': value['credentialRef'],
         'tls_ref': value['tlsRef'],

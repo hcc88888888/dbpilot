@@ -34,7 +34,6 @@ import {
  * @interface ManagedDatabaseInstance
  */
 export interface ManagedDatabaseInstance {
-    [key: string]: any | any;
     /**
      * Opaque database instance identifier.
      * @type {string}
@@ -226,8 +225,6 @@ export function ManagedDatabaseInstanceFromJSONTyped(json: any, ignoreDiscrimina
         return json;
     }
     return {
-
-            ...json,
         'instanceId': json['instance_id'],
         'tenantId': json['tenant_id'],
         'projectId': json['project_id'],
@@ -267,8 +264,6 @@ export function ManagedDatabaseInstanceToJSONTyped(value?: ManagedDatabaseInstan
     }
 
     return {
-
-            ...value,
         'instance_id': value['instanceId'],
         'tenant_id': value['tenantId'],
         'project_id': value['projectId'],

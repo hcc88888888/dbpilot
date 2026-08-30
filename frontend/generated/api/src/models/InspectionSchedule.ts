@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface InspectionSchedule
  */
 export interface InspectionSchedule {
-    [key: string]: any | any;
     /**
      * Five-field cron expression; seconds are not accepted.
      * @type {string}
@@ -52,8 +51,6 @@ export function InspectionScheduleFromJSONTyped(json: any, ignoreDiscriminator: 
         return json;
     }
     return {
-
-            ...json,
         'cron': json['cron'],
         'timezone': json['timezone'],
     };
@@ -69,8 +66,6 @@ export function InspectionScheduleToJSONTyped(value?: InspectionSchedule | null,
     }
 
     return {
-
-            ...value,
         'cron': value['cron'],
         'timezone': value['timezone'],
     };

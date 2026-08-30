@@ -34,7 +34,6 @@ import {
  * @interface PluginVersionPage
  */
 export interface PluginVersionPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginVersion>}
@@ -67,8 +66,6 @@ export function PluginVersionPageFromJSONTyped(json: any, ignoreDiscriminator: b
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(PluginVersionFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function PluginVersionPageToJSONTyped(value?: PluginVersionPage | null, i
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(PluginVersionToJSON)),
         'page': PageToJSON(value['page']),
     };

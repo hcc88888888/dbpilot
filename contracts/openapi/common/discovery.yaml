@@ -18,6 +18,21 @@ DatabaseVariant:
   minLength: 1
   maxLength: 64
   pattern: '^[a-z][a-z0-9_.-]{0,63}$'
+DiscoveryEvidenceKind:
+  type: string
+  enum: [process_name, executable_path, systemd_unit, listen_endpoint, unix_socket, container_image, container_label, container_port, version_hint]
+DiscoveryEvidence:
+  type: object
+  additionalProperties: false
+  required: [kind, value]
+  properties:
+    kind:
+      $ref: '#/DiscoveryEvidenceKind'
+    value:
+      type: string
+      minLength: 1
+      maxLength: 256
+      description: Redacted allowlisted evidence value; never a raw command line, environment value, or configuration body.
 DiscoveryCandidate:
   type: object
   additionalProperties: false
@@ -87,9 +102,7 @@ DiscoveryCandidate:
       maxItems: 32
       uniqueItems: true
       items:
-        type: string
-        minLength: 1
-        maxLength: 256
+        $ref: '#/DiscoveryEvidence'
     fingerprint:
       type: string
       pattern: '^[a-f0-9]{64}$'
@@ -150,6 +163,11 @@ AcceptDiscoveryCandidateRequest:
     labels:
       type: object
       maxProperties: 32
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$'
       additionalProperties:
         type: string
         maxLength: 128

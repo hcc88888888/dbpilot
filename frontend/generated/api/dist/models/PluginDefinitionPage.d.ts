@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface PluginDefinitionPage
  */
 export interface PluginDefinitionPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginDefinition>}

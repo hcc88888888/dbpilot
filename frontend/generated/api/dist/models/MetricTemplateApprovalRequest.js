@@ -25,7 +25,6 @@ export function MetricTemplateApprovalRequestFromJSONTyped(json, ignoreDiscrimin
         return json;
     }
     return {
-        ...json,
         'approvalComment': json['approval_comment'] == null ? undefined : json['approval_comment'],
     };
 }
@@ -37,7 +36,6 @@ export function MetricTemplateApprovalRequestToJSONTyped(value, ignoreDiscrimina
         return value;
     }
     return {
-        ...value,
         'approval_comment': value['approvalComment'],
     };
 }

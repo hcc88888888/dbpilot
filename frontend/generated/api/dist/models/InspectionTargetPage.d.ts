@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface InspectionTargetPage
  */
 export interface InspectionTargetPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionTarget>}

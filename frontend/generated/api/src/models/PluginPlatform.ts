@@ -34,7 +34,6 @@ import {
  * @interface PluginPlatform
  */
 export interface PluginPlatform {
-    [key: string]: any | any;
     /**
      *
      * @type {PluginOperatingSystem}
@@ -83,8 +82,6 @@ export function PluginPlatformFromJSONTyped(json: any, ignoreDiscriminator: bool
         return json;
     }
     return {
-
-            ...json,
         'operatingSystem': PluginOperatingSystemFromJSON(json['operating_system']),
         'architecture': PluginArchitectureFromJSON(json['architecture']),
         'sha256': json['sha256'],
@@ -102,8 +99,6 @@ export function PluginPlatformToJSONTyped(value?: PluginPlatform | null, ignoreD
     }
 
     return {
-
-            ...value,
         'operating_system': PluginOperatingSystemToJSON(value['operatingSystem']),
         'architecture': PluginArchitectureToJSON(value['architecture']),
         'sha256': value['sha256'],

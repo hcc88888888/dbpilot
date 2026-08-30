@@ -18,7 +18,6 @@ import type { InspectionMetricAggregation } from './InspectionMetricAggregation.
  * @interface InspectionMetricRule
  */
 export interface InspectionMetricRule {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

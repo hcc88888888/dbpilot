@@ -62,7 +62,6 @@ export function ManagedHostFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'hostId': json['host_id'],
         'agentId': json['agent_id'],
         'tenantId': json['tenant_id'],
@@ -97,7 +96,6 @@ export function ManagedHostToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'host_id': value['hostId'],
         'agent_id': value['agentId'],
         'tenant_id': value['tenantId'],

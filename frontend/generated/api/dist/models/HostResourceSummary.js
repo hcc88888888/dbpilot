@@ -29,7 +29,6 @@ export function HostResourceSummaryFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'capacity': json['capacity'],
         'available': json['available'],
     };
@@ -42,7 +41,6 @@ export function HostResourceSummaryToJSONTyped(value, ignoreDiscriminator = fals
         return value;
     }
     return {
-        ...value,
         'capacity': value['capacity'],
         'available': value['available'],
     };

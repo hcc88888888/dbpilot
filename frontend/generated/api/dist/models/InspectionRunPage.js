@@ -31,7 +31,6 @@ export function InspectionRunPageFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(InspectionRunFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function InspectionRunPageToJSONTyped(value, ignoreDiscriminator = false)
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(InspectionRunToJSON)),
         'page': PageToJSON(value['page']),
     };

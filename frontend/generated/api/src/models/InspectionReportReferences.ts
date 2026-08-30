@@ -27,7 +27,6 @@ import {
  * @interface InspectionReportReferences
  */
 export interface InspectionReportReferences {
-    [key: string]: any | any;
     /**
      * Opaque job identifier.
      * @type {string}
@@ -67,8 +66,6 @@ export function InspectionReportReferencesFromJSONTyped(json: any, ignoreDiscrim
         return json;
     }
     return {
-
-            ...json,
         'jobId': json['job_id'],
         'commands': ((json['commands'] as Array<any>).map(InspectionReportCommandReferenceFromJSON)),
         'auditCorrelation': json['audit_correlation'],
@@ -85,8 +82,6 @@ export function InspectionReportReferencesToJSONTyped(value?: InspectionReportRe
     }
 
     return {
-
-            ...value,
         'job_id': value['jobId'],
         'commands': ((value['commands'] as Array<any>).map(InspectionReportCommandReferenceToJSON)),
         'audit_correlation': value['auditCorrelation'],

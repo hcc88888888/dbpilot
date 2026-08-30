@@ -39,7 +39,6 @@ export function MetricTemplateFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'templateId': json['template_id'],
         'databaseFamily': json['database_family'],
         'name': json['name'],
@@ -58,7 +57,6 @@ export function MetricTemplateToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'template_id': value['templateId'],
         'database_family': value['databaseFamily'],
         'name': value['name'],

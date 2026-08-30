@@ -9,6 +9,7 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import type { PluginCircuitState } from './PluginCircuitState.js';
 import type { PluginActiveSlot } from './PluginActiveSlot.js';
 import type { PluginHealthStatus } from './PluginHealthStatus.js';
 import type { PluginProcessState } from './PluginProcessState.js';
@@ -18,7 +19,6 @@ import type { PluginProcessState } from './PluginProcessState.js';
  * @interface PluginObservedState
  */
 export interface PluginObservedState {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -61,6 +61,12 @@ export interface PluginObservedState {
      * @memberof PluginObservedState
      */
     health: PluginHealthStatus;
+    /**
+     *
+     * @type {PluginCircuitState}
+     * @memberof PluginObservedState
+     */
+    circuitState: PluginCircuitState;
     /**
      *
      * @type {number}

@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface InspectionEvidenceSelector
  */
 export interface InspectionEvidenceSelector {
-    [key: string]: any | any;
     /**
      *
      * @type {Set<string>}
@@ -45,8 +44,6 @@ export function InspectionEvidenceSelectorFromJSONTyped(json: any, ignoreDiscrim
         return json;
     }
     return {
-
-            ...json,
         'fields': new Set(json['fields']),
     };
 }
@@ -61,8 +58,6 @@ export function InspectionEvidenceSelectorToJSONTyped(value?: InspectionEvidence
     }
 
     return {
-
-            ...value,
         'fields': Array.from(value['fields'] as Set<any>),
     };
 }

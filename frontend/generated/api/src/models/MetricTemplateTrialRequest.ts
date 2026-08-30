@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface MetricTemplateTrialRequest
  */
 export interface MetricTemplateTrialRequest {
-    [key: string]: any | any;
     /**
      * Opaque database instance identifier.
      * @type {string}
@@ -52,8 +51,6 @@ export function MetricTemplateTrialRequestFromJSONTyped(json: any, ignoreDiscrim
         return json;
     }
     return {
-
-            ...json,
         'instanceId': json['instance_id'],
         'pluginVersionId': json['plugin_version_id'],
     };
@@ -69,8 +66,6 @@ export function MetricTemplateTrialRequestToJSONTyped(value?: MetricTemplateTria
     }
 
     return {
-
-            ...value,
         'instance_id': value['instanceId'],
         'plugin_version_id': value['pluginVersionId'],
     };

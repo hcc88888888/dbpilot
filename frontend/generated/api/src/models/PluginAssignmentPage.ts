@@ -34,7 +34,6 @@ import {
  * @interface PluginAssignmentPage
  */
 export interface PluginAssignmentPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginAssignment>}
@@ -67,8 +66,6 @@ export function PluginAssignmentPageFromJSONTyped(json: any, ignoreDiscriminator
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(PluginAssignmentFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function PluginAssignmentPageToJSONTyped(value?: PluginAssignmentPage | n
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(PluginAssignmentToJSON)),
         'page': PageToJSON(value['page']),
     };

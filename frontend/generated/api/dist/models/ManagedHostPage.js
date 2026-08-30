@@ -31,7 +31,6 @@ export function ManagedHostPageFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(ManagedHostFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function ManagedHostPageToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(ManagedHostToJSON)),
         'page': PageToJSON(value['page']),
     };

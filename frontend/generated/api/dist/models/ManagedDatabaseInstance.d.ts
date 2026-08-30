@@ -17,7 +17,6 @@ import type { ConnectionTestStatus } from './ConnectionTestStatus.js';
  * @interface ManagedDatabaseInstance
  */
 export interface ManagedDatabaseInstance {
-    [key: string]: any | any;
     /**
      * Opaque database instance identifier.
      * @type {string}

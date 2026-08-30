@@ -20,7 +20,6 @@ import type { ArtifactReference } from './ArtifactReference.js';
  * @interface InspectionReport
  */
 export interface InspectionReport {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

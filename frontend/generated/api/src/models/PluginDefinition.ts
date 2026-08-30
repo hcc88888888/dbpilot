@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface PluginDefinition
  */
 export interface PluginDefinition {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -92,8 +91,6 @@ export function PluginDefinitionFromJSONTyped(json: any, ignoreDiscriminator: bo
         return json;
     }
     return {
-
-            ...json,
         'pluginId': json['plugin_id'],
         'name': json['name'],
         'description': json['description'] == null ? undefined : json['description'],
@@ -115,8 +112,6 @@ export function PluginDefinitionToJSONTyped(value?: PluginDefinition | null, ign
     }
 
     return {
-
-            ...value,
         'plugin_id': value['pluginId'],
         'name': value['name'],
         'description': value['description'],

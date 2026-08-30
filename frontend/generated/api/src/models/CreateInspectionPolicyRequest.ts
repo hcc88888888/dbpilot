@@ -34,7 +34,6 @@ import {
  * @interface CreateInspectionPolicyRequest
  */
 export interface CreateInspectionPolicyRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -105,8 +104,6 @@ export function CreateInspectionPolicyRequestFromJSONTyped(json: any, ignoreDisc
         return json;
     }
     return {
-
-            ...json,
         'name': json['name'],
         'enabled': json['enabled'],
         'schedule': json['schedule'] == null ? undefined : InspectionScheduleFromJSON(json['schedule']),
@@ -128,8 +125,6 @@ export function CreateInspectionPolicyRequestToJSONTyped(value?: CreateInspectio
     }
 
     return {
-
-            ...value,
         'name': value['name'],
         'enabled': value['enabled'],
         'schedule': InspectionScheduleToJSON(value['schedule']),

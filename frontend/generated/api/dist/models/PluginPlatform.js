@@ -35,7 +35,6 @@ export function PluginPlatformFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'operatingSystem': PluginOperatingSystemFromJSON(json['operating_system']),
         'architecture': PluginArchitectureFromJSON(json['architecture']),
         'sha256': json['sha256'],
@@ -50,7 +49,6 @@ export function PluginPlatformToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'operating_system': PluginOperatingSystemToJSON(value['operatingSystem']),
         'architecture': PluginArchitectureToJSON(value['architecture']),
         'sha256': value['sha256'],

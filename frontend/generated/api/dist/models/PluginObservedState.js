@@ -11,6 +11,7 @@
  * https://openapi-generator.tech
  * Do not edit the class manually.
  */
+import { PluginCircuitStateFromJSON, PluginCircuitStateToJSON, } from './PluginCircuitState.js';
 import { PluginActiveSlotFromJSON, PluginActiveSlotToJSON, } from './PluginActiveSlot.js';
 import { PluginHealthStatusFromJSON, PluginHealthStatusToJSON, } from './PluginHealthStatus.js';
 import { PluginProcessStateFromJSON, PluginProcessStateToJSON, } from './PluginProcessState.js';
@@ -23,6 +24,8 @@ export function instanceOfPluginObservedState(value) {
     if (!('processState' in value) || value['processState'] === undefined)
         return false;
     if (!('health' in value) || value['health'] === undefined)
+        return false;
+    if (!('circuitState' in value) || value['circuitState'] === undefined)
         return false;
     if (!('restartCount' in value) || value['restartCount'] === undefined)
         return false;
@@ -44,7 +47,6 @@ export function PluginObservedStateFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'assignmentId': json['assignment_id'],
         'installedVersion': json['installed_version'] == null ? undefined : json['installed_version'],
         'activeSlot': json['active_slot'] == null ? undefined : PluginActiveSlotFromJSON(json['active_slot']),
@@ -52,6 +54,7 @@ export function PluginObservedStateFromJSONTyped(json, ignoreDiscriminator) {
         'pid': json['pid'] == null ? undefined : json['pid'],
         'startedAt': json['started_at'] == null ? undefined : (new Date(json['started_at'])),
         'health': PluginHealthStatusFromJSON(json['health']),
+        'circuitState': PluginCircuitStateFromJSON(json['circuit_state']),
         'restartCount': json['restart_count'],
         'boundInstanceCount': json['bound_instance_count'],
         'activeConfigurationRevision': json['active_configuration_revision'],
@@ -68,7 +71,6 @@ export function PluginObservedStateToJSONTyped(value, ignoreDiscriminator = fals
         return value;
     }
     return {
-        ...value,
         'assignment_id': value['assignmentId'],
         'installed_version': value['installedVersion'],
         'active_slot': PluginActiveSlotToJSON(value['activeSlot']),
@@ -76,6 +78,7 @@ export function PluginObservedStateToJSONTyped(value, ignoreDiscriminator = fals
         'pid': value['pid'],
         'started_at': value['startedAt'] == null ? undefined : ((value['startedAt']).toISOString()),
         'health': PluginHealthStatusToJSON(value['health']),
+        'circuit_state': PluginCircuitStateToJSON(value['circuitState']),
         'restart_count': value['restartCount'],
         'bound_instance_count': value['boundInstanceCount'],
         'active_configuration_revision': value['activeConfigurationRevision'],

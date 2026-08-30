@@ -17,7 +17,6 @@ import type { InspectionItem } from './InspectionItem.js';
  * @interface InspectionItemPage
  */
 export interface InspectionItemPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<InspectionItem>}

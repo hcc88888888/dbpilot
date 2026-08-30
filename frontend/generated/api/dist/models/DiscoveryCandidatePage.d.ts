@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface DiscoveryCandidatePage
  */
 export interface DiscoveryCandidatePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<DiscoveryCandidate>}

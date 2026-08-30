@@ -41,7 +41,6 @@ import {
  * @interface InspectionMetricRule
  */
 export interface InspectionMetricRule {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -110,8 +109,6 @@ export function InspectionMetricRuleFromJSONTyped(json: any, ignoreDiscriminator
         return json;
     }
     return {
-
-            ...json,
         'metricName': json['metric_name'],
         'labels': json['labels'] == null ? undefined : json['labels'],
         'window': InspectionMetricWindowFromJSON(json['window']),
@@ -132,8 +129,6 @@ export function InspectionMetricRuleToJSONTyped(value?: InspectionMetricRule | n
     }
 
     return {
-
-            ...value,
         'metric_name': value['metricName'],
         'labels': value['labels'],
         'window': InspectionMetricWindowToJSON(value['window']),

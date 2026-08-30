@@ -36,7 +36,6 @@ export function InspectionReportTargetFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'targetId': json['target_id'],
         'displayName': json['display_name'],
         'host': json['host'],
@@ -53,7 +52,6 @@ export function InspectionReportTargetToJSONTyped(value, ignoreDiscriminator = f
         return value;
     }
     return {
-        ...value,
         'target_id': value['targetId'],
         'display_name': value['displayName'],
         'host': value['host'],

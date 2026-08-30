@@ -27,7 +27,6 @@ import {
  * @interface InspectionReportDownloadRequest
  */
 export interface InspectionReportDownloadRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {InspectionReportFormat}
@@ -55,8 +54,6 @@ export function InspectionReportDownloadRequestFromJSONTyped(json: any, ignoreDi
         return json;
     }
     return {
-
-            ...json,
         'format': InspectionReportFormatFromJSON(json['format']),
     };
 }
@@ -71,8 +68,6 @@ export function InspectionReportDownloadRequestToJSONTyped(value?: InspectionRep
     }
 
     return {
-
-            ...value,
         'format': InspectionReportFormatToJSON(value['format']),
     };
 }

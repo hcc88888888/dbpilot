@@ -31,7 +31,6 @@ export function PluginAssignmentPageFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(PluginAssignmentFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function PluginAssignmentPageToJSONTyped(value, ignoreDiscriminator = fal
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(PluginAssignmentToJSON)),
         'page': PageToJSON(value['page']),
     };

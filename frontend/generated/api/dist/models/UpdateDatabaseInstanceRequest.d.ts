@@ -15,7 +15,6 @@
  * @interface UpdateDatabaseInstanceRequest
  */
 export interface UpdateDatabaseInstanceRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

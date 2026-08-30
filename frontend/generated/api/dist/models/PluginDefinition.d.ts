@@ -15,7 +15,6 @@
  * @interface PluginDefinition
  */
 export interface PluginDefinition {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

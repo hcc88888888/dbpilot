@@ -29,7 +29,6 @@ export function MetricLabelMappingFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'sourceColumn': json['source_column'],
         'label': json['label'],
     };
@@ -42,7 +41,6 @@ export function MetricLabelMappingToJSONTyped(value, ignoreDiscriminator = false
         return value;
     }
     return {
-        ...value,
         'source_column': value['sourceColumn'],
         'label': value['label'],
     };

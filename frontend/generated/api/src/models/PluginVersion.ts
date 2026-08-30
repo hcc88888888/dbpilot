@@ -34,7 +34,6 @@ import {
  * @interface PluginVersion
  */
 export interface PluginVersion {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -103,6 +102,30 @@ export interface PluginVersion {
     maximumAgentProtocolVersion?: string;
     /**
      *
+     * @type {Set<string>}
+     * @memberof PluginVersion
+     */
+    supportedVariants: Set<string>;
+    /**
+     *
+     * @type {string}
+     * @memberof PluginVersion
+     */
+    databaseVersionRange: string;
+    /**
+     *
+     * @type {Set<string>}
+     * @memberof PluginVersion
+     */
+    capabilities: Set<string>;
+    /**
+     *
+     * @type {number}
+     * @memberof PluginVersion
+     */
+    metricTemplateSchemaVersion: number;
+    /**
+     *
      * @type {Array<PluginPlatform>}
      * @memberof PluginVersion
      */
@@ -141,6 +164,10 @@ export function instanceOfPluginVersion(value: object): value is PluginVersion {
     if (!('packageSha256' in value) || value['packageSha256'] === undefined) return false;
     if (!('manifestDigest' in value) || value['manifestDigest'] === undefined) return false;
     if (!('publisherId' in value) || value['publisherId'] === undefined) return false;
+    if (!('supportedVariants' in value) || value['supportedVariants'] === undefined) return false;
+    if (!('databaseVersionRange' in value) || value['databaseVersionRange'] === undefined) return false;
+    if (!('capabilities' in value) || value['capabilities'] === undefined) return false;
+    if (!('metricTemplateSchemaVersion' in value) || value['metricTemplateSchemaVersion'] === undefined) return false;
     if (!('platforms' in value) || value['platforms'] === undefined) return false;
     if (!('createdAt' in value) || value['createdAt'] === undefined) return false;
     if (!('etag' in value) || value['etag'] === undefined) return false;
@@ -156,8 +183,6 @@ export function PluginVersionFromJSONTyped(json: any, ignoreDiscriminator: boole
         return json;
     }
     return {
-
-            ...json,
         'versionId': json['version_id'],
         'pluginId': json['plugin_id'],
         'version': json['version'],
@@ -169,6 +194,10 @@ export function PluginVersionFromJSONTyped(json: any, ignoreDiscriminator: boole
         'signingKeyId': json['signing_key_id'] == null ? undefined : json['signing_key_id'],
         'minimumAgentProtocolVersion': json['minimum_agent_protocol_version'] == null ? undefined : json['minimum_agent_protocol_version'],
         'maximumAgentProtocolVersion': json['maximum_agent_protocol_version'] == null ? undefined : json['maximum_agent_protocol_version'],
+        'supportedVariants': new Set(json['supported_variants']),
+        'databaseVersionRange': json['database_version_range'],
+        'capabilities': new Set(json['capabilities']),
+        'metricTemplateSchemaVersion': json['metric_template_schema_version'],
         'platforms': ((json['platforms'] as Array<any>).map(PluginPlatformFromJSON)),
         'createdAt': (new Date(json['created_at'])),
         'approvedAt': json['approved_at'] == null ? undefined : (new Date(json['approved_at'])),
@@ -186,8 +215,6 @@ export function PluginVersionToJSONTyped(value?: PluginVersion | null, ignoreDis
     }
 
     return {
-
-            ...value,
         'version_id': value['versionId'],
         'plugin_id': value['pluginId'],
         'version': value['version'],
@@ -199,6 +226,10 @@ export function PluginVersionToJSONTyped(value?: PluginVersion | null, ignoreDis
         'signing_key_id': value['signingKeyId'],
         'minimum_agent_protocol_version': value['minimumAgentProtocolVersion'],
         'maximum_agent_protocol_version': value['maximumAgentProtocolVersion'],
+        'supported_variants': Array.from(value['supportedVariants'] as Set<any>),
+        'database_version_range': value['databaseVersionRange'],
+        'capabilities': Array.from(value['capabilities'] as Set<any>),
+        'metric_template_schema_version': value['metricTemplateSchemaVersion'],
         'platforms': ((value['platforms'] as Array<any>).map(PluginPlatformToJSON)),
         'created_at': ((value['createdAt']).toISOString()),
         'approved_at': value['approvedAt'] == null ? undefined : ((value['approvedAt']).toISOString()),

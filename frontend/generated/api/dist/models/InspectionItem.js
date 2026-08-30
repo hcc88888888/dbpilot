@@ -53,7 +53,6 @@ export function InspectionItemFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'id': json['id'],
         'version': json['version'],
         'name': json['name'],
@@ -80,7 +79,6 @@ export function InspectionItemToJSONTyped(value, ignoreDiscriminator = false) {
         return value;
     }
     return {
-        ...value,
         'id': value['id'],
         'version': value['version'],
         'name': value['name'],

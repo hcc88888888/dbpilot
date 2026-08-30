@@ -16,7 +16,6 @@ import type { InspectionConnectivity } from './InspectionConnectivity.js';
  * @interface InspectionTarget
  */
 export interface InspectionTarget {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

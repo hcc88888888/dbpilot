@@ -28,7 +28,6 @@ export function InspectionReportDownloadRequestFromJSONTyped(json, ignoreDiscrim
         return json;
     }
     return {
-        ...json,
         'format': InspectionReportFormatFromJSON(json['format']),
     };
 }
@@ -40,7 +39,6 @@ export function InspectionReportDownloadRequestToJSONTyped(value, ignoreDiscrimi
         return value;
     }
     return {
-        ...value,
         'format': InspectionReportFormatToJSON(value['format']),
     };
 }

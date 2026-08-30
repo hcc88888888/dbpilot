@@ -27,7 +27,6 @@ export function IgnoreDiscoveryCandidateRequestFromJSONTyped(json, ignoreDiscrim
         return json;
     }
     return {
-        ...json,
         'reasonCode': json['reason_code'],
     };
 }
@@ -39,7 +38,6 @@ export function IgnoreDiscoveryCandidateRequestToJSONTyped(value, ignoreDiscrimi
         return value;
     }
     return {
-        ...value,
         'reason_code': value['reasonCode'],
     };
 }

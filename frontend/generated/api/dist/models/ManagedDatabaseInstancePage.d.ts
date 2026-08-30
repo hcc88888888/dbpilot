@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface ManagedDatabaseInstancePage
  */
 export interface ManagedDatabaseInstancePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<ManagedDatabaseInstance>}

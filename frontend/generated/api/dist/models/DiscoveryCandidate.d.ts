@@ -10,6 +10,7 @@
  * Do not edit the class manually.
  */
 import type { DiscoverySource } from './DiscoverySource.js';
+import type { DiscoveryEvidence } from './DiscoveryEvidence.js';
 import type { DiscoveryCandidateStatus } from './DiscoveryCandidateStatus.js';
 /**
  *
@@ -17,7 +18,6 @@ import type { DiscoveryCandidateStatus } from './DiscoveryCandidateStatus.js';
  * @interface DiscoveryCandidate
  */
 export interface DiscoveryCandidate {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -122,10 +122,10 @@ export interface DiscoveryCandidate {
     confidence: number;
     /**
      *
-     * @type {Set<string>}
+     * @type {Set<DiscoveryEvidence>}
      * @memberof DiscoveryCandidate
      */
-    evidenceSummary: Set<string>;
+    evidenceSummary: Set<DiscoveryEvidence>;
     /**
      *
      * @type {string}

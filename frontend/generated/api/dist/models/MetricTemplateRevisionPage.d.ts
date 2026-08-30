@@ -17,7 +17,6 @@ import type { Page } from './Page.js';
  * @interface MetricTemplateRevisionPage
  */
 export interface MetricTemplateRevisionPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<MetricTemplateRevision>}

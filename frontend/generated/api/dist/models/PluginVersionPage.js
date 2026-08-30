@@ -31,7 +31,6 @@ export function PluginVersionPageFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'items': (json['items'].map(PluginVersionFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -44,7 +43,6 @@ export function PluginVersionPageToJSONTyped(value, ignoreDiscriminator = false)
         return value;
     }
     return {
-        ...value,
         'items': (value['items'].map(PluginVersionToJSON)),
         'page': PageToJSON(value['page']),
     };

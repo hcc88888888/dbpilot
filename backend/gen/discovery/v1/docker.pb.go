@@ -22,6 +22,70 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type DockerContainerStatus int32
+
+const (
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_UNSPECIFIED DockerContainerStatus = 0
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_CREATED     DockerContainerStatus = 1
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING     DockerContainerStatus = 2
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_PAUSED      DockerContainerStatus = 3
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_RESTARTING  DockerContainerStatus = 4
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_REMOVING    DockerContainerStatus = 5
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_EXITED      DockerContainerStatus = 6
+	DockerContainerStatus_DOCKER_CONTAINER_STATUS_DEAD        DockerContainerStatus = 7
+)
+
+// Enum value maps for DockerContainerStatus.
+var (
+	DockerContainerStatus_name = map[int32]string{
+		0: "DOCKER_CONTAINER_STATUS_UNSPECIFIED",
+		1: "DOCKER_CONTAINER_STATUS_CREATED",
+		2: "DOCKER_CONTAINER_STATUS_RUNNING",
+		3: "DOCKER_CONTAINER_STATUS_PAUSED",
+		4: "DOCKER_CONTAINER_STATUS_RESTARTING",
+		5: "DOCKER_CONTAINER_STATUS_REMOVING",
+		6: "DOCKER_CONTAINER_STATUS_EXITED",
+		7: "DOCKER_CONTAINER_STATUS_DEAD",
+	}
+	DockerContainerStatus_value = map[string]int32{
+		"DOCKER_CONTAINER_STATUS_UNSPECIFIED": 0,
+		"DOCKER_CONTAINER_STATUS_CREATED":     1,
+		"DOCKER_CONTAINER_STATUS_RUNNING":     2,
+		"DOCKER_CONTAINER_STATUS_PAUSED":      3,
+		"DOCKER_CONTAINER_STATUS_RESTARTING":  4,
+		"DOCKER_CONTAINER_STATUS_REMOVING":    5,
+		"DOCKER_CONTAINER_STATUS_EXITED":      6,
+		"DOCKER_CONTAINER_STATUS_DEAD":        7,
+	}
+)
+
+func (x DockerContainerStatus) Enum() *DockerContainerStatus {
+	p := new(DockerContainerStatus)
+	*p = x
+	return p
+}
+
+func (x DockerContainerStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DockerContainerStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_discovery_v1_docker_proto_enumTypes[0].Descriptor()
+}
+
+func (DockerContainerStatus) Type() protoreflect.EnumType {
+	return &file_discovery_v1_docker_proto_enumTypes[0]
+}
+
+func (x DockerContainerStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DockerContainerStatus.Descriptor instead.
+func (DockerContainerStatus) EnumDescriptor() ([]byte, []int) {
+	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{0}
+}
+
 type DockerEventType int32
 
 const (
@@ -61,11 +125,11 @@ func (x DockerEventType) String() string {
 }
 
 func (DockerEventType) Descriptor() protoreflect.EnumDescriptor {
-	return file_discovery_v1_docker_proto_enumTypes[0].Descriptor()
+	return file_discovery_v1_docker_proto_enumTypes[1].Descriptor()
 }
 
 func (DockerEventType) Type() protoreflect.EnumType {
-	return &file_discovery_v1_docker_proto_enumTypes[0]
+	return &file_discovery_v1_docker_proto_enumTypes[1]
 }
 
 func (x DockerEventType) Number() protoreflect.EnumNumber {
@@ -74,7 +138,7 @@ func (x DockerEventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DockerEventType.Descriptor instead.
 func (DockerEventType) EnumDescriptor() ([]byte, []int) {
-	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{0}
+	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{1}
 }
 
 type DockerSnapshotRequest struct {
@@ -246,7 +310,7 @@ type DockerContainerObservation struct {
 	ContainerId    string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
 	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	Image          string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
-	Status         string                 `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+	Status         DockerContainerStatus  `protobuf:"varint,4,opt,name=status,proto3,enum=dbpilot.discovery.v1.DockerContainerStatus" json:"status,omitempty"`
 	Ports          []*DockerPortMapping   `protobuf:"bytes,5,rep,name=ports,proto3" json:"ports,omitempty"`
 	Labels         map[string]string      `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	CommandSummary string                 `protobuf:"bytes,7,opt,name=command_summary,json=commandSummary,proto3" json:"command_summary,omitempty"`
@@ -308,11 +372,11 @@ func (x *DockerContainerObservation) GetImage() string {
 	return ""
 }
 
-func (x *DockerContainerObservation) GetStatus() string {
+func (x *DockerContainerObservation) GetStatus() DockerContainerStatus {
 	if x != nil {
 		return x.Status
 	}
-	return ""
+	return DockerContainerStatus_DOCKER_CONTAINER_STATUS_UNSPECIFIED
 }
 
 func (x *DockerContainerObservation) GetPorts() []*DockerPortMapping {
@@ -511,12 +575,12 @@ const file_discovery_v1_docker_proto_rawDesc = "" +
 	"error_code\x18\x03 \x01(\tR\terrorCode\"g\n" +
 	"\x12DockerWatchRequest\x12#\n" +
 	"\rrule_revision\x18\x01 \x01(\x04R\fruleRevision\x12,\n" +
-	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\"\xf7\x03\n" +
+	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\"\xa4\x04\n" +
 	"\x1aDockerContainerObservation\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
-	"\x05image\x18\x03 \x01(\tR\x05image\x12\x16\n" +
-	"\x06status\x18\x04 \x01(\tR\x06status\x12=\n" +
+	"\x05image\x18\x03 \x01(\tR\x05image\x12C\n" +
+	"\x06status\x18\x04 \x01(\x0e2+.dbpilot.discovery.v1.DockerContainerStatusR\x06status\x12=\n" +
 	"\x05ports\x18\x05 \x03(\v2'.dbpilot.discovery.v1.DockerPortMappingR\x05ports\x12T\n" +
 	"\x06labels\x18\x06 \x03(\v2<.dbpilot.discovery.v1.DockerContainerObservation.LabelsEntryR\x06labels\x12'\n" +
 	"\x0fcommand_summary\x18\a \x01(\tR\x0ecommandSummary\x12&\n" +
@@ -538,7 +602,16 @@ const file_discovery_v1_docker_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x01(\x0e2%.dbpilot.discovery.v1.DockerEventTypeR\x04type\x12N\n" +
 	"\tcontainer\x18\x03 \x01(\v20.dbpilot.discovery.v1.DockerContainerObservationR\tcontainer\x12;\n" +
 	"\voccurred_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"occurredAt*\xa7\x01\n" +
+	"occurredAt*\xc2\x02\n" +
+	"\x15DockerContainerStatus\x12'\n" +
+	"#DOCKER_CONTAINER_STATUS_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fDOCKER_CONTAINER_STATUS_CREATED\x10\x01\x12#\n" +
+	"\x1fDOCKER_CONTAINER_STATUS_RUNNING\x10\x02\x12\"\n" +
+	"\x1eDOCKER_CONTAINER_STATUS_PAUSED\x10\x03\x12&\n" +
+	"\"DOCKER_CONTAINER_STATUS_RESTARTING\x10\x04\x12$\n" +
+	" DOCKER_CONTAINER_STATUS_REMOVING\x10\x05\x12\"\n" +
+	"\x1eDOCKER_CONTAINER_STATUS_EXITED\x10\x06\x12 \n" +
+	"\x1cDOCKER_CONTAINER_STATUS_DEAD\x10\a*\xa7\x01\n" +
 	"\x0fDockerEventType\x12!\n" +
 	"\x1dDOCKER_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17DOCKER_EVENT_TYPE_START\x10\x01\x12\x1a\n" +
@@ -561,37 +634,39 @@ func file_discovery_v1_docker_proto_rawDescGZIP() []byte {
 	return file_discovery_v1_docker_proto_rawDescData
 }
 
-var file_discovery_v1_docker_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_discovery_v1_docker_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
 var file_discovery_v1_docker_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_discovery_v1_docker_proto_goTypes = []any{
-	(DockerEventType)(0),               // 0: dbpilot.discovery.v1.DockerEventType
-	(*DockerSnapshotRequest)(nil),      // 1: dbpilot.discovery.v1.DockerSnapshotRequest
-	(*DockerSnapshotResponse)(nil),     // 2: dbpilot.discovery.v1.DockerSnapshotResponse
-	(*DockerWatchRequest)(nil),         // 3: dbpilot.discovery.v1.DockerWatchRequest
-	(*DockerContainerObservation)(nil), // 4: dbpilot.discovery.v1.DockerContainerObservation
-	(*DockerPortMapping)(nil),          // 5: dbpilot.discovery.v1.DockerPortMapping
-	(*DockerEvent)(nil),                // 6: dbpilot.discovery.v1.DockerEvent
-	nil,                                // 7: dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
-	(*timestamppb.Timestamp)(nil),      // 8: google.protobuf.Timestamp
+	(DockerContainerStatus)(0),         // 0: dbpilot.discovery.v1.DockerContainerStatus
+	(DockerEventType)(0),               // 1: dbpilot.discovery.v1.DockerEventType
+	(*DockerSnapshotRequest)(nil),      // 2: dbpilot.discovery.v1.DockerSnapshotRequest
+	(*DockerSnapshotResponse)(nil),     // 3: dbpilot.discovery.v1.DockerSnapshotResponse
+	(*DockerWatchRequest)(nil),         // 4: dbpilot.discovery.v1.DockerWatchRequest
+	(*DockerContainerObservation)(nil), // 5: dbpilot.discovery.v1.DockerContainerObservation
+	(*DockerPortMapping)(nil),          // 6: dbpilot.discovery.v1.DockerPortMapping
+	(*DockerEvent)(nil),                // 7: dbpilot.discovery.v1.DockerEvent
+	nil,                                // 8: dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
+	(*timestamppb.Timestamp)(nil),      // 9: google.protobuf.Timestamp
 }
 var file_discovery_v1_docker_proto_depIdxs = []int32{
-	4,  // 0: dbpilot.discovery.v1.DockerSnapshotResponse.containers:type_name -> dbpilot.discovery.v1.DockerContainerObservation
-	8,  // 1: dbpilot.discovery.v1.DockerSnapshotResponse.observed_at:type_name -> google.protobuf.Timestamp
-	5,  // 2: dbpilot.discovery.v1.DockerContainerObservation.ports:type_name -> dbpilot.discovery.v1.DockerPortMapping
-	7,  // 3: dbpilot.discovery.v1.DockerContainerObservation.labels:type_name -> dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
-	8,  // 4: dbpilot.discovery.v1.DockerContainerObservation.observed_at:type_name -> google.protobuf.Timestamp
-	0,  // 5: dbpilot.discovery.v1.DockerEvent.type:type_name -> dbpilot.discovery.v1.DockerEventType
-	4,  // 6: dbpilot.discovery.v1.DockerEvent.container:type_name -> dbpilot.discovery.v1.DockerContainerObservation
-	8,  // 7: dbpilot.discovery.v1.DockerEvent.occurred_at:type_name -> google.protobuf.Timestamp
-	1,  // 8: dbpilot.discovery.v1.DockerDiscovery.Snapshot:input_type -> dbpilot.discovery.v1.DockerSnapshotRequest
-	3,  // 9: dbpilot.discovery.v1.DockerDiscovery.Watch:input_type -> dbpilot.discovery.v1.DockerWatchRequest
-	2,  // 10: dbpilot.discovery.v1.DockerDiscovery.Snapshot:output_type -> dbpilot.discovery.v1.DockerSnapshotResponse
-	6,  // 11: dbpilot.discovery.v1.DockerDiscovery.Watch:output_type -> dbpilot.discovery.v1.DockerEvent
-	10, // [10:12] is the sub-list for method output_type
-	8,  // [8:10] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	5,  // 0: dbpilot.discovery.v1.DockerSnapshotResponse.containers:type_name -> dbpilot.discovery.v1.DockerContainerObservation
+	9,  // 1: dbpilot.discovery.v1.DockerSnapshotResponse.observed_at:type_name -> google.protobuf.Timestamp
+	0,  // 2: dbpilot.discovery.v1.DockerContainerObservation.status:type_name -> dbpilot.discovery.v1.DockerContainerStatus
+	6,  // 3: dbpilot.discovery.v1.DockerContainerObservation.ports:type_name -> dbpilot.discovery.v1.DockerPortMapping
+	8,  // 4: dbpilot.discovery.v1.DockerContainerObservation.labels:type_name -> dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
+	9,  // 5: dbpilot.discovery.v1.DockerContainerObservation.observed_at:type_name -> google.protobuf.Timestamp
+	1,  // 6: dbpilot.discovery.v1.DockerEvent.type:type_name -> dbpilot.discovery.v1.DockerEventType
+	5,  // 7: dbpilot.discovery.v1.DockerEvent.container:type_name -> dbpilot.discovery.v1.DockerContainerObservation
+	9,  // 8: dbpilot.discovery.v1.DockerEvent.occurred_at:type_name -> google.protobuf.Timestamp
+	2,  // 9: dbpilot.discovery.v1.DockerDiscovery.Snapshot:input_type -> dbpilot.discovery.v1.DockerSnapshotRequest
+	4,  // 10: dbpilot.discovery.v1.DockerDiscovery.Watch:input_type -> dbpilot.discovery.v1.DockerWatchRequest
+	3,  // 11: dbpilot.discovery.v1.DockerDiscovery.Snapshot:output_type -> dbpilot.discovery.v1.DockerSnapshotResponse
+	7,  // 12: dbpilot.discovery.v1.DockerDiscovery.Watch:output_type -> dbpilot.discovery.v1.DockerEvent
+	11, // [11:13] is the sub-list for method output_type
+	9,  // [9:11] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_discovery_v1_docker_proto_init() }
@@ -604,7 +679,7 @@ func file_discovery_v1_docker_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_discovery_v1_docker_proto_rawDesc), len(file_discovery_v1_docker_proto_rawDesc)),
-			NumEnums:      1,
+			NumEnums:      2,
 			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,

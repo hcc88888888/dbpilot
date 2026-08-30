@@ -34,7 +34,6 @@ import {
  * @interface ManagedHostPage
  */
 export interface ManagedHostPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<ManagedHost>}
@@ -67,8 +66,6 @@ export function ManagedHostPageFromJSONTyped(json: any, ignoreDiscriminator: boo
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(ManagedHostFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function ManagedHostPageToJSONTyped(value?: ManagedHostPage | null, ignor
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(ManagedHostToJSON)),
         'page': PageToJSON(value['page']),
     };

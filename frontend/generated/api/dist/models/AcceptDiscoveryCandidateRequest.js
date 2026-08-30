@@ -33,7 +33,6 @@ export function AcceptDiscoveryCandidateRequestFromJSONTyped(json, ignoreDiscrim
         return json;
     }
     return {
-        ...json,
         'displayName': json['display_name'],
         'databaseFamily': json['database_family'],
         'databaseVariant': json['database_variant'],
@@ -52,7 +51,6 @@ export function AcceptDiscoveryCandidateRequestToJSONTyped(value, ignoreDiscrimi
         return value;
     }
     return {
-        ...value,
         'display_name': value['displayName'],
         'database_family': value['databaseFamily'],
         'database_variant': value['databaseVariant'],

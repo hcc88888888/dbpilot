@@ -15,7 +15,6 @@
  * @interface MetricTemplateTrialRequest
  */
 export interface MetricTemplateTrialRequest {
-    [key: string]: any | any;
     /**
      * Opaque database instance identifier.
      * @type {string}

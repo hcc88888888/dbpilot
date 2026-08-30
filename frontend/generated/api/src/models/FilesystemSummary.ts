@@ -19,7 +19,6 @@ import { mapValues } from '../runtime.js';
  * @interface FilesystemSummary
  */
 export interface FilesystemSummary {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -59,8 +58,6 @@ export function FilesystemSummaryFromJSONTyped(json: any, ignoreDiscriminator: b
         return json;
     }
     return {
-
-            ...json,
         'mountPoint': json['mount_point'],
         'capacityBytes': json['capacity_bytes'],
         'availableBytes': json['available_bytes'],
@@ -77,8 +74,6 @@ export function FilesystemSummaryToJSONTyped(value?: FilesystemSummary | null, i
     }
 
     return {
-
-            ...value,
         'mount_point': value['mountPoint'],
         'capacity_bytes': value['capacityBytes'],
         'available_bytes': value['availableBytes'],

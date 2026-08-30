@@ -19,7 +19,6 @@ import type { CustomInspectionItemSourceType } from './CustomInspectionItemSourc
  * @interface CreateInspectionItemRequest
  */
 export interface CreateInspectionItemRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

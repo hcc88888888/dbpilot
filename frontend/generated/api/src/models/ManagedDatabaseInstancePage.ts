@@ -34,7 +34,6 @@ import {
  * @interface ManagedDatabaseInstancePage
  */
 export interface ManagedDatabaseInstancePage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<ManagedDatabaseInstance>}
@@ -67,8 +66,6 @@ export function ManagedDatabaseInstancePageFromJSONTyped(json: any, ignoreDiscri
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(ManagedDatabaseInstanceFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function ManagedDatabaseInstancePageToJSONTyped(value?: ManagedDatabaseIn
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(ManagedDatabaseInstanceToJSON)),
         'page': PageToJSON(value['page']),
     };

@@ -53,7 +53,6 @@ export function PluginAssignmentFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'assignmentId': json['assignment_id'],
         'hostId': json['host_id'],
         'agentId': json['agent_id'],
@@ -78,7 +77,6 @@ export function PluginAssignmentToJSONTyped(value, ignoreDiscriminator = false) 
         return value;
     }
     return {
-        ...value,
         'assignment_id': value['assignmentId'],
         'host_id': value['hostId'],
         'agent_id': value['agentId'],

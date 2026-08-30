@@ -122,18 +122,25 @@ ValidateMetricTemplateRevision:
         in: header
         required: true
         schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
     responses:
-      '202':
-        description: Validation job accepted.
+      '200':
+        description: Synchronously validated metric template revision.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
         content:
           application/json:
-            schema: { $ref: ../common/jobs.yaml#/Job }
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateRevision }
       '400': { $ref: ../common/errors.yaml#/ProblemResponse }
       '401': { $ref: ../common/errors.yaml#/ProblemResponse }
       '403': { $ref: ../common/errors.yaml#/ProblemResponse }
       '404': { $ref: ../common/errors.yaml#/ProblemResponse }
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
       '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
       '422': { $ref: ../common/errors.yaml#/ProblemResponse }
 TrialMetricTemplateRevision:
   post:

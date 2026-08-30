@@ -41,7 +41,6 @@ import {
  * @interface InspectionRun
  */
 export interface InspectionRun {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -158,8 +157,6 @@ export function InspectionRunFromJSONTyped(json: any, ignoreDiscriminator: boole
         return json;
     }
     return {
-
-            ...json,
         'id': json['id'],
         'policyId': json['policy_id'] == null ? undefined : json['policy_id'],
         'retryOfRunId': json['retry_of_run_id'] == null ? undefined : json['retry_of_run_id'],
@@ -188,8 +185,6 @@ export function InspectionRunToJSONTyped(value?: InspectionRun | null, ignoreDis
     }
 
     return {
-
-            ...value,
         'id': value['id'],
         'policy_id': value['policyId'],
         'retry_of_run_id': value['retryOfRunId'],

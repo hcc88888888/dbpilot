@@ -15,7 +15,6 @@
  * @interface FilesystemSummary
  */
 export interface FilesystemSummary {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

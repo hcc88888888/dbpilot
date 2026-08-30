@@ -32,7 +32,6 @@ export function InspectionTargetRunFromJSONTyped(json, ignoreDiscriminator) {
         return json;
     }
     return {
-        ...json,
         'targetId': json['target_id'],
         'agentId': json['agent_id'],
         'status': InspectionTargetRunStatusFromJSON(json['status']),
@@ -49,7 +48,6 @@ export function InspectionTargetRunToJSONTyped(value, ignoreDiscriminator = fals
         return value;
     }
     return {
-        ...value,
         'target_id': value['targetId'],
         'agent_id': value['agentId'],
         'status': InspectionTargetRunStatusToJSON(value['status']),

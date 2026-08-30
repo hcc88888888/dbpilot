@@ -24,6 +24,8 @@ export function instanceOfCreateMetricTemplateRevisionRequest(value) {
         return false;
     if (!('queryKind' in value) || value['queryKind'] === undefined)
         return false;
+    if (!('readOnlyStatement' in value) || value['readOnlyStatement'] === undefined)
+        return false;
     if (!('collectionIntervalSeconds' in value) || value['collectionIntervalSeconds'] === undefined)
         return false;
     if (!('timeoutSeconds' in value) || value['timeoutSeconds'] === undefined)
@@ -48,13 +50,11 @@ export function CreateMetricTemplateRevisionRequestFromJSONTyped(json, ignoreDis
         return json;
     }
     return {
-        ...json,
         'variants': new Set(json['variants']),
         'name': json['name'],
         'description': json['description'] == null ? undefined : json['description'],
         'queryKind': MetricQueryKindFromJSON(json['query_kind']),
-        'readOnlyStatement': json['read_only_statement'] == null ? undefined : json['read_only_statement'],
-        'structuredQuery': json['structured_query'] == null ? undefined : json['structured_query'],
+        'readOnlyStatement': json['read_only_statement'],
         'collectionIntervalSeconds': json['collection_interval_seconds'],
         'timeoutSeconds': json['timeout_seconds'],
         'maxRows': json['max_rows'],
@@ -74,13 +74,11 @@ export function CreateMetricTemplateRevisionRequestToJSONTyped(value, ignoreDisc
         return value;
     }
     return {
-        ...value,
         'variants': Array.from(value['variants']),
         'name': value['name'],
         'description': value['description'],
         'query_kind': MetricQueryKindToJSON(value['queryKind']),
         'read_only_statement': value['readOnlyStatement'],
-        'structured_query': value['structuredQuery'],
         'collection_interval_seconds': value['collectionIntervalSeconds'],
         'timeout_seconds': value['timeoutSeconds'],
         'max_rows': value['maxRows'],

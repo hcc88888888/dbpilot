@@ -48,7 +48,6 @@ import {
  * @interface CreateInspectionItemRequest
  */
 export interface CreateInspectionItemRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
@@ -137,8 +136,6 @@ export function CreateInspectionItemRequestFromJSONTyped(json: any, ignoreDiscri
         return json;
     }
     return {
-
-            ...json,
         'name': json['name'],
         'description': json['description'],
         'category': json['category'],
@@ -162,8 +159,6 @@ export function CreateInspectionItemRequestToJSONTyped(value?: CreateInspectionI
     }
 
     return {
-
-            ...value,
         'name': value['name'],
         'description': value['description'],
         'category': value['category'],

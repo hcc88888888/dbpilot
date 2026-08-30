@@ -17,7 +17,6 @@ import type { InspectionOverviewLatestRunStatusCounts } from './InspectionOvervi
  * @interface InspectionOverview
  */
 export interface InspectionOverview {
-    [key: string]: any | any;
     /**
      *
      * @type {number}

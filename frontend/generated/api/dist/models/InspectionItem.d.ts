@@ -19,7 +19,6 @@ import type { InspectionSourceType } from './InspectionSourceType.js';
  * @interface InspectionItem
  */
 export interface InspectionItem {
-    [key: string]: any | any;
     /**
      *
      * @type {string}

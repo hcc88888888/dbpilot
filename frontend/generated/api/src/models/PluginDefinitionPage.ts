@@ -34,7 +34,6 @@ import {
  * @interface PluginDefinitionPage
  */
 export interface PluginDefinitionPage {
-    [key: string]: any | any;
     /**
      *
      * @type {Array<PluginDefinition>}
@@ -67,8 +66,6 @@ export function PluginDefinitionPageFromJSONTyped(json: any, ignoreDiscriminator
         return json;
     }
     return {
-
-            ...json,
         'items': ((json['items'] as Array<any>).map(PluginDefinitionFromJSON)),
         'page': PageFromJSON(json['page']),
     };
@@ -84,8 +81,6 @@ export function PluginDefinitionPageToJSONTyped(value?: PluginDefinitionPage | n
     }
 
     return {
-
-            ...value,
         'items': ((value['items'] as Array<any>).map(PluginDefinitionToJSON)),
         'page': PageToJSON(value['page']),
     };

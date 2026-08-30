@@ -15,7 +15,6 @@
  * @interface MetricTemplateApprovalRequest
  */
 export interface MetricTemplateApprovalRequest {
-    [key: string]: any | any;
     /**
      *
      * @type {string}
