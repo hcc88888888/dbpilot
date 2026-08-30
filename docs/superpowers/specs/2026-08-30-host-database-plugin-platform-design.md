@@ -607,7 +607,7 @@ running → draining → stopped → uninstalling → absent
 ### 13.1 协议位置
 
 ```text
-contracts/protobuf/plugin/v1/
+contracts/protobuf/dbpilot/plugin/v1/
 ├── plugin.proto
 ├── instance.proto
 ├── metrics.proto
