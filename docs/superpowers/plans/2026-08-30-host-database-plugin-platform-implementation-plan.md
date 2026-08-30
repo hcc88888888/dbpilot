@@ -606,6 +606,8 @@ git commit -m "feat: accept and manage database instances"
 - Create: `backend/internal/plugincatalog/package_test.go`
 - Create: `backend/internal/plugincatalog/signature.go`
 - Create: `backend/internal/plugincatalog/signature_test.go`
+- Create: `contracts/plugin/package-signature-v1.md`
+- Create: `backend/internal/plugincatalog/testdata/package-v1/`
 - Create: `backend/internal/plugincatalog/postgres.go`
 - Create: `backend/internal/plugincatalog/postgres_test.go`
 - Create: `backend/internal/plugincatalog/service.go`
@@ -646,11 +648,11 @@ Expected: FAIL because catalog package is absent.
 
 - [ ] **Step 3: Implement streaming verification and Artifact persistence**
 
-Bound compressed upload and expanded tar size. Stream to create-exclusive temp Artifact, compute SHA-256, validate each tar header before extraction, parse canonical manifest, verify publisher signature, then publish immutable Artifact metadata. Never extract into the runtime plugin directory on Server.
+Bound compressed upload and expanded tar size. Stream the `application/gzip` body to an owned create-exclusive handle, compute the actual compressed SHA-256, validate each tar header without extraction, parse canonical manifest, construct the versioned logical-content message, and verify the publisher signature. The shared package-signature document and independent fixture corpus are consumed again by Task 9 Agent verification. Never extract into a Server runtime plugin directory.
 
 - [ ] **Step 4: Implement catalog APIs and approval workflow**
 
-Upload is multipart/streaming and requires plugin publish permission. Approval/revocation uses If-Match and Audit. Responses expose IDs/digests/capabilities, never storage paths or signature bytes.
+Upload is a bounded streaming `application/gzip` operation and requires plugin publish permission before body staging. Approval/publication/revocation use If-Match and Audit. Responses expose IDs/digests/capabilities, never storage paths or signature bytes.
 
 - [ ] **Step 5: Run package, API and Artifact regressions**
 

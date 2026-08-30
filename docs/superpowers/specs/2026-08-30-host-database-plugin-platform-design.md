@@ -431,11 +431,13 @@ plugin-package/
 
 ### 10.2 签名
 
-- 发布者 Ed25519 签名覆盖 canonical manifest 和完整包 SHA-256。
+- 发布者 Ed25519 签名覆盖版本化 canonical logical-content message：canonical manifest digest，加上除 `SIGNATURE.ed25519` 外所有普通文件按 path 排序后的 path/size/content-digest 元组。压缩包自身 SHA-256 由 Artifact 元数据独立计算和校验；签名不能覆盖包含自身签名文件的完整压缩字节。
 - Server 上传时验证签名、路径规范化、重复文件、symlink、文件数量和解压大小。
 - Agent 下载后独立重复验证，不能只信任 Server 的 `verified` 状态。
 - Artifact 下载 HMAC 只表示短期下载授权，不替代发布者签名。
 - 被撤销版本不能新部署；已运行实例进入 `revoked_running`，由管理员按风险策略升级或停止。
+
+Plugin Catalog 具有显式 `enabled` 配置。增量升级期间允许 disabled；disabled 时 API/capability 明确返回不可用且不影响既有非插件功能。enabled 时必须配置至少一个合法发布者公钥，且 Catalog migration、Artifact storage、发布者 trust root 全部加入 readiness；禁止 Server ready 但所有插件上传必然失败的状态。
 
 ### 10.3 插件版本状态
 
