@@ -72,6 +72,9 @@ jobs:
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/app/package-lock.json
 
       - uses: actions/setup-go@v5
         with:
@@ -80,6 +83,9 @@ jobs:
 
       - name: Install locked Node dependencies
         run: npm ci
+
+      - name: Install locked React application dependencies
+        run: npm ci --prefix frontend/app
 
       - name: Validate full-stack Compose topology
         run: docker compose -f backend/docker/full-stack/docker-compose.yml --profile '*' config --quiet
@@ -98,6 +104,11 @@ jobs:
 
       - name: Run frontend and contract tests
         run: node --test
+
+      - name: Test and build React management shell
+        run: |
+          npm run frontend:test
+          npm run frontend:build
 
       - name: Run Go tests on Ubuntu
         working-directory: backend

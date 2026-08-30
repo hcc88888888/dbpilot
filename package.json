@@ -8,7 +8,9 @@
     "contracts:breaking": "pwsh -NoProfile -File scripts/contracts/breaking.ps1",
     "contracts:verify": "pwsh -NoProfile -File scripts/contracts/verify-drift.ps1",
     "contracts:mock:start": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1",
-    "contracts:mock:test": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1 -Test"
+    "contracts:mock:test": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1 -Test",
+    "frontend:test": "npm --prefix frontend/app test -- --run",
+    "frontend:build": "npm --prefix frontend/app run build"
   },
   "devDependencies": {
     "@redocly/cli": "2.2.0",

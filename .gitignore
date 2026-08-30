@@ -5,5 +5,6 @@ backend/*.db
 backend/*.pem
 backend/bin/
 node_modules/
+frontend/app/dist/
 backend/internal/telemetry/dbpilot-spool/
 backend/.tmp-*/
