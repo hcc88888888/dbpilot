@@ -9,25 +9,59 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
-	enrollmentCSRFilename        = "agent.csr"
-	enrollmentPrepareFilename    = ".generation-prepared.json"
-	enrollmentCommitFilename     = "generation.json"
-	enrollmentGenerationFormat   = 1
-	enrollmentGenerationReady    = "prepared"
-	enrollmentGenerationComplete = "complete"
+	enrollmentCSRFilename         = "agent.csr"
+	enrollmentPrepareFilename     = ".generation-prepared.json"
+	enrollmentCompleteFilename    = ".generation-complete.json"
+	enrollmentCommitFilename      = "generation.json"
+	enrollmentGenerationFormat    = 1
+	enrollmentGenerationReady     = "prepared"
+	enrollmentGenerationComplete  = "complete"
+	enrollmentGenerationFinalized = "finalized"
+	enrollmentTemporaryPrefix     = ".dbpilot-enrollment-tmp-"
 )
+
+type enrollmentWritableFile interface {
+	io.Writer
+	Name() string
+	Chmod(os.FileMode) error
+	Sync() error
+	Close() error
+}
+
+type enrollmentFileSystem struct {
+	createTemp      func(string, string) (enrollmentWritableFile, error)
+	renameCanonical func(string, string) error
+	renameNoReplace func(string, string) error
+	remove          func(string) error
+	syncDirectory   func(string) error
+}
+
+func systemEnrollmentFilesystem() enrollmentFileSystem {
+	return enrollmentFileSystem{
+		createTemp: func(directory, pattern string) (enrollmentWritableFile, error) {
+			return os.CreateTemp(directory, pattern)
+		},
+		renameCanonical: os.Rename,
+		renameNoReplace: renameEnrollmentGenerationNoReplace,
+		remove:          os.Remove,
+		syncDirectory:   syncEnrollmentDirectory,
+	}
+}
 
 type enrollmentGenerationManifest struct {
 	Version            int    `json:"version"`
@@ -40,6 +74,7 @@ type enrollmentGenerationManifest struct {
 	CSRPublicSHA256    string `json:"csr_public_sha256"`
 	CertificateSHA256  string `json:"certificate_sha256,omitempty"`
 	CASHA256           string `json:"ca_sha256,omitempty"`
+	ExpiresAtUTC       string `json:"expires_at_utc,omitempty"`
 }
 
 type enrollmentGeneration struct {
@@ -49,6 +84,7 @@ type enrollmentGeneration struct {
 	files           enrollmentFiles
 	manifest        enrollmentGenerationManifest
 	published       bool
+	filesystem      enrollmentFileSystem
 }
 
 func enrollmentStageDirectory(outputDirectory string) string {
@@ -57,6 +93,10 @@ func enrollmentStageDirectory(outputDirectory string) string {
 }
 
 func prepareEnrollmentGeneration(outputDirectory, agentID string, token []byte, observation hostinventory.Observation, random io.Reader) (*enrollmentGeneration, error) {
+	return prepareEnrollmentGenerationWithFilesystem(outputDirectory, agentID, token, observation, random, systemEnrollmentFilesystem())
+}
+
+func prepareEnrollmentGenerationWithFilesystem(outputDirectory, agentID string, token []byte, observation hostinventory.Observation, random io.Reader, filesystem enrollmentFileSystem) (*enrollmentGeneration, error) {
 	if !filepath.IsAbs(outputDirectory) || filepath.Clean(outputDirectory) != outputDirectory || strings.TrimSpace(agentID) == "" || len(token) != enrollment.EnrollmentTokenBytes || random == nil {
 		return nil, errors.New("enrollment generation input is invalid")
 	}
@@ -76,7 +116,7 @@ func prepareEnrollmentGeneration(outputDirectory, agentID string, token []byte, 
 		if !isSecureEnrollmentDirectory(outputInfo) {
 			return nil, errors.New("enrollment output path is unsafe")
 		}
-		generation, loadErr := loadEnrollmentGeneration(outputDirectory, outputDirectory, agentID, tokenDigest, token, observation)
+		generation, loadErr := loadEnrollmentGeneration(outputDirectory, outputDirectory, agentID, tokenDigest, token, observation, filesystem)
 		if loadErr != nil || generation.manifest.State != enrollmentGenerationComplete {
 			return nil, errors.New("enrollment output path already exists")
 		}
@@ -91,30 +131,41 @@ func prepareEnrollmentGeneration(outputDirectory, agentID string, token []byte, 
 		if !isSecureEnrollmentDirectory(stageInfo) {
 			return nil, errors.New("enrollment staging path is unsafe")
 		}
-		return loadEnrollmentGeneration(outputDirectory, stageDirectory, agentID, tokenDigest, token, observation)
+		if err := cleanupEnrollmentTemporaryFiles(stageDirectory, filesystem); err != nil {
+			return nil, err
+		}
+		generation, loadErr := loadEnrollmentGeneration(outputDirectory, stageDirectory, agentID, tokenDigest, token, observation, filesystem)
+		if loadErr != nil {
+			generation, loadErr = recoverPreparedEnrollmentGeneration(outputDirectory, stageDirectory, agentID, tokenDigest, token, observation, filesystem)
+		}
+		if loadErr != nil {
+			if err := resetIncompleteEnrollmentStage(stageDirectory, filesystem); err != nil {
+				return nil, loadErr
+			}
+			return prepareEnrollmentGenerationWithFilesystem(outputDirectory, agentID, token, observation, random, filesystem)
+		}
+		if err := filesystem.syncDirectory(stageDirectory); err != nil {
+			return nil, fmt.Errorf("sync enrollment staging directory: %w", err)
+		}
+		if err := filesystem.syncDirectory(parent); err != nil {
+			return nil, fmt.Errorf("sync enrollment output parent: %w", err)
+		}
+		return generation, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, errors.New("inspect enrollment staging path failed")
 	}
 	if err := os.Mkdir(stageDirectory, 0o700); err != nil {
 		return nil, errors.New("create enrollment staging directory failed")
 	}
-	removeStage := true
-	defer func() {
-		if removeStage {
-			for _, name := range []string{agentKeyFilename, enrollmentCSRFilename, enrollmentPrepareFilename} {
-				_ = os.Remove(filepath.Join(stageDirectory, name))
-			}
-			_ = os.Remove(stageDirectory)
-		}
-	}()
 	request, files, err := generateEnrollmentMaterial(agentID, token, observation, random)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeEnrollmentFileExclusive(filepath.Join(stageDirectory, agentKeyFilename), files.PrivateKeyPEM); err != nil {
+	files.CSRPEM = append([]byte(nil), request.GetCertificateSigningRequestPem()...)
+	if err := writeEnrollmentFileAtomic(stageDirectory, agentKeyFilename, files.PrivateKeyPEM, filesystem); err != nil {
 		return nil, err
 	}
-	if err := writeEnrollmentFileExclusive(filepath.Join(stageDirectory, enrollmentCSRFilename), request.GetCertificateSigningRequestPem()); err != nil {
+	if err := writeEnrollmentFileAtomic(stageDirectory, enrollmentCSRFilename, files.CSRPEM, filesystem); err != nil {
 		return nil, err
 	}
 	manifest := enrollmentGenerationManifest{
@@ -122,32 +173,62 @@ func prepareEnrollmentGeneration(outputDirectory, agentID string, token []byte, 
 		TokenSHA256: tokenDigest, PrivateKeySHA256: enrollmentDigest(files.PrivateKeyPEM),
 		CSRPublicSHA256: enrollmentDigest(request.GetCertificateSigningRequestPem()),
 	}
-	if err := writeEnrollmentManifestExclusive(filepath.Join(stageDirectory, enrollmentPrepareFilename), manifest); err != nil {
+	if err := writeEnrollmentManifestAtomic(stageDirectory, enrollmentPrepareFilename, manifest, filesystem); err != nil {
 		return nil, err
 	}
-	if err := syncEnrollmentDirectory(stageDirectory); err != nil {
-		return nil, errors.New("sync enrollment staging directory failed")
+	if err := filesystem.syncDirectory(stageDirectory); err != nil {
+		return nil, fmt.Errorf("sync enrollment staging directory: %w", err)
 	}
-	removeStage = false
-	return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: stageDirectory, request: request, files: files, manifest: manifest}, nil
+	if err := filesystem.syncDirectory(parent); err != nil {
+		return nil, fmt.Errorf("sync enrollment output parent: %w", err)
+	}
+	return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: stageDirectory, request: request, files: files, manifest: manifest, filesystem: filesystem}, nil
 }
 
-func loadEnrollmentGeneration(outputDirectory, directory, agentID, tokenDigest string, token []byte, observation hostinventory.Observation) (*enrollmentGeneration, error) {
-	manifestPath := filepath.Join(directory, enrollmentCommitFilename)
-	manifest, err := readEnrollmentGenerationManifest(manifestPath)
-	if errors.Is(err, os.ErrNotExist) {
-		manifestPath = filepath.Join(directory, enrollmentPrepareFilename)
-		manifest, err = readEnrollmentGenerationManifest(manifestPath)
+func loadEnrollmentGeneration(outputDirectory, directory, agentID, tokenDigest string, token []byte, observation hostinventory.Observation, filesystem enrollmentFileSystem) (*enrollmentGeneration, error) {
+	type candidate struct{ name, state string }
+	candidates := []candidate{
+		{name: enrollmentCommitFilename, state: enrollmentGenerationFinalized},
+		{name: enrollmentCompleteFilename, state: enrollmentGenerationComplete},
+		{name: enrollmentPrepareFilename, state: enrollmentGenerationReady},
 	}
-	if err != nil || manifest.Version != enrollmentGenerationFormat || manifest.AgentID != agentID || manifest.TokenSHA256 != tokenDigest || (manifest.State != enrollmentGenerationReady && manifest.State != enrollmentGenerationComplete) {
+	var manifest enrollmentGenerationManifest
+	var invalidHigherPriority []string
+	found := false
+	for _, candidate := range candidates {
+		path := filepath.Join(directory, candidate.name)
+		value, readErr := readEnrollmentGenerationManifest(path)
+		if readErr == nil && value.State == candidate.state {
+			manifest = value
+			found = true
+			break
+		}
+		if info, statErr := os.Lstat(path); statErr == nil {
+			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, errors.New("enrollment manifest path is unsafe")
+			}
+			invalidHigherPriority = append(invalidHigherPriority, path)
+		}
+	}
+	if !found || manifest.Version != enrollmentGenerationFormat || manifest.AgentID != agentID || manifest.TokenSHA256 != tokenDigest {
 		return nil, errors.New("enrollment staging manifest is invalid")
+	}
+	for _, invalidPath := range invalidHigherPriority {
+		if err := filesystem.remove(invalidPath); err != nil {
+			return nil, fmt.Errorf("remove invalid enrollment manifest: %w", err)
+		}
+	}
+	if len(invalidHigherPriority) > 0 {
+		if err := filesystem.syncDirectory(directory); err != nil {
+			return nil, fmt.Errorf("sync enrollment manifest fallback: %w", err)
+		}
 	}
 	privateKey, err := readEnrollmentFile(filepath.Join(directory, agentKeyFilename), 1<<20)
 	if err != nil || enrollmentDigest(privateKey) != manifest.PrivateKeySHA256 {
 		return nil, errors.New("enrollment private key is invalid")
 	}
 	files := enrollmentFiles{PrivateKeyPEM: privateKey}
-	if manifest.State == enrollmentGenerationComplete {
+	if manifest.State == enrollmentGenerationComplete || manifest.State == enrollmentGenerationFinalized {
 		files.CertificatePEM, err = readEnrollmentFile(filepath.Join(directory, agentCertificateFilename), 4<<20)
 		if err != nil || enrollmentDigest(files.CertificatePEM) != manifest.CertificateSHA256 {
 			return nil, errors.New("enrollment certificate is invalid")
@@ -156,7 +237,12 @@ func loadEnrollmentGeneration(outputDirectory, directory, agentID, tokenDigest s
 		if err != nil || enrollmentDigest(files.ChainPEM) != manifest.CASHA256 {
 			return nil, errors.New("enrollment CA is invalid")
 		}
-		return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: directory, files: files, manifest: manifest}, nil
+		if csr, csrErr := readEnrollmentFile(filepath.Join(directory, enrollmentCSRFilename), 1<<20); csrErr == nil {
+			files.CSRPEM = csr
+		} else if manifest.State == enrollmentGenerationComplete {
+			return nil, errors.New("completed enrollment CSR is invalid")
+		}
+		return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: directory, files: files, manifest: manifest, filesystem: filesystem}, nil
 	}
 	csr, err := readEnrollmentFile(filepath.Join(directory, enrollmentCSRFilename), 1<<20)
 	if err != nil || enrollmentDigest(csr) != manifest.CSRPublicSHA256 {
@@ -166,11 +252,44 @@ func loadEnrollmentGeneration(outputDirectory, directory, agentID, tokenDigest s
 	if err != nil {
 		return nil, err
 	}
-	return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: directory, request: request, files: files, manifest: manifest}, nil
+	files.CSRPEM = csr
+	return &enrollmentGeneration{outputDirectory: outputDirectory, stageDirectory: directory, request: request, files: files, manifest: manifest, filesystem: filesystem}, nil
+}
+
+func recoverPreparedEnrollmentGeneration(outputDirectory, directory, agentID, tokenDigest string, token []byte, observation hostinventory.Observation, filesystem enrollmentFileSystem) (*enrollmentGeneration, error) {
+	privateKey, keyErr := readEnrollmentFile(filepath.Join(directory, agentKeyFilename), 1<<20)
+	csr, csrErr := readEnrollmentFile(filepath.Join(directory, enrollmentCSRFilename), 1<<20)
+	if keyErr != nil || csrErr != nil {
+		return nil, errors.New("incomplete enrollment generation has no recoverable key and CSR")
+	}
+	request, err := buildEnrollmentRequest(agentID, token, observation, privateKey, csr)
+	if err != nil {
+		return nil, err
+	}
+	manifest := enrollmentGenerationManifest{
+		Version: enrollmentGenerationFormat, State: enrollmentGenerationReady, AgentID: agentID,
+		TokenSHA256: tokenDigest, PrivateKeySHA256: enrollmentDigest(privateKey), CSRPublicSHA256: enrollmentDigest(csr),
+	}
+	preparedPath := filepath.Join(directory, enrollmentPrepareFilename)
+	if info, statErr := os.Lstat(preparedPath); statErr == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("invalid enrollment prepared manifest is unsafe")
+		}
+		if err := filesystem.remove(preparedPath); err != nil {
+			return nil, err
+		}
+	}
+	if err := writeEnrollmentManifestAtomic(directory, enrollmentPrepareFilename, manifest, filesystem); err != nil {
+		return nil, err
+	}
+	return &enrollmentGeneration{
+		outputDirectory: outputDirectory, stageDirectory: directory, request: request,
+		files: enrollmentFiles{PrivateKeyPEM: privateKey, CSRPEM: csr}, manifest: manifest, filesystem: filesystem,
+	}, nil
 }
 
 func (generation *enrollmentGeneration) readyToPublish() bool {
-	return generation != nil && generation.manifest.State == enrollmentGenerationComplete
+	return generation != nil && (generation.manifest.State == enrollmentGenerationComplete || generation.manifest.State == enrollmentGenerationFinalized)
 }
 
 func (generation *enrollmentGeneration) complete(response *agentv1.EnrollAgentResponse, serverCA []byte) error {
@@ -188,12 +307,15 @@ func (generation *enrollmentGeneration) complete(response *agentv1.EnrollAgentRe
 		if !bytes.Equal(generation.files.CertificatePEM, certificate) || !bytes.Equal(generation.files.ChainPEM, serverCA) {
 			return errors.New("completed enrollment generation does not match response")
 		}
-		return nil
+		return validateEnrollmentGenerationSemantics(generation.manifest, generation.files, serverCA, true)
 	}
-	if err := writeEnrollmentFileResumable(filepath.Join(generation.stageDirectory, agentCertificateFilename), certificate); err != nil {
+	if err := cleanupEnrollmentTemporaryFiles(generation.stageDirectory, generation.filesystem); err != nil {
 		return err
 	}
-	if err := writeEnrollmentFileResumable(filepath.Join(generation.stageDirectory, agentCAFilename), serverCA); err != nil {
+	if err := writeEnrollmentFileAtomicResumable(generation.stageDirectory, agentCertificateFilename, certificate, generation.filesystem); err != nil {
+		return err
+	}
+	if err := writeEnrollmentFileAtomicResumable(generation.stageDirectory, agentCAFilename, serverCA, generation.filesystem); err != nil {
 		return err
 	}
 	manifest := generation.manifest
@@ -202,30 +324,39 @@ func (generation *enrollmentGeneration) complete(response *agentv1.EnrollAgentRe
 	manifest.EnrollmentRevision = response.GetEnrollmentRevision()
 	manifest.CertificateSHA256 = enrollmentDigest(certificate)
 	manifest.CASHA256 = enrollmentDigest(serverCA)
-	if err := writeEnrollmentManifestExclusive(filepath.Join(generation.stageDirectory, enrollmentCommitFilename), manifest); err != nil {
-		if existing, readErr := readEnrollmentGenerationManifest(filepath.Join(generation.stageDirectory, enrollmentCommitFilename)); readErr != nil || existing != manifest {
-			return err
-		}
+	manifest.ExpiresAtUTC = response.GetExpiresAt().AsTime().UTC().Format(time.RFC3339Nano)
+	if err := writeEnrollmentManifestAtomicResumable(generation.stageDirectory, enrollmentCompleteFilename, manifest, generation.filesystem); err != nil {
+		return err
 	}
-	if err := syncEnrollmentDirectory(generation.stageDirectory); err != nil {
-		return errors.New("sync completed enrollment generation failed")
+	if err := generation.filesystem.syncDirectory(generation.stageDirectory); err != nil {
+		return fmt.Errorf("sync completed enrollment generation: %w", err)
 	}
 	generation.files.CertificatePEM = certificate
 	generation.files.ChainPEM = append([]byte(nil), serverCA...)
 	generation.manifest = manifest
-	return nil
+	return validateEnrollmentGenerationSemantics(manifest, generation.files, serverCA, true)
 }
 
-func (generation *enrollmentGeneration) publish() error {
-	if generation == nil || generation.manifest.State != enrollmentGenerationComplete {
+func (generation *enrollmentGeneration) publish(serverCA []byte) error {
+	if generation == nil || (generation.manifest.State != enrollmentGenerationComplete && generation.manifest.State != enrollmentGenerationFinalized) {
 		return errors.New("enrollment generation is incomplete")
 	}
-	if generation.published {
-		return nil
+	if err := cleanupEnrollmentTemporaryFiles(generation.stageDirectory, generation.filesystem); err != nil {
+		return err
 	}
-	loaded, err := loadEnrollmentGeneration(generation.outputDirectory, generation.stageDirectory, generation.manifest.AgentID, generation.manifest.TokenSHA256, nil, hostinventory.Observation{})
-	if err != nil || loaded.manifest.State != enrollmentGenerationComplete {
+	loaded, err := loadEnrollmentGeneration(generation.outputDirectory, generation.stageDirectory, generation.manifest.AgentID, generation.manifest.TokenSHA256, nil, hostinventory.Observation{}, generation.filesystem)
+	if err != nil || (loaded.manifest.State != enrollmentGenerationComplete && loaded.manifest.State != enrollmentGenerationFinalized) {
 		return errors.New("enrollment generation validation failed")
+	}
+	requireCSR := loaded.manifest.State == enrollmentGenerationComplete
+	if err := validateEnrollmentGenerationSemantics(loaded.manifest, loaded.files, serverCA, requireCSR); err != nil {
+		return err
+	}
+	if generation.published {
+		if err := generation.filesystem.syncDirectory(filepath.Dir(generation.outputDirectory)); err != nil {
+			return fmt.Errorf("sync published enrollment output parent: %w", err)
+		}
+		return nil
 	}
 	if _, err := os.Lstat(generation.outputDirectory); !errors.Is(err, os.ErrNotExist) {
 		return errors.New("enrollment output path already exists")
@@ -233,25 +364,106 @@ func (generation *enrollmentGeneration) publish() error {
 	if err := validateCompletedEnrollmentStage(generation.stageDirectory); err != nil {
 		return err
 	}
-	for _, transitionalName := range []string{enrollmentCSRFilename, enrollmentPrepareFilename} {
-		if err := os.Remove(filepath.Join(generation.stageDirectory, transitionalName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return errors.New("remove enrollment staging file failed")
+	if loaded.manifest.State == enrollmentGenerationComplete {
+		finalManifest := loaded.manifest
+		finalManifest.State = enrollmentGenerationFinalized
+		if err := writeEnrollmentManifestAtomicResumable(generation.stageDirectory, enrollmentCommitFilename, finalManifest, generation.filesystem); err != nil {
+			return err
+		}
+		loaded.manifest = finalManifest
+		generation.manifest = finalManifest
+	}
+	for _, transitionalName := range []string{enrollmentCSRFilename, enrollmentPrepareFilename, enrollmentCompleteFilename} {
+		if err := generation.filesystem.remove(filepath.Join(generation.stageDirectory, transitionalName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove enrollment staging file: %w", err)
 		}
 	}
-	if err := syncEnrollmentDirectory(generation.stageDirectory); err != nil {
-		return errors.New("sync finalized enrollment generation failed")
+	if err := generation.filesystem.syncDirectory(generation.stageDirectory); err != nil {
+		return fmt.Errorf("sync finalized enrollment generation: %w", err)
 	}
 	if err := validatePublishedEnrollmentEntries(generation.stageDirectory); err != nil {
 		return err
 	}
-	if err := os.Rename(generation.stageDirectory, generation.outputDirectory); err != nil {
-		return errors.New("publish enrollment generation failed")
+	if err := generation.filesystem.renameNoReplace(generation.stageDirectory, generation.outputDirectory); err != nil {
+		return fmt.Errorf("publish enrollment generation: %w", err)
 	}
-	if err := syncEnrollmentDirectory(filepath.Dir(generation.outputDirectory)); err != nil {
-		return errors.New("sync enrollment output parent failed")
+	if err := generation.filesystem.syncDirectory(filepath.Dir(generation.outputDirectory)); err != nil {
+		return fmt.Errorf("sync enrollment output parent: %w", err)
 	}
 	generation.published = true
 	return nil
+}
+
+func validateEnrollmentGenerationSemantics(manifest enrollmentGenerationManifest, files enrollmentFiles, serverCA []byte, requireCSR bool) error {
+	if manifest.Version != enrollmentGenerationFormat || (manifest.State != enrollmentGenerationComplete && manifest.State != enrollmentGenerationFinalized) || strings.TrimSpace(manifest.AgentID) == "" ||
+		strings.TrimSpace(manifest.HostID) == "" || manifest.EnrollmentRevision == 0 || !validEnrollmentDigest(manifest.TokenSHA256) ||
+		!validEnrollmentDigest(manifest.PrivateKeySHA256) || !validEnrollmentDigest(manifest.CSRPublicSHA256) ||
+		!validEnrollmentDigest(manifest.CertificateSHA256) || !validEnrollmentDigest(manifest.CASHA256) {
+		return errors.New("completed enrollment manifest is invalid")
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, manifest.ExpiresAtUTC)
+	if err != nil || !expiresAt.After(time.Now()) {
+		return errors.New("completed enrollment expiry is invalid")
+	}
+	if enrollmentDigest(files.PrivateKeyPEM) != manifest.PrivateKeySHA256 || enrollmentDigest(files.CertificatePEM) != manifest.CertificateSHA256 ||
+		enrollmentDigest(files.ChainPEM) != manifest.CASHA256 || enrollmentDigest(serverCA) != manifest.CASHA256 {
+		return errors.New("completed enrollment material does not match its manifest or configured CA")
+	}
+	if requireCSR {
+		if len(files.CSRPEM) == 0 || enrollmentDigest(files.CSRPEM) != manifest.CSRPublicSHA256 {
+			return errors.New("completed enrollment CSR is invalid")
+		}
+		if _, err := buildEnrollmentRequest(manifest.AgentID, nil, hostinventory.Observation{}, files.PrivateKeyPEM, files.CSRPEM); err != nil {
+			return errors.New("completed enrollment key and CSR do not match")
+		}
+	}
+	response := &agentv1.EnrollAgentResponse{
+		HostId: manifest.HostID, AgentId: manifest.AgentID,
+		ExpiresAt: timestamppb.New(expiresAt), EnrollmentRevision: manifest.EnrollmentRevision,
+	}
+	response.CertificatePem, response.CertificateChainPem, err = splitEnrollmentCertificateBundle(files.CertificatePEM)
+	if err != nil {
+		return err
+	}
+	if err := verifyEnrollmentResponse(manifest.AgentID, files.PrivateKeyPEM, response); err != nil {
+		return errors.New("completed enrollment certificate is invalid")
+	}
+	block, _ := pem.Decode(files.CertificatePEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("completed enrollment certificate is invalid")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || leaf.NotAfter.Unix() != expiresAt.Unix() {
+		return errors.New("completed enrollment certificate expiry is inconsistent")
+	}
+	return nil
+}
+
+func splitEnrollmentCertificateBundle(bundle []byte) ([]byte, []byte, error) {
+	remaining := bytes.TrimSpace(bundle)
+	var leafPEM, chainPEM []byte
+	for len(remaining) > 0 {
+		block, rest := pem.Decode(remaining)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, nil, errors.New("completed enrollment certificate bundle is invalid")
+		}
+		encoded := pem.EncodeToMemory(block)
+		if len(leafPEM) == 0 {
+			leafPEM = encoded
+		} else {
+			chainPEM = append(chainPEM, encoded...)
+		}
+		remaining = bytes.TrimSpace(rest)
+	}
+	if len(leafPEM) == 0 || len(chainPEM) == 0 {
+		return nil, nil, errors.New("completed enrollment certificate chain is missing")
+	}
+	return leafPEM, chainPEM, nil
+}
+
+func validEnrollmentDigest(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func validateCompletedEnrollmentStage(directory string) error {
@@ -261,7 +473,7 @@ func validateCompletedEnrollmentStage(directory string) error {
 	}
 	allowed := map[string]struct{}{
 		agentKeyFilename: {}, enrollmentCSRFilename: {}, agentCertificateFilename: {}, agentCAFilename: {},
-		enrollmentPrepareFilename: {}, enrollmentCommitFilename: {},
+		enrollmentPrepareFilename: {}, enrollmentCompleteFilename: {}, enrollmentCommitFilename: {},
 	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -315,55 +527,164 @@ func readEnrollmentGenerationManifest(path string) (enrollmentGenerationManifest
 	return manifest, nil
 }
 
-func writeEnrollmentManifestExclusive(path string, manifest enrollmentGenerationManifest) error {
+func writeEnrollmentManifestAtomic(directory, name string, manifest enrollmentGenerationManifest, filesystem enrollmentFileSystem) error {
 	data, err := json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return writeEnrollmentFileExclusive(path, data)
+	return writeEnrollmentFileAtomic(directory, name, data, filesystem)
 }
 
-func writeEnrollmentFileResumable(path string, data []byte) error {
+func writeEnrollmentManifestAtomicResumable(directory, name string, manifest enrollmentGenerationManifest, filesystem enrollmentFileSystem) error {
+	path := filepath.Join(directory, name)
+	if existing, err := readEnrollmentGenerationManifest(path); err == nil {
+		if existing == manifest {
+			return filesystem.syncDirectory(directory)
+		}
+		if err := filesystem.remove(path); err != nil {
+			return fmt.Errorf("remove enrollment manifest superseded by replayed response: %w", err)
+		}
+		if err := filesystem.syncDirectory(directory); err != nil {
+			return fmt.Errorf("sync superseded enrollment manifest removal: %w", err)
+		}
+	} else if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("enrollment manifest path is unsafe")
+		}
+		if err := filesystem.remove(path); err != nil {
+			return fmt.Errorf("remove incomplete enrollment manifest: %w", err)
+		}
+		if err := filesystem.syncDirectory(directory); err != nil {
+			return fmt.Errorf("sync incomplete enrollment manifest removal: %w", err)
+		}
+	}
+	return writeEnrollmentManifestAtomic(directory, name, manifest, filesystem)
+}
+
+func writeEnrollmentFileAtomicResumable(directory, name string, data []byte, filesystem enrollmentFileSystem) error {
+	path := filepath.Join(directory, name)
 	if existing, err := readEnrollmentFile(path, int64(len(data))+1); err == nil {
 		if bytes.Equal(existing, data) {
-			return nil
+			return filesystem.syncDirectory(directory)
 		}
-		return errors.New("enrollment staging file collides with different content")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return errors.New("enrollment staging file is unsafe")
+		if err := filesystem.remove(path); err != nil {
+			return fmt.Errorf("remove incomplete enrollment staging file: %w", err)
+		}
+		if err := filesystem.syncDirectory(directory); err != nil {
+			return fmt.Errorf("sync incomplete enrollment staging removal: %w", err)
+		}
+	} else if info, statErr := os.Lstat(path); statErr == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("enrollment staging file is unsafe")
+		}
+		if err := filesystem.remove(path); err != nil {
+			return fmt.Errorf("remove unreadable enrollment staging file: %w", err)
+		}
+		if err := filesystem.syncDirectory(directory); err != nil {
+			return fmt.Errorf("sync unreadable enrollment staging removal: %w", err)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return errors.New("inspect enrollment staging file failed")
 	}
-	return writeEnrollmentFileExclusive(path, data)
+	return writeEnrollmentFileAtomic(directory, name, data, filesystem)
 }
 
-func writeEnrollmentFileExclusive(path string, data []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return errors.New("create enrollment staging file failed")
+func writeEnrollmentFileAtomic(directory, name string, data []byte, filesystem enrollmentFileSystem) error {
+	path := filepath.Join(directory, name)
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("enrollment canonical staging path already exists")
 	}
+	file, err := filesystem.createTemp(directory, enrollmentTemporaryPrefix+name+"-")
+	if err != nil {
+		return fmt.Errorf("create enrollment temporary file: %w", err)
+	}
+	temporaryPath := file.Name()
 	remove := true
 	defer func() {
 		if remove {
-			_ = os.Remove(path)
+			_ = filesystem.remove(temporaryPath)
 		}
 	}()
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		return errors.New("secure enrollment staging file failed")
+		return fmt.Errorf("secure enrollment temporary file: %w", err)
 	}
 	if err := writeFull(file, data); err != nil {
 		_ = file.Close()
-		return errors.New("write enrollment staging file failed")
+		return fmt.Errorf("write enrollment temporary file: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return errors.New("sync enrollment staging file failed")
+		return fmt.Errorf("sync enrollment temporary file: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return errors.New("close enrollment staging file failed")
+		return fmt.Errorf("close enrollment temporary file: %w", err)
+	}
+	if err := filesystem.renameCanonical(temporaryPath, path); err != nil {
+		return fmt.Errorf("commit enrollment canonical file: %w", err)
 	}
 	remove = false
+	if err := filesystem.syncDirectory(directory); err != nil {
+		return fmt.Errorf("sync enrollment canonical file: %w", err)
+	}
 	return nil
+}
+
+func cleanupEnrollmentTemporaryFiles(directory string, filesystem enrollmentFileSystem) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), enrollmentTemporaryPrefix) {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(directory, entry.Name()))
+		if err != nil || info.IsDir() {
+			return errors.New("enrollment temporary residue is unsafe")
+		}
+		if err := filesystem.remove(filepath.Join(directory, entry.Name())); err != nil {
+			return fmt.Errorf("remove enrollment temporary residue: %w", err)
+		}
+		removed = true
+	}
+	if removed {
+		return filesystem.syncDirectory(directory)
+	}
+	return nil
+}
+
+func resetIncompleteEnrollmentStage(directory string, filesystem enrollmentFileSystem) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	known := map[string]struct{}{
+		agentKeyFilename: {}, enrollmentCSRFilename: {}, agentCertificateFilename: {}, agentCAFilename: {},
+		enrollmentPrepareFilename: {}, enrollmentCompleteFilename: {}, enrollmentCommitFilename: {},
+	}
+	for _, entry := range entries {
+		_, expected := known[entry.Name()]
+		if !expected && !strings.HasPrefix(entry.Name(), enrollmentTemporaryPrefix) {
+			return errors.New("incomplete enrollment stage contains an unexpected entry")
+		}
+		info, err := os.Lstat(filepath.Join(directory, entry.Name()))
+		if err != nil || info.IsDir() {
+			return errors.New("incomplete enrollment stage contains an unsafe entry")
+		}
+		if err := filesystem.remove(filepath.Join(directory, entry.Name())); err != nil {
+			return err
+		}
+	}
+	if err := filesystem.syncDirectory(directory); err != nil {
+		return err
+	}
+	if err := filesystem.remove(directory); err != nil {
+		return err
+	}
+	return filesystem.syncDirectory(filepath.Dir(directory))
 }
 
 func writeFull(writer io.Writer, data []byte) error {

@@ -48,6 +48,12 @@ func TestPrepareEnrollmentGenerationPrecedesRPCAndResumesSameCSR(t *testing.T) {
 	require.Equal(t, first.stageDirectory, second.stageDirectory)
 	require.Equal(t, firstCSR, second.request.GetCertificateSigningRequestPem(), "lost-response retry must reuse the proven CSR/private key")
 	require.Equal(t, first.files.PrivateKeyPEM, second.files.PrivateKeyPEM)
+	// The Server committed this response for the first request, but the first
+	// transport response was lost. Replaying the exact CSR must still publish it.
+	committedResponse, serverCA := testEnrollmentResponse(t, first.request)
+	require.NoError(t, second.complete(committedResponse, serverCA))
+	require.NoError(t, second.publish(serverCA))
+	require.DirExists(t, output)
 }
 
 func TestEnrollmentGenerationCompletesManifestAndPublishesDirectoryAtomically(t *testing.T) {
@@ -63,7 +69,7 @@ func TestEnrollmentGenerationCompletesManifestAndPublishesDirectoryAtomically(t 
 	// Re-entry after a crash between complete-manifest fsync and directory rename
 	// validates the existing generation instead of rewriting partial files.
 	require.NoError(t, generation.complete(response, serverCA))
-	require.NoError(t, generation.publish())
+	require.NoError(t, generation.publish(serverCA))
 
 	require.DirExists(t, output)
 	require.NoDirExists(t, generation.stageDirectory)
@@ -79,7 +85,7 @@ func TestEnrollmentGenerationCompletesManifestAndPublishesDirectoryAtomically(t 
 	}
 	manifest, err := readEnrollmentGenerationManifest(filepath.Join(output, enrollmentCommitFilename))
 	require.NoError(t, err)
-	require.Equal(t, enrollmentGenerationComplete, manifest.State)
+	require.Equal(t, enrollmentGenerationFinalized, manifest.State)
 	require.Equal(t, "agent-1", manifest.AgentID)
 	entries, err := os.ReadDir(output)
 	require.NoError(t, err)
@@ -98,7 +104,7 @@ func TestPrepareEnrollmentGenerationResumesCompletedStageWithoutRegenerating(t *
 	resumed, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), failingEnrollmentReader{})
 	require.NoError(t, err)
 	require.True(t, resumed.readyToPublish())
-	require.NoError(t, resumed.publish())
+	require.NoError(t, resumed.publish(serverCA))
 	require.DirExists(t, output)
 }
 
@@ -145,7 +151,7 @@ func TestEnrollmentGenerationPublishRejectsOutputCollisionWithoutChangingIt(t *t
 	sentinel := filepath.Join(output, "sentinel")
 	require.NoError(t, os.WriteFile(sentinel, []byte("unchanged"), 0o600))
 
-	err = generation.publish()
+	err = generation.publish(serverCA)
 	require.Error(t, err)
 	contents, readErr := os.ReadFile(sentinel)
 	require.NoError(t, readErr)
@@ -163,7 +169,7 @@ func TestEnrollmentGenerationPublishRejectsUnexpectedStageEntry(t *testing.T) {
 	require.NoError(t, generation.complete(response, serverCA))
 	require.NoError(t, os.WriteFile(filepath.Join(generation.stageDirectory, "unexpected"), []byte("do not publish"), 0o600))
 
-	err = generation.publish()
+	err = generation.publish(serverCA)
 	require.Error(t, err)
 	require.NoDirExists(t, output)
 	require.FileExists(t, filepath.Join(generation.stageDirectory, "unexpected"))

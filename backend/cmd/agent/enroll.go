@@ -41,6 +41,7 @@ const (
 
 type enrollmentFiles struct {
 	PrivateKeyPEM  []byte
+	CSRPEM         []byte
 	CertificatePEM []byte
 	ChainPEM       []byte
 }
@@ -102,7 +103,7 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 	}
 	defer zeroBytes(generation.files.PrivateKeyPEM)
 	if generation.readyToPublish() {
-		if err := generation.publish(); err != nil {
+		if err := generation.publish(serverCA); err != nil {
 			fmt.Fprintln(stderr, "publish enrollment credentials failed")
 			return 1
 		}
@@ -126,7 +127,7 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "Agent enrollment response is invalid")
 		return 1
 	}
-	if err := generation.publish(); err != nil {
+	if err := generation.publish(serverCA); err != nil {
 		fmt.Fprintln(stderr, "publish enrollment credentials failed")
 		return 1
 	}
