@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,9 +25,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPluginCatalogPostgres16SplitClockRetryCompletesHTTPAuditAndIdempotency(t *testing.T) {
-	// Break caught: when PostgreSQL observes expiry after the Application's
-	// earlier clock check, the first exact HTTP retry must adopt and complete.
+func TestPluginCatalogPostgres16ConcurrentReaperSplitClockRetryCompletesHTTPAuditAndIdempotency(t *testing.T) {
+	// Break caught: when a reaper locks pending before an exact retry publishes
+	// its Artifact, the same first retry must adopt after abandonment and commit.
 	if os.Getenv("DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION") != "1" {
 		t.Skip("set DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION=1 to run")
 	}
@@ -67,8 +68,47 @@ func TestPluginCatalogPostgres16SplitClockRetryCompletesHTTPAuditAndIdempotency(
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT lease_expires_at FROM plugin_catalog_operations WHERE tenant_id=$1 AND project_id=$2 AND idempotency_key=$3`, platformTestScope.TenantID, platformTestScope.ProjectID, "split-clock-upload").Scan(&leaseExpiresAt))
 	serviceNow = leaseExpiresAt.Add(-time.Millisecond)
 	repositoryNow = leaseExpiresAt.Add(time.Millisecond)
+	reaper, err := database.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { _ = reaper.Rollback() }()
+	var lockedState string
+	require.NoError(t, reaper.QueryRowContext(ctx, `SELECT state FROM plugin_catalog_operations WHERE tenant_id=$1 AND project_id=$2 AND idempotency_key=$3 FOR UPDATE`, platformTestScope.TenantID, platformTestScope.ProjectID, "split-clock-upload").Scan(&lockedState))
+	require.Equal(t, "pending", lockedState)
+	var artifactCountBeforeRetry int
+	require.NoError(t, reaper.QueryRowContext(ctx, `SELECT count(*) FROM artifacts WHERE tenant_id=$1 AND project_id=$2`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&artifactCountBeforeRetry))
+	require.Zero(t, artifactCountBeforeRetry)
+	artifactWriter.published = make(chan struct{})
+	artifactWriter.continueAfterPublish = make(chan struct{})
+	defer func() {
+		select {
+		case <-artifactWriter.continueAfterPublish:
+		default:
+			close(artifactWriter.continueAfterPublish)
+		}
+	}()
+	retryResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		retryResult <- servePlatformRequest(services, principal, newPluginUploadRequest(archive, "split-clock-upload"))
+	}()
+	select {
+	case <-artifactWriter.published:
+	case <-time.After(10 * time.Second):
+		t.Fatal("exact retry did not publish its Artifact while the reaper held the operation row")
+	}
+	reaperUpdate, err := reaper.ExecContext(ctx, `UPDATE plugin_catalog_operations SET state='abandoned', abandoned_at=$1, updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND idempotency_key=$4 AND state='pending'`, repositoryNow, platformTestScope.TenantID, platformTestScope.ProjectID, "split-clock-upload")
+	require.NoError(t, err)
+	reaperRows, err := reaperUpdate.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, reaperRows)
+	require.NoError(t, reaper.Commit())
+	close(artifactWriter.continueAfterPublish)
 
-	retry := servePlatformRequest(services, principal, newPluginUploadRequest(archive, "split-clock-upload"))
+	var retry *httptest.ResponseRecorder
+	select {
+	case retry = <-retryResult:
+	case <-time.After(10 * time.Second):
+		t.Fatal("exact retry did not finish after the reaper committed abandonment")
+	}
 	require.Equal(t, http.StatusCreated, retry.Code, retry.Body.String())
 	replay := servePlatformRequest(services, principal, newPluginUploadRequest(archive, "split-clock-upload"))
 	require.Equal(t, retry.Code, replay.Code)
@@ -94,8 +134,10 @@ func TestPluginCatalogPostgres16SplitClockRetryCompletesHTTPAuditAndIdempotency(
 }
 
 type failOncePluginArtifactWriter struct {
-	delegate plugincatalog.ArtifactWriter
-	err      error
+	delegate             plugincatalog.ArtifactWriter
+	err                  error
+	published            chan struct{}
+	continueAfterPublish chan struct{}
 }
 
 func (writer *failOncePluginArtifactWriter) PutReader(ctx context.Context, value artifact.Artifact, source io.Reader) (artifact.Artifact, error) {
@@ -104,7 +146,15 @@ func (writer *failOncePluginArtifactWriter) PutReader(ctx context.Context, value
 		writer.err = nil
 		return artifact.Artifact{}, err
 	}
-	return writer.delegate.PutReader(ctx, value, source)
+	stored, err := writer.delegate.PutReader(ctx, value, source)
+	if err != nil {
+		return artifact.Artifact{}, err
+	}
+	if writer.published != nil {
+		close(writer.published)
+		<-writer.continueAfterPublish
+	}
+	return stored, nil
 }
 
 func pluginCatalogV1CorpusArchive(t *testing.T) ([]byte, ed25519.PublicKey) {

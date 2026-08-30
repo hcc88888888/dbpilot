@@ -389,6 +389,19 @@ func (repository *PostgresRepository) FinalizeUploadOperation(ctx context.Contex
 		}
 		return value, nil
 	}
+	if value.State == OperationAbandoned {
+		adoptionAt := repository.now().UTC().Truncate(time.Microsecond)
+		leaseExpiresAt := renewedOperationLease(adoptionAt.Add(DefaultOperationLease), value.LeaseExpiresAt, adoptionAt)
+		value, err = scanOperation(transaction.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'pending', abandoned_at = NULL, lease_expires_at = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'abandoned' RETURNING "+operationColumnsSQL, leaseExpiresAt, adoptionAt, key.Scope.TenantID, key.Scope.ProjectID, key.RecordID()))
+		if errors.Is(err, sql.ErrNoRows) {
+			rollback()
+			return OperationSnapshot{}, ErrConflict
+		}
+		if err != nil {
+			rollback()
+			return OperationSnapshot{}, err
+		}
+	}
 	var artifactExists bool
 	artifactChecksum := "sha256:" + value.ArtifactSHA256
 	if err := transaction.QueryRowContext(ctx, reusableOperationArtifactExistsSQL, key.Scope.TenantID, key.Scope.ProjectID, value.ArtifactID, artifactChecksum, value.ArtifactBytes, key.RecordID(), value.Version.PluginID, value.Version.Version, value.ArtifactSHA256).Scan(&artifactExists); err != nil {
