@@ -136,6 +136,12 @@ func TestRunMigrationsRegistersPluginCatalogSchemaAtomically(t *testing.T) {
 	mock.ExpectExec("ALTER TABLE plugin_catalog_operations").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("plugincatalog/migrations/0003_plugin_catalog_operation_leases.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WithArgs(int64(0x444250494c4f54)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS .* dbpilot_schema_migrations").WithArgs("plugincatalog/migrations/0004_plugin_catalog_operation_completion.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("ALTER TABLE plugin_catalog_operations").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("plugincatalog/migrations/0004_plugin_catalog_operation_completion.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())

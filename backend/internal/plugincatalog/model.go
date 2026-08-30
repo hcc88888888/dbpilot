@@ -289,18 +289,19 @@ func (response OperationResponse) Validate() error {
 type OperationResponseBuilder func(PluginVersion) (OperationResponse, error)
 
 type OperationSnapshot struct {
-	Key            OperationKey
-	State          OperationState
-	Kind           string
-	Definition     PluginDefinition
-	Version        PluginVersion
-	ArtifactID     string
-	ArtifactSHA256 string
-	ArtifactBytes  int64
-	LeaseExpiresAt time.Time
-	AbandonedAt    *time.Time
-	Response       OperationResponse
-	AuditEventJSON []byte
+	Key                    OperationKey
+	State                  OperationState
+	Kind                   string
+	Definition             PluginDefinition
+	Version                PluginVersion
+	ArtifactID             string
+	ArtifactSHA256         string
+	ArtifactBytes          int64
+	LeaseExpiresAt         time.Time
+	AbandonedAt            *time.Time
+	CompletionReconciledAt *time.Time
+	Response               OperationResponse
+	AuditEventJSON         []byte
 }
 
 func (snapshot OperationSnapshot) Validate() error {
@@ -339,6 +340,8 @@ type OperationRepository interface {
 	FinalizeUploadOperation(context.Context, OperationKey, OperationResponseBuilder) (OperationSnapshot, error)
 	TransitionOperation(context.Context, TransitionOperationRequest, OperationResponseBuilder) (OperationSnapshot, error)
 	ReconcileExpiredUploadOperations(context.Context, time.Time, int) (OperationReconcileResult, error)
+	ListUnreconciledCommittedOperations(context.Context, int) ([]OperationSnapshot, error)
+	MarkOperationCompletionReconciled(context.Context, OperationKey, time.Time) error
 }
 
 type OperationReconcileResult struct {

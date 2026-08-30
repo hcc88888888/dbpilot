@@ -471,6 +471,50 @@ func TestPluginAuditDedupeAllowsFailureThenSuccessWithSameKey(t *testing.T) {
 		require.Len(t, audits.records, 2)
 		require.NotEqual(t, audits.records[0].DedupeKey, audits.records[1].DedupeKey)
 	})
+
+	t.Run("different failure phases", func(t *testing.T) {
+		service := newRecordingDurableCatalog(plugincatalog.PluginVersion{})
+		service.uploadErr = fmt.Errorf("%w: %w", plugincatalog.ErrBeforeSideEffect, plugincatalog.ErrUnknownPublisher)
+		audits := &recordingAuditService{}
+		services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		principal := principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage)
+		body := []byte("changes-failure-phase")
+		require.Equal(t, http.StatusUnprocessableEntity, servePlatformRequest(services, principal, newPluginUploadRequest(body, "different-failures")).Code)
+		service.uploadErr = fmt.Errorf("%w: %w", plugincatalog.ErrBeforeSideEffect, plugincatalog.ErrManifestRejected)
+		require.Equal(t, http.StatusUnprocessableEntity, servePlatformRequest(services, principal, newPluginUploadRequest(body, "different-failures")).Code)
+		require.Len(t, audits.records, 2)
+		require.NotEqual(t, audits.records[0].DedupeKey, audits.records[1].DedupeKey)
+		require.NotEqual(t, audits.records[0].Detail["error_code"], audits.records[1].Detail["error_code"])
+	})
+}
+
+func TestReaperFinalizedOperationCompletesOriginalIdempotencyAndAudit(t *testing.T) {
+	ctx := context.WithValue(context.Background(), requestIDContextKey{}, "request-reaper-original")
+	scope := platformTestScope
+	principal := Principal{Subject: "publisher-reaper", PlatformAdmin: true}
+	audits := &recordingAuditService{}
+	auditJSON, _, err := pluginAuditReconciliation(ctx, audits, scope, principal, "plugin.version_uploaded", "plugin_version", "plugin-version-1", "success", "uploadPluginVersionPackage", "reaper-key", map[string]any{"package_sha256": repeatString("a", 64)})
+	require.NoError(t, err)
+	store := newHTTPIdempotencyStore()
+	idempotencyService := idempotency.NewService(store)
+	fingerprint := "sha256:" + repeatString("b", 64)
+	idempotencyKey := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "uploadPluginVersionPackage", IdempotencyKey: "reaper-key"}
+	_, reconcile, err := pluginAuditReconciliation(ctx, audits, scope, principal, "plugin.version_uploaded", "plugin_version", "plugin-version-1", "success", "uploadPluginVersionPackage", "reaper-key", map[string]any{"package_sha256": repeatString("a", 64)})
+	require.NoError(t, err)
+	claim, err := idempotencyService.BeginRecoverable(ctx, idempotencyKey, fingerprint, auditJSON, reconcile, func(context.Context, idempotency.ProcessingClaim) (idempotency.Response, error) {
+		return idempotency.Response{}, errors.New("not called")
+	})
+	require.NoError(t, err)
+	require.True(t, claim.Claimed)
+	version := validCatalogVersion(plugincatalog.StatusVerified, 1)
+	response, err := pluginOperationResponseBuilder(version)
+	require.NoError(t, err)
+	snapshot := plugincatalog.OperationSnapshot{Key: plugincatalog.OperationKey{Scope: scope, Actor: principal.Subject, OperationID: idempotencyKey.OperationID, IdempotencyKey: idempotencyKey.IdempotencyKey, Fingerprint: fingerprint, OwnerToken: claim.OwnerToken}, Kind: "upload", State: plugincatalog.OperationCommitted, Version: version, ArtifactID: version.ArtifactID, ArtifactSHA256: version.PackageSHA256, ArtifactBytes: 121, LeaseExpiresAt: time.Now().UTC().Add(-time.Minute), Response: response, AuditEventJSON: auditJSON}
+	require.NoError(t, ReconcilePluginCatalogOperation(ctx, idempotencyService, audits, snapshot))
+	require.Len(t, audits.records, 1)
+	require.Equal(t, idempotency.StateCompleted, store.records[idempotencyKey.Scope.Key()+"\x00"+idempotencyKey.Actor+"\x00"+idempotencyKey.OperationID+"\x00"+idempotencyKey.IdempotencyKey].state)
+	require.NoError(t, ReconcilePluginCatalogOperation(ctx, idempotencyService, audits, snapshot))
+	require.Len(t, audits.records, 1)
 }
 
 func newPluginUploadRequest(body []byte, key string) *http.Request {

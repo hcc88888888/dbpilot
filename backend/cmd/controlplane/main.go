@@ -574,12 +574,28 @@ func NewServer(config Config) (*Server, error) {
 			}
 			reconciler, ok := pluginCatalogService.(interface {
 				ReconcileExpiredUploadOperations(context.Context, time.Time, int) (plugincatalog.OperationReconcileResult, error)
+				ListUnreconciledCommittedOperations(context.Context, int) ([]plugincatalog.OperationSnapshot, error)
+				MarkOperationCompletionReconciled(context.Context, plugincatalog.OperationKey, time.Time) error
 			})
 			if !ok {
 				return errors.New("plugin catalog reconciler is unavailable")
 			}
-			_, err := reconciler.ReconcileExpiredUploadOperations(ctx, at.UTC(), 25)
-			return err
+			if _, err := reconciler.ReconcileExpiredUploadOperations(ctx, at.UTC(), 25); err != nil {
+				return err
+			}
+			operations, err := reconciler.ListUnreconciledCommittedOperations(ctx, 25)
+			if err != nil {
+				return err
+			}
+			for _, operation := range operations {
+				if err := controlplane.ReconcilePluginCatalogOperation(ctx, idempotencyService, auditService, operation); err != nil {
+					return err
+				}
+				if err := reconciler.MarkOperationCompletionReconciled(ctx, operation.Key, at.UTC()); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}, nil
 }

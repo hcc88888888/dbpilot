@@ -243,6 +243,18 @@ func (repository *recordingCatalogRepository) ReconcileExpiredUploadOperations(c
 	return OperationReconcileResult{}, nil
 }
 
+func (repository *recordingCatalogRepository) ListUnreconciledCommittedOperations(context.Context, int) ([]OperationSnapshot, error) {
+	if repository.operation.State == OperationCommitted && repository.operation.CompletionReconciledAt == nil {
+		return []OperationSnapshot{repository.operation}, nil
+	}
+	return nil, nil
+}
+
+func (repository *recordingCatalogRepository) MarkOperationCompletionReconciled(_ context.Context, _ OperationKey, at time.Time) error {
+	repository.operation.CompletionReconciledAt = &at
+	return nil
+}
+
 type recordingPackageVerifier struct {
 	value VerifiedPackage
 	err   error

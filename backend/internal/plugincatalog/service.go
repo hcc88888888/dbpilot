@@ -63,7 +63,10 @@ func (service *Application) UploadOperation(ctx context.Context, scope platforms
 }
 
 func (service *Application) publishVerifiedOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, verified VerifiedPackage) (OperationSnapshot, error) {
-	createdAt := service.now().UTC()
+	// PostgreSQL timestamptz is microsecond-precision. Canonicalize once before
+	// building both the immutable version and response snapshot so transaction
+	// round-trips never change replay bytes.
+	createdAt := service.now().UTC().Truncate(time.Microsecond)
 	definition, version, artifactValue, err := service.valuesForVerified(scope, metadata, key.RecordID(), createdAt, verified)
 	if err != nil {
 		if verified.Close() != nil {
@@ -185,6 +188,20 @@ func (service *Application) ReconcileExpiredUploadOperations(ctx context.Context
 		return OperationReconcileResult{}, ErrInvalid
 	}
 	return service.operations.ReconcileExpiredUploadOperations(ctx, at.UTC(), limit)
+}
+
+func (service *Application) ListUnreconciledCommittedOperations(ctx context.Context, limit int) ([]OperationSnapshot, error) {
+	if service == nil || service.operations == nil || ctx == nil || limit < 1 || limit > 100 {
+		return nil, ErrInvalid
+	}
+	return service.operations.ListUnreconciledCommittedOperations(ctx, limit)
+}
+
+func (service *Application) MarkOperationCompletionReconciled(ctx context.Context, key OperationKey, at time.Time) error {
+	if service == nil || service.operations == nil || ctx == nil || key.Validate() != nil || at.IsZero() {
+		return ErrInvalid
+	}
+	return service.operations.MarkOperationCompletionReconciled(ctx, key, at.UTC())
 }
 
 func (service *Application) Upload(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, source io.Reader) (PluginVersion, error) {

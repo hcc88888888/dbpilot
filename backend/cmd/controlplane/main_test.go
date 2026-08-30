@@ -150,7 +150,7 @@ func TestDefaultCompositionRunsPluginCatalogMigrationsWhenEnabled(t *testing.T) 
 	}
 	var applied int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM dbpilot_schema_migrations WHERE name LIKE $1", "plugincatalog/%").Scan(&applied))
-	require.Equal(t, 3, applied)
+	require.Equal(t, 4, applied)
 	configured := server.config.PluginCatalog.Enabled && len(server.config.PluginPublishers) == 1 && strings.TrimSpace(server.config.Artifact.StorageRoot) != ""
 	require.True(t, configured)
 }

@@ -315,7 +315,8 @@ func recordPluginFailureAudit(ctx context.Context, service AuditService, scope p
 		return ErrServiceUnavailable
 	}
 	event := httpActionAuditEvent(ctx, scope, principal, action, resourceType, resourceID, "failure", operationID, idempotencyKey)
-	digest := sha256.Sum256([]byte(event.DedupeKey))
+	digest := sha256.Sum256([]byte(event.DedupeKey + "\x00" + errorCode))
+	event.DedupeKey = "http.action.failure:" + hex.EncodeToString(digest[:])
 	event.RequestID = "plugin-failure-" + hex.EncodeToString(digest[:16])
 	event.TraceID = ""
 	event.Detail["error_code"] = errorCode
@@ -388,6 +389,50 @@ func pluginAuditReconciliation(ctx context.Context, service AuditService, scope 
 		return recordErr
 	}
 	return encoded, reconcile, nil
+}
+
+// ReconcilePluginCatalogOperation completes the HTTP idempotency/Audit side of
+// a catalog operation finalized by the leased publication reaper.
+func ReconcilePluginCatalogOperation(ctx context.Context, idempotencyService IdempotencyService, auditService AuditService, snapshot plugincatalog.OperationSnapshot) error {
+	if ctx == nil || idempotencyService == nil || auditService == nil || snapshot.Validate() != nil || snapshot.State != plugincatalog.OperationCommitted {
+		return ErrInvalidRequest
+	}
+	response, err := idempotencyResponseFromOperation(snapshot.Response)
+	if err != nil {
+		return err
+	}
+	reconcile, err := storedPluginAuditReconcile(auditService, snapshot)
+	if err != nil {
+		return err
+	}
+	key := idempotency.Key{Scope: snapshot.Key.Scope, Actor: snapshot.Key.Actor, OperationID: snapshot.Key.OperationID, IdempotencyKey: snapshot.Key.IdempotencyKey}
+	claim, err := idempotencyService.BeginRecoverable(ctx, key, snapshot.Key.Fingerprint, snapshot.AuditEventJSON, reconcile, func(_ context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		if processing.OwnerToken != snapshot.Key.OwnerToken || !bytes.Equal(processing.Reconciliation, snapshot.AuditEventJSON) {
+			return idempotency.Response{}, idempotency.ErrOwnershipConflict
+		}
+		return response, nil
+	})
+	if err != nil {
+		return err
+	}
+	if claim.Response == nil || claim.Response.Status != response.Status || claim.Response.Header.Get("ETag") != response.Header.Get("ETag") || !bytes.Equal(claim.Response.Body, response.Body) {
+		return idempotency.ErrInProgress
+	}
+	return nil
+}
+
+func storedPluginAuditReconcile(service AuditService, snapshot plugincatalog.OperationSnapshot) (idempotency.ReconcileFunc, error) {
+	var expected httpActionAuditPayload
+	if json.Unmarshal(snapshot.AuditEventJSON, &expected) != nil || expected.Scope != snapshot.Key.Scope || expected.Actor.ID != snapshot.Key.Actor || expected.DedupeKey == "" || !canonicalAuditIdentity(expected.RequestID) {
+		return nil, errors.New("stored plugin Audit snapshot is invalid")
+	}
+	return func(callbackContext context.Context, _ idempotency.Response, storedJSON []byte) error {
+		if !bytes.Equal(storedJSON, snapshot.AuditEventJSON) {
+			return errors.New("stored plugin Audit snapshot changed")
+		}
+		_, err := service.RecordOnce(callbackContext, audit.Event{Scope: expected.Scope, Action: expected.Action, Actor: expected.Actor, Resource: expected.Resource, Result: expected.Result, RequestID: expected.RequestID, TraceID: expected.TraceID, DedupeKey: expected.DedupeKey, Detail: expected.Detail})
+		return err
+	}, nil
 }
 
 func openAPIPluginVersion(value plugincatalog.PluginVersion) (openapi.PluginVersion, error) {
