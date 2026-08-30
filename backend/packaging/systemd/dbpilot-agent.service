@@ -1,17 +1,15 @@
 [Unit]
 Description=DBPilot embedded telemetry agent
 Documentation=file:///usr/share/doc/dbpilot-agent/README.md
-After=network-online.target
-Wants=network-online.target
+After=network-online.target dbpilot-agent-proc-helper.socket
+Wants=network-online.target dbpilot-agent-proc-helper.socket
 
 [Service]
 Type=simple
 User=dbpilot
 Group=dbpilot
-# Native discovery reads cross-UID /proc/<pid>/exe and fd socket links. Keep the
-# production Agent unprivileged and grant only the process-inspection capability.
-CapabilityBoundingSet=CAP_SYS_PTRACE
-AmbientCapabilities=CAP_SYS_PTRACE
+CapabilityBoundingSet=
+AmbientCapabilities=
 ExecStart=/usr/local/bin/dbpilot-agent --config /etc/dbpilot/agent.yaml
 Restart=on-failure
 RestartSec=5s
@@ -20,6 +18,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
 ReadWritePaths=/var/lib/dbpilot-agent
 ConfigurationDirectory=dbpilot
 StateDirectory=dbpilot-agent

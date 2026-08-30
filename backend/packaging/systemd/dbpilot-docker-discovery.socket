@@ -1,8 +1,8 @@
 [Unit]
-Description=DBPilot bounded native process discovery helper socket
+Description=DBPilot private Docker discovery DTO socket
 
 [Socket]
-ListenStream=/run/dbpilot-agent/proc-helper.sock
+ListenStream=/run/dbpilot-agent/docker-discovery.sock
 SocketUser=dbpilot
 SocketGroup=dbpilot
 SocketMode=0600

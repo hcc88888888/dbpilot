@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 func TestLegacyProcHelperReturnsOnlyBoundedSocketInodes(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
-	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()))
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()), currentProcessName(t))
 	defer func() { cancel(); require.NoError(t, <-done) }()
 
 	inodes, err := requestLegacySocketInodesAt(socketPath, os.Getpid(), maximumFDEntries)
@@ -27,7 +28,7 @@ func TestLegacyProcHelperReturnsOnlyBoundedSocketInodes(t *testing.T) {
 
 func TestLegacyProcHelperRejectsWrongPeer(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
-	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()+1), uint32(os.Getgid()))
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()+1), uint32(os.Getgid()), currentProcessName(t))
 	defer func() { cancel(); require.NoError(t, <-done) }()
 	_, err := requestLegacySocketInodesAt(socketPath, os.Getpid(), 16)
 	require.Error(t, err)
@@ -35,7 +36,7 @@ func TestLegacyProcHelperRejectsWrongPeer(t *testing.T) {
 
 func TestLegacyProcHelperRejectsWrongGID(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
-	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()+1))
+	cancel, done := startLegacyPeerListener(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()+1), currentProcessName(t))
 	defer func() { cancel(); require.NoError(t, <-done) }()
 	_, err := requestLegacySocketInodesAt(socketPath, os.Getpid(), 16)
 	require.Error(t, err)
@@ -43,7 +44,7 @@ func TestLegacyProcHelperRejectsWrongGID(t *testing.T) {
 
 func TestLegacyProcHelperRejectsMalformedOversizeAndForbiddenOperation(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
-	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()))
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()), currentProcessName(t))
 	defer func() { cancel(); require.NoError(t, <-done) }()
 
 	for _, mutate := range []func([]byte){
@@ -64,6 +65,43 @@ func TestLegacyProcHelperRejectsMalformedOversizeAndForbiddenOperation(t *testin
 	}
 }
 
+func startLegacyPeerListener(t *testing.T, socketPath string, uid, gid uint32, allowedNames ...string) (context.CancelFunc, <-chan error) {
+	t.Helper()
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	require.NoError(t, err)
+	allowed := make(map[string]struct{}, len(allowedNames))
+	for _, name := range allowedNames {
+		allowed[name] = struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveLegacyConnections(ctx, listener, uid, gid, allowed) }()
+	return cancel, done
+}
+
+func TestProcHelperRejectsFactsAndFDsForNonDatabaseProcess(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()), "mysqld")
+	defer func() { cancel(); require.NoError(t, <-done) }()
+
+	_, err := requestLegacyProcessAt(socketPath, os.Getpid())
+	require.ErrorIs(t, err, os.ErrNotExist)
+	_, err = requestLegacySocketInodesAt(socketPath, os.Getpid(), maximumFDEntries)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestProcHelperReturnsBoundedFactsForLocallyAllowlistedDatabaseProcess(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()), currentProcessName(t))
+	defer func() { cancel(); require.NoError(t, <-done) }()
+
+	process, err := requestLegacyProcessAt(socketPath, os.Getpid())
+	require.NoError(t, err)
+	require.Equal(t, os.Getpid(), process.PID)
+	require.NotEmpty(t, process.Executable)
+	require.NotContains(t, process.Executable, "docker.sock")
+}
+
 func validLegacyRequest(pid, maximum int) []byte {
 	request := make([]byte, 16)
 	copy(request[:4], legacyMagic[:])
@@ -74,11 +112,11 @@ func validLegacyRequest(pid, maximum int) []byte {
 	return request
 }
 
-func startLegacyHelper(t *testing.T, socketPath string, uid, gid uint32) (context.CancelFunc, <-chan error) {
+func startLegacyHelper(t *testing.T, socketPath string, uid, gid uint32, allowedNames ...string) (context.CancelFunc, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveLegacyProcHelperAt(ctx, socketPath, uid, gid) }()
+	go func() { done <- serveLegacyProcHelperAt(ctx, socketPath, uid, gid, allowedNames) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := os.Lstat(socketPath); err == nil {
@@ -90,4 +128,11 @@ func startLegacyHelper(t *testing.T, socketPath string, uid, gid uint32) (contex
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func currentProcessName(t *testing.T) string {
+	t.Helper()
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	return strings.TrimSuffix(filepath.Base(executable), " (deleted)")
 }

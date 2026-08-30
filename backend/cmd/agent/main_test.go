@@ -23,6 +23,12 @@ func TestProcHelperRequiresExplicitNonzeroPeerIdentity(t *testing.T) {
 	require.Contains(t, stderr.String(), "--allowed-uid and --allowed-gid")
 }
 
+func TestProcHelperRequiresLocalDatabaseProcessAllowlist(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	require.Equal(t, 2, run([]string{"proc-helper", "--allowed-uid", "19001", "--allowed-gid", "19001"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "--allowed-process-names")
+}
+
 func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testing.T) {
 	var typedNil *mainHostCollector
 	withoutCollector, err := configuredCommandExecutors(typedNil, nil)

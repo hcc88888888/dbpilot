@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -19,21 +20,38 @@ import (
 
 const DefaultLegacyProcHelperSocket = "/run/dbpilot-agent/proc-helper.sock"
 
+const (
+	procHelperStatusOK       = uint16(0)
+	procHelperStatusRejected = uint16(2)
+)
+
 var legacyMagic = [4]byte{'D', 'B', 'P', 'F'}
 
-// RunLegacyProcHelper serves one bounded, path-free operation for legacy Linux
-// kernels. Packaging must start it as root with only SYS_PTRACE and
-// DAC_READ_SEARCH, and pass the dbpilot service UID/GID.
-func RunLegacyProcHelper(ctx context.Context, allowedUID, allowedGID uint32) error {
+// RunLegacyProcHelper serves the bounded, path-free local proc protocol.
+// Modern packaging runs it as dbpilot-proc with SYS_PTRACE; the CentOS 7
+// profile runs it as root with SYS_PTRACE plus DAC_READ_SEARCH.
+func RunLegacyProcHelper(ctx context.Context, allowedUID, allowedGID uint32, allowedProcessNames []string) error {
 	if allowedUID == 0 || allowedGID == 0 {
 		return errors.New("invalid legacy proc helper peer")
 	}
-	return serveLegacyProcHelperAt(ctx, DefaultLegacyProcHelperSocket, allowedUID, allowedGID)
+	normalized, err := NormalizeProcHelperProcessNames(allowedProcessNames)
+	if err != nil {
+		return err
+	}
+	return serveLegacyProcHelperAt(ctx, DefaultLegacyProcHelperSocket, allowedUID, allowedGID, normalized)
 }
 
-func serveLegacyProcHelperAt(ctx context.Context, socketPath string, allowedUID, allowedGID uint32) error {
+func serveLegacyProcHelperAt(ctx context.Context, socketPath string, allowedUID, allowedGID uint32, allowedProcessNames []string) error {
 	if ctx == nil || socketPath == "" {
 		return errors.New("invalid legacy proc helper configuration")
+	}
+	normalized, err := NormalizeProcHelperProcessNames(allowedProcessNames)
+	if err != nil {
+		return err
+	}
+	allowed := make(map[string]struct{}, len(normalized))
+	for _, name := range normalized {
+		allowed[name] = struct{}{}
 	}
 	listener, activated, err := activatedLegacyListener()
 	if err != nil {
@@ -41,7 +59,7 @@ func serveLegacyProcHelperAt(ctx context.Context, socketPath string, allowedUID,
 	}
 	if activated {
 		defer listener.Close()
-		return serveLegacyConnections(ctx, listener, allowedUID, allowedGID)
+		return serveLegacyConnections(ctx, listener, allowedUID, allowedGID, allowed)
 	}
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return err
@@ -62,16 +80,16 @@ func serveLegacyProcHelperAt(ctx context.Context, socketPath string, allowedUID,
 	}
 	defer listener.Close()
 	defer os.Remove(socketPath)
-	if err := os.Chown(socketPath, int(allowedUID), int(allowedGID)); err != nil {
+	if err := os.Chown(socketPath, -1, int(allowedGID)); err != nil {
 		return err
 	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	if err := os.Chmod(socketPath, 0o660); err != nil {
 		return err
 	}
-	return serveLegacyConnections(ctx, listener, allowedUID, allowedGID)
+	return serveLegacyConnections(ctx, listener, allowedUID, allowedGID, allowed)
 }
 
-func serveLegacyConnections(ctx context.Context, listener *net.UnixListener, allowedUID, allowedGID uint32) error {
+func serveLegacyConnections(ctx context.Context, listener *net.UnixListener, allowedUID, allowedGID uint32, allowed map[string]struct{}) error {
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
@@ -87,7 +105,7 @@ func serveLegacyConnections(ctx context.Context, listener *net.UnixListener, all
 		_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
 		peerUID, peerGID := peerCredentials(connection)
 		if peerUID == allowedUID && peerGID == allowedGID {
-			_ = handleLegacyProcRequest(connection)
+			_ = handleLegacyProcRequest(connection, allowed)
 		}
 		_ = connection.Close()
 	}
@@ -133,7 +151,7 @@ func peerCredentials(connection *net.UnixConn) (uint32, uint32) {
 	return uid, gid
 }
 
-func handleLegacyProcRequest(connection io.ReadWriter) error {
+func handleLegacyProcRequest(connection io.ReadWriter, allowed map[string]struct{}) error {
 	request := make([]byte, 16)
 	if _, err := io.ReadFull(connection, request); err != nil {
 		return err
@@ -147,11 +165,14 @@ func handleLegacyProcRequest(connection io.ReadWriter) error {
 	if pid == 0 || maximum == 0 || maximum > maximumFDEntries {
 		return errors.New("invalid legacy proc helper bounds")
 	}
+	process, err := NewProcReader("/proc", nil).process(int(pid))
+	if err != nil {
+		return err
+	}
+	if !procHelperProcessAllowed(process, allowed) {
+		return writeLegacyStatus(connection, procHelperStatusRejected)
+	}
 	if operation == 2 {
-		process, err := NewProcReader("/proc", nil).process(int(pid))
-		if err != nil {
-			return err
-		}
 		return writeLegacyProcess(connection, process)
 	}
 	inodes, err := socketInodesFromDirectory(filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10), "fd"))
@@ -176,6 +197,21 @@ func handleLegacyProcRequest(connection io.ReadWriter) error {
 		offset += 8
 	}
 	_, err = connection.Write(response)
+	return err
+}
+
+func procHelperProcessAllowed(process ProcessObservation, allowed map[string]struct{}) bool {
+	_, byExecutable := allowed[filepath.Base(strings.TrimSuffix(process.Executable, " (deleted)"))]
+	_, byName := allowed[process.Name]
+	return byExecutable || byName
+}
+
+func writeLegacyStatus(writer io.Writer, status uint16) error {
+	response := make([]byte, 8)
+	copy(response[:4], legacyMagic[:])
+	binary.BigEndian.PutUint16(response[4:6], 1)
+	binary.BigEndian.PutUint16(response[6:8], status)
+	_, err := writer.Write(response)
 	return err
 }
 
@@ -209,13 +245,26 @@ func writeLegacyProcess(writer io.Writer, process ProcessObservation) error {
 }
 
 func requestLegacyProcess(pid int) (ProcessObservation, error) {
-	connection, err := dialLegacyHelper(pid, maximumFDEntries, 2)
+	return requestLegacyProcessAt(DefaultLegacyProcHelperSocket, pid)
+}
+
+func requestLegacyProcessAt(socketPath string, pid int) (ProcessObservation, error) {
+	connection, err := dialLegacyHelperAt(socketPath, pid, maximumFDEntries, 2)
 	if err != nil {
 		return ProcessObservation{}, err
 	}
 	defer connection.Close()
 	header := make([]byte, 32)
-	if _, err := io.ReadFull(connection, header); err != nil || string(header[:4]) != string(legacyMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != 1 || binary.BigEndian.Uint16(header[6:8]) != 0 {
+	if _, err := io.ReadFull(connection, header[:8]); err != nil || string(header[:4]) != string(legacyMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != 1 {
+		return ProcessObservation{}, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
+	}
+	if binary.BigEndian.Uint16(header[6:8]) == procHelperStatusRejected {
+		return ProcessObservation{}, os.ErrNotExist
+	}
+	if binary.BigEndian.Uint16(header[6:8]) != procHelperStatusOK {
+		return ProcessObservation{}, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
+	}
+	if _, err := io.ReadFull(connection, header[8:]); err != nil {
 		return ProcessObservation{}, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
 	}
 	lengths := [4]uint16{}
@@ -254,7 +303,16 @@ func requestLegacySocketInodesAt(socketPath string, pid, maximum int) (map[strin
 	}
 	defer connection.Close()
 	header := make([]byte, 12)
-	if _, err := io.ReadFull(connection, header); err != nil || string(header[:4]) != string(legacyMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != 1 || binary.BigEndian.Uint16(header[6:8]) != 0 {
+	if _, err := io.ReadFull(connection, header[:8]); err != nil || string(header[:4]) != string(legacyMagic[:]) || binary.BigEndian.Uint16(header[4:6]) != 1 {
+		return nil, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
+	}
+	if binary.BigEndian.Uint16(header[6:8]) == procHelperStatusRejected {
+		return nil, os.ErrNotExist
+	}
+	if binary.BigEndian.Uint16(header[6:8]) != procHelperStatusOK {
+		return nil, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
+	}
+	if _, err := io.ReadFull(connection, header[8:]); err != nil {
 		return nil, fmt.Errorf("%w: legacy_proc_helper_unavailable", ErrNativeDiscoveryPermissionDenied)
 	}
 	count := binary.BigEndian.Uint32(header[8:12])

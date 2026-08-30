@@ -49,7 +49,6 @@ type agentConfig struct {
 	PolicyPublicKeyFile   string                         `yaml:"policy_public_key_file"`
 	PolicyFile            string                         `yaml:"policy_file"`
 	DiscoveryRuleSetFile  string                         `yaml:"discovery_rule_set_file,omitempty"`
-	LegacyProcHelper      bool                           `yaml:"legacy_proc_helper,omitempty"`
 	DockerDiscovery       bool                           `yaml:"docker_discovery,omitempty"`
 	DockerDiscoverySocket string                         `yaml:"docker_discovery_socket,omitempty"`
 	DataDirectory         string                         `yaml:"data_directory"`
@@ -159,9 +158,6 @@ func loadConfig(path string) (agentConfig, error) {
 	}
 	if settings.HostID != "" && (!filepath.IsAbs(settings.DiscoveryRuleSetFile) || runtime.GOOS != "linux") {
 		return agentConfig{}, errors.New("native discovery requires Linux and an absolute discovery_rule_set_file")
-	}
-	if settings.LegacyProcHelper && (settings.DiscoveryRuleSetFile == "" || runtime.GOOS != "linux") {
-		return agentConfig{}, errors.New("legacy_proc_helper requires Linux native discovery")
 	}
 	if settings.DockerDiscovery && settings.DiscoveryRuleSetFile == "" {
 		return agentConfig{}, errors.New("docker discovery requires host enrollment and signed discovery rules")
@@ -327,10 +323,9 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return fmt.Errorf("consume discovery pending retirement: %w", storeErr)
 		}
-		reader := agentdiscovery.NewProcReader("/proc", nil)
-		if settings.LegacyProcHelper {
-			reader = agentdiscovery.NewLegacyProcReader("/proc", nil)
-		}
+		// Production native discovery always crosses the fixed local proc-helper
+		// boundary. The main Agent never receives process-inspection capabilities.
+		reader := agentdiscovery.NewLegacyProcReader("/proc", nil)
 		var dockerDetector agentdiscovery.Detector
 		if settings.DockerDiscovery {
 			var detector *agentdiscovery.DockerDetector
@@ -429,6 +424,7 @@ func runProcHelper(arguments []string, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	allowedUID := flags.Uint("allowed-uid", 0, "numeric dbpilot Agent uid")
 	allowedGID := flags.Uint("allowed-gid", 0, "numeric dbpilot Agent gid")
+	allowedProcessNames := flags.String("allowed-process-names", "", "comma-separated local database process allowlist")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -436,9 +432,14 @@ func runProcHelper(arguments []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--allowed-uid and --allowed-gid are required uint32 values")
 		return 2
 	}
+	processNames, err := agentdiscovery.NormalizeProcHelperProcessNames(strings.Split(*allowedProcessNames, ","))
+	if err != nil {
+		fmt.Fprintln(stderr, "--allowed-process-names must contain a bounded local database process allowlist")
+		return 2
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := agentdiscovery.RunLegacyProcHelper(ctx, uint32(*allowedUID), uint32(*allowedGID)); err != nil && !errors.Is(err, context.Canceled) {
+	if err := agentdiscovery.RunLegacyProcHelper(ctx, uint32(*allowedUID), uint32(*allowedGID), processNames); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}

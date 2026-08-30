@@ -1,5 +1,5 @@
 [Unit]
-Description=DBPilot legacy procfs discovery helper
+Description=DBPilot bounded native process discovery helper
 Documentation=file:///usr/share/doc/dbpilot-agent/README.md
 Before=dbpilot-agent.service
 Requires=dbpilot-agent-proc-helper.socket
@@ -7,17 +7,33 @@ After=dbpilot-agent-proc-helper.socket
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=dbpilot-proc
+Group=dbpilot-proc
 EnvironmentFile=/etc/dbpilot/proc-helper.env
-ExecStart=/usr/local/bin/dbpilot-agent proc-helper --allowed-uid=${DBPILOT_AGENT_UID} --allowed-gid=${DBPILOT_AGENT_GID}
-CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart=/usr/local/bin/dbpilot-agent proc-helper --allowed-uid=${DBPILOT_AGENT_UID} --allowed-gid=${DBPILOT_AGENT_GID} --allowed-process-names=${DBPILOT_PROC_ALLOWED_PROCESS_NAMES}
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 NoNewPrivileges=true
 RestrictAddressFamilies=AF_UNIX
 PrivateNetwork=true
 PrivateTmp=true
-ProtectSystem=full
+PrivateDevices=true
+ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~ptrace process_vm_readv process_vm_writev pidfd_getfd kcmp mount umount2 reboot
+SystemCallErrorNumber=EPERM
+LimitNOFILE=256
+TasksMax=16
 UMask=0077
 
 [Install]

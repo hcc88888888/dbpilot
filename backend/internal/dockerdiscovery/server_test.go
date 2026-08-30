@@ -3,14 +3,22 @@ package dockerdiscovery
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	discoveryv1 "dbpilot.local/platform/gen/discovery/v1"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestDockerServerSnapshotReturnsOnlyFixedAllowlistedDTO(t *testing.T) {
@@ -40,6 +48,15 @@ func TestDockerServerRejectsUnknownLabelsAndInvalidRuleRevision(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestDockerSnapshotRequiresBoundedInfoHealthProbeBeforeInventory(t *testing.T) {
+	engine := &fakeEngine{infoErr: errors.New("engine unavailable")}
+	service, err := NewService(engine, nil)
+	require.NoError(t, err)
+	_, err = service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 1})
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Zero(t, engine.listCalls)
+}
+
 func TestDockerServerSkipsContainerRemovedBetweenListAndInspect(t *testing.T) {
 	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	service, err := NewService(&fakeEngine{list: []ContainerObservation{{ContainerID: id}}, inspectErr: ErrContainerNotFound}, []string{"dbpilot.discovery.family"})
@@ -47,6 +64,63 @@ func TestDockerServerSkipsContainerRemovedBetweenListAndInspect(t *testing.T) {
 	response, err := service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 1, AllowedLabelKeys: []string{"dbpilot.discovery.family"}})
 	require.NoError(t, err)
 	require.Empty(t, response.GetContainers())
+}
+
+func TestDockerSnapshotUsesBoundedWorkersAndDeterministicOrder(t *testing.T) {
+	engine := newConcurrentEngine(12)
+	service, err := NewService(engine, []string{"dbpilot.discovery.family"})
+	require.NoError(t, err)
+	response, err := service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 1, AllowedLabelKeys: []string{"dbpilot.discovery.family"}})
+	require.NoError(t, err)
+	ids := make([]string, len(response.GetContainers()))
+	for index, container := range response.GetContainers() {
+		ids[index] = container.GetContainerId()
+	}
+	require.True(t, sort.StringsAreSorted(ids))
+	require.LessOrEqual(t, engine.maximumConcurrent(), maximumInspectWorkers)
+	require.Greater(t, engine.maximumConcurrent(), 1)
+}
+
+func TestDockerSnapshotHonorsOneAggregateDeadline(t *testing.T) {
+	engine := newConcurrentEngine(1)
+	engine.block = true
+	service, err := NewService(engine, nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = service.Snapshot(ctx, &discoveryv1.DockerSnapshotRequest{RuleRevision: 1})
+	require.Error(t, err)
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+}
+
+func TestDockerSnapshotListUsesAggregateDeadline(t *testing.T) {
+	engine := newConcurrentEngine(1)
+	engine.blockList = true
+	service, err := NewService(engine, nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err = service.Snapshot(ctx, &discoveryv1.DockerSnapshotRequest{RuleRevision: 1})
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+}
+
+func TestDockerSnapshotRejectsAggregateSerializedDTOBudget(t *testing.T) {
+	engine := newConcurrentEngine(400)
+	labels := make(map[string]string, 32)
+	allowed := make([]string, 32)
+	for index := range allowed {
+		allowed[index] = fmt.Sprintf("dbpilot.label.%02d", index)
+		labels[allowed[index]] = strings.Repeat("x", 256)
+	}
+	engine.labels = labels
+	service, err := NewService(engine, allowed)
+	require.NoError(t, err)
+	_, err = service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 1, AllowedLabelKeys: allowed})
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 }
 
 func TestDockerServerCreatesPrivateUnixSocketAndRejectsWrongPeer(t *testing.T) {
@@ -64,7 +138,7 @@ func TestDockerServerCreatesPrivateUnixSocketAndRejectsWrongPeer(t *testing.T) {
 	<-ready
 	info, err := os.Lstat(path)
 	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	require.Equal(t, os.FileMode(0o660), info.Mode().Perm())
 	connection, err := Dial(context.Background(), path)
 	require.NoError(t, err)
 	defer connection.Close()
@@ -77,14 +151,54 @@ func TestDockerServerCreatesPrivateUnixSocketAndRejectsWrongPeer(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
+func TestDockerPeerListenerRequiresExactUIDAndGIDIndependently(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("SO_PEERCRED is a Linux contract")
+	}
+	for _, test := range []struct {
+		name string
+		uid  uint32
+		gid  uint32
+	}{
+		{name: "wrong uid", uid: uint32(os.Getuid() + 1), gid: uint32(os.Getgid())},
+		{name: "wrong gid", uid: uint32(os.Getuid()), gid: uint32(os.Getgid() + 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "peer.sock")
+			base, err := net.Listen("unix", path)
+			require.NoError(t, err)
+			verified := &peerListener{Listener: base, uid: test.uid, gid: test.gid}
+			accepted := make(chan error, 1)
+			go func() {
+				connection, acceptErr := verified.Accept()
+				if connection != nil {
+					_ = connection.Close()
+				}
+				accepted <- acceptErr
+			}()
+			client, err := net.DialTimeout("unix", path, time.Second)
+			require.NoError(t, err)
+			_ = client.SetReadDeadline(time.Now().Add(time.Second))
+			_, err = client.Read(make([]byte, 1))
+			require.ErrorIs(t, err, io.EOF)
+			require.NoError(t, client.Close())
+			require.NoError(t, base.Close())
+			require.Error(t, <-accepted)
+		})
+	}
+}
+
 type fakeEngine struct {
 	list       []ContainerObservation
 	inspect    ContainerObservation
 	listErr    error
 	inspectErr error
+	infoErr    error
+	listCalls  int
 }
 
 func (engine *fakeEngine) ListContainers(context.Context) ([]ContainerObservation, error) {
+	engine.listCalls++
 	return engine.list, engine.listErr
 }
 func (engine *fakeEngine) InspectContainer(context.Context, string) (ContainerObservation, error) {
@@ -99,5 +213,60 @@ func (engine *fakeEngine) Events(context.Context, time.Time) (<-chan ContainerEv
 	return events, errs
 }
 func (engine *fakeEngine) Info(context.Context) (EngineInfo, error) {
-	return EngineInfo{}, errors.New("unused")
+	return EngineInfo{ID: "engine-test"}, engine.infoErr
+}
+
+type concurrentEngine struct {
+	ids       []ContainerObservation
+	labels    map[string]string
+	block     bool
+	blockList bool
+	mu        sync.Mutex
+	active    int
+	maximum   int
+}
+
+func newConcurrentEngine(count int) *concurrentEngine {
+	values := make([]ContainerObservation, count)
+	for index := range values {
+		values[index].ContainerID = fmt.Sprintf("%064x", count-index)
+	}
+	return &concurrentEngine{ids: values}
+}
+func (engine *concurrentEngine) ListContainers(ctx context.Context) ([]ContainerObservation, error) {
+	if engine.blockList {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return append([]ContainerObservation(nil), engine.ids...), nil
+}
+func (engine *concurrentEngine) InspectContainer(ctx context.Context, id string) (ContainerObservation, error) {
+	engine.mu.Lock()
+	engine.active++
+	if engine.active > engine.maximum {
+		engine.maximum = engine.active
+	}
+	engine.mu.Unlock()
+	defer func() { engine.mu.Lock(); engine.active--; engine.mu.Unlock() }()
+	if engine.block {
+		<-ctx.Done()
+		return ContainerObservation{}, ctx.Err()
+	}
+	time.Sleep(time.Duration(id[len(id)-1]%4+1) * time.Millisecond)
+	return ContainerObservation{ContainerID: id, Name: "mysql-" + id[len(id)-4:], Image: "mysql:8.4", State: "running", Labels: engine.labels, ObservedAt: time.Now().UTC()}, nil
+}
+func (engine *concurrentEngine) Events(context.Context, time.Time) (<-chan ContainerEvent, <-chan error) {
+	events := make(chan ContainerEvent)
+	failures := make(chan error)
+	close(events)
+	close(failures)
+	return events, failures
+}
+func (engine *concurrentEngine) Info(context.Context) (EngineInfo, error) {
+	return EngineInfo{ID: "engine-test"}, nil
+}
+func (engine *concurrentEngine) maximumConcurrent() int {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.maximum
 }

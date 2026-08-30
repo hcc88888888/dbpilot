@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	discoveryv1 "dbpilot.local/platform/gen/discovery/v1"
@@ -17,12 +19,17 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
 	maximumGRPCMessageBytes = 4 << 20
 	maximumAllowedLabels    = 32
+	maximumInspectWorkers   = 4
+	maximumSnapshotDTOBytes = 3 << 20
+	snapshotTimeout         = 8 * time.Second
+	eventInspectTimeout     = 2 * time.Second
 )
 
 var labelKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
@@ -56,31 +63,115 @@ func (service *Service) Snapshot(ctx context.Context, request *discoveryv1.Docke
 	if err != nil {
 		return nil, err
 	}
-	containers, err := service.engine.ListContainers(ctx)
+	snapshotContext, cancel := context.WithTimeout(ctx, snapshotTimeout)
+	defer cancel()
+	if _, err := service.engine.Info(snapshotContext); err != nil {
+		if snapshotContext.Err() != nil {
+			return nil, status.Error(codes.DeadlineExceeded, "Docker snapshot deadline exceeded")
+		}
+		return nil, status.Error(codes.Unavailable, "Docker discovery unavailable")
+	}
+	containers, err := service.engine.ListContainers(snapshotContext)
 	if err != nil {
+		if snapshotContext.Err() != nil {
+			return nil, status.Error(codes.DeadlineExceeded, "Docker snapshot deadline exceeded")
+		}
 		return nil, status.Error(codes.Unavailable, "Docker discovery unavailable")
 	}
 	if len(containers) > maximumContainers {
 		return nil, status.Error(codes.ResourceExhausted, "Docker discovery response exceeds bound")
 	}
-	result := make([]*discoveryv1.DockerContainerObservation, 0, len(containers))
-	for _, summary := range containers {
-		observation, inspectErr := service.engine.InspectContainer(ctx, summary.ContainerID)
-		if inspectErr != nil {
-			if errors.Is(inspectErr, ErrContainerNotFound) {
-				continue
+	sort.Slice(containers, func(i, j int) bool { return containers[i].ContainerID < containers[j].ContainerID })
+	type inspectJob struct {
+		index int
+		id    string
+	}
+	type inspectResult struct {
+		index       int
+		observation *discoveryv1.DockerContainerObservation
+		err         error
+		missing     bool
+	}
+	jobs := make(chan inspectJob)
+	results := make(chan inspectResult, len(containers))
+	workers := maximumInspectWorkers
+	if len(containers) < workers {
+		workers = len(containers)
+	}
+	var group sync.WaitGroup
+	var budgetMutex sync.Mutex
+	budgetBytes := 0
+	budgetExceeded := false
+	for worker := 0; worker < workers; worker++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for job := range jobs {
+				observation, inspectErr := service.engine.InspectContainer(snapshotContext, job.id)
+				if errors.Is(inspectErr, ErrContainerNotFound) {
+					results <- inspectResult{index: job.index, missing: true}
+					continue
+				}
+				if inspectErr != nil {
+					results <- inspectResult{index: job.index, err: inspectErr}
+					continue
+				}
+				wire, convertErr := protobufObservation(observation, allowed)
+				if convertErr == nil {
+					budgetMutex.Lock()
+					budgetBytes += proto.Size(wire)
+					if budgetBytes > maximumSnapshotDTOBytes {
+						budgetExceeded = true
+						convertErr = errSnapshotBudget
+						cancel()
+					}
+					budgetMutex.Unlock()
+				}
+				results <- inspectResult{index: job.index, observation: wire, err: convertErr}
+			}
+		}()
+	}
+	go func() {
+		for index, summary := range containers {
+			jobs <- inspectJob{index: index, id: summary.ContainerID}
+		}
+		close(jobs)
+		group.Wait()
+		close(results)
+	}()
+	ordered := make([]*discoveryv1.DockerContainerObservation, len(containers))
+	for inspected := range results {
+		if inspected.err != nil {
+			cancel()
+			budgetMutex.Lock()
+			exhausted := budgetExceeded
+			budgetMutex.Unlock()
+			if exhausted {
+				return nil, status.Error(codes.ResourceExhausted, "Docker discovery response exceeds bound")
+			}
+			if snapshotContext.Err() != nil {
+				return nil, status.Error(codes.DeadlineExceeded, "Docker snapshot deadline exceeded")
 			}
 			return nil, status.Error(codes.Unavailable, "Docker inspect unavailable")
 		}
-		wire, convertErr := protobufObservation(observation, allowed)
-		if convertErr != nil {
-			return nil, status.Error(codes.DataLoss, "Docker inspect rejected")
+		if !inspected.missing {
+			ordered[inspected.index] = inspected.observation
 		}
-		result = append(result, wire)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ContainerId < result[j].ContainerId })
-	return &discoveryv1.DockerSnapshotResponse{Containers: result, ObservedAt: timestamppb.New(service.now())}, nil
+	result := make([]*discoveryv1.DockerContainerObservation, 0, len(ordered))
+	for _, observation := range ordered {
+		if observation != nil {
+			result = append(result, observation)
+		}
+	}
+	response := &discoveryv1.DockerSnapshotResponse{Containers: result, ObservedAt: timestamppb.New(service.now())}
+	if proto.Size(response) > maximumSnapshotDTOBytes {
+		return nil, status.Error(codes.ResourceExhausted, "Docker discovery response exceeds bound")
+	}
+	return response, nil
 }
+
+var errSnapshotBudget = errors.New("Docker snapshot DTO budget exceeded")
 
 func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream grpc.ServerStreamingServer[discoveryv1.DockerEvent]) error {
 	allowed, err := service.validateRequest(request.GetRuleRevision(), request.GetAllowedLabelKeys())
@@ -100,8 +191,13 @@ func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream gr
 			}
 			observation := ContainerObservation{ContainerID: event.ContainerID, Name: event.Name, Image: event.Image, ObservedAt: event.OccurredAt}
 			if event.Action != "destroy" {
-				current, inspectErr := service.engine.InspectContainer(stream.Context(), event.ContainerID)
+				inspectContext, cancelInspect := context.WithTimeout(stream.Context(), eventInspectTimeout)
+				current, inspectErr := service.engine.InspectContainer(inspectContext, event.ContainerID)
+				cancelInspect()
 				if inspectErr != nil {
+					if errors.Is(inspectErr, ErrContainerNotFound) {
+						continue
+					}
 					return status.Error(codes.Unavailable, "Docker inspect unavailable")
 				}
 				observation = current
@@ -119,7 +215,7 @@ func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream gr
 				continue
 			}
 			if failure != nil {
-				return status.Errorf(codes.Unavailable, "Docker event stream unavailable: %v", failure)
+				return status.Error(codes.Unavailable, "Docker event stream unavailable")
 			}
 		}
 	}
@@ -187,6 +283,14 @@ func Serve(ctx context.Context, config ServerConfig) error {
 	if err != nil {
 		return err
 	}
+	listener, activated, err := activatedDockerListener()
+	if err != nil {
+		return err
+	}
+	if activated {
+		defer listener.Close()
+		return serveDockerGRPC(ctx, listener, service, config)
+	}
 	if err := os.MkdirAll(filepath.Dir(config.SocketPath), 0o755); err != nil {
 		return err
 	}
@@ -200,18 +304,24 @@ func Serve(ctx context.Context, config ServerConfig) error {
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
-	listener, err := net.Listen("unix", config.SocketPath)
+	listener, err = net.Listen("unix", config.SocketPath)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 	defer os.Remove(config.SocketPath)
-	if err := os.Chown(config.SocketPath, int(config.AllowedUID), int(config.AllowedGID)); err != nil {
+	// In direct/container deployments the helper has the Agent GID only as a
+	// supplementary group. Keep the distinct helper UID as socket owner.
+	if err := os.Chown(config.SocketPath, -1, int(config.AllowedGID)); err != nil {
 		return err
 	}
-	if err := os.Chmod(config.SocketPath, 0o600); err != nil {
+	if err := os.Chmod(config.SocketPath, 0o660); err != nil {
 		return err
 	}
+	return serveDockerGRPC(ctx, listener, service, config)
+}
+
+func serveDockerGRPC(ctx context.Context, listener net.Listener, service *Service, config ServerConfig) error {
 	verified := &peerListener{Listener: listener, uid: config.AllowedUID, gid: config.AllowedGID}
 	server := grpc.NewServer(grpc.MaxRecvMsgSize(maximumGRPCMessageBytes), grpc.MaxSendMsgSize(maximumGRPCMessageBytes), grpc.ConnectionTimeout(5*time.Second))
 	discoveryv1.RegisterDockerDiscoveryServer(server, service)
@@ -219,11 +329,33 @@ func Serve(ctx context.Context, config ServerConfig) error {
 	if config.Ready != nil {
 		close(config.Ready)
 	}
-	err = server.Serve(verified)
+	err := server.Serve(verified)
 	if ctx.Err() != nil || errors.Is(err, grpc.ErrServerStopped) {
 		return nil
 	}
 	return err
+}
+
+func activatedDockerListener() (net.Listener, bool, error) {
+	pid, pidErr := strconv.Atoi(os.Getenv("LISTEN_PID"))
+	fds, fdsErr := strconv.Atoi(os.Getenv("LISTEN_FDS"))
+	if fdsErr != nil || fds != 1 || (pidErr == nil && pid != os.Getpid()) || (pidErr != nil && os.Getenv("LISTEN_PID") != "") {
+		return nil, false, nil
+	}
+	file := os.NewFile(3, "dbpilot-docker-discovery.socket")
+	if file == nil {
+		return nil, false, errors.New("invalid activated Docker discovery socket")
+	}
+	defer file.Close()
+	listener, err := net.FileListener(file)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, ok := listener.(*net.UnixListener); !ok {
+		_ = listener.Close()
+		return nil, false, errors.New("activated Docker discovery listener is not AF_UNIX")
+	}
+	return listener, true, nil
 }
 
 type peerListener struct {

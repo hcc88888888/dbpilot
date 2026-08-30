@@ -166,10 +166,18 @@ test('full-stack Compose grants no privileged mode, added capabilities, or Docke
   }
 });
 
-test('only the restricted helper owns the Docker socket boundary', () => {
+test('production Agent and local helpers have distinct least-privilege identities', () => {
   const result = pwsh(['-File', dockerDiscoveryVerifier, '-ContractOnly']);
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const lines = result.stdout.trim().split(/\r?\n/);
   const contract = JSON.parse(lines.at(-1));
-  assert.deepEqual(contract, { Contract: 'restricted-docker-discovery-v1', Status: 'pass', SocketOwner: 'dbpilot-docker-discovery' });
+  assert.deepEqual(contract, {
+    Contract: 'dbpilot-local-helper-boundary-v2',
+    Status: 'pass',
+    AgentUser: 'dbpilot',
+    ProcHelperUser: 'dbpilot-proc',
+    DockerHelperUser: 'dbpilot-docker',
+    AgentCapabilities: 'none',
+    DockerSocketOwner: 'dbpilot-docker-discovery',
+  });
 });

@@ -43,7 +43,7 @@ func main() {
 		if capabilities["CapBnd"] != "0000000000080004" || capabilities["CapEff"] != "0000000000080004" {
 			fail("helper must retain exactly SYS_PTRACE and DAC_READ_SEARCH")
 		}
-		fail(agentdiscovery.RunLegacyProcHelper(context.Background(), 19001, 19001).Error())
+		fail(agentdiscovery.RunLegacyProcHelper(context.Background(), 19001, 19001, []string{"mysqld"}).Error())
 	}
 	if *mode == "wrong-gid" {
 		if os.Geteuid() != 19001 || os.Getegid() == 19001 {
@@ -127,7 +127,7 @@ func activateHelper(agentBinary string) {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		fail(err.Error())
 	}
-	command := exec.Command(agentBinary, "proc-helper", "--allowed-uid=19001", "--allowed-gid=19001")
+	command := exec.Command(agentBinary, "proc-helper", "--allowed-uid=19001", "--allowed-gid=19001", "--allowed-process-names=mysqld-dbp")
 	command.ExtraFiles = []*os.File{file}
 	command.Env = append(os.Environ(), "LISTEN_FDS=1")
 	command.Stdout = os.Stdout
