@@ -25,11 +25,14 @@ var legacyMagic = [4]byte{'D', 'B', 'P', 'F'}
 // kernels. Packaging must start it as root with only SYS_PTRACE and
 // DAC_READ_SEARCH, and pass the dbpilot service UID/GID.
 func RunLegacyProcHelper(ctx context.Context, allowedUID, allowedGID uint32) error {
+	if allowedUID == 0 || allowedGID == 0 {
+		return errors.New("invalid legacy proc helper peer")
+	}
 	return serveLegacyProcHelperAt(ctx, DefaultLegacyProcHelperSocket, allowedUID, allowedGID)
 }
 
 func serveLegacyProcHelperAt(ctx context.Context, socketPath string, allowedUID, allowedGID uint32) error {
-	if ctx == nil || allowedUID == 0 || allowedGID == 0 || socketPath == "" {
+	if ctx == nil || socketPath == "" {
 		return errors.New("invalid legacy proc helper configuration")
 	}
 	listener, activated, err := activatedLegacyListener()

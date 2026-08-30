@@ -63,6 +63,7 @@ type NativeReader interface {
 	Processes(context.Context) ([]ProcessObservation, error)
 	ListeningEndpoints(context.Context, int) ([]EndpointObservation, error)
 	SystemdUnit(context.Context, int) (string, bool, error)
+	ProcessStartTime(context.Context, int) (uint64, error)
 }
 
 type SystemdFacts interface {
@@ -223,6 +224,25 @@ func (reader *ProcReader) SystemdUnit(ctx context.Context, pid int) (string, boo
 	return "", false, nil
 }
 
+func (reader *ProcReader) ProcessStartTime(ctx context.Context, pid int) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if reader.forceLegacyHelper {
+		process, err := requestLegacyProcess(pid)
+		return process.StartTime, err
+	}
+	value, err := reader.readFile(filepath.Join(reader.root, strconv.Itoa(pid), "stat"), maximumStatBytes)
+	if err != nil {
+		return 0, err
+	}
+	startTime := parseStartTime(string(value))
+	if startTime == 0 {
+		return 0, errProcessSnapshotChanged
+	}
+	return startTime, nil
+}
+
 type NativeDetector struct{ reader NativeReader }
 
 func NewNativeDetector(reader NativeReader) *NativeDetector { return &NativeDetector{reader: reader} }
@@ -265,6 +285,16 @@ func (detector *NativeDetector) Discover(ctx context.Context, rules []domain.Rul
 			}
 			if endpoint == "" && socket == "" {
 				continue
+			}
+			finalStartTime, startErr := detector.reader.ProcessStartTime(ctx, process.PID)
+			if errors.Is(startErr, os.ErrNotExist) || errors.Is(startErr, errProcessSnapshotChanged) || finalStartTime != process.StartTime {
+				continue
+			}
+			if isPermission(startErr) {
+				return nil, fmt.Errorf("%w: revalidate pid %d", ErrNativeDiscoveryPermissionDenied, process.PID)
+			}
+			if startErr != nil {
+				return nil, startErr
 			}
 			evidence := []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: bounded(process.Name, domain.MaximumEvidenceBytes)}}
 			if process.Executable != "" && len(process.Executable) <= domain.MaximumEvidenceBytes {

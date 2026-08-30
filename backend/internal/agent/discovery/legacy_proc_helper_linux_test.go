@@ -26,11 +26,16 @@ func TestLegacyProcHelperReturnsOnlyBoundedSocketInodes(t *testing.T) {
 }
 
 func TestLegacyProcHelperRejectsWrongPeer(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("root bypasses the socket mode; peer rejection is covered by the Kylin UID probe")
-	}
 	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
 	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()+1), uint32(os.Getgid()))
+	defer func() { cancel(); require.NoError(t, <-done) }()
+	_, err := requestLegacySocketInodesAt(socketPath, os.Getpid(), 16)
+	require.Error(t, err)
+}
+
+func TestLegacyProcHelperRejectsWrongGID(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "proc-helper.sock")
+	cancel, done := startLegacyHelper(t, socketPath, uint32(os.Getuid()), uint32(os.Getgid()+1))
 	defer func() { cancel(); require.NoError(t, <-done) }()
 	_, err := requestLegacySocketInodesAt(socketPath, os.Getpid(), 16)
 	require.Error(t, err)

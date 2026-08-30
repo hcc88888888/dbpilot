@@ -24,6 +24,7 @@ type NativeReader interface {
 	Processes(context.Context) ([]ProcessObservation, error)
 	ListeningEndpoints(context.Context, int) ([]EndpointObservation, error)
 	SystemdUnit(context.Context, int) (string, bool, error)
+	ProcessStartTime(context.Context, int) (uint64, error)
 }
 
 type ProcReader struct{}
@@ -39,6 +40,9 @@ func (*ProcReader) ListeningEndpoints(context.Context, int) ([]EndpointObservati
 }
 func (*ProcReader) SystemdUnit(context.Context, int) (string, bool, error) {
 	return "", false, ErrNativeDiscoveryUnsupported
+}
+func (*ProcReader) ProcessStartTime(context.Context, int) (uint64, error) {
+	return 0, ErrNativeDiscoveryUnsupported
 }
 
 type NativeDetector struct{ reader NativeReader }

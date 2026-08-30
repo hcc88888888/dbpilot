@@ -65,7 +65,7 @@ func TestProcReaderRejectsPIDReuseAcrossSnapshot(t *testing.T) {
 		if filepath.Base(path) == "stat" {
 			statReads++
 			if statReads == 2 {
-				return []byte("4242 (mysqld) S 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 67890 0 0"), nil
+				return []byte(procStat("4242", "mysqld", "67890")), nil
 			}
 		}
 		return value, err
@@ -106,6 +106,20 @@ func TestDetectorReturnsExplicitPermissionCapabilityErrorForFDInspection(t *test
 	reader := &fakeNativeReader{processes: []ProcessObservation{{PID: 42, Name: "mysqld", Executable: "/usr/sbin/mysqld", StartTime: 7}}, endpointsErr: syscall.EPERM}
 	_, err := NewNativeDetector(reader).Discover(context.Background(), []domain.Rule{{ID: "mysql", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ProcessNames: []string{"mysqld"}, DefaultPorts: []uint16{3306}}})
 	require.ErrorIs(t, err, ErrNativeDiscoveryPermissionDenied)
+}
+
+func TestDetectorRejectsPIDReuseAfterSystemdAndEndpointCollection(t *testing.T) {
+	reader := &fakeNativeReader{
+		processes: []ProcessObservation{{PID: 42, Name: "mysqld", Executable: "/usr/sbin/mysqld", StartTime: 7}},
+		endpoints: []EndpointObservation{{Network: "tcp", Address: "127.0.0.1:3306"}},
+		startTime: 8,
+	}
+	candidates, err := NewNativeDetector(reader).Discover(context.Background(), []domain.Rule{{ID: "mysql", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ProcessNames: []string{"mysqld"}, DefaultPorts: []uint16{3306}}})
+	require.NoError(t, err)
+	require.Empty(t, candidates)
+	require.True(t, reader.systemdRead)
+	require.True(t, reader.endpointsRead)
+	require.True(t, reader.finalStartRead)
 }
 
 func TestPIDFDFallbackReportsLegacyKernelCapabilityRequirement(t *testing.T) {
@@ -154,24 +168,44 @@ func writeProcProcess(t *testing.T, root, pid, executable, comm, cmdline, startT
 	require.NoError(t, os.MkdirAll(filepath.Join(pidRoot, "fd"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "comm"), []byte(comm+"\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "cmdline"), []byte(cmdline), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "stat"), []byte(pid+" ("+comm+") S 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 "+startTime+" 0 0"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "stat"), []byte(procStat(pid, comm, startTime)), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "status"), []byte("Name:\t"+comm+"\nUid:\t27\t27\t27\t27\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(pidRoot, "cgroup"), []byte("0::/user.slice/test.scope\n"), 0o600))
 	require.NoError(t, os.Symlink(executable, filepath.Join(pidRoot, "exe")))
 }
 
+func procStat(pid, comm, startTime string) string {
+	return pid + " (" + comm + ") S 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 " + startTime + " 0 0"
+}
+
 type fakeNativeReader struct {
-	processes    []ProcessObservation
-	endpoints    []EndpointObservation
-	endpointsErr error
+	processes      []ProcessObservation
+	endpoints      []EndpointObservation
+	endpointsErr   error
+	startTime      uint64
+	systemdRead    bool
+	endpointsRead  bool
+	finalStartRead bool
 }
 
 func (reader *fakeNativeReader) Processes(context.Context) ([]ProcessObservation, error) {
 	return reader.processes, nil
 }
 func (reader *fakeNativeReader) ListeningEndpoints(context.Context, int) ([]EndpointObservation, error) {
+	reader.endpointsRead = true
 	return reader.endpoints, reader.endpointsErr
 }
-func (*fakeNativeReader) SystemdUnit(context.Context, int) (string, bool, error) {
+func (reader *fakeNativeReader) SystemdUnit(context.Context, int) (string, bool, error) {
+	reader.systemdRead = true
 	return "", false, nil
+}
+func (reader *fakeNativeReader) ProcessStartTime(context.Context, int) (uint64, error) {
+	reader.finalStartRead = true
+	if reader.startTime != 0 {
+		return reader.startTime, nil
+	}
+	for _, process := range reader.processes {
+		return process.StartTime, nil
+	}
+	return 0, os.ErrNotExist
 }
