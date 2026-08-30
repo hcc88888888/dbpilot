@@ -27,10 +27,12 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
@@ -279,6 +281,54 @@ func TestNewServerWiresDefaultCommandLifecycleToRegistryAndWorker(t *testing.T) 
 	require.NotNil(t, server.commandLifecycle)
 	require.Same(t, server.commandLifecycle, server.commandObserver)
 	require.NotNil(t, server.dispatchCommands)
+	require.NotNil(t, server.hostInventoryService)
+}
+
+func TestHostInventoryAgentObserverRecordsOnlyRealHeartbeatAndMapsObservation(t *testing.T) {
+	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
+	delegate := &testCommandObserver{}
+	hosts := &recordingHostInventoryRuntime{}
+	observer := newHostInventoryAgentObserver(delegate, hosts, func() time.Time { return now }, func(error) {})
+
+	observer.Heartbeat(context.Background(), "agent-1", &agentv1.Heartbeat{AgentId: "agent-1"})
+	require.Equal(t, 1, delegate.heartbeats)
+	require.Equal(t, "agent-1", hosts.heartbeatAgentID)
+	require.Equal(t, now, hosts.heartbeatAt)
+	require.Zero(t, hosts.observationCalls, "Heartbeat must not fabricate a HostObservation")
+
+	observedAt := now.Add(-time.Second)
+	hostObserver, ok := observer.(agentcontrol.HostObservationObserver)
+	require.True(t, ok)
+	err := hostObserver.HostObservation(context.Background(), "agent-1", &agentv1.HostObservation{
+		HostId: "host-1", AgentId: "agent-1", ObservationRevision: 7, Hostname: "db-1.example",
+		OperatingSystem: "linux", OperatingSystemVersion: "kylin-v10", KernelVersion: "5.10", Architecture: "amd64",
+		LogicalCpuCount: 8, MemoryCapacityBytes: 1024,
+		Filesystems:      []*agentv1.FilesystemObservation{{MountPoint: "/", CapacityBytes: 1024, AvailableBytes: 512}},
+		NetworkAddresses: []string{"10.0.0.1"}, Capabilities: []string{"host.collect"}, AgentVersion: "1.0.0",
+		ObservedAt: timestamppb.New(observedAt),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, hosts.observationCalls)
+	require.Equal(t, "host-1", hosts.observation.HostID)
+	require.Equal(t, uint64(7), hosts.observation.Revision)
+	require.Equal(t, observedAt, hosts.observation.ObservedAt)
+	require.Equal(t, []hostinventory.FilesystemSummary{{MountPoint: "/", CapacityBytes: 1024, AvailableBytes: 512}}, hosts.observation.Filesystems)
+}
+
+func TestHostInventoryHeartbeatPersistenceCannotDelayCommandLifecycle(t *testing.T) {
+	delegate := &testCommandObserver{}
+	hosts := &blockingHostInventoryRuntime{started: make(chan struct{}), release: make(chan struct{})}
+	observer := newHostInventoryAgentObserver(delegate, hosts, func() time.Time { return time.Now().UTC() }, func(error) {})
+	done := make(chan struct{})
+	go func() {
+		observer.Heartbeat(context.Background(), "agent-1", &agentv1.Heartbeat{AgentId: "agent-1"})
+		close(done)
+	}()
+	<-hosts.started
+	heartbeats := delegate.heartbeats
+	close(hosts.release)
+	<-done
+	require.Equal(t, 1, heartbeats, "command lifecycle must observe the heartbeat before PostgreSQL inventory persistence")
 }
 
 func TestNewServerResolvesCommandSigningCredentialOnce(t *testing.T) {
@@ -855,14 +905,49 @@ func (verifier staticOIDCTokenVerifier) Verify(context.Context, string) (json.Ra
 	return json.Marshal(verifier.claims)
 }
 
-type testCommandObserver struct{}
+type testCommandObserver struct{ heartbeats int }
 
-func (*testCommandObserver) Connected(context.Context, agentcontrol.SessionInfo)                   {}
-func (*testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}
+func (*testCommandObserver) Connected(context.Context, agentcontrol.SessionInfo) {}
+func (observer *testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat) {
+	observer.heartbeats++
+}
 func (*testCommandObserver) Acknowledged(context.Context, string, *agentv1.CommandAcknowledgement) {}
 func (*testCommandObserver) Progress(context.Context, string, *agentv1.CommandProgress)            {}
 func (*testCommandObserver) Result(_ context.Context, _ string, result *agentv1.CommandResult) (agentcontrol.ResultPersistence, error) {
 	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), Persisted: true}, nil
+}
+
+type recordingHostInventoryRuntime struct {
+	observation      hostinventory.Observation
+	observationCalls int
+	heartbeatAgentID string
+	heartbeatAt      time.Time
+}
+
+type blockingHostInventoryRuntime struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*blockingHostInventoryRuntime) RecordObservation(context.Context, hostinventory.Observation) (hostinventory.Host, error) {
+	return hostinventory.Host{}, nil
+}
+
+func (runtime *blockingHostInventoryRuntime) RecordHeartbeat(context.Context, string, time.Time) (hostinventory.Host, error) {
+	close(runtime.started)
+	<-runtime.release
+	return hostinventory.Host{}, nil
+}
+
+func (runtime *recordingHostInventoryRuntime) RecordObservation(_ context.Context, observation hostinventory.Observation) (hostinventory.Host, error) {
+	runtime.observationCalls++
+	runtime.observation = observation
+	return hostinventory.Host{}, nil
+}
+
+func (runtime *recordingHostInventoryRuntime) RecordHeartbeat(_ context.Context, agentID string, at time.Time) (hostinventory.Host, error) {
+	runtime.heartbeatAgentID, runtime.heartbeatAt = agentID, at
+	return hostinventory.Host{}, nil
 }
 
 type testCommandSigner struct{}

@@ -32,6 +32,7 @@ import (
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/ingest"
 	"dbpilot.local/platform/internal/inspection"
@@ -150,36 +151,37 @@ type Config struct {
 }
 
 type Server struct {
-	config              Config
-	database            *sql.DB
-	ownsDatabase        bool
-	repository          *alert.PostgresRepository
-	evaluator           *alert.Evaluator
-	dispatcher          *alert.Dispatcher
-	httpServer          *http.Server
-	grpcServer          *grpc.Server
-	httpTLS             *tls.Config
-	grpcTLS             *tls.Config
-	ping                func(context.Context) error
-	migrate             func(context.Context) error
-	listen              func(string, string) (net.Listener, error)
-	scopes              []alert.Scope
-	ready               *atomic.Bool
-	evaluateScope       func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents          func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch            func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue            func(context.Context, time.Time) error
-	agentRegistry       *agentcontrol.Registry
-	commandObserver     agentcontrol.Observer
-	commandLifecycle    *job.CommandLifecycle
-	dispatchCommands    func(context.Context, time.Time) error
-	idempotency         *idempotency.Service
-	artifactBlobs       *artifact.LocalBlobStore
-	inspectionService   *inspection.Service
-	inspectionWorker    *inspection.Worker
-	scheduleInspections func(context.Context, time.Time) error
-	processInspections  func(context.Context, time.Time) error
-	workers             sync.WaitGroup
+	config               Config
+	database             *sql.DB
+	ownsDatabase         bool
+	repository           *alert.PostgresRepository
+	evaluator            *alert.Evaluator
+	dispatcher           *alert.Dispatcher
+	httpServer           *http.Server
+	grpcServer           *grpc.Server
+	httpTLS              *tls.Config
+	grpcTLS              *tls.Config
+	ping                 func(context.Context) error
+	migrate              func(context.Context) error
+	listen               func(string, string) (net.Listener, error)
+	scopes               []alert.Scope
+	ready                *atomic.Bool
+	evaluateScope        func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents           func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch             func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue             func(context.Context, time.Time) error
+	agentRegistry        *agentcontrol.Registry
+	commandObserver      agentcontrol.Observer
+	commandLifecycle     *job.CommandLifecycle
+	dispatchCommands     func(context.Context, time.Time) error
+	idempotency          *idempotency.Service
+	artifactBlobs        *artifact.LocalBlobStore
+	inspectionService    *inspection.Service
+	hostInventoryService *hostinventory.ApplicationService
+	inspectionWorker     *inspection.Worker
+	scheduleInspections  func(context.Context, time.Time) error
+	processInspections   func(context.Context, time.Time) error
+	workers              sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -338,6 +340,7 @@ func NewServer(config Config) (*Server, error) {
 			func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
 			func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
 			func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
+			func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
 			func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
@@ -415,6 +418,7 @@ func NewServer(config Config) (*Server, error) {
 		return nil, fmt.Errorf("configure inspection targets: %w", err)
 	}
 	inspectionTargets := liveInspectionTargetResolver{configured: configuredTargets, registry: agentRegistry}
+	hostInventoryService := hostinventory.NewService(hostinventory.NewPostgresRepository(database), configuredHostScopeResolverFrom(config.Agents))
 	inspectionRepository := inspection.NewPostgresRepository(database, jobRepository)
 	inspectionService := &inspection.Service{Repository: inspectionRepository, Targets: inspectionTargets}
 	inspectionWorker := &inspection.Worker{Runs: inspectionRepository, Jobs: jobRepository, Evaluator: &inspection.Evaluator{Evidence: inspectionRepository}, Artifacts: artifactStore, Audit: auditService}
@@ -436,7 +440,7 @@ func NewServer(config Config) (*Server, error) {
 		CapabilityInput: func(_ context.Context, scope platformscope.Scope) capability.Input {
 			return foundationCapabilityInput(scope, config.Agents, agentRegistry)
 		},
-		Idempotency: idempotencyService, Inspection: inspectionApplication,
+		Idempotency: idempotencyService, Inspection: inspectionApplication, Hosts: hostInventoryService,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
@@ -465,12 +469,15 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver))
+	agentControlObserver := newHostInventoryAgentObserver(commandObserver, hostInventoryService, time.Now, func(err error) {
+		log.Printf("host inventory AgentControl event failed: %v", err)
+	})
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, agentControlObserver))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
-		inspectionService: inspectionService, inspectionWorker: inspectionWorker,
+		inspectionService: inspectionService, inspectionWorker: inspectionWorker, hostInventoryService: hostInventoryService,
 		scheduleInspections: func(ctx context.Context, at time.Time) error {
 			_, err := inspectionService.ScheduleDue(ctx, at.UTC())
 			return err
@@ -881,6 +888,110 @@ func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configu
 	}
 	return result
 }
+
+type configuredHostScopeResolver map[string]platformscope.Scope
+
+func (resolver configuredHostScopeResolver) ScopeForAgent(_ context.Context, agentID string) (platformscope.Scope, error) {
+	scope, ok := resolver[agentID]
+	if !ok {
+		return platformscope.Scope{}, errors.New("host inventory agent assignment not found")
+	}
+	return scope, nil
+}
+
+func configuredHostScopeResolverFrom(assignments map[string]AgentAssignment) configuredHostScopeResolver {
+	result := make(configuredHostScopeResolver, len(assignments))
+	for agentID, assignment := range assignments {
+		result[agentID] = platformscope.Scope{TenantID: assignment.TenantID, ProjectID: assignment.ProjectID}
+	}
+	return result
+}
+
+type hostInventoryRuntime interface {
+	RecordObservation(context.Context, hostinventory.Observation) (hostinventory.Host, error)
+	RecordHeartbeat(context.Context, string, time.Time) (hostinventory.Host, error)
+}
+
+type hostInventoryAgentObserver struct {
+	delegate agentcontrol.Observer
+	hosts    hostInventoryRuntime
+	now      func() time.Time
+	onError  func(error)
+}
+
+type preparedHostInventoryAgentObserver struct {
+	*hostInventoryAgentObserver
+	prepared agentcontrol.PreparedObserver
+}
+
+func newHostInventoryAgentObserver(delegate agentcontrol.Observer, hosts hostInventoryRuntime, now func() time.Time, onError func(error)) agentcontrol.Observer {
+	observer := &hostInventoryAgentObserver{delegate: delegate, hosts: hosts, now: now, onError: onError}
+	if prepared, ok := delegate.(agentcontrol.PreparedObserver); ok {
+		return &preparedHostInventoryAgentObserver{hostInventoryAgentObserver: observer, prepared: prepared}
+	}
+	return observer
+}
+
+func (observer *hostInventoryAgentObserver) Connected(ctx context.Context, session agentcontrol.SessionInfo) {
+	observer.delegate.Connected(ctx, session)
+}
+
+func (observer *hostInventoryAgentObserver) Heartbeat(ctx context.Context, agentID string, heartbeat *telemetryv1.Heartbeat) {
+	observer.delegate.Heartbeat(ctx, agentID, heartbeat)
+	if observer.hosts != nil {
+		now := time.Now().UTC()
+		if observer.now != nil {
+			now = observer.now().UTC()
+		}
+		if _, err := observer.hosts.RecordHeartbeat(ctx, agentID, now); err != nil && observer.onError != nil {
+			observer.onError(err)
+		}
+	}
+}
+
+func (observer *hostInventoryAgentObserver) HostObservation(ctx context.Context, agentID string, value *telemetryv1.HostObservation) error {
+	if observer.hosts == nil || value == nil || value.GetAgentId() != agentID || value.GetObservedAt() == nil || !value.GetObservedAt().IsValid() {
+		return hostinventory.ErrInvalid
+	}
+	filesystems := make([]hostinventory.FilesystemSummary, len(value.GetFilesystems()))
+	for index, filesystem := range value.GetFilesystems() {
+		if filesystem == nil {
+			return hostinventory.ErrInvalid
+		}
+		filesystems[index] = hostinventory.FilesystemSummary{
+			MountPoint: filesystem.GetMountPoint(), CapacityBytes: filesystem.GetCapacityBytes(), AvailableBytes: filesystem.GetAvailableBytes(),
+		}
+	}
+	_, err := observer.hosts.RecordObservation(ctx, hostinventory.Observation{
+		HostID: value.GetHostId(), AgentID: value.GetAgentId(), Revision: value.GetObservationRevision(),
+		Hostname: value.GetHostname(), OS: value.GetOperatingSystem(), OSVersion: value.GetOperatingSystemVersion(),
+		Kernel: value.GetKernelVersion(), Architecture: value.GetArchitecture(), LogicalCPUCount: value.GetLogicalCpuCount(),
+		MemoryCapacityBytes: value.GetMemoryCapacityBytes(), Filesystems: filesystems,
+		NetworkAddresses: append([]string(nil), value.GetNetworkAddresses()...), Capabilities: append([]string(nil), value.GetCapabilities()...),
+		AgentVersion: value.GetAgentVersion(), ObservedAt: value.GetObservedAt().AsTime().UTC(),
+	})
+	return err
+}
+
+func (observer *hostInventoryAgentObserver) Acknowledged(ctx context.Context, agentID string, value *telemetryv1.CommandAcknowledgement) {
+	observer.delegate.Acknowledged(ctx, agentID, value)
+}
+
+func (observer *hostInventoryAgentObserver) Progress(ctx context.Context, agentID string, value *telemetryv1.CommandProgress) {
+	observer.delegate.Progress(ctx, agentID, value)
+}
+
+func (observer *hostInventoryAgentObserver) Result(ctx context.Context, agentID string, value *telemetryv1.CommandResult) (agentcontrol.ResultPersistence, error) {
+	return observer.delegate.Result(ctx, agentID, value)
+}
+
+func (observer *preparedHostInventoryAgentObserver) Prepared(ctx context.Context, agentID string, value *telemetryv1.CommandPrepared) (*telemetryv1.CommandStart, error) {
+	return observer.prepared.Prepared(ctx, agentID, value)
+}
+
+var _ agentcontrol.Observer = (*hostInventoryAgentObserver)(nil)
+var _ agentcontrol.HostObservationObserver = (*hostInventoryAgentObserver)(nil)
+var _ agentcontrol.PreparedObserver = (*preparedHostInventoryAgentObserver)(nil)
 
 func configuredInspectionTargets(assignments map[string]AgentAssignment) []inspection.HostTarget {
 	result := make([]inspection.HostTarget, 0, len(assignments))

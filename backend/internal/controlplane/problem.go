@@ -12,6 +12,7 @@ import (
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
@@ -65,7 +66,7 @@ func newRequestID() string {
 func problemForError(err error, requestID, instance string) openapi.Problem {
 	status, code, title := http.StatusInternalServerError, "internal_error", "Internal server error"
 	switch {
-	case errors.Is(err, ErrInvalidRequest), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets):
+	case errors.Is(err, ErrInvalidRequest), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets):
 		status, code, title = http.StatusBadRequest, "invalid_request", "Request validation failed"
 	case errors.Is(err, inspection.ErrReportBudgetExceeded), errors.Is(err, inspection.ErrReportBudgetOverflow):
 		status, code, title = http.StatusUnprocessableEntity, "inspection_report_budget_exceeded", "Inspection run exceeds report limits"
@@ -75,7 +76,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusForbidden, "forbidden", "Access is forbidden"
 	case errors.Is(err, ErrMethodNotAllowed):
 		status, code, title = http.StatusMethodNotAllowed, "method_not_allowed", "Method is not allowed"
-	case errors.Is(err, job.ErrNotFound), errors.Is(err, artifact.ErrNotFound), errors.Is(err, inspection.ErrNotFound):
+	case errors.Is(err, job.ErrNotFound), errors.Is(err, artifact.ErrNotFound), errors.Is(err, hostinventory.ErrNotFound), errors.Is(err, inspection.ErrNotFound):
 		status, code, title = http.StatusNotFound, "not_found", "Resource was not found"
 	case errors.Is(err, ErrPreconditionFailed):
 		status, code, title = http.StatusPreconditionFailed, "precondition_failed", "Request precondition failed"
@@ -85,7 +86,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"
 	case errors.Is(err, idempotency.ErrOwnershipConflict):
 		status, code, title = http.StatusConflict, "idempotency_ownership_conflict", "Idempotency claim ownership changed"
-	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable):
+	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, hostinventory.ErrConflict), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable):
 		status, code, title = http.StatusConflict, "conflict", "Resource state conflicts with the request"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		status, code, title = http.StatusGatewayTimeout, "timeout", "Operation timed out"

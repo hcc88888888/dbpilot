@@ -9,6 +9,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
@@ -94,6 +95,7 @@ type Services struct {
 	Capabilities    CapabilityService
 	Idempotency     IdempotencyService
 	Inspection      InspectionService
+	Hosts           hostinventory.Service
 	ArtifactContent http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated

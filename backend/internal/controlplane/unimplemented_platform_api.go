@@ -31,19 +31,11 @@ func (unimplementedPlatformAPI) CreateMetricTemplateRevision(context.Context, op
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) DecommissionHost(context.Context, openapi.DecommissionHostRequestObject) (openapi.DecommissionHostResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) GetDatabaseInstance(context.Context, openapi.GetDatabaseInstanceRequestObject) (openapi.GetDatabaseInstanceResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
 func (unimplementedPlatformAPI) GetDiscoveryCandidate(context.Context, openapi.GetDiscoveryCandidateRequestObject) (openapi.GetDiscoveryCandidateResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) GetHost(context.Context, openapi.GetHostRequestObject) (openapi.GetHostResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
@@ -60,10 +52,6 @@ func (unimplementedPlatformAPI) ListDatabaseInstances(context.Context, openapi.L
 }
 
 func (unimplementedPlatformAPI) ListDiscoveryCandidates(context.Context, openapi.ListDiscoveryCandidatesRequestObject) (openapi.ListDiscoveryCandidatesResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) ListHosts(context.Context, openapi.ListHostsRequestObject) (openapi.ListHostsResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
