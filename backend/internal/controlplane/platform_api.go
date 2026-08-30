@@ -25,7 +25,10 @@ import (
 
 type platformScopeContextKey struct{}
 
-type platformAPI struct{ services Services }
+type platformAPI struct {
+	unimplementedPlatformAPI
+	services Services
+}
 
 var _ openapi.StrictServerInterface = platformAPI{}
 

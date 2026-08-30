@@ -816,7 +816,7 @@ func (service *inspectionApplicationService) GetOverview(ctx context.Context, sc
 	}
 	overview := InspectionOverview{TargetCount: len(targets), RunStatusCounts: make(map[inspection.RunStatus]int), FindingLevelCounts: make(map[inspection.FindingLevel]int)}
 	for _, target := range targets {
-		if target.Connectivity == string(openapi.Online) {
+		if target.Connectivity == string(openapi.InspectionConnectivityOnline) {
 			overview.OnlineTargetCount++
 		}
 	}
