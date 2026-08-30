@@ -6,6 +6,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -59,6 +60,22 @@ func TestDiscoveryDispatcherQuarantinesNeverReturningAgentWithoutBlockingPeerOrC
 	require.Less(t, time.Since(started), 100*time.Millisecond)
 }
 
+func TestDiscoveryDispatcherSendsTerminalAckForUncommittedStaleReport(t *testing.T) {
+	acknowledged := make(chan *agentv1.DiscoveryReportAcknowledgement, 1)
+	dispatcher, err := NewDiscoveryDispatcher(errorDiscoverySink{err: discoverydomain.ErrConflict}, DiscoveryDispatcherConfig{Acknowledge: func(_ string, ack *agentv1.DiscoveryReportAcknowledgement) error { acknowledged <- ack; return nil }})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+	require.NoError(t, dispatcher.SubmitDiscovery("agent-1", validDiscoveryReportFixture(1)))
+	select {
+	case ack := <-acknowledged:
+		require.False(t, ack.GetPersisted())
+		require.False(t, ack.GetRetryable())
+		require.Equal(t, "REPORT_REJECTED", ack.GetReasonCode())
+	case <-time.After(time.Second):
+		t.Fatal("terminal acknowledgement was not emitted")
+	}
+}
+
 type blockingDiscoverySink struct {
 	entered chan uint64
 	release chan struct{}
@@ -71,6 +88,12 @@ func (sink selectiveDiscoverySink) RecordDiscoveryReport(_ context.Context, agen
 		<-sink.blocked
 	}
 	return nil
+}
+
+type errorDiscoverySink struct{ err error }
+
+func (sink errorDiscoverySink) RecordDiscoveryReport(context.Context, string, *agentv1.DiscoveryReport) error {
+	return sink.err
 }
 
 func (sink *blockingDiscoverySink) RecordDiscoveryReport(ctx context.Context, _ string, report *agentv1.DiscoveryReport) error {

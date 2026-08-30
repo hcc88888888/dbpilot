@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -115,6 +116,15 @@ type PluginCatalogSettings struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+type DiscoveryRulePolicySettings struct {
+	KeyID              string        `yaml:"key_id"`
+	Revision           uint64        `yaml:"revision"`
+	Digest             string        `yaml:"digest"`
+	IssuedAt           time.Time     `yaml:"issued_at"`
+	ExpiresAt          time.Time     `yaml:"expires_at"`
+	DisappearanceGrace time.Duration `yaml:"disappearance_grace"`
+}
+
 type EnrollmentSettings struct {
 	Listener                   ListenerConfig `yaml:"listener"`
 	AgentCA                    TLSMaterial    `yaml:"agent_ca"`
@@ -141,24 +151,25 @@ type PrincipalSettings struct {
 }
 
 type Config struct {
-	DatabaseURL       string                     `yaml:"database_url"`
-	WebhookAllowlist  []string                   `yaml:"webhook_allowlist"`
-	HTTP              ListenerConfig             `yaml:"http"`
-	GRPC              ListenerConfig             `yaml:"grpc"`
-	Agents            map[string]AgentAssignment `yaml:"agents"`
-	SMTP              SMTPSettings               `yaml:"smtp"`
-	Monitoring        MonitoringSettings         `yaml:"monitoring,omitempty"`
-	Identity          IdentitySettings           `yaml:"identity"`
-	EventURLBase      string                     `yaml:"event_url_base"`
-	EvaluationScopes  []EvaluationScopeSettings  `yaml:"evaluation_scopes,omitempty"`
-	EvaluationEvery   time.Duration              `yaml:"evaluation_every,omitempty"`
-	RetryEvery        time.Duration              `yaml:"retry_every,omitempty"`
-	Command           CommandSettings            `yaml:"command"`
-	Artifact          ArtifactSettings           `yaml:"artifact"`
-	PluginCatalog     PluginCatalogSettings      `yaml:"plugin_catalog,omitempty"`
-	PluginPublishers  []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
-	DiscoveryRuleKeys map[string]string          `yaml:"discovery_rule_keys,omitempty"`
-	Enrollment        EnrollmentSettings         `yaml:"enrollment,omitempty"`
+	DatabaseURL           string                        `yaml:"database_url"`
+	WebhookAllowlist      []string                      `yaml:"webhook_allowlist"`
+	HTTP                  ListenerConfig                `yaml:"http"`
+	GRPC                  ListenerConfig                `yaml:"grpc"`
+	Agents                map[string]AgentAssignment    `yaml:"agents"`
+	SMTP                  SMTPSettings                  `yaml:"smtp"`
+	Monitoring            MonitoringSettings            `yaml:"monitoring,omitempty"`
+	Identity              IdentitySettings              `yaml:"identity"`
+	EventURLBase          string                        `yaml:"event_url_base"`
+	EvaluationScopes      []EvaluationScopeSettings     `yaml:"evaluation_scopes,omitempty"`
+	EvaluationEvery       time.Duration                 `yaml:"evaluation_every,omitempty"`
+	RetryEvery            time.Duration                 `yaml:"retry_every,omitempty"`
+	Command               CommandSettings               `yaml:"command"`
+	Artifact              ArtifactSettings              `yaml:"artifact"`
+	PluginCatalog         PluginCatalogSettings         `yaml:"plugin_catalog,omitempty"`
+	PluginPublishers      []PluginPublisherSettings     `yaml:"plugin_publishers,omitempty"`
+	DiscoveryRuleKeys     map[string]string             `yaml:"discovery_rule_keys,omitempty"`
+	DiscoveryRulePolicies []DiscoveryRulePolicySettings `yaml:"discovery_rule_policies,omitempty"`
+	Enrollment            EnrollmentSettings            `yaml:"enrollment,omitempty"`
 
 	HTTPServerTLS           *tls.Config                                `yaml:"-"`
 	GRPCServerTLS           *tls.Config                                `yaml:"-"`
@@ -543,6 +554,11 @@ func NewServer(config Config) (*Server, error) {
 		return nil, keyErr
 	}
 	discoveryService.RuleKeys = discoveryKeys
+	discoveryPolicies, policyErr := discoveryRulePoliciesForConfig(config)
+	if policyErr != nil {
+		return nil, policyErr
+	}
+	discoveryService.Policies = discovery.StaticRulePolicyRegistry{Allowed: discoveryPolicies}
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -662,7 +678,7 @@ func NewServer(config Config) (*Server, error) {
 		},
 	}
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: controlplane.PluginUploadReadTimeout, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
+	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(max(ingest.MaxBatchPayloadBytes+(64<<10), discovery.MaximumAgentControlMessageBytes)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
 	var enrollmentGRPCServer *grpc.Server
 	if enrollmentTLS != nil {
@@ -753,6 +769,26 @@ func discoveryRuleKeysForConfig(config Config) (map[string]ed25519.PublicKey, er
 			return nil, errors.New("discovery_rule_keys contains an invalid Ed25519 public key")
 		}
 		result[keyID] = ed25519.PublicKey(decoded)
+	}
+	return result, nil
+}
+
+func discoveryRulePoliciesForConfig(config Config) ([]discovery.RuleAttestation, error) {
+	result := make([]discovery.RuleAttestation, len(config.DiscoveryRulePolicies))
+	seen := make(map[string]struct{}, len(result))
+	for index, value := range config.DiscoveryRulePolicies {
+		digest, err := hex.DecodeString(value.Digest)
+		if err != nil || len(digest) != 32 || value.Revision == 0 || value.KeyID == "" || value.IssuedAt.Location() != time.UTC || value.ExpiresAt.Location() != time.UTC || !value.ExpiresAt.After(value.IssuedAt) || value.DisappearanceGrace < time.Minute || value.DisappearanceGrace > 24*time.Hour {
+			return nil, errors.New("discovery_rule_policies contains an invalid current policy")
+		}
+		attestation := discovery.RuleAttestation{Version: discovery.RuleAttestationVersion, Algorithm: discovery.RuleAttestationAlgorithm, KeyID: value.KeyID, Revision: value.Revision, IssuedAt: value.IssuedAt, ExpiresAt: value.ExpiresAt, DisappearanceGrace: value.DisappearanceGrace}
+		copy(attestation.Digest[:], digest)
+		identity := value.KeyID + ":" + fmt.Sprint(value.Revision) + ":" + value.Digest
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, errors.New("discovery_rule_policies contains a duplicate")
+		}
+		seen[identity] = struct{}{}
+		result[index] = attestation
 	}
 	return result, nil
 }
@@ -875,6 +911,9 @@ func validateConfig(config Config) error {
 		return errors.New("plugin_publishers contains an invalid Ed25519 public key")
 	}
 	if _, err := discoveryRuleKeysForConfig(config); err != nil {
+		return err
+	}
+	if _, err := discoveryRulePoliciesForConfig(config); err != nil {
 		return err
 	}
 	if config.PluginCatalog.Enabled && len(config.PluginPublishers) == 0 {

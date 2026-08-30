@@ -155,7 +155,14 @@ func AttestationFor(envelope SignedRuleSet) (RuleAttestation, error) {
 }
 
 func VerifyRuleAttestation(publicKey ed25519.PublicKey, attestation RuleAttestation, now time.Time) error {
-	if len(publicKey) != ed25519.PublicKeySize || len(attestation.Signature) != ed25519.SignatureSize || attestation.Version != RuleAttestationVersion || attestation.Algorithm != RuleAttestationAlgorithm || !safeRuleLiteral(attestation.KeyID) || attestation.Revision == 0 || !validUTC(attestation.IssuedAt) || !validUTC(attestation.ExpiresAt) || now.Before(attestation.IssuedAt) || !attestation.ExpiresAt.After(now) || attestation.DisappearanceGrace < MinimumScanInterval || attestation.DisappearanceGrace > 24*time.Hour {
+	if VerifyRuleAttestationSignature(publicKey, attestation) != nil || now.Before(attestation.IssuedAt) || !attestation.ExpiresAt.After(now) {
+		return ErrInvalidRuleSet
+	}
+	return nil
+}
+
+func VerifyRuleAttestationSignature(publicKey ed25519.PublicKey, attestation RuleAttestation) error {
+	if len(publicKey) != ed25519.PublicKeySize || len(attestation.Signature) != ed25519.SignatureSize || attestation.Version != RuleAttestationVersion || attestation.Algorithm != RuleAttestationAlgorithm || !safeRuleLiteral(attestation.KeyID) || attestation.Revision == 0 || !validUTC(attestation.IssuedAt) || !validUTC(attestation.ExpiresAt) || !attestation.ExpiresAt.After(attestation.IssuedAt) || attestation.DisappearanceGrace < MinimumScanInterval || attestation.DisappearanceGrace > 24*time.Hour {
 		return ErrInvalidRuleSet
 	}
 	encoded, err := canonicalAttestation(attestation)

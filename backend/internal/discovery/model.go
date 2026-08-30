@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	MaximumEvidenceItems = 32
-	MaximumEvidenceBytes = 256
-	DefaultListLimit     = 50
+	MaximumEvidenceItems            = 32
+	MaximumEvidenceBytes            = 256
+	DefaultListLimit                = 50
+	MaximumDiscoveryReportBytes     = 1 << 20
+	MaximumAgentControlMessageBytes = MaximumDiscoveryReportBytes + (64 << 10)
 )
 
 var (

@@ -18,6 +18,8 @@ import (
 )
 
 const ProtocolVersion = "1"
+const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
+const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
 
 type Observer interface {
 	Connected(context.Context, SessionInfo)
@@ -135,7 +137,7 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 
 	ack := &agentv1.ServerMessage{
 		MessageId: fmt.Sprintf("hello-ack-%d", s.now().UnixNano()), SentAt: timestamppb.New(s.now()),
-		Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ProtocolVersion, Capabilities: append([]string(nil), current.capabilityList...), ServerTime: timestamppb.New(s.now())}},
+		Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ProtocolVersion, Capabilities: []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1}, ServerTime: timestamppb.New(s.now())}},
 	}
 	if err := stream.Send(ack); err != nil {
 		return err
@@ -291,7 +293,9 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		if err := s.discovery.SubmitDiscovery(agentID, typed.DiscoveryReport); err != nil {
 			switch {
 			case errors.Is(err, ErrDiscoveryObservationInvalid):
-				return status.Error(codes.InvalidArgument, "Discovery report is invalid")
+				// Rolling old Agents may send the pre-attestation report shape. Ignore
+				// only that discovery message; never tear down heartbeat/telemetry.
+				return nil
 			case errors.Is(err, ErrDiscoveryObservationCapacity):
 				return status.Error(codes.ResourceExhausted, "Discovery report delivery capacity is exhausted")
 			default:

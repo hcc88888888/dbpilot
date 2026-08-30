@@ -15,6 +15,7 @@ type ApplicationService struct {
 	Now                func() time.Time
 	DisappearanceGrace time.Duration
 	RuleKeys           map[string]ed25519.PublicKey
+	Policies           RulePolicyRegistry
 }
 
 func NewService(repository Repository) *ApplicationService {
@@ -37,7 +38,7 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 		return nil, ErrInvalid
 	}
 	publicKey := service.RuleKeys[report.RuleAttestation.KeyID]
-	if VerifyRuleAttestation(publicKey, report.RuleAttestation, serviceTime(service.Now)) != nil {
+	if VerifyRuleAttestationSignature(publicKey, report.RuleAttestation) != nil {
 		return nil, ErrInvalidSignature
 	}
 	for _, candidate := range report.Candidates {
@@ -49,11 +50,18 @@ func (service ApplicationService) RecordReport(ctx context.Context, report Repor
 			return nil, ErrConflict
 		}
 	}
+	committed, err := service.Repository.CommittedReport(ctx, report)
+	if err != nil {
+		return nil, err
+	}
 	now, _, err := service.settings()
 	if err != nil {
 		return nil, err
 	}
-	if report.ObservedAt.Before(now.Add(-5*time.Minute)) || report.ObservedAt.After(now.Add(5*time.Minute)) {
+	if !committed && (VerifyRuleAttestation(publicKey, report.RuleAttestation, now) != nil || service.Policies == nil || service.Policies.Allows(ctx, report.RuleAttestation) != nil) {
+		return nil, ErrConflict
+	}
+	if !committed && (report.ObservedAt.Before(now.Add(-5*time.Minute)) || report.ObservedAt.After(now.Add(5*time.Minute))) {
 		return nil, ErrConflict
 	}
 	values, err := service.Repository.RecordReport(ctx, report, now, report.RuleAttestation.DisappearanceGrace)

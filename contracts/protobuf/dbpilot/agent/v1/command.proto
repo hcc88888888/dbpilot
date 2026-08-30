@@ -50,10 +50,10 @@ message ServerMessage {
     CommandStart command_start = 26;
     CredentialLeaseResponse credential_lease_response = 27;
     PluginArtifactLeaseResponse plugin_artifact_lease_response = 28;
-    DiscoveryReportAcknowledgement discovery_report_acknowledgement = 29;
+    DiscoveryReportAcknowledgement discovery_report_acknowledgement = 50;
   }
 
-  reserved 30 to 49;
+  reserved 29 to 49;
 }
 
 message DiscoveryReportAcknowledgement {

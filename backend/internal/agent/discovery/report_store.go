@@ -7,13 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	domain "dbpilot.local/platform/internal/discovery"
 	"google.golang.org/protobuf/proto"
 )
 
-const maximumPendingReportBytes = 4 << 20
+const maximumPendingReportBytes = domain.MaximumDiscoveryReportBytes
 
 type ReportStore interface {
 	Load(context.Context) (*agentv1.DiscoveryReport, error)
@@ -66,7 +68,11 @@ func NewFileReportStore(path string) (*FileReportStore, error) {
 	if info, err := os.Stat(filepath.Dir(path)); err != nil || !info.IsDir() {
 		return nil, errors.New("report state parent is unavailable")
 	}
-	return &FileReportStore{path: path}, nil
+	store := &FileReportStore{path: path}
+	if err := store.recover(); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 func (store *FileReportStore) Load(ctx context.Context) (*agentv1.DiscoveryReport, error) {
 	if err := ctx.Err(); err != nil {
@@ -119,7 +125,7 @@ func (store *FileReportStore) Save(ctx context.Context, report *agentv1.Discover
 		_ = os.Remove(store.path + ".tmp")
 		return err
 	}
-	return nil
+	return syncParentDirectory(store.path)
 }
 func (store *FileReportStore) Clear(ctx context.Context, report *agentv1.DiscoveryReport) error {
 	if err := ctx.Err(); err != nil {
@@ -139,10 +145,16 @@ func (store *FileReportStore) Clear(ctx context.Context, report *agentv1.Discove
 	if left != right {
 		return errors.New("pending discovery report conflict")
 	}
-	return os.Remove(store.path)
+	if err := os.Remove(store.path); err != nil {
+		return err
+	}
+	return syncParentDirectory(store.path)
 }
 func (store *FileReportStore) load() (*agentv1.DiscoveryReport, error) {
-	info, err := os.Lstat(store.path)
+	return loadReportAt(store.path)
+}
+func loadReportAt(path string) (*agentv1.DiscoveryReport, error) {
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -152,7 +164,7 @@ func (store *FileReportStore) load() (*agentv1.DiscoveryReport, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 || info.Size() > maximumPendingReportBytes {
 		return nil, errors.New("pending discovery report is invalid")
 	}
-	handle, err := os.Open(store.path)
+	handle, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -166,6 +178,44 @@ func (store *FileReportStore) load() (*agentv1.DiscoveryReport, error) {
 		return nil, errors.New("pending discovery report is invalid")
 	}
 	return &report, nil
+}
+func (store *FileReportStore) recover() error {
+	final, finalErr := loadReportAt(store.path)
+	temporary, tempErr := loadReportAt(store.path + ".tmp")
+	if finalErr != nil {
+		return finalErr
+	}
+	if final != nil {
+		if temporary != nil || tempErr != nil {
+			_ = os.Remove(store.path + ".tmp")
+			return syncParentDirectory(store.path)
+		}
+		return nil
+	}
+	if temporary != nil && tempErr == nil {
+		if err := os.Rename(store.path+".tmp", store.path); err != nil {
+			return err
+		}
+		return syncParentDirectory(store.path)
+	}
+	if tempErr != nil {
+		if err := os.Remove(store.path + ".tmp"); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncParentDirectory(store.path)
+	}
+	return nil
+}
+func syncParentDirectory(path string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 func ReportDigest(report *agentv1.DiscoveryReport) ([sha256.Size]byte, error) {
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)

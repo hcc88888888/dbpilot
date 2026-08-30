@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"sync"
@@ -177,6 +178,11 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	sort.Slice(protobufCandidates, func(left, right int) bool {
 		return string(protobufCandidates[left].GetFingerprint()) < string(protobufCandidates[right].GetFingerprint())
 	})
+	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: math.MaxUint64, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
+	if err != nil || len(encoded) > domain.MaximumDiscoveryReportBytes {
+		return domain.ErrInvalid
+	}
 	if coordinator.pendingRevision == 0 {
 		revision, err := coordinator.revisionStore.Next(ctx)
 		if err != nil {
@@ -184,7 +190,7 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 		}
 		coordinator.pendingRevision = revision
 	}
-	report := &agentv1.DiscoveryReport{HostId: coordinator.hostID, AgentId: coordinator.agentID, ObservationRevision: coordinator.pendingRevision, RuleRevision: coordinator.rules.Revision, Candidates: protobufCandidates, ObservedAt: timestamppb.New(observedAt), RuleSetDigest: append([]byte(nil), coordinator.attestation.Digest[:]...), DisappearanceGraceSeconds: uint64(coordinator.attestation.DisappearanceGrace / time.Second), RuleIssuedAt: timestamppb.New(coordinator.attestation.IssuedAt), RuleExpiresAt: timestamppb.New(coordinator.attestation.ExpiresAt), RuleAttestationSignature: append([]byte(nil), coordinator.attestation.Signature...), RuleAttestationVersion: coordinator.attestation.Version, RuleAttestationAlgorithm: coordinator.attestation.Algorithm, RuleAttestationKeyId: coordinator.attestation.KeyID}
+	report.ObservationRevision = coordinator.pendingRevision
 	if err := coordinator.reports.Save(ctx, report); err != nil {
 		return err
 	}
@@ -198,6 +204,14 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 		return nil
 	}
 	if err := coordinator.reporter(ctx, proto.Clone(report).(*agentv1.DiscoveryReport)); err != nil {
+		var terminal interface{ NonRetryableDiscovery() bool }
+		if errors.As(err, &terminal) && terminal.NonRetryableDiscovery() {
+			if clearErr := coordinator.reports.Clear(ctx, report); clearErr != nil {
+				return clearErr
+			}
+			coordinator.pendingReport = nil
+			coordinator.pendingRevision = 0
+		}
 		return err
 	}
 	if err := coordinator.reports.Clear(ctx, report); err != nil {

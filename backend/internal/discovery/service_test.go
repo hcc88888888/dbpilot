@@ -18,6 +18,7 @@ func TestServiceResolvesAgentBindingAndPreservesReportScope(t *testing.T) {
 	service.Now = func() time.Time { return now }
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
 	report := Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation}
 	_, err := service.RecordReport(context.Background(), report)
 	require.NoError(t, err)
@@ -48,6 +49,7 @@ func TestServiceRejectsAgentSuppliedFingerprintThatDoesNotMatchHostFacts(t *test
 	service := NewService(repository)
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
 	service.Now = func() time.Time { return now }
 	candidate := candidateFixture(scope).CandidateObservation
 	candidate.Fingerprint[0] ^= 0xff
@@ -63,10 +65,38 @@ func TestServiceRejectsTamperedRuleGraceBeforeRepositoryWrite(t *testing.T) {
 	service.Now = func() time.Time { return now }
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
 	attestation.DisappearanceGrace = time.Minute
 	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
 	require.ErrorIs(t, err, ErrInvalidSignature)
 	require.Equal(t, uint64(0), repository.recorded.ObservationRevision)
+}
+
+func TestServiceRejectsValidButNonCurrentSignedPolicyOnFirstAdmission(t *testing.T) {
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	repository := &recordingRepository{binding: AgentBinding{Scope: scope, HostID: "host-1", AgentID: "agent-1"}}
+	service := NewService(repository)
+	service.Now = func() time.Time { return now }
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	current := attestation
+	current.Revision = 5
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{current}}
+	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
+	require.ErrorIs(t, err, ErrConflict)
+}
+
+func TestServiceAllowsExactCommittedReplayAfterExpiryAndSkewWindow(t *testing.T) {
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	repository := &recordingRepository{binding: AgentBinding{Scope: scope, HostID: "host-1", AgentID: "agent-1"}, committed: true}
+	service := NewService(repository)
+	service.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
+	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	_, err := service.RecordReport(context.Background(), Report{HostID: "host-1", AgentID: "agent-1", ObservationRevision: 1, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
+	require.NoError(t, err)
 }
 
 func signedTestAttestation(t *testing.T, now time.Time, revision uint64, grace time.Duration) (RuleAttestation, ed25519.PublicKey) {
@@ -94,10 +124,14 @@ type recordingRepository struct {
 	recorded  Report
 	grace     time.Duration
 	candidate Candidate
+	committed bool
 }
 
 func (repository *recordingRepository) ResolveAgentBinding(context.Context, string) (AgentBinding, error) {
 	return repository.binding, nil
+}
+func (repository *recordingRepository) CommittedReport(context.Context, Report) (bool, error) {
+	return repository.committed, nil
 }
 func (repository *recordingRepository) RecordReport(_ context.Context, report Report, _ time.Time, grace time.Duration) ([]Candidate, error) {
 	repository.recorded, repository.grace = report, grace

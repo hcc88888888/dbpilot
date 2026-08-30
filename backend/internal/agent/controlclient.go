@@ -16,6 +16,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	"dbpilot.local/platform/internal/commandvalidation"
+	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -23,8 +24,16 @@ import (
 )
 
 const ControlProtocolVersion = "1"
+const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
+const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
+var ErrDiscoveryControlIncompatible = errors.New("discovery unavailable: control plane lacks ACK or policy attestation capability")
+
+type nonRetryableDiscoveryError struct{}
+
+func (nonRetryableDiscoveryError) Error() string               { return "discovery report rejected non-retryably" }
+func (nonRetryableDiscoveryError) NonRetryableDiscovery() bool { return true }
 
 const controlSendQueueCapacity = 64
 
@@ -174,16 +183,17 @@ type ControlClient struct {
 	resultRetryBackoff time.Duration
 	now                func() time.Time
 
-	sessionMu        sync.RWMutex
-	session          *controlSession
-	sendMu           sync.Mutex
-	runningMu        sync.Mutex
-	running          map[string]runningCommand
-	executorWait     sync.WaitGroup
-	messageSequence  atomic.Uint64
-	executionErrors  chan error
-	discoveryMu      sync.Mutex
-	discoveryWaiters map[uint64]*discoveryAckWaiter
+	sessionMu           sync.RWMutex
+	session             *controlSession
+	sendMu              sync.Mutex
+	runningMu           sync.Mutex
+	running             map[string]runningCommand
+	executorWait        sync.WaitGroup
+	messageSequence     atomic.Uint64
+	executionErrors     chan error
+	discoveryMu         sync.Mutex
+	discoveryWaiters    map[uint64]*discoveryAckWaiter
+	discoveryCompatible atomic.Bool
 }
 
 type discoveryAckWaiter struct {
@@ -372,6 +382,8 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
+	c.discoveryCompatible.Store(hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1))
+	defer c.discoveryCompatible.Store(false)
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
@@ -859,12 +871,15 @@ func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {
 // ReportDiscovery sends a bounded discovery report on the authenticated
 // AgentControl stream. Server-side scope is resolved from the mTLS Agent ID.
 func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.DiscoveryReport) error {
+	if !c.discoveryCompatible.Load() {
+		return ErrDiscoveryControlIncompatible
+	}
 	if report == nil || report.GetAgentId() != c.agentID || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || len(report.GetCandidates()) > 1024 {
 		return errors.New("discovery report is invalid")
 	}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
-	if err != nil {
-		return err
+	if err != nil || len(encoded) > discoverydomain.MaximumDiscoveryReportBytes {
+		return errors.New("discovery report exceeds transport limit")
 	}
 	digest := sha256.Sum256(encoded)
 	waiter := &discoveryAckWaiter{digest: digest, hostID: report.GetHostId(), result: make(chan error, 1)}
@@ -901,6 +916,19 @@ func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.Dis
 	}
 }
 
+func hasCapabilities(values []string, required ...string) bool {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	for _, value := range required {
+		if _, ok := set[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *ControlClient) handleDiscoveryAcknowledgement(ack *agentv1.DiscoveryReportAcknowledgement) error {
 	if ack == nil || ack.GetAgentId() != c.agentID || ack.GetObservationRevision() == 0 || len(ack.GetReportDigest()) != sha256.Size {
 		return errors.New("discovery acknowledgement is invalid")
@@ -919,7 +947,7 @@ func (c *ControlClient) handleDiscoveryAcknowledgement(ack *agentv1.DiscoveryRep
 	} else if ack.GetRetryable() {
 		outcome = errors.New("discovery report persistence retry requested")
 	} else {
-		outcome = errors.New("discovery report persistence rejected")
+		outcome = nonRetryableDiscoveryError{}
 	}
 	select {
 	case waiter.result <- outcome:

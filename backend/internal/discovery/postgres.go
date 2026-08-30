@@ -43,8 +43,24 @@ func (repository *PostgresRepository) ResolveAgentBinding(ctx context.Context, a
 	return binding, nil
 }
 
+func (repository *PostgresRepository) CommittedReport(ctx context.Context, report Report) (bool, error) {
+	if repository == nil || repository.database == nil || ctx == nil || report.Validate() != nil {
+		return false, ErrInvalid
+	}
+	digest, err := reportDigest(report)
+	if err != nil {
+		return false, err
+	}
+	var committed bool
+	err = repository.database.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM discovery_scan_state WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4 AND observation_revision=$5 AND report_digest=$6 AND rule_revision=$7 AND rule_set_digest=$8)`, report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID, report.ObservationRevision, digest[:], report.RuleRevision, report.RuleAttestation.Digest[:]).Scan(&committed)
+	if err != nil {
+		return false, mapPostgresError(err)
+	}
+	return committed, nil
+}
+
 func (repository *PostgresRepository) RecordReport(ctx context.Context, report Report, receivedAt time.Time, grace time.Duration) ([]Candidate, error) {
-	if repository == nil || repository.database == nil || ctx == nil || report.Validate() != nil || !validUTC(receivedAt) || grace < time.Minute || grace > 24*time.Hour {
+	if repository == nil || repository.database == nil || ctx == nil || report.Validate() != nil || grace < time.Minute || grace > 24*time.Hour {
 		return nil, ErrInvalid
 	}
 	transaction, err := repository.database.BeginTx(ctx, nil)
@@ -57,6 +73,11 @@ func (repository *PostgresRepository) RecordReport(ctx context.Context, report R
 		rollback()
 		return nil, mapPostgresError(err)
 	}
+	if err := transaction.QueryRowContext(ctx, "SELECT CURRENT_TIMESTAMP").Scan(&receivedAt); err != nil {
+		rollback()
+		return nil, mapPostgresError(err)
+	}
+	receivedAt = receivedAt.UTC()
 	digest, err := reportDigest(report)
 	if err != nil {
 		rollback()

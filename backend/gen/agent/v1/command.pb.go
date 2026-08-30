@@ -761,7 +761,7 @@ type ServerMessage_PluginArtifactLeaseResponse struct {
 }
 
 type ServerMessage_DiscoveryReportAcknowledgement struct {
-	DiscoveryReportAcknowledgement *DiscoveryReportAcknowledgement `protobuf:"bytes,29,opt,name=discovery_report_acknowledgement,json=discoveryReportAcknowledgement,proto3,oneof"`
+	DiscoveryReportAcknowledgement *DiscoveryReportAcknowledgement `protobuf:"bytes,50,opt,name=discovery_report_acknowledgement,json=discoveryReportAcknowledgement,proto3,oneof"`
 }
 
 func (*ServerMessage_HelloAck) isServerMessage_Message() {}
@@ -3472,8 +3472,8 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\rcommand_start\x18\x1a \x01(\v2\x1e.dbpilot.agent.v1.CommandStartH\x00R\fcommandStart\x12g\n" +
 	"\x19credential_lease_response\x18\x1b \x01(\v2).dbpilot.agent.v1.CredentialLeaseResponseH\x00R\x17credentialLeaseResponse\x12t\n" +
 	"\x1eplugin_artifact_lease_response\x18\x1c \x01(\v2-.dbpilot.agent.v1.PluginArtifactLeaseResponseH\x00R\x1bpluginArtifactLeaseResponse\x12|\n" +
-	" discovery_report_acknowledgement\x18\x1d \x01(\v20.dbpilot.agent.v1.DiscoveryReportAcknowledgementH\x00R\x1ediscoveryReportAcknowledgementB\t\n" +
-	"\amessageJ\x04\b\x03\x10\x14J\x04\b\x1e\x102\"\x89\x02\n" +
+	" discovery_report_acknowledgement\x182 \x01(\v20.dbpilot.agent.v1.DiscoveryReportAcknowledgementH\x00R\x1ediscoveryReportAcknowledgementB\t\n" +
+	"\amessageJ\x04\b\x03\x10\x14J\x04\b\x1d\x102\"\x89\x02\n" +
 	"\x1eDiscoveryReportAcknowledgement\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +

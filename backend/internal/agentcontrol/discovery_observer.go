@@ -8,6 +8,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -80,7 +81,7 @@ func (dispatcher *DiscoveryDispatcher) SubmitDiscovery(agentID string, report *a
 		return ErrDiscoveryObservationInvalid
 	}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
-	if err != nil {
+	if err != nil || len(encoded) > discoverydomain.MaximumDiscoveryReportBytes {
 		return ErrDiscoveryObservationInvalid
 	}
 	digest := sha256.Sum256(encoded)
@@ -185,6 +186,11 @@ func (lane *discoveryLane) deliver(report *agentv1.DiscoveryReport, digest [sha2
 			cancel()
 			if err == nil {
 				lane.ack(report, digest, true, false, "PERSISTED")
+				lane.clearActive()
+				return true
+			}
+			if errors.Is(err, discoverydomain.ErrConflict) || errors.Is(err, discoverydomain.ErrStaleRevision) || errors.Is(err, discoverydomain.ErrInvalidSignature) || errors.Is(err, discoverydomain.ErrInvalid) {
+				lane.ack(report, digest, false, false, "REPORT_REJECTED")
 				lane.clearActive()
 				return true
 			}

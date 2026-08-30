@@ -3,15 +3,20 @@ package discovery
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	domain "dbpilot.local/platform/internal/discovery"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -76,6 +81,31 @@ func TestCoordinatorStopsNewScansAndCommandsWhenRulesExpire(t *testing.T) {
 	require.Equal(t, 1, detector.calls)
 }
 
+func TestCoordinatorRetiresExactTerminallyRejectedPendingReportAndAdvances(t *testing.T) {
+	detector := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
+	rules, attestation := testRules(t)
+	attempts := 0
+	var revisions []uint64
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: detector, RuleSet: rules, Attestation: attestation, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(_ context.Context, report *agentv1.DiscoveryReport) error {
+		attempts++
+		revisions = append(revisions, report.GetObservationRevision())
+		if attempts == 1 {
+			return terminalReportError{}
+		}
+		return nil
+	}})
+	require.NoError(t, err)
+	require.Error(t, coordinator.Scan(context.Background(), ScanEnrollment))
+	require.NoError(t, coordinator.Scan(context.Background(), ScanPeriodic))
+	require.Equal(t, []uint64{1, 2}, revisions)
+	require.Equal(t, 2, detector.calls)
+}
+
+type terminalReportError struct{}
+
+func (terminalReportError) Error() string               { return "terminal" }
+func (terminalReportError) NonRetryableDiscovery() bool { return true }
+
 func TestFileRevisionStoreSurvivesAgentRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "discovery-revision")
 	first, err := NewFileRevisionStore(path)
@@ -136,6 +166,91 @@ func TestFileReportStoreReplaysByteIdenticalUnknownOutcome(t *testing.T) {
 	empty, err := restarted.Load(context.Background())
 	require.NoError(t, err)
 	require.Nil(t, empty)
+}
+
+func TestFileReportStoreRecoversValidOrphanTempAndDeletesTornTemp(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "pending.pb")
+	report := validPendingReportFixture()
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path+".tmp", encoded, 0o600))
+	store, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	loaded, err := store.Load(context.Background())
+	require.NoError(t, err)
+	left, _ := ReportDigest(report)
+	right, _ := ReportDigest(loaded)
+	require.Equal(t, left, right)
+	require.NoError(t, store.Clear(context.Background(), loaded))
+	require.NoError(t, os.WriteFile(path+".tmp", []byte("torn"), 0o600))
+	store, err = NewFileReportStore(path)
+	require.NoError(t, err)
+	require.NoError(t, store.Save(context.Background(), report), "torn orphan must not permanently block later publication")
+}
+
+func TestRuleStateSameParityJumpPreservesPreviousGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules")
+	store, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	one := sha256.Sum256([]byte("one"))
+	three := sha256.Sum256([]byte("three"))
+	require.NoError(t, store.Accept(context.Background(), 1, one))
+	require.NoError(t, store.Accept(context.Background(), 3, three))
+	restarted, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	require.Error(t, restarted.Accept(context.Background(), 2, sha256.Sum256([]byte("two"))))
+	require.NoError(t, restarted.Accept(context.Background(), 3, three))
+}
+
+func TestRuleStateRecoversValidTempAndRejectsConflictingSlots(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules")
+	one := sha256.Sum256([]byte("one"))
+	store, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	require.NoError(t, store.Accept(context.Background(), 1, one))
+	two := sha256.Sum256([]byte("two"))
+	encoded, err := json.Marshal(AcceptedRuleState{Revision: 2, Digest: hex.EncodeToString(two[:])})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path+".b.tmp", encoded, 0o600))
+	recovered, err := NewRuleStateStore(path)
+	require.NoError(t, err)
+	require.Error(t, recovered.Accept(context.Background(), 1, one))
+	conflict, err := json.Marshal(AcceptedRuleState{Revision: 2, Digest: hex.EncodeToString(one[:])})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path+".a", conflict, 0o600))
+	_, err = NewRuleStateStore(path)
+	require.Error(t, err)
+}
+
+func TestCoordinatorRejectsOversizedReportBeforeAllocatingRevision(t *testing.T) {
+	rules, attestation := testRules(t)
+	candidates := make([]domain.CandidateObservation, 1024)
+	for index := range candidates {
+		evidence := make([]domain.Evidence, 32)
+		for item := range evidence {
+			evidence[item] = domain.Evidence{Kind: domain.EvidenceVersionHint, Value: fmt.Sprintf("%03d-%02d-%s", index, item, strings.Repeat("x", 245))}
+		}
+		candidates[index] = domain.CandidateObservation{ObservationID: fmt.Sprintf("obs-%d", index), Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: fmt.Sprintf("127.0.0.1:%d", 10000+index), ProcessIdentity: "mysqld", Confidence: .9, Evidence: evidence}
+	}
+	revisions := &countingRevisionStore{}
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: staticCandidatesDetector(candidates), RuleSet: rules, Attestation: attestation, RevisionStore: revisions, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(context.Context, *agentv1.DiscoveryReport) error { return nil }})
+	require.NoError(t, err)
+	require.Error(t, coordinator.Scan(context.Background(), ScanEnrollment))
+	require.Zero(t, revisions.calls)
+}
+
+type staticCandidatesDetector []domain.CandidateObservation
+
+func (detector staticCandidatesDetector) Discover(context.Context, []domain.Rule) ([]domain.CandidateObservation, error) {
+	return detector, nil
+}
+
+type countingRevisionStore struct{ calls int }
+
+func (store *countingRevisionStore) Next(context.Context) (uint64, error) {
+	store.calls++
+	return uint64(store.calls), nil
 }
 
 func validPendingReportFixture() *agentv1.DiscoveryReport {

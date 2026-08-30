@@ -91,7 +91,7 @@ func TestConnectRegistersCapabilitiesSendsHelloAckAndRejectsDuplicateSession(t *
 
 	ack := first.nextSent(t)
 	require.Equal(t, ProtocolVersion, ack.GetHelloAck().GetProtocolVersion())
-	require.Equal(t, []string{"collect_now"}, ack.GetHelloAck().GetCapabilities())
+	require.Equal(t, []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1}, ack.GetHelloAck().GetCapabilities())
 	connected := <-observer.connected
 	require.Equal(t, "agent-a", connected.AgentID)
 	require.Equal(t, []string{"collect_now"}, connected.Capabilities)
@@ -618,6 +618,18 @@ type agentRegistryIntegrationFixture struct {
 	executor     *integrationCancellationExecutor
 	privateKey   ed25519.PrivateKey
 	clientStream *loopbackControlClientStream
+}
+
+func TestNewServerIgnoresOldDiscoveryShapeWithoutTearingControlSession(t *testing.T) {
+	server := NewServer(NewRegistry(2), NoopObserver{}, WithDiscoveryObserver(rejectingDiscoveryObserver{}))
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 1, RuleRevision: 1, ObservedAt: timestamppb.Now()}}}
+	require.NoError(t, server.handleAgentMessage(context.Background(), "agent-1", message))
+}
+
+type rejectingDiscoveryObserver struct{}
+
+func (rejectingDiscoveryObserver) SubmitDiscovery(string, *agentv1.DiscoveryReport) error {
+	return ErrDiscoveryObservationInvalid
 }
 
 func newAgentRegistryIntegrationFixture(t *testing.T, observer Observer) *agentRegistryIntegrationFixture {

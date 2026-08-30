@@ -51,6 +51,7 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	service.DisappearanceGrace = 10 * time.Minute
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
 	firstReport := Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation}
 	start := make(chan struct{})
 	results := make(chan []Candidate, 2)
@@ -74,6 +75,13 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	require.Len(t, secondConcurrent, 1)
 	firstSeen := first[0].FirstSeenAt
 	require.Equal(t, firstSeen, secondConcurrent[0].FirstSeenAt)
+	service.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	service.Policies = StaticRulePolicyRegistry{}
+	delayed, err := service.RecordReport(ctx, firstReport)
+	require.NoError(t, err)
+	require.Len(t, delayed, 1, "exact committed replay must bypass current expiry and skew admission")
+	service.Now = func() time.Time { return now }
+	service.Policies = StaticRulePolicyRegistry{Allowed: []RuleAttestation{attestation}}
 	replayed, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 1, RuleRevision: 4, Candidates: []CandidateObservation{observation}, ObservedAt: now, RuleAttestation: attestation})
 	require.NoError(t, err)
 	require.Len(t, replayed, 1)
@@ -87,6 +95,8 @@ func TestDiscoveryPostgresIntegrationFencesRevisionAndMarksDisappeared(t *testin
 	_, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 0, RuleRevision: 4, ObservedAt: now, RuleAttestation: attestation})
 	require.Error(t, err)
 	later := now.Add(11 * time.Minute)
+	_, err = database.ExecContext(ctx, "UPDATE discovery_candidates SET first_seen_at=CURRENT_TIMESTAMP-INTERVAL '11 minutes',last_seen_at=CURRENT_TIMESTAMP-INTERVAL '11 minutes' WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3", scope.TenantID, scope.ProjectID, hostID)
+	require.NoError(t, err)
 	service.Now = func() time.Time { return later }
 	page, err := service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 2, RuleRevision: 4, ObservedAt: later, RuleAttestation: attestation})
 	require.NoError(t, err)

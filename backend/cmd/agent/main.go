@@ -424,15 +424,16 @@ func configuredCommandExecutors(host agent.Collector, collector *agent.Dependenc
 }
 
 func loadDiscoveryRuleSet(path string, publicKey ed25519.PublicKey, now time.Time, state *agentdiscovery.RuleStateStore) (discoverydomain.RuleSet, discoverydomain.RuleAttestation, error) {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("discovery rule set is unavailable")
-	}
 	file, err := os.Open(path)
 	if err != nil {
 		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("discovery rule set is unavailable")
 	}
 	defer file.Close()
+	openedInfo, openedErr := file.Stat()
+	pathInfo, pathErr := os.Lstat(path)
+	if openedErr != nil || pathErr != nil || !openedInfo.Mode().IsRegular() || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, pathInfo) {
+		return discoverydomain.RuleSet{}, discoverydomain.RuleAttestation{}, errors.New("discovery rule set is unavailable")
+	}
 	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
 	decoder.DisallowUnknownFields()
 	var envelope discoverydomain.SignedRuleSet

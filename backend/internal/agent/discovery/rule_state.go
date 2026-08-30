@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -30,6 +31,9 @@ func NewRuleStateStore(path string) (*RuleStateStore, error) {
 		return nil, errors.New("rule state parent is unavailable")
 	}
 	store := &RuleStateStore{path: path}
+	if err := recoverRuleSlots(path); err != nil {
+		return nil, err
+	}
 	valid := 0
 	var invalid error
 	for _, suffix := range []string{".a", ".b"} {
@@ -40,6 +44,9 @@ func NewRuleStateStore(path string) (*RuleStateStore, error) {
 		}
 		if exists {
 			valid++
+			if state.Revision == store.state.Revision && store.state.Revision != 0 && state.Digest != store.state.Digest {
+				return nil, errors.New("conflicting discovery rule state slots")
+			}
 			if state.Revision > store.state.Revision {
 				store.state = state
 			}
@@ -75,11 +82,13 @@ func (store *RuleStateStore) Accept(ctx context.Context, revision uint64, digest
 	if err != nil {
 		return err
 	}
-	suffix := ".a"
-	if revision%2 == 0 {
-		suffix = ".b"
+	target, err := olderRuleSlot(store.path)
+	if err != nil {
+		return err
 	}
-	handle, err := os.OpenFile(store.path+suffix, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	temporary := target + ".tmp"
+	_ = os.Remove(temporary)
+	handle, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -95,7 +104,72 @@ func (store *RuleStateStore) Accept(ctx context.Context, revision uint64, digest
 	if closeErr != nil {
 		return closeErr
 	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(target)
+	}
+	if err := os.Rename(temporary, target); err != nil {
+		return err
+	}
+	if err := syncParentDirectory(store.path); err != nil {
+		return err
+	}
 	store.state = state
+	return nil
+}
+
+func olderRuleSlot(path string) (string, error) {
+	left, leftExists, leftErr := readRuleState(path + ".a")
+	right, rightExists, rightErr := readRuleState(path + ".b")
+	if leftErr != nil {
+		return "", leftErr
+	}
+	if rightErr != nil {
+		return "", rightErr
+	}
+	if !leftExists {
+		return path + ".a", nil
+	}
+	if !rightExists {
+		return path + ".b", nil
+	}
+	if left.Revision <= right.Revision {
+		return path + ".a", nil
+	}
+	return path + ".b", nil
+}
+func recoverRuleSlots(path string) error {
+	for _, suffix := range []string{".a", ".b"} {
+		target := path + suffix
+		temporary := target + ".tmp"
+		temp, tempExists, tempErr := readRuleState(temporary)
+		if tempErr != nil {
+			if err := os.Remove(temporary); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err:=syncParentDirectory(path);err!=nil{return err}
+			continue
+		}
+		if !tempExists {
+			continue
+		}
+		current, currentExists, currentErr := readRuleState(target)
+		if currentErr != nil {
+			currentExists = false
+		}
+		if !currentExists || temp.Revision > current.Revision {
+			if runtime.GOOS == "windows" {
+				_ = os.Remove(target)
+			}
+			if err := os.Rename(temporary, target); err != nil {
+				return err
+			}
+			if err := syncParentDirectory(path); err != nil {
+				return err
+			}
+		} else {
+			if err:=os.Remove(temporary);err!=nil&&!errors.Is(err,os.ErrNotExist){return err};if err:=syncParentDirectory(path);err!=nil{return err}
+		}
+	}
 	return nil
 }
 
