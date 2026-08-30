@@ -1,4 +1,5 @@
 import React from 'react';
+import { trapModalFocus } from './focus';
 
 export function Drawer({ open, title, onClose, children }: React.PropsWithChildren<{ open: boolean; title: string; onClose(): void }>) {
   const closeButton = React.useRef<HTMLButtonElement>(null);
@@ -12,6 +13,7 @@ export function Drawer({ open, title, onClose, children }: React.PropsWithChildr
   if (!open) return null;
   return (
     <section className="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" onKeyDown={(event) => {
+      trapModalFocus(event);
       if (event.key === 'Escape') {
         event.stopPropagation();
         onClose();

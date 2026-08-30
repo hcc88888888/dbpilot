@@ -167,7 +167,10 @@ describe('React management shell', () => {
 
     const opener = screen.getByRole('button', { name: 'Open host details' });
     await userEvent.click(opener);
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }));
+    const close = screen.getByRole('button', { name: 'Close' });
+    expect(document.activeElement).toBe(close);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(close);
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('dialog', { name: 'Host details' })).toBeNull();
     expect(document.activeElement).toBe(opener);
@@ -195,7 +198,13 @@ describe('React management shell', () => {
 
     const opener = screen.getByRole('button', { name: 'Retire host' });
     await userEvent.click(opener);
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Retire' }));
+    const confirm = screen.getByRole('button', { name: 'Retire' });
+    const cancel = screen.getByRole('button', { name: '取消' });
+    expect(document.activeElement).toBe(confirm);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(cancel);
+    await userEvent.tab({ shift: true });
+    expect(document.activeElement).toBe(confirm);
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('dialog', { name: 'Confirm retirement' })).toBeNull();
     expect(document.activeElement).toBe(opener);

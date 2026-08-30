@@ -1,4 +1,5 @@
 import React from 'react';
+import { trapModalFocus } from './focus';
 
 export function ConfirmDialog({ open, title, confirmLabel, onConfirm, onCancel, children }: React.PropsWithChildren<{ open: boolean; title: string; confirmLabel: string; onConfirm(): void; onCancel(): void }>) {
   const confirmButton = React.useRef<HTMLButtonElement>(null);
@@ -12,6 +13,7 @@ export function ConfirmDialog({ open, title, confirmLabel, onConfirm, onCancel, 
   if (!open) return null;
   return (
     <section className="dialog-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onKeyDown={(event) => {
+      trapModalFocus(event);
       if (event.key === 'Escape') {
         event.stopPropagation();
         onCancel();
