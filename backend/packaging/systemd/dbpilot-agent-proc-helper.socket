@@ -1,0 +1,12 @@
+[Unit]
+Description=DBPilot legacy procfs helper socket
+
+[Socket]
+ListenStream=/run/dbpilot-agent/proc-helper.sock
+SocketUser=dbpilot
+SocketGroup=dbpilot
+SocketMode=0600
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

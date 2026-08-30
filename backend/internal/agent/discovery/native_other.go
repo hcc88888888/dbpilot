@@ -28,7 +28,9 @@ type NativeReader interface {
 
 type ProcReader struct{}
 
-func NewProcReader(string, interface{}) *ProcReader { return &ProcReader{} }
+func NewProcReader(string, interface{}) *ProcReader             { return &ProcReader{} }
+func NewLegacyProcReader(string, interface{}) *ProcReader       { return &ProcReader{} }
+func RunLegacyProcHelper(context.Context, uint32, uint32) error { return ErrNativeDiscoveryUnsupported }
 func (*ProcReader) Processes(context.Context) ([]ProcessObservation, error) {
 	return nil, ErrNativeDiscoveryUnsupported
 }

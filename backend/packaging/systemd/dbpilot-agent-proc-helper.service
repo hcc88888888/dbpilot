@@ -1,0 +1,24 @@
+[Unit]
+Description=DBPilot legacy procfs discovery helper
+Documentation=file:///usr/share/doc/dbpilot-agent/README.md
+Before=dbpilot-agent.service
+Requires=dbpilot-agent-proc-helper.socket
+After=dbpilot-agent-proc-helper.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/dbpilot/proc-helper.env
+ExecStart=/usr/local/bin/dbpilot-agent proc-helper --allowed-uid=${DBPILOT_AGENT_UID} --allowed-gid=${DBPILOT_AGENT_GID}
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

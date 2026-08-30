@@ -8,9 +8,18 @@ import (
 
 func main() {
 	port := "43307"
+	comm := ""
 	for _, argument := range os.Args[1:] {
 		if strings.HasPrefix(argument, "--port=") {
 			port = strings.TrimPrefix(argument, "--port=")
+		}
+		if strings.HasPrefix(argument, "--comm=") {
+			comm = strings.TrimPrefix(argument, "--comm=")
+		}
+	}
+	if comm != "" {
+		if err := setProcessName(comm); err != nil {
+			panic("set fixture comm")
 		}
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:"+port)

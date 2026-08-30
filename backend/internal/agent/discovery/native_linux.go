@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,18 +16,42 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	domain "dbpilot.local/platform/internal/discovery"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	maximumCommBytes         = 4 << 10
+	maximumCmdlineBytes      = 64 << 10
+	maximumStatusBytes       = 64 << 10
+	maximumStatBytes         = 8 << 10
+	maximumCgroupBytes       = 64 << 10
+	maximumExecutableBytes   = 4 << 10
+	maximumNetworkTableBytes = 16 << 20
+	maximumProcEntries       = 1 << 16
+	maximumFDEntries         = 1 << 12
+)
+
+var (
+	ErrNativeDiscoveryPermissionDenied = errors.New("native discovery unavailable: permission_denied")
+	ErrNativeDiscoveryDataTooLarge     = errors.New("native discovery proc data exceeds configured bound")
+	errProcessSnapshotChanged          = errors.New("process snapshot changed")
+	pidfdOpen                          = unix.PidfdOpen
+	pidfdGetfd                         = unix.PidfdGetfd
+	legacySocketInodeReader            = requestLegacySocketInodes
 )
 
 type ProcessObservation struct {
-	PID        int
-	Name       string
-	Executable string
-	Arguments  []string
-	UID        uint32
-	StartTime  uint64
-	Cgroup     string
+	PID             int
+	Name            string
+	Executable      string
+	RequestedPort   uint16
+	RequestedSocket string
+	UID             uint32
+	StartTime       uint64
+	Cgroup          string
 }
 
 type EndpointObservation struct {
@@ -45,19 +70,34 @@ type SystemdFacts interface {
 }
 
 type ProcReader struct {
-	root    string
-	systemd SystemdFacts
+	root              string
+	systemd           SystemdFacts
+	readFile          func(string, int64) ([]byte, error)
+	readLink          func(string, int) (string, error)
+	readDir           func(string, int) ([]os.DirEntry, error)
+	forceLegacyHelper bool
+}
+
+// NewLegacyProcReader selects the fixed-protocol local helper used on kernels
+// without pidfd support. The helper socket path is fixed and not configurable.
+func NewLegacyProcReader(root string, systemd SystemdFacts) *ProcReader {
+	reader := NewProcReader(root, systemd)
+	reader.forceLegacyHelper = true
+	return reader
 }
 
 func NewProcReader(root string, systemd SystemdFacts) *ProcReader {
 	if root == "" {
 		root = "/proc"
 	}
-	return &ProcReader{root: filepath.Clean(root), systemd: systemd}
+	return &ProcReader{
+		root: filepath.Clean(root), systemd: systemd,
+		readFile: readBoundedFile, readLink: readLinkBounded, readDir: readDirectoryBounded,
+	}
 }
 
 func (reader *ProcReader) Processes(ctx context.Context) ([]ProcessObservation, error) {
-	entries, err := os.ReadDir(reader.root)
+	entries, err := reader.readDir(reader.root, maximumProcEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +110,17 @@ func (reader *ProcReader) Processes(ctx context.Context) ([]ProcessObservation, 
 		if err != nil || pid <= 0 || !entry.IsDir() {
 			continue
 		}
-		process, err := reader.process(pid)
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+		var process ProcessObservation
+		if reader.forceLegacyHelper {
+			process, err = requestLegacyProcess(pid)
+		} else {
+			process, err = reader.process(pid)
+		}
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errProcessSnapshotChanged) {
 			continue
+		}
+		if isPermission(err) {
+			return nil, fmt.Errorf("%w: inspect pid %d", ErrNativeDiscoveryPermissionDenied, pid)
 		}
 		if err != nil {
 			return nil, err
@@ -85,38 +133,58 @@ func (reader *ProcReader) Processes(ctx context.Context) ([]ProcessObservation, 
 
 func (reader *ProcReader) process(pid int) (ProcessObservation, error) {
 	base := filepath.Join(reader.root, strconv.Itoa(pid))
-	comm, err := os.ReadFile(filepath.Join(base, "comm"))
+	initialStat, err := reader.readFile(filepath.Join(base, "stat"), maximumStatBytes)
 	if err != nil {
 		return ProcessObservation{}, err
 	}
-	cmdline, err := os.ReadFile(filepath.Join(base, "cmdline"))
+	initialStartTime := parseStartTime(string(initialStat))
+	if initialStartTime == 0 {
+		return ProcessObservation{}, errProcessSnapshotChanged
+	}
+	executable, err := reader.readLink(filepath.Join(base, "exe"), maximumExecutableBytes)
 	if err != nil {
 		return ProcessObservation{}, err
 	}
-	status, err := os.ReadFile(filepath.Join(base, "status"))
+	if !filepath.IsAbs(executable) || strings.ContainsAny(executable, "\x00\r\n") {
+		return ProcessObservation{}, errProcessSnapshotChanged
+	}
+	comm, err := reader.readFile(filepath.Join(base, "comm"), maximumCommBytes)
 	if err != nil {
 		return ProcessObservation{}, err
 	}
-	stat, err := os.ReadFile(filepath.Join(base, "stat"))
+	cmdline, err := reader.readFile(filepath.Join(base, "cmdline"), maximumCmdlineBytes)
 	if err != nil {
 		return ProcessObservation{}, err
 	}
-	cgroup, err := os.ReadFile(filepath.Join(base, "cgroup"))
+	status, err := reader.readFile(filepath.Join(base, "status"), maximumStatusBytes)
+	if err != nil {
+		return ProcessObservation{}, err
+	}
+	cgroup, err := reader.readFile(filepath.Join(base, "cgroup"), maximumCgroupBytes)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return ProcessObservation{}, err
 	}
-	arguments := splitNUL(cmdline)
-	executable := ""
-	if len(arguments) > 0 {
-		executable = arguments[0]
+	finalStat, err := reader.readFile(filepath.Join(base, "stat"), maximumStatBytes)
+	if err != nil {
+		return ProcessObservation{}, err
 	}
+	finalStartTime := parseStartTime(string(finalStat))
+	if finalStartTime == 0 || finalStartTime != initialStartTime {
+		return ProcessObservation{}, errProcessSnapshotChanged
+	}
+	requestedPort, requestedSocket := parseAllowedArguments(cmdline)
 	uid := parseUID(string(status))
-	startTime := parseStartTime(string(stat))
-	return ProcessObservation{PID: pid, Name: strings.TrimSpace(string(comm)), Executable: executable, Arguments: arguments[1:], UID: uid, StartTime: startTime, Cgroup: strings.TrimSpace(string(cgroup))}, nil
+	return ProcessObservation{PID: pid, Name: bounded(strings.TrimSpace(string(comm)), domain.MaximumEvidenceBytes), Executable: executable, RequestedPort: requestedPort, RequestedSocket: requestedSocket, UID: uid, StartTime: initialStartTime, Cgroup: strings.TrimSpace(string(cgroup))}, nil
 }
 
 func (reader *ProcReader) ListeningEndpoints(ctx context.Context, pid int) ([]EndpointObservation, error) {
-	inodes, err := socketInodes(filepath.Join(reader.root, strconv.Itoa(pid), "fd"))
+	var inodes map[string]struct{}
+	var err error
+	if reader.forceLegacyHelper {
+		inodes, err = legacySocketInodeReader(pid, maximumFDEntries)
+	} else {
+		inodes, err = socketInodes(pid, filepath.Join(reader.root, strconv.Itoa(pid), "fd"))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +211,7 @@ func (reader *ProcReader) SystemdUnit(ctx context.Context, pid int) (string, boo
 	if reader.systemd != nil {
 		return reader.systemd.UnitForPID(ctx, pid)
 	}
-	value, err := os.ReadFile(filepath.Join(reader.root, strconv.Itoa(pid), "cgroup"))
+	value, err := reader.readFile(filepath.Join(reader.root, strconv.Itoa(pid), "cgroup"), maximumCgroupBytes)
 	if err != nil {
 		return "", false, err
 	}
@@ -169,17 +237,29 @@ func (detector *NativeDetector) Discover(ctx context.Context, rules []domain.Rul
 	}
 	candidates := make([]domain.CandidateObservation, 0)
 	for _, process := range processes {
-		service, _, _ := detector.reader.SystemdUnit(ctx, process.PID)
+		service, _, serviceErr := detector.reader.SystemdUnit(ctx, process.PID)
+		if isPermission(serviceErr) {
+			return nil, fmt.Errorf("%w: inspect systemd unit for pid %d", ErrNativeDiscoveryPermissionDenied, process.PID)
+		}
+		if serviceErr != nil && !errors.Is(serviceErr, os.ErrNotExist) {
+			return nil, serviceErr
+		}
 		for _, rule := range rules {
 			if rule.Validate() != nil || !matchesRule(process, service, rule) {
 				continue
 			}
 			endpoints, err := detector.reader.ListeningEndpoints(ctx, process.PID)
-			if err != nil && !errors.Is(err, os.ErrPermission) && !errors.Is(err, os.ErrNotExist) {
+			if isPermission(err) {
+				return nil, fmt.Errorf("%w: inspect listening endpoints for pid %d", ErrNativeDiscoveryPermissionDenied, process.PID)
+			}
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, err
 			}
-			endpoint := selectEndpoint(endpoints, rule.DefaultPorts, process.Arguments)
-			socket := socketArgument(process.Arguments)
+			endpoint := selectEndpoint(endpoints, rule.DefaultPorts, process.RequestedPort)
+			socket := ""
+			if matchesSocketPattern(process.RequestedSocket, rule.UnixSocketPatterns) {
+				socket = process.RequestedSocket
+			}
 			if socket == "" {
 				socket = selectUnixSocket(endpoints, rule.UnixSocketPatterns)
 			}
@@ -199,19 +279,16 @@ func (detector *NativeDetector) Discover(ctx context.Context, rules []domain.Rul
 			if socket != "" {
 				evidence = append(evidence, domain.Evidence{Kind: domain.EvidenceUnixSocket, Value: socket})
 			}
-			identity := service
-			if identity == "" {
-				identity = process.Name
-			}
-			candidates = append(candidates, domain.CandidateObservation{ObservationID: fmt.Sprintf("proc-%d-%d", process.PID, process.StartTime), Source: domain.SourceNative, DatabaseFamily: rule.DatabaseFamily, DatabaseVariant: rule.DatabaseVariant, NormalizedEndpoint: endpoint, UnixSocket: socket, ProcessIdentity: process.Name, ServiceName: service, Confidence: confidence(process, endpoint, service), Evidence: evidence})
+			candidates = append(candidates, domain.CandidateObservation{ObservationID: fmt.Sprintf("proc-%d-%d", process.PID, process.StartTime), Source: domain.SourceNative, DatabaseFamily: rule.DatabaseFamily, DatabaseVariant: rule.DatabaseVariant, NormalizedEndpoint: endpoint, UnixSocket: socket, ProcessIdentity: process.Executable, ServiceName: service, Confidence: confidence(process, endpoint, service), Evidence: evidence})
 		}
 	}
 	return candidates, nil
 }
 
 func matchesRule(process ProcessObservation, service string, rule domain.Rule) bool {
+	executableName := filepath.Base(strings.TrimSuffix(process.Executable, " (deleted)"))
 	for _, name := range rule.ProcessNames {
-		if process.Name == name || filepath.Base(process.Executable) == name {
+		if executableName == name {
 			return true
 		}
 	}
@@ -229,8 +306,7 @@ func matchesRule(process ProcessObservation, service string, rule domain.Rule) b
 	return false
 }
 
-func selectEndpoint(values []EndpointObservation, defaults []uint16, arguments []string) string {
-	requested := argumentPort(arguments)
+func selectEndpoint(values []EndpointObservation, defaults []uint16, requested uint16) string {
 	for _, value := range values {
 		_, portRaw, err := net.SplitHostPort(value.Address)
 		port, _ := strconv.ParseUint(portRaw, 10, 16)
@@ -254,43 +330,65 @@ func selectEndpoint(values []EndpointObservation, defaults []uint16, arguments [
 	return ""
 }
 
-func argumentPort(arguments []string) uint16 {
-	for index, value := range arguments {
-		raw := ""
-		if strings.HasPrefix(value, "--port=") {
-			raw = strings.TrimPrefix(value, "--port=")
-		} else if value == "--port" && index+1 < len(arguments) {
-			raw = arguments[index+1]
-		}
-		parsed, err := strconv.ParseUint(raw, 10, 16)
-		if err == nil && parsed > 0 {
-			return uint16(parsed)
-		}
-	}
-	return 0
-}
-
-func socketArgument(arguments []string) string {
-	for index, value := range arguments {
-		raw := ""
-		if strings.HasPrefix(value, "--socket=") {
-			raw = strings.TrimPrefix(value, "--socket=")
-		} else if value == "--socket" && index+1 < len(arguments) {
-			raw = arguments[index+1]
-		}
-		if strings.HasPrefix(raw, "/") && len(raw) <= 512 && !strings.ContainsAny(raw, "\x00\r\n") {
-			return filepath.Clean(raw)
-		}
-	}
-	return ""
-}
-
 func splitNUL(value []byte) []string {
 	parts := strings.Split(strings.TrimRight(string(value), "\x00"), "\x00")
 	if len(parts) == 1 && parts[0] == "" {
 		return nil
 	}
 	return parts
+}
+
+func parseAllowedArguments(cmdline []byte) (uint16, string) {
+	arguments := splitNUL(cmdline)
+	if len(arguments) < 2 {
+		return 0, ""
+	}
+	var port uint16
+	var socket string
+	for index := 1; index < len(arguments); index++ {
+		value := arguments[index]
+		switch {
+		case strings.HasPrefix(value, "--port="):
+			port = parsePort(strings.TrimPrefix(value, "--port="))
+		case value == "--port" && index+1 < len(arguments):
+			index++
+			port = parsePort(arguments[index])
+		case strings.HasPrefix(value, "--socket="):
+			socket = normalizeSocketArgument(strings.TrimPrefix(value, "--socket="))
+		case value == "--socket" && index+1 < len(arguments):
+			index++
+			socket = normalizeSocketArgument(arguments[index])
+		}
+	}
+	return port, socket
+}
+
+func parsePort(raw string) uint16 {
+	parsed, err := strconv.ParseUint(raw, 10, 16)
+	if err != nil || parsed == 0 {
+		return 0
+	}
+	return uint16(parsed)
+}
+
+func normalizeSocketArgument(raw string) string {
+	if !strings.HasPrefix(raw, "/") || len(raw) > 512 || strings.ContainsAny(raw, "\x00\r\n") {
+		return ""
+	}
+	return filepath.Clean(raw)
+}
+
+func matchesSocketPattern(socket string, patterns []string) bool {
+	if socket == "" || len(patterns) == 0 {
+		return false
+	}
+	for _, pattern := range patterns {
+		compiled, err := regexp.Compile(pattern)
+		if err == nil && compiled.MatchString(socket) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseUID(status string) uint32 {
@@ -317,14 +415,22 @@ func parseStartTime(stat string) uint64 {
 	return value
 }
 
-func socketInodes(directory string) (map[string]struct{}, error) {
-	entries, err := os.ReadDir(directory)
+func socketInodes(pid int, directory string) (map[string]struct{}, error) {
+	result, err := socketInodesFromDirectory(directory)
+	if isPermission(err) {
+		return socketInodesViaPIDFD(pid, maximumFDEntries)
+	}
+	return result, err
+}
+
+func socketInodesFromDirectory(directory string) (map[string]struct{}, error) {
+	entries, err := readDirectoryBounded(directory, maximumFDEntries)
 	if err != nil {
 		return nil, err
 	}
 	result := make(map[string]struct{})
 	for _, entry := range entries {
-		target, err := os.Readlink(filepath.Join(directory, entry.Name()))
+		target, err := readLinkBounded(filepath.Join(directory, entry.Name()), maximumExecutableBytes)
 		if err == nil && strings.HasPrefix(target, "socket:[") && strings.HasSuffix(target, "]") {
 			result[strings.TrimSuffix(strings.TrimPrefix(target, "socket:["), "]")] = struct{}{}
 		}
@@ -332,14 +438,51 @@ func socketInodes(directory string) (map[string]struct{}, error) {
 	return result, nil
 }
 
-func readTCP(file, network string, inodes map[string]struct{}) ([]EndpointObservation, error) {
-	handle, err := os.Open(file)
+func socketInodesViaPIDFD(pid, maximum int) (map[string]struct{}, error) {
+	pidfd, err := pidfdOpen(pid, 0)
+	if errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EINVAL) {
+		return legacySocketInodeReader(pid, maximum)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer handle.Close()
+	defer unix.Close(pidfd)
+	result := make(map[string]struct{})
+	for targetFD := 0; targetFD < maximum; targetFD++ {
+		duplicate, duplicateErr := pidfdGetfd(pidfd, targetFD, 0)
+		if errors.Is(duplicateErr, syscall.ENOSYS) || errors.Is(duplicateErr, syscall.EINVAL) {
+			return legacySocketInodeReader(pid, maximum)
+		}
+		if errors.Is(duplicateErr, syscall.EBADF) {
+			continue
+		}
+		if duplicateErr != nil {
+			return nil, duplicateErr
+		}
+		var status unix.Stat_t
+		statErr := unix.Fstat(duplicate, &status)
+		closeErr := unix.Close(duplicate)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if status.Mode&unix.S_IFMT == unix.S_IFSOCK {
+			result[strconv.FormatUint(status.Ino, 10)] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func readTCP(file, network string, inodes map[string]struct{}) ([]EndpointObservation, error) {
+	contents, err := readBoundedFile(file, maximumNetworkTableBytes)
+	if err != nil {
+		return nil, err
+	}
 	result := []EndpointObservation{}
-	scanner := bufio.NewScanner(handle)
+	scanner := bufio.NewScanner(strings.NewReader(string(contents)))
+	scanner.Buffer(make([]byte, 4096), maximumCommBytes)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 10 || fields[3] != "0A" {
@@ -357,13 +500,13 @@ func readTCP(file, network string, inodes map[string]struct{}) ([]EndpointObserv
 }
 
 func readUnix(file string, inodes map[string]struct{}) ([]EndpointObservation, error) {
-	handle, err := os.Open(file)
+	contents, err := readBoundedFile(file, maximumNetworkTableBytes)
 	if err != nil {
 		return nil, err
 	}
-	defer handle.Close()
 	result := []EndpointObservation{}
-	scanner := bufio.NewScanner(handle)
+	scanner := bufio.NewScanner(strings.NewReader(string(contents)))
+	scanner.Buffer(make([]byte, 4096), maximumCommBytes)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 8 {
@@ -444,4 +587,52 @@ func bounded(value string, maximum int) string {
 
 func domainSafeName(value string) bool {
 	return value != "" && len(value) <= 256 && !strings.ContainsAny(value, "\x00\r\n/\\")
+}
+
+func readBoundedFile(path string, maximum int64) ([]byte, error) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+	contents, err := io.ReadAll(io.LimitReader(handle, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(contents)) > maximum {
+		return nil, fmt.Errorf("%w: %s", ErrNativeDiscoveryDataTooLarge, filepath.Base(path))
+	}
+	return contents, nil
+}
+
+func readLinkBounded(path string, maximum int) (string, error) {
+	buffer := make([]byte, maximum+1)
+	length, err := unix.Readlink(path, buffer)
+	if err != nil {
+		return "", err
+	}
+	if length > maximum {
+		return "", fmt.Errorf("%w: %s", ErrNativeDiscoveryDataTooLarge, filepath.Base(path))
+	}
+	return string(buffer[:length]), nil
+}
+
+func readDirectoryBounded(path string, maximum int) ([]os.DirEntry, error) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+	entries, err := handle.ReadDir(maximum + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(entries) > maximum {
+		return nil, fmt.Errorf("%w: %s directory", ErrNativeDiscoveryDataTooLarge, filepath.Base(path))
+	}
+	return entries, nil
+}
+
+func isPermission(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES)
 }

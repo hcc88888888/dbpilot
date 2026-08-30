@@ -8,6 +8,10 @@ Wants=network-online.target
 Type=simple
 User=dbpilot
 Group=dbpilot
+# Native discovery reads cross-UID /proc/<pid>/exe and fd socket links. Keep the
+# production Agent unprivileged and grant only the process-inspection capability.
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 ExecStart=/usr/local/bin/dbpilot-agent --config /etc/dbpilot/agent.yaml
 Restart=on-failure
 RestartSec=5s
