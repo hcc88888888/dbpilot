@@ -47,6 +47,7 @@ const (
 	PermissionPublishPluginVersion           = "plugins:publish"
 	PermissionReconcilePluginAssignment      = "plugins:deploy"
 	PermissionRediscoverHost                 = "hosts:discover"
+	PermissionReplaceHostEnrollment          = "hosts:manage"
 	PermissionRetireDatabaseInstance         = "database-instances:manage"
 	PermissionRetryInspectionRun             = "inspection:execute"
 	PermissionRevokePluginVersion            = "plugins:publish"
@@ -105,6 +106,7 @@ var OperationPermissions = map[string]string{
 	"publishPluginVersion":           PermissionPublishPluginVersion,
 	"reconcilePluginAssignment":      PermissionReconcilePluginAssignment,
 	"rediscoverHost":                 PermissionRediscoverHost,
+	"replaceHostEnrollment":          PermissionReplaceHostEnrollment,
 	"retireDatabaseInstance":         PermissionRetireDatabaseInstance,
 	"retryInspectionRun":             PermissionRetryInspectionRun,
 	"revokePluginVersion":            PermissionRevokePluginVersion,

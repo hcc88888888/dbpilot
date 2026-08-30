@@ -815,6 +815,8 @@
   $ref: ./hosts.yaml#/HostsCollection
 /host-enrollments:
   $ref: ./hosts.yaml#/HostEnrollments
+/host-enrollments/{host_id}/actions/replace:
+  $ref: ./hosts.yaml#/HostEnrollmentReplace
 /hosts/{host_id}:
   $ref: ./hosts.yaml#/HostItem
 /hosts/{host_id}/actions/rediscover:

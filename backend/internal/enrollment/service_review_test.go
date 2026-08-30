@@ -89,6 +89,10 @@ func (store *attemptMemoryStore) Create(context.Context, EnrollmentToken) (Enrol
 	return EnrollmentTokenCreation{Generation: 1}, nil
 }
 
+func (store *attemptMemoryStore) Replace(_ context.Context, _ EnrollmentToken, expected uint64) (EnrollmentTokenCreation, error) {
+	return EnrollmentTokenCreation{Generation: expected + 1, Replaced: true}, nil
+}
+
 func (store *attemptMemoryStore) Resolve(_ context.Context, key EnrollmentAttemptKey) (EnrollmentResolution, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()

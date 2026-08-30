@@ -114,6 +114,135 @@ func TestCloseReportsExactDiscardedStateAcrossLanes(t *testing.T) {
 	close(sink.blockHeartbeat)
 }
 
+func TestHostDeliveryLanesServeDistinctKeysInFIFOOrderAndReturnHotKeyToTail(t *testing.T) {
+	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	for _, kind := range []hostLaneKind{hostLaneObservation, hostLaneHello, hostLaneHeartbeat} {
+		t.Run(hostLaneName(kind), func(t *testing.T) {
+			sink := newOrderedHostSink(kind, "agent-a")
+			dispatcher, err := NewHostObservationDispatcher(sink, HostObservationDispatcherConfig{MaximumPendingHosts: 8, DeliveryTimeout: time.Second, RetryBackoff: time.Millisecond})
+			require.NoError(t, err)
+			require.NoError(t, dispatcher.Start(context.Background()))
+			require.NoError(t, submitLaneEvent(dispatcher, kind, "agent-a", 1, base))
+			requireReceive(t, sink.blocked, "hot key did not enter persistence")
+			for index, agentID := range []string{"agent-b", "agent-c", "agent-d", "agent-e", "agent-f", "agent-g", "agent-h"} {
+				require.NoError(t, submitLaneEvent(dispatcher, kind, agentID, uint64(index+1), base.Add(time.Duration(index+1)*time.Second)))
+			}
+			require.NoError(t, submitLaneEvent(dispatcher, kind, "agent-a", 2, base.Add(20*time.Second)))
+			close(sink.release)
+
+			want := []string{"agent-a", "agent-b", "agent-c", "agent-d", "agent-e", "agent-f", "agent-g", "agent-h", "agent-a"}
+			for _, agentID := range want {
+				select {
+				case got := <-sink.delivered:
+					require.Equal(t, agentID, got.agentID)
+				case <-time.After(time.Second):
+					t.Fatalf("%s lane did not deliver %s in FIFO order", hostLaneName(kind), agentID)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, err = dispatcher.Close(ctx)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestTimedOutNeverReturningKeyIsQuarantinedWithoutBlockingColdKeysInEveryLane(t *testing.T) {
+	base := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	for _, kind := range []hostLaneKind{hostLaneObservation, hostLaneHello, hostLaneHeartbeat} {
+		t.Run(hostLaneName(kind), func(t *testing.T) {
+			sink := newOrderedHostSink(kind, "agent-a")
+			dispatcher, err := NewHostObservationDispatcher(sink, HostObservationDispatcherConfig{MaximumPendingHosts: 2, DeliveryTimeout: 15 * time.Millisecond, RetryBackoff: time.Millisecond})
+			require.NoError(t, err)
+			require.NoError(t, dispatcher.Start(context.Background()))
+			require.NoError(t, submitLaneEvent(dispatcher, kind, "agent-a", 1, base))
+			requireReceive(t, sink.blocked, "never-returning key did not enter persistence")
+			require.NoError(t, submitLaneEvent(dispatcher, kind, "agent-a", 2, base.Add(time.Second)))
+			require.NoError(t, submitLaneEvent(dispatcher, kind, "agent-b", 1, base.Add(2*time.Second)))
+
+			select {
+			case got := <-sink.delivered:
+				require.Equal(t, "agent-b", got.agentID)
+			case <-time.After(250 * time.Millisecond):
+				t.Fatalf("%s lane let a timed-out sink call block a cold key", hostLaneName(kind))
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			report, closeErr := dispatcher.Close(ctx)
+			cancel()
+			require.ErrorIs(t, closeErr, context.DeadlineExceeded)
+			switch kind {
+			case hostLaneObservation:
+				require.Equal(t, uint64(1), report.ObservationDiscarded)
+			case hostLaneHello:
+				require.Equal(t, uint64(1), report.HelloDiscarded)
+			case hostLaneHeartbeat:
+				require.Equal(t, uint64(1), report.HeartbeatDiscarded)
+			}
+			close(sink.release)
+		})
+	}
+}
+
+type orderedHostSink struct {
+	kind      hostLaneKind
+	blockKey  string
+	blocked   chan struct{}
+	release   chan struct{}
+	delivered chan reviewHostEvent
+	once      sync.Once
+}
+
+func newOrderedHostSink(kind hostLaneKind, blockKey string) *orderedHostSink {
+	return &orderedHostSink{kind: kind, blockKey: blockKey, blocked: make(chan struct{}), release: make(chan struct{}), delivered: make(chan reviewHostEvent, 32)}
+}
+
+func (sink *orderedHostSink) record(agentID string, revision uint64, at time.Time) error {
+	if agentID == sink.blockKey {
+		sink.once.Do(func() { close(sink.blocked) })
+		<-sink.release
+	}
+	sink.delivered <- reviewHostEvent{agentID: agentID, revision: revision, at: at}
+	return nil
+}
+
+func (sink *orderedHostSink) RecordObservation(_ context.Context, agentID string, observation *agentv1.HostObservation) error {
+	return sink.record(agentID, observation.GetObservationRevision(), observation.GetObservedAt().AsTime())
+}
+
+func (sink *orderedHostSink) RecordHello(_ context.Context, agentID string, at time.Time) error {
+	return sink.record(agentID, 0, at)
+}
+
+func (sink *orderedHostSink) RecordHeartbeat(_ context.Context, agentID string, at time.Time) error {
+	return sink.record(agentID, 0, at)
+}
+
+func submitLaneEvent(dispatcher *HostObservationDispatcher, kind hostLaneKind, agentID string, revision uint64, at time.Time) error {
+	switch kind {
+	case hostLaneObservation:
+		return dispatcher.SubmitObservation(agentID, reviewObservation(agentID, revision, at))
+	case hostLaneHello:
+		return dispatcher.SubmitHello(agentID, at)
+	case hostLaneHeartbeat:
+		return dispatcher.SubmitHeartbeat(agentID, at)
+	default:
+		return ErrHostObservationInvalid
+	}
+}
+
+func hostLaneName(kind hostLaneKind) string {
+	switch kind {
+	case hostLaneObservation:
+		return "observation"
+	case hostLaneHello:
+		return "hello"
+	case hostLaneHeartbeat:
+		return "heartbeat"
+	default:
+		return "unknown"
+	}
+}
+
 type reviewHostEvent struct {
 	agentID  string
 	revision uint64

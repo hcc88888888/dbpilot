@@ -24,9 +24,11 @@ const (
 )
 
 var (
-	ErrEnrollmentRequestInvalid = errors.New("invalid Agent enrollment request")
-	ErrEnrollmentTokenInvalid   = errors.New("Agent enrollment token is invalid")
-	ErrEnrollmentConflict       = errors.New("Agent enrollment conflicts with existing state")
+	ErrEnrollmentRequestInvalid     = errors.New("invalid Agent enrollment request")
+	ErrEnrollmentTokenInvalid       = errors.New("Agent enrollment token is invalid")
+	ErrEnrollmentConflict           = errors.New("Agent enrollment conflicts with existing state")
+	ErrEnrollmentNotFound           = errors.New("Agent enrollment token claim was not found")
+	ErrEnrollmentGenerationConflict = errors.New("Agent enrollment generation conflict")
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -47,6 +49,23 @@ type EnrollmentToken struct {
 	IdempotencyKey     string
 	RequestFingerprint string
 	Generation         uint64
+	Audit              EnrollmentAudit
+}
+
+type EnrollmentAudit struct {
+	Actor          string
+	RequestID      string
+	TraceID        string
+	OperationID    string
+	IdempotencyKey string
+}
+
+func (value EnrollmentAudit) Validate() error {
+	if !bounded(value.Actor, 256, true) || !bounded(value.RequestID, 256, true) || !bounded(value.TraceID, 256, false) ||
+		!bounded(value.OperationID, 256, true) || !bounded(value.IdempotencyKey, 128, true) {
+		return ErrEnrollmentRequestInvalid
+	}
+	return nil
 }
 
 func (token EnrollmentToken) Validate() error {
@@ -55,7 +74,7 @@ func (token EnrollmentToken) Validate() error {
 		!bounded(token.DisplayName, 120, true) || !validLabels(token.Labels) ||
 		!validUTC(token.CreatedAt) || !validUTC(token.ExpiresAt) || !token.ExpiresAt.After(token.CreatedAt) ||
 		token.EnrollmentRevision == 0 || !bounded(token.IssuedBy, 256, true) || !bounded(token.IdempotencyKey, 128, true) ||
-		!fingerprintPattern.MatchString(token.RequestFingerprint) || token.Generation == 0 {
+		!fingerprintPattern.MatchString(token.RequestFingerprint) || token.Generation == 0 || token.Audit.Validate() != nil {
 		return ErrEnrollmentRequestInvalid
 	}
 	return nil
@@ -99,6 +118,7 @@ type CreateRequest struct {
 	IssuedBy           string
 	IdempotencyKey     string
 	RequestFingerprint string
+	Audit              EnrollmentAudit
 }
 
 type CreatedEnrollment struct {
@@ -159,6 +179,7 @@ type EnrollmentCompletion struct {
 
 type EnrollmentStore interface {
 	Create(context.Context, EnrollmentToken) (EnrollmentTokenCreation, error)
+	Replace(context.Context, EnrollmentToken, uint64) (EnrollmentTokenCreation, error)
 	Resolve(context.Context, EnrollmentAttemptKey) (EnrollmentResolution, error)
 	Complete(context.Context, EnrollmentCompletion) (EnrollResult, error)
 }

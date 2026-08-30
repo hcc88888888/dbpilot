@@ -49,6 +49,12 @@ export interface HostEnrollment {
      * @memberof HostEnrollment
      */
     enrollmentRevision: number;
+    /**
+     *
+     * @type {number}
+     * @memberof HostEnrollment
+     */
+    generation: number;
 }
 
 /**
@@ -60,6 +66,7 @@ export function instanceOfHostEnrollment(value: object): value is HostEnrollment
     if (!('enrollmentToken' in value) || value['enrollmentToken'] === undefined) return false;
     if (!('expiresAt' in value) || value['expiresAt'] === undefined) return false;
     if (!('enrollmentRevision' in value) || value['enrollmentRevision'] === undefined) return false;
+    if (!('generation' in value) || value['generation'] === undefined) return false;
     return true;
 }
 
@@ -77,6 +84,7 @@ export function HostEnrollmentFromJSONTyped(json: any, ignoreDiscriminator: bool
         'enrollmentToken': json['enrollment_token'],
         'expiresAt': (new Date(json['expires_at'])),
         'enrollmentRevision': json['enrollment_revision'],
+        'generation': json['generation'],
     };
 }
 
@@ -95,5 +103,6 @@ export function HostEnrollmentToJSONTyped(value?: HostEnrollment | null, ignoreD
         'enrollment_token': value['enrollmentToken'],
         'expires_at': ((value['expiresAt']).toISOString()),
         'enrollment_revision': value['enrollmentRevision'],
+        'generation': value['generation'],
     };
 }

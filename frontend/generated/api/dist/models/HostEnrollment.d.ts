@@ -45,6 +45,12 @@ export interface HostEnrollment {
      * @memberof HostEnrollment
      */
     enrollmentRevision: number;
+    /**
+     *
+     * @type {number}
+     * @memberof HostEnrollment
+     */
+    generation: number;
 }
 /**
  * Check if a given object implements the HostEnrollment interface.

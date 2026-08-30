@@ -70,6 +70,7 @@ type ProcessingClaim struct {
 	OwnerToken     string
 	CreatedAt      time.Time
 	Reconciliation []byte
+	Response       *Response
 }
 
 type RecoverProcessingFunc func(context.Context, ProcessingClaim) (Response, error)
@@ -92,6 +93,10 @@ type Store interface {
 	Abort(context.Context, Key, string, string) error
 }
 
+type incompleteSideEffectStore interface {
+	RepairIncompleteSideEffect(context.Context, Key, string, string, Response, []byte, time.Time) (Response, error)
+}
+
 type Service struct {
 	store    Store
 	now      func() time.Time
@@ -104,7 +109,7 @@ func NewService(store Store) *Service {
 }
 
 func (service *Service) Begin(ctx context.Context, key Key, fingerprint string, reconcile ReconcileFunc) (Claim, error) {
-	return service.begin(ctx, key, fingerprint, nil, reconcile, nil)
+	return service.begin(ctx, key, fingerprint, nil, reconcile, nil, false)
 }
 
 // BeginRecoverable persists the original reconciliation payload with the
@@ -114,10 +119,20 @@ func (service *Service) BeginRecoverable(ctx context.Context, key Key, fingerpri
 	if validateReconciliation(reconciliation) != nil || recover == nil {
 		return Claim{}, ErrInvalid
 	}
-	return service.begin(ctx, key, fingerprint, reconciliation, reconcile, recover)
+	return service.begin(ctx, key, fingerprint, reconciliation, reconcile, recover, false)
 }
 
-func (service *Service) begin(ctx context.Context, key Key, fingerprint string, reconciliation []byte, reconcile ReconcileFunc, recover RecoverProcessingFunc) (Claim, error) {
+// BeginUnreturnedRecoverable is for one-time secret responses that are never
+// persisted. If a prior handler could not finish its public marker, recover
+// fences and replaces the now-unreachable secret before any 201 is returned.
+func (service *Service) BeginUnreturnedRecoverable(ctx context.Context, key Key, fingerprint string, reconciliation []byte, reconcile ReconcileFunc, recover RecoverProcessingFunc) (Claim, error) {
+	if validateReconciliation(reconciliation) != nil || recover == nil {
+		return Claim{}, ErrInvalid
+	}
+	return service.begin(ctx, key, fingerprint, reconciliation, reconcile, recover, true)
+}
+
+func (service *Service) begin(ctx context.Context, key Key, fingerprint string, reconciliation []byte, reconcile ReconcileFunc, recover RecoverProcessingFunc, recoverIncomplete bool) (Claim, error) {
 	if service == nil || service.store == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || reconcile == nil {
 		return Claim{}, ErrInvalid
 	}
@@ -176,6 +191,30 @@ func (service *Service) begin(ctx context.Context, key Key, fingerprint string, 
 	}
 	claim.Response = &response
 	phaseReconciliation := append([]byte(nil), claim.Reconciliation...)
+	if recoverIncomplete && (claim.State == StateSideEffectCommitted || claim.State == StateAudited) {
+		repairStore, ok := service.store.(incompleteSideEffectStore)
+		if !ok || !ownerPattern.MatchString(claim.OwnerToken) || validateReconciliation(phaseReconciliation) != nil {
+			return Claim{}, ErrInvalid
+		}
+		previous := cloneResponse(response)
+		repaired, recoverErr := recover(ctx, ProcessingClaim{
+			OwnerToken: claim.OwnerToken, CreatedAt: claim.CreatedAt.UTC(), Reconciliation: append([]byte(nil), phaseReconciliation...), Response: &previous,
+		})
+		if recoverErr != nil {
+			return Claim{}, recoverErr
+		}
+		if validateResponse(repaired) != nil {
+			return Claim{}, ErrInvalid
+		}
+		response, err = repairStore.RepairIncompleteSideEffect(ctx, key, fingerprint, claim.OwnerToken, repaired, phaseReconciliation, service.currentTime())
+		if err != nil {
+			return Claim{}, err
+		}
+		if validateResponse(response) != nil {
+			return Claim{}, ErrInvalid
+		}
+		claim.State = StateSideEffectCommitted
+	}
 	switch claim.State {
 	case StateCompleted:
 		if claim.OwnerToken != "" || claim.Reconciliation != nil {

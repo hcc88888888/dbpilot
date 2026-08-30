@@ -65,6 +65,7 @@ import type {
   PluginVersionStatus,
   Problem,
   PublishPluginVersionRequest,
+  ReplaceHostEnrollmentRequest,
   RevokePluginVersionRequest,
   UpdateDatabaseInstanceRequest,
   UpdateInspectionPolicyRequest,
@@ -171,6 +172,8 @@ import {
     ProblemToJSON,
     PublishPluginVersionRequestFromJSON,
     PublishPluginVersionRequestToJSON,
+    ReplaceHostEnrollmentRequestFromJSON,
+    ReplaceHostEnrollmentRequestToJSON,
     RevokePluginVersionRequestFromJSON,
     RevokePluginVersionRequestToJSON,
     UpdateDatabaseInstanceRequestFromJSON,
@@ -408,6 +411,13 @@ export interface ReconcilePluginAssignmentRequest {
 export interface RediscoverHostRequest {
     hostId: string;
     idempotencyKey: string;
+}
+
+export interface ReplaceHostEnrollmentOperationRequest {
+    hostId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    replaceHostEnrollmentRequest: ReplaceHostEnrollmentRequest;
 }
 
 export interface RetireDatabaseInstanceRequest {
@@ -2862,6 +2872,83 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async rediscoverHost(requestParameters: RediscoverHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job> {
         const response = await this.rediscoverHostRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    async replaceHostEnrollmentRaw(requestParameters: ReplaceHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<HostEnrollment>> {
+        if (requestParameters['hostId'] == null) {
+            throw new runtime.RequiredError(
+                'hostId',
+                'Required parameter "hostId" was null or undefined when calling replaceHostEnrollment().'
+            );
+        }
+
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling replaceHostEnrollment().'
+            );
+        }
+
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError(
+                'ifMatch',
+                'Required parameter "ifMatch" was null or undefined when calling replaceHostEnrollment().'
+            );
+        }
+
+        if (requestParameters['replaceHostEnrollmentRequest'] == null) {
+            throw new runtime.RequiredError(
+                'replaceHostEnrollmentRequest',
+                'Required parameter "replaceHostEnrollmentRequest" was null or undefined when calling replaceHostEnrollment().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/host-enrollments/{host_id}/actions/replace`;
+        urlPath = urlPath.replace(`{${"host_id"}}`, encodeURIComponent(String(requestParameters['hostId'])));
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: ReplaceHostEnrollmentRequestToJSON(requestParameters['replaceHostEnrollmentRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => HostEnrollmentFromJSON(jsonValue));
+    }
+
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    async replaceHostEnrollment(requestParameters: ReplaceHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<HostEnrollment> {
+        const response = await this.replaceHostEnrollmentRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

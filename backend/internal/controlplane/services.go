@@ -43,12 +43,14 @@ type CapabilityService interface {
 type IdempotencyService interface {
 	Begin(context.Context, idempotency.Key, string, idempotency.ReconcileFunc) (idempotency.Claim, error)
 	BeginRecoverable(context.Context, idempotency.Key, string, []byte, idempotency.ReconcileFunc, idempotency.RecoverProcessingFunc) (idempotency.Claim, error)
+	BeginUnreturnedRecoverable(context.Context, idempotency.Key, string, []byte, idempotency.ReconcileFunc, idempotency.RecoverProcessingFunc) (idempotency.Claim, error)
 	Complete(context.Context, idempotency.Key, string, string, idempotency.Response, []byte, idempotency.ReconcileFunc) (idempotency.Response, error)
 	Abort(context.Context, idempotency.Key, string, string) error
 }
 
 type EnrollmentService interface {
 	Create(context.Context, platformscope.Scope, enrollment.CreateRequest) (enrollment.CreatedEnrollment, error)
+	Replace(context.Context, platformscope.Scope, enrollment.CreateRequest, uint64) (enrollment.CreatedEnrollment, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host

@@ -144,6 +144,15 @@ func TestPostgresStoreAdvancesSideEffectAuditAndCompletionByOwner(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, response, committed)
 
+	repairedResponse := Response{Status: http.StatusCreated, Header: http.Header{"ETag": {`"9"`}}, Body: []byte(`{"generation":9}`)}
+	mock.ExpectExec(regexp.QuoteMeta(repairIncompleteSideEffectSQL)).
+		WithArgs(repairedResponse.Status, `{"ETag":["\"9\""]}`, repairedResponse.Body, string(reconciliation), now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	repaired, err := NewPostgresStore(database).RepairIncompleteSideEffect(context.Background(), key, fingerprint, owner, repairedResponse, reconciliation, now)
+	require.NoError(t, err)
+	require.Equal(t, repairedResponse, repaired)
+	response = repairedResponse
+
 	mock.ExpectExec(regexp.QuoteMeta(markAuditedSQL)).
 		WithArgs(now, key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner).
 		WillReturnResult(sqlmock.NewResult(0, 1))

@@ -108,6 +108,7 @@ models/PluginVersionPage.ts
 models/PluginVersionStatus.ts
 models/Problem.ts
 models/PublishPluginVersionRequest.ts
+models/ReplaceHostEnrollmentRequest.ts
 models/ResourceReference.ts
 models/RevokePluginVersionRequest.ts
 models/UpdateDatabaseInstanceRequest.ts

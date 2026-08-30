@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -23,16 +25,76 @@ func TestPostgresCreatePersistsHashScopeAndNoRawToken(t *testing.T) {
 	labels, err := json.Marshal(token.Labels)
 	require.NoError(t, err)
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT token_hash, request_fingerprint, consumed_at, generation`).
-		WithArgs(token.Scope.TenantID, token.Scope.ProjectID, token.IssuedBy, token.IdempotencyKey).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT token_hash, consumed_at, generation`).
+		WithArgs(token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(`(?s)INSERT INTO agent_enrollment_tokens.*request_fingerprint.*generation.*RETURNING token_hash, generation`).
 		WithArgs(token.TokenHash[:], token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, 1).
 		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "generation"}).AddRow(token.TokenHash[:], 1))
+	mock.ExpectExec(`INSERT INTO audit_events`).
+		WithArgs(sqlmock.AnyArg(), token.Scope.TenantID, token.Scope.ProjectID, token.CreatedAt, "host.enrollment_created", token.Audit.Actor, token.HostID, token.Audit.RequestID, token.Audit.TraceID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	_, err = NewPostgresRepository(database).Create(context.Background(), token)
 
 	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresReplaceUsesGenerationCASAndCommitsAuditInTheSameTransaction(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	oldHash := HashToken([]byte("old-token"))
+	token := validEnrollmentToken(HashToken([]byte("replacement-token")), now)
+	token.IdempotencyKey = "replace-host-1"
+	token.Audit.OperationID = "replaceHostEnrollment"
+	labels, err := json.Marshal(token.Labels)
+	require.NoError(t, err)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT token_hash, consumed_at, generation`).
+		WithArgs(token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).
+		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "consumed_at", "generation"}).AddRow(oldHash[:], nil, 1))
+	mock.ExpectQuery(`(?s)UPDATE agent_enrollment_tokens SET.*WHERE token_hash = \$13 AND generation = \$14.*RETURNING token_hash, generation`).
+		WithArgs(token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision, 2, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, oldHash[:], uint64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "generation"}).AddRow(token.TokenHash[:], 2))
+	mock.ExpectExec(`INSERT INTO audit_events`).
+		WithArgs(sqlmock.AnyArg(), token.Scope.TenantID, token.Scope.ProjectID, token.CreatedAt, "host.enrollment_replaced", token.Audit.Actor, token.HostID, token.Audit.RequestID, token.Audit.TraceID, sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	creation, err := NewPostgresRepository(database).Replace(context.Background(), token, 1)
+
+	require.NoError(t, err)
+	require.Equal(t, EnrollmentTokenCreation{Generation: 2, Replaced: true}, creation)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresReplacementAuditFailureRollsBackTokenGeneration(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	oldHash := HashToken([]byte("old-token"))
+	token := validEnrollmentToken(HashToken([]byte("replacement-token")), now)
+	token.IdempotencyKey = "replace-host-1"
+	token.Audit.OperationID = "replaceHostEnrollment"
+	labels, err := json.Marshal(token.Labels)
+	require.NoError(t, err)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT token_hash, consumed_at, generation`).
+		WithArgs(token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).
+		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "consumed_at", "generation"}).AddRow(oldHash[:], nil, 1))
+	mock.ExpectQuery(`UPDATE agent_enrollment_tokens SET`).
+		WithArgs(token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision, 2, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, oldHash[:], uint64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "generation"}).AddRow(token.TokenHash[:], 2))
+	mock.ExpectExec(`INSERT INTO audit_events`).WillReturnError(errors.New("audit unavailable"))
+	mock.ExpectRollback()
+
+	_, err = NewPostgresRepository(database).Replace(context.Background(), token, 1)
+
+	require.ErrorContains(t, err, "record enrollment Audit")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -110,12 +172,26 @@ func TestRunMigrationsCreatesHashOnlyEnrollmentTable(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0001_agent_enrollment.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec(`(?s)CREATE TABLE agent_enrollment_tokens.*token_hash BYTEA PRIMARY KEY.*expires_at TIMESTAMPTZ.*consumed_at TIMESTAMPTZ.*UNIQUE.*idempotency_key.*CREATE TABLE agent_enrollment_issuances.*csr_digest BYTEA.*certificate_pem BYTEA`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)CREATE TABLE agent_enrollment_tokens.*token_hash BYTEA PRIMARY KEY.*expires_at TIMESTAMPTZ.*consumed_at TIMESTAMPTZ.*UNIQUE.*idempotency_key`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0001_agent_enrollment.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0002_recoverable_enrollment.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec(`(?s)ALTER TABLE agent_enrollment_tokens.*request_fingerprint.*generation.*CREATE TABLE IF NOT EXISTS agent_enrollment_issuances.*csr_digest BYTEA.*certificate_pem BYTEA`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0002_recoverable_enrollment.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	err = RunMigrations(context.Background(), database)
 
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestEnrollmentMigration0001RemainsByteIdenticalToAppliedSchema(t *testing.T) {
+	want, err := os.ReadFile("testdata/0001_agent_enrollment_original.sql")
+	require.NoError(t, err)
+	got, err := migrationFiles.ReadFile("migrations/0001_agent_enrollment.sql")
+	require.NoError(t, err)
+	require.Equal(t, want, got, "an applied migration must never be rewritten")
 }

@@ -12,7 +12,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateHostEnrollmentRequestToJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, HostEnrollmentFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, PublishPluginVersionRequestToJSON, RevokePluginVersionRequestToJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
+import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateHostEnrollmentRequestToJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, HostEnrollmentFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, PublishPluginVersionRequestToJSON, ReplaceHostEnrollmentRequestToJSON, RevokePluginVersionRequestToJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
 /**
  *
  */
@@ -1723,6 +1723,56 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async rediscoverHost(requestParameters, initOverrides) {
         const response = await this.rediscoverHostRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    async replaceHostEnrollmentRaw(requestParameters, initOverrides) {
+        if (requestParameters['hostId'] == null) {
+            throw new runtime.RequiredError('hostId', 'Required parameter "hostId" was null or undefined when calling replaceHostEnrollment().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling replaceHostEnrollment().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling replaceHostEnrollment().');
+        }
+        if (requestParameters['replaceHostEnrollmentRequest'] == null) {
+            throw new runtime.RequiredError('replaceHostEnrollmentRequest', 'Required parameter "replaceHostEnrollmentRequest" was null or undefined when calling replaceHostEnrollment().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/host-enrollments/{host_id}/actions/replace`;
+        urlPath = urlPath.replace(`{${"host_id"}}`, encodeURIComponent(String(requestParameters['hostId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: ReplaceHostEnrollmentRequestToJSON(requestParameters['replaceHostEnrollmentRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => HostEnrollmentFromJSON(jsonValue));
+    }
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    async replaceHostEnrollment(requestParameters, initOverrides) {
+        const response = await this.replaceHostEnrollmentRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**

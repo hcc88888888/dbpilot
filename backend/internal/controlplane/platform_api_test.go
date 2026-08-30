@@ -1030,6 +1030,7 @@ type httpIdempotencyStore struct {
 	mu                sync.Mutex
 	records           map[string]httpIdempotencyRecord
 	completeErr       error
+	commitUnknownErr  error
 	markAuditedErr    error
 	abortCalls        int
 	claimedOwners     []string
@@ -1078,7 +1079,7 @@ func (store *httpIdempotencyStore) Claim(_ context.Context, request idempotency.
 		ownerToken = ""
 		reconciliation = nil
 	}
-	return idempotency.Claim{OwnerToken: ownerToken, State: record.state, Response: &response, Reconciliation: reconciliation}, nil
+	return idempotency.Claim{OwnerToken: ownerToken, State: record.state, CreatedAt: record.createdAt, Response: &response, Reconciliation: reconciliation}, nil
 }
 
 func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, _ time.Time) (idempotency.Response, error) {
@@ -1098,7 +1099,25 @@ func (store *httpIdempotencyStore) CommitSideEffect(_ context.Context, key idemp
 	record.response = cloneIdempotencyResponse(response)
 	record.reconciliation = append([]byte(nil), reconciliation...)
 	store.records[mapKey] = record
+	if store.commitUnknownErr != nil {
+		return idempotency.Response{}, store.commitUnknownErr
+	}
 	return cloneIdempotencyResponse(record.response), nil
+}
+
+func (store *httpIdempotencyStore) RepairIncompleteSideEffect(_ context.Context, key idempotency.Key, fingerprint, owner string, response idempotency.Response, reconciliation []byte, _ time.Time) (idempotency.Response, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	mapKey := key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+	record, exists := store.records[mapKey]
+	if !exists || record.fingerprint != fingerprint || record.owner != owner || record.state != idempotency.StateSideEffectCommitted && record.state != idempotency.StateAudited {
+		return idempotency.Response{}, idempotency.ErrOwnershipConflict
+	}
+	record.state = idempotency.StateSideEffectCommitted
+	record.response = cloneIdempotencyResponse(response)
+	record.reconciliation = append([]byte(nil), reconciliation...)
+	store.records[mapKey] = record
+	return cloneIdempotencyResponse(response), nil
 }
 
 func (store *httpIdempotencyStore) MarkAudited(_ context.Context, key idempotency.Key, fingerprint, owner string, _ time.Time) error {

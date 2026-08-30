@@ -30,6 +30,7 @@ func TestCreateEnrollmentStoresOnlyTokenHashAndTrustedScope(t *testing.T) {
 		HostID: "host-1", AgentID: "agent-1", DisplayName: "Primary database host",
 		Labels: map[string]string{"role": "database"}, ExpiresIn: 10 * time.Minute,
 		IssuedBy: "operator-1", IdempotencyKey: "enroll-1", RequestFingerprint: "sha256:" + strings.Repeat("1", 64),
+		Audit: EnrollmentAudit{Actor: "operator-1", RequestID: "request-1", OperationID: "createHostEnrollment", IdempotencyKey: "enroll-1"},
 	})
 
 	require.NoError(t, err)
@@ -147,6 +148,7 @@ func validEnrollmentToken(hash [32]byte, now time.Time) EnrollmentToken {
 		Labels: map[string]string{"role": "database"}, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		EnrollmentRevision: 1, IssuedBy: "operator-1", IdempotencyKey: "enroll-1",
 		RequestFingerprint: "sha256:" + strings.Repeat("1", 64), Generation: 1,
+		Audit: EnrollmentAudit{Actor: "operator-1", RequestID: "request-1", OperationID: "createHostEnrollment", IdempotencyKey: "enroll-1"},
 	}
 }
 
@@ -214,6 +216,10 @@ func (store *memoryTokenStore) Resolve(context.Context, EnrollmentAttemptKey) (E
 
 func (store *memoryTokenStore) Complete(context.Context, EnrollmentCompletion) (EnrollResult, error) {
 	return EnrollResult{}, ErrEnrollmentTokenInvalid
+}
+
+func (store *memoryTokenStore) Replace(context.Context, EnrollmentToken, uint64) (EnrollmentTokenCreation, error) {
+	return EnrollmentTokenCreation{}, ErrEnrollmentConflict
 }
 
 type rejectingIssuer struct{}

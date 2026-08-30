@@ -90,17 +90,19 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusForbidden, "forbidden", "Access is forbidden"
 	case errors.Is(err, ErrMethodNotAllowed):
 		status, code, title = http.StatusMethodNotAllowed, "method_not_allowed", "Method is not allowed"
-	case errors.Is(err, job.ErrNotFound), errors.Is(err, artifact.ErrNotFound), errors.Is(err, hostinventory.ErrNotFound), errors.Is(err, inspection.ErrNotFound), errors.Is(err, plugincatalog.ErrNotFound):
+	case errors.Is(err, job.ErrNotFound), errors.Is(err, artifact.ErrNotFound), errors.Is(err, enrollment.ErrEnrollmentNotFound), errors.Is(err, hostinventory.ErrNotFound), errors.Is(err, inspection.ErrNotFound), errors.Is(err, plugincatalog.ErrNotFound):
 		status, code, title = http.StatusNotFound, "not_found", "Resource was not found"
 	case errors.Is(err, ErrPreconditionFailed):
 		status, code, title = http.StatusPreconditionFailed, "precondition_failed", "Request precondition failed"
+	case errors.Is(err, ErrEnrollmentTokenNotReplayable):
+		status, code, title = http.StatusConflict, "enrollment_token_not_replayable", "One-time enrollment token delivery cannot be replayed"
 	case errors.Is(err, idempotency.ErrKeyConflict), errors.Is(err, inspection.ErrIdempotencyConflict):
 		status, code, title = http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with the request"
 	case errors.Is(err, idempotency.ErrInProgress):
 		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"
 	case errors.Is(err, idempotency.ErrOwnershipConflict):
 		status, code, title = http.StatusConflict, "idempotency_ownership_conflict", "Idempotency claim ownership changed"
-	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, enrollment.ErrEnrollmentConflict), errors.Is(err, hostinventory.ErrConflict), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable), errors.Is(err, plugincatalog.ErrConflict):
+	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, enrollment.ErrEnrollmentConflict), errors.Is(err, enrollment.ErrEnrollmentGenerationConflict), errors.Is(err, hostinventory.ErrConflict), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable), errors.Is(err, plugincatalog.ErrConflict):
 		status, code, title = http.StatusConflict, "conflict", "Resource state conflicts with the request"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		status, code, title = http.StatusGatewayTimeout, "timeout", "Operation timed out"

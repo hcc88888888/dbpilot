@@ -91,6 +91,16 @@ type pendingHostLaneEvent struct {
 	retryAt time.Time
 }
 
+type hostLaneAttempt struct {
+	event    hostLaneEvent
+	timedOut bool
+}
+
+type hostLaneDeliveryResult struct {
+	agentID string
+	err     error
+}
+
 type hostObservationLane struct {
 	kind            hostLaneKind
 	sink            HostObservationSink
@@ -101,12 +111,15 @@ type hostObservationLane struct {
 
 	mu        sync.Mutex
 	pending   map[string]pendingHostLaneEvent
-	inFlight  *hostLaneEvent
+	queue     []string
+	queued    map[string]bool
+	active    map[string]hostLaneAttempt
 	started   bool
 	accepting bool
 	closing   bool
 	aborted   bool
 	wake      chan struct{}
+	results   chan hostLaneDeliveryResult
 	done      chan struct{}
 	doneOnce  sync.Once
 	cancel    context.CancelFunc
@@ -141,7 +154,8 @@ func NewHostObservationDispatcher(sink HostObservationSink, config HostObservati
 		return &hostObservationLane{
 			kind: kind, sink: sink, maximumPending: config.MaximumPendingHosts, deliveryTimeout: config.DeliveryTimeout,
 			retryBackoff: retryBackoff, onError: config.OnError, pending: make(map[string]pendingHostLaneEvent),
-			wake: make(chan struct{}, 1), done: make(chan struct{}),
+			queued: make(map[string]bool), active: make(map[string]hostLaneAttempt), queue: make([]string, 0, config.MaximumPendingHosts),
+			wake: make(chan struct{}, 1), results: make(chan hostLaneDeliveryResult, config.MaximumPendingHosts), done: make(chan struct{}),
 		}
 	}
 	return &HostObservationDispatcher{
@@ -268,18 +282,23 @@ func (lane *hostObservationLane) submit(event hostLaneEvent) error {
 		return ErrHostObservationClosed
 	}
 	pending, pendingExists := lane.pending[event.agentID]
-	inFlightSameKey := lane.inFlight != nil && lane.inFlight.agentID == event.agentID
-	if !pendingExists && !inFlightSameKey && lane.distinctKeysLocked() >= lane.maximumPending {
+	active, activeSameKey := lane.active[event.agentID]
+	if !pendingExists && !activeSameKey && lane.distinctKeysLocked() >= lane.maximumPending {
 		lane.rejectedNewKeys.Add(1)
 		return ErrHostObservationCapacity
 	}
-	if pendingExists || inFlightSameKey {
+	if pendingExists || activeSameKey {
 		lane.coalesced.Add(1)
 	}
 	if pendingExists {
 		event = mergeHostLaneEvent(lane.kind, pending.event, event)
+	} else if activeSameKey {
+		event = mergeHostLaneEvent(lane.kind, active.event, event)
 	}
 	lane.pending[event.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event)}
+	if !activeSameKey {
+		lane.enqueueLocked(event.agentID)
+	}
 	lane.accepted.Add(1)
 	lane.signalLocked()
 	return nil
@@ -299,15 +318,9 @@ func (lane *hostObservationLane) run(ctx context.Context) {
 			}
 			continue
 		}
-		err, late := lane.deliver(ctx, event)
-		lane.complete(event, err)
-		if late != nil {
-			select {
-			case <-late:
-			case <-ctx.Done():
-				lane.abort()
-				return
-			}
+		if !lane.deliver(ctx, event) {
+			lane.abort()
+			return
 		}
 	}
 }
@@ -320,23 +333,36 @@ func (lane *hostObservationLane) next(now time.Time) (hostLaneEvent, time.Durati
 	}
 	var selected string
 	var earliest time.Time
-	for agentID, pending := range lane.pending {
-		if pending.retryAt.IsZero() || !pending.retryAt.After(now) {
-			selected = agentID
-			break
+	queueLength := len(lane.queue)
+	for index := 0; index < queueLength; index++ {
+		agentID := lane.queue[0]
+		lane.queue = lane.queue[1:]
+		lane.queued[agentID] = false
+		pending, exists := lane.pending[agentID]
+		if !exists {
+			continue
 		}
-		if earliest.IsZero() || pending.retryAt.Before(earliest) {
-			earliest = pending.retryAt
+		if _, active := lane.active[agentID]; active {
+			continue
 		}
+		if !pending.retryAt.IsZero() && pending.retryAt.After(now) {
+			lane.enqueueLocked(agentID)
+			if earliest.IsZero() || pending.retryAt.Before(earliest) {
+				earliest = pending.retryAt
+			}
+			continue
+		}
+		selected = agentID
+		break
 	}
 	if selected != "" {
 		pending := lane.pending[selected]
 		delete(lane.pending, selected)
 		event := cloneHostLaneEvent(pending.event)
-		lane.inFlight = &event
+		lane.active[selected] = hostLaneAttempt{event: event}
 		return event, 0, true, false
 	}
-	if lane.closing && len(lane.pending) == 0 && lane.inFlight == nil {
+	if lane.closing && len(lane.pending) == 0 && len(lane.active) == 0 {
 		return hostLaneEvent{}, 0, false, true
 	}
 	if !earliest.IsZero() {
@@ -350,6 +376,9 @@ func (lane *hostObservationLane) wait(ctx context.Context, delay time.Duration) 
 		select {
 		case <-lane.wake:
 			return true
+		case result := <-lane.results:
+			lane.completeDelivery(result)
+			return true
 		case <-ctx.Done():
 			return false
 		}
@@ -359,6 +388,9 @@ func (lane *hostObservationLane) wait(ctx context.Context, delay time.Duration) 
 	select {
 	case <-lane.wake:
 		return true
+	case result := <-lane.results:
+		lane.completeDelivery(result)
+		return true
 	case <-timer.C:
 		return true
 	case <-ctx.Done():
@@ -366,18 +398,27 @@ func (lane *hostObservationLane) wait(ctx context.Context, delay time.Duration) 
 	}
 }
 
-func (lane *hostObservationLane) deliver(parent context.Context, event hostLaneEvent) (error, <-chan error) {
+func (lane *hostObservationLane) deliver(parent context.Context, event hostLaneEvent) bool {
 	deliveryContext, cancel := context.WithTimeout(parent, lane.deliveryTimeout)
-	result := make(chan error, 1)
-	go func() { result <- lane.callSink(deliveryContext, event) }()
-	select {
-	case err := <-result:
-		cancel()
-		return err, nil
-	case <-deliveryContext.Done():
-		err := deliveryContext.Err()
-		cancel()
-		return err, result
+	go func() {
+		lane.results <- hostLaneDeliveryResult{agentID: event.agentID, err: lane.callSink(deliveryContext, event)}
+	}()
+	defer cancel()
+	for {
+		select {
+		case result := <-lane.results:
+			if result.agentID == event.agentID {
+				lane.completeDelivery(result)
+				return true
+			}
+			lane.completeDelivery(result)
+		case <-deliveryContext.Done():
+			if parent.Err() != nil {
+				return false
+			}
+			lane.timeoutDelivery(event, deliveryContext.Err())
+			return true
+		}
 	}
 }
 
@@ -394,25 +435,71 @@ func (lane *hostObservationLane) callSink(ctx context.Context, event hostLaneEve
 	}
 }
 
-func (lane *hostObservationLane) complete(event hostLaneEvent, deliveryErr error) {
+func (lane *hostObservationLane) timeoutDelivery(event hostLaneEvent, deliveryErr error) {
 	var reportErr error
 	lane.mu.Lock()
 	if lane.aborted {
 		lane.mu.Unlock()
 		return
 	}
-	lane.inFlight = nil
-	if deliveryErr == nil {
+	attempt, exists := lane.active[event.agentID]
+	if !exists || attempt.timedOut {
+		lane.mu.Unlock()
+		return
+	}
+	attempt.timedOut = true
+	lane.active[event.agentID] = attempt
+	pending, pendingExists := lane.pending[event.agentID]
+	if pendingExists {
+		event = mergeHostLaneEvent(lane.kind, event, pending.event)
+	}
+	lane.pending[event.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event), retryAt: time.Now().Add(lane.retryBackoff)}
+	lane.failed.Add(1)
+	lane.retried.Add(1)
+	reportErr = deliveryErr
+	lane.signalLocked()
+	lane.mu.Unlock()
+	if reportErr != nil && lane.onError != nil {
+		lane.onError(reportErr)
+	}
+}
+
+func (lane *hostObservationLane) completeDelivery(result hostLaneDeliveryResult) {
+	var reportErr error
+	lane.mu.Lock()
+	if lane.aborted {
+		lane.mu.Unlock()
+		return
+	}
+	attempt, exists := lane.active[result.agentID]
+	if !exists {
+		lane.mu.Unlock()
+		return
+	}
+	delete(lane.active, result.agentID)
+	if attempt.timedOut {
+		if _, pending := lane.pending[result.agentID]; pending {
+			lane.enqueueLocked(result.agentID)
+		}
+		lane.signalLocked()
+		lane.mu.Unlock()
+		return
+	}
+	if result.err == nil {
 		lane.delivered.Add(1)
+		if _, pending := lane.pending[result.agentID]; pending {
+			lane.enqueueLocked(result.agentID)
+		}
 	} else {
 		lane.failed.Add(1)
 		lane.retried.Add(1)
-		pending, exists := lane.pending[event.agentID]
-		if exists {
+		event := attempt.event
+		if pending, pendingExists := lane.pending[result.agentID]; pendingExists {
 			event = mergeHostLaneEvent(lane.kind, event, pending.event)
 		}
-		lane.pending[event.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event), retryAt: time.Now().Add(lane.retryBackoff)}
-		reportErr = deliveryErr
+		lane.pending[result.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event), retryAt: time.Now().Add(lane.retryBackoff)}
+		lane.enqueueLocked(result.agentID)
+		reportErr = result.err
 	}
 	lane.signalLocked()
 	lane.mu.Unlock()
@@ -436,16 +523,18 @@ func (lane *hostObservationLane) abort() {
 		return
 	}
 	lane.accepting, lane.aborted = false, true
-	keys := make(map[string]struct{}, len(lane.pending)+1)
+	keys := make(map[string]struct{}, len(lane.pending)+len(lane.active))
 	for agentID := range lane.pending {
 		keys[agentID] = struct{}{}
 	}
-	if lane.inFlight != nil {
-		keys[lane.inFlight.agentID] = struct{}{}
+	for agentID := range lane.active {
+		keys[agentID] = struct{}{}
 	}
 	lane.discarded.Add(uint64(len(keys)))
 	lane.pending = make(map[string]pendingHostLaneEvent)
-	lane.inFlight = nil
+	lane.active = make(map[string]hostLaneAttempt)
+	lane.queue = nil
+	lane.queued = make(map[string]bool)
 	cancel := lane.cancel
 	lane.mu.Unlock()
 	if cancel != nil {
@@ -465,10 +554,18 @@ func (lane *hostObservationLane) signalLocked() {
 	}
 }
 
+func (lane *hostObservationLane) enqueueLocked(agentID string) {
+	if lane.queued[agentID] {
+		return
+	}
+	lane.queue = append(lane.queue, agentID)
+	lane.queued[agentID] = true
+}
+
 func (lane *hostObservationLane) distinctKeysLocked() int {
 	count := len(lane.pending)
-	if lane.inFlight != nil {
-		if _, pending := lane.pending[lane.inFlight.agentID]; !pending {
+	for agentID := range lane.active {
+		if _, pending := lane.pending[agentID]; !pending {
 			count++
 		}
 	}

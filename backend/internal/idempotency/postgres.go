@@ -14,6 +14,7 @@ const insertClaimSQL = "INSERT INTO idempotency_records (tenant_id, project_id, 
 const reclaimExpiredCompletedSQL = "UPDATE idempotency_records SET request_fingerprint = $1, owner_token = $2, state = 'processing', response_status = 0, response_headers = '{}'::jsonb, response_json = NULL, audit_event_json = $3, expires_at = $4, created_at = $5, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND state = 'completed' AND expires_at <= $5 RETURNING created_at"
 const selectRecordSQL = "SELECT request_fingerprint, owner_token, state, response_status, response_headers, response_json, audit_event_json, created_at FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
 const commitSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, audit_event_json = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND request_fingerprint = $11 AND owner_token = $12 AND state = 'processing'"
+const repairIncompleteSideEffectSQL = "UPDATE idempotency_records SET state = 'side_effect_committed', response_status = $1, response_headers = $2, response_json = $3, audit_event_json = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND actor = $8 AND operation_id = $9 AND idempotency_key = $10 AND request_fingerprint = $11 AND owner_token = $12 AND state IN ('side_effect_committed', 'audited')"
 const markAuditedSQL = "UPDATE idempotency_records SET state = 'audited', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'side_effect_committed'"
 const completeClaimSQL = "UPDATE idempotency_records SET state = 'completed', updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND actor = $4 AND operation_id = $5 AND idempotency_key = $6 AND request_fingerprint = $7 AND owner_token = $8 AND state = 'audited'"
 const abortClaimSQL = "DELETE FROM idempotency_records WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5 AND request_fingerprint = $6 AND owner_token = $7 AND state = 'processing'"
@@ -87,7 +88,7 @@ func (store *PostgresStore) Claim(ctx context.Context, request ClaimRequest) (Cl
 		return Claim{OwnerToken: record.owner, State: record.state, CreatedAt: record.createdAt.UTC(), Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	case StateSideEffectCommitted, StateAudited:
 		response := cloneResponse(record.response)
-		return Claim{OwnerToken: record.owner, State: record.state, Response: &response, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
+		return Claim{OwnerToken: record.owner, State: record.state, CreatedAt: record.createdAt.UTC(), Response: &response, Reconciliation: append([]byte(nil), record.reconciliation...)}, nil
 	case StateCompleted:
 		response := cloneResponse(record.response)
 		return Claim{State: StateCompleted, Response: &response}, nil
@@ -112,6 +113,28 @@ func (store *PostgresStore) CommitSideEffect(ctx context.Context, key Key, finge
 	rows, err := result.RowsAffected()
 	if err != nil {
 		return Response{}, fmt.Errorf("read idempotency side-effect result: %w", err)
+	}
+	if rows != 1 {
+		return Response{}, ErrOwnershipConflict
+	}
+	return cloneResponse(response), nil
+}
+
+func (store *PostgresStore) RepairIncompleteSideEffect(ctx context.Context, key Key, fingerprint, owner string, response Response, reconciliation []byte, at time.Time) (Response, error) {
+	if store == nil || store.database == nil || ctx == nil || validateKey(key) != nil || !fingerprintPattern.MatchString(fingerprint) || !ownerPattern.MatchString(owner) || validateResponse(response) != nil || validateReconciliation(reconciliation) != nil || at.IsZero() {
+		return Response{}, ErrInvalid
+	}
+	headerJSON, err := json.Marshal(response.Header)
+	if err != nil {
+		return Response{}, ErrInvalid
+	}
+	result, err := store.database.ExecContext(ctx, repairIncompleteSideEffectSQL, response.Status, string(headerJSON), response.Body, string(reconciliation), at.UTC(), key.Scope.TenantID, key.Scope.ProjectID, key.Actor, key.OperationID, key.IdempotencyKey, fingerprint, owner)
+	if err != nil {
+		return Response{}, fmt.Errorf("repair incomplete idempotency side effect: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return Response{}, fmt.Errorf("read repaired idempotency side-effect result: %w", err)
 	}
 	if rows != 1 {
 		return Response{}, ErrOwnershipConflict

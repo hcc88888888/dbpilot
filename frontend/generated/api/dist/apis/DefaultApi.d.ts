@@ -10,7 +10,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateHostEnrollmentRequest, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostEnrollment, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, PublishPluginVersionRequest, RevokePluginVersionRequest, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
+import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateHostEnrollmentRequest, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostEnrollment, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, PublishPluginVersionRequest, ReplaceHostEnrollmentRequest, RevokePluginVersionRequest, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
 export interface AcceptDiscoveryCandidateOperationRequest {
     candidateId: string;
     idempotencyKey: string;
@@ -197,6 +197,12 @@ export interface ReconcilePluginAssignmentRequest {
 export interface RediscoverHostRequest {
     hostId: string;
     idempotencyKey: string;
+}
+export interface ReplaceHostEnrollmentOperationRequest {
+    hostId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    replaceHostEnrollmentRequest: ReplaceHostEnrollmentRequest;
 }
 export interface RetireDatabaseInstanceRequest {
     instanceId: string;
@@ -610,6 +616,14 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Trigger a bounded database rediscovery job
      */
     rediscoverHost(requestParameters: RediscoverHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    replaceHostEnrollmentRaw(requestParameters: ReplaceHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<HostEnrollment>>;
+    /**
+     * Explicitly replace an unconsumed one-time Agent enrollment token
+     */
+    replaceHostEnrollment(requestParameters: ReplaceHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<HostEnrollment>;
     /**
      * Retire a managed database instance
      */

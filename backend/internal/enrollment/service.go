@@ -29,6 +29,17 @@ type ApplicationService struct {
 }
 
 func (service ApplicationService) Create(ctx context.Context, scope platformscope.Scope, request CreateRequest) (CreatedEnrollment, error) {
+	return service.createToken(ctx, scope, request, 0, false)
+}
+
+func (service ApplicationService) Replace(ctx context.Context, scope platformscope.Scope, request CreateRequest, expectedGeneration uint64) (CreatedEnrollment, error) {
+	if expectedGeneration == 0 {
+		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
+	}
+	return service.createToken(ctx, scope, request, expectedGeneration, true)
+}
+
+func (service ApplicationService) createToken(ctx context.Context, scope platformscope.Scope, request CreateRequest, expectedGeneration uint64, replacing bool) (CreatedEnrollment, error) {
 	if ctx == nil || service.Tokens == nil || scope.Validate() != nil {
 		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
 	}
@@ -52,18 +63,24 @@ func (service ApplicationService) Create(ctx context.Context, scope platformscop
 		TokenHash: HashToken(raw), Scope: scope, HostID: request.HostID, AgentID: request.AgentID,
 		DisplayName: request.DisplayName, Labels: cloneLabels(request.Labels), CreatedAt: now, ExpiresAt: now.Add(ttl),
 		EnrollmentRevision: 1, IssuedBy: request.IssuedBy, IdempotencyKey: request.IdempotencyKey,
-		RequestFingerprint: request.RequestFingerprint, Generation: 1,
+		RequestFingerprint: request.RequestFingerprint, Generation: 1, Audit: request.Audit,
 	}
 	if token.Validate() != nil {
 		zero(raw)
 		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
 	}
-	creation, err := service.Tokens.Create(ctx, token)
+	var creation EnrollmentTokenCreation
+	var err error
+	if replacing {
+		creation, err = service.Tokens.Replace(ctx, token, expectedGeneration)
+	} else {
+		creation, err = service.Tokens.Create(ctx, token)
+	}
 	if err != nil {
 		zero(raw)
 		return CreatedEnrollment{}, err
 	}
-	if creation.Generation == 0 {
+	if creation.Generation == 0 || creation.Replaced != replacing {
 		zero(raw)
 		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
 	}

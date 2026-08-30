@@ -3,7 +3,9 @@ package enrollment
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,16 +20,17 @@ const createEnrollmentTokenSQL = `INSERT INTO agent_enrollment_tokens (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 RETURNING token_hash, generation`
 
-const findEnrollmentTokenClaimSQL = `SELECT token_hash, request_fingerprint, consumed_at, generation
+const findEnrollmentTokenReplacementSQL = `SELECT token_hash, consumed_at, generation
 FROM agent_enrollment_tokens
-WHERE tenant_id = $1 AND project_id = $2 AND issued_by = $3 AND idempotency_key = $4
+WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3 AND agent_id = $4
+  AND consumed_at IS NULL
 FOR UPDATE`
 
 const replaceEnrollmentTokenSQL = `UPDATE agent_enrollment_tokens SET
     token_hash = $1, host_id = $2, agent_id = $3, display_name = $4, labels = $5,
-    expires_at = $6, created_at = $7, enrollment_revision = $8, generation = $9
-WHERE tenant_id = $10 AND project_id = $11 AND issued_by = $12 AND idempotency_key = $13
-  AND consumed_at IS NULL
+    expires_at = $6, created_at = $7, enrollment_revision = $8, generation = $9,
+    issued_by = $10, idempotency_key = $11, request_fingerprint = $12
+WHERE token_hash = $13 AND generation = $14 AND consumed_at IS NULL
 RETURNING token_hash, generation`
 
 const resolveEnrollmentSQL = `SELECT
@@ -46,6 +49,12 @@ const insertIssuanceSQL = `INSERT INTO agent_enrollment_issuances (
 const consumeCommittedTokenSQL = `UPDATE agent_enrollment_tokens
 SET consumed_at = CURRENT_TIMESTAMP
 WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > CURRENT_TIMESTAMP`
+
+const insertEnrollmentAuditSQL = `INSERT INTO audit_events (
+    id, tenant_id, project_id, occurred_at, action, actor_type, actor_id,
+    resource_type, resource_id, result, request_id, trace_id, job_id, command_id,
+    dedupe_key, detail, created_at
+) VALUES ($1, $2, $3, $4, $5, 'user', $6, 'host', $7, 'success', $8, $9, '', '', $10, $11, $4)`
 
 type postgresDatabase interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -76,11 +85,9 @@ func (repository *PostgresRepository) Create(ctx context.Context, token Enrollme
 	}
 	rollback := func() { _ = transaction.Rollback() }
 	var existingHash []byte
-	var existingFingerprint string
 	var consumedAt sql.NullTime
 	var generation int64
-	err = transaction.QueryRowContext(ctx, findEnrollmentTokenClaimSQL, token.Scope.TenantID, token.Scope.ProjectID, token.IssuedBy, token.IdempotencyKey).Scan(&existingHash, &existingFingerprint, &consumedAt, &generation)
-	replaced := false
+	err = transaction.QueryRowContext(ctx, findEnrollmentTokenReplacementSQL, token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).Scan(&existingHash, &consumedAt, &generation)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		generation = 1
@@ -92,16 +99,9 @@ func (repository *PostgresRepository) Create(ctx context.Context, token Enrollme
 	case err != nil:
 		rollback()
 		return EnrollmentTokenCreation{}, mapPostgresError(err)
-	case existingFingerprint != token.RequestFingerprint || consumedAt.Valid || generation < 1:
+	default:
 		rollback()
 		return EnrollmentTokenCreation{}, ErrEnrollmentConflict
-	default:
-		replaced = true
-		generation++
-		err = transaction.QueryRowContext(ctx, replaceEnrollmentTokenSQL,
-			token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt,
-			token.EnrollmentRevision, generation, token.Scope.TenantID, token.Scope.ProjectID, token.IssuedBy, token.IdempotencyKey,
-		).Scan(&existingHash, &generation)
 	}
 	if err != nil {
 		rollback()
@@ -111,10 +111,93 @@ func (repository *PostgresRepository) Create(ctx context.Context, token Enrollme
 		rollback()
 		return EnrollmentTokenCreation{}, ErrEnrollmentRequestInvalid
 	}
+	if err := insertEnrollmentAudit(ctx, transaction, token, uint64(generation), false); err != nil {
+		rollback()
+		return EnrollmentTokenCreation{}, err
+	}
 	if err := transaction.Commit(); err != nil {
 		return EnrollmentTokenCreation{}, err
 	}
-	return EnrollmentTokenCreation{Generation: uint64(generation), Replaced: replaced}, nil
+	return EnrollmentTokenCreation{Generation: uint64(generation)}, nil
+}
+
+func (repository *PostgresRepository) Replace(ctx context.Context, token EnrollmentToken, expectedGeneration uint64) (EnrollmentTokenCreation, error) {
+	if repository == nil || repository.database == nil || ctx == nil || token.Validate() != nil || expectedGeneration == 0 {
+		return EnrollmentTokenCreation{}, ErrEnrollmentRequestInvalid
+	}
+	labels, err := json.Marshal(token.Labels)
+	if err != nil {
+		return EnrollmentTokenCreation{}, ErrEnrollmentRequestInvalid
+	}
+	transaction, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return EnrollmentTokenCreation{}, err
+	}
+	rollback := func() { _ = transaction.Rollback() }
+	var existingHash []byte
+	var consumedAt sql.NullTime
+	var generation int64
+	err = transaction.QueryRowContext(ctx, findEnrollmentTokenReplacementSQL, token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).Scan(&existingHash, &consumedAt, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		rollback()
+		return EnrollmentTokenCreation{}, ErrEnrollmentNotFound
+	}
+	if err != nil {
+		rollback()
+		return EnrollmentTokenCreation{}, mapPostgresError(err)
+	}
+	if consumedAt.Valid || generation < 1 {
+		rollback()
+		return EnrollmentTokenCreation{}, ErrEnrollmentConflict
+	}
+	if uint64(generation) != expectedGeneration {
+		rollback()
+		return EnrollmentTokenCreation{}, ErrEnrollmentGenerationConflict
+	}
+	generation++
+	err = transaction.QueryRowContext(ctx, replaceEnrollmentTokenSQL,
+		token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt,
+		token.EnrollmentRevision, generation, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, existingHash, expectedGeneration,
+	).Scan(&existingHash, &generation)
+	if err != nil {
+		rollback()
+		return EnrollmentTokenCreation{}, mapPostgresError(err)
+	}
+	if !bytes.Equal(existingHash, token.TokenHash[:]) || generation < 2 {
+		rollback()
+		return EnrollmentTokenCreation{}, ErrEnrollmentRequestInvalid
+	}
+	if err := insertEnrollmentAudit(ctx, transaction, token, uint64(generation), true); err != nil {
+		rollback()
+		return EnrollmentTokenCreation{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return EnrollmentTokenCreation{}, err
+	}
+	return EnrollmentTokenCreation{Generation: uint64(generation), Replaced: true}, nil
+}
+
+func insertEnrollmentAudit(ctx context.Context, transaction *sql.Tx, token EnrollmentToken, generation uint64, replaced bool) error {
+	action := "host.enrollment_created"
+	if replaced {
+		action = "host.enrollment_replaced"
+	}
+	identity := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d", token.Scope.Key(), token.Audit.Actor, token.Audit.OperationID, token.Audit.IdempotencyKey, generation)
+	digest := sha256.Sum256([]byte(identity))
+	hexDigest := hex.EncodeToString(digest[:])
+	detail, err := json.Marshal(map[string]any{"operation_id": token.Audit.OperationID, "generation": generation})
+	if err != nil {
+		return ErrEnrollmentRequestInvalid
+	}
+	_, err = transaction.ExecContext(ctx, insertEnrollmentAuditSQL,
+		"audit-enrollment-"+hexDigest, token.Scope.TenantID, token.Scope.ProjectID, token.CreatedAt, action,
+		token.Audit.Actor, token.HostID, token.Audit.RequestID, token.Audit.TraceID,
+		"host.enrollment:"+hexDigest, detail,
+	)
+	if err != nil {
+		return fmt.Errorf("record enrollment Audit: %w", err)
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) Resolve(ctx context.Context, key EnrollmentAttemptKey) (EnrollmentResolution, error) {
@@ -246,6 +329,8 @@ func mapPostgresError(err error) error {
 		return err
 	}
 	switch postgresError.Code {
+	case "40001":
+		return ErrEnrollmentGenerationConflict
 	case "23505", "23503":
 		return ErrEnrollmentConflict
 	case "23502", "23514", "22P02", "22001":

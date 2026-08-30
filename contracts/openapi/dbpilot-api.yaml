@@ -157,6 +157,8 @@ components:
       $ref: ./common/hosts.yaml#/CreateHostEnrollmentRequest
     HostEnrollment:
       $ref: ./common/hosts.yaml#/HostEnrollment
+    ReplaceHostEnrollmentRequest:
+      $ref: ./common/hosts.yaml#/ReplaceHostEnrollmentRequest
     ManagedHost:
       $ref: ./common/hosts.yaml#/ManagedHost
     ManagedHostPage:

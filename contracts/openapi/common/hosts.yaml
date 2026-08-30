@@ -94,7 +94,7 @@ CreateHostEnrollmentRequest:
 HostEnrollment:
   type: object
   additionalProperties: false
-  required: [host_id, agent_id, enrollment_token, expires_at, enrollment_revision]
+  required: [host_id, agent_id, enrollment_token, expires_at, enrollment_revision, generation]
   properties:
     host_id:
       $ref: '#/HostId'
@@ -111,6 +111,36 @@ HostEnrollment:
       type: integer
       format: int64
       minimum: 1
+    generation:
+      type: integer
+      format: int64
+      minimum: 1
+ReplaceHostEnrollmentRequest:
+  type: object
+  additionalProperties: false
+  required: [agent_id, display_name, expires_in_seconds]
+  properties:
+    agent_id:
+      $ref: '#/AgentId'
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    labels:
+      type: object
+      maxProperties: 32
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$'
+      additionalProperties:
+        type: string
+        maxLength: 128
+    expires_in_seconds:
+      type: integer
+      minimum: 60
+      maximum: 3600
 ManagedHost:
   type: object
   additionalProperties: false

@@ -104,6 +104,7 @@ export * from './PluginVersionPage.js';
 export * from './PluginVersionStatus.js';
 export * from './Problem.js';
 export * from './PublishPluginVersionRequest.js';
+export * from './ReplaceHostEnrollmentRequest.js';
 export * from './ResourceReference.js';
 export * from './RevokePluginVersionRequest.js';
 export * from './UpdateDatabaseInstanceRequest.js';
