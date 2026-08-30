@@ -1,7 +1,6 @@
 package plugincatalog
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -138,7 +137,7 @@ func (service *Application) publishVerifiedOperation(ctx context.Context, scope 
 }
 
 func authoritativeVerifiedPackageMatches(value OperationSnapshot, verified VerifiedPackage, auditJSON []byte) bool {
-	return value.Key.Scope == value.Version.Scope && value.Version.ID != "" && value.Version.PackageSHA256 == verified.PackageSHA256 && value.Version.ManifestDigest == verified.ManifestDigest && value.ArtifactID == value.Version.ArtifactID && value.ArtifactSHA256 == verified.PackageSHA256 && value.ArtifactBytes == verified.SizeBytes && value.Version.PluginID == verified.Manifest.PluginID && value.Version.Version == verified.Manifest.Version && bytes.Equal(value.AuditEventJSON, auditJSON)
+	return value.Key.Scope == value.Version.Scope && value.Version.ID != "" && value.Version.PackageSHA256 == verified.PackageSHA256 && value.Version.ManifestDigest == verified.ManifestDigest && value.ArtifactID == value.Version.ArtifactID && value.ArtifactSHA256 == verified.PackageSHA256 && value.ArtifactBytes == verified.SizeBytes && value.Version.PluginID == verified.Manifest.PluginID && value.Version.Version == verified.Manifest.Version && AuditPayloadMatches(value.AuditEventJSON, auditJSON)
 }
 
 func (service *Application) valuesForVerified(scope platformscope.Scope, metadata UploadMetadata, sourceResourceID string, createdAt time.Time, verified VerifiedPackage) (PluginDefinition, PluginVersion, artifact.Artifact, error) {

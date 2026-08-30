@@ -124,7 +124,7 @@ func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFail
 	require.Len(t, artifacts.values, 1)
 	require.Equal(t, "plugin_catalog_operation", artifacts.values[0].SourceResource.ResourceType)
 	require.Equal(t, key.RecordID(), artifacts.values[0].SourceResource.ResourceID)
-	originalResponse := repository.operation.Response
+	originalResponse, originalLease := repository.operation.Response, repository.operation.LeaseExpiresAt
 
 	repository.finalizeOperationErr = nil
 	clock = clock.Add(5 * time.Minute)
@@ -132,6 +132,7 @@ func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFail
 	require.NoError(t, err)
 	require.Equal(t, OperationCommitted, snapshot.State)
 	require.Equal(t, originalResponse, snapshot.Response)
+	require.Equal(t, originalLease, snapshot.LeaseExpiresAt, "an active pending retry must not extend its lease")
 	require.Equal(t, 1, repository.beginOperationCalls, "retry reuses the durable reservation")
 	require.Equal(t, 2, repository.finalizeOperationCalls)
 }
@@ -163,6 +164,38 @@ func TestUploadOperationRenewsExpiredPendingLeaseOnFirstRetryAfterArtifactFailur
 	require.Equal(t, originalResponse, snapshot.Response)
 	require.Equal(t, originalCreatedAt, snapshot.Version.CreatedAt)
 	require.True(t, snapshot.LeaseExpiresAt.After(originalLease))
+	require.Len(t, repository.created, 1)
+}
+
+func TestUploadOperationAdoptsWhenLeaseExpiresBetweenServiceAndRepositoryClocks(t *testing.T) {
+	// Break caught: a retry that observes an active lease in the Application
+	// must still succeed when the repository's later clock observes it expired.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	serviceClock := time.Date(2026, 8, 30, 5, 0, 0, 987654321, time.UTC)
+	repository := &recordingCatalogRepository{at: serviceClock}
+	artifacts := &recordingArtifactWriter{err: errors.New("artifact publication failed")}
+	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), func() time.Time { return serviceClock })
+	require.NoError(t, err)
+	key := OperationKey{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, Actor: "publisher-user", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "split-clock-artifact", Fingerprint: "sha256:" + stringsOfZeros(64), OwnerToken: "owner-" + stringsOfZeros(64)}
+	builder := func(value PluginVersion) (OperationResponse, error) {
+		return OperationResponse{Status: 201, ETag: value.ETag(), Body: []byte(`{"created_at":"` + value.CreatedAt.Format(time.RFC3339Nano) + `"}`)}, nil
+	}
+	_, err = service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.ErrorIs(t, err, ErrArtifactUnavailable)
+	require.Equal(t, OperationPending, repository.operation.State)
+	originalResponse, originalCreatedAt, originalLease := repository.operation.Response, repository.operation.Version.CreatedAt, repository.operation.LeaseExpiresAt
+
+	serviceClock = originalLease.Add(-time.Millisecond)
+	repository.at = originalLease.Add(time.Millisecond)
+	artifacts.err = nil
+	snapshot, err := service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.NoError(t, err)
+	require.Equal(t, OperationCommitted, snapshot.State)
+	require.Equal(t, originalResponse, snapshot.Response)
+	require.Equal(t, originalCreatedAt, snapshot.Version.CreatedAt)
+	require.True(t, snapshot.LeaseExpiresAt.After(repository.at))
 	require.Len(t, repository.created, 1)
 }
 
@@ -248,9 +281,7 @@ func (repository *recordingCatalogRepository) BeginUploadOperation(_ context.Con
 			repository.operation.AbandonedAt = &abandonedAt
 		}
 		if repository.operation.State == OperationAbandoned {
-			if !request.LeaseExpiresAt.After(repository.operation.LeaseExpiresAt) {
-				return OperationSnapshot{}, ErrConflict
-			}
+			request.LeaseExpiresAt = renewedOperationLease(request.LeaseExpiresAt, repository.operation.LeaseExpiresAt, repository.at)
 			repository.operation.State = OperationPending
 			repository.operation.LeaseExpiresAt = request.LeaseExpiresAt
 			repository.operation.AbandonedAt = nil

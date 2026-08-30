@@ -49,3 +49,14 @@ func TestVersionFilterRejectsOutOfScopeShapedCursorAndUnboundedLimit(t *testing.
 	}
 	require.NoError(t, (VersionFilter{PluginID: "mysql", Status: StatusVerified, Limit: 25}).Validate())
 }
+
+func TestAuditPayloadMatchesJSONBSemanticsWithoutLosingNumberPrecision(t *testing.T) {
+	// Break caught: PostgreSQL JSONB reformatting must not make a durable Audit
+	// payload conflict, while a changed actor or exact numeric value must.
+	compact := []byte(`{"scope":{"tenant_id":"tenant-1"},"actor":"publisher","sequence":9007199254740993}`)
+	jsonbStyle := []byte(`{ "sequence": 9007199254740993, "actor": "publisher", "scope": { "tenant_id": "tenant-1" } }`)
+	require.True(t, AuditPayloadMatches(compact, jsonbStyle))
+	require.False(t, AuditPayloadMatches(compact, []byte(`{"scope":{"tenant_id":"tenant-1"},"actor":"other","sequence":9007199254740993}`)))
+	require.False(t, AuditPayloadMatches(compact, []byte(`{"scope":{"tenant_id":"tenant-1"},"actor":"publisher","sequence":9007199254740992}`)))
+	require.False(t, AuditPayloadMatches(compact, []byte(`not-json`)))
+}

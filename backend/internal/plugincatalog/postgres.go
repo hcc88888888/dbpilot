@@ -291,7 +291,9 @@ func (repository *PostgresRepository) BeginUploadOperation(ctx context.Context, 
 			}
 		}
 		if existing.State == OperationAbandoned {
-			adopted, adoptErr := scanOperation(repository.database.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'pending', abandoned_at = NULL, lease_expires_at = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'abandoned' RETURNING "+operationColumnsSQL, request.LeaseExpiresAt.UTC(), repository.now().UTC(), request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Key.RecordID()))
+			adoptionAt := repository.now().UTC().Truncate(time.Microsecond)
+			leaseExpiresAt := renewedOperationLease(request.LeaseExpiresAt, existing.LeaseExpiresAt, adoptionAt)
+			adopted, adoptErr := scanOperation(repository.database.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'pending', abandoned_at = NULL, lease_expires_at = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'abandoned' RETURNING "+operationColumnsSQL, leaseExpiresAt, adoptionAt, request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Key.RecordID()))
 			if errors.Is(adoptErr, sql.ErrNoRows) {
 				return OperationSnapshot{}, ErrConflict
 			}
@@ -342,8 +344,22 @@ func (repository *PostgresRepository) BeginUploadOperation(ctx context.Context, 
 	return value, err
 }
 
+func renewedOperationLease(requested, stored, repositoryNow time.Time) time.Time {
+	requested = requested.UTC().Truncate(time.Microsecond)
+	stored = stored.UTC().Truncate(time.Microsecond)
+	repositoryNow = repositoryNow.UTC().Truncate(time.Microsecond)
+	minimum := repositoryNow.Add(DefaultOperationLease)
+	if requested.Before(minimum) {
+		requested = minimum
+	}
+	if !requested.After(stored) {
+		requested = stored.Add(time.Microsecond)
+	}
+	return requested
+}
+
 func operationMatchesUpload(value OperationSnapshot, request UploadOperationRequest) bool {
-	return value.Key == request.Key && value.Kind == "upload" && value.Version.ID == request.Version.ID && value.Version.PluginID == request.Version.PluginID && value.Version.Version == request.Version.Version && value.Version.PackageSHA256 == request.Version.PackageSHA256 && value.Version.ManifestDigest == request.Version.ManifestDigest && value.ArtifactID == request.ArtifactID && value.ArtifactSHA256 == request.ArtifactSHA256 && value.ArtifactBytes == request.ArtifactBytes && value.Response.Status == request.Response.Status && value.Response.ETag == request.Response.ETag && bytes.Equal(value.Response.Body, request.Response.Body) && bytes.Equal(value.AuditEventJSON, request.AuditEventJSON)
+	return value.Key == request.Key && value.Kind == "upload" && value.Version.ID == request.Version.ID && value.Version.PluginID == request.Version.PluginID && value.Version.Version == request.Version.Version && value.Version.PackageSHA256 == request.Version.PackageSHA256 && value.Version.ManifestDigest == request.Version.ManifestDigest && value.ArtifactID == request.ArtifactID && value.ArtifactSHA256 == request.ArtifactSHA256 && value.ArtifactBytes == request.ArtifactBytes && value.Response.Status == request.Response.Status && value.Response.ETag == request.Response.ETag && bytes.Equal(value.Response.Body, request.Response.Body) && AuditPayloadMatches(value.AuditEventJSON, request.AuditEventJSON)
 }
 
 func (repository *PostgresRepository) FinalizeUploadOperation(ctx context.Context, key OperationKey, builder OperationResponseBuilder) (OperationSnapshot, error) {

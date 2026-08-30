@@ -306,10 +306,11 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	blobs := artifact.NewLocalBlobStore(t.TempDir())
 	require.NoError(t, blobs.Ready())
 	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
-	now := time.Date(2026, 8, 30, 16, 30, 0, 123456789, time.UTC)
-	baseRepository := NewPostgresRepositoryWithClock(database, func() time.Time { return now })
+	serviceNow := time.Date(2026, 8, 30, 16, 30, 0, 123456789, time.UTC)
+	repositoryNow := serviceNow
+	baseRepository := NewPostgresRepositoryWithClock(database, func() time.Time { return repositoryNow })
 	artifactWriter := &failOnceArtifactWriter{delegate: artifact.NewPostgresStore(database, blobs), err: errors.New("injected Artifact failure")}
-	application, err := NewService(baseRepository, artifactWriter, verifier, func() time.Time { return now })
+	application, err := NewService(baseRepository, artifactWriter, verifier, func() time.Time { return serviceNow })
 	require.NoError(t, err)
 	scope := platformscope.Scope{TenantID: "tenant-application", ProjectID: "project-application"}
 	key := OperationKey{Scope: scope, Actor: "publisher-application", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "application-upload", Fingerprint: "sha256:" + strings.Repeat("c", 64), OwnerToken: "owner-" + strings.Repeat("d", 64)}
@@ -327,11 +328,13 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	var artifactCount int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM artifacts WHERE tenant_id=$1 AND project_id=$2 AND id=$3", scope.TenantID, scope.ProjectID, pending.ArtifactID).Scan(&artifactCount))
 	require.Zero(t, artifactCount)
-	now = now.Add(DefaultOperationLease + time.Minute)
+	serviceNow = pending.LeaseExpiresAt.Add(-time.Millisecond)
+	repositoryNow = pending.LeaseExpiresAt.Add(time.Millisecond)
 	first, err := application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(fixture.Archive))
 	require.NoError(t, err)
 	require.Equal(t, time.Date(2026, 8, 30, 16, 30, 0, 123456000, time.UTC), first.Version.CreatedAt)
 	require.Equal(t, originalResponse, first.Response)
+	require.True(t, first.LeaseExpiresAt.After(repositoryNow))
 	retry, err := application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(nil))
 	require.NoError(t, err)
 	require.Equal(t, first.Response, retry.Response)

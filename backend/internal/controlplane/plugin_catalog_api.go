@@ -141,7 +141,7 @@ func (api platformAPI) UploadPluginVersionPackage(ctx context.Context, request o
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
-		if snapshot.Version.Scope != scope || !bytes.Equal(snapshot.AuditEventJSON, processing.Reconciliation) {
+		if snapshot.Version.Scope != scope || !plugincatalog.AuditPayloadMatches(snapshot.AuditEventJSON, processing.Reconciliation) {
 			return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 		}
 		return idempotencyResponseFromOperation(snapshot.Response)
@@ -164,7 +164,7 @@ func (api platformAPI) UploadPluginVersionPackage(ctx context.Context, request o
 		}
 		return nil, err
 	}
-	if snapshot.Version.Scope != scope || !bytes.Equal(snapshot.AuditEventJSON, auditPayload) {
+	if snapshot.Version.Scope != scope || !plugincatalog.AuditPayloadMatches(snapshot.AuditEventJSON, auditPayload) {
 		return nil, errors.New("plugin catalog returned an out-of-scope version")
 	}
 	stored, err := idempotencyResponseFromOperation(snapshot.Response)
@@ -260,7 +260,7 @@ func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, act
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
-		if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !bytes.Equal(snapshot.AuditEventJSON, processing.Reconciliation) {
+		if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !plugincatalog.AuditPayloadMatches(snapshot.AuditEventJSON, processing.Reconciliation) {
 			return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 		}
 		return idempotencyResponseFromOperation(snapshot.Response)
@@ -283,7 +283,7 @@ func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, act
 		}
 		return idempotency.Response{}, err
 	}
-	if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !bytes.Equal(snapshot.AuditEventJSON, auditPayload) {
+	if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !plugincatalog.AuditPayloadMatches(snapshot.AuditEventJSON, auditPayload) {
 		return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 	}
 	stored, err := idempotencyResponseFromOperation(snapshot.Response)
@@ -407,7 +407,7 @@ func ReconcilePluginCatalogOperation(ctx context.Context, idempotencyService Ide
 	}
 	key := idempotency.Key{Scope: snapshot.Key.Scope, Actor: snapshot.Key.Actor, OperationID: snapshot.Key.OperationID, IdempotencyKey: snapshot.Key.IdempotencyKey}
 	claim, err := idempotencyService.BeginRecoverable(ctx, key, snapshot.Key.Fingerprint, snapshot.AuditEventJSON, reconcile, func(_ context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
-		if processing.OwnerToken != snapshot.Key.OwnerToken || !bytes.Equal(processing.Reconciliation, snapshot.AuditEventJSON) {
+		if processing.OwnerToken != snapshot.Key.OwnerToken || !plugincatalog.AuditPayloadMatches(processing.Reconciliation, snapshot.AuditEventJSON) {
 			return idempotency.Response{}, idempotency.ErrOwnershipConflict
 		}
 		return response, nil
@@ -427,7 +427,7 @@ func storedPluginAuditReconcile(service AuditService, snapshot plugincatalog.Ope
 		return nil, errors.New("stored plugin Audit snapshot is invalid")
 	}
 	return func(callbackContext context.Context, _ idempotency.Response, storedJSON []byte) error {
-		if !bytes.Equal(storedJSON, snapshot.AuditEventJSON) {
+		if !plugincatalog.AuditPayloadMatches(storedJSON, snapshot.AuditEventJSON) {
 			return errors.New("stored plugin Audit snapshot changed")
 		}
 		_, err := service.RecordOnce(callbackContext, audit.Event{Scope: expected.Scope, Action: expected.Action, Actor: expected.Actor, Resource: expected.Resource, Result: expected.Result, RequestID: expected.RequestID, TraceID: expected.TraceID, DedupeKey: expected.DedupeKey, Detail: expected.Detail})

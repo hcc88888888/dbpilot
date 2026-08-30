@@ -1,6 +1,7 @@
 package plugincatalog
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -287,6 +288,26 @@ func (response OperationResponse) Validate() error {
 }
 
 type OperationResponseBuilder func(PluginVersion) (OperationResponse, error)
+
+func AuditPayloadMatches(left, right []byte) bool {
+	canonical := func(value []byte) ([]byte, bool) {
+		decoder := json.NewDecoder(bytes.NewReader(value))
+		decoder.UseNumber()
+		var decoded any
+		if err := decoder.Decode(&decoded); err != nil {
+			return nil, false
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return nil, false
+		}
+		encoded, err := json.Marshal(decoded)
+		return encoded, err == nil
+	}
+	leftCanonical, leftOK := canonical(left)
+	rightCanonical, rightOK := canonical(right)
+	return leftOK && rightOK && bytes.Equal(leftCanonical, rightCanonical)
+}
 
 type OperationSnapshot struct {
 	Key                    OperationKey
