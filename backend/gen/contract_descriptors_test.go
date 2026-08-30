@@ -36,6 +36,23 @@ func requireEnumField(t *testing.T, message protoreflect.MessageDescriptor, name
 	}
 }
 
+func requireEnumValues(t *testing.T, enum protoreflect.EnumDescriptor, want map[protoreflect.Name]protoreflect.EnumNumber) {
+	t.Helper()
+	if enum.Values().Len() != len(want) {
+		t.Fatalf("%s has %d values, want %d: %v", enum.FullName(), enum.Values().Len(), len(want), want)
+	}
+	for index := 0; index < enum.Values().Len(); index++ {
+		value := enum.Values().Get(index)
+		wantNumber, ok := want[value.Name()]
+		if !ok {
+			t.Fatalf("%s contains unexpected value %s=%d", enum.FullName(), value.Name(), value.Number())
+		}
+		if value.Number() != wantNumber {
+			t.Fatalf("%s.%s = %d, want %d", enum.FullName(), value.Name(), value.Number(), wantNumber)
+		}
+	}
+}
+
 func requireOneofField(t *testing.T, message protoreflect.MessageDescriptor, fieldName, oneofName protoreflect.Name) {
 	t.Helper()
 	field := requireField(t, message, fieldName)
@@ -111,6 +128,11 @@ func TestObservationDescriptorsCloseLifecycleEnumsAndExposeCircuitState(t *testi
 		"google/protobuf/timestamp.proto")
 	candidate := requireMessage(t, inventory, "DiscoveryCandidateObservation")
 	requireEnumField(t, candidate, "source", "dbpilot.agent.v1.DiscoverySource")
+	requireEnumValues(t, requireField(t, candidate, "source").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"DISCOVERY_SOURCE_UNSPECIFIED": 0,
+		"DISCOVERY_SOURCE_NATIVE":      1,
+		"DISCOVERY_SOURCE_DOCKER":      2,
+	})
 	evidence := requireField(t, candidate, "evidence")
 	if evidence.Kind() != protoreflect.MessageKind || evidence.Message().FullName() != "dbpilot.agent.v1.DiscoveryEvidence" {
 		t.Fatalf("DiscoveryCandidateObservation.evidence = %s, want typed DiscoveryEvidence", evidence.Kind())
@@ -120,12 +142,64 @@ func TestObservationDescriptorsCloseLifecycleEnumsAndExposeCircuitState(t *testi
 	requireEnumField(t, assignment, "process_state", "dbpilot.agent.v1.PluginProcessState")
 	requireEnumField(t, assignment, "health", "dbpilot.agent.v1.PluginHealthState")
 	requireEnumField(t, assignment, "circuit_state", "dbpilot.agent.v1.PluginCircuitState")
+	requireEnumValues(t, requireField(t, assignment, "active_slot").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"PLUGIN_ACTIVE_SLOT_UNSPECIFIED": 0,
+		"PLUGIN_ACTIVE_SLOT_NONE":        1,
+		"PLUGIN_ACTIVE_SLOT_A":           2,
+		"PLUGIN_ACTIVE_SLOT_B":           3,
+	})
+	requireEnumValues(t, requireField(t, assignment, "process_state").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"PLUGIN_PROCESS_STATE_UNSPECIFIED":        0,
+		"PLUGIN_PROCESS_STATE_ABSENT":             1,
+		"PLUGIN_PROCESS_STATE_DOWNLOADING":        2,
+		"PLUGIN_PROCESS_STATE_VERIFYING":          3,
+		"PLUGIN_PROCESS_STATE_INSTALLED":          4,
+		"PLUGIN_PROCESS_STATE_STARTING":           5,
+		"PLUGIN_PROCESS_STATE_HANDSHAKING":        6,
+		"PLUGIN_PROCESS_STATE_RUNNING":            7,
+		"PLUGIN_PROCESS_STATE_DEGRADED":           8,
+		"PLUGIN_PROCESS_STATE_RESTARTING":         9,
+		"PLUGIN_PROCESS_STATE_DRAINING":          10,
+		"PLUGIN_PROCESS_STATE_STOPPED":           11,
+		"PLUGIN_PROCESS_STATE_UNINSTALLING":      12,
+		"PLUGIN_PROCESS_STATE_DOWNLOAD_FAILED":   13,
+		"PLUGIN_PROCESS_STATE_SIGNATURE_REJECTED": 14,
+		"PLUGIN_PROCESS_STATE_MANIFEST_REJECTED":  15,
+		"PLUGIN_PROCESS_STATE_PLATFORM_MISMATCH":  16,
+		"PLUGIN_PROCESS_STATE_START_FAILED":       17,
+		"PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED":   18,
+		"PLUGIN_PROCESS_STATE_UPGRADING":          19,
+		"PLUGIN_PROCESS_STATE_ROLLBACK":           20,
+		"PLUGIN_PROCESS_STATE_CIRCUIT_OPEN":       21,
+	})
+	requireEnumValues(t, requireField(t, assignment, "health").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"PLUGIN_HEALTH_STATE_UNSPECIFIED": 0,
+		"PLUGIN_HEALTH_STATE_HEALTHY":     1,
+		"PLUGIN_HEALTH_STATE_DEGRADED":    2,
+		"PLUGIN_HEALTH_STATE_UNHEALTHY":   3,
+	})
+	requireEnumValues(t, requireField(t, assignment, "circuit_state").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"PLUGIN_CIRCUIT_STATE_UNSPECIFIED": 0,
+		"PLUGIN_CIRCUIT_STATE_CLOSED":      1,
+		"PLUGIN_CIRCUIT_STATE_OPEN":        2,
+		"PLUGIN_CIRCUIT_STATE_HALF_OPEN":   3,
+	})
 
 	docker := discoveryv1.File_discovery_v1_docker_proto
 	requireFileIdentity(t, docker, "dbpilot.discovery.v1", "dbpilot.local/platform/gen/discovery/v1;discoveryv1",
 		"google/protobuf/timestamp.proto")
 	container := requireMessage(t, docker, "DockerContainerObservation")
 	requireEnumField(t, container, "status", "dbpilot.discovery.v1.DockerContainerStatus")
+	requireEnumValues(t, requireField(t, container, "status").Enum(), map[protoreflect.Name]protoreflect.EnumNumber{
+		"DOCKER_CONTAINER_STATUS_UNSPECIFIED": 0,
+		"DOCKER_CONTAINER_STATUS_CREATED":     1,
+		"DOCKER_CONTAINER_STATUS_RUNNING":     2,
+		"DOCKER_CONTAINER_STATUS_PAUSED":      3,
+		"DOCKER_CONTAINER_STATUS_RESTARTING":  4,
+		"DOCKER_CONTAINER_STATUS_REMOVING":    5,
+		"DOCKER_CONTAINER_STATUS_EXITED":      6,
+		"DOCKER_CONTAINER_STATUS_DEAD":        7,
+	})
 }
 
 func TestPluginAndDockerDescriptorsExposeExactServices(t *testing.T) {

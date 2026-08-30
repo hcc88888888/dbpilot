@@ -217,6 +217,7 @@ const (
 	PluginProcessState_PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED   PluginProcessState = 18
 	PluginProcessState_PLUGIN_PROCESS_STATE_UPGRADING          PluginProcessState = 19
 	PluginProcessState_PLUGIN_PROCESS_STATE_ROLLBACK           PluginProcessState = 20
+	PluginProcessState_PLUGIN_PROCESS_STATE_CIRCUIT_OPEN       PluginProcessState = 21
 )
 
 // Enum value maps for PluginProcessState.
@@ -243,6 +244,7 @@ var (
 		18: "PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED",
 		19: "PLUGIN_PROCESS_STATE_UPGRADING",
 		20: "PLUGIN_PROCESS_STATE_ROLLBACK",
+		21: "PLUGIN_PROCESS_STATE_CIRCUIT_OPEN",
 	}
 	PluginProcessState_value = map[string]int32{
 		"PLUGIN_PROCESS_STATE_UNSPECIFIED":        0,
@@ -266,6 +268,7 @@ var (
 		"PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED":   18,
 		"PLUGIN_PROCESS_STATE_UPGRADING":          19,
 		"PLUGIN_PROCESS_STATE_ROLLBACK":           20,
+		"PLUGIN_PROCESS_STATE_CIRCUIT_OPEN":       21,
 	}
 )
 
@@ -1439,7 +1442,7 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"\x1ePLUGIN_ACTIVE_SLOT_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17PLUGIN_ACTIVE_SLOT_NONE\x10\x01\x12\x18\n" +
 	"\x14PLUGIN_ACTIVE_SLOT_A\x10\x02\x12\x18\n" +
-	"\x14PLUGIN_ACTIVE_SLOT_B\x10\x03*\xb0\x06\n" +
+	"\x14PLUGIN_ACTIVE_SLOT_B\x10\x03*\xd7\x06\n" +
 	"\x12PluginProcessState\x12$\n" +
 	" PLUGIN_PROCESS_STATE_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bPLUGIN_PROCESS_STATE_ABSENT\x10\x01\x12$\n" +
@@ -1462,7 +1465,8 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"!PLUGIN_PROCESS_STATE_START_FAILED\x10\x11\x12)\n" +
 	"%PLUGIN_PROCESS_STATE_HANDSHAKE_FAILED\x10\x12\x12\"\n" +
 	"\x1ePLUGIN_PROCESS_STATE_UPGRADING\x10\x13\x12!\n" +
-	"\x1dPLUGIN_PROCESS_STATE_ROLLBACK\x10\x14*\x9e\x01\n" +
+	"\x1dPLUGIN_PROCESS_STATE_ROLLBACK\x10\x14\x12%\n" +
+	"!PLUGIN_PROCESS_STATE_CIRCUIT_OPEN\x10\x15*\x9e\x01\n" +
 	"\x11PluginHealthState\x12#\n" +
 	"\x1fPLUGIN_HEALTH_STATE_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bPLUGIN_HEALTH_STATE_HEALTHY\x10\x01\x12 \n" +
