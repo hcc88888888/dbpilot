@@ -174,6 +174,702 @@ func (x *InstanceInventory) GetAttributes() map[string]string {
 	return nil
 }
 
+type HostObservation struct {
+	state                  protoimpl.MessageState   `protogen:"open.v1"`
+	HostId                 string                   `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	AgentId                string                   `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	ObservationRevision    uint64                   `protobuf:"varint,3,opt,name=observation_revision,json=observationRevision,proto3" json:"observation_revision,omitempty"`
+	Hostname               string                   `protobuf:"bytes,4,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	OperatingSystem        string                   `protobuf:"bytes,5,opt,name=operating_system,json=operatingSystem,proto3" json:"operating_system,omitempty"`
+	OperatingSystemVersion string                   `protobuf:"bytes,6,opt,name=operating_system_version,json=operatingSystemVersion,proto3" json:"operating_system_version,omitempty"`
+	KernelVersion          string                   `protobuf:"bytes,7,opt,name=kernel_version,json=kernelVersion,proto3" json:"kernel_version,omitempty"`
+	Architecture           string                   `protobuf:"bytes,8,opt,name=architecture,proto3" json:"architecture,omitempty"`
+	LogicalCpuCount        uint32                   `protobuf:"varint,9,opt,name=logical_cpu_count,json=logicalCpuCount,proto3" json:"logical_cpu_count,omitempty"`
+	MemoryCapacityBytes    uint64                   `protobuf:"varint,10,opt,name=memory_capacity_bytes,json=memoryCapacityBytes,proto3" json:"memory_capacity_bytes,omitempty"`
+	Filesystems            []*FilesystemObservation `protobuf:"bytes,11,rep,name=filesystems,proto3" json:"filesystems,omitempty"`
+	NetworkAddresses       []string                 `protobuf:"bytes,12,rep,name=network_addresses,json=networkAddresses,proto3" json:"network_addresses,omitempty"`
+	Capabilities           []string                 `protobuf:"bytes,13,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	AgentVersion           string                   `protobuf:"bytes,14,opt,name=agent_version,json=agentVersion,proto3" json:"agent_version,omitempty"`
+	ObservedAt             *timestamppb.Timestamp   `protobuf:"bytes,15,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *HostObservation) Reset() {
+	*x = HostObservation{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HostObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HostObservation) ProtoMessage() {}
+
+func (x *HostObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HostObservation.ProtoReflect.Descriptor instead.
+func (*HostObservation) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *HostObservation) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *HostObservation) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *HostObservation) GetObservationRevision() uint64 {
+	if x != nil {
+		return x.ObservationRevision
+	}
+	return 0
+}
+
+func (x *HostObservation) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
+func (x *HostObservation) GetOperatingSystem() string {
+	if x != nil {
+		return x.OperatingSystem
+	}
+	return ""
+}
+
+func (x *HostObservation) GetOperatingSystemVersion() string {
+	if x != nil {
+		return x.OperatingSystemVersion
+	}
+	return ""
+}
+
+func (x *HostObservation) GetKernelVersion() string {
+	if x != nil {
+		return x.KernelVersion
+	}
+	return ""
+}
+
+func (x *HostObservation) GetArchitecture() string {
+	if x != nil {
+		return x.Architecture
+	}
+	return ""
+}
+
+func (x *HostObservation) GetLogicalCpuCount() uint32 {
+	if x != nil {
+		return x.LogicalCpuCount
+	}
+	return 0
+}
+
+func (x *HostObservation) GetMemoryCapacityBytes() uint64 {
+	if x != nil {
+		return x.MemoryCapacityBytes
+	}
+	return 0
+}
+
+func (x *HostObservation) GetFilesystems() []*FilesystemObservation {
+	if x != nil {
+		return x.Filesystems
+	}
+	return nil
+}
+
+func (x *HostObservation) GetNetworkAddresses() []string {
+	if x != nil {
+		return x.NetworkAddresses
+	}
+	return nil
+}
+
+func (x *HostObservation) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
+}
+
+func (x *HostObservation) GetAgentVersion() string {
+	if x != nil {
+		return x.AgentVersion
+	}
+	return ""
+}
+
+func (x *HostObservation) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
+type FilesystemObservation struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	MountPoint     string                 `protobuf:"bytes,1,opt,name=mount_point,json=mountPoint,proto3" json:"mount_point,omitempty"`
+	CapacityBytes  uint64                 `protobuf:"varint,2,opt,name=capacity_bytes,json=capacityBytes,proto3" json:"capacity_bytes,omitempty"`
+	AvailableBytes uint64                 `protobuf:"varint,3,opt,name=available_bytes,json=availableBytes,proto3" json:"available_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *FilesystemObservation) Reset() {
+	*x = FilesystemObservation{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FilesystemObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FilesystemObservation) ProtoMessage() {}
+
+func (x *FilesystemObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FilesystemObservation.ProtoReflect.Descriptor instead.
+func (*FilesystemObservation) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *FilesystemObservation) GetMountPoint() string {
+	if x != nil {
+		return x.MountPoint
+	}
+	return ""
+}
+
+func (x *FilesystemObservation) GetCapacityBytes() uint64 {
+	if x != nil {
+		return x.CapacityBytes
+	}
+	return 0
+}
+
+func (x *FilesystemObservation) GetAvailableBytes() uint64 {
+	if x != nil {
+		return x.AvailableBytes
+	}
+	return 0
+}
+
+type DiscoveryReport struct {
+	state               protoimpl.MessageState           `protogen:"open.v1"`
+	HostId              string                           `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	AgentId             string                           `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	ObservationRevision uint64                           `protobuf:"varint,3,opt,name=observation_revision,json=observationRevision,proto3" json:"observation_revision,omitempty"`
+	RuleRevision        uint64                           `protobuf:"varint,4,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
+	Candidates          []*DiscoveryCandidateObservation `protobuf:"bytes,5,rep,name=candidates,proto3" json:"candidates,omitempty"`
+	ObservedAt          *timestamppb.Timestamp           `protobuf:"bytes,6,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *DiscoveryReport) Reset() {
+	*x = DiscoveryReport{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiscoveryReport) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiscoveryReport) ProtoMessage() {}
+
+func (x *DiscoveryReport) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiscoveryReport.ProtoReflect.Descriptor instead.
+func (*DiscoveryReport) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DiscoveryReport) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *DiscoveryReport) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *DiscoveryReport) GetObservationRevision() uint64 {
+	if x != nil {
+		return x.ObservationRevision
+	}
+	return 0
+}
+
+func (x *DiscoveryReport) GetRuleRevision() uint64 {
+	if x != nil {
+		return x.RuleRevision
+	}
+	return 0
+}
+
+func (x *DiscoveryReport) GetCandidates() []*DiscoveryCandidateObservation {
+	if x != nil {
+		return x.Candidates
+	}
+	return nil
+}
+
+func (x *DiscoveryReport) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
+type DiscoveryCandidateObservation struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	ObservationId      string                 `protobuf:"bytes,1,opt,name=observation_id,json=observationId,proto3" json:"observation_id,omitempty"`
+	Source             string                 `protobuf:"bytes,2,opt,name=source,proto3" json:"source,omitempty"`
+	DatabaseFamily     string                 `protobuf:"bytes,3,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	DatabaseVariant    string                 `protobuf:"bytes,4,opt,name=database_variant,json=databaseVariant,proto3" json:"database_variant,omitempty"`
+	VersionHint        string                 `protobuf:"bytes,5,opt,name=version_hint,json=versionHint,proto3" json:"version_hint,omitempty"`
+	NormalizedEndpoint string                 `protobuf:"bytes,6,opt,name=normalized_endpoint,json=normalizedEndpoint,proto3" json:"normalized_endpoint,omitempty"`
+	UnixSocket         string                 `protobuf:"bytes,7,opt,name=unix_socket,json=unixSocket,proto3" json:"unix_socket,omitempty"`
+	ProcessIdentity    string                 `protobuf:"bytes,8,opt,name=process_identity,json=processIdentity,proto3" json:"process_identity,omitempty"`
+	ServiceName        string                 `protobuf:"bytes,9,opt,name=service_name,json=serviceName,proto3" json:"service_name,omitempty"`
+	ContainerIdentity  string                 `protobuf:"bytes,10,opt,name=container_identity,json=containerIdentity,proto3" json:"container_identity,omitempty"`
+	ContainerImage     string                 `protobuf:"bytes,11,opt,name=container_image,json=containerImage,proto3" json:"container_image,omitempty"`
+	DiscoveredRole     string                 `protobuf:"bytes,12,opt,name=discovered_role,json=discoveredRole,proto3" json:"discovered_role,omitempty"`
+	Confidence         float64                `protobuf:"fixed64,13,opt,name=confidence,proto3" json:"confidence,omitempty"`
+	Evidence           []string               `protobuf:"bytes,14,rep,name=evidence,proto3" json:"evidence,omitempty"`
+	Fingerprint        []byte                 `protobuf:"bytes,15,opt,name=fingerprint,proto3" json:"fingerprint,omitempty"`
+	ObservedAt         *timestamppb.Timestamp `protobuf:"bytes,16,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *DiscoveryCandidateObservation) Reset() {
+	*x = DiscoveryCandidateObservation{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DiscoveryCandidateObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiscoveryCandidateObservation) ProtoMessage() {}
+
+func (x *DiscoveryCandidateObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiscoveryCandidateObservation.ProtoReflect.Descriptor instead.
+func (*DiscoveryCandidateObservation) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DiscoveryCandidateObservation) GetObservationId() string {
+	if x != nil {
+		return x.ObservationId
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetDatabaseFamily() string {
+	if x != nil {
+		return x.DatabaseFamily
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetDatabaseVariant() string {
+	if x != nil {
+		return x.DatabaseVariant
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetVersionHint() string {
+	if x != nil {
+		return x.VersionHint
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetNormalizedEndpoint() string {
+	if x != nil {
+		return x.NormalizedEndpoint
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetUnixSocket() string {
+	if x != nil {
+		return x.UnixSocket
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetProcessIdentity() string {
+	if x != nil {
+		return x.ProcessIdentity
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetServiceName() string {
+	if x != nil {
+		return x.ServiceName
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetContainerIdentity() string {
+	if x != nil {
+		return x.ContainerIdentity
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetContainerImage() string {
+	if x != nil {
+		return x.ContainerImage
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetDiscoveredRole() string {
+	if x != nil {
+		return x.DiscoveredRole
+	}
+	return ""
+}
+
+func (x *DiscoveryCandidateObservation) GetConfidence() float64 {
+	if x != nil {
+		return x.Confidence
+	}
+	return 0
+}
+
+func (x *DiscoveryCandidateObservation) GetEvidence() []string {
+	if x != nil {
+		return x.Evidence
+	}
+	return nil
+}
+
+func (x *DiscoveryCandidateObservation) GetFingerprint() []byte {
+	if x != nil {
+		return x.Fingerprint
+	}
+	return nil
+}
+
+func (x *DiscoveryCandidateObservation) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
+type PluginObservation struct {
+	state               protoimpl.MessageState         `protogen:"open.v1"`
+	HostId              string                         `protobuf:"bytes,1,opt,name=host_id,json=hostId,proto3" json:"host_id,omitempty"`
+	AgentId             string                         `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	ObservationRevision uint64                         `protobuf:"varint,3,opt,name=observation_revision,json=observationRevision,proto3" json:"observation_revision,omitempty"`
+	Assignments         []*PluginAssignmentObservation `protobuf:"bytes,4,rep,name=assignments,proto3" json:"assignments,omitempty"`
+	ObservedAt          *timestamppb.Timestamp         `protobuf:"bytes,5,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *PluginObservation) Reset() {
+	*x = PluginObservation{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PluginObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PluginObservation) ProtoMessage() {}
+
+func (x *PluginObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PluginObservation.ProtoReflect.Descriptor instead.
+func (*PluginObservation) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *PluginObservation) GetHostId() string {
+	if x != nil {
+		return x.HostId
+	}
+	return ""
+}
+
+func (x *PluginObservation) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *PluginObservation) GetObservationRevision() uint64 {
+	if x != nil {
+		return x.ObservationRevision
+	}
+	return 0
+}
+
+func (x *PluginObservation) GetAssignments() []*PluginAssignmentObservation {
+	if x != nil {
+		return x.Assignments
+	}
+	return nil
+}
+
+func (x *PluginObservation) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
+type PluginAssignmentObservation struct {
+	state                       protoimpl.MessageState `protogen:"open.v1"`
+	AssignmentId                string                 `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	PluginId                    string                 `protobuf:"bytes,2,opt,name=plugin_id,json=pluginId,proto3" json:"plugin_id,omitempty"`
+	DatabaseFamily              string                 `protobuf:"bytes,3,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	InstalledVersion            string                 `protobuf:"bytes,4,opt,name=installed_version,json=installedVersion,proto3" json:"installed_version,omitempty"`
+	ActiveSlot                  string                 `protobuf:"bytes,5,opt,name=active_slot,json=activeSlot,proto3" json:"active_slot,omitempty"`
+	ProcessState                string                 `protobuf:"bytes,6,opt,name=process_state,json=processState,proto3" json:"process_state,omitempty"`
+	ProcessId                   uint32                 `protobuf:"varint,7,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	StartedAt                   *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	Health                      string                 `protobuf:"bytes,9,opt,name=health,proto3" json:"health,omitempty"`
+	RestartCount                uint32                 `protobuf:"varint,10,opt,name=restart_count,json=restartCount,proto3" json:"restart_count,omitempty"`
+	BoundInstanceCount          uint32                 `protobuf:"varint,11,opt,name=bound_instance_count,json=boundInstanceCount,proto3" json:"bound_instance_count,omitempty"`
+	ActiveConfigurationRevision uint64                 `protobuf:"varint,12,opt,name=active_configuration_revision,json=activeConfigurationRevision,proto3" json:"active_configuration_revision,omitempty"`
+	ObservedOperationRevision   uint64                 `protobuf:"varint,13,opt,name=observed_operation_revision,json=observedOperationRevision,proto3" json:"observed_operation_revision,omitempty"`
+	LastErrorCode               string                 `protobuf:"bytes,14,opt,name=last_error_code,json=lastErrorCode,proto3" json:"last_error_code,omitempty"`
+	ObservedAt                  *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	unknownFields               protoimpl.UnknownFields
+	sizeCache                   protoimpl.SizeCache
+}
+
+func (x *PluginAssignmentObservation) Reset() {
+	*x = PluginAssignmentObservation{}
+	mi := &file_agent_v1_inventory_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PluginAssignmentObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PluginAssignmentObservation) ProtoMessage() {}
+
+func (x *PluginAssignmentObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_inventory_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PluginAssignmentObservation.ProtoReflect.Descriptor instead.
+func (*PluginAssignmentObservation) Descriptor() ([]byte, []int) {
+	return file_agent_v1_inventory_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *PluginAssignmentObservation) GetAssignmentId() string {
+	if x != nil {
+		return x.AssignmentId
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetPluginId() string {
+	if x != nil {
+		return x.PluginId
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetDatabaseFamily() string {
+	if x != nil {
+		return x.DatabaseFamily
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetInstalledVersion() string {
+	if x != nil {
+		return x.InstalledVersion
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetActiveSlot() string {
+	if x != nil {
+		return x.ActiveSlot
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetProcessState() string {
+	if x != nil {
+		return x.ProcessState
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetProcessId() uint32 {
+	if x != nil {
+		return x.ProcessId
+	}
+	return 0
+}
+
+func (x *PluginAssignmentObservation) GetStartedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartedAt
+	}
+	return nil
+}
+
+func (x *PluginAssignmentObservation) GetHealth() string {
+	if x != nil {
+		return x.Health
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetRestartCount() uint32 {
+	if x != nil {
+		return x.RestartCount
+	}
+	return 0
+}
+
+func (x *PluginAssignmentObservation) GetBoundInstanceCount() uint32 {
+	if x != nil {
+		return x.BoundInstanceCount
+	}
+	return 0
+}
+
+func (x *PluginAssignmentObservation) GetActiveConfigurationRevision() uint64 {
+	if x != nil {
+		return x.ActiveConfigurationRevision
+	}
+	return 0
+}
+
+func (x *PluginAssignmentObservation) GetObservedOperationRevision() uint64 {
+	if x != nil {
+		return x.ObservedOperationRevision
+	}
+	return 0
+}
+
+func (x *PluginAssignmentObservation) GetLastErrorCode() string {
+	if x != nil {
+		return x.LastErrorCode
+	}
+	return ""
+}
+
+func (x *PluginAssignmentObservation) GetObservedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ObservedAt
+	}
+	return nil
+}
+
 var File_agent_v1_inventory_proto protoreflect.FileDescriptor
 
 const file_agent_v1_inventory_proto_rawDesc = "" +
@@ -198,7 +894,90 @@ const file_agent_v1_inventory_proto_rawDesc = "" +
 	"attributes\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B-Z+dbpilot.local/platform/gen/agent/v1;agentv1b\x06proto3"
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa8\x05\n" +
+	"\x0fHostObservation\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
+	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
+	"\x14observation_revision\x18\x03 \x01(\x04R\x13observationRevision\x12\x1a\n" +
+	"\bhostname\x18\x04 \x01(\tR\bhostname\x12)\n" +
+	"\x10operating_system\x18\x05 \x01(\tR\x0foperatingSystem\x128\n" +
+	"\x18operating_system_version\x18\x06 \x01(\tR\x16operatingSystemVersion\x12%\n" +
+	"\x0ekernel_version\x18\a \x01(\tR\rkernelVersion\x12\"\n" +
+	"\farchitecture\x18\b \x01(\tR\farchitecture\x12*\n" +
+	"\x11logical_cpu_count\x18\t \x01(\rR\x0flogicalCpuCount\x122\n" +
+	"\x15memory_capacity_bytes\x18\n" +
+	" \x01(\x04R\x13memoryCapacityBytes\x12I\n" +
+	"\vfilesystems\x18\v \x03(\v2'.dbpilot.agent.v1.FilesystemObservationR\vfilesystems\x12+\n" +
+	"\x11network_addresses\x18\f \x03(\tR\x10networkAddresses\x12\"\n" +
+	"\fcapabilities\x18\r \x03(\tR\fcapabilities\x12#\n" +
+	"\ragent_version\x18\x0e \x01(\tR\fagentVersion\x12;\n" +
+	"\vobserved_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAtJ\x04\b\x10\x10 \"\x88\x01\n" +
+	"\x15FilesystemObservation\x12\x1f\n" +
+	"\vmount_point\x18\x01 \x01(\tR\n" +
+	"mountPoint\x12%\n" +
+	"\x0ecapacity_bytes\x18\x02 \x01(\x04R\rcapacityBytes\x12'\n" +
+	"\x0favailable_bytes\x18\x03 \x01(\x04R\x0eavailableBytes\"\xb1\x02\n" +
+	"\x0fDiscoveryReport\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
+	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
+	"\x14observation_revision\x18\x03 \x01(\x04R\x13observationRevision\x12#\n" +
+	"\rrule_revision\x18\x04 \x01(\x04R\fruleRevision\x12O\n" +
+	"\n" +
+	"candidates\x18\x05 \x03(\v2/.dbpilot.agent.v1.DiscoveryCandidateObservationR\n" +
+	"candidates\x12;\n" +
+	"\vobserved_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAtJ\x04\b\a\x10\x14\"\x97\x05\n" +
+	"\x1dDiscoveryCandidateObservation\x12%\n" +
+	"\x0eobservation_id\x18\x01 \x01(\tR\robservationId\x12\x16\n" +
+	"\x06source\x18\x02 \x01(\tR\x06source\x12'\n" +
+	"\x0fdatabase_family\x18\x03 \x01(\tR\x0edatabaseFamily\x12)\n" +
+	"\x10database_variant\x18\x04 \x01(\tR\x0fdatabaseVariant\x12!\n" +
+	"\fversion_hint\x18\x05 \x01(\tR\vversionHint\x12/\n" +
+	"\x13normalized_endpoint\x18\x06 \x01(\tR\x12normalizedEndpoint\x12\x1f\n" +
+	"\vunix_socket\x18\a \x01(\tR\n" +
+	"unixSocket\x12)\n" +
+	"\x10process_identity\x18\b \x01(\tR\x0fprocessIdentity\x12!\n" +
+	"\fservice_name\x18\t \x01(\tR\vserviceName\x12-\n" +
+	"\x12container_identity\x18\n" +
+	" \x01(\tR\x11containerIdentity\x12'\n" +
+	"\x0fcontainer_image\x18\v \x01(\tR\x0econtainerImage\x12'\n" +
+	"\x0fdiscovered_role\x18\f \x01(\tR\x0ediscoveredRole\x12\x1e\n" +
+	"\n" +
+	"confidence\x18\r \x01(\x01R\n" +
+	"confidence\x12\x1a\n" +
+	"\bevidence\x18\x0e \x03(\tR\bevidence\x12 \n" +
+	"\vfingerprint\x18\x0f \x01(\fR\vfingerprint\x12;\n" +
+	"\vobserved_at\x18\x10 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAtJ\x04\b\x11\x10 \"\x8e\x02\n" +
+	"\x11PluginObservation\x12\x17\n" +
+	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
+	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
+	"\x14observation_revision\x18\x03 \x01(\x04R\x13observationRevision\x12O\n" +
+	"\vassignments\x18\x04 \x03(\v2-.dbpilot.agent.v1.PluginAssignmentObservationR\vassignments\x12;\n" +
+	"\vobserved_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAtJ\x04\b\x06\x10\x14\"\xb3\x05\n" +
+	"\x1bPluginAssignmentObservation\x12#\n" +
+	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x12\x1b\n" +
+	"\tplugin_id\x18\x02 \x01(\tR\bpluginId\x12'\n" +
+	"\x0fdatabase_family\x18\x03 \x01(\tR\x0edatabaseFamily\x12+\n" +
+	"\x11installed_version\x18\x04 \x01(\tR\x10installedVersion\x12\x1f\n" +
+	"\vactive_slot\x18\x05 \x01(\tR\n" +
+	"activeSlot\x12#\n" +
+	"\rprocess_state\x18\x06 \x01(\tR\fprocessState\x12\x1d\n" +
+	"\n" +
+	"process_id\x18\a \x01(\rR\tprocessId\x129\n" +
+	"\n" +
+	"started_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12\x16\n" +
+	"\x06health\x18\t \x01(\tR\x06health\x12#\n" +
+	"\rrestart_count\x18\n" +
+	" \x01(\rR\frestartCount\x120\n" +
+	"\x14bound_instance_count\x18\v \x01(\rR\x12boundInstanceCount\x12B\n" +
+	"\x1dactive_configuration_revision\x18\f \x01(\x04R\x1bactiveConfigurationRevision\x12>\n" +
+	"\x1bobserved_operation_revision\x18\r \x01(\x04R\x19observedOperationRevision\x12&\n" +
+	"\x0flast_error_code\x18\x0e \x01(\tR\rlastErrorCode\x12;\n" +
+	"\vobserved_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"observedAtJ\x04\b\x10\x10 B-Z+dbpilot.local/platform/gen/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_agent_v1_inventory_proto_rawDescOnce sync.Once
@@ -212,22 +991,37 @@ func file_agent_v1_inventory_proto_rawDescGZIP() []byte {
 	return file_agent_v1_inventory_proto_rawDescData
 }
 
-var file_agent_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_agent_v1_inventory_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_agent_v1_inventory_proto_goTypes = []any{
-	(*Inventory)(nil),             // 0: dbpilot.agent.v1.Inventory
-	(*InstanceInventory)(nil),     // 1: dbpilot.agent.v1.InstanceInventory
-	nil,                           // 2: dbpilot.agent.v1.InstanceInventory.AttributesEntry
-	(*timestamppb.Timestamp)(nil), // 3: google.protobuf.Timestamp
+	(*Inventory)(nil),                     // 0: dbpilot.agent.v1.Inventory
+	(*InstanceInventory)(nil),             // 1: dbpilot.agent.v1.InstanceInventory
+	(*HostObservation)(nil),               // 2: dbpilot.agent.v1.HostObservation
+	(*FilesystemObservation)(nil),         // 3: dbpilot.agent.v1.FilesystemObservation
+	(*DiscoveryReport)(nil),               // 4: dbpilot.agent.v1.DiscoveryReport
+	(*DiscoveryCandidateObservation)(nil), // 5: dbpilot.agent.v1.DiscoveryCandidateObservation
+	(*PluginObservation)(nil),             // 6: dbpilot.agent.v1.PluginObservation
+	(*PluginAssignmentObservation)(nil),   // 7: dbpilot.agent.v1.PluginAssignmentObservation
+	nil,                                   // 8: dbpilot.agent.v1.InstanceInventory.AttributesEntry
+	(*timestamppb.Timestamp)(nil),         // 9: google.protobuf.Timestamp
 }
 var file_agent_v1_inventory_proto_depIdxs = []int32{
-	1, // 0: dbpilot.agent.v1.Inventory.instances:type_name -> dbpilot.agent.v1.InstanceInventory
-	3, // 1: dbpilot.agent.v1.Inventory.observed_at:type_name -> google.protobuf.Timestamp
-	2, // 2: dbpilot.agent.v1.InstanceInventory.attributes:type_name -> dbpilot.agent.v1.InstanceInventory.AttributesEntry
-	3, // [3:3] is the sub-list for method output_type
-	3, // [3:3] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	1,  // 0: dbpilot.agent.v1.Inventory.instances:type_name -> dbpilot.agent.v1.InstanceInventory
+	9,  // 1: dbpilot.agent.v1.Inventory.observed_at:type_name -> google.protobuf.Timestamp
+	8,  // 2: dbpilot.agent.v1.InstanceInventory.attributes:type_name -> dbpilot.agent.v1.InstanceInventory.AttributesEntry
+	3,  // 3: dbpilot.agent.v1.HostObservation.filesystems:type_name -> dbpilot.agent.v1.FilesystemObservation
+	9,  // 4: dbpilot.agent.v1.HostObservation.observed_at:type_name -> google.protobuf.Timestamp
+	5,  // 5: dbpilot.agent.v1.DiscoveryReport.candidates:type_name -> dbpilot.agent.v1.DiscoveryCandidateObservation
+	9,  // 6: dbpilot.agent.v1.DiscoveryReport.observed_at:type_name -> google.protobuf.Timestamp
+	9,  // 7: dbpilot.agent.v1.DiscoveryCandidateObservation.observed_at:type_name -> google.protobuf.Timestamp
+	7,  // 8: dbpilot.agent.v1.PluginObservation.assignments:type_name -> dbpilot.agent.v1.PluginAssignmentObservation
+	9,  // 9: dbpilot.agent.v1.PluginObservation.observed_at:type_name -> google.protobuf.Timestamp
+	9,  // 10: dbpilot.agent.v1.PluginAssignmentObservation.started_at:type_name -> google.protobuf.Timestamp
+	9,  // 11: dbpilot.agent.v1.PluginAssignmentObservation.observed_at:type_name -> google.protobuf.Timestamp
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_inventory_proto_init() }
@@ -241,7 +1035,7 @@ func file_agent_v1_inventory_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_inventory_proto_rawDesc), len(file_agent_v1_inventory_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -1,0 +1,121 @@
+DatabaseInstancesCollection:
+  get:
+    operationId: listDatabaseInstances
+    summary: List managed database instances
+    x-dbpilot-permission: database-instances:view
+    parameters:
+      - name: host_id
+        in: query
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+      - name: database_family
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DatabaseFamily }
+      - name: status
+        in: query
+        schema: { $ref: ../common/database-instances.yaml#/DatabaseManagementStatus }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated managed database instances.
+        content:
+          application/json:
+            schema: { $ref: ../common/database-instances.yaml#/ManagedDatabaseInstancePage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+DatabaseInstanceItem:
+  get:
+    operationId: getDatabaseInstance
+    summary: Get a managed database instance
+    x-dbpilot-permission: database-instances:view
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: { $ref: ../common/identifiers.yaml#/InstanceId }
+    responses:
+      '200':
+        description: Managed database instance.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/database-instances.yaml#/ManagedDatabaseInstance }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+  patch:
+    operationId: updateDatabaseInstance
+    summary: Update mutable database instance settings
+    x-dbpilot-permission: database-instances:manage
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: { $ref: ../common/identifiers.yaml#/InstanceId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/database-instances.yaml#/UpdateDatabaseInstanceRequest }
+    responses:
+      '200':
+        description: Updated database instance.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/database-instances.yaml#/ManagedDatabaseInstance }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+TestDatabaseInstanceConnection:
+  post:
+    operationId: testDatabaseInstanceConnection
+    summary: Start a bounded database connection test job
+    x-dbpilot-permission: database-instances:test
+    parameters:
+      - name: instance_id
+        in: path
+        required: true
+        schema: { $ref: ../common/identifiers.yaml#/InstanceId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '202':
+        description: Connection test job accepted.
+        headers:
+          Location: { required: true, schema: { type: string, format: uri-reference } }
+        content:
+          application/json:
+            schema: { $ref: ../common/jobs.yaml#/Job }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }

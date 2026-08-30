@@ -137,3 +137,113 @@ components:
       $ref: ./common/inspection.yaml#/InspectionReportPage
     InspectionOverview:
       $ref: ./common/inspection.yaml#/InspectionOverview
+    HostId:
+      $ref: ./common/hosts.yaml#/HostId
+    AgentId:
+      $ref: ./common/hosts.yaml#/AgentId
+    HostStatus:
+      $ref: ./common/hosts.yaml#/HostStatus
+    ContainerRuntime:
+      $ref: ./common/hosts.yaml#/ContainerRuntime
+    HostCapabilityReason:
+      $ref: ./common/hosts.yaml#/HostCapabilityReason
+    HostCapability:
+      $ref: ./common/hosts.yaml#/HostCapability
+    HostResourceSummary:
+      $ref: ./common/hosts.yaml#/HostResourceSummary
+    FilesystemSummary:
+      $ref: ./common/hosts.yaml#/FilesystemSummary
+    ManagedHost:
+      $ref: ./common/hosts.yaml#/ManagedHost
+    ManagedHostPage:
+      $ref: ./common/hosts.yaml#/ManagedHostPage
+    CandidateId:
+      $ref: ./common/discovery.yaml#/CandidateId
+    DiscoverySource:
+      $ref: ./common/discovery.yaml#/DiscoverySource
+    DiscoveryCandidateStatus:
+      $ref: ./common/discovery.yaml#/DiscoveryCandidateStatus
+    DatabaseFamily:
+      $ref: ./common/discovery.yaml#/DatabaseFamily
+    DatabaseVariant:
+      $ref: ./common/discovery.yaml#/DatabaseVariant
+    DiscoveryCandidate:
+      $ref: ./common/discovery.yaml#/DiscoveryCandidate
+    DiscoveryCandidatePage:
+      $ref: ./common/discovery.yaml#/DiscoveryCandidatePage
+    AcceptDiscoveryCandidateRequest:
+      $ref: ./common/discovery.yaml#/AcceptDiscoveryCandidateRequest
+    IgnoreDiscoveryCandidateRequest:
+      $ref: ./common/discovery.yaml#/IgnoreDiscoveryCandidateRequest
+    DatabaseManagementStatus:
+      $ref: ./common/database-instances.yaml#/DatabaseManagementStatus
+    ConnectionTestStatus:
+      $ref: ./common/database-instances.yaml#/ConnectionTestStatus
+    ManagedDatabaseInstance:
+      $ref: ./common/database-instances.yaml#/ManagedDatabaseInstance
+    ManagedDatabaseInstancePage:
+      $ref: ./common/database-instances.yaml#/ManagedDatabaseInstancePage
+    UpdateDatabaseInstanceRequest:
+      $ref: ./common/database-instances.yaml#/UpdateDatabaseInstanceRequest
+    PluginVersionStatus:
+      $ref: ./common/plugins.yaml#/PluginVersionStatus
+    PluginDesiredState:
+      $ref: ./common/plugins.yaml#/PluginDesiredState
+    PluginProcessState:
+      $ref: ./common/plugins.yaml#/PluginProcessState
+    PluginHealthStatus:
+      $ref: ./common/plugins.yaml#/PluginHealthStatus
+    PluginActiveSlot:
+      $ref: ./common/plugins.yaml#/PluginActiveSlot
+    PluginOperatingSystem:
+      $ref: ./common/plugins.yaml#/PluginOperatingSystem
+    PluginArchitecture:
+      $ref: ./common/plugins.yaml#/PluginArchitecture
+    PluginDefinition:
+      $ref: ./common/plugins.yaml#/PluginDefinition
+    PluginDefinitionPage:
+      $ref: ./common/plugins.yaml#/PluginDefinitionPage
+    PluginPlatform:
+      $ref: ./common/plugins.yaml#/PluginPlatform
+    PluginVersion:
+      $ref: ./common/plugins.yaml#/PluginVersion
+    PluginVersionPage:
+      $ref: ./common/plugins.yaml#/PluginVersionPage
+    CreatePluginVersionRequest:
+      $ref: ./common/plugins.yaml#/CreatePluginVersionRequest
+    ApprovePluginVersionRequest:
+      $ref: ./common/plugins.yaml#/ApprovePluginVersionRequest
+    PluginObservedState:
+      $ref: ./common/plugins.yaml#/PluginObservedState
+    PluginAssignment:
+      $ref: ./common/plugins.yaml#/PluginAssignment
+    PluginAssignmentPage:
+      $ref: ./common/plugins.yaml#/PluginAssignmentPage
+    UpdatePluginAssignmentRequest:
+      $ref: ./common/plugins.yaml#/UpdatePluginAssignmentRequest
+    MetricTemplateRevisionStatus:
+      $ref: ./common/metric-templates.yaml#/MetricTemplateRevisionStatus
+    MetricQueryKind:
+      $ref: ./common/metric-templates.yaml#/MetricQueryKind
+    MetricValueType:
+      $ref: ./common/metric-templates.yaml#/MetricValueType
+    MetricTemplate:
+      $ref: ./common/metric-templates.yaml#/MetricTemplate
+    MetricTemplatePage:
+      $ref: ./common/metric-templates.yaml#/MetricTemplatePage
+    MetricValueMapping:
+      $ref: ./common/metric-templates.yaml#/MetricValueMapping
+    MetricLabelMapping:
+      $ref: ./common/metric-templates.yaml#/MetricLabelMapping
+    MetricTemplateRevision:
+      $ref: ./common/metric-templates.yaml#/MetricTemplateRevision
+    MetricTemplateRevisionPage:
+      $ref: ./common/metric-templates.yaml#/MetricTemplateRevisionPage
+    CreateMetricTemplateRequest:
+      $ref: ./common/metric-templates.yaml#/CreateMetricTemplateRequest
+    CreateMetricTemplateRevisionRequest:
+      $ref: ./common/metric-templates.yaml#/CreateMetricTemplateRevisionRequest
+    MetricTemplateTrialRequest:
+      $ref: ./common/metric-templates.yaml#/MetricTemplateTrialRequest
+    MetricTemplateApprovalRequest:
+      $ref: ./common/metric-templates.yaml#/MetricTemplateApprovalRequest

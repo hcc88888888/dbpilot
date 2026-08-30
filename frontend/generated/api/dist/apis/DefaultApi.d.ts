@@ -10,7 +10,24 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, DownloadDescriptor, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, UpdateInspectionPolicyRequest } from '../models/index.js';
+import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, CreatePluginVersionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
+export interface AcceptDiscoveryCandidateOperationRequest {
+    candidateId: string;
+    idempotencyKey: string;
+    acceptDiscoveryCandidateRequest: AcceptDiscoveryCandidateRequest;
+}
+export interface ApproveMetricTemplateRevisionRequest {
+    revisionId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    metricTemplateApprovalRequest: MetricTemplateApprovalRequest;
+}
+export interface ApprovePluginVersionOperationRequest {
+    versionId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    approvePluginVersionRequest: ApprovePluginVersionRequest;
+}
 export interface CancelInspectionRunRequest {
     runId: string;
     idempotencyKey: string;
@@ -41,8 +58,35 @@ export interface CreateInspectionRunOperationRequest {
     idempotencyKey: string;
     createInspectionRunRequest: CreateInspectionRunRequest;
 }
+export interface CreateMetricTemplateOperationRequest {
+    idempotencyKey: string;
+    createMetricTemplateRequest: CreateMetricTemplateRequest;
+}
+export interface CreateMetricTemplateRevisionOperationRequest {
+    templateId: string;
+    idempotencyKey: string;
+    createMetricTemplateRevisionRequest: CreateMetricTemplateRevisionRequest;
+}
+export interface CreatePluginVersionOperationRequest {
+    idempotencyKey: string;
+    createPluginVersionRequest: CreatePluginVersionRequest;
+}
+export interface DecommissionHostRequest {
+    hostId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+}
 export interface GetArtifactRequest {
     artifactId: string;
+}
+export interface GetDatabaseInstanceRequest {
+    instanceId: string;
+}
+export interface GetDiscoveryCandidateRequest {
+    candidateId: string;
+}
+export interface GetHostRequest {
+    hostId: string;
 }
 export interface GetInspectionPolicyRequest {
     policyId: string;
@@ -56,7 +100,35 @@ export interface GetInspectionRunRequest {
 export interface GetJobRequest {
     jobId: string;
 }
+export interface GetPluginAssignmentRequest {
+    assignmentId: string;
+}
+export interface IgnoreDiscoveryCandidateOperationRequest {
+    candidateId: string;
+    idempotencyKey: string;
+    ignoreDiscoveryCandidateRequest: IgnoreDiscoveryCandidateRequest;
+}
 export interface ListAuditEventsRequest {
+    cursor?: string;
+    limit?: number;
+}
+export interface ListDatabaseInstancesRequest {
+    hostId?: string;
+    databaseFamily?: string;
+    status?: DatabaseManagementStatus;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListDiscoveryCandidatesRequest {
+    hostId?: string;
+    status?: DiscoveryCandidateStatus;
+    source?: DiscoverySource;
+    databaseFamily?: string;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListHostsRequest {
+    status?: HostStatus;
     cursor?: string;
     limit?: number;
 }
@@ -80,6 +152,46 @@ export interface ListInspectionTargetsRequest {
     cursor?: string;
     limit?: number;
 }
+export interface ListMetricTemplateRevisionsRequest {
+    templateId: string;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListMetricTemplatesRequest {
+    databaseFamily?: string;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListPluginAssignmentsRequest {
+    hostId?: string;
+    pluginId?: string;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListPluginDefinitionsRequest {
+    databaseFamily?: string;
+    cursor?: string;
+    limit?: number;
+}
+export interface ListPluginVersionsRequest {
+    pluginId?: string;
+    status?: PluginVersionStatus;
+    cursor?: string;
+    limit?: number;
+}
+export interface PublishMetricTemplateRevisionRequest {
+    revisionId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+}
+export interface ReconcilePluginAssignmentRequest {
+    assignmentId: string;
+    idempotencyKey: string;
+}
+export interface RediscoverHostRequest {
+    hostId: string;
+    idempotencyKey: string;
+}
 export interface RetryInspectionRunRequest {
     runId: string;
     idempotencyKey: string;
@@ -88,16 +200,65 @@ export interface RunInspectionPolicyRequest {
     policyId: string;
     idempotencyKey: string;
 }
+export interface TestDatabaseInstanceConnectionRequest {
+    instanceId: string;
+    idempotencyKey: string;
+}
+export interface TrialMetricTemplateRevisionRequest {
+    revisionId: string;
+    idempotencyKey: string;
+    metricTemplateTrialRequest: MetricTemplateTrialRequest;
+}
+export interface UpdateDatabaseInstanceOperationRequest {
+    instanceId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    updateDatabaseInstanceRequest: UpdateDatabaseInstanceRequest;
+}
 export interface UpdateInspectionPolicyOperationRequest {
     policyId: string;
     idempotencyKey: string;
     ifMatch: string;
     updateInspectionPolicyRequest: UpdateInspectionPolicyRequest;
 }
+export interface UpdatePluginAssignmentOperationRequest {
+    assignmentId: string;
+    idempotencyKey: string;
+    ifMatch: string;
+    updatePluginAssignmentRequest: UpdatePluginAssignmentRequest;
+}
+export interface ValidateMetricTemplateRevisionRequest {
+    revisionId: string;
+    idempotencyKey: string;
+}
 /**
  *
  */
 export declare class DefaultApi extends runtime.BaseAPI {
+    /**
+     * Accept a candidate and begin managed instance provisioning
+     */
+    acceptDiscoveryCandidateRaw(requestParameters: AcceptDiscoveryCandidateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedDatabaseInstance>>;
+    /**
+     * Accept a candidate and begin managed instance provisioning
+     */
+    acceptDiscoveryCandidate(requestParameters: AcceptDiscoveryCandidateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedDatabaseInstance>;
+    /**
+     * Approve a successfully trialed metric template revision
+     */
+    approveMetricTemplateRevisionRaw(requestParameters: ApproveMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplateRevision>>;
+    /**
+     * Approve a successfully trialed metric template revision
+     */
+    approveMetricTemplateRevision(requestParameters: ApproveMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
+    /**
+     * Approve a verified plugin version for new assignments
+     */
+    approvePluginVersionRaw(requestParameters: ApprovePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
+    /**
+     * Approve a verified plugin version for new assignments
+     */
+    approvePluginVersion(requestParameters: ApprovePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
     /**
      * Cancel an inspection run
      */
@@ -155,6 +316,38 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     createInspectionRun(requestParameters: CreateInspectionRunOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
     /**
+     * Create a custom metric template
+     */
+    createMetricTemplateRaw(requestParameters: CreateMetricTemplateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplate>>;
+    /**
+     * Create a custom metric template
+     */
+    createMetricTemplate(requestParameters: CreateMetricTemplateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplate>;
+    /**
+     * Create an immutable custom metric template revision
+     */
+    createMetricTemplateRevisionRaw(requestParameters: CreateMetricTemplateRevisionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplateRevision>>;
+    /**
+     * Create an immutable custom metric template revision
+     */
+    createMetricTemplateRevision(requestParameters: CreateMetricTemplateRevisionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
+    /**
+     * Register a Server-hosted signed plugin artifact
+     */
+    createPluginVersionRaw(requestParameters: CreatePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersion>>;
+    /**
+     * Register a Server-hosted signed plugin artifact
+     */
+    createPluginVersion(requestParameters: CreatePluginVersionOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersion>;
+    /**
+     * Decommission a managed host and revoke Agent enrollment
+     */
+    decommissionHostRaw(requestParameters: DecommissionHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedHost>>;
+    /**
+     * Decommission a managed host and revoke Agent enrollment
+     */
+    decommissionHost(requestParameters: DecommissionHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedHost>;
+    /**
      * Get artifact metadata
      */
     getArtifactRaw(requestParameters: GetArtifactRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Artifact>>;
@@ -170,6 +363,30 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Get effective capabilities
      */
     getCapabilities(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<CapabilitySet>;
+    /**
+     * Get a managed database instance
+     */
+    getDatabaseInstanceRaw(requestParameters: GetDatabaseInstanceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedDatabaseInstance>>;
+    /**
+     * Get a managed database instance
+     */
+    getDatabaseInstance(requestParameters: GetDatabaseInstanceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedDatabaseInstance>;
+    /**
+     * Get a database discovery candidate
+     */
+    getDiscoveryCandidateRaw(requestParameters: GetDiscoveryCandidateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DiscoveryCandidate>>;
+    /**
+     * Get a database discovery candidate
+     */
+    getDiscoveryCandidate(requestParameters: GetDiscoveryCandidateRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DiscoveryCandidate>;
+    /**
+     * Get a managed host
+     */
+    getHostRaw(requestParameters: GetHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedHost>>;
+    /**
+     * Get a managed host
+     */
+    getHost(requestParameters: GetHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedHost>;
     /**
      * Get host inspection overview
      */
@@ -211,6 +428,22 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     getJob(requestParameters: GetJobRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
     /**
+     * Get a plugin assignment
+     */
+    getPluginAssignmentRaw(requestParameters: GetPluginAssignmentRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginAssignment>>;
+    /**
+     * Get a plugin assignment
+     */
+    getPluginAssignment(requestParameters: GetPluginAssignmentRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginAssignment>;
+    /**
+     * Ignore a discovery candidate
+     */
+    ignoreDiscoveryCandidateRaw(requestParameters: IgnoreDiscoveryCandidateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DiscoveryCandidate>>;
+    /**
+     * Ignore a discovery candidate
+     */
+    ignoreDiscoveryCandidate(requestParameters: IgnoreDiscoveryCandidateOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DiscoveryCandidate>;
+    /**
      * List audit events
      */
     listAuditEventsRaw(requestParameters: ListAuditEventsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<AuditEventPage>>;
@@ -218,6 +451,30 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * List audit events
      */
     listAuditEvents(requestParameters?: ListAuditEventsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<AuditEventPage>;
+    /**
+     * List managed database instances
+     */
+    listDatabaseInstancesRaw(requestParameters: ListDatabaseInstancesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedDatabaseInstancePage>>;
+    /**
+     * List managed database instances
+     */
+    listDatabaseInstances(requestParameters?: ListDatabaseInstancesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedDatabaseInstancePage>;
+    /**
+     * List database discovery candidates
+     */
+    listDiscoveryCandidatesRaw(requestParameters: ListDiscoveryCandidatesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<DiscoveryCandidatePage>>;
+    /**
+     * List database discovery candidates
+     */
+    listDiscoveryCandidates(requestParameters?: ListDiscoveryCandidatesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DiscoveryCandidatePage>;
+    /**
+     * List managed hosts
+     */
+    listHostsRaw(requestParameters: ListHostsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedHostPage>>;
+    /**
+     * List managed hosts
+     */
+    listHosts(requestParameters?: ListHostsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedHostPage>;
     /**
      * List inspection items
      */
@@ -259,6 +516,70 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     listInspectionTargets(requestParameters?: ListInspectionTargetsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionTargetPage>;
     /**
+     * List immutable metric template revisions
+     */
+    listMetricTemplateRevisionsRaw(requestParameters: ListMetricTemplateRevisionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplateRevisionPage>>;
+    /**
+     * List immutable metric template revisions
+     */
+    listMetricTemplateRevisions(requestParameters: ListMetricTemplateRevisionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevisionPage>;
+    /**
+     * List built-in and custom metric templates
+     */
+    listMetricTemplatesRaw(requestParameters: ListMetricTemplatesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplatePage>>;
+    /**
+     * List built-in and custom metric templates
+     */
+    listMetricTemplates(requestParameters?: ListMetricTemplatesRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplatePage>;
+    /**
+     * List desired and observed plugin assignments
+     */
+    listPluginAssignmentsRaw(requestParameters: ListPluginAssignmentsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginAssignmentPage>>;
+    /**
+     * List desired and observed plugin assignments
+     */
+    listPluginAssignments(requestParameters?: ListPluginAssignmentsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginAssignmentPage>;
+    /**
+     * List database plugin definitions
+     */
+    listPluginDefinitionsRaw(requestParameters: ListPluginDefinitionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginDefinitionPage>>;
+    /**
+     * List database plugin definitions
+     */
+    listPluginDefinitions(requestParameters?: ListPluginDefinitionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginDefinitionPage>;
+    /**
+     * List immutable plugin versions
+     */
+    listPluginVersionsRaw(requestParameters: ListPluginVersionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginVersionPage>>;
+    /**
+     * List immutable plugin versions
+     */
+    listPluginVersions(requestParameters?: ListPluginVersionsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginVersionPage>;
+    /**
+     * Publish an approved metric template revision
+     */
+    publishMetricTemplateRevisionRaw(requestParameters: PublishMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<MetricTemplateRevision>>;
+    /**
+     * Publish an approved metric template revision
+     */
+    publishMetricTemplateRevision(requestParameters: PublishMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<MetricTemplateRevision>;
+    /**
+     * Trigger typed plugin reconciliation
+     */
+    reconcilePluginAssignmentRaw(requestParameters: ReconcilePluginAssignmentRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    /**
+     * Trigger typed plugin reconciliation
+     */
+    reconcilePluginAssignment(requestParameters: ReconcilePluginAssignmentRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    /**
+     * Trigger a bounded database rediscovery job
+     */
+    rediscoverHostRaw(requestParameters: RediscoverHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    /**
+     * Trigger a bounded database rediscovery job
+     */
+    rediscoverHost(requestParameters: RediscoverHostRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    /**
      * Retry a terminal inspection run as a new run
      */
     retryInspectionRunRaw(requestParameters: RetryInspectionRunRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionRun>>;
@@ -275,6 +596,30 @@ export declare class DefaultApi extends runtime.BaseAPI {
      */
     runInspectionPolicy(requestParameters: RunInspectionPolicyRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionRun>;
     /**
+     * Start a bounded database connection test job
+     */
+    testDatabaseInstanceConnectionRaw(requestParameters: TestDatabaseInstanceConnectionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    /**
+     * Start a bounded database connection test job
+     */
+    testDatabaseInstanceConnection(requestParameters: TestDatabaseInstanceConnectionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    /**
+     * Run a bounded metric template trial without raw business rows
+     */
+    trialMetricTemplateRevisionRaw(requestParameters: TrialMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    /**
+     * Run a bounded metric template trial without raw business rows
+     */
+    trialMetricTemplateRevision(requestParameters: TrialMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
+    /**
+     * Update mutable database instance settings
+     */
+    updateDatabaseInstanceRaw(requestParameters: UpdateDatabaseInstanceOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ManagedDatabaseInstance>>;
+    /**
+     * Update mutable database instance settings
+     */
+    updateDatabaseInstance(requestParameters: UpdateDatabaseInstanceOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ManagedDatabaseInstance>;
+    /**
      * Update an inspection policy
      */
     updateInspectionPolicyRaw(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<InspectionPolicy>>;
@@ -282,4 +627,20 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Update an inspection policy
      */
     updateInspectionPolicy(requestParameters: UpdateInspectionPolicyOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<InspectionPolicy>;
+    /**
+     * Update plugin desired state or version
+     */
+    updatePluginAssignmentRaw(requestParameters: UpdatePluginAssignmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<PluginAssignment>>;
+    /**
+     * Update plugin desired state or version
+     */
+    updatePluginAssignment(requestParameters: UpdatePluginAssignmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<PluginAssignment>;
+    /**
+     * Start static validation for a draft metric template revision
+     */
+    validateMetricTemplateRevisionRaw(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Job>>;
+    /**
+     * Start static validation for a draft metric template revision
+     */
+    validateMetricTemplateRevision(requestParameters: ValidateMetricTemplateRevisionRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Job>;
 }

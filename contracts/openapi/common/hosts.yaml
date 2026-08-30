@@ -1,0 +1,181 @@
+HostId:
+  type: string
+  minLength: 1
+  maxLength: 128
+  pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+AgentId:
+  type: string
+  minLength: 1
+  maxLength: 128
+  pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+HostStatus:
+  type: string
+  enum: [pending, enrolling, online, stale, offline, decommissioned]
+ContainerRuntime:
+  type: string
+  enum: [none, docker]
+HostCapabilityReason:
+  type: string
+  enum: [agent_unsupported, docker_discovery_unavailable, plugin_not_installed, plugin_version_incompatible, permission_denied]
+HostCapability:
+  type: object
+  additionalProperties: false
+  required: [name, available]
+  properties:
+    name:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.-]{0,127}$'
+    available:
+      type: boolean
+    reason:
+      oneOf:
+        - $ref: '#/HostCapabilityReason'
+        - type: 'null'
+HostResourceSummary:
+  type: object
+  additionalProperties: false
+  required: [capacity, available]
+  properties:
+    capacity:
+      type: integer
+      format: int64
+      minimum: 0
+    available:
+      type: integer
+      format: int64
+      minimum: 0
+FilesystemSummary:
+  type: object
+  additionalProperties: false
+  required: [mount_point, capacity_bytes, available_bytes]
+  properties:
+    mount_point:
+      type: string
+      minLength: 1
+      maxLength: 512
+    capacity_bytes:
+      type: integer
+      format: int64
+      minimum: 0
+    available_bytes:
+      type: integer
+      format: int64
+      minimum: 0
+ManagedHost:
+  type: object
+  additionalProperties: false
+  required:
+    - host_id
+    - agent_id
+    - tenant_id
+    - project_id
+    - display_name
+    - hostname
+    - operating_system
+    - architecture
+    - network_addresses
+    - labels
+    - container_runtime
+    - capabilities
+    - enrollment_revision
+    - status
+    - enrolled_at
+    - etag
+  properties:
+    host_id:
+      $ref: '#/HostId'
+    agent_id:
+      $ref: '#/AgentId'
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    hostname:
+      type: string
+      minLength: 1
+      maxLength: 253
+    operating_system:
+      type: string
+      minLength: 1
+      maxLength: 64
+    operating_system_version:
+      type: string
+      maxLength: 128
+    kernel_version:
+      type: string
+      maxLength: 128
+    architecture:
+      type: string
+      minLength: 1
+      maxLength: 32
+    cpu_summary:
+      $ref: '#/HostResourceSummary'
+    memory_summary:
+      $ref: '#/HostResourceSummary'
+    filesystem_summary:
+      type: array
+      maxItems: 128
+      items:
+        $ref: '#/FilesystemSummary'
+    network_addresses:
+      type: array
+      maxItems: 32
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
+        maxLength: 64
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    container_runtime:
+      $ref: '#/ContainerRuntime'
+    agent_version:
+      type: string
+      maxLength: 64
+    capabilities:
+      type: array
+      maxItems: 64
+      items:
+        $ref: '#/HostCapability'
+    enrollment_revision:
+      type: integer
+      format: int64
+      minimum: 1
+    enrolled_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    last_hello_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    last_heartbeat_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    status:
+      $ref: '#/HostStatus'
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
+ManagedHostPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/ManagedHost'
+    page:
+      $ref: ./pagination.yaml#/Page

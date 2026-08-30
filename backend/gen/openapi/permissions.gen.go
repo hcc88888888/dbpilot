@@ -3,6 +3,9 @@
 package openapi
 
 const (
+	PermissionAcceptDiscoveryCandidate       = "discovery:manage"
+	PermissionApproveMetricTemplateRevision  = "metric-templates:approve"
+	PermissionApprovePluginVersion           = "plugins:approve"
 	PermissionCancelInspectionRun            = "inspection:execute"
 	PermissionCancelJob                      = "platform.jobs.cancel"
 	PermissionCreateArtifactDownload         = "platform.artifacts.download"
@@ -10,25 +13,53 @@ const (
 	PermissionCreateInspectionPolicy         = "inspection:manage"
 	PermissionCreateInspectionReportDownload = "inspection:view"
 	PermissionCreateInspectionRun            = "inspection:execute"
+	PermissionCreateMetricTemplate           = "metric-templates:manage"
+	PermissionCreateMetricTemplateRevision   = "metric-templates:manage"
+	PermissionCreatePluginVersion            = "plugins:publish"
+	PermissionDecommissionHost               = "hosts:manage"
 	PermissionGetArtifact                    = "platform.artifacts.read"
 	PermissionGetCapabilities                = "platform.capabilities.read"
+	PermissionGetDatabaseInstance            = "database-instances:view"
+	PermissionGetDiscoveryCandidate          = "discovery:view"
+	PermissionGetHost                        = "hosts:view"
 	PermissionGetInspectionOverview          = "inspection:view"
 	PermissionGetInspectionPolicy            = "inspection:view"
 	PermissionGetInspectionReport            = "inspection:view"
 	PermissionGetInspectionRun               = "inspection:view"
 	PermissionGetJob                         = "platform.jobs.read"
+	PermissionGetPluginAssignment            = "plugins:view"
+	PermissionIgnoreDiscoveryCandidate       = "discovery:manage"
 	PermissionListAuditEvents                = "platform.audit.read"
+	PermissionListDatabaseInstances          = "database-instances:view"
+	PermissionListDiscoveryCandidates        = "discovery:view"
+	PermissionListHosts                      = "hosts:view"
 	PermissionListInspectionItems            = "inspection:view"
 	PermissionListInspectionPolicies         = "inspection:view"
 	PermissionListInspectionReports          = "inspection:view"
 	PermissionListInspectionRuns             = "inspection:view"
 	PermissionListInspectionTargets          = "inspection:view"
+	PermissionListMetricTemplateRevisions    = "metric-templates:view"
+	PermissionListMetricTemplates            = "metric-templates:view"
+	PermissionListPluginAssignments          = "plugins:view"
+	PermissionListPluginDefinitions          = "plugins:view"
+	PermissionListPluginVersions             = "plugins:view"
+	PermissionPublishMetricTemplateRevision  = "metric-templates:approve"
+	PermissionReconcilePluginAssignment      = "plugins:deploy"
+	PermissionRediscoverHost                 = "hosts:discover"
 	PermissionRetryInspectionRun             = "inspection:execute"
 	PermissionRunInspectionPolicy            = "inspection:execute"
+	PermissionTestDatabaseInstanceConnection = "database-instances:test"
+	PermissionTrialMetricTemplateRevision    = "metric-templates:manage"
+	PermissionUpdateDatabaseInstance         = "database-instances:manage"
 	PermissionUpdateInspectionPolicy         = "inspection:manage"
+	PermissionUpdatePluginAssignment         = "plugins:manage"
+	PermissionValidateMetricTemplateRevision = "metric-templates:manage"
 )
 
 var OperationPermissions = map[string]string{
+	"acceptDiscoveryCandidate":       PermissionAcceptDiscoveryCandidate,
+	"approveMetricTemplateRevision":  PermissionApproveMetricTemplateRevision,
+	"approvePluginVersion":           PermissionApprovePluginVersion,
 	"cancelInspectionRun":            PermissionCancelInspectionRun,
 	"cancelJob":                      PermissionCancelJob,
 	"createArtifactDownload":         PermissionCreateArtifactDownload,
@@ -36,20 +67,45 @@ var OperationPermissions = map[string]string{
 	"createInspectionPolicy":         PermissionCreateInspectionPolicy,
 	"createInspectionReportDownload": PermissionCreateInspectionReportDownload,
 	"createInspectionRun":            PermissionCreateInspectionRun,
+	"createMetricTemplate":           PermissionCreateMetricTemplate,
+	"createMetricTemplateRevision":   PermissionCreateMetricTemplateRevision,
+	"createPluginVersion":            PermissionCreatePluginVersion,
+	"decommissionHost":               PermissionDecommissionHost,
 	"getArtifact":                    PermissionGetArtifact,
 	"getCapabilities":                PermissionGetCapabilities,
+	"getDatabaseInstance":            PermissionGetDatabaseInstance,
+	"getDiscoveryCandidate":          PermissionGetDiscoveryCandidate,
+	"getHost":                        PermissionGetHost,
 	"getInspectionOverview":          PermissionGetInspectionOverview,
 	"getInspectionPolicy":            PermissionGetInspectionPolicy,
 	"getInspectionReport":            PermissionGetInspectionReport,
 	"getInspectionRun":               PermissionGetInspectionRun,
 	"getJob":                         PermissionGetJob,
+	"getPluginAssignment":            PermissionGetPluginAssignment,
+	"ignoreDiscoveryCandidate":       PermissionIgnoreDiscoveryCandidate,
 	"listAuditEvents":                PermissionListAuditEvents,
+	"listDatabaseInstances":          PermissionListDatabaseInstances,
+	"listDiscoveryCandidates":        PermissionListDiscoveryCandidates,
+	"listHosts":                      PermissionListHosts,
 	"listInspectionItems":            PermissionListInspectionItems,
 	"listInspectionPolicies":         PermissionListInspectionPolicies,
 	"listInspectionReports":          PermissionListInspectionReports,
 	"listInspectionRuns":             PermissionListInspectionRuns,
 	"listInspectionTargets":          PermissionListInspectionTargets,
+	"listMetricTemplateRevisions":    PermissionListMetricTemplateRevisions,
+	"listMetricTemplates":            PermissionListMetricTemplates,
+	"listPluginAssignments":          PermissionListPluginAssignments,
+	"listPluginDefinitions":          PermissionListPluginDefinitions,
+	"listPluginVersions":             PermissionListPluginVersions,
+	"publishMetricTemplateRevision":  PermissionPublishMetricTemplateRevision,
+	"reconcilePluginAssignment":      PermissionReconcilePluginAssignment,
+	"rediscoverHost":                 PermissionRediscoverHost,
 	"retryInspectionRun":             PermissionRetryInspectionRun,
 	"runInspectionPolicy":            PermissionRunInspectionPolicy,
+	"testDatabaseInstanceConnection": PermissionTestDatabaseInstanceConnection,
+	"trialMetricTemplateRevision":    PermissionTrialMetricTemplateRevision,
+	"updateDatabaseInstance":         PermissionUpdateDatabaseInstance,
 	"updateInspectionPolicy":         PermissionUpdateInspectionPolicy,
+	"updatePluginAssignment":         PermissionUpdatePluginAssignment,
+	"validateMetricTemplateRevision": PermissionValidateMetricTemplateRevision,
 }

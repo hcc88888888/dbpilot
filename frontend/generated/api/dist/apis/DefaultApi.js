@@ -12,11 +12,155 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import { ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, DownloadDescriptorFromJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, UpdateInspectionPolicyRequestToJSON, } from '../models/index.js';
+import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, CreatePluginVersionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
 /**
  *
  */
 export class DefaultApi extends runtime.BaseAPI {
+    /**
+     * Accept a candidate and begin managed instance provisioning
+     */
+    async acceptDiscoveryCandidateRaw(requestParameters, initOverrides) {
+        if (requestParameters['candidateId'] == null) {
+            throw new runtime.RequiredError('candidateId', 'Required parameter "candidateId" was null or undefined when calling acceptDiscoveryCandidate().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling acceptDiscoveryCandidate().');
+        }
+        if (requestParameters['acceptDiscoveryCandidateRequest'] == null) {
+            throw new runtime.RequiredError('acceptDiscoveryCandidateRequest', 'Required parameter "acceptDiscoveryCandidateRequest" was null or undefined when calling acceptDiscoveryCandidate().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/discovery-candidates/{candidate_id}/actions/accept`;
+        urlPath = urlPath.replace(`{${"candidate_id"}}`, encodeURIComponent(String(requestParameters['candidateId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: AcceptDiscoveryCandidateRequestToJSON(requestParameters['acceptDiscoveryCandidateRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedDatabaseInstanceFromJSON(jsonValue));
+    }
+    /**
+     * Accept a candidate and begin managed instance provisioning
+     */
+    async acceptDiscoveryCandidate(requestParameters, initOverrides) {
+        const response = await this.acceptDiscoveryCandidateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Approve a successfully trialed metric template revision
+     */
+    async approveMetricTemplateRevisionRaw(requestParameters, initOverrides) {
+        if (requestParameters['revisionId'] == null) {
+            throw new runtime.RequiredError('revisionId', 'Required parameter "revisionId" was null or undefined when calling approveMetricTemplateRevision().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling approveMetricTemplateRevision().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling approveMetricTemplateRevision().');
+        }
+        if (requestParameters['metricTemplateApprovalRequest'] == null) {
+            throw new runtime.RequiredError('metricTemplateApprovalRequest', 'Required parameter "metricTemplateApprovalRequest" was null or undefined when calling approveMetricTemplateRevision().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-template-revisions/{revision_id}/actions/approve`;
+        urlPath = urlPath.replace(`{${"revision_id"}}`, encodeURIComponent(String(requestParameters['revisionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: MetricTemplateApprovalRequestToJSON(requestParameters['metricTemplateApprovalRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateRevisionFromJSON(jsonValue));
+    }
+    /**
+     * Approve a successfully trialed metric template revision
+     */
+    async approveMetricTemplateRevision(requestParameters, initOverrides) {
+        const response = await this.approveMetricTemplateRevisionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Approve a verified plugin version for new assignments
+     */
+    async approvePluginVersionRaw(requestParameters, initOverrides) {
+        if (requestParameters['versionId'] == null) {
+            throw new runtime.RequiredError('versionId', 'Required parameter "versionId" was null or undefined when calling approvePluginVersion().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling approvePluginVersion().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling approvePluginVersion().');
+        }
+        if (requestParameters['approvePluginVersionRequest'] == null) {
+            throw new runtime.RequiredError('approvePluginVersionRequest', 'Required parameter "approvePluginVersionRequest" was null or undefined when calling approvePluginVersion().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions/{version_id}/actions/approve`;
+        urlPath = urlPath.replace(`{${"version_id"}}`, encodeURIComponent(String(requestParameters['versionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: ApprovePluginVersionRequestToJSON(requestParameters['approvePluginVersionRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
+    }
+    /**
+     * Approve a verified plugin version for new assignments
+     */
+    async approvePluginVersion(requestParameters, initOverrides) {
+        const response = await this.approvePluginVersionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
     /**
      * Cancel an inspection run
      */
@@ -305,6 +449,175 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Create a custom metric template
+     */
+    async createMetricTemplateRaw(requestParameters, initOverrides) {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createMetricTemplate().');
+        }
+        if (requestParameters['createMetricTemplateRequest'] == null) {
+            throw new runtime.RequiredError('createMetricTemplateRequest', 'Required parameter "createMetricTemplateRequest" was null or undefined when calling createMetricTemplate().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-templates`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateMetricTemplateRequestToJSON(requestParameters['createMetricTemplateRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateFromJSON(jsonValue));
+    }
+    /**
+     * Create a custom metric template
+     */
+    async createMetricTemplate(requestParameters, initOverrides) {
+        const response = await this.createMetricTemplateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Create an immutable custom metric template revision
+     */
+    async createMetricTemplateRevisionRaw(requestParameters, initOverrides) {
+        if (requestParameters['templateId'] == null) {
+            throw new runtime.RequiredError('templateId', 'Required parameter "templateId" was null or undefined when calling createMetricTemplateRevision().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createMetricTemplateRevision().');
+        }
+        if (requestParameters['createMetricTemplateRevisionRequest'] == null) {
+            throw new runtime.RequiredError('createMetricTemplateRevisionRequest', 'Required parameter "createMetricTemplateRevisionRequest" was null or undefined when calling createMetricTemplateRevision().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-templates/{template_id}/revisions`;
+        urlPath = urlPath.replace(`{${"template_id"}}`, encodeURIComponent(String(requestParameters['templateId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateMetricTemplateRevisionRequestToJSON(requestParameters['createMetricTemplateRevisionRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateRevisionFromJSON(jsonValue));
+    }
+    /**
+     * Create an immutable custom metric template revision
+     */
+    async createMetricTemplateRevision(requestParameters, initOverrides) {
+        const response = await this.createMetricTemplateRevisionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Register a Server-hosted signed plugin artifact
+     */
+    async createPluginVersionRaw(requestParameters, initOverrides) {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createPluginVersion().');
+        }
+        if (requestParameters['createPluginVersionRequest'] == null) {
+            throw new runtime.RequiredError('createPluginVersionRequest', 'Required parameter "createPluginVersionRequest" was null or undefined when calling createPluginVersion().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreatePluginVersionRequestToJSON(requestParameters['createPluginVersionRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionFromJSON(jsonValue));
+    }
+    /**
+     * Register a Server-hosted signed plugin artifact
+     */
+    async createPluginVersion(requestParameters, initOverrides) {
+        const response = await this.createPluginVersionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Decommission a managed host and revoke Agent enrollment
+     */
+    async decommissionHostRaw(requestParameters, initOverrides) {
+        if (requestParameters['hostId'] == null) {
+            throw new runtime.RequiredError('hostId', 'Required parameter "hostId" was null or undefined when calling decommissionHost().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling decommissionHost().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling decommissionHost().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/hosts/{host_id}/actions/decommission`;
+        urlPath = urlPath.replace(`{${"host_id"}}`, encodeURIComponent(String(requestParameters['hostId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedHostFromJSON(jsonValue));
+    }
+    /**
+     * Decommission a managed host and revoke Agent enrollment
+     */
+    async decommissionHost(requestParameters, initOverrides) {
+        const response = await this.decommissionHostRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Get artifact metadata
      */
     async getArtifactRaw(requestParameters, initOverrides) {
@@ -364,6 +677,105 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async getCapabilities(initOverrides) {
         const response = await this.getCapabilitiesRaw(initOverrides);
+        return await response.value();
+    }
+    /**
+     * Get a managed database instance
+     */
+    async getDatabaseInstanceRaw(requestParameters, initOverrides) {
+        if (requestParameters['instanceId'] == null) {
+            throw new runtime.RequiredError('instanceId', 'Required parameter "instanceId" was null or undefined when calling getDatabaseInstance().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/database-instances/{instance_id}`;
+        urlPath = urlPath.replace(`{${"instance_id"}}`, encodeURIComponent(String(requestParameters['instanceId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedDatabaseInstanceFromJSON(jsonValue));
+    }
+    /**
+     * Get a managed database instance
+     */
+    async getDatabaseInstance(requestParameters, initOverrides) {
+        const response = await this.getDatabaseInstanceRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Get a database discovery candidate
+     */
+    async getDiscoveryCandidateRaw(requestParameters, initOverrides) {
+        if (requestParameters['candidateId'] == null) {
+            throw new runtime.RequiredError('candidateId', 'Required parameter "candidateId" was null or undefined when calling getDiscoveryCandidate().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/discovery-candidates/{candidate_id}`;
+        urlPath = urlPath.replace(`{${"candidate_id"}}`, encodeURIComponent(String(requestParameters['candidateId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => DiscoveryCandidateFromJSON(jsonValue));
+    }
+    /**
+     * Get a database discovery candidate
+     */
+    async getDiscoveryCandidate(requestParameters, initOverrides) {
+        const response = await this.getDiscoveryCandidateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Get a managed host
+     */
+    async getHostRaw(requestParameters, initOverrides) {
+        if (requestParameters['hostId'] == null) {
+            throw new runtime.RequiredError('hostId', 'Required parameter "hostId" was null or undefined when calling getHost().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/hosts/{host_id}`;
+        urlPath = urlPath.replace(`{${"host_id"}}`, encodeURIComponent(String(requestParameters['hostId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedHostFromJSON(jsonValue));
+    }
+    /**
+     * Get a managed host
+     */
+    async getHost(requestParameters, initOverrides) {
+        const response = await this.getHostRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**
@@ -528,6 +940,83 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Get a plugin assignment
+     */
+    async getPluginAssignmentRaw(requestParameters, initOverrides) {
+        if (requestParameters['assignmentId'] == null) {
+            throw new runtime.RequiredError('assignmentId', 'Required parameter "assignmentId" was null or undefined when calling getPluginAssignment().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-assignments/{assignment_id}`;
+        urlPath = urlPath.replace(`{${"assignment_id"}}`, encodeURIComponent(String(requestParameters['assignmentId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginAssignmentFromJSON(jsonValue));
+    }
+    /**
+     * Get a plugin assignment
+     */
+    async getPluginAssignment(requestParameters, initOverrides) {
+        const response = await this.getPluginAssignmentRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Ignore a discovery candidate
+     */
+    async ignoreDiscoveryCandidateRaw(requestParameters, initOverrides) {
+        if (requestParameters['candidateId'] == null) {
+            throw new runtime.RequiredError('candidateId', 'Required parameter "candidateId" was null or undefined when calling ignoreDiscoveryCandidate().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling ignoreDiscoveryCandidate().');
+        }
+        if (requestParameters['ignoreDiscoveryCandidateRequest'] == null) {
+            throw new runtime.RequiredError('ignoreDiscoveryCandidateRequest', 'Required parameter "ignoreDiscoveryCandidateRequest" was null or undefined when calling ignoreDiscoveryCandidate().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/discovery-candidates/{candidate_id}/actions/ignore`;
+        urlPath = urlPath.replace(`{${"candidate_id"}}`, encodeURIComponent(String(requestParameters['candidateId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: IgnoreDiscoveryCandidateRequestToJSON(requestParameters['ignoreDiscoveryCandidateRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => DiscoveryCandidateFromJSON(jsonValue));
+    }
+    /**
+     * Ignore a discovery candidate
+     */
+    async ignoreDiscoveryCandidate(requestParameters, initOverrides) {
+        const response = await this.ignoreDiscoveryCandidateRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * List audit events
      */
     async listAuditEventsRaw(requestParameters, initOverrides) {
@@ -560,6 +1049,135 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async listAuditEvents(requestParameters = {}, initOverrides) {
         const response = await this.listAuditEventsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List managed database instances
+     */
+    async listDatabaseInstancesRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['hostId'] != null) {
+            queryParameters['host_id'] = requestParameters['hostId'];
+        }
+        if (requestParameters['databaseFamily'] != null) {
+            queryParameters['database_family'] = requestParameters['databaseFamily'];
+        }
+        if (requestParameters['status'] != null) {
+            queryParameters['status'] = requestParameters['status'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/database-instances`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedDatabaseInstancePageFromJSON(jsonValue));
+    }
+    /**
+     * List managed database instances
+     */
+    async listDatabaseInstances(requestParameters = {}, initOverrides) {
+        const response = await this.listDatabaseInstancesRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List database discovery candidates
+     */
+    async listDiscoveryCandidatesRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['hostId'] != null) {
+            queryParameters['host_id'] = requestParameters['hostId'];
+        }
+        if (requestParameters['status'] != null) {
+            queryParameters['status'] = requestParameters['status'];
+        }
+        if (requestParameters['source'] != null) {
+            queryParameters['source'] = requestParameters['source'];
+        }
+        if (requestParameters['databaseFamily'] != null) {
+            queryParameters['database_family'] = requestParameters['databaseFamily'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/discovery-candidates`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => DiscoveryCandidatePageFromJSON(jsonValue));
+    }
+    /**
+     * List database discovery candidates
+     */
+    async listDiscoveryCandidates(requestParameters = {}, initOverrides) {
+        const response = await this.listDiscoveryCandidatesRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List managed hosts
+     */
+    async listHostsRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['status'] != null) {
+            queryParameters['status'] = requestParameters['status'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/hosts`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedHostPageFromJSON(jsonValue));
+    }
+    /**
+     * List managed hosts
+     */
+    async listHosts(requestParameters = {}, initOverrides) {
+        const response = await this.listHostsRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**
@@ -738,6 +1356,326 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * List immutable metric template revisions
+     */
+    async listMetricTemplateRevisionsRaw(requestParameters, initOverrides) {
+        if (requestParameters['templateId'] == null) {
+            throw new runtime.RequiredError('templateId', 'Required parameter "templateId" was null or undefined when calling listMetricTemplateRevisions().');
+        }
+        const queryParameters = {};
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-templates/{template_id}/revisions`;
+        urlPath = urlPath.replace(`{${"template_id"}}`, encodeURIComponent(String(requestParameters['templateId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateRevisionPageFromJSON(jsonValue));
+    }
+    /**
+     * List immutable metric template revisions
+     */
+    async listMetricTemplateRevisions(requestParameters, initOverrides) {
+        const response = await this.listMetricTemplateRevisionsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List built-in and custom metric templates
+     */
+    async listMetricTemplatesRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['databaseFamily'] != null) {
+            queryParameters['database_family'] = requestParameters['databaseFamily'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-templates`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplatePageFromJSON(jsonValue));
+    }
+    /**
+     * List built-in and custom metric templates
+     */
+    async listMetricTemplates(requestParameters = {}, initOverrides) {
+        const response = await this.listMetricTemplatesRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List desired and observed plugin assignments
+     */
+    async listPluginAssignmentsRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['hostId'] != null) {
+            queryParameters['host_id'] = requestParameters['hostId'];
+        }
+        if (requestParameters['pluginId'] != null) {
+            queryParameters['plugin_id'] = requestParameters['pluginId'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-assignments`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginAssignmentPageFromJSON(jsonValue));
+    }
+    /**
+     * List desired and observed plugin assignments
+     */
+    async listPluginAssignments(requestParameters = {}, initOverrides) {
+        const response = await this.listPluginAssignmentsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List database plugin definitions
+     */
+    async listPluginDefinitionsRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['databaseFamily'] != null) {
+            queryParameters['database_family'] = requestParameters['databaseFamily'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-definitions`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginDefinitionPageFromJSON(jsonValue));
+    }
+    /**
+     * List database plugin definitions
+     */
+    async listPluginDefinitions(requestParameters = {}, initOverrides) {
+        const response = await this.listPluginDefinitionsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * List immutable plugin versions
+     */
+    async listPluginVersionsRaw(requestParameters, initOverrides) {
+        const queryParameters = {};
+        if (requestParameters['pluginId'] != null) {
+            queryParameters['plugin_id'] = requestParameters['pluginId'];
+        }
+        if (requestParameters['status'] != null) {
+            queryParameters['status'] = requestParameters['status'];
+        }
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
+        }
+        if (requestParameters['limit'] != null) {
+            queryParameters['limit'] = requestParameters['limit'];
+        }
+        const headerParameters = {};
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-versions`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginVersionPageFromJSON(jsonValue));
+    }
+    /**
+     * List immutable plugin versions
+     */
+    async listPluginVersions(requestParameters = {}, initOverrides) {
+        const response = await this.listPluginVersionsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Publish an approved metric template revision
+     */
+    async publishMetricTemplateRevisionRaw(requestParameters, initOverrides) {
+        if (requestParameters['revisionId'] == null) {
+            throw new runtime.RequiredError('revisionId', 'Required parameter "revisionId" was null or undefined when calling publishMetricTemplateRevision().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling publishMetricTemplateRevision().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling publishMetricTemplateRevision().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-template-revisions/{revision_id}/actions/publish`;
+        urlPath = urlPath.replace(`{${"revision_id"}}`, encodeURIComponent(String(requestParameters['revisionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => MetricTemplateRevisionFromJSON(jsonValue));
+    }
+    /**
+     * Publish an approved metric template revision
+     */
+    async publishMetricTemplateRevision(requestParameters, initOverrides) {
+        const response = await this.publishMetricTemplateRevisionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Trigger typed plugin reconciliation
+     */
+    async reconcilePluginAssignmentRaw(requestParameters, initOverrides) {
+        if (requestParameters['assignmentId'] == null) {
+            throw new runtime.RequiredError('assignmentId', 'Required parameter "assignmentId" was null or undefined when calling reconcilePluginAssignment().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling reconcilePluginAssignment().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-assignments/{assignment_id}/actions/reconcile`;
+        urlPath = urlPath.replace(`{${"assignment_id"}}`, encodeURIComponent(String(requestParameters['assignmentId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+    }
+    /**
+     * Trigger typed plugin reconciliation
+     */
+    async reconcilePluginAssignment(requestParameters, initOverrides) {
+        const response = await this.reconcilePluginAssignmentRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Trigger a bounded database rediscovery job
+     */
+    async rediscoverHostRaw(requestParameters, initOverrides) {
+        if (requestParameters['hostId'] == null) {
+            throw new runtime.RequiredError('hostId', 'Required parameter "hostId" was null or undefined when calling rediscoverHost().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling rediscoverHost().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/hosts/{host_id}/actions/rediscover`;
+        urlPath = urlPath.replace(`{${"host_id"}}`, encodeURIComponent(String(requestParameters['hostId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+    }
+    /**
+     * Trigger a bounded database rediscovery job
+     */
+    async rediscoverHost(requestParameters, initOverrides) {
+        const response = await this.rediscoverHostRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Retry a terminal inspection run as a new run
      */
     async retryInspectionRunRaw(requestParameters, initOverrides) {
@@ -816,6 +1754,139 @@ export class DefaultApi extends runtime.BaseAPI {
         return await response.value();
     }
     /**
+     * Start a bounded database connection test job
+     */
+    async testDatabaseInstanceConnectionRaw(requestParameters, initOverrides) {
+        if (requestParameters['instanceId'] == null) {
+            throw new runtime.RequiredError('instanceId', 'Required parameter "instanceId" was null or undefined when calling testDatabaseInstanceConnection().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling testDatabaseInstanceConnection().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/database-instances/{instance_id}/actions/test-connection`;
+        urlPath = urlPath.replace(`{${"instance_id"}}`, encodeURIComponent(String(requestParameters['instanceId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+    }
+    /**
+     * Start a bounded database connection test job
+     */
+    async testDatabaseInstanceConnection(requestParameters, initOverrides) {
+        const response = await this.testDatabaseInstanceConnectionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Run a bounded metric template trial without raw business rows
+     */
+    async trialMetricTemplateRevisionRaw(requestParameters, initOverrides) {
+        if (requestParameters['revisionId'] == null) {
+            throw new runtime.RequiredError('revisionId', 'Required parameter "revisionId" was null or undefined when calling trialMetricTemplateRevision().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling trialMetricTemplateRevision().');
+        }
+        if (requestParameters['metricTemplateTrialRequest'] == null) {
+            throw new runtime.RequiredError('metricTemplateTrialRequest', 'Required parameter "metricTemplateTrialRequest" was null or undefined when calling trialMetricTemplateRevision().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-template-revisions/{revision_id}/actions/trial`;
+        urlPath = urlPath.replace(`{${"revision_id"}}`, encodeURIComponent(String(requestParameters['revisionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: MetricTemplateTrialRequestToJSON(requestParameters['metricTemplateTrialRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+    }
+    /**
+     * Run a bounded metric template trial without raw business rows
+     */
+    async trialMetricTemplateRevision(requestParameters, initOverrides) {
+        const response = await this.trialMetricTemplateRevisionRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Update mutable database instance settings
+     */
+    async updateDatabaseInstanceRaw(requestParameters, initOverrides) {
+        if (requestParameters['instanceId'] == null) {
+            throw new runtime.RequiredError('instanceId', 'Required parameter "instanceId" was null or undefined when calling updateDatabaseInstance().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling updateDatabaseInstance().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling updateDatabaseInstance().');
+        }
+        if (requestParameters['updateDatabaseInstanceRequest'] == null) {
+            throw new runtime.RequiredError('updateDatabaseInstanceRequest', 'Required parameter "updateDatabaseInstanceRequest" was null or undefined when calling updateDatabaseInstance().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/database-instances/{instance_id}`;
+        urlPath = urlPath.replace(`{${"instance_id"}}`, encodeURIComponent(String(requestParameters['instanceId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'PATCH',
+            headers: headerParameters,
+            query: queryParameters,
+            body: UpdateDatabaseInstanceRequestToJSON(requestParameters['updateDatabaseInstanceRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => ManagedDatabaseInstanceFromJSON(jsonValue));
+    }
+    /**
+     * Update mutable database instance settings
+     */
+    async updateDatabaseInstance(requestParameters, initOverrides) {
+        const response = await this.updateDatabaseInstanceRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
      * Update an inspection policy
      */
     async updateInspectionPolicyRaw(requestParameters, initOverrides) {
@@ -863,6 +1934,95 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async updateInspectionPolicy(requestParameters, initOverrides) {
         const response = await this.updateInspectionPolicyRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Update plugin desired state or version
+     */
+    async updatePluginAssignmentRaw(requestParameters, initOverrides) {
+        if (requestParameters['assignmentId'] == null) {
+            throw new runtime.RequiredError('assignmentId', 'Required parameter "assignmentId" was null or undefined when calling updatePluginAssignment().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling updatePluginAssignment().');
+        }
+        if (requestParameters['ifMatch'] == null) {
+            throw new runtime.RequiredError('ifMatch', 'Required parameter "ifMatch" was null or undefined when calling updatePluginAssignment().');
+        }
+        if (requestParameters['updatePluginAssignmentRequest'] == null) {
+            throw new runtime.RequiredError('updatePluginAssignmentRequest', 'Required parameter "updatePluginAssignmentRequest" was null or undefined when calling updatePluginAssignment().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (requestParameters['ifMatch'] != null) {
+            headerParameters['If-Match'] = String(requestParameters['ifMatch']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/plugin-assignments/{assignment_id}`;
+        urlPath = urlPath.replace(`{${"assignment_id"}}`, encodeURIComponent(String(requestParameters['assignmentId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'PATCH',
+            headers: headerParameters,
+            query: queryParameters,
+            body: UpdatePluginAssignmentRequestToJSON(requestParameters['updatePluginAssignmentRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => PluginAssignmentFromJSON(jsonValue));
+    }
+    /**
+     * Update plugin desired state or version
+     */
+    async updatePluginAssignment(requestParameters, initOverrides) {
+        const response = await this.updatePluginAssignmentRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Start static validation for a draft metric template revision
+     */
+    async validateMetricTemplateRevisionRaw(requestParameters, initOverrides) {
+        if (requestParameters['revisionId'] == null) {
+            throw new runtime.RequiredError('revisionId', 'Required parameter "revisionId" was null or undefined when calling validateMetricTemplateRevision().');
+        }
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling validateMetricTemplateRevision().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/metric-template-revisions/{revision_id}/actions/validate`;
+        urlPath = urlPath.replace(`{${"revision_id"}}`, encodeURIComponent(String(requestParameters['revisionId'])));
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => JobFromJSON(jsonValue));
+    }
+    /**
+     * Start static validation for a draft metric template revision
+     */
+    async validateMetricTemplateRevision(requestParameters, initOverrides) {
+        const response = await this.validateMetricTemplateRevisionRaw(requestParameters, initOverrides);
         return await response.value();
     }
 }

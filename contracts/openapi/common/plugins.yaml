@@ -1,0 +1,304 @@
+PluginVersionStatus:
+  type: string
+  enum: [uploaded, verified, approved, available, deprecated, revoked, rejected]
+PluginDesiredState:
+  type: string
+  enum: [absent, installed, running, stopped]
+PluginProcessState:
+  type: string
+  enum: [absent, downloading, verifying, installed, starting, handshaking, running, degraded, restarting, circuit_open, draining, stopped, uninstalling, download_failed, signature_rejected, manifest_rejected, platform_mismatch, start_failed, handshake_failed, upgrading, rollback]
+PluginHealthStatus:
+  type: string
+  enum: [unknown, healthy, degraded, unhealthy]
+PluginActiveSlot:
+  type: string
+  enum: [none, a, b]
+PluginOperatingSystem:
+  type: string
+  enum: [linux]
+PluginArchitecture:
+  type: string
+  enum: [amd64, arm64]
+PluginDefinition:
+  type: object
+  additionalProperties: false
+  required: [plugin_id, name, database_family, protocol_version, capabilities, latest_available_version]
+  properties:
+    plugin_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.-]{0,127}$'
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 1000
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    protocol_version:
+      type: string
+      minLength: 1
+      maxLength: 32
+    supported_variants:
+      type: array
+      maxItems: 16
+      uniqueItems: true
+      items:
+        $ref: ./discovery.yaml#/DatabaseVariant
+    capabilities:
+      type: array
+      maxItems: 64
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
+        maxLength: 128
+    latest_available_version:
+      type: [string, 'null']
+      maxLength: 64
+PluginDefinitionPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/PluginDefinition'
+    page:
+      $ref: ./pagination.yaml#/Page
+PluginPlatform:
+  type: object
+  additionalProperties: false
+  required: [operating_system, architecture, sha256, size_bytes]
+  properties:
+    operating_system:
+      $ref: '#/PluginOperatingSystem'
+    architecture:
+      $ref: '#/PluginArchitecture'
+    sha256:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    size_bytes:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 1073741824
+PluginVersion:
+  type: object
+  additionalProperties: false
+  required: [version_id, plugin_id, version, status, artifact_id, package_sha256, manifest_digest, publisher_id, platforms, created_at, etag]
+  properties:
+    version_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    plugin_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    version:
+      type: string
+      minLength: 1
+      maxLength: 64
+    status:
+      $ref: '#/PluginVersionStatus'
+    artifact_id:
+      $ref: ./identifiers.yaml#/ArtifactId
+    package_sha256:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    manifest_digest:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    publisher_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    signing_key_id:
+      type: string
+      maxLength: 128
+    minimum_agent_protocol_version:
+      type: string
+      maxLength: 32
+    maximum_agent_protocol_version:
+      type: string
+      maxLength: 32
+    platforms:
+      type: array
+      minItems: 1
+      maxItems: 16
+      items:
+        $ref: '#/PluginPlatform'
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    approved_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
+PluginVersionPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/PluginVersion'
+    page:
+      $ref: ./pagination.yaml#/Page
+CreatePluginVersionRequest:
+  type: object
+  additionalProperties: false
+  required: [plugin_id, artifact_id, package_sha256, manifest_digest]
+  properties:
+    plugin_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    artifact_id:
+      $ref: ./identifiers.yaml#/ArtifactId
+    package_sha256:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    manifest_digest:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+ApprovePluginVersionRequest:
+  type: object
+  additionalProperties: false
+  properties:
+    approval_comment:
+      type: string
+      maxLength: 500
+PluginObservedState:
+  type: object
+  additionalProperties: false
+  required: [assignment_id, process_state, health, restart_count, bound_instance_count, active_configuration_revision, observed_operation_revision, observed_at]
+  properties:
+    assignment_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    installed_version:
+      type: string
+      maxLength: 64
+    active_slot:
+      $ref: '#/PluginActiveSlot'
+    process_state:
+      $ref: '#/PluginProcessState'
+    pid:
+      type: integer
+      minimum: 0
+    started_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    health:
+      $ref: '#/PluginHealthStatus'
+    restart_count:
+      type: integer
+      minimum: 0
+    bound_instance_count:
+      type: integer
+      minimum: 0
+      maximum: 1000
+    active_configuration_revision:
+      type: integer
+      format: int64
+      minimum: 0
+    observed_operation_revision:
+      type: integer
+      format: int64
+      minimum: 0
+    last_error_code:
+      type: string
+      maxLength: 64
+      pattern: '^[a-z][a-z0-9_]{0,63}$'
+    observed_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+PluginAssignment:
+  type: object
+  additionalProperties: false
+  required: [assignment_id, host_id, agent_id, plugin_id, database_family, desired_version, desired_state, configuration_revision, operation_revision, rollout_percentage, created_at, updated_at, etag]
+  properties:
+    assignment_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    host_id:
+      $ref: ./hosts.yaml#/HostId
+    agent_id:
+      $ref: ./hosts.yaml#/AgentId
+    plugin_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    desired_version:
+      type: string
+      minLength: 1
+      maxLength: 64
+    desired_state:
+      $ref: '#/PluginDesiredState'
+    configuration_revision:
+      type: integer
+      format: int64
+      minimum: 1
+    operation_revision:
+      type: integer
+      format: int64
+      minimum: 1
+    rollout_percentage:
+      type: integer
+      minimum: 1
+      maximum: 100
+    observed_state:
+      oneOf:
+        - $ref: '#/PluginObservedState'
+        - type: 'null'
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    updated_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
+PluginAssignmentPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/PluginAssignment'
+    page:
+      $ref: ./pagination.yaml#/Page
+UpdatePluginAssignmentRequest:
+  type: object
+  additionalProperties: false
+  minProperties: 1
+  properties:
+    desired_version:
+      type: string
+      minLength: 1
+      maxLength: 64
+    desired_state:
+      $ref: '#/PluginDesiredState'
+    rollout_percentage:
+      type: integer
+      minimum: 1
+      maximum: 100

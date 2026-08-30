@@ -1,0 +1,165 @@
+CandidateId:
+  type: string
+  minLength: 1
+  maxLength: 128
+DiscoverySource:
+  type: string
+  enum: [native, docker]
+DiscoveryCandidateStatus:
+  type: string
+  enum: [discovered, awaiting_confirmation, accepted, provisioning, ignored, duplicate, disappeared]
+DatabaseFamily:
+  type: string
+  minLength: 1
+  maxLength: 64
+  pattern: '^[a-z][a-z0-9_-]{0,63}$'
+DatabaseVariant:
+  type: string
+  minLength: 1
+  maxLength: 64
+  pattern: '^[a-z][a-z0-9_.-]{0,63}$'
+DiscoveryCandidate:
+  type: object
+  additionalProperties: false
+  required:
+    - candidate_id
+    - tenant_id
+    - project_id
+    - host_id
+    - agent_id
+    - discovery_source
+    - database_family
+    - database_variant
+    - confidence
+    - evidence_summary
+    - fingerprint
+    - rule_revision
+    - first_seen_at
+    - last_seen_at
+    - status
+  properties:
+    candidate_id:
+      $ref: '#/CandidateId'
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    host_id:
+      $ref: ./hosts.yaml#/HostId
+    agent_id:
+      $ref: ./hosts.yaml#/AgentId
+    discovery_source:
+      $ref: '#/DiscoverySource'
+    database_family:
+      $ref: '#/DatabaseFamily'
+    database_variant:
+      $ref: '#/DatabaseVariant'
+    version_hint:
+      type: string
+      maxLength: 128
+    normalized_endpoint:
+      type: string
+      maxLength: 512
+    unix_socket:
+      type: string
+      maxLength: 512
+    process_identity:
+      type: string
+      maxLength: 256
+    service_name:
+      type: string
+      maxLength: 256
+    container_identity:
+      type: string
+      maxLength: 128
+    container_image:
+      type: string
+      maxLength: 512
+    discovered_role:
+      type: string
+      maxLength: 64
+    confidence:
+      type: number
+      minimum: 0
+      maximum: 1
+    evidence_summary:
+      type: array
+      maxItems: 32
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
+        maxLength: 256
+    fingerprint:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    possible_duplicate_of:
+      oneOf:
+        - $ref: '#/CandidateId'
+        - type: 'null'
+    rule_revision:
+      type: integer
+      format: int64
+      minimum: 1
+    first_seen_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    last_seen_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    status:
+      $ref: '#/DiscoveryCandidateStatus'
+DiscoveryCandidatePage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/DiscoveryCandidate'
+    page:
+      $ref: ./pagination.yaml#/Page
+AcceptDiscoveryCandidateRequest:
+  type: object
+  additionalProperties: false
+  required: [display_name, database_family, database_variant, credential_ref]
+  properties:
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    database_family:
+      $ref: '#/DatabaseFamily'
+    database_variant:
+      $ref: '#/DatabaseVariant'
+    normalized_endpoint:
+      type: string
+      maxLength: 512
+    unix_socket:
+      type: string
+      maxLength: 512
+    credential_ref:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    tls_ref:
+      type: string
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+IgnoreDiscoveryCandidateRequest:
+  type: object
+  additionalProperties: false
+  required: [reason_code]
+  properties:
+    reason_code:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z][a-z0-9_]{0,63}$'

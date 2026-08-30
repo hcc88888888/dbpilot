@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package dbpilot.agent.v1;
+
+import "agent/v1/inventory.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/agent/v1;agentv1";
+
+service AgentEnrollment {
+  rpc Enroll(EnrollAgentRequest) returns (EnrollAgentResponse);
+}
+
+message EnrollAgentRequest {
+  bytes enrollment_token = 1;
+  string agent_id = 2;
+  bytes certificate_signing_request_pem = 3;
+  bytes csr_public_key = 4;
+  bytes csr_proof = 5;
+  HostObservation host_observation = 6;
+  reserved 7 to 19;
+}
+
+message EnrollAgentResponse {
+  string host_id = 1;
+  string agent_id = 2;
+  bytes certificate_pem = 3;
+  bytes certificate_chain_pem = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  uint64 enrollment_revision = 6;
+  reserved 7 to 19;
+}

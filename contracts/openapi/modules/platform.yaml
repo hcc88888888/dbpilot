@@ -811,3 +811,49 @@
         $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse
       '409':
         $ref: ../common/errors.yaml#/ProblemResponse
+/hosts:
+  $ref: ./hosts.yaml#/HostsCollection
+/hosts/{host_id}:
+  $ref: ./hosts.yaml#/HostItem
+/hosts/{host_id}/actions/rediscover:
+  $ref: ./hosts.yaml#/HostRediscover
+/hosts/{host_id}/actions/decommission:
+  $ref: ./hosts.yaml#/HostDecommission
+/discovery-candidates:
+  $ref: ./discovery.yaml#/DiscoveryCandidatesCollection
+/discovery-candidates/{candidate_id}:
+  $ref: ./discovery.yaml#/DiscoveryCandidateItem
+/discovery-candidates/{candidate_id}/actions/accept:
+  $ref: ./discovery.yaml#/AcceptDiscoveryCandidate
+/discovery-candidates/{candidate_id}/actions/ignore:
+  $ref: ./discovery.yaml#/IgnoreDiscoveryCandidate
+/database-instances:
+  $ref: ./database-instances.yaml#/DatabaseInstancesCollection
+/database-instances/{instance_id}:
+  $ref: ./database-instances.yaml#/DatabaseInstanceItem
+/database-instances/{instance_id}/actions/test-connection:
+  $ref: ./database-instances.yaml#/TestDatabaseInstanceConnection
+/plugin-definitions:
+  $ref: ./plugins.yaml#/PluginDefinitionsCollection
+/plugin-versions:
+  $ref: ./plugins.yaml#/PluginVersionsCollection
+/plugin-versions/{version_id}/actions/approve:
+  $ref: ./plugins.yaml#/ApprovePluginVersion
+/plugin-assignments:
+  $ref: ./plugins.yaml#/PluginAssignmentsCollection
+/plugin-assignments/{assignment_id}:
+  $ref: ./plugins.yaml#/PluginAssignmentItem
+/plugin-assignments/{assignment_id}/actions/reconcile:
+  $ref: ./plugins.yaml#/ReconcilePluginAssignment
+/metric-templates:
+  $ref: ./metric-templates.yaml#/MetricTemplatesCollection
+/metric-templates/{template_id}/revisions:
+  $ref: ./metric-templates.yaml#/MetricTemplateRevisionsCollection
+/metric-template-revisions/{revision_id}/actions/validate:
+  $ref: ./metric-templates.yaml#/ValidateMetricTemplateRevision
+/metric-template-revisions/{revision_id}/actions/trial:
+  $ref: ./metric-templates.yaml#/TrialMetricTemplateRevision
+/metric-template-revisions/{revision_id}/actions/approve:
+  $ref: ./metric-templates.yaml#/ApproveMetricTemplateRevision
+/metric-template-revisions/{revision_id}/actions/publish:
+  $ref: ./metric-templates.yaml#/PublishMetricTemplateRevision

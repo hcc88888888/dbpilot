@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package dbpilot.plugin.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/plugin/v1;pluginv1";
+
+message CollectPluginMetricsRequest {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+  repeated string instance_ids = 3;
+  repeated string template_ids = 4;
+}
+
+message CollectPluginMetricsResponse {
+  repeated PluginMetricBatch batches = 1;
+}
+
+message StreamPluginMetricsRequest {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+}
+
+message PluginMetricBatch {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  string database_family = 3;
+  string database_variant = 4;
+  string instance_id = 5;
+  uint64 configuration_revision = 6;
+  string template_id = 7;
+  uint64 template_revision = 8;
+  google.protobuf.Timestamp collected_at = 9;
+  uint64 sequence = 10;
+  repeated PluginMetricSample samples = 11;
+  PluginCollectionStatus collection_status = 12;
+  string error_code = 13;
+}
+
+message PluginMetricSample {
+  string metric_name = 1;
+  double value = 2;
+  string unit = 3;
+  PluginMetricType metric_type = 4;
+  map<string, string> labels = 5;
+  google.protobuf.Timestamp sampled_at = 6;
+}
+
+enum PluginMetricType {
+  PLUGIN_METRIC_TYPE_UNSPECIFIED = 0;
+  PLUGIN_METRIC_TYPE_GAUGE = 1;
+  PLUGIN_METRIC_TYPE_MONOTONIC_GAUGE = 2;
+  PLUGIN_METRIC_TYPE_COUNTER = 3;
+  PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER = 4;
+}
+
+enum PluginCollectionStatus {
+  PLUGIN_COLLECTION_STATUS_UNSPECIFIED = 0;
+  PLUGIN_COLLECTION_STATUS_SUCCEEDED = 1;
+  PLUGIN_COLLECTION_STATUS_PARTIAL = 2;
+  PLUGIN_COLLECTION_STATUS_FAILED = 3;
+  PLUGIN_COLLECTION_STATUS_STALE = 4;
+}

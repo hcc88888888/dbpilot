@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package dbpilot.plugin.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/plugin/v1;pluginv1";
+
+message ApplyPluginConfigurationRequest {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+  repeated PluginInstanceConfiguration instances = 3;
+}
+
+message ApplyPluginConfigurationResponse {
+  uint64 active_configuration_revision = 1;
+  repeated PluginInstanceConfigurationResult results = 2;
+  string error_code = 3;
+}
+
+message PluginInstanceConfiguration {
+  string instance_id = 1;
+  string database_variant = 2;
+  string endpoint = 3;
+  string unix_socket = 4;
+  CredentialLease credential_lease = 5;
+  repeated MetricTemplateConfiguration templates = 6;
+}
+
+message CredentialLease {
+  string lease_id = 1;
+  uint64 credential_revision = 2;
+  string username = 3;
+  bytes secret_bytes = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message MetricTemplateConfiguration {
+  string template_id = 1;
+  uint64 revision = 2;
+  bytes query_digest = 3;
+  string query_kind = 4;
+  string read_only_statement = 5;
+  uint32 collection_interval_seconds = 6;
+  uint32 timeout_seconds = 7;
+  uint32 max_rows = 8;
+  uint32 max_columns = 9;
+  repeated MetricValueMapping value_mappings = 10;
+  repeated MetricLabelMapping label_mappings = 11;
+}
+
+message MetricValueMapping {
+  string source_column = 1;
+  string metric_name = 2;
+  string metric_type = 3;
+  string unit = 4;
+}
+
+message MetricLabelMapping {
+  string source_column = 1;
+  string label = 2;
+}
+
+message PluginInstanceConfigurationResult {
+  string instance_id = 1;
+  bool applied = 2;
+  string error_code = 3;
+}
+
+message ValidatePluginInstanceRequest {
+  string assignment_id = 1;
+  string instance_id = 2;
+  uint64 configuration_revision = 3;
+}
+
+message ValidatePluginInstanceResponse {
+  string instance_id = 1;
+  bool valid = 2;
+  string database_version = 3;
+  string database_edition = 4;
+  repeated string capabilities = 5;
+  string error_code = 6;
+}

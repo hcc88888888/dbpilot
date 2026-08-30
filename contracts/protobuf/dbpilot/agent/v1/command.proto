@@ -25,7 +25,14 @@ message AgentMessage {
     CommandProgress command_progress = 24;
     CommandResult command_result = 25;
     CommandPrepared command_prepared = 26;
+    HostObservation host_observation = 27;
+    DiscoveryReport discovery_report = 28;
+    PluginObservation plugin_observation = 29;
+    CredentialLeaseRequest credential_lease_request = 30;
+    PluginArtifactLeaseRequest plugin_artifact_lease_request = 31;
   }
+
+  reserved 32 to 49;
 }
 
 message ServerMessage {
@@ -41,7 +48,11 @@ message ServerMessage {
     FlowControlInstruction flow_control_instruction = 24;
     CommandResultAcknowledgement command_result_acknowledgement = 25;
     CommandStart command_start = 26;
+    CredentialLeaseResponse credential_lease_response = 27;
+    PluginArtifactLeaseResponse plugin_artifact_lease_response = 28;
   }
+
+  reserved 29 to 49;
 }
 
 message Hello {
@@ -93,7 +104,15 @@ message CommandEnvelope {
     ExecuteSQL execute_sql = 22;
     ExecuteRegisteredProcess execute_registered_process = 23;
     CollectDiagnostic collect_diagnostic = 24;
+    DiscoverDatabases discover_databases = 25;
+    ReconcilePlugin reconcile_plugin = 26;
+    ApplyPluginConfiguration apply_plugin_configuration = 27;
+    ValidateDatabaseInstance validate_database_instance = 28;
+    DrainPlugin drain_plugin = 29;
+    CollectDatabaseMetrics collect_database_metrics = 30;
   }
+
+  reserved 31 to 49;
 }
 
 message CollectNow {
@@ -148,6 +167,118 @@ message ExecuteRegisteredProcess {
 message CollectDiagnostic {
   string instance_id = 1;
   repeated string diagnostic_kinds = 2;
+}
+
+message DiscoverDatabases {
+  string host_id = 1;
+  uint64 rule_revision = 2;
+  bool include_native = 3;
+  bool include_docker = 4;
+}
+
+message ReconcilePlugin {
+  string assignment_id = 1;
+  string plugin_id = 2;
+  string database_family = 3;
+  string desired_version = 4;
+  PluginDesiredState desired_state = 5;
+  string artifact_id = 6;
+  bytes artifact_sha256 = 7;
+  bytes manifest_digest = 8;
+  uint64 configuration_revision = 9;
+  uint64 operation_revision = 10;
+}
+
+enum PluginDesiredState {
+  PLUGIN_DESIRED_STATE_UNSPECIFIED = 0;
+  PLUGIN_DESIRED_STATE_ABSENT = 1;
+  PLUGIN_DESIRED_STATE_INSTALLED = 2;
+  PLUGIN_DESIRED_STATE_RUNNING = 3;
+  PLUGIN_DESIRED_STATE_STOPPED = 4;
+}
+
+message ApplyPluginConfiguration {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+  repeated PluginInstanceConfiguration instances = 3;
+}
+
+message PluginInstanceConfiguration {
+  string instance_id = 1;
+  string database_variant = 2;
+  string endpoint = 3;
+  string unix_socket = 4;
+  uint64 credential_revision = 5;
+  repeated PluginTemplateRevision templates = 6;
+}
+
+message PluginTemplateRevision {
+  string template_id = 1;
+  uint64 revision = 2;
+  bytes query_digest = 3;
+}
+
+message ValidateDatabaseInstance {
+  string assignment_id = 1;
+  string instance_id = 2;
+  uint64 configuration_revision = 3;
+}
+
+message DrainPlugin {
+  string assignment_id = 1;
+  uint64 operation_revision = 2;
+  uint32 timeout_seconds = 3;
+}
+
+message CollectDatabaseMetrics {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+  repeated string instance_ids = 3;
+  repeated string template_ids = 4;
+}
+
+// Credential lease requests and responses exist only on the live AgentControl
+// stream. They are never embedded in CommandEnvelope, Job, Outbox or Result.
+message CredentialLeaseRequest {
+  bytes request_nonce = 1;
+  string instance_id = 2;
+  string assignment_id = 3;
+  uint64 configuration_revision = 4;
+}
+
+message CredentialLeaseResponse {
+  bytes request_nonce = 1;
+  string lease_id = 2;
+  string instance_id = 3;
+  string assignment_id = 4;
+  uint64 credential_revision = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  CredentialMaterial credential = 7;
+}
+
+message CredentialMaterial {
+  string username = 1;
+  bytes secret_bytes = 2;
+}
+
+// Artifact URLs and authorization headers are returned only after command
+// execution is fenced by CommandStart and are never persisted in a command.
+message PluginArtifactLeaseRequest {
+  bytes request_nonce = 1;
+  string assignment_id = 2;
+  string artifact_id = 3;
+  uint64 operation_revision = 4;
+}
+
+message PluginArtifactLeaseResponse {
+  bytes request_nonce = 1;
+  string lease_id = 2;
+  string assignment_id = 3;
+  string artifact_id = 4;
+  uint64 operation_revision = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  string download_url = 7;
+  map<string, string> request_headers = 8;
 }
 
 message CommandAcknowledgement {

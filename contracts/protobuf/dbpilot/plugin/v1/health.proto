@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package dbpilot.plugin.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/plugin/v1;pluginv1";
+
+message GetPluginHealthRequest {
+  string assignment_id = 1;
+}
+
+message PluginHealth {
+  string assignment_id = 1;
+  PluginHealthState state = 2;
+  uint64 active_configuration_revision = 3;
+  uint32 bound_instance_count = 4;
+  repeated PluginInstanceHealth instances = 5;
+  google.protobuf.Timestamp observed_at = 6;
+}
+
+message PluginInstanceHealth {
+  string instance_id = 1;
+  PluginHealthState state = 2;
+  string error_code = 3;
+}
+
+enum PluginHealthState {
+  PLUGIN_HEALTH_STATE_UNSPECIFIED = 0;
+  PLUGIN_HEALTH_STATE_HEALTHY = 1;
+  PLUGIN_HEALTH_STATE_DEGRADED = 2;
+  PLUGIN_HEALTH_STATE_UNHEALTHY = 3;
+}
+
+message ShutdownPluginRequest {
+  string assignment_id = 1;
+  uint32 drain_timeout_seconds = 2;
+}
+
+message ShutdownPluginResponse {
+  bool drained = 1;
+  string error_code = 2;
+}

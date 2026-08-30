@@ -1,0 +1,152 @@
+DatabaseManagementStatus:
+  type: string
+  enum: [accepted, provisioning, connection_testing, managed, monitoring, plugin_failed, authentication_failed, tls_failed, unreachable, unsupported_version, degraded, offline, retired]
+ConnectionTestStatus:
+  type: string
+  enum: [not_tested, pending, succeeded, authentication_failed, tls_failed, unreachable, unsupported_version]
+ManagedDatabaseInstance:
+  type: object
+  additionalProperties: false
+  required:
+    - instance_id
+    - tenant_id
+    - project_id
+    - host_id
+    - agent_id
+    - database_family
+    - database_variant
+    - display_name
+    - credential_ref
+    - labels
+    - capabilities
+    - connection_test_status
+    - plugin_assignment_revision
+    - management_status
+    - etag
+  properties:
+    instance_id:
+      $ref: ./identifiers.yaml#/InstanceId
+    tenant_id:
+      $ref: ./identifiers.yaml#/TenantId
+    project_id:
+      $ref: ./identifiers.yaml#/ProjectId
+    host_id:
+      $ref: ./hosts.yaml#/HostId
+    agent_id:
+      $ref: ./hosts.yaml#/AgentId
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    database_variant:
+      $ref: ./discovery.yaml#/DatabaseVariant
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    endpoint:
+      type: string
+      maxLength: 512
+    unix_socket:
+      type: string
+      maxLength: 512
+    version:
+      type: string
+      maxLength: 128
+    edition:
+      type: string
+      maxLength: 128
+    role:
+      type: string
+      maxLength: 64
+    topology:
+      type: string
+      maxLength: 256
+    credential_ref:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    tls_ref:
+      type: string
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    plugin_id:
+      type: string
+      maxLength: 128
+    desired_plugin_version:
+      type: string
+      maxLength: 64
+    template_profile_id:
+      type: string
+      maxLength: 128
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128
+    capabilities:
+      type: array
+      maxItems: 64
+      uniqueItems: true
+      items:
+        type: string
+        minLength: 1
+        maxLength: 128
+    connection_test_status:
+      $ref: '#/ConnectionTestStatus'
+    connection_test_at:
+      oneOf:
+        - $ref: ./identifiers.yaml#/UtcTimestamp
+        - type: 'null'
+    plugin_assignment_revision:
+      type: integer
+      format: int64
+      minimum: 0
+    management_status:
+      $ref: '#/DatabaseManagementStatus'
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
+ManagedDatabaseInstancePage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/ManagedDatabaseInstance'
+    page:
+      $ref: ./pagination.yaml#/Page
+UpdateDatabaseInstanceRequest:
+  type: object
+  additionalProperties: false
+  minProperties: 1
+  properties:
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    credential_ref:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    tls_ref:
+      type: string
+      maxLength: 512
+      pattern: '^secret://[^\s]+$'
+    desired_plugin_version:
+      type: string
+      maxLength: 64
+    template_profile_id:
+      type: string
+      maxLength: 128
+    labels:
+      type: object
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 128

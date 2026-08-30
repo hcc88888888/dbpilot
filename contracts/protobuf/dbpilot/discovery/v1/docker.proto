@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package dbpilot.discovery.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "dbpilot.local/platform/gen/discovery/v1;discoveryv1";
+
+service DockerDiscovery {
+  rpc Snapshot(DockerSnapshotRequest) returns (DockerSnapshotResponse);
+  rpc Watch(DockerWatchRequest) returns (stream DockerEvent);
+}
+
+message DockerSnapshotRequest {
+  uint64 rule_revision = 1;
+  repeated string allowed_label_keys = 2;
+}
+
+message DockerSnapshotResponse {
+  repeated DockerContainerObservation containers = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  string error_code = 3;
+}
+
+message DockerWatchRequest {
+  uint64 rule_revision = 1;
+  repeated string allowed_label_keys = 2;
+}
+
+message DockerContainerObservation {
+  string container_id = 1;
+  string name = 2;
+  string image = 3;
+  string status = 4;
+  repeated DockerPortMapping ports = 5;
+  map<string, string> labels = 6;
+  string command_summary = 7;
+  uint32 host_process_id = 8;
+  string cgroup = 9;
+  google.protobuf.Timestamp observed_at = 10;
+}
+
+message DockerPortMapping {
+  string host_address = 1;
+  uint32 host_port = 2;
+  uint32 container_port = 3;
+  string protocol = 4;
+}
+
+message DockerEvent {
+  string event_id = 1;
+  DockerEventType type = 2;
+  DockerContainerObservation container = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+}
+
+enum DockerEventType {
+  DOCKER_EVENT_TYPE_UNSPECIFIED = 0;
+  DOCKER_EVENT_TYPE_START = 1;
+  DOCKER_EVENT_TYPE_STOP = 2;
+  DOCKER_EVENT_TYPE_DIE = 3;
+  DOCKER_EVENT_TYPE_DESTROY = 4;
+}

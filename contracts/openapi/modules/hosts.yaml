@@ -1,0 +1,112 @@
+HostsCollection:
+  get:
+    operationId: listHosts
+    summary: List managed hosts
+    x-dbpilot-permission: hosts:view
+    parameters:
+      - name: status
+        in: query
+        schema:
+          $ref: ../common/hosts.yaml#/HostStatus
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated managed hosts.
+        content:
+          application/json:
+            schema:
+              $ref: ../common/hosts.yaml#/ManagedHostPage
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+HostItem:
+  get:
+    operationId: getHost
+    summary: Get a managed host
+    x-dbpilot-permission: hosts:view
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+    responses:
+      '200':
+        description: Managed host and current observed state.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/hosts.yaml#/ManagedHost }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+HostRediscover:
+  post:
+    operationId: rediscoverHost
+    summary: Trigger a bounded database rediscovery job
+    x-dbpilot-permission: hosts:discover
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '202':
+        description: Rediscovery job accepted.
+        headers:
+          Location: { required: true, schema: { type: string, format: uri-reference } }
+        content:
+          application/json:
+            schema: { $ref: ../common/jobs.yaml#/Job }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+HostDecommission:
+  post:
+    operationId: decommissionHost
+    summary: Decommission a managed host and revoke Agent enrollment
+    x-dbpilot-permission: hosts:manage
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '200':
+        description: Decommissioned host.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/hosts.yaml#/ManagedHost }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }

@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package dbpilot.plugin.v1;
+
+import "plugin/v1/health.proto";
+import "plugin/v1/instance.proto";
+import "plugin/v1/metrics.proto";
+
+option go_package = "dbpilot.local/platform/gen/plugin/v1;pluginv1";
+
+service PluginRuntime {
+  rpc Handshake(PluginHandshakeRequest) returns (PluginHandshakeResponse);
+  rpc ApplyConfiguration(ApplyPluginConfigurationRequest) returns (ApplyPluginConfigurationResponse);
+  rpc ValidateInstance(ValidatePluginInstanceRequest) returns (ValidatePluginInstanceResponse);
+  rpc CollectNow(CollectPluginMetricsRequest) returns (CollectPluginMetricsResponse);
+  rpc StreamMetrics(StreamPluginMetricsRequest) returns (stream PluginMetricBatch);
+  rpc GetHealth(GetPluginHealthRequest) returns (PluginHealth);
+  rpc Shutdown(ShutdownPluginRequest) returns (ShutdownPluginResponse);
+}
+
+message PluginHandshakeRequest {
+  string expected_plugin_id = 1;
+  string expected_database_family = 2;
+  string expected_version = 3;
+  string expected_protocol_version = 4;
+  bytes launch_nonce_challenge = 5;
+}
+
+message PluginHandshakeResponse {
+  string plugin_id = 1;
+  string database_family = 2;
+  string version = 3;
+  string protocol_version = 4;
+  repeated string supported_variants = 5;
+  string database_version_range = 6;
+  repeated string capabilities = 7;
+  uint32 metric_template_schema_version = 8;
+  bytes executable_digest = 9;
+  bytes launch_nonce_proof = 10;
+}

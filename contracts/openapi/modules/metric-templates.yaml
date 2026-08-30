@@ -1,0 +1,241 @@
+MetricTemplatesCollection:
+  get:
+    operationId: listMetricTemplates
+    summary: List built-in and custom metric templates
+    x-dbpilot-permission: metric-templates:view
+    parameters:
+      - name: database_family
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DatabaseFamily }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated metric templates.
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplatePage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+  post:
+    operationId: createMetricTemplate
+    summary: Create a custom metric template
+    x-dbpilot-permission: metric-templates:manage
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/metric-templates.yaml#/CreateMetricTemplateRequest }
+    responses:
+      '201':
+        description: Created custom metric template.
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplate }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+MetricTemplateRevisionsCollection:
+  get:
+    operationId: listMetricTemplateRevisions
+    summary: List immutable metric template revisions
+    x-dbpilot-permission: metric-templates:view
+    parameters:
+      - name: template_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated immutable metric template revisions.
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateRevisionPage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+  post:
+    operationId: createMetricTemplateRevision
+    summary: Create an immutable custom metric template revision
+    x-dbpilot-permission: metric-templates:manage
+    parameters:
+      - name: template_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/metric-templates.yaml#/CreateMetricTemplateRevisionRequest }
+    responses:
+      '201':
+        description: Created immutable draft revision.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateRevision }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+ValidateMetricTemplateRevision:
+  post:
+    operationId: validateMetricTemplateRevision
+    summary: Start static validation for a draft metric template revision
+    x-dbpilot-permission: metric-templates:manage
+    parameters:
+      - name: revision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '202':
+        description: Validation job accepted.
+        content:
+          application/json:
+            schema: { $ref: ../common/jobs.yaml#/Job }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+TrialMetricTemplateRevision:
+  post:
+    operationId: trialMetricTemplateRevision
+    summary: Run a bounded metric template trial without raw business rows
+    x-dbpilot-permission: metric-templates:manage
+    parameters:
+      - name: revision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateTrialRequest }
+    responses:
+      '202':
+        description: Trial job accepted; results contain mapped metrics only.
+        content:
+          application/json:
+            schema: { $ref: ../common/jobs.yaml#/Job }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+ApproveMetricTemplateRevision:
+  post:
+    operationId: approveMetricTemplateRevision
+    summary: Approve a successfully trialed metric template revision
+    x-dbpilot-permission: metric-templates:approve
+    parameters:
+      - name: revision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateApprovalRequest }
+    responses:
+      '200':
+        description: Approved metric template revision.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateRevision }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+PublishMetricTemplateRevision:
+  post:
+    operationId: publishMetricTemplateRevision
+    summary: Publish an approved metric template revision
+    x-dbpilot-permission: metric-templates:approve
+    parameters:
+      - name: revision_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '200':
+        description: Published metric template revision.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/metric-templates.yaml#/MetricTemplateRevision }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }

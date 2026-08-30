@@ -1,0 +1,237 @@
+PluginDefinitionsCollection:
+  get:
+    operationId: listPluginDefinitions
+    summary: List database plugin definitions
+    x-dbpilot-permission: plugins:view
+    parameters:
+      - name: database_family
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DatabaseFamily }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated plugin definitions.
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginDefinitionPage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+PluginVersionsCollection:
+  get:
+    operationId: listPluginVersions
+    summary: List immutable plugin versions
+    x-dbpilot-permission: plugins:view
+    parameters:
+      - name: plugin_id
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: status
+        in: query
+        schema: { $ref: ../common/plugins.yaml#/PluginVersionStatus }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated plugin versions without package bytes or download credentials.
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginVersionPage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+  post:
+    operationId: createPluginVersion
+    summary: Register a Server-hosted signed plugin artifact
+    x-dbpilot-permission: plugins:publish
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/plugins.yaml#/CreatePluginVersionRequest }
+    responses:
+      '201':
+        description: Registered plugin version metadata.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginVersion }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+ApprovePluginVersion:
+  post:
+    operationId: approvePluginVersion
+    summary: Approve a verified plugin version for new assignments
+    x-dbpilot-permission: plugins:approve
+    parameters:
+      - name: version_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/plugins.yaml#/ApprovePluginVersionRequest }
+    responses:
+      '200':
+        description: Approved plugin version.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginVersion }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+PluginAssignmentsCollection:
+  get:
+    operationId: listPluginAssignments
+    summary: List desired and observed plugin assignments
+    x-dbpilot-permission: plugins:view
+    parameters:
+      - name: host_id
+        in: query
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+      - name: plugin_id
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated plugin assignments.
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginAssignmentPage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+PluginAssignmentItem:
+  get:
+    operationId: getPluginAssignment
+    summary: Get a plugin assignment
+    x-dbpilot-permission: plugins:view
+    parameters:
+      - name: assignment_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '200':
+        description: Plugin assignment and latest observed state.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginAssignment }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+  patch:
+    operationId: updatePluginAssignment
+    summary: Update plugin desired state or version
+    x-dbpilot-permission: plugins:manage
+    parameters:
+      - name: assignment_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: If-Match
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/plugins.yaml#/UpdatePluginAssignmentRequest }
+    responses:
+      '200':
+        description: Updated plugin assignment desired state.
+        headers:
+          ETag: { required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        content:
+          application/json:
+            schema: { $ref: ../common/plugins.yaml#/PluginAssignment }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '412': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+ReconcilePluginAssignment:
+  post:
+    operationId: reconcilePluginAssignment
+    summary: Trigger typed plugin reconciliation
+    x-dbpilot-permission: plugins:deploy
+    parameters:
+      - name: assignment_id
+        in: path
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    responses:
+      '202':
+        description: Reconciliation job accepted.
+        headers:
+          Location: { required: true, schema: { type: string, format: uri-reference } }
+        content:
+          application/json:
+            schema: { $ref: ../common/jobs.yaml#/Job }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }

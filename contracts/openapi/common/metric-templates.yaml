@@ -1,0 +1,303 @@
+MetricTemplateRevisionStatus:
+  type: string
+  enum: [draft, validating, validated, trial_running, trial_passed, approval_pending, approved, published, superseded, validation_failed, trial_failed, rejected]
+MetricQueryKind:
+  type: string
+  enum: [builtin, sql, structured]
+MetricValueType:
+  type: string
+  enum: [gauge, monotonic_gauge, counter, monotonic_counter]
+MetricTemplate:
+  type: object
+  additionalProperties: false
+  required: [template_id, database_family, name, builtin, latest_revision, published_revision, created_at]
+  properties:
+    template_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.-]{0,127}$'
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 1000
+    builtin:
+      type: boolean
+    latest_revision:
+      type: integer
+      format: int64
+      minimum: 1
+    published_revision:
+      type: [integer, 'null']
+      format: int64
+      minimum: 1
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+MetricTemplatePage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/MetricTemplate'
+    page:
+      $ref: ./pagination.yaml#/Page
+MetricValueMapping:
+  type: object
+  additionalProperties: false
+  required: [source_column, metric_name, metric_type, unit]
+  properties:
+    source_column:
+      type: string
+      minLength: 1
+      maxLength: 128
+    metric_name:
+      type: string
+      minLength: 2
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.]{1,127}$'
+    metric_type:
+      $ref: '#/MetricValueType'
+    unit:
+      type: string
+      minLength: 1
+      maxLength: 32
+MetricLabelMapping:
+  type: object
+  additionalProperties: false
+  required: [source_column, label]
+  properties:
+    source_column:
+      type: string
+      minLength: 1
+      maxLength: 128
+    label:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.-]{0,127}$'
+MetricTemplateRevision:
+  type: object
+  additionalProperties: false
+  required: [revision_id, template_id, revision, database_family, variants, name, query_kind, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit, query_digest, status, created_by, created_at, etag]
+  properties:
+    revision_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    template_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+    revision:
+      type: integer
+      format: int64
+      minimum: 1
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    variants:
+      type: array
+      minItems: 1
+      maxItems: 16
+      uniqueItems: true
+      items:
+        $ref: ./discovery.yaml#/DatabaseVariant
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 1000
+    query_kind:
+      $ref: '#/MetricQueryKind'
+    read_only_statement:
+      type: string
+      minLength: 1
+      maxLength: 32768
+    structured_query:
+      type: object
+      maxProperties: 32
+      additionalProperties: true
+    collection_interval_seconds:
+      type: integer
+      minimum: 10
+      maximum: 86400
+    timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 30
+      default: 5
+    max_rows:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 1
+    max_columns:
+      type: integer
+      minimum: 1
+      maximum: 32
+    value_mappings:
+      type: array
+      minItems: 1
+      maxItems: 32
+      items:
+        $ref: '#/MetricValueMapping'
+    label_mappings:
+      type: array
+      maxItems: 16
+      items:
+        $ref: '#/MetricLabelMapping'
+    database_version_range:
+      type: string
+      maxLength: 128
+    plugin_version_range:
+      type: string
+      maxLength: 128
+    cardinality_limit:
+      type: integer
+      minimum: 1
+      maximum: 10000
+    created_by:
+      type: string
+      minLength: 1
+      maxLength: 128
+    approved_by:
+      type: [string, 'null']
+      maxLength: 128
+    query_digest:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    status:
+      $ref: '#/MetricTemplateRevisionStatus'
+    created_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    etag:
+      type: string
+      minLength: 1
+      maxLength: 128
+MetricTemplateRevisionPage:
+  type: object
+  additionalProperties: false
+  required: [items, page]
+  properties:
+    items:
+      type: array
+      maxItems: 100
+      items:
+        $ref: '#/MetricTemplateRevision'
+    page:
+      $ref: ./pagination.yaml#/Page
+CreateMetricTemplateRequest:
+  type: object
+  additionalProperties: false
+  required: [template_id, database_family, name]
+  properties:
+    template_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9_.-]{0,127}$'
+    database_family:
+      $ref: ./discovery.yaml#/DatabaseFamily
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 1000
+CreateMetricTemplateRevisionRequest:
+  type: object
+  additionalProperties: false
+  required: [variants, name, query_kind, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit]
+  properties:
+    variants:
+      type: array
+      minItems: 1
+      maxItems: 16
+      uniqueItems: true
+      items:
+        $ref: ./discovery.yaml#/DatabaseVariant
+    name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    description:
+      type: string
+      maxLength: 1000
+    query_kind:
+      $ref: '#/MetricQueryKind'
+    read_only_statement:
+      type: string
+      minLength: 1
+      maxLength: 32768
+    structured_query:
+      type: object
+      maxProperties: 32
+      additionalProperties: true
+    collection_interval_seconds:
+      type: integer
+      minimum: 10
+      maximum: 86400
+    timeout_seconds:
+      type: integer
+      minimum: 1
+      maximum: 30
+      default: 5
+    max_rows:
+      type: integer
+      minimum: 1
+      maximum: 100
+      default: 1
+    max_columns:
+      type: integer
+      minimum: 1
+      maximum: 32
+    value_mappings:
+      type: array
+      minItems: 1
+      maxItems: 32
+      items:
+        $ref: '#/MetricValueMapping'
+    label_mappings:
+      type: array
+      maxItems: 16
+      items:
+        $ref: '#/MetricLabelMapping'
+    database_version_range:
+      type: string
+      maxLength: 128
+    plugin_version_range:
+      type: string
+      maxLength: 128
+    cardinality_limit:
+      type: integer
+      minimum: 1
+      maximum: 10000
+MetricTemplateTrialRequest:
+  type: object
+  additionalProperties: false
+  required: [instance_id, plugin_version_id]
+  properties:
+    instance_id:
+      $ref: ./identifiers.yaml#/InstanceId
+    plugin_version_id:
+      type: string
+      minLength: 1
+      maxLength: 128
+MetricTemplateApprovalRequest:
+  type: object
+  additionalProperties: false
+  properties:
+    approval_comment:
+      type: string
+      maxLength: 500

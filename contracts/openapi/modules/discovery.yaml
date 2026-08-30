@@ -1,0 +1,118 @@
+DiscoveryCandidatesCollection:
+  get:
+    operationId: listDiscoveryCandidates
+    summary: List database discovery candidates
+    x-dbpilot-permission: discovery:view
+    parameters:
+      - name: host_id
+        in: query
+        schema: { $ref: ../common/hosts.yaml#/HostId }
+      - name: status
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DiscoveryCandidateStatus }
+      - name: source
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DiscoverySource }
+      - name: database_family
+        in: query
+        schema: { $ref: ../common/discovery.yaml#/DatabaseFamily }
+      - name: cursor
+        in: query
+        schema: { type: string, minLength: 1, maxLength: 512 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 100 }
+    responses:
+      '200':
+        description: Cursor-paginated discovery candidates with redacted evidence.
+        content:
+          application/json:
+            schema: { $ref: ../common/discovery.yaml#/DiscoveryCandidatePage }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+DiscoveryCandidateItem:
+  get:
+    operationId: getDiscoveryCandidate
+    summary: Get a database discovery candidate
+    x-dbpilot-permission: discovery:view
+    parameters:
+      - name: candidate_id
+        in: path
+        required: true
+        schema: { $ref: ../common/discovery.yaml#/CandidateId }
+    responses:
+      '200':
+        description: Discovery candidate with bounded redacted evidence.
+        content:
+          application/json:
+            schema: { $ref: ../common/discovery.yaml#/DiscoveryCandidate }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+AcceptDiscoveryCandidate:
+  post:
+    operationId: acceptDiscoveryCandidate
+    summary: Accept a candidate and begin managed instance provisioning
+    x-dbpilot-permission: discovery:manage
+    parameters:
+      - name: candidate_id
+        in: path
+        required: true
+        schema: { $ref: ../common/discovery.yaml#/CandidateId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/discovery.yaml#/AcceptDiscoveryCandidateRequest }
+    responses:
+      '202':
+        description: Candidate accepted and provisioning started.
+        content:
+          application/json:
+            schema: { $ref: ../common/database-instances.yaml#/ManagedDatabaseInstance }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '422': { $ref: ../common/errors.yaml#/ProblemResponse }
+IgnoreDiscoveryCandidate:
+  post:
+    operationId: ignoreDiscoveryCandidate
+    summary: Ignore a discovery candidate
+    x-dbpilot-permission: discovery:manage
+    parameters:
+      - name: candidate_id
+        in: path
+        required: true
+        schema: { $ref: ../common/discovery.yaml#/CandidateId }
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/discovery.yaml#/IgnoreDiscoveryCandidateRequest }
+    responses:
+      '200':
+        description: Ignored discovery candidate.
+        content:
+          application/json:
+            schema: { $ref: ../common/discovery.yaml#/DiscoveryCandidate }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '404': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
