@@ -109,11 +109,12 @@ func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFail
 	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
 	repository := &recordingCatalogRepository{finalizeOperationErr: errors.New("catalog unavailable after artifact")}
 	artifacts := &recordingArtifactWriter{}
-	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), func() time.Time { return time.Date(2026, 8, 30, 4, 0, 0, 0, time.UTC) })
+	clock := time.Date(2026, 8, 30, 4, 0, 0, 123456789, time.UTC)
+	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), func() time.Time { return clock })
 	require.NoError(t, err)
 	key := OperationKey{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, Actor: "publisher-user", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "upload-operation", Fingerprint: "sha256:" + stringsOfZeros(64), OwnerToken: "owner-" + stringsOfZeros(64)}
 	builder := func(value PluginVersion) (OperationResponse, error) {
-		return OperationResponse{Status: 201, ETag: value.ETag(), Body: []byte(`{"version_id":"` + value.ID + `"}`)}, nil
+		return OperationResponse{Status: 201, ETag: value.ETag(), Body: []byte(`{"version_id":"` + value.ID + `","created_at":"` + value.CreatedAt.Format(time.RFC3339Nano) + `"}`)}, nil
 	}
 
 	_, err = service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
@@ -123,11 +124,14 @@ func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFail
 	require.Len(t, artifacts.values, 1)
 	require.Equal(t, "plugin_catalog_operation", artifacts.values[0].SourceResource.ResourceType)
 	require.Equal(t, key.RecordID(), artifacts.values[0].SourceResource.ResourceID)
+	originalResponse := repository.operation.Response
 
 	repository.finalizeOperationErr = nil
+	clock = clock.Add(5 * time.Minute)
 	snapshot, err := service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
 	require.NoError(t, err)
 	require.Equal(t, OperationCommitted, snapshot.State)
+	require.Equal(t, originalResponse, snapshot.Response)
 	require.Equal(t, 1, repository.beginOperationCalls, "retry reuses the durable reservation")
 	require.Equal(t, 2, repository.finalizeOperationCalls)
 }
@@ -204,6 +208,9 @@ func (repository *recordingCatalogRepository) GetOperation(_ context.Context, ke
 
 func (repository *recordingCatalogRepository) BeginUploadOperation(_ context.Context, request UploadOperationRequest) (OperationSnapshot, error) {
 	if repository.operation.Key.Identity() == request.Key.Identity() {
+		if !operationMatchesUpload(repository.operation, request) {
+			return OperationSnapshot{}, ErrConflict
+		}
 		return repository.operation, nil
 	}
 	repository.beginOperationCalls++

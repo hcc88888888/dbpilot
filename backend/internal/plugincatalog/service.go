@@ -1,6 +1,7 @@
 package plugincatalog
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -47,11 +48,17 @@ func (service *Application) Ready(ctx context.Context) error {
 }
 
 func (service *Application) UploadOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, source io.Reader) (OperationSnapshot, error) {
-	if service == nil || service.operations == nil || key.Scope != scope || key.Validate() != nil || !json.Valid(auditJSON) || builder == nil {
+	if service == nil || service.operations == nil || key.Scope != scope || key.Validate() != nil || metadata.Actor != key.Actor || metadata.ContentLength <= 0 || source == nil || !json.Valid(auditJSON) || builder == nil {
 		return OperationSnapshot{}, ErrInvalid
 	}
+	var authoritative *OperationSnapshot
 	if existing, err := service.operations.GetOperation(ctx, key); err == nil && existing.State == OperationCommitted {
 		return existing, nil
+	} else if err == nil {
+		if existing.Validate() != nil || existing.State != OperationPending && existing.State != OperationAbandoned {
+			return OperationSnapshot{}, ErrConflict
+		}
+		authoritative = &existing
 	} else if err != nil && !errors.Is(err, ErrNotFound) {
 		return OperationSnapshot{}, err
 	}
@@ -59,32 +66,46 @@ func (service *Application) UploadOperation(ctx context.Context, scope platforms
 	if err != nil {
 		return OperationSnapshot{}, err
 	}
-	return service.publishVerifiedOperation(ctx, scope, metadata, key, auditJSON, builder, verified)
+	return service.publishVerifiedOperation(ctx, scope, metadata, key, auditJSON, builder, verified, authoritative)
 }
 
-func (service *Application) publishVerifiedOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, verified VerifiedPackage) (OperationSnapshot, error) {
+func (service *Application) publishVerifiedOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, verified VerifiedPackage, authoritative *OperationSnapshot) (OperationSnapshot, error) {
 	// PostgreSQL timestamptz is microsecond-precision. Canonicalize once before
 	// building both the immutable version and response snapshot so transaction
 	// round-trips never change replay bytes.
 	createdAt := service.now().UTC().Truncate(time.Microsecond)
-	definition, version, artifactValue, err := service.valuesForVerified(scope, metadata, key.RecordID(), createdAt, verified)
-	if err != nil {
-		if verified.Close() != nil {
-			return OperationSnapshot{}, ErrArtifactUnavailable
+	definition, version, artifactValue, response, finalizeBuilder, leaseExpiresAt := PluginDefinition{}, PluginVersion{}, artifact.Artifact{}, OperationResponse{}, builder, createdAt.Add(DefaultOperationLease)
+	if authoritative == nil {
+		var err error
+		definition, version, artifactValue, err = service.valuesForVerified(scope, metadata, key.RecordID(), createdAt, verified)
+		if err == nil {
+			response, err = builder(version)
 		}
-		return OperationSnapshot{}, err
-	}
-	response, err := builder(version)
-	if err != nil || response.Validate() != nil {
-		if verified.Close() != nil {
-			return OperationSnapshot{}, ErrArtifactUnavailable
+		if err != nil || response.Validate() != nil {
+			if verified.Close() != nil {
+				return OperationSnapshot{}, ErrArtifactUnavailable
+			}
+			return OperationSnapshot{}, ErrInvalid
 		}
-		return OperationSnapshot{}, ErrInvalid
+	} else {
+		if !authoritativeVerifiedPackageMatches(*authoritative, verified, auditJSON) {
+			if verified.Close() != nil {
+				return OperationSnapshot{}, ErrArtifactUnavailable
+			}
+			return OperationSnapshot{}, ErrConflict
+		}
+		definition, version, response, createdAt = authoritative.Definition, authoritative.Version, authoritative.Response, authoritative.Version.CreatedAt
+		leaseExpiresAt = authoritative.LeaseExpiresAt
+		if authoritative.State == OperationAbandoned {
+			leaseExpiresAt = service.now().UTC().Truncate(time.Microsecond).Add(DefaultOperationLease)
+		}
+		artifactValue = artifact.Artifact{ID: authoritative.ArtifactID, Scope: scope, Kind: "plugin-package", ContentType: "application/gzip", SizeBytes: authoritative.ArtifactBytes, Checksum: "sha256:" + authoritative.ArtifactSHA256, SourceResource: artifact.ResourceReference{ResourceType: "plugin_catalog_operation", ResourceID: key.RecordID()}, CreatedBy: metadata.Actor, CreatedAt: createdAt}
+		finalizeBuilder = func(PluginVersion) (OperationResponse, error) { return response, nil }
 	}
 	pending, err := service.operations.BeginUploadOperation(ctx, UploadOperationRequest{
 		Key: key, Definition: definition, Version: version, ArtifactID: artifactValue.ID,
 		ArtifactSHA256: version.PackageSHA256, ArtifactBytes: verified.SizeBytes, CreatedBy: metadata.Actor, CreatedAt: createdAt,
-		LeaseExpiresAt: createdAt.Add(DefaultOperationLease), Response: response,
+		LeaseExpiresAt: leaseExpiresAt, Response: response,
 		AuditEventJSON: append([]byte(nil), auditJSON...),
 	})
 	if err != nil {
@@ -112,7 +133,11 @@ func (service *Application) publishVerifiedOperation(ctx context.Context, scope 
 	if artifactErr != nil || closeReaderErr != nil || cleanupErr != nil || storedArtifact.ID != artifactValue.ID || storedArtifact.Scope != scope || storedArtifact.Checksum != artifactValue.Checksum || storedArtifact.SizeBytes != artifactValue.SizeBytes {
 		return OperationSnapshot{}, ErrArtifactUnavailable
 	}
-	return service.operations.FinalizeUploadOperation(ctx, key, builder)
+	return service.operations.FinalizeUploadOperation(ctx, key, finalizeBuilder)
+}
+
+func authoritativeVerifiedPackageMatches(value OperationSnapshot, verified VerifiedPackage, auditJSON []byte) bool {
+	return value.Key.Scope == value.Version.Scope && value.Version.ID != "" && value.Version.PackageSHA256 == verified.PackageSHA256 && value.Version.ManifestDigest == verified.ManifestDigest && value.ArtifactID == value.Version.ArtifactID && value.ArtifactSHA256 == verified.PackageSHA256 && value.ArtifactBytes == verified.SizeBytes && value.Version.PluginID == verified.Manifest.PluginID && value.Version.Version == verified.Manifest.Version && bytes.Equal(value.AuditEventJSON, auditJSON)
 }
 
 func (service *Application) valuesForVerified(scope platformscope.Scope, metadata UploadMetadata, sourceResourceID string, createdAt time.Time, verified VerifiedPackage) (PluginDefinition, PluginVersion, artifact.Artifact, error) {
@@ -220,7 +245,7 @@ func (service *Application) Upload(ctx context.Context, scope platformscope.Scop
 	snapshot, err := service.publishVerifiedOperation(ctx, scope, metadata, key, auditJSON, func(value PluginVersion) (OperationResponse, error) {
 		body, marshalErr := json.Marshal(value)
 		return OperationResponse{Status: 201, ETag: value.ETag(), Body: body}, marshalErr
-	}, verified)
+	}, verified, nil)
 	if err != nil {
 		return PluginVersion{}, err
 	}

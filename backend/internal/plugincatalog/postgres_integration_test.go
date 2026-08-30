@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -305,7 +306,9 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	require.NoError(t, blobs.Ready())
 	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
 	now := time.Date(2026, 8, 30, 16, 30, 0, 123456789, time.UTC)
-	application, err := NewService(NewPostgresRepositoryWithClock(database, func() time.Time { return now }), artifact.NewPostgresStore(database, blobs), verifier, func() time.Time { return now })
+	baseRepository := NewPostgresRepositoryWithClock(database, func() time.Time { return now })
+	repository := &failOnceFinalizeRepository{PostgresRepository: baseRepository, err: errors.New("injected finalize failure")}
+	application, err := NewService(repository, artifact.NewPostgresStore(database, blobs), verifier, func() time.Time { return now })
 	require.NoError(t, err)
 	scope := platformscope.Scope{TenantID: "tenant-application", ProjectID: "project-application"}
 	key := OperationKey{Scope: scope, Actor: "publisher-application", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "application-upload", Fingerprint: "sha256:" + strings.Repeat("c", 64), OwnerToken: "owner-" + strings.Repeat("d", 64)}
@@ -314,13 +317,44 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 		return OperationResponse{Status: 201, ETag: value.ETag(), Body: body}, marshalErr
 	}
 	auditJSON := []byte(`{"action":"plugin.version_uploaded"}`)
+	_, err = application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(fixture.Archive))
+	require.EqualError(t, err, "injected finalize failure")
+	pending, err := baseRepository.GetOperation(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, OperationPending, pending.State)
+	originalResponse := pending.Response
+	now = now.Add(5 * time.Minute)
 	first, err := application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(fixture.Archive))
 	require.NoError(t, err)
-	require.Equal(t, now.UTC().Truncate(time.Microsecond), first.Version.CreatedAt)
+	require.Equal(t, time.Date(2026, 8, 30, 16, 30, 0, 123456000, time.UTC), first.Version.CreatedAt)
+	require.Equal(t, originalResponse, first.Response)
 	retry, err := application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(nil))
 	require.NoError(t, err)
 	require.Equal(t, first.Response, retry.Response)
 	require.Equal(t, first.Version, retry.Version)
+	conflictingKey := key
+	conflictingKey.Fingerprint = "sha256:" + strings.Repeat("e", 64)
+	_, err = application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, conflictingKey, auditJSON, builder, bytes.NewReader(nil))
+	require.ErrorIs(t, err, ErrConflict)
+	var versionCount, operationCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM plugin_versions WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3", scope.TenantID, scope.ProjectID, first.Version.ID).Scan(&versionCount))
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM plugin_catalog_operations WHERE tenant_id=$1 AND project_id=$2 AND operation_record_id=$3 AND audit_event_json=$4", scope.TenantID, scope.ProjectID, key.RecordID(), auditJSON).Scan(&operationCount))
+	require.Equal(t, 1, versionCount)
+	require.Equal(t, 1, operationCount)
+}
+
+type failOnceFinalizeRepository struct {
+	*PostgresRepository
+	err error
+}
+
+func (repository *failOnceFinalizeRepository) FinalizeUploadOperation(ctx context.Context, key OperationKey, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	if repository.err != nil {
+		err := repository.err
+		repository.err = nil
+		return OperationSnapshot{}, err
+	}
+	return repository.PostgresRepository.FinalizeUploadOperation(ctx, key, builder)
 }
 
 func integrationVersion(scope platformscope.Scope, id, artifactID, version, digest string, createdAt time.Time) PluginVersion {
