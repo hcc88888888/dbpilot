@@ -2,6 +2,7 @@ import React from 'react';
 import { trapModalFocus } from './focus';
 
 export function Drawer({ open, title, onClose, children }: React.PropsWithChildren<{ open: boolean; title: string; onClose(): void }>) {
+  const titleId = React.useId();
   const closeButton = React.useRef<HTMLButtonElement>(null);
   const previousFocus = React.useRef<HTMLElement | null>(null);
   React.useEffect(() => {
@@ -12,7 +13,7 @@ export function Drawer({ open, title, onClose, children }: React.PropsWithChildr
   }, [open]);
   if (!open) return null;
   return (
-    <section className="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" onKeyDown={(event) => {
+    <section className="drawer" role="dialog" aria-modal="true" aria-labelledby={titleId} onKeyDown={(event) => {
       trapModalFocus(event);
       if (event.key === 'Escape') {
         event.stopPropagation();
@@ -20,7 +21,7 @@ export function Drawer({ open, title, onClose, children }: React.PropsWithChildr
       }
     }}>
       <header>
-        <h2 id="drawer-title">{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button ref={closeButton} type="button" aria-label="Close" onClick={onClose}>×</button>
       </header>
       {children}

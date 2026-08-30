@@ -1,39 +1,37 @@
 import React from 'react';
-import { useAccessToken, useProjectContext } from '../auth/AuthProvider';
-import { projectApiBase } from '../api/client';
+import { useProjectContext } from '../auth/AuthProvider';
 
 export type LegacyModuleContext = {
-  scope: { tenantId: string; projectId: string };
-  request(path: string, init?: RequestInit): Promise<Response>;
+  scope: Readonly<{ tenantId: string; projectId: string }>;
+  permissions: ReadonlySet<string>;
 };
 
-export type LegacyModuleMount = (root: HTMLElement, context: LegacyModuleContext) => void | (() => void);
+export type LegacyModuleMount = (
+  root: HTMLElement,
+  context: LegacyModuleContext,
+  signal: AbortSignal,
+) => void | (() => void);
 
 export function LegacyModuleHost({ mount }: { mount: LegacyModuleMount }) {
   const rootRef = React.useRef<HTMLDivElement>(null);
   const project = useProjectContext();
-  const getAccessToken = useAccessToken();
 
   React.useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
     root.replaceChildren();
-    const scope = { tenantId: project.tenantId, projectId: project.projectId };
-    const cleanup = mount(root, {
-      scope,
-      async request(path, init = {}) {
-        const token = await getAccessToken();
-        const headers = new Headers(init.headers);
-        if (token) headers.set('Authorization', `Bearer ${token}`);
-        const relativePath = path.startsWith('/') ? path : `/${path}`;
-        return fetch(`${projectApiBase(scope)}${relativePath}`, { ...init, headers });
-      },
+    const controller = new AbortController();
+    const context: LegacyModuleContext = Object.freeze({
+      scope: Object.freeze({ tenantId: project.tenantId, projectId: project.projectId }),
+      permissions: new Set(project.permissions),
     });
+    const cleanup = mount(root, context, controller.signal);
     return () => {
+      controller.abort();
       cleanup?.();
       root.replaceChildren();
     };
-  }, [getAccessToken, mount, project.projectId, project.tenantId]);
+  }, [mount, project.permissions, project.projectId, project.tenantId]);
 
-  return <div ref={rootRef} data-testid="legacy-module-host" data-legacy-isolation="restricted" />;
+  return <div ref={rootRef} data-testid="legacy-module-host" />;
 }

@@ -18,12 +18,15 @@ export type AuthUser = {
 
 export type AuthManager = {
   getUser(): Promise<AuthUser | null>;
-  signinRedirectCallback(url?: string): Promise<AuthUser>;
   signinRedirect(): Promise<void>;
   signoutRedirect(): Promise<void>;
   events: {
     addUserLoaded(callback: (user: AuthUser) => void): void;
     removeUserLoaded(callback: (user: AuthUser) => void): void;
+    addUserUnloaded(callback: () => void): void;
+    removeUserUnloaded(callback: () => void): void;
+    addSilentRenewError(callback: (error: Error) => void): void;
+    removeSilentRenewError(callback: (error: Error) => void): void;
   };
 };
 
@@ -59,15 +62,23 @@ function scopeKey(project: ProjectClaim): string {
 }
 
 export function projectContextsFromProfile(profile: Record<string, unknown>): ProjectContext[] {
-  if (!Array.isArray(profile.dbpilot_projects) || profile.dbpilot_projects.length === 0) {
-    throw new Error('Validated OIDC project claims are required');
+  const subject = profile.sub;
+  if (
+    typeof subject !== 'string'
+    || subject.length === 0
+    || subject.length > 256
+    || subject.trim() !== subject
+    || /[\r\n\t]/.test(subject)
+  ) {
+    throw new Error('Invalid OIDC subject claim');
   }
-  if (!Array.isArray(profile.dbpilot_grants)) {
-    throw new Error('Validated OIDC grant claims are required');
-  }
+  const projectClaims = profile.dbpilot_projects == null ? [] : profile.dbpilot_projects;
+  const grantClaims = profile.dbpilot_grants == null ? [] : profile.dbpilot_grants;
+  if (!Array.isArray(projectClaims)) throw new Error('Invalid OIDC project claims');
+  if (!Array.isArray(grantClaims)) throw new Error('Invalid OIDC grant claims');
 
   const permissionsByScope = new Map<string, ReadonlySet<string>>();
-  for (const value of profile.dbpilot_grants) {
+  for (const value of grantClaims) {
     if (!isProjectClaim(value) || !Array.isArray((value as GrantClaim).permissions)) {
       throw new Error('Invalid project grant claim');
     }
@@ -75,18 +86,26 @@ export function projectContextsFromProfile(profile: Record<string, unknown>): Pr
     if (!safeIdentifier.test(grant.tenant_id) || !safeIdentifier.test(grant.project_id)) {
       throw new Error('Invalid project identifier in OIDC claims');
     }
+    const key = scopeKey(grant);
+    if (permissionsByScope.has(key)) throw new Error('Duplicate project grant in OIDC claims');
     const permissions = new Set<string>();
     for (const permission of grant.permissions) {
-      if (typeof permission !== 'string' || permission.trim() !== permission || permission.length === 0) {
+      if (
+        typeof permission !== 'string'
+        || permission.trim() !== permission
+        || permission.length === 0
+        || /[\r\n\t]/.test(permission)
+      ) {
         throw new Error('Invalid permission in OIDC claims');
       }
+      if (permissions.has(permission)) throw new Error('Duplicate permission in OIDC claims');
       permissions.add(permission);
     }
-    permissionsByScope.set(scopeKey(grant), permissions);
+    permissionsByScope.set(key, permissions);
   }
 
   const seen = new Set<string>();
-  return profile.dbpilot_projects.map((value) => {
+  return projectClaims.map((value) => {
     if (!isProjectClaim(value) || !safeIdentifier.test(value.tenant_id) || !safeIdentifier.test(value.project_id)) {
       throw new Error('Invalid project identifier in OIDC claims');
     }
@@ -111,26 +130,38 @@ export function AuthProvider({
   const [projects, setProjects] = React.useState<ProjectContext[]>([]);
   const [selectedKey, setSelectedKey] = React.useState('');
   const [error, setError] = React.useState<Error>();
+  const [authMessage, setAuthMessage] = React.useState('');
   const userRef = React.useRef<AuthUser | null>(null);
+  const projectGeneration = React.useRef(0);
 
   const acceptUser = React.useCallback((nextUser: AuthUser | null) => {
-    userRef.current = nextUser;
-    setUser(nextUser);
+    projectGeneration.current += 1;
     if (!nextUser || nextUser.expired) {
+      userRef.current = null;
+      setUser(null);
       setProjects([]);
       setSelectedKey('');
+      setError(undefined);
       return;
     }
     try {
       const nextProjects = projectContextsFromProfile(nextUser.profile);
+      userRef.current = nextUser;
+      setUser(nextUser);
       setProjects(nextProjects);
-      setSelectedKey((current) =>
-        nextProjects.some((project) => scopeKey({ tenant_id: project.tenantId, project_id: project.projectId }) === current)
+      setSelectedKey((current) => {
+        if (nextProjects.length === 0) return '';
+        return nextProjects.some((project) => scopeKey({ tenant_id: project.tenantId, project_id: project.projectId }) === current)
           ? current
-          : scopeKey({ tenant_id: nextProjects[0].tenantId, project_id: nextProjects[0].projectId }),
-      );
+          : scopeKey({ tenant_id: nextProjects[0].tenantId, project_id: nextProjects[0].projectId });
+      });
       setError(undefined);
+      setAuthMessage('');
     } catch (value) {
+      userRef.current = null;
+      setUser(null);
+      setProjects([]);
+      setSelectedKey('');
       setError(value instanceof Error ? value : new Error('Invalid OIDC claims'));
     }
   }, []);
@@ -140,21 +171,30 @@ export function AuthProvider({
     const loaded = (nextUser: AuthUser) => {
       if (active) acceptUser(nextUser);
     };
+    const unloaded = () => {
+      if (active) {
+        setAuthMessage('');
+        acceptUser(null);
+      }
+    };
+    const renewFailed = () => {
+      if (active) {
+        acceptUser(null);
+        setAuthMessage('登录续期失败，请重新登录');
+      }
+    };
     manager.events.addUserLoaded(loaded);
-    const parameters = new URLSearchParams(window.location.search);
-    const isOidcCallback = parameters.has('state') && (parameters.has('code') || parameters.has('error'));
-    const restore = isOidcCallback ? manager.signinRedirectCallback() : manager.getUser();
-    void restore.then(
-      (nextUser) => {
-        if (!active) return;
-        if (isOidcCallback) window.history.replaceState({}, document.title, '/');
-        acceptUser(nextUser);
-      },
-      () => active && setError(new Error(isOidcCallback ? 'Unable to complete OIDC login' : 'Unable to restore login')),
+    manager.events.addUserUnloaded(unloaded);
+    manager.events.addSilentRenewError(renewFailed);
+    void manager.getUser().then(
+      (nextUser) => active && acceptUser(nextUser),
+      () => active && setError(new Error('Unable to restore login')),
     );
     return () => {
       active = false;
       manager.events.removeUserLoaded(loaded);
+      manager.events.removeUserUnloaded(unloaded);
+      manager.events.removeSilentRenewError(renewFailed);
     };
   }, [acceptUser, manager]);
 
@@ -164,6 +204,7 @@ export function AuthProvider({
     return (
       <main>
         <h1>DBPilot</h1>
+        {authMessage ? <p role="alert">{authMessage}</p> : null}
         <button type="button" onClick={() => void manager.signinRedirect()}>
           登录
         </button>
@@ -174,6 +215,15 @@ export function AuthProvider({
   const project = projects.find(
     (candidate) => scopeKey({ tenant_id: candidate.tenantId, project_id: candidate.projectId }) === selectedKey,
   );
+  if (projects.length === 0) {
+    return (
+      <main>
+        <h1>DBPilot</h1>
+        <p role="status">没有可访问的项目</p>
+        <button type="button" onClick={() => void manager.signoutRedirect()}>退出登录</button>
+      </main>
+    );
+  }
   if (!project) return <div role="status">正在加载项目…</div>;
 
   const getAccessToken = async () => {
@@ -185,7 +235,9 @@ export function AuthProvider({
     if (!projects.some((candidate) => scopeKey({ tenant_id: candidate.tenantId, project_id: candidate.projectId }) === nextKey)) {
       throw new Error('Project is not granted by the validated OIDC claims');
     }
+    const generation = ++projectGeneration.current;
     await queryCache?.cancelQueries();
+    if (generation !== projectGeneration.current) return;
     queryCache?.clear();
     setSelectedKey(nextKey);
   };

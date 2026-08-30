@@ -5,14 +5,14 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createGeneratedApiClient } from '../api/client';
-import { AuthProvider, type AuthManager } from '../auth/AuthProvider';
+import { AuthProvider, type AuthManager, useAuthActions } from '../auth/AuthProvider';
 import { AsyncBoundary } from '../components/AsyncBoundary';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { DataTable } from '../components/DataTable';
 import { Drawer } from '../components/Drawer';
 import { FormField } from '../components/FormField';
 import { PermissionGate } from '../components/PermissionGate';
-import { LegacyModuleHost } from '../legacy/LegacyModuleHost';
+import { LegacyModuleHost, type LegacyModuleContext } from '../legacy/LegacyModuleHost';
 import { AppShell } from './AppShell';
 
 const profile = {
@@ -30,10 +30,16 @@ const profile = {
 function manager(): AuthManager {
   return {
     getUser: async () => ({ access_token: 'not-rendered', expired: false, profile }),
-    signinRedirectCallback: async () => ({ access_token: 'not-rendered', expired: false, profile }),
     signinRedirect: async () => undefined,
     signoutRedirect: async () => undefined,
-    events: { addUserLoaded: () => undefined, removeUserLoaded: () => undefined },
+    events: {
+      addUserLoaded: () => undefined,
+      removeUserLoaded: () => undefined,
+      addUserUnloaded: () => undefined,
+      removeUserUnloaded: () => undefined,
+      addSilentRenewError: () => undefined,
+      removeSilentRenewError: () => undefined,
+    },
   };
 }
 
@@ -153,6 +159,27 @@ describe('React management shell', () => {
     expect(closeDrawer).not.toHaveBeenCalled();
   });
 
+  it('gives simultaneous dialog instances unique accessible title relationships', () => {
+    render(
+      <>
+        <Drawer open title="First drawer" onClose={() => undefined}>First</Drawer>
+        <Drawer open title="Second drawer" onClose={() => undefined}>Second</Drawer>
+        <ConfirmDialog open title="First confirmation" confirmLabel="Confirm first" onConfirm={() => undefined} onCancel={() => undefined}>First</ConfirmDialog>
+        <ConfirmDialog open title="Second confirmation" confirmLabel="Confirm second" onConfirm={() => undefined} onCancel={() => undefined}>Second</ConfirmDialog>
+      </>,
+    );
+
+    const dialogs = [
+      screen.getByRole('dialog', { name: 'First drawer' }),
+      screen.getByRole('dialog', { name: 'Second drawer' }),
+      screen.getByRole('dialog', { name: 'First confirmation' }),
+      screen.getByRole('dialog', { name: 'Second confirmation' }),
+    ];
+    const titleIds = dialogs.map((dialog) => dialog.getAttribute('aria-labelledby'));
+    expect(new Set(titleIds).size).toBe(4);
+    for (const id of titleIds) expect(document.getElementById(id!)).not.toBeNull();
+  });
+
   it('moves focus into a drawer and restores it to the opener after keyboard dismissal', async () => {
     function DrawerHarness() {
       const [open, setOpen] = React.useState(false);
@@ -200,36 +227,65 @@ describe('React management shell', () => {
     await userEvent.click(opener);
     const confirm = screen.getByRole('button', { name: 'Retire' });
     const cancel = screen.getByRole('button', { name: '取消' });
-    expect(document.activeElement).toBe(confirm);
-    await userEvent.tab();
     expect(document.activeElement).toBe(cancel);
     await userEvent.tab({ shift: true });
     expect(document.activeElement).toBe(confirm);
+    await userEvent.tab();
+    expect(document.activeElement).toBe(cancel);
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('dialog', { name: 'Confirm retirement' })).toBeNull();
     expect(document.activeElement).toBe(opener);
   });
 
-  it('mounts legacy modules into an isolated root with only scope and authenticated request capabilities', async () => {
+  it('remounts legacy modules with validated scope and permissions while aborting the previous lifecycle', async () => {
     const cleanup = vi.fn();
-    const mount = vi.fn((root: HTMLElement, context: Record<string, unknown>) => {
-      root.textContent = 'Legacy monitoring';
-      expect(Object.keys(context).sort()).toEqual(['request', 'scope']);
-      expect(context).not.toHaveProperty('accessToken');
-      expect(context).not.toHaveProperty('storage');
+    const signals: AbortSignal[] = [];
+    const contexts: LegacyModuleContext[] = [];
+    const mount = vi.fn((root: HTMLElement, context: LegacyModuleContext, signal: AbortSignal) => {
+      signals.push(signal);
+      contexts.push(context);
+      if (signals.length === 1) (context.permissions as Set<string>).add('plugins:manage');
+      root.textContent = `Legacy ${context.scope.projectId}`;
       return cleanup;
     });
+    function LegacyHarness() {
+      const [, rerender] = React.useReducer((value) => value + 1, 0);
+      const { projects, switchProject } = useAuthActions();
+      return (
+        <>
+          <button type="button" onClick={() => void switchProject(projects[1])}>Switch legacy project</button>
+          <button type="button" onClick={rerender}>Rerender permissions</button>
+          <PermissionGate permission="plugins:manage" fallback={<span>No plugin access</span>}>
+            <span>Plugin access</span>
+          </PermissionGate>
+          <LegacyModuleHost mount={mount} />
+        </>
+      );
+    }
     const { unmount } = render(
       <AuthProvider manager={manager()}>
-        <LegacyModuleHost mount={mount} />
+        <LegacyHarness />
       </AuthProvider>,
     );
 
-    expect(await screen.findByText('Legacy monitoring')).not.toBeNull();
-    const host = screen.getByTestId('legacy-module-host');
-    expect(host.getAttribute('data-legacy-isolation')).toBe('restricted');
-    expect(host.textContent).not.toContain('not-rendered');
-    unmount();
+    expect(await screen.findByText('Legacy project-a')).not.toBeNull();
+    expect(Object.keys(contexts[0]).sort()).toEqual(['permissions', 'scope']);
+    expect(contexts[0]).not.toHaveProperty('request');
+    expect(contexts[0]).not.toHaveProperty('accessToken');
+    expect(signals[0].aborted).toBe(false);
+    await userEvent.click(screen.getByRole('button', { name: 'Rerender permissions' }));
+    expect(screen.getByText('No plugin access')).not.toBeNull();
+    expect(screen.queryByText('Plugin access')).toBeNull();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Switch legacy project' }));
+    expect(await screen.findByText('Legacy project-b')).not.toBeNull();
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[1].aborted).toBe(false);
     expect(cleanup).toHaveBeenCalledTimes(1);
+    expect([...contexts[1].permissions]).toEqual(['plugins:manage']);
+
+    unmount();
+    expect(signals[1].aborted).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(2);
   });
 });
