@@ -42,20 +42,22 @@ const (
 var controlIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 type CoordinatorConfig struct {
-	HostID                 string
-	AgentID                string
-	Detector               Detector
-	DockerDetector         Detector
-	RuleSet                domain.RuleSet
-	Attestation            domain.RuleAttestation
-	Reporter               Reporter
-	Now                    func() time.Time
-	RetryBackoff           time.Duration
-	RevisionStore          RevisionStore
-	ReportStore            ReportStore
-	InitialUnavailable     bool
-	Compatibility          func() CompatibilityState
-	SourceResultsSupported func() bool
+	HostID                        string
+	AgentID                       string
+	Detector                      Detector
+	DockerDetector                Detector
+	RuleSet                       domain.RuleSet
+	Attestation                   domain.RuleAttestation
+	Reporter                      Reporter
+	Now                           func() time.Time
+	RetryBackoff                  time.Duration
+	RevisionStore                 RevisionStore
+	ReportStore                   ReportStore
+	InitialUnavailable            bool
+	Compatibility                 func() CompatibilityState
+	SourceResultsSupported        func() bool
+	SourceResultsPeerSupported    func() bool
+	RequestSourceResultsReconnect func() bool
 }
 
 type Coordinator struct {
@@ -69,14 +71,16 @@ type Coordinator struct {
 	now            func() time.Time
 	retryBackoff   time.Duration
 
-	mu                     sync.Mutex
-	revisionStore          RevisionStore
-	pendingRevision        uint64
-	reports                ReportStore
-	pendingReport          *agentv1.DiscoveryReport
-	unavailable            bool
-	compatibility          func() CompatibilityState
-	sourceResultsSupported func() bool
+	mu                            sync.Mutex
+	revisionStore                 RevisionStore
+	pendingRevision               uint64
+	reports                       ReportStore
+	pendingReport                 *agentv1.DiscoveryReport
+	unavailable                   bool
+	compatibility                 func() CompatibilityState
+	sourceResultsSupported        func() bool
+	sourceResultsPeerSupported    func() bool
+	requestSourceResultsReconnect func() bool
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -104,6 +108,9 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.SourceResultsSupported == nil {
 		config.SourceResultsSupported = func() bool { return true }
 	}
+	if config.SourceResultsPeerSupported == nil {
+		config.SourceResultsPeerSupported = func() bool { return false }
+	}
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
@@ -116,7 +123,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 			return nil, err
 		}
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, pendingReport: pending, unavailable: config.InitialUnavailable, compatibility: config.Compatibility, sourceResultsSupported: config.SourceResultsSupported}, nil
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, dockerDetector: config.DockerDetector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, pendingReport: pending, unavailable: config.InitialUnavailable, compatibility: config.Compatibility, sourceResultsSupported: config.SourceResultsSupported, sourceResultsPeerSupported: config.SourceResultsPeerSupported, requestSourceResultsReconnect: config.RequestSourceResultsReconnect}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -353,6 +360,11 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 	if report == nil {
 		return nil
 	}
+	variant, err := reportVariant(report)
+	if err != nil {
+		return err
+	}
+	requestProtocolUpgrade := variant == reportProtocolOldShape && !coordinator.sourceResultsSupported() && coordinator.sourceResultsPeerSupported() && coordinator.requestSourceResultsReconnect != nil
 	if err := coordinator.reporter(ctx, proto.Clone(report).(*agentv1.DiscoveryReport)); err != nil {
 		var terminal interface{ NonRetryableDiscovery() bool }
 		if errors.As(err, &terminal) && terminal.NonRetryableDiscovery() {
@@ -370,6 +382,9 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 	}
 	coordinator.pendingReport = nil
 	coordinator.pendingRevision = 0
+	if requestProtocolUpgrade {
+		_ = coordinator.requestSourceResultsReconnect()
+	}
 	return nil
 }
 
@@ -426,6 +441,8 @@ func (coordinator *Coordinator) AdditionalCapabilities() []string {
 	}
 	if variant != reportProtocolOldShape {
 		capabilities = append(capabilities, "discovery_source_results_v1")
+	} else {
+		capabilities = append(capabilities, "discovery_source_results_pending_legacy_v1")
 	}
 	if coordinator.dockerDetector != nil {
 		capabilities = append(capabilities, "docker_discovery_configured")

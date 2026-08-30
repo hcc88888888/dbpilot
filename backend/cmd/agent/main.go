@@ -356,7 +356,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 				return agent.ErrControlStreamDisconnected
 			}
 			return controlClient.ReportDiscovery(reportContext, report)
-		}, SourceResultsSupported: func() bool { return controlClient != nil && controlClient.DiscoverySourceResultsSupported() }})
+		}, SourceResultsSupported: func() bool { return controlClient != nil && controlClient.DiscoverySourceResultsSupported() }, SourceResultsPeerSupported: func() bool { return controlClient != nil && controlClient.DiscoverySourceResultsPeerSupported() }, RequestSourceResultsReconnect: func() bool { return controlClient != nil && controlClient.RequestDiscoverySourceResultsReconnect() }})
 		if loadErr != nil {
 			_ = store.Close()
 			return fmt.Errorf("configure native discovery: %w", loadErr)

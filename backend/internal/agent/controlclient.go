@@ -26,6 +26,7 @@ import (
 const ControlProtocolVersion = "1"
 const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
 const CapabilityDiscoverySourceResultsV1 = "discovery_source_results_v1"
+const CapabilityDiscoverySourceResultsPendingLegacyV1 = "discovery_source_results_pending_legacy_v1"
 const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
@@ -200,18 +201,19 @@ type ControlClient struct {
 	resultRetryBackoff time.Duration
 	now                func() time.Time
 
-	sessionMu              sync.RWMutex
-	session                *controlSession
-	sendMu                 sync.Mutex
-	runningMu              sync.Mutex
-	running                map[string]runningCommand
-	executorWait           sync.WaitGroup
-	messageSequence        atomic.Uint64
-	executionErrors        chan error
-	discoveryMu            sync.Mutex
-	discoveryWaiters       map[uint64]*discoveryAckWaiter
-	discoveryCompatibility atomic.Uint32
-	discoverySourceResults atomic.Bool
+	sessionMu                  sync.RWMutex
+	session                    *controlSession
+	sendMu                     sync.Mutex
+	runningMu                  sync.Mutex
+	running                    map[string]runningCommand
+	executorWait               sync.WaitGroup
+	messageSequence            atomic.Uint64
+	executionErrors            chan error
+	discoveryMu                sync.Mutex
+	discoveryWaiters           map[uint64]*discoveryAckWaiter
+	discoveryCompatibility     atomic.Uint32
+	discoverySourceResults     atomic.Bool
+	discoverySourceResultsPeer atomic.Bool
 }
 
 type discoveryAckWaiter struct {
@@ -232,14 +234,17 @@ type runningCommand struct {
 }
 
 type controlSession struct {
-	ctx           context.Context
-	cancel        context.CancelFunc
-	stream        ControlStream
-	outgoing      chan controlSendRequest
-	sendErrors    chan error
-	wait          sync.WaitGroup
-	resultRetryMu sync.Mutex
-	resultRetries map[string]*scheduledResultRetry
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	stream                 ControlStream
+	outgoing               chan controlSendRequest
+	sendErrors             chan error
+	wait                   sync.WaitGroup
+	resultRetryMu          sync.Mutex
+	resultRetries          map[string]*scheduledResultRetry
+	sourceUpgradeEligible  bool
+	sourceUpgradeRequested atomic.Bool
+	reconnect              chan struct{}
 }
 
 type scheduledResultRetry struct{ cancel context.CancelFunc }
@@ -305,6 +310,9 @@ func (c *ControlClient) Run(ctx context.Context) (runErr error) {
 		if ctx.Err() != nil {
 			return nil
 		}
+		if errors.Is(err, errDiscoveryProtocolReconnect) {
+			continue
+		}
 		var fatal *fatalControlError
 		if errors.As(err, &fatal) {
 			return fatal.err
@@ -368,7 +376,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 		err     error
 	}
 	received := make(chan receiveResult, 1)
-	session := &controlSession{ctx: ctx, cancel: cancel, stream: stream, outgoing: make(chan controlSendRequest, controlSendQueueCapacity), sendErrors: make(chan error, 1), resultRetries: make(map[string]*scheduledResultRetry)}
+	session := &controlSession{ctx: ctx, cancel: cancel, stream: stream, outgoing: make(chan controlSendRequest, controlSendQueueCapacity), sendErrors: make(chan error, 1), resultRetries: make(map[string]*scheduledResultRetry), reconnect: make(chan struct{}, 1)}
 	session.wait.Add(1)
 	go func() {
 		defer session.wait.Done()
@@ -403,7 +411,10 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
-	c.discoverySourceResults.Store(advertisesSourceResults && hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoverySourceResultsV1))
+	peerSourceResults := hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoverySourceResultsV1)
+	c.discoverySourceResultsPeer.Store(peerSourceResults)
+	c.discoverySourceResults.Store(advertisesSourceResults && peerSourceResults)
+	session.sourceUpgradeEligible = !advertisesSourceResults && hasCapabilities(capabilities, CapabilityDiscoverySourceResultsPendingLegacyV1) && peerSourceResults
 	if hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1) {
 		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
 	} else {
@@ -411,6 +422,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	}
 	defer c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityUnknown))
 	defer c.discoverySourceResults.Store(false)
+	defer c.discoverySourceResultsPeer.Store(false)
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
@@ -442,11 +454,15 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 			}
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-session.reconnect:
+			return errDiscoveryProtocolReconnect
 		}
 	}
 }
 
 type fatalControlError struct{ err error }
+
+var errDiscoveryProtocolReconnect = errors.New("graceful discovery protocol reconnect")
 
 func (e *fatalControlError) Error() string { return e.err.Error() }
 func (e *fatalControlError) Unwrap() error { return e.err }
@@ -952,6 +968,24 @@ func (c *ControlClient) DiscoveryCompatibility() DiscoveryCompatibility {
 
 func (c *ControlClient) DiscoverySourceResultsSupported() bool {
 	return c.discoverySourceResults.Load()
+}
+
+func (c *ControlClient) DiscoverySourceResultsPeerSupported() bool {
+	return c.discoverySourceResultsPeer.Load()
+}
+
+func (c *ControlClient) RequestDiscoverySourceResultsReconnect() bool {
+	c.sessionMu.RLock()
+	session := c.session
+	c.sessionMu.RUnlock()
+	if session == nil || !session.sourceUpgradeEligible || !c.discoverySourceResultsPeer.Load() || !session.sourceUpgradeRequested.CompareAndSwap(false, true) {
+		return false
+	}
+	select {
+	case session.reconnect <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func hasCapabilities(values []string, required ...string) bool {
