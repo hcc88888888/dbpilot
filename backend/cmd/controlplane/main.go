@@ -167,37 +167,38 @@ type Config struct {
 }
 
 type Server struct {
-	config               Config
-	database             *sql.DB
-	ownsDatabase         bool
-	repository           *alert.PostgresRepository
-	evaluator            *alert.Evaluator
-	dispatcher           *alert.Dispatcher
-	httpServer           *http.Server
-	grpcServer           *grpc.Server
-	httpTLS              *tls.Config
-	grpcTLS              *tls.Config
-	ping                 func(context.Context) error
-	migrate              func(context.Context) error
-	listen               func(string, string) (net.Listener, error)
-	scopes               []alert.Scope
-	ready                *atomic.Bool
-	evaluateScope        func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents           func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch             func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue             func(context.Context, time.Time) error
-	agentRegistry        *agentcontrol.Registry
-	commandObserver      agentcontrol.Observer
-	commandLifecycle     *job.CommandLifecycle
-	dispatchCommands     func(context.Context, time.Time) error
-	idempotency          *idempotency.Service
-	artifactBlobs        *artifact.LocalBlobStore
-	inspectionService    *inspection.Service
-	hostInventoryService *hostinventory.ApplicationService
-	inspectionWorker     *inspection.Worker
-	scheduleInspections  func(context.Context, time.Time) error
-	processInspections   func(context.Context, time.Time) error
-	workers              sync.WaitGroup
+	config                 Config
+	database               *sql.DB
+	ownsDatabase           bool
+	repository             *alert.PostgresRepository
+	evaluator              *alert.Evaluator
+	dispatcher             *alert.Dispatcher
+	httpServer             *http.Server
+	grpcServer             *grpc.Server
+	httpTLS                *tls.Config
+	grpcTLS                *tls.Config
+	ping                   func(context.Context) error
+	migrate                func(context.Context) error
+	listen                 func(string, string) (net.Listener, error)
+	scopes                 []alert.Scope
+	ready                  *atomic.Bool
+	evaluateScope          func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents             func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch               func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue               func(context.Context, time.Time) error
+	agentRegistry          *agentcontrol.Registry
+	commandObserver        agentcontrol.Observer
+	commandLifecycle       *job.CommandLifecycle
+	dispatchCommands       func(context.Context, time.Time) error
+	idempotency            *idempotency.Service
+	artifactBlobs          *artifact.LocalBlobStore
+	inspectionService      *inspection.Service
+	hostInventoryService   *hostinventory.ApplicationService
+	inspectionWorker       *inspection.Worker
+	scheduleInspections    func(context.Context, time.Time) error
+	processInspections     func(context.Context, time.Time) error
+	reconcilePluginCatalog func(context.Context, time.Time) error
+	workers                sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -567,6 +568,19 @@ func NewServer(config Config) (*Server, error) {
 			_, err := inspectionWorker.Process(ctx, at.UTC(), 10)
 			return err
 		},
+		reconcilePluginCatalog: func(ctx context.Context, at time.Time) error {
+			if !config.PluginCatalog.Enabled {
+				return nil
+			}
+			reconciler, ok := pluginCatalogService.(interface {
+				ReconcileExpiredUploadOperations(context.Context, time.Time, int) (plugincatalog.OperationReconcileResult, error)
+			})
+			if !ok {
+				return errors.New("plugin catalog reconciler is unavailable")
+			}
+			_, err := reconciler.ReconcileExpiredUploadOperations(ctx, at.UTC(), 25)
+			return err
+		},
 	}, nil
 }
 
@@ -873,7 +887,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(5)
+	server.workers.Add(6)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -899,6 +913,14 @@ func (server *Server) startLoops(ctx context.Context) {
 		periodic(ctx, time.Second, func(at time.Time) {
 			if err := server.processInspections(ctx, at); err != nil && ctx.Err() == nil {
 				log.Printf("inspection worker pass failed: %v", err)
+			}
+		})
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, time.Minute, func(at time.Time) {
+			if err := server.reconcilePluginCatalog(ctx, at); err != nil && ctx.Err() == nil {
+				log.Printf("plugin catalog reconciliation pass failed: %v", err)
 			}
 		})
 	}()

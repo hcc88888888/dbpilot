@@ -425,7 +425,7 @@ func jobTransitionFailedBeforeSideEffect(err error) bool {
 }
 
 func httpActionAuditEvent(ctx context.Context, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string) audit.Event {
-	digest := sha256.Sum256([]byte(scope.Key() + "\x00" + principal.Subject + "\x00" + operationID + "\x00" + resourceID + "\x00" + idempotencyKey))
+	digest := sha256.Sum256([]byte(scope.Key() + "\x00" + principal.Subject + "\x00" + operationID + "\x00" + resourceID + "\x00" + idempotencyKey + "\x00" + action + "\x00" + result))
 	return audit.Event{
 		Scope: scope, Action: action, Actor: audit.Actor{Type: "user", ID: principal.Subject},
 		Resource: audit.Resource{Type: resourceType, ID: resourceID}, Result: result,

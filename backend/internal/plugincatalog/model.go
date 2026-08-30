@@ -237,7 +237,10 @@ type OperationState string
 const (
 	OperationPending   OperationState = "pending"
 	OperationCommitted OperationState = "committed"
+	OperationAbandoned OperationState = "abandoned"
 )
+
+const DefaultOperationLease = 10 * time.Minute
 
 type OperationKey struct {
 	Scope          platformscope.Scope
@@ -294,15 +297,17 @@ type OperationSnapshot struct {
 	ArtifactID     string
 	ArtifactSHA256 string
 	ArtifactBytes  int64
+	LeaseExpiresAt time.Time
+	AbandonedAt    *time.Time
 	Response       OperationResponse
 	AuditEventJSON []byte
 }
 
 func (snapshot OperationSnapshot) Validate() error {
-	if snapshot.Key.Validate() != nil || snapshot.State != OperationPending && snapshot.State != OperationCommitted || !json.Valid(snapshot.AuditEventJSON) {
+	if snapshot.Key.Validate() != nil || snapshot.State != OperationPending && snapshot.State != OperationCommitted && snapshot.State != OperationAbandoned || !json.Valid(snapshot.AuditEventJSON) || snapshot.LeaseExpiresAt.IsZero() {
 		return ErrInvalid
 	}
-	if snapshot.Version.Validate() != nil || snapshot.State == OperationCommitted && snapshot.Response.Validate() != nil {
+	if snapshot.Version.Validate() != nil || snapshot.Response.Validate() != nil || snapshot.State == OperationAbandoned && snapshot.AbandonedAt == nil {
 		return ErrInvalid
 	}
 	return nil
@@ -317,6 +322,8 @@ type UploadOperationRequest struct {
 	ArtifactBytes  int64
 	CreatedBy      string
 	CreatedAt      time.Time
+	LeaseExpiresAt time.Time
+	Response       OperationResponse
 	AuditEventJSON []byte
 }
 
@@ -331,6 +338,12 @@ type OperationRepository interface {
 	BeginUploadOperation(context.Context, UploadOperationRequest) (OperationSnapshot, error)
 	FinalizeUploadOperation(context.Context, OperationKey, OperationResponseBuilder) (OperationSnapshot, error)
 	TransitionOperation(context.Context, TransitionOperationRequest, OperationResponseBuilder) (OperationSnapshot, error)
+	ReconcileExpiredUploadOperations(context.Context, time.Time, int) (OperationReconcileResult, error)
+}
+
+type OperationReconcileResult struct {
+	Finalized int
+	Abandoned int
 }
 
 type TransitionRequest struct {

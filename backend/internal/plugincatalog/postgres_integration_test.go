@@ -62,7 +62,7 @@ func TestPluginCatalogPostgres16Integration(t *testing.T) {
 	}
 	var migrations int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM dbpilot_schema_migrations WHERE name LIKE 'plugincatalog/%'").Scan(&migrations))
-	require.Equal(t, 2, migrations)
+	require.Equal(t, 3, migrations)
 
 	scope := platformscope.Scope{TenantID: "tenant-pg16", ProjectID: "project-pg16"}
 	definition := PluginDefinition{Scope: scope, PluginID: "mysql", Name: "mysql", DatabaseFamily: "mysql", ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, Capabilities: []string{"metrics.collect"}}
@@ -140,7 +140,7 @@ func TestPluginCatalogPostgres16Integration(t *testing.T) {
 	third := integrationVersion(scope, "plugin-version-pg16-3", "plugin-artifact-pg16-3", "1.2.0", strings.Repeat("3", 64), createdAt.Add(3*time.Second))
 	key := OperationKey{Scope: scope, Actor: "publisher-pg16", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "upload-pg16", Fingerprint: "sha256:" + strings.Repeat("4", 64), OwnerToken: "owner-" + strings.Repeat("5", 64)}
 	auditJSON := []byte(`{"action":"plugin.version_uploaded"}`)
-	pending, err := repository.BeginUploadOperation(ctx, UploadOperationRequest{Key: key, Definition: definition, Version: third, ArtifactID: third.ArtifactID, ArtifactSHA256: third.PackageSHA256, ArtifactBytes: 123, CreatedBy: key.Actor, CreatedAt: third.CreatedAt, AuditEventJSON: auditJSON})
+	pending, err := repository.BeginUploadOperation(ctx, UploadOperationRequest{Key: key, Definition: definition, Version: third, ArtifactID: third.ArtifactID, ArtifactSHA256: third.PackageSHA256, ArtifactBytes: 123, CreatedBy: key.Actor, CreatedAt: third.CreatedAt, LeaseExpiresAt: third.CreatedAt.Add(DefaultOperationLease), Response: OperationResponse{Status: 201, ETag: third.ETag(), Body: []byte(`{"version_id":"` + third.ID + `"}`)}, AuditEventJSON: auditJSON})
 	require.NoError(t, err)
 	require.Equal(t, OperationPending, pending.State)
 	insertIntegrationArtifactSized(t, ctx, database, third.ArtifactID, scope, third.PackageSHA256, 123, "plugin_catalog_operation", key.RecordID())
@@ -154,6 +154,98 @@ func TestPluginCatalogPostgres16Integration(t *testing.T) {
 	require.Equal(t, committed.Response, recovered.Response)
 	_, err = database.ExecContext(ctx, "DELETE FROM plugin_catalog_operations WHERE tenant_id = $1 AND project_id = $2 AND operation_record_id = $3", scope.TenantID, scope.ProjectID, key.RecordID())
 	require.ErrorContains(t, err, "immutable")
+}
+
+func TestPluginCatalogPostgres16ExpiredUploadLedgerReconciliation(t *testing.T) {
+	if os.Getenv("DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_PLUGIN_CATALOG_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_PLUGIN_CATALOG_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	admin := openPluginCatalogIntegrationDB(t, ctx, dsn)
+	schema := fmt.Sprintf("plugin_catalog_ledger_%d", time.Now().UnixNano())
+	quotedSchema := pq.QuoteIdentifier(schema)
+	_, err := admin.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, cleanupErr := admin.ExecContext(cleanupContext, "DROP SCHEMA "+quotedSchema+" CASCADE")
+		require.NoError(t, cleanupErr)
+		require.NoError(t, admin.Close())
+	})
+	database := openPluginCatalogIntegrationDB(t, ctx, pluginCatalogIntegrationDSN(t, dsn, schema))
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	require.NoError(t, RunMigrations(ctx, database))
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	repository := NewPostgresRepositoryWithClock(database, func() time.Time { return now })
+	scope := platformscope.Scope{TenantID: "tenant-ledger", ProjectID: "project-ledger"}
+	definition := PluginDefinition{Scope: scope, PluginID: "mysql", Name: "mysql", DatabaseFamily: "mysql", ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, Capabilities: []string{"metrics.collect"}}
+	version := integrationVersion(scope, "plugin-version-ledger-a", "plugin-artifact-ledger-a", "2.0.0", strings.Repeat("9", 64), now.Add(-time.Hour))
+	response := OperationResponse{Status: 201, ETag: version.ETag(), Body: []byte(`{"status":"verified"}`)}
+	oldKey := OperationKey{Scope: scope, Actor: "publisher-ledger", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "abandoned-old", Fingerprint: "sha256:" + strings.Repeat("9", 64), OwnerToken: "owner-" + strings.Repeat("1", 64)}
+	request := UploadOperationRequest{Key: oldKey, Definition: definition, Version: version, ArtifactID: version.ArtifactID, ArtifactSHA256: version.PackageSHA256, ArtifactBytes: 121, CreatedBy: oldKey.Actor, CreatedAt: now.Add(-time.Hour), LeaseExpiresAt: now.Add(-time.Minute), Response: response, AuditEventJSON: []byte(`{"action":"upload"}`)}
+	oldPending, err := repository.BeginUploadOperation(ctx, request)
+	require.NoError(t, err)
+	require.Equal(t, OperationPending, oldPending.State)
+	result, err := repository.ReconcileExpiredUploadOperations(ctx, now, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Abandoned)
+	require.Zero(t, result.Finalized)
+	abandoned, err := repository.GetOperation(ctx, oldKey)
+	require.NoError(t, err)
+	require.Equal(t, OperationAbandoned, abandoned.State)
+
+	different := request
+	different.Key = OperationKey{Scope: scope, Actor: "publisher-ledger", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "different-digest", Fingerprint: "sha256:" + strings.Repeat("8", 64), OwnerToken: "owner-" + strings.Repeat("2", 64)}
+	different.Version.PackageSHA256, different.Version.ArtifactID, different.ArtifactSHA256 = strings.Repeat("8", 64), "plugin-artifact-ledger-different", strings.Repeat("8", 64)
+	different.ArtifactID = different.Version.ArtifactID
+	_, err = repository.BeginUploadOperation(ctx, different)
+	require.ErrorIs(t, err, ErrConflict)
+
+	adopted := request
+	adopted.Key = OperationKey{Scope: scope, Actor: "publisher-ledger", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "same-digest-adopt", Fingerprint: oldKey.Fingerprint, OwnerToken: "owner-" + strings.Repeat("3", 64)}
+	adopted.CreatedAt, adopted.LeaseExpiresAt = now, now.Add(DefaultOperationLease)
+	newPending, err := repository.BeginUploadOperation(ctx, adopted)
+	require.NoError(t, err)
+	require.Equal(t, OperationPending, newPending.State)
+
+	artifactDefinition := PluginDefinition{Scope: scope, PluginID: "postgres", Name: "postgres", DatabaseFamily: "postgres", ProtocolVersion: "v1", SupportedVariants: []string{"postgres"}, Capabilities: []string{"metrics.collect"}}
+	artifactVersion := integrationVersion(scope, "plugin-version-ledger-b", "plugin-artifact-ledger-b", "3.0.0", strings.Repeat("7", 64), now.Add(-time.Hour))
+	artifactVersion.PluginID, artifactVersion.SupportedVariants = "postgres", []string{"postgres"}
+	artifactKey := OperationKey{Scope: scope, Actor: "publisher-ledger", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "artifact-expired", Fingerprint: "sha256:" + strings.Repeat("7", 64), OwnerToken: "owner-" + strings.Repeat("4", 64)}
+	artifactRequest := UploadOperationRequest{Key: artifactKey, Definition: artifactDefinition, Version: artifactVersion, ArtifactID: artifactVersion.ArtifactID, ArtifactSHA256: artifactVersion.PackageSHA256, ArtifactBytes: 121, CreatedBy: artifactKey.Actor, CreatedAt: now.Add(-time.Hour), LeaseExpiresAt: now.Add(-time.Minute), Response: OperationResponse{Status: 201, ETag: artifactVersion.ETag(), Body: []byte(`{"status":"verified"}`)}, AuditEventJSON: []byte(`{"action":"upload"}`)}
+	_, err = repository.BeginUploadOperation(ctx, artifactRequest)
+	require.NoError(t, err)
+	insertIntegrationArtifact(t, ctx, database, artifactVersion.ArtifactID, scope, artifactVersion.PackageSHA256, "plugin_catalog_operation", artifactKey.RecordID())
+
+	type outcome struct {
+		result OperationReconcileResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			value, reconcileErr := repository.ReconcileExpiredUploadOperations(context.Background(), now, 1)
+			outcomes <- outcome{result: value, err: reconcileErr}
+		}()
+	}
+	totalFinalized := 0
+	for range 2 {
+		value := <-outcomes
+		require.NoError(t, value.err)
+		totalFinalized += value.result.Finalized
+	}
+	require.Equal(t, 1, totalFinalized)
+	finalized, err := repository.GetOperation(ctx, artifactKey)
+	require.NoError(t, err)
+	require.Equal(t, OperationCommitted, finalized.State)
+	require.Equal(t, artifactRequest.Response, finalized.Response)
 }
 
 func integrationVersion(scope platformscope.Scope, id, artifactID, version, digest string, createdAt time.Time) PluginVersion {

@@ -71,9 +71,17 @@ func (service *Application) publishVerifiedOperation(ctx context.Context, scope 
 		}
 		return OperationSnapshot{}, err
 	}
+	response, err := builder(version)
+	if err != nil || response.Validate() != nil {
+		if verified.Close() != nil {
+			return OperationSnapshot{}, ErrArtifactUnavailable
+		}
+		return OperationSnapshot{}, ErrInvalid
+	}
 	pending, err := service.operations.BeginUploadOperation(ctx, UploadOperationRequest{
 		Key: key, Definition: definition, Version: version, ArtifactID: artifactValue.ID,
 		ArtifactSHA256: version.PackageSHA256, ArtifactBytes: verified.SizeBytes, CreatedBy: metadata.Actor, CreatedAt: createdAt,
+		LeaseExpiresAt: createdAt.Add(DefaultOperationLease), Response: response,
 		AuditEventJSON: append([]byte(nil), auditJSON...),
 	})
 	if err != nil {
@@ -170,6 +178,13 @@ func (service *Application) RecoverOperation(ctx context.Context, key OperationK
 		return OperationSnapshot{}, ErrOperationPending
 	}
 	return value, nil
+}
+
+func (service *Application) ReconcileExpiredUploadOperations(ctx context.Context, at time.Time, limit int) (OperationReconcileResult, error) {
+	if service == nil || service.operations == nil || ctx == nil || at.IsZero() || limit < 1 || limit > 100 {
+		return OperationReconcileResult{}, ErrInvalid
+	}
+	return service.operations.ReconcileExpiredUploadOperations(ctx, at.UTC(), limit)
 }
 
 func (service *Application) Upload(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, source io.Reader) (PluginVersion, error) {

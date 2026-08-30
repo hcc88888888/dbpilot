@@ -22,9 +22,9 @@ const insertDefinitionSQL = "INSERT INTO plugin_definitions (tenant_id, project_
 const insertVersionSQL = "INSERT INTO plugin_versions (version_id, tenant_id, project_id, plugin_id, semantic_version, status, artifact_id, package_sha256, manifest_digest, publisher_id, signing_key_id, protocol_version, minimum_agent_protocol_version, maximum_agent_protocol_version, supported_variants, database_version_range, capabilities, metric_template_schema_version, platforms, revision, created_at, approved_at, revocation_reason) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) ON CONFLICT DO NOTHING RETURNING " + versionColumnsSQL
 const transitionVersionSQL = "UPDATE plugin_versions SET status = $1, revision = revision + 1, approved_at = CASE WHEN $1 = 'approved' THEN $2 ELSE approved_at END, revocation_reason = CASE WHEN $1 = 'revoked' THEN $3 ELSE revocation_reason END WHERE tenant_id = $4 AND project_id = $5 AND version_id = $6 AND revision = $7 AND status = ANY($8) RETURNING " + versionColumnsSQL
 const versionExistsSQL = "SELECT EXISTS (SELECT 1 FROM plugin_versions WHERE tenant_id = $1 AND project_id = $2 AND version_id = $3)"
-const operationColumnsSQL = "operation_record_id, tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, kind, state, version_id, plugin_id, semantic_version, artifact_id, artifact_sha256, artifact_bytes, definition_json, version_json, response_status, response_etag, response_body, audit_event_json, created_at, updated_at"
+const operationColumnsSQL = "operation_record_id, tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, kind, state, version_id, plugin_id, semantic_version, artifact_id, artifact_sha256, artifact_bytes, definition_json, version_json, response_status, response_etag, response_body, audit_event_json, created_at, updated_at, lease_expires_at, abandoned_at"
 const getOperationSQL = "SELECT " + operationColumnsSQL + " FROM plugin_catalog_operations WHERE tenant_id = $1 AND project_id = $2 AND actor = $3 AND operation_id = $4 AND idempotency_key = $5"
-const insertOperationSQL = "INSERT INTO plugin_catalog_operations (operation_record_id, tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, kind, state, version_id, plugin_id, semantic_version, artifact_id, artifact_sha256, artifact_bytes, definition_json, version_json, response_status, response_etag, response_body, audit_event_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) ON CONFLICT DO NOTHING RETURNING " + operationColumnsSQL
+const insertOperationSQL = "INSERT INTO plugin_catalog_operations (operation_record_id, tenant_id, project_id, actor, operation_id, idempotency_key, request_fingerprint, owner_token, kind, state, version_id, plugin_id, semantic_version, artifact_id, artifact_sha256, artifact_bytes, definition_json, version_json, response_status, response_etag, response_body, audit_event_json, created_at, updated_at, lease_expires_at, abandoned_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) ON CONFLICT DO NOTHING RETURNING " + operationColumnsSQL
 
 type PostgresRepository struct {
 	database *sql.DB
@@ -273,16 +273,43 @@ func (repository *PostgresRepository) GetOperation(ctx context.Context, key Oper
 }
 
 func (repository *PostgresRepository) BeginUploadOperation(ctx context.Context, request UploadOperationRequest) (OperationSnapshot, error) {
-	if repository == nil || repository.database == nil || ctx == nil || request.Key.Validate() != nil || request.Definition.Validate() != nil || request.Version.Validate() != nil || request.Key.Scope != request.Version.Scope || request.Definition.Scope != request.Version.Scope || request.ArtifactID != request.Version.ArtifactID || request.ArtifactSHA256 != request.Version.PackageSHA256 || request.ArtifactBytes <= 0 || !canonicalText(request.CreatedBy, 256) || request.CreatedAt.IsZero() || !json.Valid(request.AuditEventJSON) {
+	if repository == nil || repository.database == nil || ctx == nil || request.Key.Validate() != nil || request.Definition.Validate() != nil || request.Version.Validate() != nil || request.Key.Scope != request.Version.Scope || request.Definition.Scope != request.Version.Scope || request.ArtifactID != request.Version.ArtifactID || request.ArtifactSHA256 != request.Version.PackageSHA256 || request.ArtifactBytes <= 0 || !canonicalText(request.CreatedBy, 256) || request.CreatedAt.IsZero() || request.LeaseExpiresAt.IsZero() || request.Response.Validate() != nil || !json.Valid(request.AuditEventJSON) {
 		return OperationSnapshot{}, ErrInvalid
 	}
 	if existing, err := repository.GetOperation(ctx, request.Key); err == nil {
 		if !operationMatchesUpload(existing, request) {
 			return OperationSnapshot{}, ErrConflict
 		}
+		if existing.State == OperationPending && !existing.LeaseExpiresAt.After(repository.now().UTC()) {
+			if _, reconcileErr := repository.ReconcileExpiredUploadOperations(ctx, repository.now().UTC(), 10); reconcileErr != nil {
+				return OperationSnapshot{}, reconcileErr
+			}
+			existing, err = repository.GetOperation(ctx, request.Key)
+			if err != nil {
+				return OperationSnapshot{}, err
+			}
+		}
+		if existing.State == OperationAbandoned {
+			adopted, adoptErr := scanOperation(repository.database.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'pending', abandoned_at = NULL, lease_expires_at = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'abandoned' RETURNING "+operationColumnsSQL, request.LeaseExpiresAt.UTC(), repository.now().UTC(), request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Key.RecordID()))
+			if errors.Is(adoptErr, sql.ErrNoRows) {
+				return OperationSnapshot{}, ErrConflict
+			}
+			return adopted, adoptErr
+		}
 		return existing, nil
 	} else if !errors.Is(err, ErrNotFound) {
 		return OperationSnapshot{}, err
+	}
+	if _, err := repository.ReconcileExpiredUploadOperations(ctx, repository.now().UTC(), 10); err != nil {
+		return OperationSnapshot{}, err
+	}
+	var historicalDigest string
+	historyErr := repository.database.QueryRowContext(ctx, "SELECT artifact_sha256 FROM plugin_catalog_operations WHERE tenant_id = $1 AND project_id = $2 AND plugin_id = $3 AND semantic_version = $4 AND kind = 'upload' ORDER BY created_at DESC, operation_record_id DESC LIMIT 1", request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Version.PluginID, request.Version.Version).Scan(&historicalDigest)
+	if historyErr != nil && !errors.Is(historyErr, sql.ErrNoRows) {
+		return OperationSnapshot{}, historyErr
+	}
+	if historyErr == nil && historicalDigest != request.ArtifactSHA256 {
+		return OperationSnapshot{}, ErrConflict
 	}
 	var semanticVersionExists bool
 	if err := repository.database.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM plugin_versions WHERE tenant_id = $1 AND project_id = $2 AND plugin_id = $3 AND semantic_version = $4)", request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Version.PluginID, request.Version.Version).Scan(&semanticVersionExists); err != nil {
@@ -302,8 +329,8 @@ func (repository *PostgresRepository) BeginUploadOperation(ctx context.Context, 
 	value, err := scanOperation(repository.database.QueryRowContext(ctx, insertOperationSQL,
 		request.Key.RecordID(), request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Key.Actor, request.Key.OperationID, request.Key.IdempotencyKey,
 		request.Key.Fingerprint, request.Key.OwnerToken, "upload", OperationPending, request.Version.ID, request.Version.PluginID, request.Version.Version,
-		request.ArtifactID, request.ArtifactSHA256, request.ArtifactBytes, string(definitionJSON), string(versionJSON), nil, nil, nil,
-		request.AuditEventJSON, request.CreatedAt.UTC(), request.CreatedAt.UTC(),
+		request.ArtifactID, request.ArtifactSHA256, request.ArtifactBytes, string(definitionJSON), string(versionJSON), request.Response.Status, request.Response.ETag, request.Response.Body,
+		request.AuditEventJSON, request.CreatedAt.UTC(), request.CreatedAt.UTC(), request.LeaseExpiresAt.UTC(), nil,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		if existing, getErr := repository.GetOperation(ctx, request.Key); getErr == nil && operationMatchesUpload(existing, request) {
@@ -315,7 +342,7 @@ func (repository *PostgresRepository) BeginUploadOperation(ctx context.Context, 
 }
 
 func operationMatchesUpload(value OperationSnapshot, request UploadOperationRequest) bool {
-	return value.Key == request.Key && value.Kind == "upload" && value.Version.ID == request.Version.ID && value.Version.PluginID == request.Version.PluginID && value.Version.Version == request.Version.Version && value.Version.PackageSHA256 == request.Version.PackageSHA256 && value.Version.ManifestDigest == request.Version.ManifestDigest && value.ArtifactID == request.ArtifactID && value.ArtifactSHA256 == request.ArtifactSHA256 && value.ArtifactBytes == request.ArtifactBytes && bytes.Equal(value.AuditEventJSON, request.AuditEventJSON)
+	return value.Key == request.Key && value.Kind == "upload" && value.Version.ID == request.Version.ID && value.Version.PluginID == request.Version.PluginID && value.Version.Version == request.Version.Version && value.Version.PackageSHA256 == request.Version.PackageSHA256 && value.Version.ManifestDigest == request.Version.ManifestDigest && value.ArtifactID == request.ArtifactID && value.ArtifactSHA256 == request.ArtifactSHA256 && value.ArtifactBytes == request.ArtifactBytes && value.Response.Status == request.Response.Status && value.Response.ETag == request.Response.ETag && bytes.Equal(value.Response.Body, request.Response.Body) && bytes.Equal(value.AuditEventJSON, request.AuditEventJSON)
 }
 
 func (repository *PostgresRepository) FinalizeUploadOperation(ctx context.Context, key OperationKey, builder OperationResponseBuilder) (OperationSnapshot, error) {
@@ -361,7 +388,7 @@ func (repository *PostgresRepository) FinalizeUploadOperation(ctx context.Contex
 		return OperationSnapshot{}, err
 	}
 	response, err := builder(storedVersion)
-	if err != nil || response.Validate() != nil {
+	if err != nil || response.Validate() != nil || response.Status != value.Response.Status || response.ETag != value.Response.ETag || !bytes.Equal(response.Body, value.Response.Body) {
 		rollback()
 		return OperationSnapshot{}, ErrInvalid
 	}
@@ -370,8 +397,8 @@ func (repository *PostgresRepository) FinalizeUploadOperation(ctx context.Contex
 		rollback()
 		return OperationSnapshot{}, ErrInvalid
 	}
-	committed, err := scanOperation(transaction.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'committed', version_json = $1, response_status = $2, response_etag = $3, response_body = $4, updated_at = $5 WHERE tenant_id = $6 AND project_id = $7 AND operation_record_id = $8 AND state = 'pending' RETURNING "+operationColumnsSQL,
-		string(versionJSON), response.Status, response.ETag, response.Body, repository.now().UTC(), key.Scope.TenantID, key.Scope.ProjectID, key.RecordID()))
+	committed, err := scanOperation(transaction.QueryRowContext(ctx, "UPDATE plugin_catalog_operations SET state = 'committed', version_json = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'pending' RETURNING "+operationColumnsSQL,
+		string(versionJSON), repository.now().UTC(), key.Scope.TenantID, key.Scope.ProjectID, key.RecordID()))
 	if err != nil {
 		rollback()
 		return OperationSnapshot{}, err
@@ -412,6 +439,9 @@ func (repository *PostgresRepository) TransitionOperation(ctx context.Context, r
 		if !exists {
 			return OperationSnapshot{}, ErrNotFound
 		}
+		if existing, getErr := repository.GetOperation(ctx, request.Key); getErr == nil {
+			return existing, nil
+		}
 		return OperationSnapshot{}, ErrRevisionConflict
 	}
 	if err != nil {
@@ -427,7 +457,7 @@ func (repository *PostgresRepository) TransitionOperation(ctx context.Context, r
 	kind := map[Status]string{StatusApproved: "approve", StatusAvailable: "publish", StatusRevoked: "revoke"}[request.Transition.To]
 	committed, err := scanOperation(transaction.QueryRowContext(ctx, insertOperationSQL,
 		request.Key.RecordID(), request.Key.Scope.TenantID, request.Key.Scope.ProjectID, request.Key.Actor, request.Key.OperationID, request.Key.IdempotencyKey,
-		request.Key.Fingerprint, request.Key.OwnerToken, kind, OperationCommitted, value.ID, value.PluginID, value.Version, value.ArtifactID, value.PackageSHA256, int64(0), "{}", string(versionJSON), response.Status, response.ETag, response.Body, request.AuditEventJSON, at, at,
+		request.Key.Fingerprint, request.Key.OwnerToken, kind, OperationCommitted, value.ID, value.PluginID, value.Version, value.ArtifactID, value.PackageSHA256, int64(0), "{}", string(versionJSON), response.Status, response.ETag, response.Body, request.AuditEventJSON, at, at, at.Add(DefaultOperationLease), nil,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		rollback()
@@ -444,6 +474,88 @@ func (repository *PostgresRepository) TransitionOperation(ctx context.Context, r
 		return OperationSnapshot{}, err
 	}
 	return committed, nil
+}
+
+func (repository *PostgresRepository) ReconcileExpiredUploadOperations(ctx context.Context, at time.Time, limit int) (OperationReconcileResult, error) {
+	if repository == nil || repository.database == nil || ctx == nil || at.IsZero() || limit < 1 || limit > 100 {
+		return OperationReconcileResult{}, ErrInvalid
+	}
+	transaction, err := repository.database.BeginTx(ctx, nil)
+	if err != nil {
+		return OperationReconcileResult{}, err
+	}
+	rollback := func() { _ = transaction.Rollback() }
+	rows, err := transaction.QueryContext(ctx, "SELECT "+operationColumnsSQL+" FROM plugin_catalog_operations WHERE kind = 'upload' AND state = 'pending' AND lease_expires_at <= $1 ORDER BY lease_expires_at ASC, tenant_id ASC, project_id ASC, operation_record_id ASC FOR UPDATE SKIP LOCKED LIMIT $2", at.UTC(), limit)
+	if err != nil {
+		rollback()
+		return OperationReconcileResult{}, err
+	}
+	values := make([]OperationSnapshot, 0, limit)
+	for rows.Next() {
+		value, scanErr := scanOperation(rows)
+		if scanErr != nil {
+			_ = rows.Close()
+			rollback()
+			return OperationReconcileResult{}, scanErr
+		}
+		values = append(values, value)
+	}
+	rowsErr := rows.Err()
+	closeErr := rows.Close()
+	if rowsErr != nil || closeErr != nil {
+		rollback()
+		if rowsErr != nil {
+			return OperationReconcileResult{}, rowsErr
+		}
+		return OperationReconcileResult{}, closeErr
+	}
+	result := OperationReconcileResult{}
+	for _, value := range values {
+		var artifactExists bool
+		if err := transaction.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM artifacts WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND checksum = $4 AND size_bytes = $5 AND source_resource_type = 'plugin_catalog_operation' AND source_resource_id = $6)", value.Key.Scope.TenantID, value.Key.Scope.ProjectID, value.ArtifactID, "sha256:"+value.ArtifactSHA256, value.ArtifactBytes, value.Key.RecordID()).Scan(&artifactExists); err != nil {
+			rollback()
+			return OperationReconcileResult{}, err
+		}
+		if artifactExists {
+			storedVersion, err := createVersionInTransaction(ctx, transaction, value.Definition, value.Version)
+			if err != nil {
+				rollback()
+				return OperationReconcileResult{}, err
+			}
+			versionJSON, err := json.Marshal(storedVersion)
+			if err != nil {
+				rollback()
+				return OperationReconcileResult{}, ErrInvalid
+			}
+			update, err := transaction.ExecContext(ctx, "UPDATE plugin_catalog_operations SET state = 'committed', version_json = $1, updated_at = $2 WHERE tenant_id = $3 AND project_id = $4 AND operation_record_id = $5 AND state = 'pending'", string(versionJSON), at.UTC(), value.Key.Scope.TenantID, value.Key.Scope.ProjectID, value.Key.RecordID())
+			if err != nil {
+				rollback()
+				return OperationReconcileResult{}, err
+			}
+			affected, _ := update.RowsAffected()
+			if affected != 1 {
+				rollback()
+				return OperationReconcileResult{}, ErrConflict
+			}
+			result.Finalized++
+			continue
+		}
+		update, err := transaction.ExecContext(ctx, "UPDATE plugin_catalog_operations SET state = 'abandoned', abandoned_at = $1, updated_at = $1 WHERE tenant_id = $2 AND project_id = $3 AND operation_record_id = $4 AND state = 'pending'", at.UTC(), value.Key.Scope.TenantID, value.Key.Scope.ProjectID, value.Key.RecordID())
+		if err != nil {
+			rollback()
+			return OperationReconcileResult{}, err
+		}
+		affected, _ := update.RowsAffected()
+		if affected != 1 {
+			rollback()
+			return OperationReconcileResult{}, ErrConflict
+		}
+		result.Abandoned++
+	}
+	if err := transaction.Commit(); err != nil {
+		return OperationReconcileResult{}, err
+	}
+	return result, nil
 }
 
 func createVersionInTransaction(ctx context.Context, transaction *sql.Tx, definition PluginDefinition, version PluginVersion) (PluginVersion, error) {
@@ -487,7 +599,8 @@ func scanOperation(scanner interface{ Scan(...any) error }) (OperationSnapshot, 
 	var responseETag sql.NullString
 	var responseBody []byte
 	var createdAt, updatedAt time.Time
-	if err := scanner.Scan(&recordID, &value.Key.Scope.TenantID, &value.Key.Scope.ProjectID, &actor, &operationID, &idempotencyKey, &fingerprint, &ownerToken, &value.Kind, &value.State, &value.Version.ID, &value.Version.PluginID, &value.Version.Version, &value.ArtifactID, &value.ArtifactSHA256, &value.ArtifactBytes, &definitionJSON, &versionJSON, &responseStatus, &responseETag, &responseBody, &value.AuditEventJSON, &createdAt, &updatedAt); err != nil {
+	var abandonedAt sql.NullTime
+	if err := scanner.Scan(&recordID, &value.Key.Scope.TenantID, &value.Key.Scope.ProjectID, &actor, &operationID, &idempotencyKey, &fingerprint, &ownerToken, &value.Kind, &value.State, &value.Version.ID, &value.Version.PluginID, &value.Version.Version, &value.ArtifactID, &value.ArtifactSHA256, &value.ArtifactBytes, &definitionJSON, &versionJSON, &responseStatus, &responseETag, &responseBody, &value.AuditEventJSON, &createdAt, &updatedAt, &value.LeaseExpiresAt, &abandonedAt); err != nil {
 		return OperationSnapshot{}, err
 	}
 	value.Key.Actor, value.Key.OperationID, value.Key.IdempotencyKey, value.Key.Fingerprint, value.Key.OwnerToken = actor, operationID, idempotencyKey, fingerprint, ownerToken
@@ -499,6 +612,11 @@ func scanOperation(scanner interface{ Scan(...any) error }) (OperationSnapshot, 
 	}
 	if responseStatus.Valid {
 		value.Response = OperationResponse{Status: int(responseStatus.Int64), ETag: responseETag.String, Body: append([]byte(nil), responseBody...)}
+	}
+	value.LeaseExpiresAt = value.LeaseExpiresAt.UTC()
+	if abandonedAt.Valid {
+		at := abandonedAt.Time.UTC()
+		value.AbandonedAt = &at
 	}
 	if value.Validate() != nil {
 		return OperationSnapshot{}, ErrConflict

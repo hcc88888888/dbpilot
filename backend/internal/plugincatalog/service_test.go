@@ -207,7 +207,7 @@ func (repository *recordingCatalogRepository) BeginUploadOperation(_ context.Con
 		return repository.operation, nil
 	}
 	repository.beginOperationCalls++
-	repository.operation = OperationSnapshot{Key: request.Key, State: OperationPending, Version: request.Version, AuditEventJSON: append([]byte(nil), request.AuditEventJSON...)}
+	repository.operation = OperationSnapshot{Key: request.Key, Kind: "upload", State: OperationPending, Definition: request.Definition, Version: request.Version, ArtifactID: request.ArtifactID, ArtifactSHA256: request.ArtifactSHA256, ArtifactBytes: request.ArtifactBytes, LeaseExpiresAt: request.LeaseExpiresAt, Response: request.Response, AuditEventJSON: append([]byte(nil), request.AuditEventJSON...)}
 	return repository.operation, nil
 }
 
@@ -237,6 +237,10 @@ func (repository *recordingCatalogRepository) TransitionOperation(_ context.Cont
 	}
 	repository.operation = OperationSnapshot{Key: request.Key, State: OperationCommitted, Version: value, Response: response, AuditEventJSON: append([]byte(nil), request.AuditEventJSON...)}
 	return repository.operation, nil
+}
+
+func (repository *recordingCatalogRepository) ReconcileExpiredUploadOperations(context.Context, time.Time, int) (OperationReconcileResult, error) {
+	return OperationReconcileResult{}, nil
 }
 
 type recordingPackageVerifier struct {

@@ -90,8 +90,9 @@ func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func
 	methods[method] = struct{}{}
 	registrar.mu.Unlock()
 
-	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)), registrar.removeUpload, registrar.uploadCleanupFailure)
-	if method == http.MethodPost && strings.HasSuffix(path, "/plugin-versions") {
+	isPluginUpload := method == http.MethodPost && strings.HasSuffix(path, "/plugin-versions")
+	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)), registrar.removeUpload, registrar.uploadCleanupFailure, isPluginUpload)
+	if isPluginUpload {
 		validated = registrar.admitPluginUpload(validated)
 	}
 	secured := authenticatePlatform(registrar.resolver, requirePlatformScope(validated))
@@ -193,9 +194,13 @@ type platformRequestMetadata struct {
 
 type platformRequestMetadataContextKey struct{}
 
-func capturePlatformRequestMetadata(next http.Handler, removeUpload func(string) error, cleanupFailure func(error)) http.Handler {
+func capturePlatformRequestMetadata(next http.Handler, removeUpload func(string) error, cleanupFailure func(error), pluginUpload bool) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if strings.EqualFold(strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]), "application/gzip") {
+			if !pluginUpload {
+				writePlatformProblem(writer, request, ErrInvalidRequest)
+				return
+			}
 			captureBinaryPlatformRequest(next, writer, request, removeUpload, cleanupFailure)
 			return
 		}

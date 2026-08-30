@@ -120,6 +120,46 @@ func TestPluginApproveProcessingRecoveryReplaysApprovedSnapshotAfterPublish(t *t
 	require.Equal(t, 1, audits.recordCalls)
 }
 
+func TestPluginLifecycleProcessingRecoveryCreatesMissingOperationSnapshot(t *testing.T) {
+	tests := []struct {
+		name, path, body, key, etag, failureName string
+		permission                               string
+		status                                   plugincatalog.Status
+		revision                                 uint64
+	}{
+		{name: "approve", path: "/plugin-versions/plugin-version-1/actions/approve", body: `{}`, key: "approve-pre-operation", etag: `"7"`, failureName: "approve", permission: openapi.PermissionApprovePluginVersion, status: plugincatalog.StatusApproved, revision: 8},
+		{name: "publish", path: "/plugin-versions/plugin-version-1/actions/publish", body: `{}`, key: "publish-pre-operation", etag: `"8"`, failureName: "publish", permission: openapi.PermissionPublishPluginVersion, status: plugincatalog.StatusAvailable, revision: 9},
+		{name: "revoke", path: "/plugin-versions/plugin-version-1/actions/revoke", body: `{"reason_code":"publisher_compromise"}`, key: "revoke-pre-operation", etag: `"9"`, failureName: "revoke", permission: openapi.PermissionRevokePluginVersion, status: plugincatalog.StatusRevoked, revision: 10},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 7))
+			service.approveValue = validCatalogVersion(test.status, test.revision)
+			service.publishValue = validCatalogVersion(test.status, test.revision)
+			service.revokeValue = validCatalogVersion(test.status, test.revision)
+			service.operationFailures = map[string]int{test.failureName: 1}
+			audits := &recordingAuditService{}
+			services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+			request := func() *http.Request {
+				value := httptest.NewRequest(http.MethodPost, platformBasePath+test.path, bytes.NewBufferString(test.body))
+				value.Header.Set("Content-Type", "application/json")
+				value.Header.Set("Idempotency-Key", test.key)
+				value.Header.Set("If-Match", test.etag)
+				return value
+			}
+			first := servePlatformRequest(services, principalWith(platformTestScope, test.permission), request())
+			require.Equal(t, http.StatusInternalServerError, first.Code)
+			require.Empty(t, service.operations)
+			retry := servePlatformRequest(services, principalWith(platformTestScope, test.permission), request())
+			require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+			require.Equal(t, `"`+fmt.Sprint(test.revision)+`"`, retry.Header().Get("ETag"))
+			require.Contains(t, retry.Body.String(), `"status":"`+string(test.status)+`"`)
+			require.Len(t, service.operations, 1)
+			require.Len(t, audits.records, 1)
+		})
+	}
+}
+
 func TestPluginLifecycleAPIsEnforceETagAndReturnPublicMetadataOnly(t *testing.T) {
 	// Break caught: lifecycle mutations without If-Match can overwrite a newer
 	// decision; responses must never expose storage paths or signature bytes.
@@ -285,6 +325,28 @@ func TestDisabledPluginCatalogRejectsBeforeReadingUpload(t *testing.T) {
 	require.Zero(t, body.reads)
 }
 
+func TestNonUploadRoutesRejectGzipWithoutReadingOrStaging(t *testing.T) {
+	tests := []struct {
+		name, method, path, permission string
+	}{
+		{name: "GET list", method: http.MethodGet, path: "/plugin-definitions", permission: openapi.PermissionListPluginDefinitions},
+		{name: "JSON lifecycle", method: http.MethodPost, path: "/plugin-versions/plugin-version-1/actions/approve", permission: openapi.PermissionApprovePluginVersion},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := &countingRequestBody{contents: bytes.Repeat([]byte("gzip-shaped"), 1024)}
+			request := httptest.NewRequest(test.method, platformBasePath+test.path, body)
+			request.ContentLength = int64(len(body.contents))
+			request.Header.Set("Content-Type", "application/gzip")
+			request.Header.Set("Idempotency-Key", "wrong-route")
+			request.Header.Set("If-Match", `"7"`)
+			response := servePlatformRequest(Services{PluginCatalog: newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 7))}, principalWith(platformTestScope, test.permission), request)
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			require.Zero(t, body.reads)
+		})
+	}
+}
+
 func TestPluginUploadStagingReportsCleanupFailure(t *testing.T) {
 	body := []byte("cleanup-observed-upload")
 	service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 1))
@@ -368,6 +430,49 @@ func TestPluginFailuresAuditExactlyOnceWithoutPublishingState(t *testing.T) {
 	})
 }
 
+func TestPluginAuditDedupeAllowsFailureThenSuccessWithSameKey(t *testing.T) {
+	t.Run("unknown publisher then configured", func(t *testing.T) {
+		service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 1))
+		service.uploadErr = fmt.Errorf("%w: %w", plugincatalog.ErrBeforeSideEffect, plugincatalog.ErrUnknownPublisher)
+		audits := &recordingAuditService{}
+		services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		principal := principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage)
+		body := []byte("publisher-becomes-trusted")
+		failure := servePlatformRequest(services, principal, newPluginUploadRequest(body, "failure-success-upload"))
+		require.Equal(t, http.StatusUnprocessableEntity, failure.Code)
+		service.uploadErr = nil
+		success := servePlatformRequest(services, principal, newPluginUploadRequest(body, "failure-success-upload"))
+		require.Equal(t, http.StatusCreated, success.Code, success.Body.String())
+		replay := servePlatformRequest(services, principal, newPluginUploadRequest(body, "failure-success-upload"))
+		require.Equal(t, http.StatusCreated, replay.Code)
+		require.Len(t, audits.records, 2)
+		require.NotEqual(t, audits.records[0].DedupeKey, audits.records[1].DedupeKey)
+		require.Equal(t, []string{"failure", "success"}, []string{audits.records[0].Result, audits.records[1].Result})
+	})
+
+	t.Run("not found then created version", func(t *testing.T) {
+		service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 7))
+		service.approveValue = validCatalogVersion(plugincatalog.StatusApproved, 8)
+		service.approveErr = plugincatalog.ErrNotFound
+		audits := &recordingAuditService{}
+		services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		principal := principalWith(platformTestScope, openapi.PermissionApprovePluginVersion)
+		request := func() *http.Request {
+			value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions/plugin-version-1/actions/approve", bytes.NewBufferString(`{}`))
+			value.Header.Set("Content-Type", "application/json")
+			value.Header.Set("Idempotency-Key", "failure-success-approve")
+			value.Header.Set("If-Match", `"7"`)
+			return value
+		}
+		require.Equal(t, http.StatusNotFound, servePlatformRequest(services, principal, request()).Code)
+		service.approveErr = nil
+		require.Equal(t, http.StatusOK, servePlatformRequest(services, principal, request()).Code)
+		require.Equal(t, http.StatusOK, servePlatformRequest(services, principal, request()).Code)
+		require.Len(t, audits.records, 2)
+		require.NotEqual(t, audits.records[0].DedupeKey, audits.records[1].DedupeKey)
+	})
+}
+
 func newPluginUploadRequest(body []byte, key string) *http.Request {
 	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/gzip")
@@ -412,6 +517,7 @@ type recordingPluginCatalogService struct {
 	listDefinitionScopes  []platformscope.Scope
 	definitionFilters     []plugincatalog.DefinitionFilter
 	operations            map[string]plugincatalog.OperationSnapshot
+	operationFailures     map[string]int
 	uploadOperationCalls  int
 	approveOperationCalls int
 	recoverOperationCalls int
@@ -485,6 +591,9 @@ func (service *recordingPluginCatalogService) UploadOperation(_ context.Context,
 
 func (service *recordingPluginCatalogService) ApproveOperation(_ context.Context, _ platformscope.Scope, _ string, revision uint64, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
 	service.approveOperationCalls++
+	if service.consumeOperationFailure("approve") {
+		return plugincatalog.OperationSnapshot{}, errors.New("crash before approve operation snapshot")
+	}
 	service.approveRevisions = append(service.approveRevisions, revision)
 	if service.approveErr != nil {
 		return plugincatalog.OperationSnapshot{}, service.approveErr
@@ -502,6 +611,9 @@ func (service *recordingPluginCatalogService) ApproveOperation(_ context.Context
 }
 
 func (service *recordingPluginCatalogService) PublishOperation(ctx context.Context, scope platformscope.Scope, id string, revision uint64, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
+	if service.consumeOperationFailure("publish") {
+		return plugincatalog.OperationSnapshot{}, errors.New("crash before publish operation snapshot")
+	}
 	value, err := service.Publish(ctx, scope, id, revision)
 	if err != nil {
 		return plugincatalog.OperationSnapshot{}, err
@@ -519,6 +631,9 @@ func (service *recordingPluginCatalogService) PublishOperation(ctx context.Conte
 }
 
 func (service *recordingPluginCatalogService) RevokeOperation(ctx context.Context, scope platformscope.Scope, id string, revision uint64, reason string, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
+	if service.consumeOperationFailure("revoke") {
+		return plugincatalog.OperationSnapshot{}, errors.New("crash before revoke operation snapshot")
+	}
 	value, err := service.Revoke(ctx, scope, id, revision, reason)
 	if err != nil {
 		return plugincatalog.OperationSnapshot{}, err
@@ -533,6 +648,14 @@ func (service *recordingPluginCatalogService) RevokeOperation(ctx context.Contex
 	}
 	service.operations[key.Identity()] = snapshot
 	return snapshot, nil
+}
+
+func (service *recordingPluginCatalogService) consumeOperationFailure(name string) bool {
+	if service.operationFailures[name] <= 0 {
+		return false
+	}
+	service.operationFailures[name]--
+	return true
 }
 
 func (service *recordingPluginCatalogService) RecoverOperation(_ context.Context, key plugincatalog.OperationKey) (plugincatalog.OperationSnapshot, error) {

@@ -252,7 +252,11 @@ func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, act
 		return plugincatalog.OperationKey{Scope: scope, Actor: principal.Subject, OperationID: operationID, IdempotencyKey: idempotencyKey, Fingerprint: fingerprint, OwnerToken: owner}
 	}
 	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
-		snapshot, recoveryErr := api.services.PluginCatalog.RecoverOperation(recoveryContext, operationKey(processing.OwnerToken))
+		durableKey := operationKey(processing.OwnerToken)
+		snapshot, recoveryErr := api.services.PluginCatalog.RecoverOperation(recoveryContext, durableKey)
+		if errors.Is(recoveryErr, plugincatalog.ErrNotFound) {
+			snapshot, recoveryErr = mutate(recoveryContext, scope, uint64(revision), durableKey, processing.Reconciliation)
+		}
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
