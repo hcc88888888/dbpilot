@@ -91,7 +91,7 @@ func TestConnectRegistersCapabilitiesSendsHelloAckAndRejectsDuplicateSession(t *
 
 	ack := first.nextSent(t)
 	require.Equal(t, ProtocolVersion, ack.GetHelloAck().GetProtocolVersion())
-	require.Equal(t, []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1}, ack.GetHelloAck().GetCapabilities())
+	require.Equal(t, []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1, CapabilityDiscoverySourceResultsV1}, ack.GetHelloAck().GetCapabilities())
 	connected := <-observer.connected
 	require.Equal(t, "agent-a", connected.AgentID)
 	require.Equal(t, []string{"collect_now"}, connected.Capabilities)

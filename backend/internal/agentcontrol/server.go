@@ -20,6 +20,7 @@ import (
 const ProtocolVersion = "1"
 const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
 const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
+const CapabilityDiscoverySourceResultsV1 = "discovery_source_results_v1"
 
 type Observer interface {
 	Connected(context.Context, SessionInfo)
@@ -137,7 +138,7 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 
 	ack := &agentv1.ServerMessage{
 		MessageId: fmt.Sprintf("hello-ack-%d", s.now().UnixNano()), SentAt: timestamppb.New(s.now()),
-		Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ProtocolVersion, Capabilities: []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1}, ServerTime: timestamppb.New(s.now())}},
+		Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ProtocolVersion, Capabilities: []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1, CapabilityDiscoverySourceResultsV1}, ServerTime: timestamppb.New(s.now())}},
 	}
 	if err := stream.Send(ack); err != nil {
 		return err

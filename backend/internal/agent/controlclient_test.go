@@ -463,6 +463,51 @@ func TestControlClientDoesNotPublishStreamBeforeHelloAck(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestControlClientNegotiatesDiscoverySourceResultsIndependently(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		capability bool
+	}{{name: "old server", capability: false}, {name: "new server", capability: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			stream := newFakeControlStream()
+			capabilities := []string{CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1}
+			if test.capability {
+				capabilities = append(capabilities, CapabilityDiscoverySourceResultsV1)
+			}
+			stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: capabilities}}}
+			client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- client.Run(ctx) }()
+			require.NotNil(t, stream.nextSent(t).GetHello())
+			require.Eventually(t, func() bool { return client.DiscoveryCompatibility() == DiscoveryCompatibilityCompatible }, time.Second, time.Millisecond)
+			require.Equal(t, test.capability, client.DiscoverySourceResultsSupported())
+			cancel()
+			require.NoError(t, <-done)
+		})
+	}
+}
+
+func TestControlClientRenegotiatesDiscoverySourceResultsOnReconnect(t *testing.T) {
+	oldServer := newFakeControlStream()
+	newServer := newFakeControlStream()
+	base := []string{CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1}
+	oldServer.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: base}}}
+	newServer.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion, Capabilities: append(base, CapabilityDiscoverySourceResultsV1)}}}
+	client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{oldServer, newServer}}).Open)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	require.NotNil(t, oldServer.nextSent(t).GetHello())
+	require.Eventually(t, func() bool { return client.DiscoveryCompatibility() == DiscoveryCompatibilityCompatible }, time.Second, time.Millisecond)
+	require.False(t, client.DiscoverySourceResultsSupported())
+	oldServer.receiveErrors <- io.EOF
+	require.NotNil(t, newServer.nextSent(t).GetHello())
+	require.Eventually(t, client.DiscoverySourceResultsSupported, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestControlClientNeverSendsNewOutputToStaleOrHandshakingSession(t *testing.T) {
 	first := newFakeControlStream()
 	second := newFakeControlStream()

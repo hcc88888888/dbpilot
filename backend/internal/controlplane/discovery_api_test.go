@@ -50,8 +50,9 @@ func TestDiscoveryAPIIgnoreRequiresPermissionAndIsIdempotent(t *testing.T) {
 }
 
 type discoveryAPIService struct {
-	candidate   discovery.Candidate
-	ignoreCalls int
+	candidate     discovery.Candidate
+	ignoreCalls   int
+	sourceResults []discovery.SourceResult
 }
 
 func (service *discoveryAPIService) RecordReport(context.Context, discovery.Report) ([]discovery.Candidate, error) {
@@ -77,6 +78,9 @@ func (service *discoveryAPIService) Ignore(_ context.Context, scope platformscop
 	value.IgnoreReason = reason
 	service.candidate = value
 	return value, nil
+}
+func (service *discoveryAPIService) SourceResults(context.Context, platformscope.Scope, string) ([]discovery.SourceResult, error) {
+	return append([]discovery.SourceResult(nil), service.sourceResults...), nil
 }
 
 func discoveryAPICandidate(scope platformscope.Scope) discovery.Candidate {

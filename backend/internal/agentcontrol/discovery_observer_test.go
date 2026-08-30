@@ -2,12 +2,14 @@ package agentcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"testing"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -76,6 +78,41 @@ func TestDiscoveryDispatcherSendsTerminalAckForUncommittedStaleReport(t *testing
 	}
 }
 
+func TestDiscoveryDispatcherAcceptsLegacyNativeShapeWithoutAgingDocker(t *testing.T) {
+	persisted := make(chan *agentv1.DiscoveryReport, 1)
+	acknowledged := make(chan *agentv1.DiscoveryReportAcknowledgement, 1)
+	dispatcher, err := NewDiscoveryDispatcher(capturingDiscoverySink{reports: persisted}, DiscoveryDispatcherConfig{SourceResultsSupported: func(string) bool { return false }, Acknowledge: func(_ string, ack *agentv1.DiscoveryReportAcknowledgement) error { acknowledged <- ack; return nil }})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+	legacy := validDiscoveryReportFixture(1)
+	legacy.SourceResults = nil
+	legacy.Candidates = nil
+	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, dispatcher.SubmitDiscovery("agent-1", legacy))
+	stored := <-persisted
+	require.Len(t, stored.GetSourceResults(), 2)
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, stored.GetSourceResults()[0].GetStatus())
+	require.Equal(t, agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED, stored.GetSourceResults()[1].GetStatus())
+	ack := <-acknowledged
+	expectedDigest := sha256.Sum256(wire)
+	require.Equal(t, expectedDigest[:], ack.GetReportDigest(), "legacy ACK digest must cover the original old wire shape")
+}
+
+func TestDiscoveryDispatcherRequiresNegotiatedSourceResultsAndRejectsLegacyDockerCandidates(t *testing.T) {
+	dispatcher, err := NewDiscoveryDispatcher(capturingDiscoverySink{reports: make(chan *agentv1.DiscoveryReport, 1)}, DiscoveryDispatcherConfig{Acknowledge: func(string, *agentv1.DiscoveryReportAcknowledgement) error { return nil }})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+	missing := validDiscoveryReportFixture(1)
+	missing.SourceResults = nil
+	require.ErrorIs(t, dispatcher.SubmitDiscovery("agent-1", missing), ErrDiscoveryObservationInvalid)
+	legacyDispatcher, err := NewDiscoveryDispatcher(capturingDiscoverySink{reports: make(chan *agentv1.DiscoveryReport, 1)}, DiscoveryDispatcherConfig{SourceResultsSupported: func(string) bool { return false }, Acknowledge: func(string, *agentv1.DiscoveryReportAcknowledgement) error { return nil }})
+	require.NoError(t, err)
+	defer legacyDispatcher.Close()
+	missing.Candidates[0].Source = agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER
+	require.ErrorIs(t, legacyDispatcher.SubmitDiscovery("agent-1", missing), ErrDiscoveryObservationInvalid)
+}
+
 type blockingDiscoverySink struct {
 	entered chan uint64
 	release chan struct{}
@@ -91,6 +128,13 @@ func (sink selectiveDiscoverySink) RecordDiscoveryReport(_ context.Context, agen
 }
 
 type errorDiscoverySink struct{ err error }
+
+type capturingDiscoverySink struct{ reports chan *agentv1.DiscoveryReport }
+
+func (sink capturingDiscoverySink) RecordDiscoveryReport(_ context.Context, _ string, report *agentv1.DiscoveryReport) error {
+	sink.reports <- proto.Clone(report).(*agentv1.DiscoveryReport)
+	return nil
+}
 
 func (sink errorDiscoverySink) RecordDiscoveryReport(context.Context, string, *agentv1.DiscoveryReport) error {
 	return sink.err

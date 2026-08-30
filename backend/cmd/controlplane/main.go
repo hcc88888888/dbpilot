@@ -592,6 +592,9 @@ func NewServer(config Config) (*Server, error) {
 		MaximumPendingAgents: maximumPendingHosts, DeliveryTimeout: observationDeliveryTimeout,
 		OnError:     func(err error) { log.Printf("discovery report persistence failed: %v", err) },
 		Acknowledge: agentRegistry.AcknowledgeDiscovery,
+		SourceResultsSupported: func(agentID string) bool {
+			return agentRegistry.Supports(agentID, agentcontrol.CapabilityDiscoverySourceResultsV1)
+		},
 	})
 	if err != nil {
 		if artifactBlobs != nil {

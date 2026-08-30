@@ -60,6 +60,38 @@ func TestDockerLabelValuesScrubEmbeddedURIAndSensitiveQuery(t *testing.T) {
 	require.Contains(t, value, "[REDACTED]")
 }
 
+func TestDockerRedactionCoversBareAndEmbeddedDSNGrammars(t *testing.T) {
+	tests := []struct {
+		name, value string
+		forbidden   []string
+	}{
+		{name: "go mysql positional", value: "alice:mysql-secret@tcp(db:3306)/app", forbidden: []string{"alice", "mysql-secret"}},
+		{name: "go mysql arbitrary option", value: "--target=alice:mysql-secret@tcp(db:3306)/app?tls=true", forbidden: []string{"alice", "mysql-secret"}},
+		{name: "go mysql escaped", value: "alice%40corp:secret%3Avalue@tcp(db:3306)/app", forbidden: []string{"alice%40corp", "secret%3Avalue"}},
+		{name: "oracle easy connect", value: "scott/oracle-secret@db:1521/service", forbidden: []string{"scott", "oracle-secret"}},
+		{name: "postgres keyword", value: "user=alice password=pg-secret host=db dbname=app", forbidden: []string{"alice", "pg-secret"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			summary := RedactCommand([]string{"app", test.value})
+			for _, forbidden := range test.forbidden {
+				require.NotContains(t, summary, forbidden)
+			}
+			require.Contains(t, summary, "[REDACTED]")
+			labels := FilterLabels(map[string]string{"dbpilot.hint": test.value}, []string{"dbpilot.hint"})
+			for _, forbidden := range test.forbidden {
+				require.NotContains(t, labels["dbpilot.hint"], forbidden)
+			}
+		})
+	}
+}
+
+func TestDockerDSNRedactionAvoidsOrdinaryTextFalsePositives(t *testing.T) {
+	for _, value := range []string{"meeting:owner@example.com", "artifact@tcp.example.com/path", "host=db dbname=app", "12:30 schedule"} {
+		require.Contains(t, RedactCommand([]string{"app", value}), value)
+	}
+}
+
 func TestDockerLabelsAreStrictlyAllowlistedAndCredentialValuesStillRedacted(t *testing.T) {
 	labels := FilterLabels(map[string]string{
 		"dbpilot.discovery.family": "mysql",

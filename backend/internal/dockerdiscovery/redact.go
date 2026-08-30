@@ -11,6 +11,9 @@ import (
 const maximumCommandSummaryBytes = 512
 
 var credentialKey = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|credential|authorization|api[_-]?key)`)
+var goStyleDSN = regexp.MustCompile(`(?i)^[^:@/\s]+:[^@/\s]+@(?:tcp|tcp4|tcp6|unix)\([^)]*\)/?.*$`)
+var oracleStyleDSN = regexp.MustCompile(`(?i)^[^/:@\s]+/[^@\s]+@[a-z0-9_.-]+(?::[0-9]+)?(?:/[a-z0-9_.-]+)?$`)
+var keywordCredential = regexp.MustCompile(`(?i)\b(user(?:name)?|password|passwd|pwd|token)\s*=\s*(?:'[^']*'|"[^"]*"|[^\s;]+)`)
 var sensitiveValueFlags = map[string]struct{}{
 	"-p": {}, "--password": {}, "--passwd": {}, "--pwd": {}, "--token": {}, "--secret": {}, "--credential": {}, "--authorization": {}, "--header": {}, "--database-url": {}, "--database_url": {}, "--dsn": {}, "--uri": {}, "--url": {}, "--connection": {}, "--connection-string": {}, "--connection_string": {},
 }
@@ -52,7 +55,7 @@ func RedactCommand(arguments []string) string {
 		lowerKey := strings.ToLower(key)
 		_, sensitiveFlag := sensitiveValueFlags[lowerKey]
 		sensitiveFlag = sensitiveFlag || key == "-H"
-		if sensitiveFlag || credentialKey.MatchString(strings.TrimLeft(key, "-")) {
+		if sensitiveFlag || (credentialKey.MatchString(strings.TrimLeft(key, "-")) && (hasValue || strings.HasPrefix(key, "-"))) {
 			if hasValue {
 				redacted = append(redacted, key+"=[REDACTED]")
 			} else {
@@ -95,6 +98,15 @@ func FilterLabels(labels map[string]string, allowed []string) map[string]string 
 func redactEmbeddedValue(value string) string {
 	if value == "" {
 		return value
+	}
+	if goStyleDSN.MatchString(value) || oracleStyleDSN.MatchString(value) {
+		if separator := strings.IndexByte(value, '@'); separator >= 0 {
+			return "[REDACTED]" + value[separator:]
+		}
+		return "[REDACTED]"
+	}
+	if keywordCredential.MatchString(value) {
+		value = keywordCredential.ReplaceAllString(value, "$1=[REDACTED]")
 	}
 	parsed, err := url.Parse(value)
 	if err == nil && parsed.Scheme != "" {

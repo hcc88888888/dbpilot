@@ -27,6 +27,7 @@ var (
 	dockerContainerIDPattern           = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	dockerSecretPattern                = regexp.MustCompile(`(?i)(password|passwd|pwd|token|secret|credential|authorization)(=|:)`)
 	dockerDSNPattern                   = regexp.MustCompile(`[^\s:]+:[^\s@]+@(?:tcp\(|[^\s]+)`)
+	dockerOracleDSNPattern             = regexp.MustCompile(`(?i)^[^/:@\s]+/[^@\s]+@[a-z0-9_.-]+(?::[0-9]+)?(?:/[a-z0-9_.-]+)?$`)
 )
 
 const dockerSnapshotTimeout = 8 * time.Second
@@ -227,6 +228,12 @@ func validRedactedCommandSummary(summary string) bool {
 			continue
 		}
 		key, value, equal := strings.Cut(token, "=")
+		if equal && agentCredentialAssignmentKey(strings.ToLower(strings.TrimLeft(key, "-"))) {
+			if value != "[REDACTED]" {
+				return false
+			}
+			continue
+		}
 		if equal && (key == "-H" || agentSensitiveFlag(strings.ToLower(key))) {
 			if value != "[REDACTED]" {
 				return false
@@ -265,12 +272,21 @@ func agentSensitiveFlag(value string) bool {
 	}
 }
 
+func agentCredentialAssignmentKey(value string) bool {
+	switch value {
+	case "user", "username", "password", "passwd", "pwd", "token", "secret", "credential", "authorization", "api-key", "api_key":
+		return true
+	default:
+		return false
+	}
+}
+
 func validRedactedExternalValue(value string) bool {
 	if !utf8.ValidString(value) || strings.ContainsAny(value, "\x00\r\n") {
 		return false
 	}
 	if !strings.Contains(value, "://") {
-		if dockerDSNPattern.MatchString(value) {
+		if dockerDSNPattern.MatchString(value) || dockerOracleDSNPattern.MatchString(value) {
 			return false
 		}
 		return !dockerSecretPattern.MatchString(value) || value == "[REDACTED]"

@@ -139,6 +139,7 @@ func TestDiscoveryPostgresIntegrationIncompleteDockerSourceDoesNotAgeCandidates(
 	require.NoError(t, err)
 	docker.Fingerprint, err = Fingerprint(hostID, docker)
 	require.NoError(t, err)
+	originalDockerFingerprint := docker.Fingerprint
 	attestation, key := signedTestAttestation(t, now, 4, 10*time.Minute)
 	service := NewService(NewPostgresRepository(database))
 	service.RuleKeys = map[string]ed25519.PublicKey{"test": key}
@@ -163,10 +164,17 @@ func TestDiscoveryPostgresIntegrationIncompleteDockerSourceDoesNotAgeCandidates(
 
 	recoveryAt := time.Now().UTC().Truncate(time.Microsecond)
 	native.ObservedAt, docker.ObservedAt = recoveryAt, recoveryAt
+	docker.NormalizedEndpoint = "127.0.0.1:59272"
+	docker.Fingerprint, err = Fingerprint(hostID, docker)
+	require.NoError(t, err)
+	require.Equal(t, originalDockerFingerprint, docker.Fingerprint, "stable identity must survive an ephemeral host-port change")
 	recoveryResults := []SourceResult{{Source: SourceNative, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: recoveryAt}, {Source: SourceDocker, Status: SourceCompleted, Reason: SourceHealthy, ObservedAt: recoveryAt}}
 	page, err = service.RecordReport(ctx, Report{HostID: hostID, AgentID: agentID, ObservationRevision: 3, RuleRevision: 4, Candidates: []CandidateObservation{native, docker}, SourceResults: recoveryResults, ObservedAt: recoveryAt, RuleAttestation: attestation})
 	require.NoError(t, err)
 	require.Len(t, page, 2)
+	for _, candidate := range page {
+		if candidate.Source == SourceDocker { require.Equal(t, "127.0.0.1:59272", candidate.NormalizedEndpoint) }
+	}
 	stored, err := NewPostgresRepository(database).SourceResults(ctx, scope, hostID)
 	require.NoError(t, err)
 	require.Equal(t, recoveryResults, stored)

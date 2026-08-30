@@ -18,15 +18,18 @@ func Fingerprint(hostID string, observation CandidateObservation) ([32]byte, err
 		return [32]byte{}, err
 	}
 	socket := normalizeSocket(observation.UnixSocket)
-	identity := strings.TrimSpace(observation.ServiceName)
+	identity := ""
 	if observation.Source == SourceDocker {
 		identity = strings.TrimSpace(observation.ContainerIdentity)
-		if endpoint != "" {
-			identity = ""
+		if identity != "" {
+			endpoint = ""
+			socket = ""
 		}
-	}
-	if identity == "" {
-		identity = strings.TrimSpace(observation.ProcessIdentity)
+	} else {
+		identity = strings.TrimSpace(observation.ServiceName)
+		if identity == "" {
+			identity = strings.TrimSpace(observation.ProcessIdentity)
+		}
 	}
 	if endpoint == "" && socket == "" && (observation.Source != SourceDocker || identity == "") {
 		return [32]byte{}, ErrInvalid

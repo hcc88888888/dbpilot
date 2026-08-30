@@ -101,6 +101,25 @@ func (service ApplicationService) List(ctx context.Context, scope platformscope.
 	return page, nil
 }
 
+func (service ApplicationService) SourceResults(ctx context.Context, scope platformscope.Scope, hostID string) ([]SourceResult, error) {
+	reader, ok := service.Repository.(interface {
+		SourceResults(context.Context, platformscope.Scope, string) ([]SourceResult, error)
+	})
+	if ctx == nil || !ok || scope.Validate() != nil || !identifierPattern.MatchString(hostID) {
+		return nil, ErrInvalid
+	}
+	results, err := reader.SourceResults(ctx, scope, hostID)
+	if err != nil {
+		return nil, err
+	}
+	for _, result := range results {
+		if result.Validate() != nil {
+			return nil, ErrInvalid
+		}
+	}
+	return results, nil
+}
+
 func (service ApplicationService) Get(ctx context.Context, scope platformscope.Scope, candidateID string) (Candidate, error) {
 	if ctx == nil || service.Repository == nil || scope.Validate() != nil || !identifierPattern.MatchString(candidateID) {
 		return Candidate{}, ErrInvalid

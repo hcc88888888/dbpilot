@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/gen/openapi"
+	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/platformscope"
@@ -57,6 +58,24 @@ func TestManagedHostGetReturnsGeneratedDTOAndETag(t *testing.T) {
 	require.Equal(t, int64(1), body.EnrollmentRevision)
 	require.NotNil(t, body.LastHeartbeatAt)
 	requireOpenAPIResponse(t, request, response)
+}
+
+func TestManagedHostPresentsLiveDiscoverySourceHealth(t *testing.T) {
+	hosts := &recordingHostService{getValue: validManagedHost()}
+	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
+	discoveryService := &discoveryAPIService{sourceResults: []discovery.SourceResult{{Source: discovery.SourceNative, Status: discovery.SourceCompleted, Reason: discovery.SourceHealthy, ObservedAt: now}, {Source: discovery.SourceDocker, Status: discovery.SourceUnavailable, Reason: discovery.SourceHelperUnavailable, ObservedAt: now}}}
+	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/hosts/host-1", nil)
+	response := servePlatformRequest(Services{Hosts: hosts, Discovery: discoveryService}, principalWith(platformTestScope, openapi.PermissionGetHost), request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var body openapi.ManagedHost
+	require.NoError(t, decodeJSONBytes(response.Body.Bytes(), &body))
+	byName := map[string]openapi.HostCapability{}
+	for _, capability := range body.Capabilities {
+		byName[capability.Name] = capability
+	}
+	require.True(t, byName["native_discovery_v1"].Available)
+	require.False(t, byName["docker_discovery_v1"].Available)
+	require.Equal(t, openapi.DockerDiscoveryUnavailable, *byName["docker_discovery_v1"].Reason)
 }
 
 func TestManagedHostDecommissionUsesETagIdempotencyAndAuditOnce(t *testing.T) {

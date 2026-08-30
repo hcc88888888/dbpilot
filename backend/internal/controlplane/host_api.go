@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"dbpilot.local/platform/gen/openapi"
+	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/platformscope"
@@ -39,6 +40,10 @@ func (api platformAPI) ListHosts(ctx context.Context, request openapi.ListHostsR
 	for index, value := range page.Items {
 		if value.Scope != scope {
 			return nil, errors.New("host service returned an out-of-scope entity")
+		}
+		value, err = hostWithDiscoverySourceHealth(ctx, api.services, value)
+		if err != nil {
+			return nil, err
 		}
 		items[index], err = openAPIManagedHost(value)
 		if err != nil {
@@ -78,12 +83,59 @@ func (api platformAPI) GetHost(ctx context.Context, request openapi.GetHostReque
 	if host.Scope != scope || host.ID != request.HostId {
 		return nil, errors.New("host service returned an out-of-scope entity")
 	}
+	host, err = hostWithDiscoverySourceHealth(ctx, api.services, host)
+	if err != nil {
+		return nil, err
+	}
 	body, err := openAPIManagedHost(host)
 	if err != nil {
 		return nil, err
 	}
 	etag := entityTag(int64(host.Version))
 	return openapi.GetHost200JSONResponse{Body: body, Headers: openapi.GetHost200ResponseHeaders{ETag: etag}}, nil
+}
+
+func hostWithDiscoverySourceHealth(ctx context.Context, services Services, host hostinventory.Host) (hostinventory.Host, error) {
+	reader, ok := services.Discovery.(interface {
+		SourceResults(context.Context, platformscope.Scope, string) ([]discovery.SourceResult, error)
+	})
+	if !ok {
+		return host, nil
+	}
+	results, err := reader.SourceResults(ctx, host.Scope, host.ID)
+	if err != nil {
+		return hostinventory.Host{}, err
+	}
+	if len(results) == 0 {
+		return host, nil
+	}
+	filtered := make([]hostinventory.Capability, 0, len(host.Capabilities)+2)
+	for _, capability := range host.Capabilities {
+		if capability.Name != "native_discovery_v1" && capability.Name != "docker_discovery_v1" {
+			filtered = append(filtered, capability)
+		}
+	}
+	for _, result := range results {
+		if result.Status == discovery.SourceNotRequested {
+			continue
+		}
+		capability := hostinventory.Capability{Name: string(result.Source) + "_discovery_v1", Available: result.Status == discovery.SourceCompleted}
+		if !capability.Available {
+			if result.Reason == discovery.SourcePermissionDenied {
+				capability.Reason = "permission_denied"
+			} else if result.Source == discovery.SourceDocker {
+				capability.Reason = "docker_discovery_unavailable"
+			} else {
+				capability.Reason = "agent_unsupported"
+			}
+		}
+		filtered = append(filtered, capability)
+	}
+	host.Capabilities = filtered
+	if host.Validate() != nil {
+		return hostinventory.Host{}, hostinventory.ErrInvalid
+	}
+	return host, nil
 }
 
 func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.DecommissionHostRequestObject) (openapi.DecommissionHostResponseObject, error) {

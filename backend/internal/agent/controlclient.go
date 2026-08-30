@@ -25,6 +25,7 @@ import (
 
 const ControlProtocolVersion = "1"
 const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
+const CapabilityDiscoverySourceResultsV1 = "discovery_source_results_v1"
 const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
@@ -210,6 +211,7 @@ type ControlClient struct {
 	discoveryMu            sync.Mutex
 	discoveryWaiters       map[uint64]*discoveryAckWaiter
 	discoveryCompatibility atomic.Uint32
+	discoverySourceResults atomic.Bool
 }
 
 type discoveryAckWaiter struct {
@@ -400,12 +402,14 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
+	c.discoverySourceResults.Store(hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoverySourceResultsV1))
 	if hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1) {
 		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
 	} else {
 		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityIncompatible))
 	}
 	defer c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityUnknown))
+	defer c.discoverySourceResults.Store(false)
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
@@ -943,6 +947,10 @@ func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.Dis
 
 func (c *ControlClient) DiscoveryCompatibility() DiscoveryCompatibility {
 	return DiscoveryCompatibility(c.discoveryCompatibility.Load())
+}
+
+func (c *ControlClient) DiscoverySourceResultsSupported() bool {
+	return c.discoverySourceResults.Load()
 }
 
 func hasCapabilities(values []string, required ...string) bool {

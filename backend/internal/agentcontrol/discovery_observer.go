@@ -27,11 +27,12 @@ type DiscoveryObserver interface {
 type DiscoveryAcknowledger func(string, *agentv1.DiscoveryReportAcknowledgement) error
 
 type DiscoveryDispatcherConfig struct {
-	MaximumPendingAgents int
-	DeliveryTimeout      time.Duration
-	RetryBackoff         time.Duration
-	OnError              func(error)
-	Acknowledge          DiscoveryAcknowledger
+	MaximumPendingAgents   int
+	DeliveryTimeout        time.Duration
+	RetryBackoff           time.Duration
+	OnError                func(error)
+	Acknowledge            DiscoveryAcknowledger
+	SourceResultsSupported func(string) bool
 }
 type discoveryLane struct {
 	agentID        string
@@ -77,7 +78,11 @@ func NewDiscoveryDispatcher(sink DiscoveryReportSink, config DiscoveryDispatcher
 	return &DiscoveryDispatcher{sink: sink, config: config, lanes: make(map[string]*discoveryLane), last: make(map[string]discoveryRevisionDigest), stop: make(chan struct{})}, nil
 }
 func (dispatcher *DiscoveryDispatcher) SubmitDiscovery(agentID string, report *agentv1.DiscoveryReport) error {
-	if !validDiscoveryReport(agentID, report) {
+	requiresSourceResults := true
+	if dispatcher.config.SourceResultsSupported != nil {
+		requiresSourceResults = dispatcher.config.SourceResultsSupported(agentID)
+	}
+	if !validDiscoveryReport(agentID, report, requiresSourceResults) {
 		return ErrDiscoveryObservationInvalid
 	}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
@@ -86,6 +91,9 @@ func (dispatcher *DiscoveryDispatcher) SubmitDiscovery(agentID string, report *a
 	}
 	digest := sha256.Sum256(encoded)
 	clone := proto.Clone(report).(*agentv1.DiscoveryReport)
+	if !requiresSourceResults {
+		clone = normalizeLegacyDiscoveryReport(clone)
+	}
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
 	if dispatcher.closed {
@@ -288,9 +296,20 @@ func (lane *discoveryLane) retire() bool {
 	delete(lane.dispatcher.lanes, lane.agentID)
 	return true
 }
-func validDiscoveryReport(agentID string, report *agentv1.DiscoveryReport) bool {
-	if !hostObservationAgentID.MatchString(agentID) || report == nil || report.GetAgentId() != agentID || !hostObservationAgentID.MatchString(report.GetHostId()) || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || report.GetObservedAt() == nil || !report.GetObservedAt().IsValid() || len(report.GetCandidates()) > 1024 || len(report.GetSourceResults()) != 2 || len(report.GetRuleSetDigest()) != sha256.Size || report.GetDisappearanceGraceSeconds() == 0 || report.GetRuleIssuedAt() == nil || !report.GetRuleIssuedAt().IsValid() || report.GetRuleExpiresAt() == nil || !report.GetRuleExpiresAt().IsValid() || len(report.GetRuleAttestationSignature()) != 64 || report.GetRuleAttestationVersion() == 0 || report.GetRuleAttestationAlgorithm() == "" || report.GetRuleAttestationKeyId() == "" {
+func validDiscoveryReport(agentID string, report *agentv1.DiscoveryReport, requiresSourceResults bool) bool {
+	if !hostObservationAgentID.MatchString(agentID) || report == nil || report.GetAgentId() != agentID || !hostObservationAgentID.MatchString(report.GetHostId()) || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || report.GetObservedAt() == nil || !report.GetObservedAt().IsValid() || len(report.GetCandidates()) > 1024 || len(report.GetRuleSetDigest()) != sha256.Size || report.GetDisappearanceGraceSeconds() == 0 || report.GetRuleIssuedAt() == nil || !report.GetRuleIssuedAt().IsValid() || report.GetRuleExpiresAt() == nil || !report.GetRuleExpiresAt().IsValid() || len(report.GetRuleAttestationSignature()) != 64 || report.GetRuleAttestationVersion() == 0 || report.GetRuleAttestationAlgorithm() == "" || report.GetRuleAttestationKeyId() == "" {
 		return false
+	}
+	if requiresSourceResults && len(report.GetSourceResults()) != 2 || !requiresSourceResults && len(report.GetSourceResults()) != 0 {
+		return false
+	}
+	if !requiresSourceResults {
+		for _, candidate := range report.GetCandidates() {
+			if candidate.GetSource() != agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE {
+				return false
+			}
+		}
+		return validDiscoveryCandidates(report.GetCandidates(), map[agentv1.DiscoverySource]bool{agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE: true})
 	}
 	completed := map[agentv1.DiscoverySource]bool{}
 	for _, result := range report.GetSourceResults() {
@@ -308,12 +327,24 @@ func validDiscoveryReport(agentID string, report *agentv1.DiscoveryReport) bool 
 	if _, ok := completed[agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER]; !ok {
 		return false
 	}
-	for _, candidate := range report.GetCandidates() {
+	return validDiscoveryCandidates(report.GetCandidates(), completed)
+}
+
+func validDiscoveryCandidates(candidates []*agentv1.DiscoveryCandidateObservation, completed map[agentv1.DiscoverySource]bool) bool {
+	for _, candidate := range candidates {
 		if candidate == nil || candidate.GetSource() == agentv1.DiscoverySource_DISCOVERY_SOURCE_UNSPECIFIED || !completed[candidate.GetSource()] || candidate.GetDatabaseFamily() == "" || candidate.GetDatabaseVariant() == "" || len(candidate.GetFingerprint()) != 32 || candidate.GetObservedAt() == nil || !candidate.GetObservedAt().IsValid() || len(candidate.GetEvidence()) > 32 {
 			return false
 		}
 	}
 	return true
+}
+
+func normalizeLegacyDiscoveryReport(report *agentv1.DiscoveryReport) *agentv1.DiscoveryReport {
+	report.SourceResults = []*agentv1.DiscoverySourceResult{
+		{Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_NATIVE, Status: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_COMPLETED, Reason: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_HEALTHY, ObservedAt: report.GetObservedAt()},
+		{Source: agentv1.DiscoverySource_DISCOVERY_SOURCE_DOCKER, Status: agentv1.DiscoverySourceResultStatus_DISCOVERY_SOURCE_RESULT_STATUS_NOT_REQUESTED, Reason: agentv1.DiscoverySourceReason_DISCOVERY_SOURCE_REASON_NOT_REQUESTED, ObservedAt: report.GetObservedAt()},
+	}
+	return report
 }
 
 func validSourceOutcome(statusValue agentv1.DiscoverySourceResultStatus, reason agentv1.DiscoverySourceReason) bool {
