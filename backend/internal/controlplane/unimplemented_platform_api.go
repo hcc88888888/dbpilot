@@ -19,10 +19,6 @@ func (unimplementedPlatformAPI) ApproveMetricTemplateRevision(context.Context, o
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) ApprovePluginVersion(context.Context, openapi.ApprovePluginVersionRequestObject) (openapi.ApprovePluginVersionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) CreateMetricTemplate(context.Context, openapi.CreateMetricTemplateRequestObject) (openapi.CreateMetricTemplateResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
@@ -67,19 +63,7 @@ func (unimplementedPlatformAPI) ListPluginAssignments(context.Context, openapi.L
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) ListPluginDefinitions(context.Context, openapi.ListPluginDefinitionsRequestObject) (openapi.ListPluginDefinitionsResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) ListPluginVersions(context.Context, openapi.ListPluginVersionsRequestObject) (openapi.ListPluginVersionsResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) PublishMetricTemplateRevision(context.Context, openapi.PublishMetricTemplateRevisionRequestObject) (openapi.PublishMetricTemplateRevisionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) PublishPluginVersion(context.Context, openapi.PublishPluginVersionRequestObject) (openapi.PublishPluginVersionResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
@@ -92,10 +76,6 @@ func (unimplementedPlatformAPI) RediscoverHost(context.Context, openapi.Rediscov
 }
 
 func (unimplementedPlatformAPI) RetireDatabaseInstance(context.Context, openapi.RetireDatabaseInstanceRequestObject) (openapi.RetireDatabaseInstanceResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) RevokePluginVersion(context.Context, openapi.RevokePluginVersionRequestObject) (openapi.RevokePluginVersionResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
@@ -112,10 +92,6 @@ func (unimplementedPlatformAPI) UpdateDatabaseInstance(context.Context, openapi.
 }
 
 func (unimplementedPlatformAPI) UpdatePluginAssignment(context.Context, openapi.UpdatePluginAssignmentRequestObject) (openapi.UpdatePluginAssignmentResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) UploadPluginVersionPackage(context.Context, openapi.UploadPluginVersionPackageRequestObject) (openapi.UploadPluginVersionPackageResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 

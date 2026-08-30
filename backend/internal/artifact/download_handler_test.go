@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -20,6 +21,20 @@ import (
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLocalBlobStorePutReaderVerifiesRetrySourceWhenBlobAlreadyExists(t *testing.T) {
+	// Break caught: content-addressed existence must not turn PutReader into a
+	// trust-caller shortcut; every supplied stream is independently verified.
+	store := NewLocalBlobStore(t.TempDir())
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	payload := []byte("verified plugin bytes")
+	checksum := testChecksum(payload)
+	_, err := store.PutReader(context.Background(), checksum, int64(len(payload)), bytes.NewReader(payload))
+	require.NoError(t, err)
+	tampered := []byte("tampered plugin bytes")
+	_, err = store.PutReader(context.Background(), checksum, int64(len(tampered)), bytes.NewReader(tampered))
+	require.ErrorIs(t, err, ErrIntegrityMismatch)
+}
 
 func TestDownloadHandlerVerifiesClaimsAndStreamsExactLocalArtifact(t *testing.T) {
 	root := t.TempDir()

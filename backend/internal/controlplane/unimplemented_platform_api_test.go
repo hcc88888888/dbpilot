@@ -17,7 +17,6 @@ import (
 var task1UnimplementedOperationNames = []string{
 	"AcceptDiscoveryCandidate",
 	"ApproveMetricTemplateRevision",
-	"ApprovePluginVersion",
 	"CreateMetricTemplate",
 	"CreateMetricTemplateRevision",
 	"GetDatabaseInstance",
@@ -29,19 +28,14 @@ var task1UnimplementedOperationNames = []string{
 	"ListMetricTemplateRevisions",
 	"ListMetricTemplates",
 	"ListPluginAssignments",
-	"ListPluginDefinitions",
-	"ListPluginVersions",
 	"PublishMetricTemplateRevision",
-	"PublishPluginVersion",
 	"ReconcilePluginAssignment",
 	"RediscoverHost",
 	"RetireDatabaseInstance",
-	"RevokePluginVersion",
 	"TestDatabaseInstanceConnection",
 	"TrialMetricTemplateRevision",
 	"UpdateDatabaseInstance",
 	"UpdatePluginAssignment",
-	"UploadPluginVersionPackage",
 	"ValidateMetricTemplateRevision",
 }
 

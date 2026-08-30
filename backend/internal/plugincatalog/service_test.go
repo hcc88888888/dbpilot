@@ -1,0 +1,182 @@
+package plugincatalog
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"testing"
+	"time"
+
+	"dbpilot.local/platform/internal/artifact"
+	"dbpilot.local/platform/internal/platformscope"
+	"github.com/stretchr/testify/require"
+)
+
+func TestServiceUploadPersistsVerifiedBytesAsImmutableArtifactThenCatalogVersion(t *testing.T) {
+	// Break caught: trusting upload metadata or inserting catalog state before
+	// immutable bytes exist can publish an unverifiable/missing plugin version.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	verifier := newTestPackageVerifier(t, public, testPackageLimits())
+	artifacts := &recordingArtifactWriter{}
+	repository := &recordingCatalogRepository{}
+	now := time.Date(2026, 8, 30, 4, 0, 0, 0, time.UTC)
+	service, err := NewService(repository, artifacts, verifier, func() time.Time { return now })
+	require.NoError(t, err)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+
+	version, err := service.Upload(context.Background(), scope, UploadMetadata{Actor: "publisher-user", ContentLength: int64(len(fixture.Archive))}, bytes.NewReader(fixture.Archive))
+	require.NoError(t, err)
+	require.Equal(t, StatusVerified, version.Status)
+	require.Equal(t, uint64(1), version.Revision)
+	require.Equal(t, scope, version.Scope)
+	require.Equal(t, "mysql", version.PluginID)
+	require.Equal(t, now, version.CreatedAt)
+	require.Len(t, artifacts.values, 1)
+	require.Len(t, repository.created, 1)
+	storedArtifact := artifacts.values[0]
+	wantDigest := sha256.Sum256(fixture.Archive)
+	require.Equal(t, "sha256:"+hex.EncodeToString(wantDigest[:]), storedArtifact.Checksum)
+	require.Equal(t, int64(len(fixture.Archive)), storedArtifact.SizeBytes)
+	require.Equal(t, "plugin-package", storedArtifact.Kind)
+	require.Equal(t, "application/gzip", storedArtifact.ContentType)
+	require.Equal(t, "plugin-version", storedArtifact.SourceResource.ResourceType)
+	require.Equal(t, version.ID, storedArtifact.SourceResource.ResourceID)
+	require.Equal(t, "publisher-user", storedArtifact.CreatedBy)
+	require.Equal(t, fixture.Archive, artifacts.contents[0])
+	require.Equal(t, storedArtifact.ID, repository.created[0].ArtifactID)
+	require.Equal(t, []string{"artifact", "catalog"}, append(artifacts.order, repository.order...))
+}
+
+func TestServiceUploadRejectsBeforeArtifactSideEffectAndDoesNotPersistSignatures(t *testing.T) {
+	// Break caught: signature failure must stop before Artifact publication, and
+	// the accepted domain model must not retain detached signature bytes.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	for index := range fixture.Entries {
+		if fixture.Entries[index].Name == signaturePath {
+			fixture.Entries[index].Body[0] ^= 0xff
+		}
+	}
+	fixture.Archive = writeTarGzip(t, fixture.Entries)
+	artifacts := &recordingArtifactWriter{}
+	repository := &recordingCatalogRepository{}
+	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), time.Now)
+	require.NoError(t, err)
+
+	_, err = service.Upload(context.Background(), platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, UploadMetadata{Actor: "publisher-user", ContentLength: int64(len(fixture.Archive))}, bytes.NewReader(fixture.Archive))
+	require.ErrorIs(t, err, ErrSignatureRejected)
+	require.ErrorIs(t, err, ErrBeforeSideEffect)
+	require.Empty(t, artifacts.values)
+	require.Empty(t, repository.created)
+}
+
+func TestServiceLifecycleUsesScopedRevisionCAS(t *testing.T) {
+	// Break caught: skipping status/from-state or revision checks permits stale
+	// approvals and revoked versions to become available again.
+	repository := &recordingCatalogRepository{transitionValue: validServiceVersion()}
+	service, err := NewService(repository, &recordingArtifactWriter{}, &recordingPackageVerifier{}, time.Now)
+	require.NoError(t, err)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+
+	_, err = service.Approve(context.Background(), scope, "plugin-version-1", 7)
+	require.NoError(t, err)
+	_, err = service.Publish(context.Background(), scope, "plugin-version-1", 8)
+	require.NoError(t, err)
+	_, err = service.Revoke(context.Background(), scope, "plugin-version-1", 9, "publisher_compromise")
+	require.NoError(t, err)
+
+	require.Equal(t, []TransitionRequest{
+		{Scope: scope, VersionID: "plugin-version-1", ExpectedRevision: 7, AllowedFrom: []Status{StatusVerified}, To: StatusApproved},
+		{Scope: scope, VersionID: "plugin-version-1", ExpectedRevision: 8, AllowedFrom: []Status{StatusApproved}, To: StatusAvailable},
+		{Scope: scope, VersionID: "plugin-version-1", ExpectedRevision: 9, AllowedFrom: []Status{StatusVerified, StatusApproved, StatusAvailable, StatusDeprecated}, To: StatusRevoked, Reason: "publisher_compromise"},
+	}, repository.transitions)
+}
+
+type recordingArtifactWriter struct {
+	values   []artifact.Artifact
+	contents [][]byte
+	order    []string
+	err      error
+}
+
+func (writer *recordingArtifactWriter) PutReader(_ context.Context, value artifact.Artifact, source io.Reader) (artifact.Artifact, error) {
+	contents, err := io.ReadAll(source)
+	if err != nil {
+		return artifact.Artifact{}, err
+	}
+	writer.values = append(writer.values, value)
+	writer.contents = append(writer.contents, contents)
+	writer.order = append(writer.order, "artifact")
+	if writer.err != nil {
+		return artifact.Artifact{}, writer.err
+	}
+	return value, nil
+}
+
+type recordingCatalogRepository struct {
+	created         []PluginVersion
+	order           []string
+	createErr       error
+	transitionValue PluginVersion
+	transitionErr   error
+	transitions     []TransitionRequest
+	page            VersionPage
+	definitions     DefinitionPage
+}
+
+func (repository *recordingCatalogRepository) Create(_ context.Context, _ PluginDefinition, version PluginVersion) (PluginVersion, error) {
+	repository.created = append(repository.created, version)
+	repository.order = append(repository.order, "catalog")
+	if repository.createErr != nil {
+		return PluginVersion{}, repository.createErr
+	}
+	return version, nil
+}
+
+func (repository *recordingCatalogRepository) Transition(_ context.Context, request TransitionRequest) (PluginVersion, error) {
+	repository.transitions = append(repository.transitions, request)
+	if repository.transitionErr != nil {
+		return PluginVersion{}, repository.transitionErr
+	}
+	value := repository.transitionValue
+	value.Scope, value.ID, value.Status, value.Revision = request.Scope, request.VersionID, request.To, request.ExpectedRevision+1
+	return value, nil
+}
+
+func (repository *recordingCatalogRepository) ListVersions(context.Context, platformscope.Scope, VersionFilter) (VersionPage, error) {
+	return repository.page, nil
+}
+
+func (repository *recordingCatalogRepository) ListDefinitions(context.Context, platformscope.Scope, DefinitionFilter) (DefinitionPage, error) {
+	return repository.definitions, nil
+}
+
+type recordingPackageVerifier struct {
+	value VerifiedPackage
+	err   error
+}
+
+func (verifier *recordingPackageVerifier) Verify(context.Context, io.Reader, int64) (VerifiedPackage, error) {
+	return verifier.value, verifier.err
+}
+
+func validServiceVersion() PluginVersion {
+	return PluginVersion{
+		ID: "plugin-version-1", Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"},
+		PluginID: "mysql", Version: "1.0.0", Status: StatusVerified,
+		ArtifactID: "plugin-package-a", PackageSHA256: stringsOfZeros(64), ManifestDigest: stringsOfZeros(64),
+		PublisherID: "publisher-1", SigningKeyID: "key-1", ProtocolVersion: "v1",
+		MinimumAgentProtocolVersion: "v1", MaximumAgentProtocolVersion: "v1",
+		SupportedVariants: []string{"mysql"}, DatabaseVersionRange: ">=8 <9", Capabilities: []string{"metrics.collect"},
+		MetricTemplateSchemaVersion: 1,
+		Platforms:                   []Platform{{OperatingSystem: "linux", Architecture: "amd64", SHA256: stringsOfZeros(64), SizeBytes: 24}},
+		Revision:                    7, CreatedAt: time.Date(2026, 8, 30, 3, 0, 0, 0, time.UTC),
+	}
+}

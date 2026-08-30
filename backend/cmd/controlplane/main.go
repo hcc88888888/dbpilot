@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -40,6 +42,7 @@ import (
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/plugincatalog"
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -98,6 +101,12 @@ type ArtifactSettings struct {
 	SigningKeyRef string `yaml:"signing_key_ref"`
 }
 
+type PluginPublisherSettings struct {
+	PublisherID string `yaml:"publisher_id"`
+	KeyID       string `yaml:"key_id"`
+	PublicKey   string `yaml:"public_key"`
+}
+
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
 }
@@ -130,6 +139,7 @@ type Config struct {
 	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
 	Command          CommandSettings            `yaml:"command"`
 	Artifact         ArtifactSettings           `yaml:"artifact"`
+	PluginPublishers []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
 
 	HTTPServerTLS           *tls.Config                                `yaml:"-"`
 	GRPCServerTLS           *tls.Config                                `yaml:"-"`
@@ -148,6 +158,7 @@ type Config struct {
 	ArtifactDownloadHandler http.Handler                               `yaml:"-"`
 	ArtifactSecretResolver  platformdatabase.SecretResolver            `yaml:"-"`
 	CommandTargetAuthorizer commandvalidation.TargetAuthorizer         `yaml:"-"`
+	PluginCatalog           plugincatalog.CatalogService               `yaml:"-"`
 }
 
 type Server struct {
@@ -255,11 +266,12 @@ type defaultMigrationSteps struct {
 	job        func(context.Context) error
 	platform   func(context.Context) error
 	host       func(context.Context) error
+	plugin     func(context.Context) error
 	inspection func(context.Context) error
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	return composeMigrations(steps.alert, steps.job, steps.platform, steps.host, steps.inspection)
+	return composeMigrations(steps.alert, steps.job, steps.platform, steps.host, steps.plugin, steps.inspection)
 }
 
 func NewServer(config Config) (*Server, error) {
@@ -353,6 +365,7 @@ func NewServer(config Config) (*Server, error) {
 			job:      func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
 			platform: func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
 			host:     func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
+			plugin:   func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) },
 			inspection: func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
@@ -404,6 +417,35 @@ func NewServer(config Config) (*Server, error) {
 		artifactStore = artifact.NewPostgresStore(database, artifactBlobs)
 	}
 	artifactService := artifact.NewService(artifactStore, artifactSigner)
+	pluginCatalogService := config.PluginCatalog
+	if pluginCatalogService == nil && artifactBlobs != nil {
+		publisherKeys, keyErr := publisherKeysForConfig(config)
+		if keyErr != nil {
+			_ = artifactBlobs.Close()
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("configure plugin publishers: %w", keyErr)
+		}
+		packageVerifier, verifierErr := plugincatalog.NewStreamingPackageVerifier(plugincatalog.PackageVerifierConfig{
+			Publishers: publisherKeys, TemporaryDirectory: config.Artifact.StorageRoot, Limits: plugincatalog.DefaultPackageLimits(),
+		})
+		if verifierErr != nil {
+			_ = artifactBlobs.Close()
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("configure plugin package verification: %w", verifierErr)
+		}
+		pluginCatalogService, err = plugincatalog.NewService(plugincatalog.NewPostgresRepository(database), artifactStore, packageVerifier, time.Now)
+		if err != nil {
+			_ = artifactBlobs.Close()
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("configure plugin catalog: %w", err)
+		}
+	}
 	if artifactContent == nil {
 		blobStore := artifactBlobs
 		artifactContent, err = artifact.NewDownloadHandler(artifactService, artifactSigner, blobStore)
@@ -453,6 +495,7 @@ func NewServer(config Config) (*Server, error) {
 			return foundationCapabilityInput(scope, config.Agents, agentRegistry)
 		},
 		Idempotency: idempotencyService, Inspection: inspectionApplication, Hosts: hostInventoryService,
+		PluginCatalog: pluginCatalogService,
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
@@ -496,6 +539,18 @@ func NewServer(config Config) (*Server, error) {
 			return err
 		},
 	}, nil
+}
+
+func publisherKeysForConfig(config Config) (*plugincatalog.StaticPublisherKeyStore, error) {
+	keys := make([]plugincatalog.PublisherKey, len(config.PluginPublishers))
+	for index, configured := range config.PluginPublishers {
+		decoded, err := base64.StdEncoding.DecodeString(configured.PublicKey)
+		if err != nil || base64.StdEncoding.EncodeToString(decoded) != configured.PublicKey || len(decoded) != ed25519.PublicKeySize {
+			return nil, plugincatalog.ErrInvalid
+		}
+		keys[index] = plugincatalog.PublisherKey{PublisherID: configured.PublisherID, KeyID: configured.KeyID, PublicKey: ed25519.PublicKey(decoded)}
+	}
+	return plugincatalog.NewStaticPublisherKeyStore(keys)
 }
 
 func validateConfig(config Config) error {
@@ -591,6 +646,9 @@ func validateConfig(config Config) error {
 	}
 	if len(configuredScopes(config)) == 0 {
 		return errors.New("at least one evaluation scope is required")
+	}
+	if _, err := publisherKeysForConfig(config); err != nil {
+		return errors.New("plugin_publishers contains an invalid Ed25519 public key")
 	}
 	return nil
 }

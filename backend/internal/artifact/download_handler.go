@@ -292,16 +292,23 @@ func (store *LocalBlobStore) Open(ctx context.Context, value Artifact) (ReadSeek
 // os.Root. The checksum is verified before any write and an existing blob is
 // accepted only when its bytes are identical.
 func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents []byte) (string, error) {
-	if store == nil || ctx == nil || ctx.Err() != nil || len(contents) > 64<<20 || !strings.HasPrefix(checksum, "sha256:") {
+	if len(contents) > 64<<20 {
+		return "", ErrInvalid
+	}
+	return store.PutReader(ctx, checksum, int64(len(contents)), bytes.NewReader(contents))
+}
+
+// PutReader durably publishes a bounded checksum-addressed stream without
+// retaining the complete Artifact in memory. The create-exclusive temporary
+// file is hashed before publication, and collisions are accepted only when the
+// existing regular file has the exact expected size and digest.
+func (store *LocalBlobStore) PutReader(ctx context.Context, checksum string, sizeBytes int64, source io.Reader) (string, error) {
+	if store == nil || ctx == nil || ctx.Err() != nil || source == nil || sizeBytes < 0 || sizeBytes > 256<<20 || !strings.HasPrefix(checksum, "sha256:") {
 		return "", ErrInvalid
 	}
 	expected, err := hex.DecodeString(strings.TrimPrefix(checksum, "sha256:"))
 	if err != nil || len(expected) != sha256.Size {
 		return "", ErrInvalid
-	}
-	digest := sha256.Sum256(contents)
-	if !equalBytes(digest[:], expected) {
-		return "", ErrIntegrityMismatch
 	}
 	if err := store.Ready(); err != nil {
 		return "", err
@@ -314,11 +321,14 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 	if store.closed || store.root == nil {
 		return "", ErrInvalid
 	}
-	if matches, exists, err := rootBlobMatches(store.root, reference, contents); err != nil {
+	if matches, exists, err := rootBlobMatchesDigest(store.root, reference, expected, sizeBytes); err != nil {
 		return "", safeBlobError("inspect", err)
 	} else if exists {
 		if !matches {
 			return "", ErrIntegrityMismatch
+		}
+		if err := verifyArtifactReader(ctx, source, sizeBytes, expected); err != nil {
+			return "", err
 		}
 		if err := store.syncRetainedDirectory(directory); err != nil {
 			return "", safeBlobError("sync directory", err)
@@ -344,20 +354,15 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 		_ = file.Close()
 		_ = store.root.Remove(temporary)
 	}
-	for offset := 0; offset < len(contents); {
-		if err := ctx.Err(); err != nil {
-			cleanup()
-			return "", err
-		}
-		written, writeErr := file.Write(contents[offset:])
-		if writeErr == nil && written <= 0 {
-			writeErr = io.ErrShortWrite
-		}
-		if writeErr != nil {
-			cleanup()
-			return "", safeBlobError("write temporary", writeErr)
-		}
-		offset += written
+	hash := sha256.New()
+	written, writeErr := copyArtifactReader(ctx, io.MultiWriter(file, hash), io.LimitReader(source, sizeBytes+1))
+	if writeErr != nil {
+		cleanup()
+		return "", safeBlobError("write temporary", writeErr)
+	}
+	if written != sizeBytes || !equalBytes(hash.Sum(nil), expected) {
+		cleanup()
+		return "", ErrIntegrityMismatch
 	}
 	if err := file.Sync(); err != nil {
 		cleanup()
@@ -367,7 +372,7 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 		_ = store.root.Remove(temporary)
 		return "", safeBlobError("close temporary", err)
 	}
-	if matches, exists, err := rootBlobMatches(store.root, reference, contents); err != nil {
+	if matches, exists, err := rootBlobMatchesDigest(store.root, reference, expected, sizeBytes); err != nil {
 		_ = store.root.Remove(temporary)
 		return "", safeBlobError("inspect", err)
 	} else if exists {
@@ -382,7 +387,7 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 	}
 	if err := store.root.Link(temporary, reference); err != nil {
 		_ = store.root.Remove(temporary)
-		matches, exists, inspectErr := rootBlobMatches(store.root, reference, contents)
+		matches, exists, inspectErr := rootBlobMatchesDigest(store.root, reference, expected, sizeBytes)
 		if inspectErr != nil {
 			return "", safeBlobError("inspect collision", inspectErr)
 		}
@@ -406,6 +411,72 @@ func (store *LocalBlobStore) Put(ctx context.Context, checksum string, contents 
 	return filepath.ToSlash(reference), nil
 }
 
+func verifyArtifactReader(ctx context.Context, source io.Reader, sizeBytes int64, expected []byte) error {
+	hash := sha256.New()
+	written, err := copyArtifactReader(ctx, hash, io.LimitReader(source, sizeBytes+1))
+	if err != nil {
+		return safeBlobError("verify source", err)
+	}
+	if written != sizeBytes || !equalBytes(hash.Sum(nil), expected) {
+		return ErrIntegrityMismatch
+	}
+	return nil
+}
+
+func copyArtifactReader(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		read, readErr := source.Read(buffer)
+		if read > 0 {
+			written, writeErr := destination.Write(buffer[:read])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != read {
+				return total, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+		if read == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+}
+
+func rootBlobMatchesDigest(root *os.Root, reference string, expected []byte, sizeBytes int64) (bool, bool, error) {
+	file, err := root.Open(reference)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, true, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != sizeBytes {
+		return false, true, nil
+	}
+	hash := sha256.New()
+	written, err := io.CopyBuffer(hash, file, make([]byte, 32<<10))
+	if err != nil {
+		return false, true, err
+	}
+	return written == sizeBytes && equalBytes(hash.Sum(nil), expected), true, nil
+}
+
 func (store *LocalBlobStore) syncRetainedDirectory(name string) error {
 	return store.syncRetainedDirectoryAt(store.root, name)
 }
@@ -427,29 +498,6 @@ func (store *LocalBlobStore) syncRetainedDirectoryAt(root *os.Root, name string)
 		return syncErr
 	}
 	return closeErr
-}
-
-func rootBlobMatches(root *os.Root, reference string, contents []byte) (bool, bool, error) {
-	file, err := root.Open(reference)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, false, nil
-	}
-	if err != nil {
-		return false, false, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return false, true, err
-	}
-	if !info.Mode().IsRegular() || info.Size() != int64(len(contents)) {
-		return false, true, nil
-	}
-	stored := make([]byte, len(contents))
-	if _, err := io.ReadFull(file, stored); err != nil {
-		return false, true, err
-	}
-	return bytes.Equal(stored, contents), true, nil
 }
 
 var _ http.Handler = (*DownloadHandler)(nil)

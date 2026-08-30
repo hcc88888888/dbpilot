@@ -410,6 +410,12 @@ func platformIdempotencyFingerprint(ctx context.Context, operationID, resourceID
 		input.WriteByte(':')
 		input.WriteString(value)
 	}
+	if metadata.BodyDigest != "" {
+		input.WriteString(strconv.Itoa(len(metadata.BodyDigest)))
+		input.WriteByte(':')
+		input.WriteString(metadata.BodyDigest)
+		input.WriteString(strconv.FormatInt(metadata.ContentLength, 10))
+	}
 	digest := sha256.Sum256(input.Bytes())
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
@@ -442,7 +448,23 @@ type httpActionAuditPayload struct {
 }
 
 func httpActionAuditReconciliation(ctx context.Context, service AuditService, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string) ([]byte, idempotency.ReconcileFunc, error) {
+	return httpActionAuditReconciliationWithDetail(ctx, service, scope, principal, action, resourceType, resourceID, result, operationID, idempotencyKey, nil)
+}
+
+func httpActionAuditReconciliationWithDetail(ctx context.Context, service AuditService, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string, detail map[string]any) ([]byte, idempotency.ReconcileFunc, error) {
 	expected := httpActionAuditEvent(ctx, scope, principal, action, resourceType, resourceID, result, operationID, idempotencyKey)
+	for key, value := range detail {
+		expected.Detail[key] = value
+	}
+	encodedDetail, err := json.Marshal(expected.Detail)
+	if err != nil {
+		return nil, nil, err
+	}
+	var normalizedDetail map[string]any
+	if err := json.Unmarshal(encodedDetail, &normalizedDetail); err != nil {
+		return nil, nil, err
+	}
+	expected.Detail = normalizedDetail
 	payload := httpActionAuditPayload{
 		Scope: expected.Scope, Action: expected.Action, Actor: expected.Actor, Resource: expected.Resource,
 		Result: expected.Result, RequestID: expected.RequestID, TraceID: expected.TraceID,

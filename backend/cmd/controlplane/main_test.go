@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -30,6 +31,7 @@ import (
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/plugincatalog"
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,6 +49,30 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
 	require.Equal(t, "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", config.Command.SigningPrivateKeyRef)
 	require.Equal(t, "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY", config.Command.ExecutionTokenKeyRef)
+}
+
+func TestPublisherKeysForConfigDecodesOnlyCanonicalEd25519PublicKeys(t *testing.T) {
+	// Break caught: malformed or duplicate configured trust roots must stop
+	// startup rather than silently disabling package signature verification.
+	public := ed25519.PublicKey(bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize))
+	config := Config{PluginPublishers: []PluginPublisherSettings{{
+		PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public),
+	}}}
+	store, err := publisherKeysForConfig(config)
+	require.NoError(t, err)
+	got, err := store.PublicKey(context.Background(), "publisher-1", "key-1")
+	require.NoError(t, err)
+	require.Equal(t, public, got)
+
+	config.PluginPublishers[0].PublicKey = "not-base64"
+	_, err = publisherKeysForConfig(config)
+	require.Error(t, err)
+	config.PluginPublishers = []PluginPublisherSettings{
+		{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)},
+		{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)},
+	}
+	_, err = publisherKeysForConfig(config)
+	require.ErrorIs(t, err, plugincatalog.ErrInvalid)
 }
 
 func TestFullStackFixtureGeneratedConfigPassesProductionValidation(t *testing.T) {

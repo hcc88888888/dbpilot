@@ -3,10 +3,14 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -78,17 +82,23 @@ func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func
 }
 
 type platformRequestMetadata struct {
-	Method   string
-	Path     string
-	RawQuery string
-	IfMatch  string
-	Body     []byte
+	Method        string
+	Path          string
+	RawQuery      string
+	IfMatch       string
+	Body          []byte
+	BodyDigest    string
+	ContentLength int64
 }
 
 type platformRequestMetadataContextKey struct{}
 
 func capturePlatformRequestMetadata(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if strings.EqualFold(strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]), "application/gzip") {
+			captureBinaryPlatformRequest(next, writer, request)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(request.Body, maxJSONBodyBytes+1))
 		if err != nil || int64(len(body)) > maxJSONBodyBytes {
 			writePlatformProblem(writer, request, ErrInvalidRequest)
@@ -97,11 +107,51 @@ func capturePlatformRequestMetadata(next http.Handler) http.Handler {
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		metadata := platformRequestMetadata{
 			Method: request.Method, Path: request.URL.EscapedPath(), RawQuery: request.URL.RawQuery,
-			IfMatch: request.Header.Get("If-Match"), Body: append([]byte(nil), body...),
+			IfMatch: request.Header.Get("If-Match"), Body: append([]byte(nil), body...), ContentLength: int64(len(body)),
 		}
 		ctx := context.WithValue(request.Context(), platformRequestMetadataContextKey{}, metadata)
 		next.ServeHTTP(writer, request.WithContext(ctx))
 	})
+}
+
+func captureBinaryPlatformRequest(next http.Handler, writer http.ResponseWriter, request *http.Request) {
+	const maximumBinaryRequestBytes int64 = 256 << 20
+	if request.ContentLength <= 0 || request.ContentLength > maximumBinaryRequestBytes {
+		writePlatformProblem(writer, request, ErrInvalidRequest)
+		return
+	}
+	temporary, err := os.CreateTemp("", ".dbpilot-platform-upload-*")
+	if err != nil {
+		writePlatformProblem(writer, request, ErrServiceUnavailable)
+		return
+	}
+	path := temporary.Name()
+	cleanup := func() {
+		_ = temporary.Close()
+		_ = os.Remove(path)
+	}
+	defer cleanup()
+	hash := sha256.New()
+	written, err := io.CopyBuffer(io.MultiWriter(temporary, hash), io.LimitReader(request.Body, request.ContentLength+1), make([]byte, 32<<10))
+	if err != nil || written != request.ContentLength {
+		writePlatformProblem(writer, request, ErrInvalidRequest)
+		return
+	}
+	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+		writePlatformProblem(writer, request, ErrServiceUnavailable)
+		return
+	}
+	request.Body = temporary
+	// net/http parses Content-Length into Request.ContentLength and normally
+	// removes it from Header. The generated Task 1 binder models the required
+	// contract header, so restore the canonical value for that binder only.
+	request.Header.Set("Content-Length", strconv.FormatInt(written, 10))
+	metadata := platformRequestMetadata{
+		Method: request.Method, Path: request.URL.EscapedPath(), RawQuery: request.URL.RawQuery,
+		IfMatch: request.Header.Get("If-Match"), BodyDigest: "sha256:" + hex.EncodeToString(hash.Sum(nil)), ContentLength: written,
+	}
+	ctx := context.WithValue(request.Context(), platformRequestMetadataContextKey{}, metadata)
+	next.ServeHTTP(writer, request.WithContext(ctx))
 }
 
 func (registrar *platformRouteRegistrar) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -238,6 +288,10 @@ func (validator platformResponseValidator) requestMiddleware(next http.Handler) 
 		// that declare a request body. Enforce the intended condition here.
 		if route.Operation.RequestBody == nil && request.ContentLength > 0 {
 			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		if route.Operation.OperationID == "uploadPluginVersionPackage" && strings.EqualFold(strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]), "application/gzip") {
+			next.ServeHTTP(writer, request)
 			return
 		}
 		if err := openapi3filter.ValidateRequest(request.Context(), input); err != nil {

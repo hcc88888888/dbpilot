@@ -1,12 +1,14 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"dbpilot.local/platform/internal/platformscope"
@@ -47,13 +49,27 @@ func (store *PostgresStore) Get(ctx context.Context, scope platformscope.Scope, 
 }
 
 func (store *PostgresStore) Put(ctx context.Context, value Artifact, contents []byte) (Artifact, error) {
-	if store == nil || store.database == nil || store.blobs == nil || ctx == nil || ctx.Err() != nil || !validArtifact(value, contents) {
+	if len(contents) > 64<<20 || !validArtifact(value, contents) {
 		return Artifact{}, ErrInvalid
 	}
-	reference, err := store.blobs.Put(ctx, value.Checksum, contents)
+	return store.PutReader(ctx, value, bytes.NewReader(contents))
+}
+
+// PutReader publishes immutable Artifact bytes with bounded memory, then
+// inserts metadata. A retry with the same ID/checksum returns the existing
+// metadata; an ID can never be rebound to a different checksum.
+func (store *PostgresStore) PutReader(ctx context.Context, value Artifact, source io.Reader) (Artifact, error) {
+	if store == nil || store.database == nil || store.blobs == nil || ctx == nil || ctx.Err() != nil || source == nil || !validArtifactMetadata(value) {
+		return Artifact{}, ErrInvalid
+	}
+	reference, err := store.blobs.PutReader(ctx, value.Checksum, value.SizeBytes, source)
 	if err != nil {
 		return Artifact{}, err
 	}
+	return store.insertMetadata(ctx, value, reference)
+}
+
+func (store *PostgresStore) insertMetadata(ctx context.Context, value Artifact, reference string) (Artifact, error) {
 	if value.StorageReference != "" && value.StorageReference != reference {
 		return Artifact{}, ErrInvalid
 	}
@@ -84,13 +100,7 @@ func (store *PostgresStore) Put(ctx context.Context, value Artifact, contents []
 }
 
 func validArtifact(value Artifact, contents []byte) bool {
-	if !validArtifactID(value.ID) || value.Scope.Validate() != nil || strings.TrimSpace(value.Kind) == "" || strings.TrimSpace(value.ContentType) == "" || value.SizeBytes != int64(len(contents)) || value.CreatedAt.IsZero() || (value.SourceResource.ResourceType == "") != (value.SourceResource.ResourceID == "") {
-		return false
-	}
-	if value.ExpiresAt != nil && !value.ExpiresAt.After(value.CreatedAt) {
-		return false
-	}
-	if !strings.HasPrefix(value.Checksum, "sha256:") {
+	if !validArtifactMetadata(value) || value.SizeBytes != int64(len(contents)) {
 		return false
 	}
 	expected, err := hex.DecodeString(strings.TrimPrefix(value.Checksum, "sha256:"))
@@ -99,6 +109,17 @@ func validArtifact(value Artifact, contents []byte) bool {
 	}
 	digest := sha256.Sum256(contents)
 	return equalBytes(digest[:], expected)
+}
+
+func validArtifactMetadata(value Artifact) bool {
+	if !validArtifactID(value.ID) || value.Scope.Validate() != nil || strings.TrimSpace(value.Kind) == "" || strings.TrimSpace(value.ContentType) == "" || value.SizeBytes < 0 || value.SizeBytes > 256<<20 || value.CreatedAt.IsZero() || (value.SourceResource.ResourceType == "") != (value.SourceResource.ResourceID == "") || !strings.HasPrefix(value.Checksum, "sha256:") {
+		return false
+	}
+	if value.ExpiresAt != nil && !value.ExpiresAt.After(value.CreatedAt) {
+		return false
+	}
+	expected, err := hex.DecodeString(strings.TrimPrefix(value.Checksum, "sha256:"))
+	return err == nil && len(expected) == sha256.Size
 }
 
 func scanArtifact(scanner interface{ Scan(...any) error }) (Artifact, error) {

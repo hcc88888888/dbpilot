@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -76,6 +77,42 @@ func TestPostgresStorePutPublishesContentAddressedBlobBeforeMetadata(t *testing.
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresStorePutReaderStreamsBoundedImmutableBlobBeforeMetadata(t *testing.T) {
+	// Break caught: buffering a plugin upload in memory defeats the streaming
+	// contract, while metadata-before-blob creates an unusable Artifact.
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	rootPath := t.TempDir()
+	blobs := NewLocalBlobStore(rootPath)
+	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
+	payload := bytes.Repeat([]byte("streamed-plugin-package\n"), 128*1024)
+	value := putArtifactFixture(payload)
+	value.ID = "plugin-package-streamed"
+	value.Kind = "plugin-package"
+	value.ContentType = "application/gzip"
+	wantReference := filepath.ToSlash(filepath.Join("sha256", value.Checksum[len("sha256:"):]+".blob"))
+	stored := value
+	stored.StorageReference = wantReference
+	mock.ExpectQuery("INSERT INTO artifacts .* ON CONFLICT .* DO NOTHING RETURNING").
+		WithArgs(value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.Kind, value.ContentType, value.SizeBytes, value.Checksum, value.SourceResource.ResourceType, value.SourceResource.ResourceID, value.JobID, value.CreatedBy, value.CreatedAt, nil, wantReference).
+		WillReturnRows(artifactRows(stored))
+	reader := &boundedReadRecorder{reader: bytes.NewReader(payload)}
+
+	got, err := NewPostgresStore(database, blobs).PutReader(context.Background(), value, reader)
+
+	require.NoError(t, err)
+	require.Equal(t, wantReference, got.StorageReference)
+	require.LessOrEqual(t, reader.maximumRequest, 64<<10, "streaming must use a bounded copy buffer")
+	contents, err := os.ReadFile(filepath.Join(rootPath, filepath.FromSlash(wantReference)))
+	require.NoError(t, err)
+	require.Equal(t, payload, contents)
+	temporary, err := filepath.Glob(filepath.Join(rootPath, "sha256", ".tmp-*"))
+	require.NoError(t, err)
+	require.Empty(t, temporary)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresStorePutIdenticalChecksumRetrySucceedsAndConflictingIDFails(t *testing.T) {
 	// Break caught: crash repair must accept the exact same artifact bytes, but
 	// an Artifact ID can never be rebound to a different checksum.
@@ -126,4 +163,16 @@ func artifactRows(values ...Artifact) *sqlmock.Rows {
 		rows.AddRow(value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.Kind, value.ContentType, value.SizeBytes, value.Checksum, value.SourceResource.ResourceType, value.SourceResource.ResourceID, value.JobID, value.CreatedBy, value.CreatedAt, value.ExpiresAt, value.StorageReference)
 	}
 	return rows
+}
+
+type boundedReadRecorder struct {
+	reader         *bytes.Reader
+	maximumRequest int
+}
+
+func (reader *boundedReadRecorder) Read(buffer []byte) (int, error) {
+	if len(buffer) > reader.maximumRequest {
+		reader.maximumRequest = len(buffer)
+	}
+	return reader.reader.Read(buffer)
 }

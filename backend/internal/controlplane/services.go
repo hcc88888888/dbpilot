@@ -15,6 +15,7 @@ import (
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/plugincatalog"
 )
 
 type JobService interface {
@@ -96,6 +97,7 @@ type Services struct {
 	Idempotency     IdempotencyService
 	Inspection      InspectionService
 	Hosts           hostinventory.Service
+	PluginCatalog   plugincatalog.CatalogService
 	ArtifactContent http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated
