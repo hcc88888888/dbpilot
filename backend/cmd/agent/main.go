@@ -309,11 +309,27 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return fmt.Errorf("migrate discovery pending revision: %w", storeErr)
 		}
+		if storeErr = reportStore.ConsumeRetirement(ctx); storeErr != nil {
+			_ = store.Close()
+			return fmt.Errorf("consume discovery pending retirement: %w", storeErr)
+		}
 		reader := agentdiscovery.NewProcReader("/proc", nil)
 		if settings.LegacyProcHelper {
 			reader = agentdiscovery.NewLegacyProcReader("/proc", nil)
 		}
-		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, InitialUnavailable: reportStore.Unavailable(), Reporter: func(reportContext context.Context, report *telemetryv1.DiscoveryReport) error {
+		discoveryCoordinator, loadErr = agentdiscovery.NewCoordinator(agentdiscovery.CoordinatorConfig{HostID: settings.HostID, AgentID: settings.AgentID, Detector: agentdiscovery.NewNativeDetector(reader), RuleSet: ruleSet, Attestation: attestation, RevisionStore: revisionStore, ReportStore: reportStore, InitialUnavailable: reportStore.Unavailable(), Compatibility: func() agentdiscovery.CompatibilityState {
+			if controlClient == nil {
+				return agentdiscovery.CompatibilityUnknown
+			}
+			switch controlClient.DiscoveryCompatibility() {
+			case agent.DiscoveryCompatibilityCompatible:
+				return agentdiscovery.CompatibilityCompatible
+			case agent.DiscoveryCompatibilityIncompatible:
+				return agentdiscovery.CompatibilityIncompatible
+			default:
+				return agentdiscovery.CompatibilityUnknown
+			}
+		}, Reporter: func(reportContext context.Context, report *telemetryv1.DiscoveryReport) error {
 			if controlClient == nil {
 				return agent.ErrControlStreamDisconnected
 			}

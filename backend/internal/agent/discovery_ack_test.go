@@ -17,7 +17,7 @@ func TestReportDiscoveryCompletesOnlyAfterMatchingPersistenceAcknowledgement(t *
 	defer cancel()
 	session := &controlSession{ctx: ctx, outgoing: make(chan controlSendRequest, 1)}
 	client := &ControlClient{agentID: "agent-1", session: session, discoveryWaiters: make(map[uint64]*discoveryAckWaiter)}
-	client.discoveryCompatible.Store(true)
+	client.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
 	report := &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 7, RuleRevision: 4, ObservedAt: timestamppb.New(time.Now().UTC())}
 	handled := make(chan struct{})
 	go func() {
@@ -38,7 +38,7 @@ func TestReportDiscoveryRejectsMismatchedAcknowledgementDigest(t *testing.T) {
 	defer cancel()
 	session := &controlSession{ctx: ctx, outgoing: make(chan controlSendRequest, 1)}
 	client := &ControlClient{agentID: "agent-1", session: session, discoveryWaiters: make(map[uint64]*discoveryAckWaiter)}
-	client.discoveryCompatible.Store(true)
+	client.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
 	report := &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 8, RuleRevision: 4, ObservedAt: timestamppb.New(time.Now().UTC())}
 	go func() {
 		request := <-session.outgoing
@@ -50,6 +50,7 @@ func TestReportDiscoveryRejectsMismatchedAcknowledgementDigest(t *testing.T) {
 
 func TestReportDiscoveryFailsFastWhenOldServerDoesNotAdvertiseCapabilities(t *testing.T) {
 	client := &ControlClient{agentID: "agent-1", discoveryWaiters: make(map[uint64]*discoveryAckWaiter)}
+	client.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityIncompatible))
 	report := &agentv1.DiscoveryReport{AgentId: "agent-1", HostId: "host-1", ObservationRevision: 1, RuleRevision: 1}
 	require.ErrorIs(t, client.ReportDiscovery(context.Background(), report), ErrDiscoveryControlIncompatible)
 }

@@ -287,14 +287,17 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 			return status.Error(codes.InvalidArgument, "Host observation is invalid")
 		}
 	case *agentv1.AgentMessage_DiscoveryReport:
+		if !s.registry.Supports(agentID, CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1) {
+			return nil
+		}
 		if typed.DiscoveryReport == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.DiscoveryReport.GetAgentId())) != 1 {
-			return status.Error(codes.PermissionDenied, "Discovery report Agent ID does not match the session identity")
+			s.rejectDiscoveryReport(agentID, typed.DiscoveryReport, "REPORT_IDENTITY_REJECTED")
+			return nil
 		}
 		if err := s.discovery.SubmitDiscovery(agentID, typed.DiscoveryReport); err != nil {
 			switch {
 			case errors.Is(err, ErrDiscoveryObservationInvalid):
-				// Rolling old Agents may send the pre-attestation report shape. Ignore
-				// only that discovery message; never tear down heartbeat/telemetry.
+				s.rejectDiscoveryReport(agentID, typed.DiscoveryReport, "REPORT_INVALID")
 				return nil
 			case errors.Is(err, ErrDiscoveryObservationCapacity):
 				return status.Error(codes.ResourceExhausted, "Discovery report delivery capacity is exhausted")
@@ -306,6 +309,18 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}
 	return nil
+}
+
+func (s *Server) rejectDiscoveryReport(agentID string, report *agentv1.DiscoveryReport, reason string) {
+	if report == nil || report.GetObservationRevision() == 0 || report.GetHostId() == "" {
+		return
+	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(report)
+	if err != nil {
+		return
+	}
+	digest := sha256.Sum256(encoded)
+	_ = s.registry.AcknowledgeDiscovery(agentID, &agentv1.DiscoveryReportAcknowledgement{HostId: report.GetHostId(), AgentId: agentID, ObservationRevision: report.GetObservationRevision(), ReportDigest: digest[:], Persisted: false, Retryable: false, ReasonCode: reason})
 }
 
 var _ agentv1.AgentControlServer = (*Server)(nil)

@@ -92,6 +92,48 @@ func NewFileReportStore(path string) (*FileReportStore, error) {
 }
 func (store *FileReportStore) RetiredRevision() uint64 { return store.retiredRevision }
 func (store *FileReportStore) Unavailable() bool       { return store.unavailable }
+func (store *FileReportStore) ConsumeRetirement(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	marker, exists, err := readReportRetirement(store.path + ".retired")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if marker.Revision != store.retiredRevision {
+		return errors.New("report retirement marker revision changed")
+	}
+	legacy, legacyErr := loadReportAtLimit(store.path, maximumLegacyPendingReportBytes)
+	if legacyErr == nil && legacy != nil {
+		digest, _ := ReportDigest(legacy)
+		if legacy.GetObservationRevision() != marker.Revision || hex.EncodeToString(digest[:]) != marker.Digest {
+			return errors.New("legacy pending report changed before retirement")
+		}
+		if err = os.Remove(store.path); err != nil {
+			return err
+		}
+		_ = os.Remove(store.path + ".tmp")
+		if err = syncParentDirectory(store.path); err != nil {
+			return err
+		}
+	} else if legacyErr != nil && !errors.Is(legacyErr, os.ErrNotExist) {
+		return legacyErr
+	}
+	if err = os.Remove(store.path + ".retired"); err != nil {
+		return err
+	}
+	if err = syncParentDirectory(store.path); err != nil {
+		return err
+	}
+	store.retiredRevision = 0
+	store.unavailable = false
+	return nil
+}
 func (store *FileReportStore) Load(ctx context.Context) (*agentv1.DiscoveryReport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -201,6 +243,21 @@ func loadReportAtLimit(path string, limit int64) (*agentv1.DiscoveryReport, erro
 	return &report, nil
 }
 func (store *FileReportStore) recover() error {
+	if store.retiredRevision != 0 {
+		legacy, legacyErr := loadReportAtLimit(store.path, maximumLegacyPendingReportBytes)
+		if errors.Is(legacyErr, os.ErrNotExist) || legacy == nil {
+			return nil
+		}
+		if legacyErr != nil {
+			return legacyErr
+		}
+		digest, _ := ReportDigest(legacy)
+		marker, _, markerErr := readReportRetirement(store.path + ".retired")
+		if markerErr != nil || legacy.GetObservationRevision() != marker.Revision || hex.EncodeToString(digest[:]) != marker.Digest {
+			return errors.New("legacy pending report retirement identity mismatch")
+		}
+		return nil
+	}
 	final, finalErr := loadReportAt(store.path)
 	temporary, tempErr := loadReportAt(store.path + ".tmp")
 	if finalErr != nil {
@@ -270,13 +327,6 @@ func (store *FileReportStore) retireLegacy(report *agentv1.DiscoveryReport) erro
 	if err = os.Rename(temporary, store.path+".retired"); err != nil {
 		return err
 	}
-	if err = syncParentDirectory(store.path); err != nil {
-		return err
-	}
-	if err = os.Remove(store.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	_ = os.Remove(store.path + ".tmp")
 	if err = syncParentDirectory(store.path); err != nil {
 		return err
 	}

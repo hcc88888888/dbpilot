@@ -185,6 +185,21 @@ func (r *Registry) AcknowledgeDiscovery(agentID string, acknowledgement *agentv1
 	return r.enqueue(agentID, &agentv1.ServerMessage{MessageId: "discovery-ack-" + acknowledgement.GetHostId(), Message: &agentv1.ServerMessage_DiscoveryReportAcknowledgement{DiscoveryReportAcknowledgement: acknowledgement}})
 }
 
+func (r *Registry) Supports(agentID string, required ...string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current := r.sessions[agentID]
+	if current == nil {
+		return false
+	}
+	for _, capability := range required {
+		if _, ok := current.capabilities[capability]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agentv1.CommandEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err

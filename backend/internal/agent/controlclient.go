@@ -34,9 +34,17 @@ type discoveryControlIncompatibleError struct{}
 func (discoveryControlIncompatibleError) Error() string {
 	return "discovery unavailable: control plane lacks ACK or policy attestation capability"
 }
-func (discoveryControlIncompatibleError) NonRetryableDiscovery() bool { return true }
 
 var ErrDiscoveryControlIncompatible error = discoveryControlIncompatibleError{}
+var ErrDiscoveryCompatibilityUnknown = errors.New("discovery compatibility unknown until HelloAck")
+
+type DiscoveryCompatibility uint32
+
+const (
+	DiscoveryCompatibilityUnknown DiscoveryCompatibility = iota
+	DiscoveryCompatibilityCompatible
+	DiscoveryCompatibilityIncompatible
+)
 
 type nonRetryableDiscoveryError struct{}
 
@@ -191,17 +199,17 @@ type ControlClient struct {
 	resultRetryBackoff time.Duration
 	now                func() time.Time
 
-	sessionMu           sync.RWMutex
-	session             *controlSession
-	sendMu              sync.Mutex
-	runningMu           sync.Mutex
-	running             map[string]runningCommand
-	executorWait        sync.WaitGroup
-	messageSequence     atomic.Uint64
-	executionErrors     chan error
-	discoveryMu         sync.Mutex
-	discoveryWaiters    map[uint64]*discoveryAckWaiter
-	discoveryCompatible atomic.Bool
+	sessionMu              sync.RWMutex
+	session                *controlSession
+	sendMu                 sync.Mutex
+	runningMu              sync.Mutex
+	running                map[string]runningCommand
+	executorWait           sync.WaitGroup
+	messageSequence        atomic.Uint64
+	executionErrors        chan error
+	discoveryMu            sync.Mutex
+	discoveryWaiters       map[uint64]*discoveryAckWaiter
+	discoveryCompatibility atomic.Uint32
 }
 
 type discoveryAckWaiter struct {
@@ -339,9 +347,11 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 		}
 		recovery = append(recovery, &agentv1.CommandRecoveryState{CommandId: entry.CommandID, State: state, ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision})
 	}
+	capabilities := append(c.executors.Capabilities(), CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1)
+	sort.Strings(capabilities)
 	hello := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Hello{Hello: &agentv1.Hello{
 		ProtocolVersion: ControlProtocolVersion, AgentId: c.agentID, AgentVersion: c.agentVersion,
-		OperatingSystem: c.operatingSystem, Architecture: c.architecture, Capabilities: c.executors.Capabilities(),
+		OperatingSystem: c.operatingSystem, Architecture: c.architecture, Capabilities: capabilities,
 		DatabaseAdapters: append([]string(nil), c.databaseAdapters...), ActiveCommands: recovery,
 	}}}
 	if err := c.sendOnStream(stream, hello); err != nil {
@@ -390,8 +400,12 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	if first.message.GetHelloAck() == nil || first.message.GetHelloAck().GetProtocolVersion() != ControlProtocolVersion {
 		return errors.New("control plane did not accept the Agent protocol version")
 	}
-	c.discoveryCompatible.Store(hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1))
-	defer c.discoveryCompatible.Store(false)
+	if hasCapabilities(first.message.GetHelloAck().GetCapabilities(), CapabilityDiscoveryReportACKV1, CapabilityDiscoveryPolicyAttestationV1) {
+		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityCompatible))
+	} else {
+		c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityIncompatible))
+	}
+	defer c.discoveryCompatibility.Store(uint32(DiscoveryCompatibilityUnknown))
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
@@ -879,7 +893,10 @@ func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {
 // ReportDiscovery sends a bounded discovery report on the authenticated
 // AgentControl stream. Server-side scope is resolved from the mTLS Agent ID.
 func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.DiscoveryReport) error {
-	if !c.discoveryCompatible.Load() {
+	switch c.DiscoveryCompatibility() {
+	case DiscoveryCompatibilityUnknown:
+		return ErrDiscoveryCompatibilityUnknown
+	case DiscoveryCompatibilityIncompatible:
 		return ErrDiscoveryControlIncompatible
 	}
 	if report == nil || report.GetAgentId() != c.agentID || report.GetObservationRevision() == 0 || report.GetRuleRevision() == 0 || len(report.GetCandidates()) > 1024 {
@@ -922,6 +939,10 @@ func (c *ControlClient) ReportDiscovery(ctx context.Context, report *agentv1.Dis
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (c *ControlClient) DiscoveryCompatibility() DiscoveryCompatibility {
+	return DiscoveryCompatibility(c.discoveryCompatibility.Load())
 }
 
 func hasCapabilities(values []string, required ...string) bool {

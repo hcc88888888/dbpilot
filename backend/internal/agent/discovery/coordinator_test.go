@@ -81,6 +81,22 @@ func TestCoordinatorStopsNewScansAndCommandsWhenRulesExpire(t *testing.T) {
 	require.Equal(t, 1, detector.calls)
 }
 
+func TestCoordinatorWaitsForHelloCapabilityOutcomeAndResumesAfterCompatibleReconnect(t *testing.T) {
+	detector := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
+	rules, attestation := testRules(t)
+	state := CompatibilityUnknown
+	coordinator, err := NewCoordinator(CoordinatorConfig{HostID: "host-1", AgentID: "agent-1", Detector: detector, RuleSet: rules, Attestation: attestation, Compatibility: func() CompatibilityState { return state }, Now: func() time.Time { return time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC) }, Reporter: func(context.Context, *agentv1.DiscoveryReport) error { return nil }})
+	require.NoError(t, err)
+	require.ErrorIs(t, coordinator.Scan(context.Background(), ScanEnrollment), ErrDiscoveryCompatibilityUnknown)
+	require.Zero(t, detector.calls)
+	state = CompatibilityIncompatible
+	require.ErrorIs(t, coordinator.Scan(context.Background(), ScanEnrollment), ErrDiscoveryCompatibilityPaused)
+	require.Zero(t, detector.calls)
+	state = CompatibilityCompatible
+	require.NoError(t, coordinator.Scan(context.Background(), ScanEnrollment))
+	require.Equal(t, 1, detector.calls)
+}
+
 func TestCoordinatorRetiresExactTerminallyRejectedPendingReportAndLatchesUnavailable(t *testing.T) {
 	detector := &recordingDetector{candidate: domain.CandidateObservation{ObservationID: "native-1", Source: domain.SourceNative, DatabaseFamily: "mysql", DatabaseVariant: "mysql", NormalizedEndpoint: "127.0.0.1:3306", ProcessIdentity: "mysqld", Confidence: .9, Evidence: []domain.Evidence{{Kind: domain.EvidenceProcessName, Value: "mysqld"}}}}
 	rules, attestation := testRules(t)
@@ -204,10 +220,21 @@ func TestFileReportStoreRetiresLegacyOversizedPendingWithoutBlockingAgent(t *tes
 	require.NoError(t, err)
 	require.True(t, store.Unavailable())
 	require.Equal(t, uint64(7), store.RetiredRevision())
-	require.NoFileExists(t, path)
+	require.FileExists(t, path)
+	store, err = NewFileReportStore(path)
+	require.NoError(t, err)
+	require.True(t, store.Unavailable())
+	require.Equal(t, uint64(7), store.RetiredRevision())
 	revisionStore, err := NewFileRevisionStore(filepath.Join(directory, "revision"))
 	require.NoError(t, err)
 	require.NoError(t, revisionStore.EnsureAtLeast(context.Background(), store.RetiredRevision()))
+	require.NoError(t, store.ConsumeRetirement(context.Background()))
+	require.False(t, store.Unavailable())
+	require.NoFileExists(t, path)
+	restartedStore, err := NewFileReportStore(path)
+	require.NoError(t, err)
+	require.False(t, restartedStore.Unavailable())
+	require.Zero(t, restartedStore.RetiredRevision())
 	next, err := revisionStore.Next(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, uint64(8), next)

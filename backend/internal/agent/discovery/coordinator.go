@@ -30,6 +30,13 @@ const (
 )
 
 type Reporter func(context.Context, *agentv1.DiscoveryReport) error
+type CompatibilityState uint8
+
+const (
+	CompatibilityUnknown CompatibilityState = iota
+	CompatibilityCompatible
+	CompatibilityIncompatible
+)
 
 var controlIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
@@ -45,6 +52,7 @@ type CoordinatorConfig struct {
 	RevisionStore      RevisionStore
 	ReportStore        ReportStore
 	InitialUnavailable bool
+	Compatibility      func() CompatibilityState
 }
 
 type Coordinator struct {
@@ -63,6 +71,7 @@ type Coordinator struct {
 	reports         ReportStore
 	pendingReport   *agentv1.DiscoveryReport
 	unavailable     bool
+	compatibility   func() CompatibilityState
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -84,10 +93,13 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.ReportStore == nil {
 		config.ReportStore = &memoryReportStore{}
 	}
+	if config.Compatibility == nil {
+		config.Compatibility = func() CompatibilityState { return CompatibilityCompatible }
+	}
 	if config.Attestation.Revision != config.RuleSet.Revision || config.Attestation.Digest == ([32]byte{}) || config.Attestation.IssuedAt != config.RuleSet.IssuedAt || config.Attestation.ExpiresAt != config.RuleSet.ExpiresAt || config.Attestation.DisappearanceGrace != config.RuleSet.DisappearanceGrace {
 		return nil, domain.ErrInvalid
 	}
-	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable}, nil
+	return &Coordinator{hostID: config.HostID, agentID: config.AgentID, detector: config.Detector, rules: config.RuleSet, attestation: config.Attestation, reporter: config.Reporter, now: config.Now, retryBackoff: config.RetryBackoff, revisionStore: config.RevisionStore, reports: config.ReportStore, unavailable: config.InitialUnavailable, compatibility: config.Compatibility}, nil
 }
 
 // Run performs the enrollment scan before starting the bounded periodic scan.
@@ -137,6 +149,12 @@ func (coordinator *Coordinator) Scan(ctx context.Context, _ ScanReason) error {
 	defer coordinator.mu.Unlock()
 	if coordinator.unavailable {
 		return ErrDiscoveryUnavailable
+	}
+	switch coordinator.compatibility() {
+	case CompatibilityUnknown:
+		return ErrDiscoveryCompatibilityUnknown
+	case CompatibilityIncompatible:
+		return ErrDiscoveryCompatibilityPaused
 	}
 	if coordinator.pendingReport == nil {
 		pending, err := coordinator.reports.Load(ctx)
@@ -232,6 +250,8 @@ func (coordinator *Coordinator) deliverPending(ctx context.Context) error {
 }
 
 var ErrDiscoveryUnavailable = errors.New("native discovery unavailable until restart or policy reload")
+var ErrDiscoveryCompatibilityUnknown = errors.New("native discovery waiting for control compatibility")
+var ErrDiscoveryCompatibilityPaused = errors.New("native discovery paused for incompatible control plane")
 
 func (coordinator *Coordinator) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, _ interface {
 	Report(*agentv1.CommandProgress) error

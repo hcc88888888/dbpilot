@@ -621,14 +621,44 @@ type agentRegistryIntegrationFixture struct {
 }
 
 func TestNewServerIgnoresOldDiscoveryShapeWithoutTearingControlSession(t *testing.T) {
-	server := NewServer(NewRegistry(2), NoopObserver{}, WithDiscoveryObserver(rejectingDiscoveryObserver{}))
+	registry := NewRegistry(2)
+	require.NoError(t, registry.register("agent-1", []string{"collect_now"}, nil, func() {}))
+	observer := &countingRejectingDiscoveryObserver{}
+	server := NewServer(registry, NoopObserver{}, WithDiscoveryObserver(observer))
 	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 1, RuleRevision: 1, ObservedAt: timestamppb.Now()}}}
 	require.NoError(t, server.handleAgentMessage(context.Background(), "agent-1", message))
+	require.Zero(t, observer.calls)
+}
+
+func TestCompatibleMalformedDiscoveryGetsTerminalAckWithoutStreamError(t *testing.T) {
+	registry := NewRegistry(2)
+	require.NoError(t, registry.register("agent-1", []string{CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1}, nil, func() {}))
+	server := NewServer(registry, NoopObserver{}, WithDiscoveryObserver(rejectingDiscoveryObserver{}))
+	report := &agentv1.DiscoveryReport{HostId: "host-1", AgentId: "agent-1", ObservationRevision: 9, RuleRevision: 4, ObservedAt: timestamppb.Now()}
+	require.NoError(t, server.handleAgentMessage(context.Background(), "agent-1", &agentv1.AgentMessage{Message: &agentv1.AgentMessage_DiscoveryReport{DiscoveryReport: report}}))
+	session, _ := registry.liveSession("agent-1")
+	select {
+	case message := <-session.send:
+		ack := message.GetDiscoveryReportAcknowledgement()
+		require.NotNil(t, ack)
+		require.False(t, ack.GetPersisted())
+		require.False(t, ack.GetRetryable())
+		require.Equal(t, "REPORT_INVALID", ack.GetReasonCode())
+	case <-time.After(time.Second):
+		t.Fatal("terminal discovery acknowledgement missing")
+	}
 }
 
 type rejectingDiscoveryObserver struct{}
 
 func (rejectingDiscoveryObserver) SubmitDiscovery(string, *agentv1.DiscoveryReport) error {
+	return ErrDiscoveryObservationInvalid
+}
+
+type countingRejectingDiscoveryObserver struct{ calls int }
+
+func (observer *countingRejectingDiscoveryObserver) SubmitDiscovery(string, *agentv1.DiscoveryReport) error {
+	observer.calls++
 	return ErrDiscoveryObservationInvalid
 }
 
