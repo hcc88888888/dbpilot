@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const hostColumnsSQL = "tenant_id, project_id, host_id, agent_id, display_name, hostname, operating_system, operating_system_version, kernel_version, architecture, logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses, labels, container_runtime, capabilities, agent_version, enrollment_revision, observation_revision, enrolled_at, last_hello_at, last_heartbeat_at, status, version"
+const hostColumnsSQL = "tenant_id, project_id, host_id, agent_id, display_name, hostname, operating_system, operating_system_version, kernel_version, architecture, logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses, labels, container_runtime, capabilities, agent_version, enrollment_revision, observation_revision, enrolled_at, last_hello_at, last_heartbeat_at, status, version, decommission_actor, decommission_operation, decommission_idempotency_key, decommission_fingerprint, decommission_owner_token"
 
 const getHostSQL = "SELECT " + hostColumnsSQL + " FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3"
 const getHostByAgentSQL = "SELECT " + hostColumnsSQL + " FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3"
@@ -69,6 +69,11 @@ RETURNING ` + hostColumnsSQL
 
 const decommissionHostSQL = `UPDATE managed_hosts SET
     status = 'decommissioned',
+    decommission_actor = $6,
+    decommission_operation = $7,
+    decommission_idempotency_key = $8,
+    decommission_fingerprint = $9,
+    decommission_owner_token = $10,
     version = version + 1,
     updated_at = $5
 WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3 AND version = $4 AND status <> 'decommissioned'
@@ -120,7 +125,17 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, sco
 		if err == nil && host.AgentID != observation.AgentID {
 			return Host{}, ErrConflict
 		}
-		return host, err
+		if err != nil {
+			return Host{}, err
+		}
+		switch {
+		case host.ObservationRevision > observation.Revision:
+			return Host{}, ErrStaleRevision
+		case host.ObservationRevision == observation.Revision:
+			return host, nil
+		default:
+			return Host{}, ErrConflict
+		}
 	}
 	if err != nil {
 		return Host{}, mapPostgresError(err)
@@ -163,8 +178,9 @@ func (repository *PostgresRepository) List(ctx context.Context, scope platformsc
         operating_system, operating_system_version, kernel_version, architecture,
         logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses,
         labels, container_runtime, capabilities, agent_version, enrollment_revision,
-        observation_revision, enrolled_at, last_hello_at, last_heartbeat_at,
-        ` + classification + ` AS status, version
+		observation_revision, enrolled_at, last_hello_at, last_heartbeat_at,
+		` + classification + ` AS status, version, decommission_actor, decommission_operation,
+		decommission_idempotency_key, decommission_fingerprint, decommission_owner_token
     FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND ($3 = '' OR host_id > $3)
 )
 SELECT ` + hostColumnsSQL + ` FROM classified
@@ -208,11 +224,11 @@ func (repository *PostgresRepository) Get(ctx context.Context, scope platformsco
 	return host, nil
 }
 
-func (repository *PostgresRepository) Decommission(ctx context.Context, scope platformscope.Scope, hostID string, expectedVersion uint64, at time.Time) (Host, error) {
-	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !validPostgresRevision(expectedVersion, false) || !validUTC(at) {
+func (repository *PostgresRepository) Decommission(ctx context.Context, scope platformscope.Scope, hostID string, expectedVersion uint64, at time.Time, transition DecommissionTransition) (Host, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !validPostgresRevision(expectedVersion, false) || !validUTC(at) || transition.Validate() != nil {
 		return Host{}, ErrInvalid
 	}
-	host, err := scanHost(repository.database.QueryRowContext(ctx, decommissionHostSQL, scope.TenantID, scope.ProjectID, hostID, expectedVersion, at))
+	host, err := scanHost(repository.database.QueryRowContext(ctx, decommissionHostSQL, scope.TenantID, scope.ProjectID, hostID, expectedVersion, at, transition.Actor, transition.OperationID, transition.IdempotencyKey, transition.Fingerprint, transition.OwnerToken))
 	if err == nil {
 		return host, nil
 	}
@@ -248,12 +264,14 @@ func scanHost(scanner rowScanner) (Host, error) {
 	var logicalCPUCount, memoryCapacityBytes, enrollmentRevision, observationRevision, version int64
 	var filesystems, addresses, labels, capabilities []byte
 	var helloAt, heartbeatAt sql.NullTime
+	var decommissionActor, decommissionOperation, decommissionKey, decommissionFingerprint, decommissionOwner sql.NullString
 	err := scanner.Scan(
 		&host.Scope.TenantID, &host.Scope.ProjectID, &host.ID, &host.AgentID, &host.DisplayName, &host.Hostname,
 		&host.OperatingSystem, &host.OperatingSystemVersion, &host.KernelVersion, &host.Architecture,
 		&logicalCPUCount, &memoryCapacityBytes, &filesystems, &addresses, &labels, &host.ContainerRuntime,
 		&capabilities, &host.AgentVersion, &enrollmentRevision, &observationRevision, &host.EnrolledAt,
 		&helloAt, &heartbeatAt, &host.Status, &version,
+		&decommissionActor, &decommissionOperation, &decommissionKey, &decommissionFingerprint, &decommissionOwner,
 	)
 	if err != nil {
 		return Host{}, err
@@ -283,6 +301,15 @@ func scanHost(scanner rowScanner) (Host, error) {
 	if heartbeatAt.Valid {
 		host.LastHeartbeatAt = heartbeatAt.Time.UTC()
 	}
+	if decommissionActor.Valid || decommissionOperation.Valid || decommissionKey.Valid || decommissionFingerprint.Valid || decommissionOwner.Valid {
+		if !decommissionActor.Valid || !decommissionOperation.Valid || !decommissionKey.Valid || !decommissionFingerprint.Valid || !decommissionOwner.Valid {
+			return Host{}, ErrInvalid
+		}
+		host.DecommissionTransition = &DecommissionTransition{
+			Actor: decommissionActor.String, OperationID: decommissionOperation.String,
+			IdempotencyKey: decommissionKey.String, Fingerprint: decommissionFingerprint.String, OwnerToken: decommissionOwner.String,
+		}
+	}
 	if host.Validate() != nil {
 		return Host{}, ErrInvalid
 	}
@@ -294,6 +321,7 @@ func hostColumnNames() []string {
 		"tenant_id", "project_id", "host_id", "agent_id", "display_name", "hostname", "operating_system", "operating_system_version", "kernel_version", "architecture",
 		"logical_cpu_count", "memory_capacity_bytes", "filesystems", "network_addresses", "labels", "container_runtime", "capabilities", "agent_version",
 		"enrollment_revision", "observation_revision", "enrolled_at", "last_hello_at", "last_heartbeat_at", "status", "version",
+		"decommission_actor", "decommission_operation", "decommission_idempotency_key", "decommission_fingerprint", "decommission_owner_token",
 	}
 }
 

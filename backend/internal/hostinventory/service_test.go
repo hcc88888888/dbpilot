@@ -67,6 +67,8 @@ func TestServiceRecordHeartbeatPreservesDecommissionedHostDuringRace(t *testing.
 	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
 	host := validHostFixture()
 	host.Status = HostDecommissioned
+	transition := validDecommissionTransition()
+	host.DecommissionTransition = &transition
 	host.LastHeartbeatAt = now.Add(-time.Hour)
 	repository := &recordingRepository{recordHeartbeatResult: host}
 	service := ApplicationService{
@@ -110,6 +112,8 @@ func TestServiceGetAndDecommissionEnforceScopeIdentityAndCAS(t *testing.T) {
 	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
 	host := validHostFixture()
 	host.Status, host.Version = HostDecommissioned, 3
+	transition := validDecommissionTransition()
+	host.DecommissionTransition = &transition
 	repository := &recordingRepository{getResult: validHostFixture(), decommissionResult: host}
 	service := ApplicationService{Repository: repository, Now: func() time.Time { return now }, StaleAfter: time.Minute, OfflineAfter: 5 * time.Minute}
 
@@ -117,15 +121,17 @@ func TestServiceGetAndDecommissionEnforceScopeIdentityAndCAS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, scope, got.Scope)
 
-	got, err = service.Decommission(context.Background(), scope, "host-1", 2)
+	decommissionContext := WithDecommissionTransition(context.Background(), transition)
+	got, err = service.Decommission(decommissionContext, scope, "host-1", 2)
 	require.NoError(t, err)
 	require.Equal(t, HostDecommissioned, got.Status)
 	require.Equal(t, uint64(3), got.Version)
 	require.Equal(t, uint64(2), repository.decommissionExpectedVersion)
 	require.Equal(t, now, repository.decommissionAt)
+	require.Equal(t, transition, repository.decommissionTransition)
 
 	repository.decommissionResult.Scope.ProjectID = "project-2"
-	_, err = service.Decommission(context.Background(), scope, "host-1", 2)
+	_, err = service.Decommission(decommissionContext, scope, "host-1", 2)
 	require.ErrorIs(t, err, ErrInvalid)
 }
 
@@ -141,6 +147,8 @@ func TestServiceRejectsInvalidWindowsAndInputsBeforeRepository(t *testing.T) {
 	service.Now = func() time.Time { return time.Now().UTC() }
 	_, err = service.Decommission(context.Background(), platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, "host-1", math.MaxUint64)
 	require.ErrorIs(t, err, ErrInvalid)
+	_, err = service.Decommission(context.Background(), platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, "host-1", 2)
+	require.ErrorIs(t, err, ErrInvalid, "decommission requires durable idempotency correlation")
 	require.Zero(t, repository.calls)
 }
 
@@ -174,6 +182,7 @@ type recordingRepository struct {
 	getErr                      error
 	decommissionExpectedVersion uint64
 	decommissionAt              time.Time
+	decommissionTransition      DecommissionTransition
 	decommissionResult          Host
 	decommissionErr             error
 }
@@ -204,9 +213,10 @@ func (repository *recordingRepository) Get(context.Context, platformscope.Scope,
 	return repository.getResult, repository.getErr
 }
 
-func (repository *recordingRepository) Decommission(_ context.Context, _ platformscope.Scope, _ string, expectedVersion uint64, at time.Time) (Host, error) {
+func (repository *recordingRepository) Decommission(_ context.Context, _ platformscope.Scope, _ string, expectedVersion uint64, at time.Time, transition DecommissionTransition) (Host, error) {
 	repository.calls++
 	repository.decommissionExpectedVersion, repository.decommissionAt = expectedVersion, at
+	repository.decommissionTransition = transition
 	return repository.decommissionResult, repository.decommissionErr
 }
 

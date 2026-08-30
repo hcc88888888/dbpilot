@@ -39,10 +39,6 @@ type PreparedObserver interface {
 	Prepared(context.Context, string, *agentv1.CommandPrepared) (*agentv1.CommandStart, error)
 }
 
-type HostObservationObserver interface {
-	HostObservation(context.Context, string, *agentv1.HostObservation) error
-}
-
 // NoopObserver is the safe pre-integration default for command business events.
 type NoopObserver struct{}
 
@@ -252,20 +248,6 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		}
 	case *agentv1.AgentMessage_Inventory:
 		// Inventory is authenticated by this stream and consumed by the inventory service in a later task.
-	case *agentv1.AgentMessage_HostObservation:
-		if typed.HostObservation == nil {
-			return status.Error(codes.InvalidArgument, "host observation is required")
-		}
-		if subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.HostObservation.GetAgentId())) != 1 {
-			return status.Error(codes.PermissionDenied, "host observation Agent ID does not match the session identity")
-		}
-		observer, ok := s.observer.(HostObservationObserver)
-		if !ok {
-			return status.Error(codes.FailedPrecondition, "host observation service is unavailable")
-		}
-		if err := observer.HostObservation(ctx, agentID, typed.HostObservation); err != nil {
-			return status.Error(codes.Unavailable, "host observation persistence failed")
-		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}

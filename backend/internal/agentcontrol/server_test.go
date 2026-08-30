@@ -157,36 +157,6 @@ func TestConnectRecordsRealHeartbeatWhileCommandResultObserverIsBlocked(t *testi
 	require.NoError(t, <-done)
 }
 
-func TestConnectDeliversHostObservationOnlyForAuthenticatedAgent(t *testing.T) {
-	observer := &recordingHostObservationObserver{observations: make(chan *agentv1.HostObservation, 1)}
-	server := NewServer(NewRegistry(2), observer)
-	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
-	done := make(chan error, 1)
-	go func() { done <- server.Connect(stream) }()
-	_ = stream.nextSent(t)
-	observedAt := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
-	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_HostObservation{HostObservation: &agentv1.HostObservation{
-		HostId: "host-a", AgentId: "agent-a", ObservationRevision: 1, Hostname: "db-a.example",
-		OperatingSystem: "linux", Architecture: "amd64", LogicalCpuCount: 4, MemoryCapacityBytes: 1024,
-		ObservedAt: timestamppb.New(observedAt),
-	}}})
-	select {
-	case observation := <-observer.observations:
-		require.Equal(t, "host-a", observation.GetHostId())
-		require.Equal(t, observedAt, observation.GetObservedAt().AsTime())
-	case err := <-done:
-		t.Fatalf("Connect returned before delivering HostObservation: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("HostObservation was not delivered")
-	}
-	stream.closeReceive()
-	require.NoError(t, <-done)
-
-	mismatch := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
-	mismatch.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_HostObservation{HostObservation: &agentv1.HostObservation{HostId: "host-b", AgentId: "agent-b"}}})
-	require.Equal(t, codes.PermissionDenied, status.Code(server.Connect(mismatch)))
-}
-
 func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.T) {
 	now := time.Unix(1_725_000_000, 0).UTC()
 	registry := NewRegistry(1)
@@ -532,16 +502,6 @@ type blockingObserver struct {
 	connectedRelease chan struct{}
 	resultEntered    chan struct{}
 	resultRelease    chan struct{}
-}
-
-type recordingHostObservationObserver struct {
-	NoopObserver
-	observations chan *agentv1.HostObservation
-}
-
-func (observer *recordingHostObservationObserver) HostObservation(_ context.Context, _ string, value *agentv1.HostObservation) error {
-	observer.observations <- proto.Clone(value).(*agentv1.HostObservation)
-	return nil
 }
 
 func (o *blockingObserver) Connected(ctx context.Context, _ SessionInfo) {

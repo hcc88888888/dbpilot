@@ -110,15 +110,16 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 	if err != nil {
 		return nil, err
 	}
-	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
+	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
 		current, recoveryErr := api.services.Hosts.Get(recoveryContext, scope, request.HostId)
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
-		if current.Status != hostinventory.HostDecommissioned || current.Version != uint64(version)+1 {
+		expectedTransition := hostDecommissionTransition(key, fingerprint, processing.OwnerToken)
+		if current.Status != hostinventory.HostDecommissioned || current.Version != uint64(version)+1 || current.DecommissionTransition == nil || !current.DecommissionTransition.Matches(expectedTransition) {
 			return idempotency.Response{}, idempotency.ErrInProgress
 		}
-		return storedHostDecommissionResponse(current, scope, request.HostId)
+		return storedHostDecommissionResponse(current, scope, request.HostId, expectedTransition)
 	})
 	if err != nil {
 		return nil, err
@@ -130,7 +131,9 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 		return hostDecommissionIdempotentResponse{response: *claim.Response}, nil
 	}
 	owner := claim.OwnerToken
-	host, err := api.services.Hosts.Decommission(ctx, scope, request.HostId, uint64(version))
+	transition := hostDecommissionTransition(key, fingerprint, owner)
+	decommissionContext := hostinventory.WithDecommissionTransition(ctx, transition)
+	host, err := api.services.Hosts.Decommission(decommissionContext, scope, request.HostId, uint64(version))
 	if errors.Is(err, hostinventory.ErrConflict) {
 		if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, owner); abortErr != nil {
 			return nil, abortErr
@@ -145,7 +148,7 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 		}
 		return nil, err
 	}
-	stored, err := storedHostDecommissionResponse(host, scope, request.HostId)
+	stored, err := storedHostDecommissionResponse(host, scope, request.HostId, transition)
 	if err != nil {
 		return nil, err
 	}
@@ -156,14 +159,21 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 	return hostDecommissionIdempotentResponse{response: completed}, nil
 }
 
+func hostDecommissionTransition(key idempotency.Key, fingerprint, owner string) hostinventory.DecommissionTransition {
+	return hostinventory.DecommissionTransition{
+		Actor: key.Actor, OperationID: key.OperationID, IdempotencyKey: key.IdempotencyKey,
+		Fingerprint: fingerprint, OwnerToken: owner,
+	}
+}
+
 type hostDecommissionIdempotentResponse struct{ response idempotency.Response }
 
 func (response hostDecommissionIdempotentResponse) VisitDecommissionHostResponse(writer http.ResponseWriter) error {
 	return writeIdempotencyResponse(writer, response.response)
 }
 
-func storedHostDecommissionResponse(value hostinventory.Host, scope platformscope.Scope, hostID string) (idempotency.Response, error) {
-	if value.Scope != scope || value.ID != hostID || value.Status != hostinventory.HostDecommissioned {
+func storedHostDecommissionResponse(value hostinventory.Host, scope platformscope.Scope, hostID string, expected hostinventory.DecommissionTransition) (idempotency.Response, error) {
+	if value.Scope != scope || value.ID != hostID || value.Status != hostinventory.HostDecommissioned || value.DecommissionTransition == nil || !value.DecommissionTransition.Matches(expected) {
 		return idempotency.Response{}, errors.New("stored host decommission snapshot is invalid")
 	}
 	body, err := openAPIManagedHost(value)

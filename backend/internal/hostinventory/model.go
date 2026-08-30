@@ -2,6 +2,7 @@
 package hostinventory
 
 import (
+	"context"
 	"errors"
 	"math"
 	"regexp"
@@ -18,9 +19,10 @@ const (
 )
 
 var (
-	ErrInvalid  = errors.New("invalid host inventory value")
-	ErrNotFound = errors.New("managed host not found")
-	ErrConflict = errors.New("managed host version conflict")
+	ErrInvalid       = errors.New("invalid host inventory value")
+	ErrNotFound      = errors.New("managed host not found")
+	ErrConflict      = errors.New("managed host version conflict")
+	ErrStaleRevision = errors.New("host observation revision is stale")
 )
 
 type HostStatus string
@@ -58,31 +60,67 @@ type FilesystemSummary struct {
 	AvailableBytes uint64 `json:"available_bytes"`
 }
 
+type DecommissionTransition struct {
+	Actor          string
+	OperationID    string
+	IdempotencyKey string
+	Fingerprint    string
+	OwnerToken     string
+}
+
+type decommissionTransitionContextKey struct{}
+
+func WithDecommissionTransition(ctx context.Context, transition DecommissionTransition) context.Context {
+	return context.WithValue(ctx, decommissionTransitionContextKey{}, transition)
+}
+
+func DecommissionTransitionFromContext(ctx context.Context) (DecommissionTransition, bool) {
+	if ctx == nil {
+		return DecommissionTransition{}, false
+	}
+	transition, ok := ctx.Value(decommissionTransitionContextKey{}).(DecommissionTransition)
+	return transition, ok && transition.Validate() == nil
+}
+
+func (transition DecommissionTransition) Validate() error {
+	if !boundedRequired(transition.Actor, 256) || transition.OperationID != "decommissionHost" ||
+		!boundedRequired(transition.IdempotencyKey, 256) || !fingerprintPattern.MatchString(transition.Fingerprint) ||
+		!ownerTokenPattern.MatchString(transition.OwnerToken) {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (transition DecommissionTransition) Matches(expected DecommissionTransition) bool {
+	return transition.Validate() == nil && expected.Validate() == nil && transition == expected
+}
+
 type Host struct {
-	Scope                  platformscope.Scope `json:"scope"`
-	ID                     string              `json:"host_id"`
-	AgentID                string              `json:"agent_id"`
-	DisplayName            string              `json:"display_name"`
-	Hostname               string              `json:"hostname"`
-	OperatingSystem        string              `json:"operating_system"`
-	OperatingSystemVersion string              `json:"operating_system_version,omitempty"`
-	KernelVersion          string              `json:"kernel_version,omitempty"`
-	Architecture           string              `json:"architecture"`
-	CPU                    ResourceSummary     `json:"cpu_summary,omitempty"`
-	Memory                 ResourceSummary     `json:"memory_summary,omitempty"`
-	Filesystems            []FilesystemSummary `json:"filesystem_summary,omitempty"`
-	NetworkAddresses       []string            `json:"network_addresses"`
-	Labels                 map[string]string   `json:"labels"`
-	ContainerRuntime       ContainerRuntime    `json:"container_runtime"`
-	Capabilities           []Capability        `json:"capabilities"`
-	AgentVersion           string              `json:"agent_version,omitempty"`
-	EnrollmentRevision     uint64              `json:"enrollment_revision"`
-	ObservationRevision    uint64              `json:"observation_revision"`
-	EnrolledAt             time.Time           `json:"enrolled_at"`
-	LastHelloAt            time.Time           `json:"last_hello_at,omitempty"`
-	LastHeartbeatAt        time.Time           `json:"last_heartbeat_at,omitempty"`
-	Status                 HostStatus          `json:"status"`
-	Version                uint64              `json:"version"`
+	Scope                  platformscope.Scope     `json:"scope"`
+	ID                     string                  `json:"host_id"`
+	AgentID                string                  `json:"agent_id"`
+	DisplayName            string                  `json:"display_name"`
+	Hostname               string                  `json:"hostname"`
+	OperatingSystem        string                  `json:"operating_system"`
+	OperatingSystemVersion string                  `json:"operating_system_version,omitempty"`
+	KernelVersion          string                  `json:"kernel_version,omitempty"`
+	Architecture           string                  `json:"architecture"`
+	CPU                    ResourceSummary         `json:"cpu_summary,omitempty"`
+	Memory                 ResourceSummary         `json:"memory_summary,omitempty"`
+	Filesystems            []FilesystemSummary     `json:"filesystem_summary,omitempty"`
+	NetworkAddresses       []string                `json:"network_addresses"`
+	Labels                 map[string]string       `json:"labels"`
+	ContainerRuntime       ContainerRuntime        `json:"container_runtime"`
+	Capabilities           []Capability            `json:"capabilities"`
+	AgentVersion           string                  `json:"agent_version,omitempty"`
+	EnrollmentRevision     uint64                  `json:"enrollment_revision"`
+	ObservationRevision    uint64                  `json:"observation_revision"`
+	EnrolledAt             time.Time               `json:"enrolled_at"`
+	LastHelloAt            time.Time               `json:"last_hello_at,omitempty"`
+	LastHeartbeatAt        time.Time               `json:"last_heartbeat_at,omitempty"`
+	Status                 HostStatus              `json:"status"`
+	Version                uint64                  `json:"version"`
+	DecommissionTransition *DecommissionTransition `json:"-"`
 }
 
 // Observation contains only inventory reported by an authenticated Agent.
@@ -123,6 +161,8 @@ type Page struct {
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var capabilityPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 var labelNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+var fingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var ownerTokenPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
 
 func (host Host) Validate() error {
 	if host.Scope.Validate() != nil || !identifierPattern.MatchString(host.ID) || !identifierPattern.MatchString(host.AgentID) ||
@@ -134,7 +174,8 @@ func (host Host) Validate() error {
 		!validUTC(host.EnrolledAt) || !validOptionalUTC(host.LastHelloAt) || !validOptionalUTC(host.LastHeartbeatAt) ||
 		!validHostStatus(host.Status) || !validContainerRuntime(host.ContainerRuntime) ||
 		!validResource(host.CPU) || !validResource(host.Memory) || !validFilesystems(host.Filesystems) ||
-		!validUniqueStrings(host.NetworkAddresses, 32, 64, false) || !validLabels(host.Labels) || !validCapabilities(host.Capabilities) {
+		!validUniqueStrings(host.NetworkAddresses, 32, 64, false) || !validLabels(host.Labels) || !validCapabilities(host.Capabilities) ||
+		(host.DecommissionTransition != nil && (host.Status != HostDecommissioned || host.DecommissionTransition.Validate() != nil)) {
 		return ErrInvalid
 	}
 	return nil

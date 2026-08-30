@@ -12,7 +12,7 @@ type Repository interface {
 	RecordHeartbeat(context.Context, platformscope.Scope, string, time.Time) (Host, error)
 	List(context.Context, platformscope.Scope, Filter) (Page, error)
 	Get(context.Context, platformscope.Scope, string) (Host, error)
-	Decommission(context.Context, platformscope.Scope, string, uint64, time.Time) (Host, error)
+	Decommission(context.Context, platformscope.Scope, string, uint64, time.Time, DecommissionTransition) (Host, error)
 }
 
 type AgentScopeResolver interface {

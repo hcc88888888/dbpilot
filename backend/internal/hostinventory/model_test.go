@@ -157,6 +157,53 @@ func TestMigrationDefinesScopedUniqueHostsAndAppendOnlyObservations(t *testing.T
 	}
 }
 
+func TestMigrationAddsDurableDecommissionCorrelationForwardOnly(t *testing.T) {
+	content, err := migrationFiles.ReadFile("migrations/0002_decommission_correlation.sql")
+	require.NoError(t, err)
+	schema := string(content)
+	for _, required := range []string{
+		"ALTER TABLE managed_hosts",
+		"ADD COLUMN decommission_actor TEXT",
+		"ADD COLUMN decommission_operation TEXT",
+		"ADD COLUMN decommission_idempotency_key TEXT",
+		"ADD COLUMN decommission_fingerprint TEXT",
+		"ADD COLUMN decommission_owner_token TEXT",
+		"ADD CONSTRAINT managed_hosts_decommission_correlation",
+	} {
+		require.Contains(t, schema, required)
+	}
+}
+
+func TestDecommissionTransitionValidationAndMatching(t *testing.T) {
+	valid := validDecommissionTransition()
+	require.NoError(t, valid.Validate())
+	require.True(t, valid.Matches(valid))
+
+	for _, mutate := range []func(*DecommissionTransition){
+		func(value *DecommissionTransition) { value.Actor = "" },
+		func(value *DecommissionTransition) { value.OperationID = "otherOperation" },
+		func(value *DecommissionTransition) { value.IdempotencyKey = "" },
+		func(value *DecommissionTransition) { value.Fingerprint = "sha256:invalid" },
+		func(value *DecommissionTransition) { value.OwnerToken = "owner-invalid" },
+	} {
+		transition := valid
+		mutate(&transition)
+		require.ErrorIs(t, transition.Validate(), ErrInvalid)
+		require.False(t, transition.Matches(valid))
+	}
+}
+
+func TestHostValidationAllowsLegacyDecommissionWithoutFalseRecoveryCorrelation(t *testing.T) {
+	legacy := validHostFixture()
+	legacy.Status = HostDecommissioned
+	require.NoError(t, legacy.Validate(), "0002 must remain forward-compatible with rows decommissioned before correlation existed")
+
+	invalid := validHostFixture()
+	transition := validDecommissionTransition()
+	invalid.DecommissionTransition = &transition
+	require.ErrorIs(t, invalid.Validate(), ErrInvalid, "only a decommissioned Host may carry transition correlation")
+}
+
 func validHostFixture() Host {
 	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	return Host{
@@ -180,6 +227,13 @@ func validObservationFixture() Observation {
 		Filesystems:      []FilesystemSummary{{MountPoint: "/", CapacityBytes: 1024, AvailableBytes: 512}},
 		NetworkAddresses: []string{"10.0.0.1"}, Capabilities: []string{"host.collect"},
 		ObservedAt: time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC),
+	}
+}
+
+func validDecommissionTransition() DecommissionTransition {
+	return DecommissionTransition{
+		Actor: "operator-1", OperationID: "decommissionHost", IdempotencyKey: "decommission-1",
+		Fingerprint: "sha256:" + stringOfLength(64), OwnerToken: "owner-" + stringOfLength(64),
 	}
 }
 

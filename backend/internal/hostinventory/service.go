@@ -133,18 +133,19 @@ func (service ApplicationService) Get(ctx context.Context, scope platformscope.S
 }
 
 func (service ApplicationService) Decommission(ctx context.Context, scope platformscope.Scope, hostID string, expectedVersion uint64) (Host, error) {
-	if ctx == nil || service.Repository == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !validPostgresRevision(expectedVersion, false) {
+	transition, transitionOK := DecommissionTransitionFromContext(ctx)
+	if ctx == nil || service.Repository == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !validPostgresRevision(expectedVersion, false) || !transitionOK {
 		return Host{}, ErrInvalid
 	}
 	now, _, _, err := service.classification()
 	if err != nil {
 		return Host{}, err
 	}
-	host, err := service.Repository.Decommission(ctx, scope, hostID, expectedVersion, now)
+	host, err := service.Repository.Decommission(ctx, scope, hostID, expectedVersion, now, transition)
 	if err != nil {
 		return Host{}, err
 	}
-	if host.Validate() != nil || host.Scope != scope || host.ID != hostID || host.Status != HostDecommissioned || host.Version != expectedVersion+1 {
+	if host.Validate() != nil || host.Scope != scope || host.ID != hostID || host.Status != HostDecommissioned || host.Version != expectedVersion+1 || host.DecommissionTransition == nil || !host.DecommissionTransition.Matches(transition) {
 		return Host{}, ErrInvalid
 	}
 	return host, nil

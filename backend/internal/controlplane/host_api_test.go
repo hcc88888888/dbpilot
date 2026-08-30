@@ -127,6 +127,31 @@ func TestManagedHostDecommissionRetryRecoversCommittedSideEffectAndAudit(t *test
 	require.Equal(t, 1, audits.recordCalls)
 }
 
+func TestManagedHostDecommissionRecoveryRejectsCompetingActorTransition(t *testing.T) {
+	host := validManagedHost()
+	hosts := &competingHostService{host: host, failNext: errors.New("request A stopped before CAS")}
+	audits := &recordingAuditService{}
+	services := Services{Hosts: hosts, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	actorA := principalWith(platformTestScope, openapi.PermissionDecommissionHost)
+	actorA.Subject = "operator-a"
+	actorB := principalWith(platformTestScope, openapi.PermissionDecommissionHost)
+	actorB.Subject = "operator-b"
+
+	firstA := servePlatformRequest(services, actorA, newDecommissionHostRequest(`"2"`, "request-a"))
+	requireProblem(t, firstA, http.StatusInternalServerError, "internal_error", firstA.Header().Get("X-Request-ID"))
+
+	requestB := servePlatformRequest(services, actorB, newDecommissionHostRequest(`"2"`, "request-b"))
+	require.Equal(t, http.StatusOK, requestB.Code, requestB.Body.String())
+	require.Equal(t, `"3"`, requestB.Header().Get("ETag"))
+	require.Len(t, audits.records, 1)
+	require.Equal(t, "operator-b", audits.records[0].Actor.ID)
+
+	retryA := servePlatformRequest(services, actorA, newDecommissionHostRequest(`"2"`, "request-a"))
+	requireProblem(t, retryA, http.StatusConflict, "idempotency_in_progress", retryA.Header().Get("X-Request-ID"))
+	require.Equal(t, 2, hosts.decommissionCalls, "A retry must not repeat CAS after B owns the transition")
+	require.Len(t, audits.records, 1, "A must not Audit B's transition")
+}
+
 func TestManagedHostHandlersRejectOutOfScopeServiceValues(t *testing.T) {
 	host := validManagedHost()
 	host.Scope.ProjectID = "other-project"
@@ -161,21 +186,22 @@ func validManagedHost() hostinventory.Host {
 }
 
 type recordingHostService struct {
-	listValue           hostinventory.Page
-	listErr             error
-	listScope           platformscope.Scope
-	listFilter          hostinventory.Filter
-	listCalls           int
-	getValue            hostinventory.Host
-	getErr              error
-	getScope            platformscope.Scope
-	getID               string
-	decommissionValue   hostinventory.Host
-	decommissionErr     error
-	decommissionScope   platformscope.Scope
-	decommissionID      string
-	decommissionVersion uint64
-	decommissionCalls   int
+	listValue              hostinventory.Page
+	listErr                error
+	listScope              platformscope.Scope
+	listFilter             hostinventory.Filter
+	listCalls              int
+	getValue               hostinventory.Host
+	getErr                 error
+	getScope               platformscope.Scope
+	getID                  string
+	decommissionValue      hostinventory.Host
+	decommissionErr        error
+	decommissionScope      platformscope.Scope
+	decommissionID         string
+	decommissionVersion    uint64
+	decommissionTransition hostinventory.DecommissionTransition
+	decommissionCalls      int
 }
 
 func (service *recordingHostService) RecordObservation(context.Context, hostinventory.Observation) (hostinventory.Host, error) {
@@ -193,10 +219,66 @@ func (service *recordingHostService) Get(_ context.Context, scope platformscope.
 	return service.getValue, service.getErr
 }
 
-func (service *recordingHostService) Decommission(_ context.Context, scope platformscope.Scope, id string, version uint64) (hostinventory.Host, error) {
+func (service *recordingHostService) Decommission(ctx context.Context, scope platformscope.Scope, id string, version uint64) (hostinventory.Host, error) {
 	service.decommissionCalls++
 	service.decommissionScope, service.decommissionID, service.decommissionVersion = scope, id, version
-	return service.decommissionValue, service.decommissionErr
+	transition, ok := hostinventory.DecommissionTransitionFromContext(ctx)
+	if !ok {
+		return hostinventory.Host{}, hostinventory.ErrInvalid
+	}
+	service.decommissionTransition = transition
+	value := service.decommissionValue
+	if service.decommissionErr == nil {
+		value.DecommissionTransition = &transition
+		service.getValue = value
+	}
+	return value, service.decommissionErr
 }
 
 var _ hostinventory.Service = (*recordingHostService)(nil)
+
+type competingHostService struct {
+	host              hostinventory.Host
+	failNext          error
+	decommissionCalls int
+}
+
+func (*competingHostService) RecordObservation(context.Context, hostinventory.Observation) (hostinventory.Host, error) {
+	return hostinventory.Host{}, errors.New("unexpected observation")
+}
+
+func (service *competingHostService) List(context.Context, platformscope.Scope, hostinventory.Filter) (hostinventory.Page, error) {
+	return hostinventory.Page{}, nil
+}
+
+func (service *competingHostService) Get(_ context.Context, scope platformscope.Scope, id string) (hostinventory.Host, error) {
+	if service.host.Scope != scope || service.host.ID != id {
+		return hostinventory.Host{}, hostinventory.ErrNotFound
+	}
+	return service.host, nil
+}
+
+func (service *competingHostService) Decommission(ctx context.Context, scope platformscope.Scope, id string, version uint64) (hostinventory.Host, error) {
+	service.decommissionCalls++
+	if service.failNext != nil {
+		err := service.failNext
+		service.failNext = nil
+		return hostinventory.Host{}, err
+	}
+	transition, ok := hostinventory.DecommissionTransitionFromContext(ctx)
+	if !ok {
+		return hostinventory.Host{}, hostinventory.ErrInvalid
+	}
+	if service.host.Scope != scope || service.host.ID != id {
+		return hostinventory.Host{}, hostinventory.ErrNotFound
+	}
+	if service.host.Status == hostinventory.HostDecommissioned || service.host.Version != version {
+		return hostinventory.Host{}, hostinventory.ErrConflict
+	}
+	service.host.Status = hostinventory.HostDecommissioned
+	service.host.Version++
+	service.host.DecommissionTransition = &transition
+	return service.host, nil
+}
+
+var _ hostinventory.Service = (*competingHostService)(nil)
