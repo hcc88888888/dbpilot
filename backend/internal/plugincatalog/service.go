@@ -2,6 +2,8 @@ package plugincatalog
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"time"
 
@@ -15,6 +17,7 @@ type ArtifactWriter interface {
 
 type Application struct {
 	repository Repository
+	operations OperationRepository
 	artifacts  ArtifactWriter
 	verifier   PackageVerifier
 	now        func() time.Time
@@ -24,21 +27,86 @@ func NewService(repository Repository, artifacts ArtifactWriter, verifier Packag
 	if repository == nil || artifacts == nil || verifier == nil || now == nil {
 		return nil, ErrInvalid
 	}
-	return &Application{repository: repository, artifacts: artifacts, verifier: verifier, now: now}, nil
+	operations, _ := repository.(OperationRepository)
+	return &Application{repository: repository, operations: operations, artifacts: artifacts, verifier: verifier, now: now}, nil
 }
 
-func (service *Application) Upload(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, source io.Reader) (PluginVersion, error) {
-	if service == nil || ctx == nil || scope.Validate() != nil || !canonicalText(metadata.Actor, 256) || metadata.ContentLength <= 0 || source == nil {
-		return PluginVersion{}, beforeSideEffect(ErrInvalid)
+func (service *Application) Ready(ctx context.Context) error {
+	if service == nil || service.operations == nil || ctx == nil {
+		return ErrInvalid
+	}
+	verifier, verifierOK := service.verifier.(interface{ Ready(context.Context) error })
+	repository, repositoryOK := service.repository.(interface{ Ready(context.Context) error })
+	if !verifierOK || !repositoryOK {
+		return ErrInvalid
+	}
+	if err := verifier.Ready(ctx); err != nil {
+		return err
+	}
+	return repository.Ready(ctx)
+}
+
+func (service *Application) UploadOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, source io.Reader) (OperationSnapshot, error) {
+	if service == nil || service.operations == nil || key.Scope != scope || key.Validate() != nil || !json.Valid(auditJSON) || builder == nil {
+		return OperationSnapshot{}, ErrInvalid
+	}
+	if existing, err := service.operations.GetOperation(ctx, key); err == nil && existing.State == OperationCommitted {
+		return existing, nil
+	} else if err != nil && !errors.Is(err, ErrNotFound) {
+		return OperationSnapshot{}, err
 	}
 	verified, err := service.verifier.Verify(ctx, source, metadata.ContentLength)
 	if err != nil {
-		return PluginVersion{}, err
+		return OperationSnapshot{}, err
 	}
-	defer verified.Close()
+	return service.publishVerifiedOperation(ctx, scope, metadata, key, auditJSON, builder, verified)
+}
+
+func (service *Application) publishVerifiedOperation(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, key OperationKey, auditJSON []byte, builder OperationResponseBuilder, verified VerifiedPackage) (OperationSnapshot, error) {
 	createdAt := service.now().UTC()
+	definition, version, artifactValue, err := service.valuesForVerified(scope, metadata, key.RecordID(), createdAt, verified)
+	if err != nil {
+		if verified.Close() != nil {
+			return OperationSnapshot{}, ErrArtifactUnavailable
+		}
+		return OperationSnapshot{}, err
+	}
+	pending, err := service.operations.BeginUploadOperation(ctx, UploadOperationRequest{
+		Key: key, Definition: definition, Version: version, ArtifactID: artifactValue.ID,
+		ArtifactSHA256: version.PackageSHA256, ArtifactBytes: verified.SizeBytes, CreatedBy: metadata.Actor, CreatedAt: createdAt,
+		AuditEventJSON: append([]byte(nil), auditJSON...),
+	})
+	if err != nil {
+		if verified.Close() != nil {
+			return OperationSnapshot{}, ErrArtifactUnavailable
+		}
+		return OperationSnapshot{}, err
+	}
+	if pending.State == OperationCommitted {
+		if verified.Close() != nil {
+			return OperationSnapshot{}, ErrArtifactUnavailable
+		}
+		return pending, nil
+	}
+	reader, err := verified.Open()
+	if err != nil {
+		if verified.Close() != nil {
+			return OperationSnapshot{}, ErrArtifactUnavailable
+		}
+		return OperationSnapshot{}, ErrArtifactUnavailable
+	}
+	storedArtifact, artifactErr := service.artifacts.PutReader(ctx, artifactValue, reader)
+	closeReaderErr := reader.Close()
+	cleanupErr := verified.Close()
+	if artifactErr != nil || closeReaderErr != nil || cleanupErr != nil || storedArtifact.ID != artifactValue.ID || storedArtifact.Scope != scope || storedArtifact.Checksum != artifactValue.Checksum || storedArtifact.SizeBytes != artifactValue.SizeBytes {
+		return OperationSnapshot{}, ErrArtifactUnavailable
+	}
+	return service.operations.FinalizeUploadOperation(ctx, key, builder)
+}
+
+func (service *Application) valuesForVerified(scope platformscope.Scope, metadata UploadMetadata, sourceResourceID string, createdAt time.Time, verified VerifiedPackage) (PluginDefinition, PluginVersion, artifact.Artifact, error) {
 	if createdAt.IsZero() || !digestPattern.MatchString(verified.PackageSHA256) || !digestPattern.MatchString(verified.ManifestDigest) {
-		return PluginVersion{}, beforeSideEffect(ErrInvalid)
+		return PluginDefinition{}, PluginVersion{}, artifact.Artifact{}, beforeSideEffect(ErrInvalid)
 	}
 	versionID := "plugin-version-" + verified.PackageSHA256[:32]
 	artifactID := "plugin-package-" + verified.PackageSHA256
@@ -55,41 +123,76 @@ func (service *Application) Upload(ctx context.Context, scope platformscope.Scop
 		Capabilities: append([]string(nil), verified.Manifest.Capabilities...), MetricTemplateSchemaVersion: verified.Manifest.MetricTemplateSchemaVersion,
 		Platforms: platforms, Revision: 1, CreatedAt: createdAt,
 	}
-	if err := version.Validate(); err != nil {
-		return PluginVersion{}, beforeSideEffect(ErrInvalid)
-	}
-	definition := PluginDefinition{
-		Scope: scope, PluginID: version.PluginID, Name: version.PluginID, DatabaseFamily: verified.Manifest.DatabaseFamily,
-		ProtocolVersion: version.ProtocolVersion, SupportedVariants: append([]string(nil), version.SupportedVariants...), Capabilities: append([]string(nil), version.Capabilities...),
-	}
-	if err := definition.Validate(); err != nil {
-		return PluginVersion{}, beforeSideEffect(ErrInvalid)
-	}
-	reader, err := verified.Open()
-	if err != nil {
-		return PluginVersion{}, ErrArtifactUnavailable
-	}
-	storedArtifact, artifactErr := service.artifacts.PutReader(ctx, artifact.Artifact{
+	definition := PluginDefinition{Scope: scope, PluginID: version.PluginID, Name: version.PluginID, DatabaseFamily: verified.Manifest.DatabaseFamily, ProtocolVersion: version.ProtocolVersion, SupportedVariants: append([]string(nil), version.SupportedVariants...), Capabilities: append([]string(nil), version.Capabilities...)}
+	artifactValue := artifact.Artifact{
 		ID: artifactID, Scope: scope, Kind: "plugin-package", ContentType: "application/gzip", SizeBytes: verified.SizeBytes,
 		Checksum:       "sha256:" + verified.PackageSHA256,
-		SourceResource: artifact.ResourceReference{ResourceType: "plugin-version", ResourceID: versionID},
+		SourceResource: artifact.ResourceReference{ResourceType: "plugin_catalog_operation", ResourceID: sourceResourceID},
 		CreatedBy:      metadata.Actor, CreatedAt: createdAt,
-	}, reader)
-	closeErr := reader.Close()
-	if artifactErr != nil || closeErr != nil {
-		return PluginVersion{}, ErrArtifactUnavailable
 	}
-	if storedArtifact.ID != artifactID || storedArtifact.Scope != scope || storedArtifact.Checksum != "sha256:"+verified.PackageSHA256 || storedArtifact.SizeBytes != verified.SizeBytes {
-		return PluginVersion{}, ErrArtifactUnavailable
+	if version.Validate() != nil || definition.Validate() != nil {
+		return PluginDefinition{}, PluginVersion{}, artifact.Artifact{}, beforeSideEffect(ErrInvalid)
 	}
-	created, err := service.repository.Create(ctx, definition, version)
+	return definition, version, artifactValue, nil
+}
+
+func (service *Application) ApproveOperation(ctx context.Context, scope platformscope.Scope, versionID string, revision uint64, key OperationKey, auditJSON []byte, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	return service.transitionOperation(ctx, TransitionOperationRequest{Key: key, Transition: TransitionRequest{Scope: scope, VersionID: versionID, ExpectedRevision: revision, AllowedFrom: []Status{StatusVerified}, To: StatusApproved}, AuditEventJSON: auditJSON}, builder)
+}
+
+func (service *Application) PublishOperation(ctx context.Context, scope platformscope.Scope, versionID string, revision uint64, key OperationKey, auditJSON []byte, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	return service.transitionOperation(ctx, TransitionOperationRequest{Key: key, Transition: TransitionRequest{Scope: scope, VersionID: versionID, ExpectedRevision: revision, AllowedFrom: []Status{StatusApproved}, To: StatusAvailable}, AuditEventJSON: auditJSON}, builder)
+}
+
+func (service *Application) RevokeOperation(ctx context.Context, scope platformscope.Scope, versionID string, revision uint64, reason string, key OperationKey, auditJSON []byte, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	if !reasonPattern.MatchString(reason) {
+		return OperationSnapshot{}, ErrInvalid
+	}
+	return service.transitionOperation(ctx, TransitionOperationRequest{Key: key, Transition: TransitionRequest{Scope: scope, VersionID: versionID, ExpectedRevision: revision, AllowedFrom: []Status{StatusVerified, StatusApproved, StatusAvailable, StatusDeprecated}, To: StatusRevoked, Reason: reason}, AuditEventJSON: auditJSON}, builder)
+}
+
+func (service *Application) transitionOperation(ctx context.Context, request TransitionOperationRequest, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	if service == nil || service.operations == nil || request.Key.Scope != request.Transition.Scope || request.Key.Validate() != nil || !json.Valid(request.AuditEventJSON) || builder == nil {
+		return OperationSnapshot{}, ErrInvalid
+	}
+	return service.operations.TransitionOperation(ctx, request, builder)
+}
+
+func (service *Application) RecoverOperation(ctx context.Context, key OperationKey) (OperationSnapshot, error) {
+	if service == nil || service.operations == nil || ctx == nil || key.Validate() != nil {
+		return OperationSnapshot{}, ErrInvalid
+	}
+	value, err := service.operations.GetOperation(ctx, key)
+	if err != nil {
+		return OperationSnapshot{}, err
+	}
+	if value.State != OperationCommitted {
+		return OperationSnapshot{}, ErrOperationPending
+	}
+	return value, nil
+}
+
+func (service *Application) Upload(ctx context.Context, scope platformscope.Scope, metadata UploadMetadata, source io.Reader) (PluginVersion, error) {
+	if service == nil || ctx == nil || scope.Validate() != nil || !canonicalText(metadata.Actor, 256) || metadata.ContentLength <= 0 || source == nil {
+		return PluginVersion{}, beforeSideEffect(ErrInvalid)
+	}
+	if service.operations == nil {
+		return PluginVersion{}, ErrInvalid
+	}
+	verified, err := service.verifier.Verify(ctx, source, metadata.ContentLength)
 	if err != nil {
 		return PluginVersion{}, err
 	}
-	if created.ID != version.ID || created.Scope != scope || created.PackageSHA256 != version.PackageSHA256 || created.ManifestDigest != version.ManifestDigest || created.ArtifactID != artifactID || created.Validate() != nil {
-		return PluginVersion{}, ErrConflict
+	key := OperationKey{Scope: scope, Actor: metadata.Actor, OperationID: "uploadPluginVersionPackage", IdempotencyKey: "implicit-" + verified.PackageSHA256[:32], Fingerprint: "sha256:" + verified.PackageSHA256, OwnerToken: "owner-" + verified.PackageSHA256}
+	auditJSON, _ := json.Marshal(map[string]any{"operation_id": key.OperationID, "package_sha256": verified.PackageSHA256})
+	snapshot, err := service.publishVerifiedOperation(ctx, scope, metadata, key, auditJSON, func(value PluginVersion) (OperationResponse, error) {
+		body, marshalErr := json.Marshal(value)
+		return OperationResponse{Status: 201, ETag: value.ETag(), Body: body}, marshalErr
+	}, verified)
+	if err != nil {
+		return PluginVersion{}, err
 	}
-	return created, nil
+	return snapshot.Version, nil
 }
 
 func (service *Application) Approve(ctx context.Context, scope platformscope.Scope, versionID string, expectedRevision uint64) (PluginVersion, error) {

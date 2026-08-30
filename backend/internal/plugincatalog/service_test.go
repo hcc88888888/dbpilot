@@ -7,7 +7,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,8 +47,8 @@ func TestServiceUploadPersistsVerifiedBytesAsImmutableArtifactThenCatalogVersion
 	require.Equal(t, int64(len(fixture.Archive)), storedArtifact.SizeBytes)
 	require.Equal(t, "plugin-package", storedArtifact.Kind)
 	require.Equal(t, "application/gzip", storedArtifact.ContentType)
-	require.Equal(t, "plugin-version", storedArtifact.SourceResource.ResourceType)
-	require.Equal(t, version.ID, storedArtifact.SourceResource.ResourceID)
+	require.Equal(t, "plugin_catalog_operation", storedArtifact.SourceResource.ResourceType)
+	require.True(t, strings.HasPrefix(storedArtifact.SourceResource.ResourceID, "plugin-operation-"))
 	require.Equal(t, "publisher-user", storedArtifact.CreatedBy)
 	require.Equal(t, fixture.Archive, artifacts.contents[0])
 	require.Equal(t, storedArtifact.ID, repository.created[0].ArtifactID)
@@ -99,6 +101,37 @@ func TestServiceLifecycleUsesScopedRevisionCAS(t *testing.T) {
 	}, repository.transitions)
 }
 
+func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFailure(t *testing.T) {
+	// Break caught: Artifact publication must always have a durable pending
+	// operation that can be finalized after a catalog crash/SQL failure.
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	repository := &recordingCatalogRepository{finalizeOperationErr: errors.New("catalog unavailable after artifact")}
+	artifacts := &recordingArtifactWriter{}
+	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), func() time.Time { return time.Date(2026, 8, 30, 4, 0, 0, 0, time.UTC) })
+	require.NoError(t, err)
+	key := OperationKey{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, Actor: "publisher-user", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "upload-operation", Fingerprint: "sha256:" + stringsOfZeros(64), OwnerToken: "owner-" + stringsOfZeros(64)}
+	builder := func(value PluginVersion) (OperationResponse, error) {
+		return OperationResponse{Status: 201, ETag: value.ETag(), Body: []byte(`{"version_id":"` + value.ID + `"}`)}, nil
+	}
+
+	_, err = service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.EqualError(t, err, "catalog unavailable after artifact")
+	require.Equal(t, 1, repository.beginOperationCalls)
+	require.Equal(t, OperationPending, repository.operation.State)
+	require.Len(t, artifacts.values, 1)
+	require.Equal(t, "plugin_catalog_operation", artifacts.values[0].SourceResource.ResourceType)
+	require.Equal(t, key.RecordID(), artifacts.values[0].SourceResource.ResourceID)
+
+	repository.finalizeOperationErr = nil
+	snapshot, err := service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.NoError(t, err)
+	require.Equal(t, OperationCommitted, snapshot.State)
+	require.Equal(t, 1, repository.beginOperationCalls, "retry reuses the durable reservation")
+	require.Equal(t, 2, repository.finalizeOperationCalls)
+}
+
 type recordingArtifactWriter struct {
 	values   []artifact.Artifact
 	contents [][]byte
@@ -121,14 +154,18 @@ func (writer *recordingArtifactWriter) PutReader(_ context.Context, value artifa
 }
 
 type recordingCatalogRepository struct {
-	created         []PluginVersion
-	order           []string
-	createErr       error
-	transitionValue PluginVersion
-	transitionErr   error
-	transitions     []TransitionRequest
-	page            VersionPage
-	definitions     DefinitionPage
+	created                []PluginVersion
+	order                  []string
+	createErr              error
+	transitionValue        PluginVersion
+	transitionErr          error
+	transitions            []TransitionRequest
+	page                   VersionPage
+	definitions            DefinitionPage
+	operation              OperationSnapshot
+	beginOperationCalls    int
+	finalizeOperationCalls int
+	finalizeOperationErr   error
 }
 
 func (repository *recordingCatalogRepository) Create(_ context.Context, _ PluginDefinition, version PluginVersion) (PluginVersion, error) {
@@ -156,6 +193,50 @@ func (repository *recordingCatalogRepository) ListVersions(context.Context, plat
 
 func (repository *recordingCatalogRepository) ListDefinitions(context.Context, platformscope.Scope, DefinitionFilter) (DefinitionPage, error) {
 	return repository.definitions, nil
+}
+
+func (repository *recordingCatalogRepository) GetOperation(_ context.Context, key OperationKey) (OperationSnapshot, error) {
+	if repository.operation.Key.Identity() != key.Identity() {
+		return OperationSnapshot{}, ErrNotFound
+	}
+	return repository.operation, nil
+}
+
+func (repository *recordingCatalogRepository) BeginUploadOperation(_ context.Context, request UploadOperationRequest) (OperationSnapshot, error) {
+	if repository.operation.Key.Identity() == request.Key.Identity() {
+		return repository.operation, nil
+	}
+	repository.beginOperationCalls++
+	repository.operation = OperationSnapshot{Key: request.Key, State: OperationPending, Version: request.Version, AuditEventJSON: append([]byte(nil), request.AuditEventJSON...)}
+	return repository.operation, nil
+}
+
+func (repository *recordingCatalogRepository) FinalizeUploadOperation(_ context.Context, _ OperationKey, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	repository.finalizeOperationCalls++
+	if repository.finalizeOperationErr != nil {
+		return OperationSnapshot{}, repository.finalizeOperationErr
+	}
+	response, err := builder(repository.operation.Version)
+	if err != nil {
+		return OperationSnapshot{}, err
+	}
+	repository.operation.State, repository.operation.Response = OperationCommitted, response
+	repository.created = append(repository.created, repository.operation.Version)
+	repository.order = append(repository.order, "catalog")
+	return repository.operation, nil
+}
+
+func (repository *recordingCatalogRepository) TransitionOperation(_ context.Context, request TransitionOperationRequest, builder OperationResponseBuilder) (OperationSnapshot, error) {
+	value, err := repository.Transition(context.Background(), request.Transition)
+	if err != nil {
+		return OperationSnapshot{}, err
+	}
+	response, err := builder(value)
+	if err != nil {
+		return OperationSnapshot{}, err
+	}
+	repository.operation = OperationSnapshot{Key: request.Key, State: OperationCommitted, Version: value, Response: response, AuditEventJSON: append([]byte(nil), request.AuditEventJSON...)}
+	return repository.operation, nil
 }
 
 type recordingPackageVerifier struct {

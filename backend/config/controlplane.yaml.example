@@ -37,6 +37,11 @@ artifact:
   # route rejects traversal, symlink escape, size drift, and checksum drift.
   storage_root: "/var/lib/dbpilot/artifacts"
   signing_key_ref: "secret://controlplane/artifact-download"
+plugin_catalog:
+  # Disabled is explicit during incremental rollout. When enabled, configure
+  # at least one non-secret Ed25519 public key below.
+  enabled: false
+plugin_publishers: []
 monitoring:
   maximum_instances: 200
   maximum_metrics: 50

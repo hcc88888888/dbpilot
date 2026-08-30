@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -57,6 +59,65 @@ func TestPluginUploadStreamsBeyondJSONLimitAndReplaysIdempotentlyWithAudit(t *te
 	conflict := servePlatformRequest(services, principal, conflictRequest)
 	requireProblem(t, conflict, http.StatusConflict, "idempotency_conflict", conflict.Header().Get("X-Request-ID"))
 	require.Equal(t, 1, service.uploadCalls)
+}
+
+func TestPluginUploadProcessingRecoveryReplaysImmutableOriginalSnapshotAfterApproval(t *testing.T) {
+	// Break caught: a crash after verified revision 1 must not replay a later
+	// approved row as the original upload response or Audit event.
+	body := []byte("durable-upload-body")
+	service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 1))
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("simulated crash after catalog commit")
+	services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage)
+
+	first := servePlatformRequest(services, principal, newPluginUploadRequest(body, "upload-crash-key"))
+	require.Equal(t, http.StatusInternalServerError, first.Code)
+	require.Equal(t, 1, service.uploadOperationCalls)
+	service.uploadValue = validCatalogVersion(plugincatalog.StatusApproved, 2)
+	store.completeErr = nil
+
+	retry := servePlatformRequest(services, principal, newPluginUploadRequest(body, "upload-crash-key"))
+	require.Equal(t, http.StatusCreated, retry.Code, retry.Body.String())
+	require.Equal(t, `"1"`, retry.Header().Get("ETag"))
+	require.Contains(t, retry.Body.String(), `"status":"verified"`)
+	require.Equal(t, 1, service.uploadOperationCalls, "recovery must use the immutable operation snapshot")
+	require.Equal(t, 1, service.recoverOperationCalls)
+	require.Equal(t, 1, audits.recordCalls)
+}
+
+func TestPluginApproveProcessingRecoveryReplaysApprovedSnapshotAfterPublish(t *testing.T) {
+	// Break caught: a later available revision cannot make the original approve
+	// idempotency key unrecoverable or change its ETag/body.
+	service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 7))
+	service.approveValue = validCatalogVersion(plugincatalog.StatusApproved, 8)
+	audits := &recordingAuditService{}
+	store := newHTTPIdempotencyStore()
+	store.completeErr = errors.New("simulated crash after approve commit")
+	services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(store)}
+	principal := principalWith(platformTestScope, openapi.PermissionApprovePluginVersion)
+	request := func() *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions/plugin-version-1/actions/approve", bytes.NewBufferString(`{}`))
+		value.Header.Set("Content-Type", "application/json")
+		value.Header.Set("Idempotency-Key", "approve-crash-key")
+		value.Header.Set("If-Match", `"7"`)
+		return value
+	}
+
+	first := servePlatformRequest(services, principal, request())
+	require.Equal(t, http.StatusInternalServerError, first.Code)
+	require.Equal(t, 1, service.approveOperationCalls)
+	service.approveValue = validCatalogVersion(plugincatalog.StatusAvailable, 9)
+	store.completeErr = nil
+
+	retry := servePlatformRequest(services, principal, request())
+	require.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+	require.Equal(t, `"8"`, retry.Header().Get("ETag"))
+	require.Contains(t, retry.Body.String(), `"status":"approved"`)
+	require.Equal(t, 1, service.approveOperationCalls)
+	require.Equal(t, 1, service.recoverOperationCalls)
+	require.Equal(t, 1, audits.recordCalls)
 }
 
 func TestPluginLifecycleAPIsEnforceETagAndReturnPublicMetadataOnly(t *testing.T) {
@@ -163,6 +224,84 @@ func TestPluginUploadRejectsOutOfScopeApplicationResult(t *testing.T) {
 	requireProblem(t, response, http.StatusInternalServerError, "internal_error", response.Header().Get("X-Request-ID"))
 }
 
+func TestPluginUploadAdmissionRejectsBeforeReadingBody(t *testing.T) {
+	// Break caught: permission and cheap contract failures must not consume or
+	// stage an attacker-controlled upload.
+	tests := []struct {
+		name          string
+		principal     Principal
+		contentType   string
+		keyValues     []string
+		contentLength int64
+		wantStatus    int
+	}{
+		{name: "forbidden", principal: principalWith(platformTestScope, openapi.PermissionListPluginVersions), contentType: "application/gzip", keyValues: []string{"upload-key"}, wantStatus: http.StatusForbidden},
+		{name: "wrong media type", principal: principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), contentType: "application/octet-stream", keyValues: []string{"upload-key"}, wantStatus: http.StatusBadRequest},
+		{name: "129 byte key", principal: principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), contentType: "application/gzip", keyValues: []string{repeatString("k", 129)}, wantStatus: http.StatusBadRequest},
+		{name: "duplicate key", principal: principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), contentType: "application/gzip", keyValues: []string{"one", "two"}, wantStatus: http.StatusBadRequest},
+		{name: "missing key", principal: principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), contentType: "application/gzip", wantStatus: http.StatusBadRequest},
+		{name: "oversized content length", principal: principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), contentType: "application/gzip", keyValues: []string{"upload-key"}, contentLength: maximumPluginUploadBytes + 1, wantStatus: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := &countingRequestBody{contents: []byte("must-not-be-read")}
+			request := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions", body)
+			request.ContentLength = int64(len(body.contents))
+			if test.contentLength != 0 {
+				request.ContentLength = test.contentLength
+			}
+			request.Header.Set("Content-Type", test.contentType)
+			request.Header.Del("Idempotency-Key")
+			for _, value := range test.keyValues {
+				request.Header.Add("Idempotency-Key", value)
+			}
+			response := servePlatformRequest(Services{PluginCatalog: &recordingPluginCatalogService{}}, test.principal, request)
+			require.Equal(t, test.wantStatus, response.Code, response.Body.String())
+			require.Zero(t, body.reads)
+		})
+	}
+}
+
+func TestUploadAdmissionEnforcesAggregateBytesAndConcurrency(t *testing.T) {
+	admission := newUploadAdmission(100, 2)
+	releaseFirst, err := admission.Acquire(60)
+	require.NoError(t, err)
+	defer releaseFirst()
+	_, err = admission.Acquire(50)
+	require.ErrorIs(t, err, ErrServiceUnavailable)
+	releaseSecond, err := admission.Acquire(40)
+	require.NoError(t, err)
+	releaseSecond()
+}
+
+func TestDisabledPluginCatalogRejectsBeforeReadingUpload(t *testing.T) {
+	body := &countingRequestBody{contents: []byte("disabled-must-not-stage")}
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions", body)
+	request.ContentLength = int64(len(body.contents))
+	request.Header.Set("Content-Type", "application/gzip")
+	request.Header.Set("Idempotency-Key", "disabled-upload")
+	response := servePlatformRequest(Services{}, principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), request)
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.Zero(t, body.reads)
+}
+
+func TestPluginUploadStagingReportsCleanupFailure(t *testing.T) {
+	body := []byte("cleanup-observed-upload")
+	service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 1))
+	cleanupFailures := 0
+	services := Services{
+		PluginCatalog: service, Audit: &recordingAuditService{}, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()),
+		PluginUploadRemove: func(path string) error {
+			_ = os.Remove(path)
+			return errors.New("injected HTTP upload cleanup failure")
+		},
+		PluginUploadCleanupFailure: func(error) { cleanupFailures++ },
+	}
+	response := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage), newPluginUploadRequest(body, "cleanup-observed"))
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+	require.Equal(t, 1, cleanupFailures)
+}
+
 func TestPluginCatalogProblemMappingsAreFixedAndRedacted(t *testing.T) {
 	// Break caught: wrapping publisher/storage errors must not place filesystem,
 	// signature, or key material in public Problems.
@@ -188,6 +327,47 @@ func TestPluginCatalogProblemMappingsAreFixedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestPluginFailuresAuditExactlyOnceWithoutPublishingState(t *testing.T) {
+	// Break caught: rejected signatures/manifests and stale lifecycle attempts
+	// need a fixed deduplicated failure Audit even though no state is published.
+	t.Run("invalid signature", func(t *testing.T) {
+		service := newRecordingDurableCatalog(plugincatalog.PluginVersion{})
+		service.uploadErr = fmt.Errorf("%w: SIGNATURE bytes /private/path: %w", plugincatalog.ErrBeforeSideEffect, plugincatalog.ErrSignatureRejected)
+		audits := &recordingAuditService{}
+		services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		principal := principalWith(platformTestScope, openapi.PermissionUploadPluginVersionPackage)
+		for range 2 {
+			response := servePlatformRequest(services, principal, newPluginUploadRequest([]byte("invalid-signed-package"), "invalid-signature-key"))
+			require.Equal(t, http.StatusUnprocessableEntity, response.Code)
+		}
+		require.Len(t, audits.records, 1)
+		require.Equal(t, "plugin.version_verification_failed", audits.records[0].Action)
+		require.Equal(t, "failure", audits.records[0].Result)
+		require.NotContains(t, fmt.Sprint(audits.records[0].Detail), "SIGNATURE")
+		require.NotContains(t, fmt.Sprint(audits.records[0].Detail), "private")
+		require.Empty(t, service.operations)
+	})
+
+	t.Run("stale approval", func(t *testing.T) {
+		service := newRecordingDurableCatalog(validCatalogVersion(plugincatalog.StatusVerified, 7))
+		service.approveErr = plugincatalog.ErrRevisionConflict
+		audits := &recordingAuditService{}
+		services := Services{PluginCatalog: service, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+		principal := principalWith(platformTestScope, openapi.PermissionApprovePluginVersion)
+		for range 2 {
+			request := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions/plugin-version-1/actions/approve", bytes.NewBufferString(`{}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", "stale-approve-key")
+			request.Header.Set("If-Match", `"7"`)
+			response := servePlatformRequest(services, principal, request)
+			require.Equal(t, http.StatusPreconditionFailed, response.Code)
+		}
+		require.Len(t, audits.records, 1)
+		require.Equal(t, "plugin.version_transition_failed", audits.records[0].Action)
+		require.Equal(t, "state_revision_conflict", audits.records[0].Detail["error_code"])
+	})
+}
+
 func newPluginUploadRequest(body []byte, key string) *http.Request {
 	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-versions", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/gzip")
@@ -211,26 +391,52 @@ func validCatalogVersion(status plugincatalog.Status, revision uint64) plugincat
 func repeatString(value string, count int) string { return string(bytes.Repeat([]byte(value), count)) }
 
 type recordingPluginCatalogService struct {
-	uploadValue          plugincatalog.PluginVersion
-	uploadErr            error
-	uploadCalls          int
-	uploadScopes         []platformscope.Scope
-	uploadMetadata       []plugincatalog.UploadMetadata
-	uploadBodies         [][]byte
-	approveValue         plugincatalog.PluginVersion
-	publishValue         plugincatalog.PluginVersion
-	revokeValue          plugincatalog.PluginVersion
-	approveRevisions     []uint64
-	publishRevisions     []uint64
-	revokeRevisions      []uint64
-	revokeReasons        []string
-	versionPage          plugincatalog.VersionPage
-	definitionPage       plugincatalog.DefinitionPage
-	listVersionScopes    []platformscope.Scope
-	versionFilters       []plugincatalog.VersionFilter
-	listDefinitionScopes []platformscope.Scope
-	definitionFilters    []plugincatalog.DefinitionFilter
+	uploadValue           plugincatalog.PluginVersion
+	uploadErr             error
+	uploadCalls           int
+	uploadScopes          []platformscope.Scope
+	uploadMetadata        []plugincatalog.UploadMetadata
+	uploadBodies          [][]byte
+	approveValue          plugincatalog.PluginVersion
+	approveErr            error
+	publishValue          plugincatalog.PluginVersion
+	revokeValue           plugincatalog.PluginVersion
+	approveRevisions      []uint64
+	publishRevisions      []uint64
+	revokeRevisions       []uint64
+	revokeReasons         []string
+	versionPage           plugincatalog.VersionPage
+	definitionPage        plugincatalog.DefinitionPage
+	listVersionScopes     []platformscope.Scope
+	versionFilters        []plugincatalog.VersionFilter
+	listDefinitionScopes  []platformscope.Scope
+	definitionFilters     []plugincatalog.DefinitionFilter
+	operations            map[string]plugincatalog.OperationSnapshot
+	uploadOperationCalls  int
+	approveOperationCalls int
+	recoverOperationCalls int
 }
+
+func newRecordingDurableCatalog(value plugincatalog.PluginVersion) *recordingPluginCatalogService {
+	return &recordingPluginCatalogService{uploadValue: value, operations: make(map[string]plugincatalog.OperationSnapshot)}
+}
+
+type countingRequestBody struct {
+	contents []byte
+	reads    int
+}
+
+func (body *countingRequestBody) Read(buffer []byte) (int, error) {
+	body.reads++
+	if len(body.contents) == 0 {
+		return 0, io.EOF
+	}
+	read := copy(buffer, body.contents)
+	body.contents = body.contents[read:]
+	return read, nil
+}
+
+func (*countingRequestBody) Close() error { return nil }
 
 func (service *recordingPluginCatalogService) Upload(_ context.Context, scope platformscope.Scope, metadata plugincatalog.UploadMetadata, reader io.Reader) (plugincatalog.PluginVersion, error) {
 	service.uploadCalls++
@@ -246,7 +452,96 @@ func (service *recordingPluginCatalogService) Upload(_ context.Context, scope pl
 
 func (service *recordingPluginCatalogService) Approve(_ context.Context, _ platformscope.Scope, _ string, revision uint64) (plugincatalog.PluginVersion, error) {
 	service.approveRevisions = append(service.approveRevisions, revision)
-	return service.approveValue, nil
+	return service.approveValue, service.approveErr
+}
+
+func (service *recordingPluginCatalogService) UploadOperation(_ context.Context, scope platformscope.Scope, metadata plugincatalog.UploadMetadata, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder, reader io.Reader) (plugincatalog.OperationSnapshot, error) {
+	service.uploadOperationCalls++
+	service.uploadCalls++
+	if service.uploadErr != nil {
+		return plugincatalog.OperationSnapshot{}, service.uploadErr
+	}
+	if snapshot, ok := service.operations[key.Identity()]; ok {
+		return snapshot, nil
+	}
+	if service.operations == nil {
+		service.operations = make(map[string]plugincatalog.OperationSnapshot)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	service.uploadBodies = append(service.uploadBodies, body)
+	service.uploadScopes = append(service.uploadScopes, scope)
+	service.uploadMetadata = append(service.uploadMetadata, metadata)
+	response, err := builder(service.uploadValue)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	snapshot := plugincatalog.OperationSnapshot{Key: key, State: plugincatalog.OperationCommitted, Version: service.uploadValue, Response: response, AuditEventJSON: append([]byte(nil), auditJSON...)}
+	service.operations[key.Identity()] = snapshot
+	return snapshot, nil
+}
+
+func (service *recordingPluginCatalogService) ApproveOperation(_ context.Context, _ platformscope.Scope, _ string, revision uint64, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
+	service.approveOperationCalls++
+	service.approveRevisions = append(service.approveRevisions, revision)
+	if service.approveErr != nil {
+		return plugincatalog.OperationSnapshot{}, service.approveErr
+	}
+	response, err := builder(service.approveValue)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	snapshot := plugincatalog.OperationSnapshot{Key: key, State: plugincatalog.OperationCommitted, Version: service.approveValue, Response: response, AuditEventJSON: append([]byte(nil), auditJSON...)}
+	if service.operations == nil {
+		service.operations = make(map[string]plugincatalog.OperationSnapshot)
+	}
+	service.operations[key.Identity()] = snapshot
+	return snapshot, nil
+}
+
+func (service *recordingPluginCatalogService) PublishOperation(ctx context.Context, scope platformscope.Scope, id string, revision uint64, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
+	value, err := service.Publish(ctx, scope, id, revision)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	response, err := builder(value)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	snapshot := plugincatalog.OperationSnapshot{Key: key, State: plugincatalog.OperationCommitted, Version: value, Response: response, AuditEventJSON: append([]byte(nil), auditJSON...)}
+	if service.operations == nil {
+		service.operations = make(map[string]plugincatalog.OperationSnapshot)
+	}
+	service.operations[key.Identity()] = snapshot
+	return snapshot, nil
+}
+
+func (service *recordingPluginCatalogService) RevokeOperation(ctx context.Context, scope platformscope.Scope, id string, revision uint64, reason string, key plugincatalog.OperationKey, auditJSON []byte, builder plugincatalog.OperationResponseBuilder) (plugincatalog.OperationSnapshot, error) {
+	value, err := service.Revoke(ctx, scope, id, revision, reason)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	response, err := builder(value)
+	if err != nil {
+		return plugincatalog.OperationSnapshot{}, err
+	}
+	snapshot := plugincatalog.OperationSnapshot{Key: key, State: plugincatalog.OperationCommitted, Version: value, Response: response, AuditEventJSON: append([]byte(nil), auditJSON...)}
+	if service.operations == nil {
+		service.operations = make(map[string]plugincatalog.OperationSnapshot)
+	}
+	service.operations[key.Identity()] = snapshot
+	return snapshot, nil
+}
+
+func (service *recordingPluginCatalogService) RecoverOperation(_ context.Context, key plugincatalog.OperationKey) (plugincatalog.OperationSnapshot, error) {
+	service.recoverOperationCalls++
+	snapshot, ok := service.operations[key.Identity()]
+	if !ok {
+		return plugincatalog.OperationSnapshot{}, plugincatalog.ErrNotFound
+	}
+	return snapshot, nil
 }
 
 func (service *recordingPluginCatalogService) Publish(_ context.Context, _ platformscope.Scope, _ string, revision uint64) (plugincatalog.PluginVersion, error) {

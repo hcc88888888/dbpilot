@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode"
 )
 
@@ -43,12 +45,17 @@ type PackageVerifierConfig struct {
 	Publishers         PublisherKeyStore
 	TemporaryDirectory string
 	Limits             PackageLimits
+	RemoveTemporary    func(string) error
+	CleanupFailure     func(error)
 }
 
 type StreamingPackageVerifier struct {
-	publishers PublisherKeyStore
-	temporary  string
-	limits     PackageLimits
+	publishers      PublisherKeyStore
+	temporary       string
+	limits          PackageLimits
+	removeTemporary func(string) error
+	cleanupFailure  func(error)
+	cleanupFailures atomic.Uint64
 }
 
 func DefaultPackageLimits() PackageLimits {
@@ -75,7 +82,56 @@ func NewStreamingPackageVerifier(config PackageVerifierConfig) (*StreamingPackag
 	if err != nil || !info.IsDir() {
 		return nil, ErrInvalid
 	}
-	return &StreamingPackageVerifier{publishers: config.Publishers, temporary: config.TemporaryDirectory, limits: config.Limits}, nil
+	removeTemporary := config.RemoveTemporary
+	if removeTemporary == nil {
+		removeTemporary = os.Remove
+	}
+	return &StreamingPackageVerifier{publishers: config.Publishers, temporary: config.TemporaryDirectory, limits: config.Limits, removeTemporary: removeTemporary, cleanupFailure: config.CleanupFailure}, nil
+}
+
+func (verifier *StreamingPackageVerifier) CleanupFailures() uint64 {
+	if verifier == nil {
+		return 0
+	}
+	return verifier.cleanupFailures.Load()
+}
+
+func (verifier *StreamingPackageVerifier) Ready(ctx context.Context) error {
+	if verifier == nil || ctx == nil || ctx.Err() != nil {
+		return ErrInvalid
+	}
+	ready, ok := verifier.publishers.(interface{ Ready(context.Context) error })
+	if !ok || ready.Ready(ctx) != nil {
+		return ErrUnknownPublisher
+	}
+	info, err := os.Stat(verifier.temporary)
+	if err != nil || !info.IsDir() {
+		return ErrArtifactUnavailable
+	}
+	return nil
+}
+
+func (verifier *StreamingPackageVerifier) observeCleanupFailure(err error) {
+	if err == nil {
+		return
+	}
+	verifier.cleanupFailures.Add(1)
+	if verifier.cleanupFailure != nil {
+		verifier.cleanupFailure(err)
+	}
+}
+
+func (verifier *StreamingPackageVerifier) cleanupTemporary(file *os.File, name string) error {
+	var closeErr, removeErr error
+	if file != nil {
+		closeErr = file.Close()
+	}
+	if name != "" {
+		removeErr = verifier.removeTemporary(name)
+	}
+	err := errors.Join(closeErr, removeErr)
+	verifier.observeCleanupFailure(err)
+	return err
 }
 
 func validPackageLimits(value PackageLimits) bool {
@@ -98,63 +154,56 @@ func (verifier *StreamingPackageVerifier) Verify(ctx context.Context, source io.
 		return VerifiedPackage{}, ErrArtifactUnavailable
 	}
 	temporaryPath := temporary.Name()
-	cleanup := func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryPath)
+	cleanupResult := func(primary error) error {
+		if cleanupErr := verifier.cleanupTemporary(temporary, temporaryPath); cleanupErr != nil {
+			return fmt.Errorf("%w: temporary cleanup", ErrArtifactUnavailable)
+		}
+		return primary
 	}
 	packageHash := sha256.New()
 	limited := &io.LimitedReader{R: source, N: declaredBytes + 1}
 	written, copyErr := copyWithContext(ctx, io.MultiWriter(temporary, packageHash), limited)
 	if copyErr != nil {
-		cleanup()
 		if ctx.Err() != nil {
-			return VerifiedPackage{}, ctx.Err()
+			return VerifiedPackage{}, cleanupResult(ctx.Err())
 		}
-		return VerifiedPackage{}, beforeSideEffect(ErrManifestRejected)
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(ErrManifestRejected))
 	}
 	if written != declaredBytes {
-		cleanup()
 		if written > declaredBytes {
-			return VerifiedPackage{}, beforeSideEffect(ErrPackageTooLarge)
+			return VerifiedPackage{}, cleanupResult(beforeSideEffect(ErrPackageTooLarge))
 		}
-		return VerifiedPackage{}, beforeSideEffect(ErrManifestRejected)
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(ErrManifestRejected))
 	}
 	if err := temporary.Sync(); err != nil {
-		cleanup()
-		return VerifiedPackage{}, ErrArtifactUnavailable
+		return VerifiedPackage{}, cleanupResult(ErrArtifactUnavailable)
 	}
 	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
-		cleanup()
-		return VerifiedPackage{}, ErrArtifactUnavailable
+		return VerifiedPackage{}, cleanupResult(ErrArtifactUnavailable)
 	}
 	manifestBytes, signature, entries, err := verifier.inspectArchive(ctx, temporary)
 	if err != nil {
-		cleanup()
-		return VerifiedPackage{}, beforeSideEffect(err)
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(err))
 	}
 	manifest, canonical, err := decodeCanonicalManifest(manifestBytes)
 	if err != nil {
-		cleanup()
-		return VerifiedPackage{}, beforeSideEffect(ErrManifestRejected)
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(ErrManifestRejected))
 	}
 	if err := validateManifest(manifest, entries, verifier.limits); err != nil {
-		cleanup()
-		return VerifiedPackage{}, beforeSideEffect(err)
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(err))
 	}
 	manifestDigest := sha256.Sum256(canonical)
 	contentDigest := logicalContentDigest(entries)
 	if err := verifyPublisherSignature(ctx, verifier.publishers, manifest, signature, manifestDigest, contentDigest); err != nil {
-		cleanup()
-		return VerifiedPackage{}, beforeSideEffect(err)
-	}
-	if err := temporary.Close(); err != nil {
-		_ = os.Remove(temporaryPath)
-		return VerifiedPackage{}, ErrArtifactUnavailable
+		return VerifiedPackage{}, cleanupResult(beforeSideEffect(err))
 	}
 	return VerifiedPackage{
 		Manifest: manifest, PackageSHA256: hex.EncodeToString(packageHash.Sum(nil)),
 		ManifestDigest: hex.EncodeToString(manifestDigest[:]), ContentDigest: hex.EncodeToString(contentDigest[:]),
-		SizeBytes: declaredBytes, lifecycle: &verifiedPackageLifecycle{path: temporaryPath},
+		SizeBytes: declaredBytes, lifecycle: &verifiedPackageLifecycle{
+			file: temporary, size: declaredBytes, path: temporaryPath,
+			close: func(file *os.File) error { return file.Close() }, remove: verifier.removeTemporary, observe: verifier.observeCleanupFailure,
+		},
 	}, nil
 }
 
@@ -230,15 +279,42 @@ func (verifier *StreamingPackageVerifier) inspectArchive(ctx context.Context, pa
 		var capture bytes.Buffer
 		hash := sha256.New()
 		writer := io.Writer(hash)
+		var executable *os.File
 		if name == manifestPath || name == signaturePath {
 			writer = io.MultiWriter(hash, &capture)
+		} else if strings.HasPrefix(name, "plugin-package/bin/") {
+			executable, err = os.CreateTemp(verifier.temporary, ".dbpilot-plugin-executable-*")
+			if err != nil {
+				return nil, nil, nil, ErrArtifactUnavailable
+			}
+			writer = io.MultiWriter(hash, executable)
 		}
 		copied, copyErr := copyNWithContext(ctx, writer, tarReader, header.Size)
 		if copyErr != nil || copied != header.Size {
+			if executable != nil && verifier.cleanupTemporary(executable, executable.Name()) != nil {
+				return nil, nil, nil, ErrArtifactUnavailable
+			}
 			if expandedStream.N == 0 {
 				return nil, nil, nil, ErrPackageTooLarge
 			}
 			return nil, nil, nil, ErrManifestRejected
+		}
+		if executable != nil {
+			var validationErr error
+			if executable.Sync() != nil || seekExecutable(executable) != nil {
+				validationErr = ErrManifestRejected
+			} else {
+				validationErr = validateStaticExecutable(executable, name)
+			}
+			if validationErr != nil {
+				if verifier.cleanupTemporary(executable, executable.Name()) != nil {
+					return nil, nil, nil, ErrArtifactUnavailable
+				}
+				return nil, nil, nil, validationErr
+			}
+			if verifier.cleanupTemporary(executable, executable.Name()) != nil {
+				return nil, nil, nil, ErrArtifactUnavailable
+			}
 		}
 		var digest [sha256.Size]byte
 		copy(digest[:], hash.Sum(nil))
@@ -253,13 +329,14 @@ func (verifier *StreamingPackageVerifier) inspectArchive(ctx context.Context, pa
 	if len(manifestBytes) == 0 || len(signature) != 64 {
 		return nil, nil, nil, ErrManifestRejected
 	}
-	trailing, drainErr := copyWithContext(ctx, io.Discard, expandedStream)
+	trailing, drainErr := drainZeroPadding(ctx, expandedStream)
 	if expandedStream.N == 0 {
 		return nil, nil, nil, ErrPackageTooLarge
 	}
-	if drainErr != nil || trailing != 0 {
+	if drainErr != nil {
 		return nil, nil, nil, ErrManifestRejected
 	}
+	_ = trailing
 	if _, peekErr := buffered.Peek(1); !errors.Is(peekErr, io.EOF) {
 		return nil, nil, nil, ErrManifestRejected
 	}
@@ -274,7 +351,7 @@ func canonicalArchivePath(value string, directory bool) (string, error) {
 	if directory {
 		trimmed = strings.TrimSuffix(trimmed, "/")
 	}
-	if trimmed == "" || path.Clean(trimmed) != trimmed || trimmed == "plugin-package" || !strings.HasPrefix(trimmed, "plugin-package/") {
+	if trimmed == "" || path.Clean(trimmed) != trimmed || trimmed != "plugin-package" && !strings.HasPrefix(trimmed, "plugin-package/") || trimmed == "plugin-package" && !directory {
 		return "", ErrManifestRejected
 	}
 	for _, part := range strings.Split(trimmed, "/") {
@@ -283,6 +360,73 @@ func canonicalArchivePath(value string, directory bool) (string, error) {
 		}
 	}
 	return trimmed, nil
+}
+
+func seekExecutable(file *os.File) error {
+	_, err := file.Seek(0, io.SeekStart)
+	return err
+}
+
+func validateStaticExecutable(file *os.File, name string) error {
+	parts := strings.Split(name, "/")
+	if len(parts) < 4 || parts[0] != "plugin-package" || parts[1] != "bin" {
+		return ErrManifestRejected
+	}
+	wantMachine := elf.Machine(0)
+	switch parts[2] {
+	case "linux-amd64":
+		wantMachine = elf.EM_X86_64
+	case "linux-arm64":
+		wantMachine = elf.EM_AARCH64
+	default:
+		return ErrPlatformMismatch
+	}
+	value, err := elf.NewFile(file)
+	if err != nil {
+		return ErrManifestRejected
+	}
+	if value.Class != elf.ELFCLASS64 || value.Data != elf.ELFDATA2LSB || value.Machine != wantMachine || value.Type != elf.ET_EXEC {
+		return ErrManifestRejected
+	}
+	for _, program := range value.Progs {
+		if program.Type == elf.PT_INTERP || program.Type == elf.PT_DYNAMIC {
+			return ErrManifestRejected
+		}
+	}
+	for _, section := range value.Sections {
+		if section.Type == elf.SHT_DYNAMIC || section.Name == ".interp" || section.Name == ".dynamic" || section.Name == ".dynstr" || section.Name == ".dynsym" {
+			return ErrManifestRejected
+		}
+	}
+	return nil
+}
+
+func drainZeroPadding(ctx context.Context, source io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		read, err := source.Read(buffer)
+		if read > 0 {
+			total += int64(read)
+			for _, value := range buffer[:read] {
+				if value != 0 {
+					return total, ErrManifestRejected
+				}
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+		if read == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
 }
 
 func forbiddenPackagePath(value string) bool {

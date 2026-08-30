@@ -2,6 +2,9 @@ package plugincatalog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -26,6 +29,7 @@ var (
 	ErrPackageTooLarge     = errors.New("plugin package exceeds limits")
 	ErrArtifactUnavailable = errors.New("plugin artifact unavailable")
 	ErrBeforeSideEffect    = errors.New("plugin operation failed before a durable side effect")
+	ErrOperationPending    = errors.New("plugin catalog operation is pending")
 )
 
 type Manifest struct {
@@ -221,6 +225,112 @@ type CatalogService interface {
 	Service
 	PublicationService
 	DefinitionService
+	UploadOperation(context.Context, platformscope.Scope, UploadMetadata, OperationKey, []byte, OperationResponseBuilder, io.Reader) (OperationSnapshot, error)
+	ApproveOperation(context.Context, platformscope.Scope, string, uint64, OperationKey, []byte, OperationResponseBuilder) (OperationSnapshot, error)
+	PublishOperation(context.Context, platformscope.Scope, string, uint64, OperationKey, []byte, OperationResponseBuilder) (OperationSnapshot, error)
+	RevokeOperation(context.Context, platformscope.Scope, string, uint64, string, OperationKey, []byte, OperationResponseBuilder) (OperationSnapshot, error)
+	RecoverOperation(context.Context, OperationKey) (OperationSnapshot, error)
+}
+
+type OperationState string
+
+const (
+	OperationPending   OperationState = "pending"
+	OperationCommitted OperationState = "committed"
+)
+
+type OperationKey struct {
+	Scope          platformscope.Scope
+	Actor          string
+	OperationID    string
+	IdempotencyKey string
+	Fingerprint    string
+	OwnerToken     string
+}
+
+func (key OperationKey) Validate() error {
+	if key.Scope.Validate() != nil || !canonicalText(key.Actor, 256) || !canonicalText(key.OperationID, 128) || !canonicalText(key.IdempotencyKey, 128) || len(key.Fingerprint) != len("sha256:")+64 || !strings.HasPrefix(key.Fingerprint, "sha256:") || len(key.OwnerToken) != len("owner-")+64 || !strings.HasPrefix(key.OwnerToken, "owner-") {
+		return ErrInvalid
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(key.Fingerprint, "sha256:")); err != nil {
+		return ErrInvalid
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(key.OwnerToken, "owner-")); err != nil {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func (key OperationKey) Identity() string {
+	return key.Scope.Key() + "\x00" + key.Actor + "\x00" + key.OperationID + "\x00" + key.IdempotencyKey
+}
+
+func (key OperationKey) RecordID() string {
+	digest := sha256.Sum256([]byte(key.Identity()))
+	return "plugin-operation-" + hex.EncodeToString(digest[:16])
+}
+
+type OperationResponse struct {
+	Status int
+	ETag   string
+	Body   []byte
+}
+
+func (response OperationResponse) Validate() error {
+	if response.Status < 100 || response.Status > 599 || response.ETag == "" || !json.Valid(response.Body) {
+		return ErrInvalid
+	}
+	return nil
+}
+
+type OperationResponseBuilder func(PluginVersion) (OperationResponse, error)
+
+type OperationSnapshot struct {
+	Key            OperationKey
+	State          OperationState
+	Kind           string
+	Definition     PluginDefinition
+	Version        PluginVersion
+	ArtifactID     string
+	ArtifactSHA256 string
+	ArtifactBytes  int64
+	Response       OperationResponse
+	AuditEventJSON []byte
+}
+
+func (snapshot OperationSnapshot) Validate() error {
+	if snapshot.Key.Validate() != nil || snapshot.State != OperationPending && snapshot.State != OperationCommitted || !json.Valid(snapshot.AuditEventJSON) {
+		return ErrInvalid
+	}
+	if snapshot.Version.Validate() != nil || snapshot.State == OperationCommitted && snapshot.Response.Validate() != nil {
+		return ErrInvalid
+	}
+	return nil
+}
+
+type UploadOperationRequest struct {
+	Key            OperationKey
+	Definition     PluginDefinition
+	Version        PluginVersion
+	ArtifactID     string
+	ArtifactSHA256 string
+	ArtifactBytes  int64
+	CreatedBy      string
+	CreatedAt      time.Time
+	AuditEventJSON []byte
+}
+
+type TransitionOperationRequest struct {
+	Key            OperationKey
+	Transition     TransitionRequest
+	AuditEventJSON []byte
+}
+
+type OperationRepository interface {
+	GetOperation(context.Context, OperationKey) (OperationSnapshot, error)
+	BeginUploadOperation(context.Context, UploadOperationRequest) (OperationSnapshot, error)
+	FinalizeUploadOperation(context.Context, OperationKey, OperationResponseBuilder) (OperationSnapshot, error)
+	TransitionOperation(context.Context, TransitionOperationRequest, OperationResponseBuilder) (OperationSnapshot, error)
 }
 
 type TransitionRequest struct {
@@ -254,7 +364,12 @@ type VerifiedPackage struct {
 
 type verifiedPackageLifecycle struct {
 	mu       sync.Mutex
+	file     *os.File
+	size     int64
 	path     string
+	close    func(*os.File) error
+	remove   func(string) error
+	observe  func(error)
 	closeErr error
 }
 
@@ -264,14 +379,10 @@ func (value *VerifiedPackage) Open() (io.ReadCloser, error) {
 	}
 	value.lifecycle.mu.Lock()
 	defer value.lifecycle.mu.Unlock()
-	if value.lifecycle.path == "" {
+	if value.lifecycle.file == nil {
 		return nil, ErrInvalid
 	}
-	file, err := os.Open(value.lifecycle.path)
-	if err != nil {
-		return nil, ErrInvalid
-	}
-	return file, nil
+	return io.NopCloser(io.NewSectionReader(value.lifecycle.file, 0, value.lifecycle.size)), nil
 }
 
 func (value *VerifiedPackage) Close() error {
@@ -283,13 +394,21 @@ func (value *VerifiedPackage) Close() error {
 	}
 	value.lifecycle.mu.Lock()
 	defer value.lifecycle.mu.Unlock()
-	if value.lifecycle.path == "" {
+	if value.lifecycle.file == nil && value.lifecycle.path == "" {
 		return value.lifecycle.closeErr
 	}
-	value.lifecycle.closeErr = os.Remove(value.lifecycle.path)
-	if errors.Is(value.lifecycle.closeErr, os.ErrNotExist) {
-		value.lifecycle.closeErr = nil
+	var closeErr, removeErr error
+	if value.lifecycle.file != nil {
+		closeErr = value.lifecycle.close(value.lifecycle.file)
+		value.lifecycle.file = nil
 	}
-	value.lifecycle.path = ""
+	if value.lifecycle.path != "" {
+		removeErr = value.lifecycle.remove(value.lifecycle.path)
+		value.lifecycle.path = ""
+	}
+	value.lifecycle.closeErr = errors.Join(closeErr, removeErr)
+	if value.lifecycle.closeErr != nil && value.lifecycle.observe != nil {
+		value.lifecycle.observe(value.lifecycle.closeErr)
+	}
 	return value.lifecycle.closeErr
 }

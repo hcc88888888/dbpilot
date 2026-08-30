@@ -64,3 +64,14 @@ func TestStaticPublisherKeyStoreCopiesApprovedKeysAndRejectsDuplicates(t *testin
 	_, err = store.PublicKey(context.Background(), "publisher-1", "missing")
 	require.ErrorIs(t, err, ErrUnknownPublisher)
 }
+
+func TestStaticPublisherKeyStoreReadinessRequiresTrustRoot(t *testing.T) {
+	empty, err := NewStaticPublisherKeyStore(nil)
+	require.NoError(t, err)
+	require.ErrorIs(t, empty.Ready(context.Background()), ErrUnknownPublisher)
+	public, _, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	configured, err := NewStaticPublisherKeyStore([]PublisherKey{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: public}})
+	require.NoError(t, err)
+	require.NoError(t, configured.Ready(context.Background()))
+}

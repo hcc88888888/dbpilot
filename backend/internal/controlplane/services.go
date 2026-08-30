@@ -87,18 +87,20 @@ type InspectionService interface {
 // Services contains the dependencies made available to HTTP handlers.
 // Monitoring deliberately uses its storage-neutral QueryStore boundary.
 type Services struct {
-	Repository      alert.ControlPlaneRepository
-	Evaluator       EvaluatorHealthReader
-	Monitoring      monitoring.QueryStore
-	Jobs            JobService
-	Artifacts       ArtifactService
-	Audit           AuditService
-	Capabilities    CapabilityService
-	Idempotency     IdempotencyService
-	Inspection      InspectionService
-	Hosts           hostinventory.Service
-	PluginCatalog   plugincatalog.CatalogService
-	ArtifactContent http.Handler
+	Repository                 alert.ControlPlaneRepository
+	Evaluator                  EvaluatorHealthReader
+	Monitoring                 monitoring.QueryStore
+	Jobs                       JobService
+	Artifacts                  ArtifactService
+	Audit                      AuditService
+	Capabilities               CapabilityService
+	Idempotency                IdempotencyService
+	Inspection                 InspectionService
+	Hosts                      hostinventory.Service
+	PluginCatalog              plugincatalog.CatalogService
+	PluginUploadRemove         func(string) error
+	PluginUploadCleanupFailure func(error)
+	ArtifactContent            http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated
 	// principal and never trusts this callback for user authorization.

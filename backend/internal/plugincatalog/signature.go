@@ -53,6 +53,18 @@ func (store *StaticPublisherKeyStore) PublicKey(ctx context.Context, publisherID
 	return append(ed25519.PublicKey(nil), value...), nil
 }
 
+func (store *StaticPublisherKeyStore) Ready(ctx context.Context) error {
+	if store == nil || ctx == nil || ctx.Err() != nil {
+		return ErrUnknownPublisher
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if len(store.keys) == 0 {
+		return ErrUnknownPublisher
+	}
+	return nil
+}
+
 func signatureMessage(manifestDigest, contentDigest [sha256.Size]byte) []byte {
 	return []byte("dbpilot-plugin-signature-v1\nmanifest-sha256:" + hex.EncodeToString(manifestDigest[:]) + "\ncontent-sha256:" + hex.EncodeToString(contentDigest[:]) + "\n")
 }

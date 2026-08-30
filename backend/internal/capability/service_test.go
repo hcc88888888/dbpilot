@@ -95,6 +95,14 @@ func findCapability(values []Capability, name string) Capability {
 	return Capability{}
 }
 
+func TestPluginCatalogCapabilityIsExplicitlyDeploymentDisabled(t *testing.T) {
+	values := NewService(FoundationCatalog()).Resolve(Input{DeploymentFlags: FoundationDeploymentFlags(), Permissions: map[string]bool{"plugins:view": true}})
+	value := findCapability(values, "platform.plugin_catalog")
+	require.Equal(t, "platform.plugin_catalog", value.Name)
+	require.False(t, value.Enabled)
+	require.Equal(t, DeploymentDisabled, value.ReasonCode)
+}
+
 func cloneInput(input Input) Input {
 	result := input
 	result.DeploymentFlags = cloneSet(input.DeploymentFlags)

@@ -8,12 +8,18 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"debug/elf"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -238,6 +244,59 @@ func TestPackageVerifierRejectsWrongPlatformScriptsHooksAndSecretFields(t *testi
 	}
 }
 
+func TestPackageVerifierInspectsSignedExecutableBytes(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	tests := []struct {
+		name         string
+		body         []byte
+		architecture string
+	}{
+		{name: "extensionless shebang", body: []byte("#!/bin/sh\nexec false\n"), architecture: "amd64"},
+		{name: "non ELF bytes", body: []byte("not an executable"), architecture: "amd64"},
+		{name: "arm64 labelled amd64", body: independentStaticELF(elf.EM_AARCH64), architecture: "amd64"},
+		{name: "PT INTERP", body: independentELFWithProgram(elf.EM_X86_64, elf.PT_INTERP), architecture: "amd64"},
+		{name: "PT DYNAMIC", body: independentELFWithProgram(elf.EM_X86_64, elf.PT_DYNAMIC), architecture: "amd64"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, func(manifest map[string]any, entries *[]tarFixtureEntry) {
+				replaceFixtureBinary(manifest, entries, test.body, test.architecture)
+			})
+			_, err := newTestPackageVerifier(t, public, testPackageLimits()).Verify(context.Background(), bytes.NewReader(fixture.Archive), int64(len(fixture.Archive)))
+			require.ErrorIs(t, err, ErrManifestRejected)
+		})
+	}
+}
+
+func TestPackageVerifierAcceptsSafeRootDirectoryAndBoundedZeroTarPadding(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	entries := append([]tarFixtureEntry{{Name: "plugin-package/", Typeflag: tar.TypeDir, Mode: 0o700}}, fixture.Entries...)
+	archive := writeTarGzipWithTrailing(t, entries, make([]byte, 4*512))
+	verified, err := newTestPackageVerifier(t, public, testPackageLimits()).Verify(context.Background(), bytes.NewReader(archive), int64(len(archive)))
+	require.NoError(t, err)
+	require.NoError(t, verified.Close())
+}
+
+func TestPackageVerifierRejectsNonzeroSuffixAndAdditionalGzipMembers(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	tests := map[string][]byte{
+		"nonzero decompressed suffix": writeTarGzipWithTrailing(t, fixture.Entries, []byte{0, 0, 1}),
+		"raw compressed suffix":       append(append([]byte(nil), fixture.Archive...), []byte("raw-junk")...),
+		"additional gzip member":      append(append([]byte(nil), fixture.Archive...), fixture.Archive...),
+	}
+	for name, archive := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := newTestPackageVerifier(t, public, testPackageLimits()).Verify(context.Background(), bytes.NewReader(archive), int64(len(archive)))
+			require.ErrorIs(t, err, ErrManifestRejected)
+		})
+	}
+}
+
 func TestPackageVerifierAcceptsCanonicalSignedPackageAndDerivesDigests(t *testing.T) {
 	// Break caught: returning caller/manifest claims instead of hashes derived
 	// from the actual archive would publish the wrong immutable Artifact.
@@ -261,6 +320,87 @@ func TestPackageVerifierAcceptsCanonicalSignedPackageAndDerivesDigests(t *testin
 	stored, err := io.ReadAll(reader)
 	require.NoError(t, err)
 	require.Equal(t, fixture.Archive, stored)
+}
+
+func TestVerifiedPackageRetainsOwnedHandleAndSurfacesCleanupFailure(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	cleanupErr := errors.New("injected remove failure")
+	observed := make([]error, 0)
+	verifier, err := NewStreamingPackageVerifier(PackageVerifierConfig{
+		Publishers: testPublisherStore{"publisher-1\x00key-1": public}, TemporaryDirectory: t.TempDir(), Limits: testPackageLimits(),
+		RemoveTemporary: func(path string) error {
+			if strings.Contains(filepath.Base(path), "plugin-upload") {
+				return cleanupErr
+			}
+			return os.Remove(path)
+		}, CleanupFailure: func(err error) { observed = append(observed, err) },
+	})
+	require.NoError(t, err)
+	verified, err := verifier.Verify(context.Background(), bytes.NewReader(fixture.Archive), int64(len(fixture.Archive)))
+	require.NoError(t, err)
+	originalPath := verified.lifecycle.path
+	t.Cleanup(func() { _ = os.Remove(originalPath) })
+	require.NotNil(t, verified.lifecycle.file, "verified package must retain the already-verified file handle")
+	reader, err := verified.Open()
+	require.NoError(t, err)
+	contents, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, fixture.Archive, contents)
+	require.NoError(t, reader.Close())
+	require.ErrorIs(t, verified.Close(), cleanupErr)
+	require.Equal(t, uint64(1), verifier.CleanupFailures())
+	require.Len(t, observed, 1)
+}
+
+func TestPackageSignatureV1IndependentFixtureCorpus(t *testing.T) {
+	type vectorFile struct {
+		PublicKeyHex   string            `json:"public_key_hex"`
+		ManifestDigest string            `json:"manifest_digest"`
+		ContentDigest  string            `json:"content_digest"`
+		MessageHex     string            `json:"message_hex"`
+		SignatureHex   string            `json:"signature_hex"`
+		InstalledModes map[string]string `json:"installed_modes"`
+	}
+	read := func(name string) []byte {
+		value, err := os.ReadFile(filepath.Join("testdata", "package-v1", name))
+		require.NoError(t, err)
+		return value
+	}
+	decodeHex := func(name string) []byte {
+		value, err := hex.DecodeString(strings.TrimSpace(string(read(name))))
+		require.NoError(t, err)
+		return value
+	}
+	var vector vectorFile
+	require.NoError(t, json.Unmarshal(read("vectors.json"), &vector))
+	manifest := bytes.TrimSuffix(read("manifest.json"), []byte("\n"))
+	amd64, arm64 := decodeHex("linux-amd64.elf.hex"), decodeHex("linux-arm64.elf.hex")
+	signature, err := hex.DecodeString(vector.SignatureHex)
+	require.NoError(t, err)
+	public, err := hex.DecodeString(vector.PublicKeyHex)
+	require.NoError(t, err)
+	regular := []tarFixtureEntry{
+		{Name: manifestPath, Body: manifest, Mode: 0o777},
+		{Name: "plugin-package/bin/linux-amd64/dbpilot-plugin-mysql", Body: amd64, Mode: 0o777},
+		{Name: "plugin-package/bin/linux-arm64/dbpilot-plugin-mysql", Body: arm64, Mode: 0o777},
+	}
+	contentDigest := independentLogicalContentDigest(regular)
+	manifestDigest := sha256.Sum256(manifest)
+	require.Equal(t, vector.ContentDigest, hex.EncodeToString(contentDigest[:]))
+	require.Equal(t, vector.ManifestDigest, hex.EncodeToString(manifestDigest[:]))
+	require.Equal(t, vector.MessageHex, hex.EncodeToString(independentSignatureMessage(manifestDigest, contentDigest)))
+	require.Equal(t, map[string]string{"directory": "0700", "executable": "0500", "manifest": "0400"}, vector.InstalledModes)
+	entries := append([]tarFixtureEntry{{Name: "plugin-package/", Typeflag: tar.TypeDir, Mode: 0o777}}, regular...)
+	entries = append(entries, tarFixtureEntry{Name: signaturePath, Body: signature, Mode: 0o777})
+	archive := writeTarGzipWithTrailing(t, entries, make([]byte, 1024))
+	verifier, err := NewStreamingPackageVerifier(PackageVerifierConfig{Publishers: testPublisherStore{"fixture-publisher\x00fixture-key": ed25519.PublicKey(public)}, TemporaryDirectory: t.TempDir(), Limits: testPackageLimits()})
+	require.NoError(t, err)
+	verified, err := verifier.Verify(context.Background(), bytes.NewReader(archive), int64(len(archive)))
+	require.NoError(t, err)
+	require.Equal(t, vector.ContentDigest, verified.ContentDigest)
+	require.NoError(t, verified.Close())
 }
 
 const testBinaryPath = "plugin-package/bin/linux-amd64/dbpilot-plugin-mysql"
@@ -312,7 +452,7 @@ type signedPackageFixture struct {
 
 func newSignedPackageFixture(t *testing.T, publisherID, keyID string, private ed25519.PrivateKey, mutate func(map[string]any, *[]tarFixtureEntry)) signedPackageFixture {
 	t.Helper()
-	binary := []byte("\x7fELF dbpilot mysql plugin\n")
+	binary := independentStaticELF(elf.EM_X86_64)
 	binaryDigest := sha256.Sum256(binary)
 	manifest := map[string]any{
 		"plugin_id":                      "mysql",
@@ -361,6 +501,66 @@ func appendManifestFile(manifest map[string]any, path string, body []byte) {
 		"sha256":     hex.EncodeToString(digest[:]),
 		"size_bytes": float64(len(body)),
 	})
+}
+
+func replaceFixtureBinary(manifest map[string]any, entries *[]tarFixtureEntry, body []byte, architecture string) {
+	digest := sha256.Sum256(body)
+	for index := range *entries {
+		if (*entries)[index].Name == testBinaryPath {
+			(*entries)[index].Body = append([]byte(nil), body...)
+		}
+	}
+	file := manifest["files"].([]any)[0].(map[string]any)
+	file["sha256"], file["size_bytes"] = hex.EncodeToString(digest[:]), float64(len(body))
+	binaryEntry := manifest["binaries"].([]any)[0].(map[string]any)
+	binaryEntry["sha256"], binaryEntry["size_bytes"], binaryEntry["architecture"] = hex.EncodeToString(digest[:]), float64(len(body)), architecture
+}
+
+func independentStaticELF(machine elf.Machine) []byte {
+	return independentELFWithProgram(machine, elf.PT_LOAD)
+}
+
+func independentELFWithProgram(machine elf.Machine, extra elf.ProgType) []byte {
+	programTypes := []elf.ProgType{elf.PT_LOAD}
+	if extra != elf.PT_LOAD {
+		programTypes = append(programTypes, extra)
+	}
+	const headerSize, programHeaderSize = 64, 56
+	payloadOffset := headerSize + programHeaderSize*len(programTypes)
+	payload := []byte{0}
+	if extra == elf.PT_INTERP {
+		payload = append([]byte("/lib64/ld-linux-x86-64.so.2"), 0)
+	} else if extra == elf.PT_DYNAMIC {
+		payload = make([]byte, 16)
+	}
+	result := make([]byte, payloadOffset+len(payload))
+	copy(result[:16], []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0})
+	binary.LittleEndian.PutUint16(result[16:18], uint16(elf.ET_EXEC))
+	binary.LittleEndian.PutUint16(result[18:20], uint16(machine))
+	binary.LittleEndian.PutUint32(result[20:24], 1)
+	binary.LittleEndian.PutUint64(result[24:32], 0x400000)
+	binary.LittleEndian.PutUint64(result[32:40], headerSize)
+	binary.LittleEndian.PutUint16(result[52:54], headerSize)
+	binary.LittleEndian.PutUint16(result[54:56], programHeaderSize)
+	binary.LittleEndian.PutUint16(result[56:58], uint16(len(programTypes)))
+	binary.LittleEndian.PutUint16(result[58:60], 64)
+	for index, programType := range programTypes {
+		offset := headerSize + index*programHeaderSize
+		binary.LittleEndian.PutUint32(result[offset:offset+4], uint32(programType))
+		binary.LittleEndian.PutUint32(result[offset+4:offset+8], uint32(elf.PF_R|elf.PF_X))
+		fileOffset, size := uint64(0), uint64(len(result))
+		if programType != elf.PT_LOAD {
+			fileOffset, size = uint64(payloadOffset), uint64(len(payload))
+		}
+		binary.LittleEndian.PutUint64(result[offset+8:offset+16], fileOffset)
+		binary.LittleEndian.PutUint64(result[offset+16:offset+24], 0x400000+fileOffset)
+		binary.LittleEndian.PutUint64(result[offset+24:offset+32], 0x400000+fileOffset)
+		binary.LittleEndian.PutUint64(result[offset+32:offset+40], size)
+		binary.LittleEndian.PutUint64(result[offset+40:offset+48], size)
+		binary.LittleEndian.PutUint64(result[offset+48:offset+56], 0x1000)
+	}
+	copy(result[payloadOffset:], payload)
+	return result
 }
 
 func independentLogicalContentDigest(entries []tarFixtureEntry) [sha256.Size]byte {

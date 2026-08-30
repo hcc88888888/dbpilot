@@ -107,6 +107,10 @@ type PluginPublisherSettings struct {
 	PublicKey   string `yaml:"public_key"`
 }
 
+type PluginCatalogSettings struct {
+	Enabled bool `yaml:"enabled"`
+}
+
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
 }
@@ -139,6 +143,7 @@ type Config struct {
 	RetryEvery       time.Duration              `yaml:"retry_every,omitempty"`
 	Command          CommandSettings            `yaml:"command"`
 	Artifact         ArtifactSettings           `yaml:"artifact"`
+	PluginCatalog    PluginCatalogSettings      `yaml:"plugin_catalog,omitempty"`
 	PluginPublishers []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
 
 	HTTPServerTLS           *tls.Config                                `yaml:"-"`
@@ -158,7 +163,7 @@ type Config struct {
 	ArtifactDownloadHandler http.Handler                               `yaml:"-"`
 	ArtifactSecretResolver  platformdatabase.SecretResolver            `yaml:"-"`
 	CommandTargetAuthorizer commandvalidation.TargetAuthorizer         `yaml:"-"`
-	PluginCatalog           plugincatalog.CatalogService               `yaml:"-"`
+	PluginCatalogService    plugincatalog.CatalogService               `yaml:"-"`
 }
 
 type Server struct {
@@ -271,7 +276,12 @@ type defaultMigrationSteps struct {
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	return composeMigrations(steps.alert, steps.job, steps.platform, steps.host, steps.plugin, steps.inspection)
+	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host}
+	if steps.plugin != nil {
+		pipeline = append(pipeline, steps.plugin)
+	}
+	pipeline = append(pipeline, steps.inspection)
+	return composeMigrations(pipeline...)
 }
 
 func NewServer(config Config) (*Server, error) {
@@ -360,19 +370,22 @@ func NewServer(config Config) (*Server, error) {
 	}
 	migrate := config.Migrate
 	if migrate == nil {
-		migrate = composeDefaultMigrations(defaultMigrationSteps{
+		steps := defaultMigrationSteps{
 			alert:    func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
 			job:      func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
 			platform: func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
 			host:     func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
-			plugin:   func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) },
 			inspection: func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
 				}
 				return seedInspectionCatalog(ctx, inspection.NewPostgresRepository(database, nil), configuredScopes(config), time.Now().UTC())
 			},
-		})
+		}
+		if config.PluginCatalog.Enabled {
+			steps.plugin = func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) }
+		}
+		migrate = composeDefaultMigrations(steps)
 	}
 	listen := config.Listen
 	if listen == nil {
@@ -402,7 +415,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 	artifactContent := config.ArtifactDownloadHandler
 	var artifactBlobs *artifact.LocalBlobStore
-	if artifactContent == nil {
+	if artifactContent == nil || config.PluginCatalog.Enabled {
 		blobStore := artifact.NewLocalBlobStore(config.Artifact.StorageRoot)
 		if err := blobStore.Ready(); err != nil {
 			if ownsDatabase {
@@ -417,8 +430,11 @@ func NewServer(config Config) (*Server, error) {
 		artifactStore = artifact.NewPostgresStore(database, artifactBlobs)
 	}
 	artifactService := artifact.NewService(artifactStore, artifactSigner)
-	pluginCatalogService := config.PluginCatalog
-	if pluginCatalogService == nil && artifactBlobs != nil {
+	pluginCatalogService := config.PluginCatalogService
+	if !config.PluginCatalog.Enabled {
+		pluginCatalogService = nil
+	}
+	if config.PluginCatalog.Enabled && pluginCatalogService == nil && artifactBlobs != nil {
 		publisherKeys, keyErr := publisherKeysForConfig(config)
 		if keyErr != nil {
 			_ = artifactBlobs.Close()
@@ -492,18 +508,31 @@ func NewServer(config Config) (*Server, error) {
 		Jobs: jobRepository, Artifacts: artifactService, Audit: auditService, ArtifactContent: artifactContent,
 		Capabilities: capability.NewService(capability.FoundationCatalog()),
 		CapabilityInput: func(_ context.Context, scope platformscope.Scope) capability.Input {
-			return foundationCapabilityInput(scope, config.Agents, agentRegistry)
+			input := foundationCapabilityInput(scope, config.Agents, agentRegistry)
+			input.DeploymentFlags["plugin_catalog"] = config.PluginCatalog.Enabled
+			return input
 		},
-		Idempotency: idempotencyService, Inspection: inspectionApplication, Hosts: hostInventoryService,
-		PluginCatalog: pluginCatalogService,
+		Idempotency: idempotencyService, Inspection: inspectionApplication,
+		Hosts:                      hostInventoryService,
+		PluginCatalog:              pluginCatalogService,
+		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
 				return errors.New("a successful all-scope evaluation pass has not completed")
 			}
-			return ping(ctx)
+			if err := ping(ctx); err != nil {
+				return err
+			}
+			if config.PluginCatalog.Enabled {
+				readyService, ok := pluginCatalogService.(interface{ Ready(context.Context) error })
+				if !ok || readyService.Ready(ctx) != nil {
+					return errors.New("plugin catalog is not ready")
+				}
+			}
+			return nil
 		},
 	}
-	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: controlplane.PluginUploadReadTimeout, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
@@ -577,6 +606,9 @@ func validateConfig(config Config) error {
 	if config.ArtifactDownloadHandler == nil && strings.TrimSpace(config.Artifact.StorageRoot) == "" {
 		return errors.New("artifact.storage_root is required")
 	}
+	if config.PluginCatalog.Enabled && strings.TrimSpace(config.Artifact.StorageRoot) == "" {
+		return errors.New("artifact.storage_root is required when plugin catalog is enabled")
+	}
 	if err := monitoring.ValidateQueryLimits(config.Monitoring.limits()); err != nil {
 		return errors.New("monitoring limits are invalid")
 	}
@@ -649,6 +681,9 @@ func validateConfig(config Config) error {
 	}
 	if _, err := publisherKeysForConfig(config); err != nil {
 		return errors.New("plugin_publishers contains an invalid Ed25519 public key")
+	}
+	if config.PluginCatalog.Enabled && len(config.PluginPublishers) == 0 {
+		return errors.New("plugin catalog enabled requires at least one publisher")
 	}
 	return nil
 }

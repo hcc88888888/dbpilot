@@ -44,12 +44,13 @@ func FoundationCatalog() []Definition {
 		{Name: "platform.jobs", DeploymentFlags: []string{"jobs"}, RequiredPermission: "platform.jobs.read"},
 		{Name: "platform.audit", DeploymentFlags: []string{"audit"}, RequiredPermission: "platform.audit.read"},
 		{Name: "platform.artifacts", DeploymentFlags: []string{"artifacts"}, RequiredPermission: "platform.artifacts.read"},
+		{Name: "platform.plugin_catalog", DeploymentFlags: []string{"plugin_catalog"}, RequiredPermission: "plugins:view"},
 		{Name: "agent.control", DeploymentFlags: []string{"agent_control"}, AgentCapabilities: []string{"collect_now"}, RequiredPermission: "platform.jobs.cancel"},
 	}
 }
 
 func FoundationDeploymentFlags() map[string]bool {
-	return map[string]bool{"jobs": true, "audit": true, "artifacts": true, "agent_control": true}
+	return map[string]bool{"jobs": true, "audit": true, "artifacts": true, "agent_control": true, "plugin_catalog": false}
 }
 
 func NewService(catalog []Definition) Service {

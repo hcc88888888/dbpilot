@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/platformscope"
@@ -24,9 +26,22 @@ import (
 
 const platformRouteBase = "/api/v1/tenants/{tenantID}/projects/{projectID}"
 
+const PluginUploadReadTimeout = 2 * time.Minute
+const maximumPluginUploadBytes int64 = 256 << 20
+const maximumAggregatePluginUploadBytes int64 = 512 << 20
+const maximumConcurrentPluginUploads = 4
+
 func mountPlatformRoutes(mux *http.ServeMux, services Services, resolver PrincipalResolver) {
 	validator := newPlatformResponseValidator()
-	registrar := &platformRouteRegistrar{mux: mux, resolver: resolver, validator: validator, allowed: make(map[string]map[string]struct{})}
+	removeUpload := services.PluginUploadRemove
+	if removeUpload == nil {
+		removeUpload = os.Remove
+	}
+	registrar := &platformRouteRegistrar{
+		mux: mux, resolver: resolver, validator: validator, allowed: make(map[string]map[string]struct{}),
+		uploads:      newUploadAdmission(maximumAggregatePluginUploadBytes, maximumConcurrentPluginUploads),
+		removeUpload: removeUpload, uploadCleanupFailure: services.PluginUploadCleanupFailure, pluginCatalogAvailable: services.PluginCatalog != nil,
+	}
 	strict := openapi.NewStrictHandlerWithOptions(
 		platformAPI{services: services},
 		[]openapi.StrictMiddlewareFunc{generatedAuthorizationMiddleware(Authorizer{})},
@@ -49,11 +64,15 @@ func mountPlatformRoutes(mux *http.ServeMux, services Services, resolver Princip
 }
 
 type platformRouteRegistrar struct {
-	mux       *http.ServeMux
-	resolver  PrincipalResolver
-	validator platformResponseValidator
-	mu        sync.RWMutex
-	allowed   map[string]map[string]struct{}
+	mux                    *http.ServeMux
+	resolver               PrincipalResolver
+	validator              platformResponseValidator
+	mu                     sync.RWMutex
+	allowed                map[string]map[string]struct{}
+	uploads                *uploadAdmission
+	removeUpload           func(string) error
+	uploadCleanupFailure   func(error)
+	pluginCatalogAvailable bool
 }
 
 func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
@@ -71,7 +90,10 @@ func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func
 	methods[method] = struct{}{}
 	registrar.mu.Unlock()
 
-	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)))
+	validated := capturePlatformRequestMetadata(registrar.validator.requestMiddleware(http.HandlerFunc(handler)), registrar.removeUpload, registrar.uploadCleanupFailure)
+	if method == http.MethodPost && strings.HasSuffix(path, "/plugin-versions") {
+		validated = registrar.admitPluginUpload(validated)
+	}
 	secured := authenticatePlatform(registrar.resolver, requirePlatformScope(validated))
 	registrar.mux.Handle(pattern, withRequestID(withTraceContext(registrar.validator.middleware(exactPlatformMethod(method, secured)))))
 	if firstPathRegistration {
@@ -79,6 +101,84 @@ func (registrar *platformRouteRegistrar) HandleFunc(pattern string, handler func
 			writePlatformMethodNotAllowed(writer, request, registrar.allowedMethods(path))
 		})))))
 	}
+}
+
+type uploadAdmission struct {
+	mu           sync.Mutex
+	maximumBytes int64
+	maximumCount int
+	currentBytes int64
+	currentCount int
+}
+
+func newUploadAdmission(maximumBytes int64, maximumCount int) *uploadAdmission {
+	return &uploadAdmission{maximumBytes: maximumBytes, maximumCount: maximumCount}
+}
+
+func (admission *uploadAdmission) Acquire(size int64) (func(), error) {
+	if admission == nil || size <= 0 {
+		return nil, ErrServiceUnavailable
+	}
+	admission.mu.Lock()
+	if admission.maximumBytes <= 0 || admission.maximumCount <= 0 || admission.currentCount >= admission.maximumCount || size > admission.maximumBytes-admission.currentBytes {
+		admission.mu.Unlock()
+		return nil, ErrServiceUnavailable
+	}
+	admission.currentBytes += size
+	admission.currentCount++
+	admission.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			admission.mu.Lock()
+			admission.currentBytes -= size
+			admission.currentCount--
+			admission.mu.Unlock()
+		})
+	}, nil
+}
+
+func (registrar *platformRouteRegistrar) admitPluginUpload(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		principal, principalOK := request.Context().Value(principalContextKey{}).(Principal)
+		scope, scopeOK := request.Context().Value(platformScopeContextKey{}).(platformscope.Scope)
+		if !principalOK || !scopeOK {
+			writePlatformProblem(writer, request, ErrUnauthenticated)
+			return
+		}
+		if err := (Authorizer{}).Require(principal, scope, openapi.PermissionUploadPluginVersionPackage); err != nil {
+			writePlatformProblem(writer, request, err)
+			return
+		}
+		if !registrar.pluginCatalogAvailable {
+			writePlatformProblem(writer, request, ErrServiceUnavailable)
+			return
+		}
+		contentTypes := request.Header.Values("Content-Type")
+		idempotencyKeys := request.Header.Values("Idempotency-Key")
+		if len(contentTypes) != 1 || !strings.EqualFold(strings.TrimSpace(contentTypes[0]), "application/gzip") || len(idempotencyKeys) != 1 || !validPluginUploadIdempotencyKey(idempotencyKeys[0]) || request.ContentLength <= 0 || request.ContentLength > maximumPluginUploadBytes || len(request.TransferEncoding) != 0 {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		if contentLengths := request.Header.Values("Content-Length"); len(contentLengths) > 0 && (len(contentLengths) != 1 || contentLengths[0] != strconv.FormatInt(request.ContentLength, 10)) {
+			writePlatformProblem(writer, request, ErrInvalidRequest)
+			return
+		}
+		release, err := registrar.uploads.Acquire(request.ContentLength)
+		if err != nil {
+			writer.Header().Set("Retry-After", "1")
+			writePlatformProblem(writer, request, err)
+			return
+		}
+		defer release()
+		ctx, cancel := context.WithTimeout(request.Context(), PluginUploadReadTimeout)
+		defer cancel()
+		next.ServeHTTP(writer, request.WithContext(ctx))
+	})
+}
+
+func validPluginUploadIdempotencyKey(value string) bool {
+	return value != "" && len(value) <= 128 && value == strings.TrimSpace(value) && !strings.ContainsAny(value, "\r\n\t")
 }
 
 type platformRequestMetadata struct {
@@ -93,10 +193,10 @@ type platformRequestMetadata struct {
 
 type platformRequestMetadataContextKey struct{}
 
-func capturePlatformRequestMetadata(next http.Handler) http.Handler {
+func capturePlatformRequestMetadata(next http.Handler, removeUpload func(string) error, cleanupFailure func(error)) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if strings.EqualFold(strings.TrimSpace(strings.Split(request.Header.Get("Content-Type"), ";")[0]), "application/gzip") {
-			captureBinaryPlatformRequest(next, writer, request)
+			captureBinaryPlatformRequest(next, writer, request, removeUpload, cleanupFailure)
 			return
 		}
 		body, err := io.ReadAll(io.LimitReader(request.Body, maxJSONBodyBytes+1))
@@ -114,9 +214,8 @@ func capturePlatformRequestMetadata(next http.Handler) http.Handler {
 	})
 }
 
-func captureBinaryPlatformRequest(next http.Handler, writer http.ResponseWriter, request *http.Request) {
-	const maximumBinaryRequestBytes int64 = 256 << 20
-	if request.ContentLength <= 0 || request.ContentLength > maximumBinaryRequestBytes {
+func captureBinaryPlatformRequest(next http.Handler, writer http.ResponseWriter, request *http.Request, removeUpload func(string) error, cleanupFailure func(error)) {
+	if request.ContentLength <= 0 || request.ContentLength > maximumPluginUploadBytes {
 		writePlatformProblem(writer, request, ErrInvalidRequest)
 		return
 	}
@@ -127,12 +226,16 @@ func captureBinaryPlatformRequest(next http.Handler, writer http.ResponseWriter,
 	}
 	path := temporary.Name()
 	cleanup := func() {
-		_ = temporary.Close()
-		_ = os.Remove(path)
+		closeErr := temporary.Close()
+		removeErr := removeUpload(path)
+		err := errors.Join(closeErr, removeErr)
+		if err != nil && cleanupFailure != nil {
+			cleanupFailure(err)
+		}
 	}
 	defer cleanup()
 	hash := sha256.New()
-	written, err := io.CopyBuffer(io.MultiWriter(temporary, hash), io.LimitReader(request.Body, request.ContentLength+1), make([]byte, 32<<10))
+	written, err := copyPlatformUpload(request.Context(), io.MultiWriter(temporary, hash), io.LimitReader(request.Body, request.ContentLength+1))
 	if err != nil || written != request.ContentLength {
 		writePlatformProblem(writer, request, ErrInvalidRequest)
 		return
@@ -152,6 +255,36 @@ func captureBinaryPlatformRequest(next http.Handler, writer http.ResponseWriter,
 	}
 	ctx := context.WithValue(request.Context(), platformRequestMetadataContextKey{}, metadata)
 	next.ServeHTTP(writer, request.WithContext(ctx))
+}
+
+func copyPlatformUpload(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
+	buffer := make([]byte, 32<<10)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		read, readErr := source.Read(buffer)
+		if read > 0 {
+			written, writeErr := destination.Write(buffer[:read])
+			total += int64(written)
+			if writeErr != nil {
+				return total, writeErr
+			}
+			if written != read {
+				return total, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return total, nil
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+		if read == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
 }
 
 func (registrar *platformRouteRegistrar) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

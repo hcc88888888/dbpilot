@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -14,10 +15,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +35,7 @@ import (
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/plugincatalog"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -73,6 +77,82 @@ func TestPublisherKeysForConfigDecodesOnlyCanonicalEd25519PublicKeys(t *testing.
 	}
 	_, err = publisherKeysForConfig(config)
 	require.ErrorIs(t, err, plugincatalog.ErrInvalid)
+}
+
+func TestPluginCatalogEnablementRequiresTrustRootAndArtifactReadiness(t *testing.T) {
+	public := ed25519.PublicKey(bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize))
+	config := validServerConfig()
+	config.PluginCatalog.Enabled = true
+	config.Artifact.StorageRoot = t.TempDir()
+	require.ErrorContains(t, validateConfig(config), "publisher")
+
+	config.PluginPublishers = []PluginPublisherSettings{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)}}
+	require.NoError(t, validateConfig(config))
+	config.Artifact.StorageRoot = ""
+	require.ErrorContains(t, validateConfig(config), "storage_root")
+
+	disabled := validServerConfig()
+	disabled.PluginCatalog.Enabled = false
+	require.NoError(t, validateConfig(disabled))
+}
+
+func TestDefaultCompositionRunsPluginCatalogMigrationsWhenEnabled(t *testing.T) {
+	if os.Getenv("DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_PLUGIN_CATALOG_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_PLUGIN_CATALOG_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_PLUGIN_CATALOG_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	admin, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	require.NoError(t, admin.PingContext(ctx))
+	schema := fmt.Sprintf("plugin_catalog_composition_%d", time.Now().UnixNano())
+	quotedSchema := pq.QuoteIdentifier(schema)
+	_, err = admin.ExecContext(ctx, "CREATE SCHEMA "+quotedSchema)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, cleanupErr := admin.ExecContext(cleanupContext, "DROP SCHEMA "+quotedSchema+" CASCADE")
+		require.NoError(t, cleanupErr)
+		require.NoError(t, admin.Close())
+	})
+	parsed, err := url.Parse(dsn)
+	require.NoError(t, err)
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	database, err := sql.Open("postgres", parsed.String())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	public := ed25519.PublicKey(bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize))
+	config := validServerConfig()
+	config.Database = database
+	config.Ping = database.PingContext
+	config.PluginCatalog.Enabled = true
+	config.PluginPublishers = []PluginPublisherSettings{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)}}
+	config.Artifact.StorageRoot = t.TempDir()
+	config.Migrate = nil
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	if server.artifactBlobs != nil {
+		t.Cleanup(func() { require.NoError(t, server.artifactBlobs.Close()) })
+	}
+	require.NoError(t, server.migrate(ctx))
+	for _, table := range []string{"plugin_definitions", "plugin_versions", "plugin_catalog_operations"} {
+		var actual string
+		require.NoError(t, database.QueryRowContext(ctx, "SELECT $1::regclass::text", table).Scan(&actual))
+		require.Equal(t, table, actual)
+	}
+	var applied int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM dbpilot_schema_migrations WHERE name LIKE $1", "plugincatalog/%").Scan(&applied))
+	require.Equal(t, 2, applied)
+	configured := server.config.PluginCatalog.Enabled && len(server.config.PluginPublishers) == 1 && strings.TrimSpace(server.config.Artifact.StorageRoot) != ""
+	require.True(t, configured)
 }
 
 func TestFullStackFixtureGeneratedConfigPassesProductionValidation(t *testing.T) {
@@ -237,15 +317,22 @@ func TestNewServerExposesNonemptyFoundationCapabilityCatalog(t *testing.T) {
 		} `json:"capabilities"`
 	}
 	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
-	require.Len(t, body.Capabilities, 4)
+	require.Len(t, body.Capabilities, 5)
+	seenAgent, seenCatalog := false, false
 	for _, value := range body.Capabilities {
 		if value.Name == "agent.control" {
 			require.False(t, value.Enabled)
 			require.Equal(t, "agent_unsupported", value.ReasonCode)
-			return
+			seenAgent = true
+		}
+		if value.Name == "platform.plugin_catalog" {
+			require.False(t, value.Enabled)
+			require.Equal(t, "deployment_disabled", value.ReasonCode)
+			seenCatalog = true
 		}
 	}
-	t.Fatal("agent.control capability missing")
+	require.True(t, seenAgent)
+	require.True(t, seenCatalog)
 }
 
 func TestConfigStrictlyDecodesSnakeCaseEvaluationScopes(t *testing.T) {

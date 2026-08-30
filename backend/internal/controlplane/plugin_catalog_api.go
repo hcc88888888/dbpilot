@@ -1,14 +1,18 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 
 	"dbpilot.local/platform/gen/openapi"
+	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/plugincatalog"
@@ -116,24 +120,31 @@ func (api platformAPI) UploadPluginVersionPackage(ctx context.Context, request o
 	if err != nil {
 		return nil, err
 	}
-	auditPayload, reconcile, err := httpActionAuditReconciliationWithDetail(ctx, api.services.Audit, scope, principal, "plugin.version_uploaded", "plugin_version", resourceID, "success", key.OperationID, key.IdempotencyKey, map[string]any{
+	auditPayload, reconcile, err := pluginAuditReconciliation(ctx, api.services.Audit, scope, principal, "plugin.version_uploaded", "plugin_version", resourceID, "success", key.OperationID, key.IdempotencyKey, map[string]any{
 		"package_sha256": strings.TrimPrefix(metadata.BodyDigest, "sha256:"),
 	})
 	if err != nil {
 		return nil, err
 	}
-	upload := func(operationContext context.Context) (plugincatalog.PluginVersion, error) {
-		return api.services.PluginCatalog.Upload(operationContext, scope, plugincatalog.UploadMetadata{Actor: principal.Subject, ContentLength: request.Params.ContentLength}, request.Body)
+	operationKey := func(owner string) plugincatalog.OperationKey {
+		return plugincatalog.OperationKey{Scope: scope, Actor: principal.Subject, OperationID: key.OperationID, IdempotencyKey: key.IdempotencyKey, Fingerprint: fingerprint, OwnerToken: owner}
 	}
-	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
-		value, recoveryErr := upload(recoveryContext)
+	upload := func(operationContext context.Context, durableKey plugincatalog.OperationKey, storedAudit []byte) (plugincatalog.OperationSnapshot, error) {
+		return api.services.PluginCatalog.UploadOperation(operationContext, scope, plugincatalog.UploadMetadata{Actor: principal.Subject, ContentLength: request.Params.ContentLength}, durableKey, storedAudit, pluginOperationResponseBuilder, request.Body)
+	}
+	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		durableKey := operationKey(processing.OwnerToken)
+		snapshot, recoveryErr := api.services.PluginCatalog.RecoverOperation(recoveryContext, durableKey)
+		if errors.Is(recoveryErr, plugincatalog.ErrOperationPending) || errors.Is(recoveryErr, plugincatalog.ErrNotFound) {
+			snapshot, recoveryErr = upload(recoveryContext, durableKey, processing.Reconciliation)
+		}
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
-		if value.Scope != scope {
+		if snapshot.Version.Scope != scope || !bytes.Equal(snapshot.AuditEventJSON, processing.Reconciliation) {
 			return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 		}
-		return storedPluginVersionResponse(value, http.StatusCreated)
+		return idempotencyResponseFromOperation(snapshot.Response)
 	})
 	if err != nil {
 		return nil, err
@@ -141,19 +152,22 @@ func (api platformAPI) UploadPluginVersionPackage(ctx context.Context, request o
 	if claim.Response != nil {
 		return uploadPluginVersionIdempotentResponse{response: *claim.Response}, nil
 	}
-	value, err := upload(ctx)
+	snapshot, err := upload(ctx, operationKey(claim.OwnerToken), auditPayload)
 	if err != nil {
 		if errors.Is(err, plugincatalog.ErrBeforeSideEffect) {
+			if auditErr := recordPluginFailureAudit(ctx, api.services.Audit, scope, principal, "plugin.version_verification_failed", "plugin_package", resourceID, key.OperationID, key.IdempotencyKey, pluginFailureCode(err), map[string]any{"package_sha256": strings.TrimPrefix(metadata.BodyDigest, "sha256:")}); auditErr != nil {
+				return nil, auditErr
+			}
 			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, claim.OwnerToken); abortErr != nil {
 				return nil, abortErr
 			}
 		}
 		return nil, err
 	}
-	if value.Scope != scope {
+	if snapshot.Version.Scope != scope || !bytes.Equal(snapshot.AuditEventJSON, auditPayload) {
 		return nil, errors.New("plugin catalog returned an out-of-scope version")
 	}
-	stored, err := storedPluginVersionResponse(value, http.StatusCreated)
+	stored, err := idempotencyResponseFromOperation(snapshot.Response)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +187,8 @@ func validPluginBodyDigest(value string) bool {
 }
 
 func (api platformAPI) ApprovePluginVersion(ctx context.Context, request openapi.ApprovePluginVersionRequestObject) (openapi.ApprovePluginVersionResponseObject, error) {
-	response, err := api.mutatePluginVersion(ctx, "approvePluginVersion", "plugin.version_approved", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusApproved, func(callContext context.Context, revision uint64) (plugincatalog.PluginVersion, error) {
-		return api.services.PluginCatalog.Approve(callContext, mustPlatformScope(ctx), request.VersionId, revision)
+	response, err := api.mutatePluginVersion(ctx, "approvePluginVersion", "plugin.version_approved", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusApproved, func(callContext context.Context, scope platformscope.Scope, revision uint64, key plugincatalog.OperationKey, auditJSON []byte) (plugincatalog.OperationSnapshot, error) {
+		return api.services.PluginCatalog.ApproveOperation(callContext, scope, request.VersionId, revision, key, auditJSON, pluginOperationResponseBuilder)
 	})
 	if err != nil {
 		return nil, err
@@ -183,8 +197,8 @@ func (api platformAPI) ApprovePluginVersion(ctx context.Context, request openapi
 }
 
 func (api platformAPI) PublishPluginVersion(ctx context.Context, request openapi.PublishPluginVersionRequestObject) (openapi.PublishPluginVersionResponseObject, error) {
-	response, err := api.mutatePluginVersion(ctx, "publishPluginVersion", "plugin.version_published", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusAvailable, func(callContext context.Context, revision uint64) (plugincatalog.PluginVersion, error) {
-		return api.services.PluginCatalog.Publish(callContext, mustPlatformScope(ctx), request.VersionId, revision)
+	response, err := api.mutatePluginVersion(ctx, "publishPluginVersion", "plugin.version_published", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusAvailable, func(callContext context.Context, scope platformscope.Scope, revision uint64, key plugincatalog.OperationKey, auditJSON []byte) (plugincatalog.OperationSnapshot, error) {
+		return api.services.PluginCatalog.PublishOperation(callContext, scope, request.VersionId, revision, key, auditJSON, pluginOperationResponseBuilder)
 	})
 	if err != nil {
 		return nil, err
@@ -197,8 +211,8 @@ func (api platformAPI) RevokePluginVersion(ctx context.Context, request openapi.
 		return nil, ErrInvalidRequest
 	}
 	reason := request.Body.ReasonCode
-	response, err := api.mutatePluginVersion(ctx, "revokePluginVersion", "plugin.version_revoked", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusRevoked, func(callContext context.Context, revision uint64) (plugincatalog.PluginVersion, error) {
-		return api.services.PluginCatalog.Revoke(callContext, mustPlatformScope(ctx), request.VersionId, revision, reason)
+	response, err := api.mutatePluginVersion(ctx, "revokePluginVersion", "plugin.version_revoked", request.VersionId, request.Params.IdempotencyKey, request.Params.IfMatch, plugincatalog.StatusRevoked, func(callContext context.Context, scope platformscope.Scope, revision uint64, key plugincatalog.OperationKey, auditJSON []byte) (plugincatalog.OperationSnapshot, error) {
+		return api.services.PluginCatalog.RevokeOperation(callContext, scope, request.VersionId, revision, reason, key, auditJSON, pluginOperationResponseBuilder)
 	})
 	if err != nil {
 		return nil, err
@@ -206,7 +220,7 @@ func (api platformAPI) RevokePluginVersion(ctx context.Context, request openapi.
 	return revokePluginVersionIdempotentResponse{response: response}, nil
 }
 
-type pluginMutationFunc func(context.Context, uint64) (plugincatalog.PluginVersion, error)
+type pluginMutationFunc func(context.Context, platformscope.Scope, uint64, plugincatalog.OperationKey, []byte) (plugincatalog.OperationSnapshot, error)
 
 func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, action, versionID, idempotencyKey, ifMatch string, target plugincatalog.Status, mutate pluginMutationFunc) (idempotency.Response, error) {
 	if api.services.PluginCatalog == nil || api.services.Idempotency == nil || api.services.Audit == nil || mutate == nil {
@@ -228,29 +242,24 @@ func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, act
 	if err != nil {
 		return idempotency.Response{}, err
 	}
-	auditPayload, reconcile, err := httpActionAuditReconciliationWithDetail(ctx, api.services.Audit, scope, principal, action, "plugin_version", versionID, "success", operationID, idempotencyKey, map[string]any{
+	auditPayload, reconcile, err := pluginAuditReconciliation(ctx, api.services.Audit, scope, principal, action, "plugin_version", versionID, "success", operationID, idempotencyKey, map[string]any{
 		"expected_revision": uint64(revision), "target_status": string(target),
 	})
 	if err != nil {
 		return idempotency.Response{}, err
 	}
-	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
-		value, recoveryErr := mutate(recoveryContext, uint64(revision))
-		if errors.Is(recoveryErr, plugincatalog.ErrRevisionConflict) {
-			page, listErr := api.services.PluginCatalog.ListVersions(recoveryContext, scope, plugincatalog.VersionFilter{VersionID: versionID, Limit: 1})
-			if listErr != nil || len(page.Items) != 1 || page.Items[0].Status != target || page.Items[0].Revision != uint64(revision)+1 {
-				return idempotency.Response{}, recoveryErr
-			}
-			value = page.Items[0]
-			recoveryErr = nil
-		}
+	operationKey := func(owner string) plugincatalog.OperationKey {
+		return plugincatalog.OperationKey{Scope: scope, Actor: principal.Subject, OperationID: operationID, IdempotencyKey: idempotencyKey, Fingerprint: fingerprint, OwnerToken: owner}
+	}
+	claim, err := api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, auditPayload, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+		snapshot, recoveryErr := api.services.PluginCatalog.RecoverOperation(recoveryContext, operationKey(processing.OwnerToken))
 		if recoveryErr != nil {
 			return idempotency.Response{}, recoveryErr
 		}
-		if value.Scope != scope || value.ID != versionID {
+		if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !bytes.Equal(snapshot.AuditEventJSON, processing.Reconciliation) {
 			return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 		}
-		return storedPluginVersionResponse(value, http.StatusOK)
+		return idempotencyResponseFromOperation(snapshot.Response)
 	})
 	if err != nil {
 		return idempotency.Response{}, err
@@ -258,28 +267,59 @@ func (api platformAPI) mutatePluginVersion(ctx context.Context, operationID, act
 	if claim.Response != nil {
 		return *claim.Response, nil
 	}
-	value, err := mutate(ctx, uint64(revision))
+	snapshot, err := mutate(ctx, scope, uint64(revision), operationKey(claim.OwnerToken), auditPayload)
 	if err != nil {
 		if errors.Is(err, plugincatalog.ErrInvalid) || errors.Is(err, plugincatalog.ErrNotFound) || errors.Is(err, plugincatalog.ErrRevisionConflict) {
+			if auditErr := recordPluginFailureAudit(ctx, api.services.Audit, scope, principal, "plugin.version_transition_failed", "plugin_version", versionID, operationID, idempotencyKey, pluginFailureCode(err), map[string]any{"expected_revision": uint64(revision), "target_status": string(target)}); auditErr != nil {
+				return idempotency.Response{}, auditErr
+			}
 			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, claim.OwnerToken); abortErr != nil {
 				return idempotency.Response{}, abortErr
 			}
 		}
 		return idempotency.Response{}, err
 	}
-	if value.Scope != scope || value.ID != versionID {
+	if snapshot.Version.Scope != scope || snapshot.Version.ID != versionID || !bytes.Equal(snapshot.AuditEventJSON, auditPayload) {
 		return idempotency.Response{}, errors.New("plugin catalog returned an out-of-scope version")
 	}
-	stored, err := storedPluginVersionResponse(value, http.StatusOK)
+	stored, err := idempotencyResponseFromOperation(snapshot.Response)
 	if err != nil {
 		return idempotency.Response{}, err
 	}
 	return api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, auditPayload, reconcile)
 }
 
-func mustPlatformScope(ctx context.Context) platformscope.Scope {
-	scope, _, _ := platformRequestIdentity(ctx)
-	return scope
+func pluginFailureCode(err error) string {
+	switch {
+	case errors.Is(err, plugincatalog.ErrSignatureRejected), errors.Is(err, plugincatalog.ErrUnknownPublisher):
+		return "plugin_signature_rejected"
+	case errors.Is(err, plugincatalog.ErrManifestRejected), errors.Is(err, plugincatalog.ErrPackageTooLarge):
+		return "plugin_manifest_rejected"
+	case errors.Is(err, plugincatalog.ErrPlatformMismatch):
+		return "plugin_platform_mismatch"
+	case errors.Is(err, plugincatalog.ErrRevisionConflict):
+		return "state_revision_conflict"
+	case errors.Is(err, plugincatalog.ErrNotFound):
+		return "not_found"
+	default:
+		return "invalid_request"
+	}
+}
+
+func recordPluginFailureAudit(ctx context.Context, service AuditService, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, operationID, idempotencyKey, errorCode string, detail map[string]any) error {
+	if service == nil {
+		return ErrServiceUnavailable
+	}
+	event := httpActionAuditEvent(ctx, scope, principal, action, resourceType, resourceID, "failure", operationID, idempotencyKey)
+	digest := sha256.Sum256([]byte(event.DedupeKey))
+	event.RequestID = "plugin-failure-" + hex.EncodeToString(digest[:16])
+	event.TraceID = ""
+	event.Detail["error_code"] = errorCode
+	for key, value := range detail {
+		event.Detail[key] = value
+	}
+	_, err := service.RecordOnce(ctx, event)
+	return err
 }
 
 func storedPluginVersionResponse(value plugincatalog.PluginVersion, status int) (idempotency.Response, error) {
@@ -295,6 +335,55 @@ func storedPluginVersionResponse(value plugincatalog.PluginVersion, status int) 
 	stored.Header.Set("Content-Type", "application/json")
 	stored.Header.Set("ETag", value.ETag())
 	return stored, nil
+}
+
+func pluginOperationResponseBuilder(value plugincatalog.PluginVersion) (plugincatalog.OperationResponse, error) {
+	stored, err := storedPluginVersionResponse(value, map[plugincatalog.Status]int{plugincatalog.StatusVerified: http.StatusCreated}[value.Status])
+	if err != nil {
+		return plugincatalog.OperationResponse{}, err
+	}
+	if stored.Status == 0 {
+		stored.Status = http.StatusOK
+	}
+	return plugincatalog.OperationResponse{Status: stored.Status, ETag: stored.Header.Get("ETag"), Body: append([]byte(nil), stored.Body...)}, nil
+}
+
+func idempotencyResponseFromOperation(value plugincatalog.OperationResponse) (idempotency.Response, error) {
+	if value.Validate() != nil {
+		return idempotency.Response{}, errors.New("stored plugin operation response is invalid")
+	}
+	response := idempotency.Response{Status: value.Status, Header: make(http.Header), Body: append([]byte(nil), value.Body...)}
+	response.Header.Set("Content-Type", "application/json")
+	response.Header.Set("ETag", value.ETag)
+	return response, nil
+}
+
+func pluginAuditReconciliation(ctx context.Context, service AuditService, scope platformscope.Scope, principal Principal, action, resourceType, resourceID, result, operationID, idempotencyKey string, detail map[string]any) ([]byte, idempotency.ReconcileFunc, error) {
+	expected := httpActionAuditEvent(ctx, scope, principal, action, resourceType, resourceID, result, operationID, idempotencyKey)
+	for key, value := range detail {
+		expected.Detail[key] = value
+	}
+	encodedDetail, err := json.Marshal(expected.Detail)
+	if err != nil {
+		return nil, nil, err
+	}
+	if json.Unmarshal(encodedDetail, &expected.Detail) != nil {
+		return nil, nil, errors.New("plugin audit detail is invalid")
+	}
+	payload := httpActionAuditPayload{Scope: expected.Scope, Action: expected.Action, Actor: expected.Actor, Resource: expected.Resource, Result: expected.Result, RequestID: expected.RequestID, TraceID: expected.TraceID, DedupeKey: expected.DedupeKey, Detail: expected.Detail}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	reconcile := func(callbackContext context.Context, _ idempotency.Response, storedJSON []byte) error {
+		var stored httpActionAuditPayload
+		if json.Unmarshal(storedJSON, &stored) != nil || stored.Scope != expected.Scope || stored.Action != expected.Action || stored.Actor != expected.Actor || stored.Resource != expected.Resource || stored.Result != expected.Result || stored.DedupeKey != expected.DedupeKey || !reflect.DeepEqual(stored.Detail, expected.Detail) || !canonicalAuditIdentity(stored.RequestID) || stored.TraceID != "" && !canonicalAuditIdentity(stored.TraceID) {
+			return errors.New("stored plugin audit payload is invalid")
+		}
+		_, recordErr := service.RecordOnce(callbackContext, audit.Event{Scope: stored.Scope, Action: stored.Action, Actor: stored.Actor, Resource: stored.Resource, Result: stored.Result, RequestID: stored.RequestID, TraceID: stored.TraceID, DedupeKey: stored.DedupeKey, Detail: stored.Detail})
+		return recordErr
+	}
+	return encoded, reconcile, nil
 }
 
 func openAPIPluginVersion(value plugincatalog.PluginVersion) (openapi.PluginVersion, error) {
