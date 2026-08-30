@@ -69,10 +69,12 @@ func TestEnrollmentGenerationCompletesManifestAndPublishesDirectoryAtomically(t 
 	// Re-entry after a crash between complete-manifest fsync and directory rename
 	// validates the existing generation instead of rewriting partial files.
 	require.NoError(t, generation.complete(response, serverCA))
+	stagedDirectory := generation.stageDirectory
 	require.NoError(t, generation.publish(serverCA))
 
 	require.DirExists(t, output)
-	require.NoDirExists(t, generation.stageDirectory)
+	require.NoDirExists(t, stagedDirectory)
+	require.Equal(t, output, generation.stageDirectory)
 	for _, name := range []string{agentKeyFilename, agentCertificateFilename, agentCAFilename, enrollmentCommitFilename} {
 		require.FileExists(t, filepath.Join(output, name))
 		info, statErr := os.Lstat(filepath.Join(output, name))

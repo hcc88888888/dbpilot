@@ -209,9 +209,82 @@ func TestEnrollmentGenerationResumesAfterFinalManifestBeforeTransitionCleanup(t 
 
 	resumed, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), failingEnrollmentReader{})
 	require.NoError(t, err)
+	require.False(t, resumed.published, "a finalized marker in the sibling stage is not an already-published output")
 	require.NoError(t, resumed.publish(serverCA))
 	require.DirExists(t, output)
 	require.Len(t, mustReadDirectory(t, output), 4)
+}
+
+func TestFinalizedOutputReopensAfterRenameParentSyncFailure(t *testing.T) {
+	root := t.TempDir()
+	output := filepath.Join(root, "credentials")
+	token := bytes.Repeat([]byte{0x58}, enrollment.EnrollmentTokenBytes)
+	generation, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), rand.Reader)
+	require.NoError(t, err)
+	response, serverCA := testEnrollmentResponse(t, generation.request)
+	require.NoError(t, generation.complete(response, serverCA))
+	originalKey := append([]byte(nil), generation.files.PrivateKeyPEM...)
+	filesystem := systemEnrollmentFilesystem()
+	realSync := filesystem.syncDirectory
+	failed := false
+	filesystem.syncDirectory = func(path string) error {
+		if !failed && filepath.Clean(path) == filepath.Clean(root) {
+			if _, statErr := os.Lstat(output); statErr == nil {
+				failed = true
+				return errEnrollmentCrash
+			}
+		}
+		return realSync(path)
+	}
+	generation.filesystem = filesystem
+
+	err = generation.publish(serverCA)
+	require.ErrorIs(t, err, errEnrollmentCrash)
+	require.DirExists(t, output)
+	require.NoDirExists(t, enrollmentStageDirectory(output))
+	// An in-process retry must switch to validating the already-renamed output.
+	require.NoError(t, generation.publish(serverCA))
+
+	// A fresh invocation after lost stderr/stdout must not generate a new key or
+	// contact the enrollment service; it reopens and validates finalized output.
+	reopened, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), failingEnrollmentReader{})
+	require.NoError(t, err)
+	require.True(t, reopened.published)
+	require.Nil(t, reopened.request)
+	require.Equal(t, originalKey, reopened.files.PrivateKeyPEM)
+	require.NoError(t, reopened.publish(serverCA))
+}
+
+func TestExistingEnrollmentOutputDistinguishesCorruptFinalizedFromCollision(t *testing.T) {
+	t.Run("corrupt finalized output", func(t *testing.T) {
+		root := t.TempDir()
+		output := filepath.Join(root, "credentials")
+		token := bytes.Repeat([]byte{0x59}, enrollment.EnrollmentTokenBytes)
+		generation, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), rand.Reader)
+		require.NoError(t, err)
+		response, serverCA := testEnrollmentResponse(t, generation.request)
+		require.NoError(t, generation.complete(response, serverCA))
+		require.NoError(t, generation.publish(serverCA))
+		require.NoError(t, os.WriteFile(filepath.Join(output, enrollmentCommitFilename), []byte(`{"state":"finalized`), 0o600))
+
+		_, err = prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), failingEnrollmentReader{})
+		require.ErrorContains(t, err, "invalid")
+		require.NotContains(t, err.Error(), "already exists")
+		require.NoDirExists(t, enrollmentStageDirectory(output))
+	})
+
+	t.Run("ordinary collision", func(t *testing.T) {
+		root := t.TempDir()
+		output := filepath.Join(root, "credentials")
+		require.NoError(t, os.Mkdir(output, 0o700))
+		token := bytes.Repeat([]byte{0x5a}, enrollment.EnrollmentTokenBytes)
+
+		_, err := prepareEnrollmentGeneration(output, "agent-1", token, validCLIHostObservation(), failingEnrollmentReader{})
+		require.ErrorContains(t, err, "already exists")
+		require.NotContains(t, err.Error(), "invalid")
+		require.Empty(t, mustReadDirectory(t, output))
+		require.NoDirExists(t, enrollmentStageDirectory(output))
+	})
 }
 
 func TestCompletedEnrollmentGenerationRejectsSemanticSubstitution(t *testing.T) {
