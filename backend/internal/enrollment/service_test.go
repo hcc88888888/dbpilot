@@ -29,7 +29,7 @@ func TestCreateEnrollmentStoresOnlyTokenHashAndTrustedScope(t *testing.T) {
 	created, err := service.Create(context.Background(), scope, CreateRequest{
 		HostID: "host-1", AgentID: "agent-1", DisplayName: "Primary database host",
 		Labels: map[string]string{"role": "database"}, ExpiresIn: 10 * time.Minute,
-		IssuedBy: "operator-1", IdempotencyKey: "enroll-1",
+		IssuedBy: "operator-1", IdempotencyKey: "enroll-1", RequestFingerprint: "sha256:" + strings.Repeat("1", 64),
 	})
 
 	require.NoError(t, err)
@@ -43,17 +43,14 @@ func TestCreateEnrollmentStoresOnlyTokenHashAndTrustedScope(t *testing.T) {
 	require.NotContains(t, store.created.String(), string(raw))
 }
 
-func TestEnrollmentTokenCannotBeConsumedTwiceAndCertificateUsesCanonicalSPIFFE(t *testing.T) {
+func TestEnrollmentRetryReturnsStoredCertificateAndCertificateUsesCanonicalSPIFFE(t *testing.T) {
 	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	raw := bytes.Repeat([]byte{0x31}, EnrollmentTokenBytes)
 	caCertificate, caKey := testCertificateAuthority(t, now)
 	issuer, err := NewAgentCertificateIssuer(caCertificate, caKey, time.Hour, func() time.Time { return now }, rand.Reader)
 	require.NoError(t, err)
-	store := &memoryTokenStore{tokens: map[[32]byte]EnrollmentToken{
-		HashToken(raw): validEnrollmentToken(HashToken(raw), now),
-	}}
-	hosts := &recordingHostService{}
-	service := ApplicationService{Tokens: store, Certificates: issuer, Hosts: hosts, Now: func() time.Time { return now }}
+	store := newAttemptMemoryStore(validEnrollmentToken(HashToken(raw), now).Grant())
+	service := ApplicationService{Tokens: store, Certificates: issuer, Now: func() time.Time { return now }}
 	request := signedEnrollRequest(t, raw, "agent-1", now)
 
 	first, err := service.Enroll(context.Background(), request)
@@ -61,15 +58,14 @@ func TestEnrollmentTokenCannotBeConsumedTwiceAndCertificateUsesCanonicalSPIFFE(t
 	require.NoError(t, err)
 	require.NotEmpty(t, first.CertificatePEM)
 	require.Equal(t, "host-1", first.HostID)
-	require.Equal(t, "host-1", hosts.observation.HostID)
-	require.Equal(t, "agent-1", hosts.observation.AgentID)
 	certificate := parseLeafCertificate(t, first.CertificatePEM)
 	require.Len(t, certificate.URIs, 1)
 	require.Equal(t, "spiffe://dbpilot.local/agent/agent-1", certificate.URIs[0].String())
 	require.Equal(t, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, certificate.ExtKeyUsage)
 
-	_, err = service.Enroll(context.Background(), request)
-	require.ErrorIs(t, err, ErrEnrollmentTokenInvalid)
+	replayed, err := service.Enroll(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, first, replayed)
 }
 
 func TestEnrollRejectsExpiryScopeMismatchAndInvalidEd25519Proof(t *testing.T) {
@@ -80,27 +76,28 @@ func TestEnrollRejectsExpiryScopeMismatchAndInvalidEd25519Proof(t *testing.T) {
 	t.Run("expired", func(t *testing.T) {
 		expired := valid
 		expired.ExpiresAt = now
-		store := &memoryTokenStore{tokens: map[[32]byte]EnrollmentToken{expired.TokenHash: expired}}
-		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Hosts: &recordingHostService{}, Now: func() time.Time { return now }}
+		store := newAttemptMemoryStore(expired.Grant())
+		store.resolveErr = ErrEnrollmentTokenInvalid
+		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Now: func() time.Time { return now }}
 		_, err := service.Enroll(context.Background(), signedEnrollRequest(t, raw, valid.AgentID, now))
 		require.ErrorIs(t, err, ErrEnrollmentTokenInvalid)
 	})
 
 	t.Run("scope binding", func(t *testing.T) {
-		store := &memoryTokenStore{tokens: map[[32]byte]EnrollmentToken{valid.TokenHash: valid}}
-		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Hosts: &recordingHostService{}, Now: func() time.Time { return now }}
+		store := newAttemptMemoryStore(valid.Grant())
+		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Now: func() time.Time { return now }}
 		_, err := service.Enroll(context.Background(), signedEnrollRequest(t, raw, "agent-other", now))
 		require.ErrorIs(t, err, ErrEnrollmentTokenInvalid)
 	})
 
 	t.Run("proof checked before consumption", func(t *testing.T) {
-		store := &memoryTokenStore{tokens: map[[32]byte]EnrollmentToken{valid.TokenHash: valid}}
-		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Hosts: &recordingHostService{}, Now: func() time.Time { return now }}
+		store := newAttemptMemoryStore(valid.Grant())
+		service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Now: func() time.Time { return now }}
 		request := signedEnrollRequest(t, raw, valid.AgentID, now)
 		request.CSRProof[0] ^= 0xff
 		_, err := service.Enroll(context.Background(), request)
 		require.ErrorIs(t, err, ErrEnrollmentRequestInvalid)
-		require.Zero(t, store.consumeCalls)
+		require.Zero(t, store.completeCalls)
 	})
 }
 
@@ -109,8 +106,9 @@ func TestEnrollmentErrorsNeverContainTokenOrPrivateMaterial(t *testing.T) {
 	raw := bytes.Repeat([]byte("private-enrollment-token"), 2)[:EnrollmentTokenBytes]
 	request := signedEnrollRequest(t, raw, "agent-1", now)
 	privateMarker := "PRIVATE-KEY-MARKER"
-	store := &memoryTokenStore{consumeErr: errors.New("storage unavailable")}
-	service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Hosts: &recordingHostService{}, Now: func() time.Time { return now }}
+	store := newAttemptMemoryStore(validEnrollmentToken(HashToken(raw), now).Grant())
+	store.resolveErr = errors.New("storage unavailable")
+	service := ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Now: func() time.Time { return now }}
 
 	_, err := service.Enroll(context.Background(), request)
 
@@ -148,6 +146,7 @@ func validEnrollmentToken(hash [32]byte, now time.Time) EnrollmentToken {
 		HostID: "host-1", AgentID: "agent-1", DisplayName: "Primary database host",
 		Labels: map[string]string{"role": "database"}, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 		EnrollmentRevision: 1, IssuedBy: "operator-1", IdempotencyKey: "enroll-1",
+		RequestFingerprint: "sha256:" + strings.Repeat("1", 64), Generation: 1,
 	}
 }
 
@@ -184,16 +183,16 @@ type memoryTokenStore struct {
 	consumeErr   error
 }
 
-func (store *memoryTokenStore) Create(_ context.Context, token EnrollmentToken) error {
+func (store *memoryTokenStore) Create(_ context.Context, token EnrollmentToken) (EnrollmentTokenCreation, error) {
 	store.created = token
 	if store.tokens == nil {
 		store.tokens = make(map[[32]byte]EnrollmentToken)
 	}
 	if _, exists := store.tokens[token.TokenHash]; exists {
-		return ErrEnrollmentConflict
+		return EnrollmentTokenCreation{}, ErrEnrollmentConflict
 	}
 	store.tokens[token.TokenHash] = token
-	return nil
+	return EnrollmentTokenCreation{Generation: 1}, nil
 }
 
 func (store *memoryTokenStore) Consume(_ context.Context, hash [32]byte, now time.Time) (EnrollmentGrant, error) {
@@ -209,11 +208,12 @@ func (store *memoryTokenStore) Consume(_ context.Context, hash [32]byte, now tim
 	return token.Grant(), nil
 }
 
-type recordingHostService struct{ observation hostinventory.Observation }
+func (store *memoryTokenStore) Resolve(context.Context, EnrollmentAttemptKey) (EnrollmentResolution, error) {
+	return EnrollmentResolution{}, ErrEnrollmentTokenInvalid
+}
 
-func (service *recordingHostService) RecordEnrollment(_ context.Context, _ EnrollmentGrant, observation hostinventory.Observation, _ time.Time) error {
-	service.observation = observation
-	return nil
+func (store *memoryTokenStore) Complete(context.Context, EnrollmentCompletion) (EnrollResult, error) {
+	return EnrollResult{}, ErrEnrollmentTokenInvalid
 }
 
 type rejectingIssuer struct{}

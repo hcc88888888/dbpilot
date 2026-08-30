@@ -126,11 +126,19 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, sco
 	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || observation.Validate() != nil || !validUTC(receivedAt) {
 		return Host{}, ErrInvalid
 	}
-	filesystems, err := json.Marshal(observation.Filesystems)
+	filesystemValues := observation.Filesystems
+	if filesystemValues == nil {
+		filesystemValues = []FilesystemSummary{}
+	}
+	filesystems, err := json.Marshal(filesystemValues)
 	if err != nil {
 		return Host{}, ErrInvalid
 	}
-	addresses, err := json.Marshal(observation.NetworkAddresses)
+	addressValues := observation.NetworkAddresses
+	if addressValues == nil {
+		addressValues = []string{}
+	}
+	addresses, err := json.Marshal(addressValues)
 	if err != nil {
 		return Host{}, ErrInvalid
 	}
@@ -194,11 +202,19 @@ func (repository *PostgresRepository) RecordEnrollment(ctx context.Context, scop
 		enrollment.HostID != observation.HostID || enrollment.AgentID != observation.AgentID {
 		return Host{}, ErrInvalid
 	}
-	filesystems, err := json.Marshal(observation.Filesystems)
+	filesystemValues := observation.Filesystems
+	if filesystemValues == nil {
+		filesystemValues = []FilesystemSummary{}
+	}
+	filesystems, err := json.Marshal(filesystemValues)
 	if err != nil {
 		return Host{}, ErrInvalid
 	}
-	addresses, err := json.Marshal(observation.NetworkAddresses)
+	addressValues := observation.NetworkAddresses
+	if addressValues == nil {
+		addressValues = []string{}
+	}
+	addresses, err := json.Marshal(addressValues)
 	if err != nil {
 		return Host{}, ErrInvalid
 	}

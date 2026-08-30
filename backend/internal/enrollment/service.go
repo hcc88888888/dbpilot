@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/url"
@@ -21,9 +22,8 @@ import (
 const csrProofDomain = "dbpilot-agent-enrollment-csr-proof-v1"
 
 type ApplicationService struct {
-	Tokens       TokenStore
+	Tokens       EnrollmentStore
 	Certificates CertificateIssuer
-	Hosts        HostObservationRecorder
 	Random       io.Reader
 	Now          func() time.Time
 }
@@ -52,20 +52,29 @@ func (service ApplicationService) Create(ctx context.Context, scope platformscop
 		TokenHash: HashToken(raw), Scope: scope, HostID: request.HostID, AgentID: request.AgentID,
 		DisplayName: request.DisplayName, Labels: cloneLabels(request.Labels), CreatedAt: now, ExpiresAt: now.Add(ttl),
 		EnrollmentRevision: 1, IssuedBy: request.IssuedBy, IdempotencyKey: request.IdempotencyKey,
+		RequestFingerprint: request.RequestFingerprint, Generation: 1,
 	}
 	if token.Validate() != nil {
 		zero(raw)
 		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
 	}
-	if err := service.Tokens.Create(ctx, token); err != nil {
+	creation, err := service.Tokens.Create(ctx, token)
+	if err != nil {
 		zero(raw)
 		return CreatedEnrollment{}, err
 	}
-	return CreatedEnrollment{HostID: token.HostID, AgentID: token.AgentID, Token: raw, ExpiresAt: token.ExpiresAt, EnrollmentRevision: token.EnrollmentRevision}, nil
+	if creation.Generation == 0 {
+		zero(raw)
+		return CreatedEnrollment{}, ErrEnrollmentRequestInvalid
+	}
+	return CreatedEnrollment{
+		HostID: token.HostID, AgentID: token.AgentID, Token: raw, ExpiresAt: token.ExpiresAt,
+		EnrollmentRevision: token.EnrollmentRevision, Generation: creation.Generation, Replaced: creation.Replaced,
+	}, nil
 }
 
 func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequest) (EnrollResult, error) {
-	if ctx == nil || service.Tokens == nil || service.Certificates == nil || service.Hosts == nil ||
+	if ctx == nil || service.Tokens == nil || service.Certificates == nil ||
 		len(request.Token) != EnrollmentTokenBytes || !identifierPattern.MatchString(request.AgentID) ||
 		request.Observation.AgentID != request.AgentID || len(request.CSRProof) != ed25519.SignatureSize {
 		return EnrollResult{}, ErrEnrollmentRequestInvalid
@@ -77,7 +86,7 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 	if observationProbe.Validate() != nil {
 		return EnrollResult{}, ErrEnrollmentRequestInvalid
 	}
-	proofMessage, publicKey, err := verifiedCSRProofInputs(request.AgentID, request.CSRPEM, request.CSRPublicKey)
+	proofMessage, publicKey, csrDigest, err := verifiedCSRProofInputs(request.AgentID, request.CSRPEM, request.CSRPublicKey)
 	if err != nil || !ed25519.Verify(publicKey, proofMessage, request.CSRProof) {
 		return EnrollResult{}, ErrEnrollmentRequestInvalid
 	}
@@ -85,30 +94,50 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 	if !validUTC(now) {
 		return EnrollResult{}, ErrEnrollmentRequestInvalid
 	}
-	grant, err := service.Tokens.Consume(ctx, HashToken(request.Token), now)
+	key := EnrollmentAttemptKey{TokenHash: HashToken(request.Token), CSRDigest: csrDigest, AgentID: request.AgentID, HostID: request.Observation.HostID}
+	resolution, err := service.Tokens.Resolve(ctx, key)
 	if err != nil {
 		if errors.Is(err, ErrEnrollmentTokenInvalid) {
 			return EnrollResult{}, ErrEnrollmentTokenInvalid
 		}
-		return EnrollResult{}, errors.New("consume Agent enrollment token")
+		return EnrollResult{}, errors.New("resolve Agent enrollment token")
 	}
+	grant := resolution.Grant
 	if grant.Validate() != nil || grant.AgentID != request.AgentID || (request.Observation.HostID != "" && request.Observation.HostID != grant.HostID) {
 		return EnrollResult{}, ErrEnrollmentTokenInvalid
+	}
+	key.HostID = grant.HostID
+	if resolution.Response != nil {
+		if err := validateEnrollmentResult(*resolution.Response, grant); err != nil {
+			return EnrollResult{}, errors.New("stored Agent enrollment response is invalid")
+		}
+		return cloneEnrollmentResult(*resolution.Response), nil
 	}
 	certificatePEM, chainPEM, expiresAt, err := service.Certificates.SignAgentCSR(ctx, grant, request.CSRPEM)
 	if err != nil || len(certificatePEM) == 0 || len(chainPEM) == 0 || !validUTC(expiresAt) || !expiresAt.After(now) {
 		return EnrollResult{}, errors.New("issue Agent enrollment certificate")
 	}
-	observation := request.Observation
-	observation.HostID = grant.HostID
-	if err := service.Hosts.RecordEnrollment(ctx, grant, observation, now); err != nil {
-		return EnrollResult{}, errors.New("record enrolled Agent host observation")
-	}
-	return EnrollResult{
+	result := EnrollResult{
 		HostID: grant.HostID, AgentID: grant.AgentID, CertificatePEM: append([]byte(nil), certificatePEM...),
 		CertificateChainPEM: append([]byte(nil), chainPEM...), ExpiresAt: expiresAt,
 		EnrollmentRevision: grant.EnrollmentRevision,
-	}, nil
+	}
+	observation := request.Observation
+	observation.HostID = grant.HostID
+	completed, err := service.Tokens.Complete(ctx, EnrollmentCompletion{Key: key, Grant: grant, Observation: observation, Result: result, CompletedAt: now})
+	if err == nil {
+		if validateEnrollmentResult(completed, grant) != nil {
+			return EnrollResult{}, errors.New("completed Agent enrollment response is invalid")
+		}
+		return cloneEnrollmentResult(completed), nil
+	}
+	// A connection loss can make COMMIT outcome unknown. Resolve by the exact
+	// token/CSR/Agent/Host key before reporting failure or asking for a new token.
+	recovered, resolveErr := service.Tokens.Resolve(ctx, key)
+	if resolveErr == nil && recovered.Response != nil && validateEnrollmentResult(*recovered.Response, grant) == nil {
+		return cloneEnrollmentResult(*recovered.Response), nil
+	}
+	return EnrollResult{}, errors.New("complete Agent enrollment attempt")
 }
 
 func (service ApplicationService) now() time.Time {
@@ -122,33 +151,35 @@ func (service ApplicationService) now() time.Time {
 // CSRProofMessage returns the canonical byte string the Agent proves with the
 // private key corresponding to its CSR. It contains no token or private key.
 func CSRProofMessage(agentID string, csrPEM, publicKeyDER []byte) ([]byte, error) {
-	message, _, err := verifiedCSRProofInputs(agentID, csrPEM, publicKeyDER)
+	message, _, _, err := verifiedCSRProofInputs(agentID, csrPEM, publicKeyDER)
 	return message, err
 }
 
-func verifiedCSRProofInputs(agentID string, csrPEM, publicKeyDER []byte) ([]byte, ed25519.PublicKey, error) {
-	if !identifierPattern.MatchString(agentID) {
-		return nil, nil, ErrEnrollmentRequestInvalid
+func verifiedCSRProofInputs(agentID string, csrPEM, publicKeyDER []byte) ([]byte, ed25519.PublicKey, [sha256.Size]byte, error) {
+	if !identifierPattern.MatchString(agentID) || len(csrPEM) == 0 || len(csrPEM) > MaximumCSRPEMBytes || len(publicKeyDER) == 0 || len(publicKeyDER) > MaximumCSRPublicKeyBytes {
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	block, rest := pem.Decode(csrPEM)
-	if block == nil || block.Type != "CERTIFICATE REQUEST" || len(bytes.TrimSpace(rest)) != 0 {
-		return nil, nil, ErrEnrollmentRequestInvalid
+	if block == nil || block.Type != "CERTIFICATE REQUEST" || len(block.Headers) != 0 || len(bytes.TrimSpace(rest)) != 0 {
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	csr, err := x509.ParseCertificateRequest(block.Bytes)
-	if err != nil || csr.CheckSignature() != nil || csr.Subject.String() != "" || len(csr.DNSNames) != 0 || len(csr.EmailAddresses) != 0 || len(csr.IPAddresses) != 0 || len(csr.URIs) != 0 {
-		return nil, nil, ErrEnrollmentRequestInvalid
+	if err != nil || csr.CheckSignature() != nil || csr.SignatureAlgorithm != x509.PureEd25519 || csr.Subject.String() != "" || !bytes.Equal(csr.RawSubject, []byte{0x30, 0x00}) ||
+		len(csr.Attributes) != 0 || len(csr.Extensions) != 0 || len(csr.ExtraExtensions) != 0 || len(csr.DNSNames) != 0 || len(csr.EmailAddresses) != 0 || len(csr.IPAddresses) != 0 || len(csr.URIs) != 0 {
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	publicKey, ok := csr.PublicKey.(ed25519.PublicKey)
 	if !ok || len(publicKey) != ed25519.PublicKeySize {
-		return nil, nil, ErrEnrollmentRequestInvalid
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	parsedPublic, err := x509.ParsePKIXPublicKey(publicKeyDER)
 	if err != nil {
-		return nil, nil, ErrEnrollmentRequestInvalid
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	provided, ok := parsedPublic.(ed25519.PublicKey)
-	if !ok || !bytes.Equal(publicKey, provided) {
-		return nil, nil, ErrEnrollmentRequestInvalid
+	canonicalPublic, canonicalErr := x509.MarshalPKIXPublicKey(publicKey)
+	if !ok || canonicalErr != nil || !bytes.Equal(publicKey, provided) || !bytes.Equal(canonicalPublic, publicKeyDER) {
+		return nil, nil, [sha256.Size]byte{}, ErrEnrollmentRequestInvalid
 	}
 	csrDigest := sha256.Sum256(csr.Raw)
 	keyDigest := sha256.Sum256(publicKeyDER)
@@ -160,11 +191,27 @@ func verifiedCSRProofInputs(agentID string, csrPEM, publicKeyDER []byte) ([]byte
 	message = append(message, agentID...)
 	message = append(message, csrDigest[:]...)
 	message = append(message, keyDigest[:]...)
-	return message, append(ed25519.PublicKey(nil), publicKey...), nil
+	return message, append(ed25519.PublicKey(nil), publicKey...), csrDigest, nil
+}
+
+func validateEnrollmentResult(result EnrollResult, grant EnrollmentGrant) error {
+	if result.HostID != grant.HostID || result.AgentID != grant.AgentID || len(result.CertificatePEM) == 0 || len(result.CertificateChainPEM) == 0 ||
+		!validUTC(result.ExpiresAt) || result.EnrollmentRevision != grant.EnrollmentRevision {
+		return ErrEnrollmentRequestInvalid
+	}
+	return nil
+}
+
+func cloneEnrollmentResult(result EnrollResult) EnrollResult {
+	result.CertificatePEM = append([]byte(nil), result.CertificatePEM...)
+	result.CertificateChainPEM = append([]byte(nil), result.CertificateChainPEM...)
+	return result
 }
 
 type AgentCertificateIssuer struct {
 	ca       *x509.Certificate
+	chain    []*x509.Certificate
+	chainPEM []byte
 	key      ed25519.PrivateKey
 	lifetime time.Duration
 	now      func() time.Time
@@ -172,14 +219,13 @@ type AgentCertificateIssuer struct {
 }
 
 func NewAgentCertificateIssuer(certificatePEM, privateKeyPEM []byte, lifetime time.Duration, now func() time.Time, random io.Reader) (*AgentCertificateIssuer, error) {
-	certificateBlock, certificateRest := pem.Decode(certificatePEM)
+	certificates, err := parseCertificateChain(certificatePEM)
 	keyBlock, keyRest := pem.Decode(privateKeyPEM)
-	if certificateBlock == nil || certificateBlock.Type != "CERTIFICATE" || len(bytes.TrimSpace(certificateRest)) != 0 ||
-		keyBlock == nil || keyBlock.Type != "PRIVATE KEY" || len(bytes.TrimSpace(keyRest)) != 0 || lifetime <= 0 || lifetime > 365*24*time.Hour {
+	if err != nil || keyBlock == nil || keyBlock.Type != "PRIVATE KEY" || len(keyBlock.Headers) != 0 || len(bytes.TrimSpace(keyRest)) != 0 || lifetime <= 0 || lifetime > 365*24*time.Hour {
 		return nil, ErrEnrollmentRequestInvalid
 	}
-	certificate, err := x509.ParseCertificate(certificateBlock.Bytes)
-	if err != nil || !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
+	certificate := certificates[0]
+	if !certificate.IsCA || certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
 		return nil, ErrEnrollmentRequestInvalid
 	}
 	parsedKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
@@ -196,7 +242,14 @@ func NewAgentCertificateIssuer(certificatePEM, privateKeyPEM []byte, lifetime ti
 	if random == nil {
 		random = rand.Reader
 	}
-	return &AgentCertificateIssuer{ca: certificate, key: append(ed25519.PrivateKey(nil), privateKey...), lifetime: lifetime, now: now, random: random}, nil
+	current := now()
+	if !validUTC(current) || current.Before(certificate.NotBefore) || !current.Before(certificate.NotAfter) {
+		return nil, ErrEnrollmentRequestInvalid
+	}
+	return &AgentCertificateIssuer{
+		ca: certificate, chain: certificates, chainPEM: append([]byte(nil), certificatePEM...),
+		key: append(ed25519.PrivateKey(nil), privateKey...), lifetime: lifetime, now: now, random: random,
+	}, nil
 }
 
 func (issuer *AgentCertificateIssuer) SignAgentCSR(_ context.Context, grant EnrollmentGrant, csrPEM []byte) ([]byte, []byte, time.Time, error) {
@@ -244,7 +297,71 @@ func (issuer *AgentCertificateIssuer) SignAgentCSR(_ context.Context, grant Enro
 	if err != nil {
 		return nil, nil, time.Time{}, errors.New("sign Agent certificate")
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.ca.Raw}), expiresAt, nil
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}), append([]byte(nil), issuer.chainPEM...), expiresAt, nil
+}
+
+func (issuer *AgentCertificateIssuer) ValidateAgentControlTrust(roots *x509.CertPool) error {
+	if issuer == nil || roots == nil {
+		return ErrEnrollmentRequestInvalid
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(issuer.random)
+	if err != nil {
+		return errors.New("generate enrollment trust probe key")
+	}
+	csrDER, err := x509.CreateCertificateRequest(issuer.random, &x509.CertificateRequest{}, privateKey)
+	if err != nil {
+		return errors.New("generate enrollment trust probe CSR")
+	}
+	_ = publicKey
+	certificatePEM, _, _, err := issuer.SignAgentCSR(context.Background(), EnrollmentGrant{
+		Scope: platformscope.Scope{TenantID: "trust-probe", ProjectID: "trust-probe"}, HostID: "trust-probe", AgentID: "trust-probe",
+		DisplayName: "trust-probe", Labels: map[string]string{}, EnrollmentRevision: 1,
+	}, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}))
+	if err != nil {
+		return err
+	}
+	leafBlock, rest := pem.Decode(certificatePEM)
+	if leafBlock == nil || len(bytes.TrimSpace(rest)) != 0 {
+		return errors.New("decode enrollment trust probe certificate")
+	}
+	leaf, err := x509.ParseCertificate(leafBlock.Bytes)
+	if err != nil {
+		return err
+	}
+	intermediates := x509.NewCertPool()
+	for _, certificate := range issuer.chain {
+		if certificate.CheckSignatureFrom(certificate) != nil {
+			intermediates.AddCert(certificate)
+		}
+	}
+	_, err = leaf.Verify(x509.VerifyOptions{
+		Roots: roots, Intermediates: intermediates, CurrentTime: issuer.now(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	if err != nil {
+		return fmt.Errorf("enrollment issuing chain is not trusted by AgentControl: %w", err)
+	}
+	return nil
+}
+
+func parseCertificateChain(contents []byte) ([]*x509.Certificate, error) {
+	remaining := bytes.TrimSpace(contents)
+	var certificates []*x509.Certificate
+	for len(remaining) > 0 {
+		block, rest := pem.Decode(remaining)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, ErrEnrollmentRequestInvalid
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, ErrEnrollmentRequestInvalid
+		}
+		certificates = append(certificates, certificate)
+		remaining = bytes.TrimSpace(rest)
+	}
+	if len(certificates) == 0 {
+		return nil, ErrEnrollmentRequestInvalid
+	}
+	return certificates, nil
 }
 
 func mustMarshalPublicKey(key any) []byte {

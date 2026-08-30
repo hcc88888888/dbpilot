@@ -296,7 +296,7 @@ type defaultMigrationSteps struct {
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.enrollment, steps.host}
+	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.enrollment}
 	if steps.plugin != nil {
 		pipeline = append(pipeline, steps.plugin)
 	}
@@ -571,9 +571,18 @@ func NewServer(config Config) (*Server, error) {
 			}
 			return nil, err
 		}
+		if err := issuer.ValidateAgentControlTrust(grpcTLS.ClientCAs); err != nil {
+			if artifactBlobs != nil {
+				_ = artifactBlobs.Close()
+			}
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, fmt.Errorf("validate enrollment CA against AgentControl trust: %w", err)
+		}
 		enrollmentService = &enrollment.ApplicationService{
 			Tokens: enrollment.NewPostgresRepository(database), Certificates: issuer,
-			Hosts: persistedEnrollmentHostRecorder{repository: hostRepository}, Now: func() time.Time { return time.Now().UTC() },
+			Now: func() time.Time { return time.Now().UTC() },
 		}
 	}
 	inspectionRepository := inspection.NewPostgresRepository(database, jobRepository)
@@ -1054,8 +1063,12 @@ func (server *Server) stop(httpListener, grpcListener, enrollmentListener net.Li
 		_ = enrollmentListener.Close()
 	}
 	if server.hostObservations != nil {
-		if err := server.hostObservations.Close(shutdownCtx); err != nil {
+		report, err := server.hostObservations.Close(shutdownCtx)
+		if err != nil {
 			return fmt.Errorf("close Host observation delivery: %w", err)
+		}
+		if report.TotalDiscarded() != 0 {
+			return fmt.Errorf("close Host observation delivery: discarded observation=%d hello=%d heartbeat=%d", report.ObservationDiscarded, report.HelloDiscarded, report.HeartbeatDiscarded)
 		}
 	}
 	return nil
@@ -1281,29 +1294,7 @@ func (sink persistedHostObservationSink) RecordHeartbeat(ctx context.Context, ag
 	return err
 }
 
-type persistedEnrollmentHostRecorder struct {
-	repository *hostinventory.PostgresRepository
-}
-
-func (recorder persistedEnrollmentHostRecorder) RecordEnrollment(ctx context.Context, grant enrollment.EnrollmentGrant, observation hostinventory.Observation, receivedAt time.Time) error {
-	if recorder.repository == nil || grant.Validate() != nil || !receivedAt.IsZero() && receivedAt.Location() != time.UTC {
-		return hostinventory.ErrInvalid
-	}
-	value, err := recorder.repository.RecordEnrollment(ctx, grant.Scope, hostinventory.Enrollment{
-		HostID: grant.HostID, AgentID: grant.AgentID, DisplayName: grant.DisplayName, Labels: grant.Labels,
-		Revision: grant.EnrollmentRevision, EnrolledAt: receivedAt,
-	}, observation, receivedAt)
-	if err != nil {
-		return err
-	}
-	if value.Validate() != nil || value.Scope != grant.Scope || value.ID != grant.HostID || value.AgentID != grant.AgentID || value.EnrollmentRevision != grant.EnrollmentRevision || !value.LastHeartbeatAt.IsZero() {
-		return hostinventory.ErrInvalid
-	}
-	return nil
-}
-
 var _ agentcontrol.HostObservationSink = persistedHostObservationSink{}
-var _ enrollment.HostObservationRecorder = persistedEnrollmentHostRecorder{}
 
 func configuredInspectionTargets(assignments map[string]AgentAssignment) []inspection.HostTarget {
 	result := make([]inspection.HostTarget, 0, len(assignments))

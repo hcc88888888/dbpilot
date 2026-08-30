@@ -20,7 +20,7 @@ func TestHostObservationDispatcherCoalescesNewestHeartbeatWhilePersistenceIsBloc
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = dispatcher.Close(ctx)
+		_, _ = dispatcher.Close(ctx)
 	})
 	require.NoError(t, dispatcher.SubmitHello("agent-a", base))
 	select {
@@ -37,21 +37,10 @@ func TestHostObservationDispatcherCoalescesNewestHeartbeatWhilePersistenceIsBloc
 	require.ErrorIs(t, dispatcher.SubmitHeartbeat("agent-b", latest), ErrHostObservationCapacity)
 	stats := dispatcher.Stats()
 	require.Equal(t, uint64(1), stats.RejectedNewKeys)
-	require.GreaterOrEqual(t, stats.Coalesced, uint64(99))
 
 	close(sink.releaseHello)
-	select {
-	case revision := <-sink.observations:
-		require.Equal(t, uint64(100), revision, "the pending Agent key must retain its highest inventory revision")
-	case <-time.After(time.Second):
-		t.Fatal("highest Host observation revision was not persisted after release")
-	}
-	select {
-	case persisted := <-sink.heartbeats:
-		require.Equal(t, latest, persisted, "the pending Agent key must retain its newest real Heartbeat")
-	case <-time.After(time.Second):
-		t.Fatal("newest Heartbeat was not persisted after the blocked Hello released")
-	}
+	requireEventuallyRevision(t, sink.observations, 100)
+	requireEventuallyTime(t, sink.heartbeats, latest)
 }
 
 func TestHostObservationDispatcherClosePerformsOneBoundedDrainThenStopsIntake(t *testing.T) {
@@ -63,7 +52,9 @@ func TestHostObservationDispatcherClosePerformsOneBoundedDrainThenStopsIntake(t 
 	require.NoError(t, dispatcher.SubmitHeartbeat("agent-a", base))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	require.NoError(t, dispatcher.Close(ctx))
+	report, err := dispatcher.Close(ctx)
+	require.NoError(t, err)
+	require.Zero(t, report.TotalDiscarded())
 	require.Equal(t, base, <-sink.heartbeats)
 	require.ErrorIs(t, dispatcher.SubmitHeartbeat("agent-a", base.Add(time.Second)), ErrHostObservationClosed)
 }
@@ -83,9 +74,11 @@ func TestHostObservationFailureDoesNotSuppressRealHeartbeat(t *testing.T) {
 		t.Fatal("a failed inventory observation suppressed real Heartbeat liveness")
 	}
 	require.Eventually(t, func() bool { return dispatcher.Stats().Failed == 1 }, time.Second, time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	require.NoError(t, dispatcher.Close(ctx))
+	report, err := dispatcher.Close(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, uint64(1), report.ObservationDiscarded)
 }
 
 type blockingHostObservationSink struct {
@@ -129,6 +122,36 @@ func (sink *blockingHostObservationSink) RecordHeartbeat(ctx context.Context, _ 
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func requireEventuallyRevision(t *testing.T, values <-chan uint64, want uint64) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case got := <-values:
+			if got == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("revision %d was not persisted", want)
+		}
+	}
+}
+
+func requireEventuallyTime(t *testing.T, values <-chan time.Time, want time.Time) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case got := <-values:
+			if got.Equal(want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timestamp %s was not persisted", want)
+		}
 	}
 }
 

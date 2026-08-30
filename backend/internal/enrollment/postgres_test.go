@@ -2,6 +2,7 @@ package enrollment
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"testing"
@@ -21,57 +22,84 @@ func TestPostgresCreatePersistsHashScopeAndNoRawToken(t *testing.T) {
 	token := validEnrollmentToken(HashToken(raw), now)
 	labels, err := json.Marshal(token.Labels)
 	require.NoError(t, err)
-	mock.ExpectQuery(`(?s)INSERT INTO agent_enrollment_tokens.*token_hash.*tenant_id.*project_id.*idempotency_key.*RETURNING token_hash`).
-		WithArgs(token.TokenHash[:], token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision, token.IssuedBy, token.IdempotencyKey).
-		WillReturnRows(sqlmock.NewRows([]string{"token_hash"}).AddRow(token.TokenHash[:]))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT token_hash, request_fingerprint, consumed_at, generation`).
+		WithArgs(token.Scope.TenantID, token.Scope.ProjectID, token.IssuedBy, token.IdempotencyKey).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`(?s)INSERT INTO agent_enrollment_tokens.*request_fingerprint.*generation.*RETURNING token_hash, generation`).
+		WithArgs(token.TokenHash[:], token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"token_hash", "generation"}).AddRow(token.TokenHash[:], 1))
+	mock.ExpectCommit()
 
-	err = NewPostgresRepository(database).Create(context.Background(), token)
+	_, err = NewPostgresRepository(database).Create(context.Background(), token)
 
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestPostgresConsumeAtomicallyEnforcesSingleUseAndExpiry(t *testing.T) {
+func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
-	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	hash := HashToken([]byte("opaque-token"))
+	csrDigest := sha256.Sum256([]byte("csr"))
+	key := EnrollmentAttemptKey{TokenHash: hash, CSRDigest: csrDigest, AgentID: "agent-1", HostID: "host-1"}
 	grant := EnrollmentGrant{
 		Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, HostID: "host-1", AgentID: "agent-1",
 		DisplayName: "Primary database host", Labels: map[string]string{"role": "database"}, EnrollmentRevision: 1,
 	}
 	labels, err := json.Marshal(grant.Labels)
 	require.NoError(t, err)
-	mock.ExpectQuery(`(?s)UPDATE agent_enrollment_tokens SET consumed_at = \$2.*WHERE token_hash = \$1.*consumed_at IS NULL.*expires_at > \$2.*RETURNING tenant_id, project_id, host_id, agent_id, display_name, labels, enrollment_revision`).
-		WithArgs(hash[:], now).
-		WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "host_id", "agent_id", "display_name", "labels", "enrollment_revision"}).
-			AddRow(grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision))
-	mock.ExpectQuery(`UPDATE agent_enrollment_tokens SET consumed_at`).WithArgs(hash[:], now.Add(time.Second)).
-		WillReturnError(sql.ErrNoRows)
+	columns := enrollmentResolutionColumns()
+	mock.ExpectQuery(`(?s)SELECT.*t.consumed_at.*expires_at > CURRENT_TIMESTAMP.*LEFT JOIN agent_enrollment_issuances`).
+		WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
+		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
+		nil, true, nil, nil, nil, nil, nil, nil,
+	))
+	issuedAt := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	expiresAt := issuedAt.Add(time.Hour)
+	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
+		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
+		issuedAt, false, csrDigest[:], []byte("certificate"), []byte("chain"), expiresAt, issuedAt, grant.EnrollmentRevision,
+	))
 	repository := NewPostgresRepository(database)
 
-	first, err := repository.Consume(context.Background(), hash, now)
+	first, err := repository.Resolve(context.Background(), key)
 	require.NoError(t, err)
-	require.Equal(t, grant, first)
-	_, err = repository.Consume(context.Background(), hash, now.Add(time.Second))
-	require.ErrorIs(t, err, ErrEnrollmentTokenInvalid)
+	require.Equal(t, grant, first.Grant)
+	require.Nil(t, first.Response)
+	replayed, err := repository.Resolve(context.Background(), key)
+	require.NoError(t, err)
+	require.Equal(t, []byte("certificate"), replayed.Response.CertificatePEM)
+	require.Equal(t, expiresAt, replayed.Response.ExpiresAt)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestPostgresConsumeMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
+func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = database.Close() })
 	hash := HashToken([]byte("expired-token"))
-	now := time.Now().UTC()
-	mock.ExpectQuery(`UPDATE agent_enrollment_tokens SET consumed_at`).WithArgs(hash[:], now).WillReturnError(sql.ErrNoRows)
+	csrDigest := sha256.Sum256([]byte("csr"))
+	key := EnrollmentAttemptKey{TokenHash: hash, CSRDigest: csrDigest, AgentID: "agent-1"}
+	grant := validEnrollmentToken(hash, time.Now().UTC()).Grant()
+	labels, _ := json.Marshal(grant.Labels)
+	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(enrollmentResolutionColumns()).AddRow(
+		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
+		nil, false, nil, nil, nil, nil, nil, nil,
+	))
 
-	_, err = NewPostgresRepository(database).Consume(context.Background(), hash, now)
+	_, err = NewPostgresRepository(database).Resolve(context.Background(), key)
 
 	require.ErrorIs(t, err, ErrEnrollmentTokenInvalid)
 	require.NotContains(t, err.Error(), string(hash[:]))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func enrollmentResolutionColumns() []string {
+	return []string{
+		"tenant_id", "project_id", "host_id", "agent_id", "display_name", "labels", "enrollment_revision",
+		"consumed_at", "active", "csr_digest", "certificate_pem", "certificate_chain_pem", "expires_at", "issued_at", "issuance_revision",
+	}
 }
 
 func TestRunMigrationsCreatesHashOnlyEnrollmentTable(t *testing.T) {
@@ -82,7 +110,7 @@ func TestRunMigrationsCreatesHashOnlyEnrollmentTable(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0001_agent_enrollment.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
-	mock.ExpectExec(`(?s)CREATE TABLE agent_enrollment_tokens.*token_hash BYTEA PRIMARY KEY.*expires_at TIMESTAMPTZ.*consumed_at TIMESTAMPTZ.*UNIQUE.*idempotency_key`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)CREATE TABLE agent_enrollment_tokens.*token_hash BYTEA PRIMARY KEY.*expires_at TIMESTAMPTZ.*consumed_at TIMESTAMPTZ.*UNIQUE.*idempotency_key.*CREATE TABLE agent_enrollment_issuances.*csr_digest BYTEA.*certificate_pem BYTEA`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0001_agent_enrollment.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 

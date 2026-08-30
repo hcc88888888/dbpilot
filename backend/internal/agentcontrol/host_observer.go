@@ -35,7 +35,18 @@ type HostObserver interface {
 type HostObservationDispatcherConfig struct {
 	MaximumPendingHosts int
 	DeliveryTimeout     time.Duration
+	RetryBackoff        time.Duration
 	OnError             func(error)
+}
+
+type HostObservationLaneStats struct {
+	Accepted        uint64
+	Coalesced       uint64
+	RejectedNewKeys uint64
+	Delivered       uint64
+	Failed          uint64
+	Retried         uint64
+	Discarded       uint64
 }
 
 type HostObservationDispatcherStats struct {
@@ -44,29 +55,60 @@ type HostObservationDispatcherStats struct {
 	RejectedNewKeys uint64
 	Delivered       uint64
 	Failed          uint64
+	Retried         uint64
+	Discarded       uint64
+	Observation     HostObservationLaneStats
+	Hello           HostObservationLaneStats
+	Heartbeat       HostObservationLaneStats
 }
 
-type hostObservationEvent struct {
+type HostObservationCloseReport struct {
+	ObservationDiscarded uint64
+	HelloDiscarded       uint64
+	HeartbeatDiscarded   uint64
+}
+
+func (report HostObservationCloseReport) TotalDiscarded() uint64 {
+	return report.ObservationDiscarded + report.HelloDiscarded + report.HeartbeatDiscarded
+}
+
+type hostLaneKind uint8
+
+const (
+	hostLaneObservation hostLaneKind = iota + 1
+	hostLaneHello
+	hostLaneHeartbeat
+)
+
+type hostLaneEvent struct {
 	agentID     string
-	helloAt     time.Time
-	heartbeatAt time.Time
+	at          time.Time
 	observation *agentv1.HostObservation
 }
 
-type HostObservationDispatcher struct {
+type pendingHostLaneEvent struct {
+	event   hostLaneEvent
+	retryAt time.Time
+}
+
+type hostObservationLane struct {
+	kind            hostLaneKind
 	sink            HostObservationSink
 	maximumPending  int
 	deliveryTimeout time.Duration
+	retryBackoff    time.Duration
 	onError         func(error)
 
 	mu        sync.Mutex
-	pending   map[string]hostObservationEvent
+	pending   map[string]pendingHostLaneEvent
+	inFlight  *hostLaneEvent
 	started   bool
 	accepting bool
 	closing   bool
-	finished  bool
+	aborted   bool
 	wake      chan struct{}
 	done      chan struct{}
+	doneOnce  sync.Once
 	cancel    context.CancelFunc
 
 	accepted        atomic.Uint64
@@ -74,15 +116,36 @@ type HostObservationDispatcher struct {
 	rejectedNewKeys atomic.Uint64
 	delivered       atomic.Uint64
 	failed          atomic.Uint64
+	retried         atomic.Uint64
+	discarded       atomic.Uint64
+}
+
+type HostObservationDispatcher struct {
+	observation *hostObservationLane
+	hello       *hostObservationLane
+	heartbeat   *hostObservationLane
+	mu          sync.Mutex
+	started     bool
+	closed      bool
 }
 
 func NewHostObservationDispatcher(sink HostObservationSink, config HostObservationDispatcherConfig) (*HostObservationDispatcher, error) {
-	if sink == nil || config.MaximumPendingHosts < 1 || config.MaximumPendingHosts > 100000 || config.DeliveryTimeout <= 0 {
+	if sink == nil || config.MaximumPendingHosts < 1 || config.MaximumPendingHosts > 100000 || config.DeliveryTimeout <= 0 || config.RetryBackoff < 0 {
 		return nil, ErrHostObservationInvalid
 	}
+	retryBackoff := config.RetryBackoff
+	if retryBackoff == 0 {
+		retryBackoff = 100 * time.Millisecond
+	}
+	newLane := func(kind hostLaneKind) *hostObservationLane {
+		return &hostObservationLane{
+			kind: kind, sink: sink, maximumPending: config.MaximumPendingHosts, deliveryTimeout: config.DeliveryTimeout,
+			retryBackoff: retryBackoff, onError: config.OnError, pending: make(map[string]pendingHostLaneEvent),
+			wake: make(chan struct{}, 1), done: make(chan struct{}),
+		}
+	}
 	return &HostObservationDispatcher{
-		sink: sink, maximumPending: config.MaximumPendingHosts, deliveryTimeout: config.DeliveryTimeout, onError: config.OnError,
-		pending: make(map[string]hostObservationEvent), wake: make(chan struct{}, 1), done: make(chan struct{}),
+		observation: newLane(hostLaneObservation), hello: newLane(hostLaneHello), heartbeat: newLane(hostLaneHeartbeat),
 	}, nil
 }
 
@@ -92,181 +155,356 @@ func (dispatcher *HostObservationDispatcher) Start(ctx context.Context) error {
 	}
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
-	if dispatcher.started {
+	if dispatcher.started || dispatcher.closed {
 		return ErrHostObservationInvalid
 	}
-	workerContext, cancel := context.WithCancel(ctx)
-	dispatcher.started, dispatcher.accepting, dispatcher.cancel = true, true, cancel
-	go dispatcher.run(workerContext)
+	for _, lane := range dispatcher.lanes() {
+		lane.start(ctx)
+	}
+	dispatcher.started = true
 	return nil
 }
 
 func (dispatcher *HostObservationDispatcher) SubmitHello(agentID string, at time.Time) error {
-	return dispatcher.submit(hostObservationEvent{agentID: agentID, helloAt: at})
+	if dispatcher == nil || !validHostLaneTime(agentID, at) {
+		return ErrHostObservationInvalid
+	}
+	return dispatcher.hello.submit(hostLaneEvent{agentID: agentID, at: at})
 }
 
 func (dispatcher *HostObservationDispatcher) SubmitHeartbeat(agentID string, at time.Time) error {
-	return dispatcher.submit(hostObservationEvent{agentID: agentID, heartbeatAt: at})
+	if dispatcher == nil || !validHostLaneTime(agentID, at) {
+		return ErrHostObservationInvalid
+	}
+	return dispatcher.heartbeat.submit(hostLaneEvent{agentID: agentID, at: at})
 }
 
 func (dispatcher *HostObservationDispatcher) SubmitObservation(agentID string, observation *agentv1.HostObservation) error {
-	if observation == nil || observation.GetAgentId() != agentID || !hostObservationAgentID.MatchString(observation.GetHostId()) || observation.GetObservationRevision() == 0 {
+	if dispatcher == nil || observation == nil || observation.GetAgentId() != agentID || !hostObservationAgentID.MatchString(agentID) ||
+		!hostObservationAgentID.MatchString(observation.GetHostId()) || observation.GetObservationRevision() == 0 {
 		return ErrHostObservationInvalid
 	}
-	return dispatcher.submit(hostObservationEvent{agentID: agentID, observation: proto.Clone(observation).(*agentv1.HostObservation)})
+	return dispatcher.observation.submit(hostLaneEvent{agentID: agentID, observation: proto.Clone(observation).(*agentv1.HostObservation)})
 }
 
-func (dispatcher *HostObservationDispatcher) submit(event hostObservationEvent) error {
-	if dispatcher == nil || !hostObservationAgentID.MatchString(event.agentID) ||
-		(event.helloAt.IsZero() && event.heartbeatAt.IsZero() && event.observation == nil) ||
-		(!event.helloAt.IsZero() && event.helloAt.Location() != time.UTC) ||
-		(!event.heartbeatAt.IsZero() && event.heartbeatAt.Location() != time.UTC) {
-		return ErrHostObservationInvalid
-	}
-	dispatcher.mu.Lock()
-	if !dispatcher.started || !dispatcher.accepting {
-		dispatcher.mu.Unlock()
-		return ErrHostObservationClosed
-	}
-	pending, exists := dispatcher.pending[event.agentID]
-	if !exists && len(dispatcher.pending) >= dispatcher.maximumPending {
-		dispatcher.rejectedNewKeys.Add(1)
-		dispatcher.mu.Unlock()
-		return ErrHostObservationCapacity
-	}
-	if exists {
-		dispatcher.coalesced.Add(1)
-	}
-	pending.agentID = event.agentID
-	if event.helloAt.After(pending.helloAt) {
-		pending.helloAt = event.helloAt
-	}
-	if event.heartbeatAt.After(pending.heartbeatAt) {
-		pending.heartbeatAt = event.heartbeatAt
-	}
-	if event.observation != nil && (pending.observation == nil || event.observation.GetObservationRevision() > pending.observation.GetObservationRevision()) {
-		pending.observation = proto.Clone(event.observation).(*agentv1.HostObservation)
-	}
-	dispatcher.pending[event.agentID] = pending
-	dispatcher.accepted.Add(1)
-	dispatcher.signalLocked()
-	dispatcher.mu.Unlock()
-	return nil
-}
-
-func (dispatcher *HostObservationDispatcher) Close(ctx context.Context) error {
+func (dispatcher *HostObservationDispatcher) Close(ctx context.Context) (HostObservationCloseReport, error) {
 	if dispatcher == nil || ctx == nil {
-		return ErrHostObservationInvalid
+		return HostObservationCloseReport{}, ErrHostObservationInvalid
 	}
 	dispatcher.mu.Lock()
 	if !dispatcher.started {
-		dispatcher.accepting = false
+		dispatcher.closed = true
 		dispatcher.mu.Unlock()
-		return nil
+		return HostObservationCloseReport{}, nil
 	}
-	dispatcher.accepting = false
-	dispatcher.closing = true
-	dispatcher.signalLocked()
-	done := dispatcher.done
-	cancelWorker := dispatcher.cancel
+	if !dispatcher.closed {
+		dispatcher.closed = true
+		for _, lane := range dispatcher.lanes() {
+			lane.beginClose()
+		}
+	}
 	dispatcher.mu.Unlock()
+
+	allDone := make(chan struct{})
+	go func() {
+		for _, lane := range dispatcher.lanes() {
+			<-lane.done
+		}
+		close(allDone)
+	}()
+	var closeErr error
 	select {
-	case <-done:
-		cancelWorker()
-		return nil
+	case <-allDone:
 	case <-ctx.Done():
-		cancelWorker()
-		return ctx.Err()
+		closeErr = ctx.Err()
+		for _, lane := range dispatcher.lanes() {
+			lane.abort()
+		}
+		<-allDone
 	}
+	report := HostObservationCloseReport{
+		ObservationDiscarded: dispatcher.observation.discarded.Load(),
+		HelloDiscarded:       dispatcher.hello.discarded.Load(),
+		HeartbeatDiscarded:   dispatcher.heartbeat.discarded.Load(),
+	}
+	return report, closeErr
 }
 
 func (dispatcher *HostObservationDispatcher) Stats() HostObservationDispatcherStats {
 	if dispatcher == nil {
 		return HostObservationDispatcherStats{}
 	}
+	observation := dispatcher.observation.stats()
+	hello := dispatcher.hello.stats()
+	heartbeat := dispatcher.heartbeat.stats()
 	return HostObservationDispatcherStats{
-		Accepted: dispatcher.accepted.Load(), Coalesced: dispatcher.coalesced.Load(), RejectedNewKeys: dispatcher.rejectedNewKeys.Load(),
-		Delivered: dispatcher.delivered.Load(), Failed: dispatcher.failed.Load(),
+		Accepted:        observation.Accepted + hello.Accepted + heartbeat.Accepted,
+		Coalesced:       observation.Coalesced + hello.Coalesced + heartbeat.Coalesced,
+		RejectedNewKeys: observation.RejectedNewKeys + hello.RejectedNewKeys + heartbeat.RejectedNewKeys,
+		Delivered:       observation.Delivered + hello.Delivered + heartbeat.Delivered,
+		Failed:          observation.Failed + hello.Failed + heartbeat.Failed,
+		Retried:         observation.Retried + hello.Retried + heartbeat.Retried,
+		Discarded:       observation.Discarded + hello.Discarded + heartbeat.Discarded,
+		Observation:     observation, Hello: hello, Heartbeat: heartbeat,
 	}
 }
 
-func (dispatcher *HostObservationDispatcher) run(ctx context.Context) {
+func (dispatcher *HostObservationDispatcher) lanes() []*hostObservationLane {
+	return []*hostObservationLane{dispatcher.observation, dispatcher.hello, dispatcher.heartbeat}
+}
+
+func (lane *hostObservationLane) start(parent context.Context) {
+	lane.mu.Lock()
+	workerContext, cancel := context.WithCancel(parent)
+	lane.started, lane.accepting, lane.cancel = true, true, cancel
+	lane.mu.Unlock()
+	go lane.run(workerContext)
+}
+
+func (lane *hostObservationLane) submit(event hostLaneEvent) error {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	if !lane.started || !lane.accepting {
+		return ErrHostObservationClosed
+	}
+	pending, pendingExists := lane.pending[event.agentID]
+	inFlightSameKey := lane.inFlight != nil && lane.inFlight.agentID == event.agentID
+	if !pendingExists && !inFlightSameKey && lane.distinctKeysLocked() >= lane.maximumPending {
+		lane.rejectedNewKeys.Add(1)
+		return ErrHostObservationCapacity
+	}
+	if pendingExists || inFlightSameKey {
+		lane.coalesced.Add(1)
+	}
+	if pendingExists {
+		event = mergeHostLaneEvent(lane.kind, pending.event, event)
+	}
+	lane.pending[event.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event)}
+	lane.accepted.Add(1)
+	lane.signalLocked()
+	return nil
+}
+
+func (lane *hostObservationLane) run(ctx context.Context) {
 	for {
-		select {
-		case <-dispatcher.wake:
-		case <-ctx.Done():
-			dispatcher.finish()
+		event, wait, ok, finish := lane.next(time.Now())
+		if finish {
+			lane.finish()
 			return
 		}
-		for {
-			event, ok, shouldFinish := dispatcher.take()
-			if shouldFinish {
-				dispatcher.finish()
+		if !ok {
+			if !lane.wait(ctx, wait) {
+				lane.abort()
 				return
 			}
-			if !ok {
-				break
-			}
-			deliveryContext, cancel := context.WithTimeout(ctx, dispatcher.deliveryTimeout)
-			err := dispatcher.deliver(deliveryContext, event)
-			cancel()
-			if err != nil {
-				dispatcher.failed.Add(1)
-				if dispatcher.onError != nil {
-					dispatcher.onError(err)
-				}
-			} else {
-				dispatcher.delivered.Add(1)
+			continue
+		}
+		err, late := lane.deliver(ctx, event)
+		lane.complete(event, err)
+		if late != nil {
+			select {
+			case <-late:
+			case <-ctx.Done():
+				lane.abort()
+				return
 			}
 		}
 	}
 }
 
-func (dispatcher *HostObservationDispatcher) take() (hostObservationEvent, bool, bool) {
-	dispatcher.mu.Lock()
-	defer dispatcher.mu.Unlock()
-	for agentID, event := range dispatcher.pending {
-		delete(dispatcher.pending, agentID)
-		return event, true, false
+func (lane *hostObservationLane) next(now time.Time) (hostLaneEvent, time.Duration, bool, bool) {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	if lane.aborted {
+		return hostLaneEvent{}, 0, false, true
 	}
-	return hostObservationEvent{}, false, dispatcher.closing
+	var selected string
+	var earliest time.Time
+	for agentID, pending := range lane.pending {
+		if pending.retryAt.IsZero() || !pending.retryAt.After(now) {
+			selected = agentID
+			break
+		}
+		if earliest.IsZero() || pending.retryAt.Before(earliest) {
+			earliest = pending.retryAt
+		}
+	}
+	if selected != "" {
+		pending := lane.pending[selected]
+		delete(lane.pending, selected)
+		event := cloneHostLaneEvent(pending.event)
+		lane.inFlight = &event
+		return event, 0, true, false
+	}
+	if lane.closing && len(lane.pending) == 0 && lane.inFlight == nil {
+		return hostLaneEvent{}, 0, false, true
+	}
+	if !earliest.IsZero() {
+		return hostLaneEvent{}, time.Until(earliest), false, false
+	}
+	return hostLaneEvent{}, 0, false, false
 }
 
-func (dispatcher *HostObservationDispatcher) deliver(ctx context.Context, event hostObservationEvent) error {
-	var deliveryErrors []error
-	if event.observation != nil {
-		if err := dispatcher.sink.RecordObservation(ctx, event.agentID, proto.Clone(event.observation).(*agentv1.HostObservation)); err != nil {
-			deliveryErrors = append(deliveryErrors, err)
+func (lane *hostObservationLane) wait(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		select {
+		case <-lane.wake:
+			return true
+		case <-ctx.Done():
+			return false
 		}
 	}
-	if !event.helloAt.IsZero() {
-		if err := dispatcher.sink.RecordHello(ctx, event.agentID, event.helloAt); err != nil {
-			deliveryErrors = append(deliveryErrors, err)
-		}
-	}
-	if !event.heartbeatAt.IsZero() {
-		if err := dispatcher.sink.RecordHeartbeat(ctx, event.agentID, event.heartbeatAt); err != nil {
-			deliveryErrors = append(deliveryErrors, err)
-		}
-	}
-	return errors.Join(deliveryErrors...)
-}
-
-func (dispatcher *HostObservationDispatcher) signalLocked() {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
-	case dispatcher.wake <- struct{}{}:
+	case <-lane.wake:
+		return true
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (lane *hostObservationLane) deliver(parent context.Context, event hostLaneEvent) (error, <-chan error) {
+	deliveryContext, cancel := context.WithTimeout(parent, lane.deliveryTimeout)
+	result := make(chan error, 1)
+	go func() { result <- lane.callSink(deliveryContext, event) }()
+	select {
+	case err := <-result:
+		cancel()
+		return err, nil
+	case <-deliveryContext.Done():
+		err := deliveryContext.Err()
+		cancel()
+		return err, result
+	}
+}
+
+func (lane *hostObservationLane) callSink(ctx context.Context, event hostLaneEvent) error {
+	switch lane.kind {
+	case hostLaneObservation:
+		return lane.sink.RecordObservation(ctx, event.agentID, proto.Clone(event.observation).(*agentv1.HostObservation))
+	case hostLaneHello:
+		return lane.sink.RecordHello(ctx, event.agentID, event.at)
+	case hostLaneHeartbeat:
+		return lane.sink.RecordHeartbeat(ctx, event.agentID, event.at)
+	default:
+		return ErrHostObservationInvalid
+	}
+}
+
+func (lane *hostObservationLane) complete(event hostLaneEvent, deliveryErr error) {
+	var reportErr error
+	lane.mu.Lock()
+	if lane.aborted {
+		lane.mu.Unlock()
+		return
+	}
+	lane.inFlight = nil
+	if deliveryErr == nil {
+		lane.delivered.Add(1)
+	} else {
+		lane.failed.Add(1)
+		lane.retried.Add(1)
+		pending, exists := lane.pending[event.agentID]
+		if exists {
+			event = mergeHostLaneEvent(lane.kind, event, pending.event)
+		}
+		lane.pending[event.agentID] = pendingHostLaneEvent{event: cloneHostLaneEvent(event), retryAt: time.Now().Add(lane.retryBackoff)}
+		reportErr = deliveryErr
+	}
+	lane.signalLocked()
+	lane.mu.Unlock()
+	if reportErr != nil && lane.onError != nil {
+		lane.onError(reportErr)
+	}
+}
+
+func (lane *hostObservationLane) beginClose() {
+	lane.mu.Lock()
+	lane.accepting = false
+	lane.closing = true
+	lane.signalLocked()
+	lane.mu.Unlock()
+}
+
+func (lane *hostObservationLane) abort() {
+	lane.mu.Lock()
+	if lane.aborted {
+		lane.mu.Unlock()
+		return
+	}
+	lane.accepting, lane.aborted = false, true
+	keys := make(map[string]struct{}, len(lane.pending)+1)
+	for agentID := range lane.pending {
+		keys[agentID] = struct{}{}
+	}
+	if lane.inFlight != nil {
+		keys[lane.inFlight.agentID] = struct{}{}
+	}
+	lane.discarded.Add(uint64(len(keys)))
+	lane.pending = make(map[string]pendingHostLaneEvent)
+	lane.inFlight = nil
+	cancel := lane.cancel
+	lane.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	lane.finish()
+}
+
+func (lane *hostObservationLane) finish() {
+	lane.doneOnce.Do(func() { close(lane.done) })
+}
+
+func (lane *hostObservationLane) signalLocked() {
+	select {
+	case lane.wake <- struct{}{}:
 	default:
 	}
 }
 
-func (dispatcher *HostObservationDispatcher) finish() {
-	dispatcher.mu.Lock()
-	defer dispatcher.mu.Unlock()
-	if dispatcher.finished {
-		return
+func (lane *hostObservationLane) distinctKeysLocked() int {
+	count := len(lane.pending)
+	if lane.inFlight != nil {
+		if _, pending := lane.pending[lane.inFlight.agentID]; !pending {
+			count++
+		}
 	}
-	dispatcher.finished, dispatcher.accepting = true, false
-	close(dispatcher.done)
+	return count
+}
+
+func (lane *hostObservationLane) stats() HostObservationLaneStats {
+	return HostObservationLaneStats{
+		Accepted: lane.accepted.Load(), Coalesced: lane.coalesced.Load(), RejectedNewKeys: lane.rejectedNewKeys.Load(),
+		Delivered: lane.delivered.Load(), Failed: lane.failed.Load(), Retried: lane.retried.Load(), Discarded: lane.discarded.Load(),
+	}
+}
+
+func mergeHostLaneEvent(kind hostLaneKind, first, second hostLaneEvent) hostLaneEvent {
+	if kind == hostLaneObservation {
+		if first.observation == nil || (second.observation != nil && second.observation.GetObservationRevision() > first.observation.GetObservationRevision()) {
+			return cloneHostLaneEvent(second)
+		}
+		return cloneHostLaneEvent(first)
+	}
+	if second.at.After(first.at) {
+		return cloneHostLaneEvent(second)
+	}
+	return cloneHostLaneEvent(first)
+}
+
+func cloneHostLaneEvent(event hostLaneEvent) hostLaneEvent {
+	clone := event
+	if event.observation != nil {
+		clone.observation = proto.Clone(event.observation).(*agentv1.HostObservation)
+	}
+	return clone
+}
+
+func validHostLaneTime(agentID string, at time.Time) bool {
+	return hostObservationAgentID.MatchString(agentID) && !at.IsZero() && at.Location() == time.UTC
 }
 
 type noopHostObserver struct{}

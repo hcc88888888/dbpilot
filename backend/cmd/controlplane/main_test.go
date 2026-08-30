@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -571,14 +574,14 @@ func TestDefaultMigrationSequenceRunsHostBeforeInspectionAndStopsOnHostFailure(t
 	migrate := composeDefaultMigrations(steps)
 
 	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform", "enrollment", "host", "inspection"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "host", "enrollment", "inspection"}, order)
 
 	want := errors.New("host migration failed")
 	order = nil
 	steps.host = func(context.Context) error { order = append(order, "host"); return want }
 	migrate = composeDefaultMigrations(steps)
 	require.ErrorIs(t, migrate(context.Background()), want)
-	require.Equal(t, []string{"alert", "job", "platform", "enrollment", "host"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "host"}, order)
 }
 
 func TestDefaultHostMigrationFailurePreventsListenersAndReadiness(t *testing.T) {
@@ -949,6 +952,56 @@ func TestEnrollmentUsesSeparateTLSOnlyListenerAndOwnedHostDispatcher(t *testing.
 	require.NotNil(t, server.hostObservations)
 }
 
+func TestEnrollmentAndAgentControlTLSPerformRealDistinctHandshakes(t *testing.T) {
+	now := time.Now().UTC()
+	serverCA, serverCAKey, serverPool := testTLSAuthority(t, "server-ca", now)
+	serverCertificate := testTLSServerCertificate(t, serverCA, serverCAKey, now)
+	agentCA, agentCAKey, agentPool := testTLSAuthority(t, "agent-ca", now)
+	agentCertificate := testTLSClientCertificate(t, agentCA, agentCAKey, "agent-1", now)
+	otherCA, otherCAKey, _ := testTLSAuthority(t, "other-ca", now)
+	wrongCertificate := testTLSClientCertificate(t, otherCA, otherCAKey, "agent-1", now)
+	config := validServerConfig()
+	config.Enrollment = EnrollmentSettings{Listener: ListenerConfig{Address: "127.0.0.1:10443"}}
+	config.EnrollmentServerTLS = &tls.Config{Certificates: []tls.Certificate{serverCertificate}, MinVersion: tls.VersionTLS12}
+	config.GRPCServerTLS = &tls.Config{Certificates: []tls.Certificate{serverCertificate}, ClientCAs: agentPool, MinVersion: tls.VersionTLS12}
+	config.EnrollmentService = &enrollment.ApplicationService{}
+	server, err := NewServer(config)
+	require.NoError(t, err)
+
+	require.NoError(t, performTLSHandshake(server.enrollmentTLS, &tls.Config{RootCAs: serverPool, ServerName: "localhost", MinVersion: tls.VersionTLS12}))
+	require.Error(t, performTLSHandshake(server.grpcTLS, &tls.Config{RootCAs: serverPool, ServerName: "localhost", MinVersion: tls.VersionTLS12}), "AgentControl must reject a client without mTLS")
+	require.Error(t, performTLSHandshake(server.grpcTLS, &tls.Config{RootCAs: serverPool, ServerName: "localhost", Certificates: []tls.Certificate{wrongCertificate}, MinVersion: tls.VersionTLS12}))
+	require.NoError(t, performTLSHandshake(server.grpcTLS, &tls.Config{RootCAs: serverPool, ServerName: "localhost", Certificates: []tls.Certificate{agentCertificate}, MinVersion: tls.VersionTLS12}))
+}
+
+func TestNewServerRejectsEnrollmentCAOutsideAgentControlTrust(t *testing.T) {
+	now := time.Now().UTC()
+	agentCA, agentCAKey, agentRoots := testTLSAuthority(t, "agent-ca", now)
+	_, _, wrongRoots := testTLSAuthority(t, "wrong-agent-ca", now)
+	directory := t.TempDir()
+	caPath := filepath.Join(directory, "agent-ca.pem")
+	keyPath := filepath.Join(directory, "agent-ca-key.pem")
+	require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: agentCA.Raw}), 0o600))
+	keyDER, err := x509.MarshalPKCS8PrivateKey(agentCAKey)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600))
+	config := validServerConfig()
+	config.Enrollment = EnrollmentSettings{
+		Listener: ListenerConfig{Address: "127.0.0.1:10443"}, AgentCA: TLSMaterial{CertFile: caPath, KeyFile: keyPath}, CertificateLifetime: time.Hour,
+	}
+	config.EnrollmentServerTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+	config.GRPCServerTLS = &tls.Config{MinVersion: tls.VersionTLS12, ClientCAs: wrongRoots}
+
+	server, err := NewServer(config)
+	require.Nil(t, server)
+	require.ErrorContains(t, err, "not trusted by AgentControl")
+
+	config.GRPCServerTLS.ClientCAs = agentRoots
+	server, err = NewServer(config)
+	require.NoError(t, err)
+	server.closeResources()
+}
+
 func TestRunCancellationStopsEnrollmentListenerAndClosesHostDispatcher(t *testing.T) {
 	config := validServerConfig()
 	config.Enrollment = EnrollmentSettings{Listener: ListenerConfig{Address: "127.0.0.1:10443"}}
@@ -1056,6 +1109,78 @@ func validServerConfig() Config {
 		ArtifactSecretResolver:  platformdatabase.StaticSecretResolver{"secret://controlplane/artifact-download": bytes.Repeat([]byte{0x42}, 32)},
 		ArtifactDownloadHandler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 	}
+}
+
+func testTLSAuthority(t *testing.T, commonName string, now time.Time) (*x509.Certificate, ed25519.PrivateKey, *x509.CertPool) {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano()), Subject: pkix.Name{CommonName: commonName},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	encoded, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	require.NoError(t, err)
+	certificate, err := x509.ParseCertificate(encoded)
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	pool.AddCert(certificate)
+	return certificate, privateKey, pool
+}
+
+func testTLSServerCertificate(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, now time.Time) tls.Certificate {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano() + 1), Subject: pkix.Name{CommonName: "localhost"}, DNSNames: []string{"localhost"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true,
+	}
+	encoded, err := x509.CreateCertificate(rand.Reader, template, ca, publicKey, caKey)
+	require.NoError(t, err)
+	return tls.Certificate{Certificate: [][]byte{encoded}, PrivateKey: privateKey}
+}
+
+func testTLSClientCertificate(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, agentID string, now time.Time) tls.Certificate {
+	t.Helper()
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	identity, err := url.Parse("spiffe://dbpilot.local/agent/" + agentID)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano() + 2), URIs: []*url.URL{identity}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, BasicConstraintsValid: true,
+	}
+	encoded, err := x509.CreateCertificate(rand.Reader, template, ca, publicKey, caKey)
+	require.NoError(t, err)
+	return tls.Certificate{Certificate: [][]byte{encoded}, PrivateKey: privateKey}
+}
+
+func performTLSHandshake(serverConfig, clientConfig *tls.Config) error {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	serverResult := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverResult <- acceptErr
+			return
+		}
+		defer connection.Close()
+		_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
+		serverResult <- tls.Server(connection, serverConfig.Clone()).Handshake()
+	}()
+	client, clientErr := tls.Dial("tcp", listener.Addr().String(), clientConfig.Clone())
+	if client != nil {
+		_ = client.Close()
+	}
+	serverErr := <-serverResult
+	return errors.Join(clientErr, serverErr)
 }
 
 type trustedTestPrincipalResolver struct{}

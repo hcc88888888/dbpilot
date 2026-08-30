@@ -20,9 +20,8 @@ func TestGRPCEnrollMapsAuthenticatedHostObservationAndCertificateResponse(t *tes
 	caCertificate, caKey := testCertificateAuthority(t, now)
 	issuer, err := NewAgentCertificateIssuer(caCertificate, caKey, time.Hour, func() time.Time { return now }, rand.Reader)
 	require.NoError(t, err)
-	store := &memoryTokenStore{tokens: map[[32]byte]EnrollmentToken{HashToken(raw): validEnrollmentToken(HashToken(raw), now)}}
-	hosts := &recordingHostService{}
-	service := &ApplicationService{Tokens: store, Certificates: issuer, Hosts: hosts, Now: func() time.Time { return now }}
+	store := newAttemptMemoryStore(validEnrollmentToken(HashToken(raw), now).Grant())
+	service := &ApplicationService{Tokens: store, Certificates: issuer, Now: func() time.Time { return now }}
 	modelRequest := signedEnrollRequest(t, raw, "agent-1", now)
 	server := NewGRPCServer(service)
 
@@ -34,14 +33,15 @@ func TestGRPCEnrollMapsAuthenticatedHostObservationAndCertificateResponse(t *tes
 	require.NotEmpty(t, response.GetCertificatePem())
 	require.Equal(t, now.Add(time.Hour), response.GetExpiresAt().AsTime())
 	require.Equal(t, uint64(1), response.GetEnrollmentRevision())
-	require.Equal(t, "host-1", hosts.observation.HostID, "trusted token grant supplies the Host ID")
 }
 
 func TestGRPCEnrollUsesFixedStatusWithoutEchoingToken(t *testing.T) {
 	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	raw := bytes.Repeat([]byte("secret-token"), 3)[:EnrollmentTokenBytes]
 	request := signedEnrollRequest(t, raw, "agent-1", now)
-	service := &ApplicationService{Tokens: &memoryTokenStore{}, Certificates: rejectingIssuer{}, Hosts: &recordingHostService{}, Now: func() time.Time { return now }}
+	store := newAttemptMemoryStore(validEnrollmentToken(HashToken(raw), now).Grant())
+	store.resolveErr = ErrEnrollmentTokenInvalid
+	service := &ApplicationService{Tokens: store, Certificates: rejectingIssuer{}, Now: func() time.Time { return now }}
 
 	_, err := NewGRPCServer(service).Enroll(context.Background(), protoEnrollRequest(request))
 

@@ -193,23 +193,14 @@ func TestBlockedHostPersistenceDoesNotBlockCommandEventsAndKeepsNewestHeartbeat(
 	require.NotNil(t, stream.nextSent(t).GetCommandResultAcknowledgement(), "result ACK must not wait for Host PostgreSQL")
 	require.Greater(t, dispatcher.Stats().Coalesced, uint64(0))
 	close(sink.releaseHello)
-	select {
-	case revision := <-sink.observations:
-		require.Equal(t, uint64(64), revision)
-	case <-time.After(time.Second):
-		t.Fatal("coalesced Host observation did not persist after release")
-	}
-	select {
-	case persisted := <-sink.heartbeats:
-		require.True(t, persisted.After(base))
-	case <-time.After(time.Second):
-		t.Fatal("coalesced Heartbeat did not persist after release")
-	}
+	requireEventuallyRevision(t, sink.observations, 64)
+	requireEventuallyTime(t, sink.heartbeats, base.Add(68*time.Second))
 	stream.closeReceive()
 	require.NoError(t, <-done)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	require.NoError(t, dispatcher.Close(ctx))
+	_, err = dispatcher.Close(ctx)
+	require.NoError(t, err)
 }
 
 func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.T) {

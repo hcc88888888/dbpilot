@@ -14,6 +14,8 @@ CREATE TABLE agent_enrollment_tokens (
     enrollment_revision BIGINT NOT NULL CHECK (enrollment_revision >= 1),
     issued_by TEXT NOT NULL CHECK (char_length(issued_by) BETWEEN 1 AND 256 AND issued_by = btrim(issued_by)),
     idempotency_key TEXT NOT NULL CHECK (char_length(idempotency_key) BETWEEN 1 AND 128 AND idempotency_key = btrim(idempotency_key)),
+    request_fingerprint TEXT NOT NULL CHECK (request_fingerprint ~ '^sha256:[0-9a-f]{64}$'),
+    generation BIGINT NOT NULL CHECK (generation >= 1),
     CHECK (expires_at > created_at),
     CHECK (consumed_at IS NULL OR consumed_at >= created_at),
     UNIQUE (tenant_id, project_id, issued_by, idempotency_key)
@@ -22,5 +24,24 @@ CREATE TABLE agent_enrollment_tokens (
 CREATE INDEX agent_enrollment_tokens_expiry_idx
     ON agent_enrollment_tokens (expires_at)
     WHERE consumed_at IS NULL;
+
+CREATE TABLE agent_enrollment_issuances (
+    token_hash BYTEA PRIMARY KEY REFERENCES agent_enrollment_tokens (token_hash),
+    csr_digest BYTEA NOT NULL CHECK (octet_length(csr_digest) = 32),
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    certificate_pem BYTEA NOT NULL CHECK (octet_length(certificate_pem) BETWEEN 1 AND 262144),
+    certificate_chain_pem BYTEA NOT NULL CHECK (octet_length(certificate_chain_pem) BETWEEN 1 AND 262144),
+    expires_at TIMESTAMPTZ NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL,
+    enrollment_revision BIGINT NOT NULL CHECK (enrollment_revision >= 1),
+    FOREIGN KEY (tenant_id, project_id, host_id, agent_id)
+        REFERENCES managed_hosts (tenant_id, project_id, host_id, agent_id)
+);
+
+CREATE UNIQUE INDEX agent_enrollment_issuances_identity_idx
+    ON agent_enrollment_issuances (tenant_id, project_id, host_id, agent_id, csr_digest);
 
 COMMIT;

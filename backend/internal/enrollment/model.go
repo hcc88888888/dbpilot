@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	EnrollmentTokenBytes = 32
-	DefaultTokenTTL      = 10 * time.Minute
-	MaximumTokenTTL      = time.Hour
+	EnrollmentTokenBytes     = 32
+	MaximumCSRPEMBytes       = 64 << 10
+	MaximumCSRPublicKeyBytes = 4 << 10
+	DefaultTokenTTL          = 10 * time.Minute
+	MaximumTokenTTL          = time.Hour
 )
 
 var (
@@ -29,6 +31,7 @@ var (
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
+var fingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 type EnrollmentToken struct {
 	TokenHash          [sha256.Size]byte
@@ -42,6 +45,8 @@ type EnrollmentToken struct {
 	EnrollmentRevision uint64
 	IssuedBy           string
 	IdempotencyKey     string
+	RequestFingerprint string
+	Generation         uint64
 }
 
 func (token EnrollmentToken) Validate() error {
@@ -49,7 +54,8 @@ func (token EnrollmentToken) Validate() error {
 		!identifierPattern.MatchString(token.HostID) || !identifierPattern.MatchString(token.AgentID) ||
 		!bounded(token.DisplayName, 120, true) || !validLabels(token.Labels) ||
 		!validUTC(token.CreatedAt) || !validUTC(token.ExpiresAt) || !token.ExpiresAt.After(token.CreatedAt) ||
-		token.EnrollmentRevision == 0 || !bounded(token.IssuedBy, 256, true) || !bounded(token.IdempotencyKey, 128, true) {
+		token.EnrollmentRevision == 0 || !bounded(token.IssuedBy, 256, true) || !bounded(token.IdempotencyKey, 128, true) ||
+		!fingerprintPattern.MatchString(token.RequestFingerprint) || token.Generation == 0 {
 		return ErrEnrollmentRequestInvalid
 	}
 	return nil
@@ -85,13 +91,14 @@ func (grant EnrollmentGrant) Validate() error {
 }
 
 type CreateRequest struct {
-	HostID         string
-	AgentID        string
-	DisplayName    string
-	Labels         map[string]string
-	ExpiresIn      time.Duration
-	IssuedBy       string
-	IdempotencyKey string
+	HostID             string
+	AgentID            string
+	DisplayName        string
+	Labels             map[string]string
+	ExpiresIn          time.Duration
+	IssuedBy           string
+	IdempotencyKey     string
+	RequestFingerprint string
 }
 
 type CreatedEnrollment struct {
@@ -100,6 +107,8 @@ type CreatedEnrollment struct {
 	Token              []byte
 	ExpiresAt          time.Time
 	EnrollmentRevision uint64
+	Generation         uint64
+	Replaced           bool
 }
 
 type EnrollRequest struct {
@@ -120,17 +129,47 @@ type EnrollResult struct {
 	EnrollmentRevision  uint64
 }
 
-type TokenStore interface {
-	Create(context.Context, EnrollmentToken) error
-	Consume(context.Context, [sha256.Size]byte, time.Time) (EnrollmentGrant, error)
+type EnrollmentAttemptKey struct {
+	TokenHash [sha256.Size]byte
+	CSRDigest [sha256.Size]byte
+	AgentID   string
+	HostID    string
+}
+
+func (key EnrollmentAttemptKey) Validate() error {
+	if key.TokenHash == ([sha256.Size]byte{}) || key.CSRDigest == ([sha256.Size]byte{}) ||
+		!identifierPattern.MatchString(key.AgentID) || (key.HostID != "" && !identifierPattern.MatchString(key.HostID)) {
+		return ErrEnrollmentRequestInvalid
+	}
+	return nil
+}
+
+type EnrollmentResolution struct {
+	Grant    EnrollmentGrant
+	Response *EnrollResult
+}
+
+type EnrollmentCompletion struct {
+	Key         EnrollmentAttemptKey
+	Grant       EnrollmentGrant
+	Observation hostinventory.Observation
+	Result      EnrollResult
+	CompletedAt time.Time
+}
+
+type EnrollmentStore interface {
+	Create(context.Context, EnrollmentToken) (EnrollmentTokenCreation, error)
+	Resolve(context.Context, EnrollmentAttemptKey) (EnrollmentResolution, error)
+	Complete(context.Context, EnrollmentCompletion) (EnrollResult, error)
+}
+
+type EnrollmentTokenCreation struct {
+	Generation uint64
+	Replaced   bool
 }
 
 type CertificateIssuer interface {
 	SignAgentCSR(context.Context, EnrollmentGrant, []byte) (certificatePEM, chainPEM []byte, expiresAt time.Time, err error)
-}
-
-type HostObservationRecorder interface {
-	RecordEnrollment(context.Context, EnrollmentGrant, hostinventory.Observation, time.Time) error
 }
 
 func HashToken(token []byte) [sha256.Size]byte { return sha256.Sum256(token) }
