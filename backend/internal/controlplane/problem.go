@@ -12,6 +12,7 @@ import (
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
+	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/inspection"
@@ -79,7 +80,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusPreconditionFailed, "state_revision_conflict", "Resource revision conflicts with the request"
 	case errors.Is(err, plugincatalog.ErrPackageTooLarge):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_manifest_rejected", "Plugin package exceeds verification limits"
-	case errors.Is(err, ErrInvalidRequest), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets), errors.Is(err, plugincatalog.ErrInvalid):
+	case errors.Is(err, ErrInvalidRequest), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, enrollment.ErrEnrollmentRequestInvalid), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets), errors.Is(err, plugincatalog.ErrInvalid):
 		status, code, title = http.StatusBadRequest, "invalid_request", "Request validation failed"
 	case errors.Is(err, inspection.ErrReportBudgetExceeded), errors.Is(err, inspection.ErrReportBudgetOverflow):
 		status, code, title = http.StatusUnprocessableEntity, "inspection_report_budget_exceeded", "Inspection run exceeds report limits"
@@ -99,7 +100,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusConflict, "idempotency_in_progress", "Idempotent request is still processing"
 	case errors.Is(err, idempotency.ErrOwnershipConflict):
 		status, code, title = http.StatusConflict, "idempotency_ownership_conflict", "Idempotency claim ownership changed"
-	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, hostinventory.ErrConflict), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable), errors.Is(err, plugincatalog.ErrConflict):
+	case errors.Is(err, job.ErrConflict), errors.Is(err, job.ErrInvalidTransition), errors.Is(err, artifact.ErrExpired), errors.Is(err, enrollment.ErrEnrollmentConflict), errors.Is(err, hostinventory.ErrConflict), errors.Is(err, inspection.ErrConflict), errors.Is(err, inspection.ErrDuplicate), errors.Is(err, inspection.ErrRunNotRetryable), errors.Is(err, plugincatalog.ErrConflict):
 		status, code, title = http.StatusConflict, "conflict", "Resource state conflicts with the request"
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		status, code, title = http.StatusGatewayTimeout, "timeout", "Operation timed out"

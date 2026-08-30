@@ -80,6 +80,7 @@ test('host plugin platform exposes the complete exact operation inventory', asyn
     .map(({ path, method, operation }) => [path, method, operation.operationId, operation['x-dbpilot-permission']])
     .sort((left, right) => left[2].localeCompare(right[2]));
   const expected = [
+    ['/host-enrollments', 'post', 'createHostEnrollment', 'hosts:manage'],
     ['/discovery-candidates/{candidate_id}/actions/accept', 'post', 'acceptDiscoveryCandidate', 'discovery:manage'],
     ['/plugin-versions/{version_id}/actions/approve', 'post', 'approvePluginVersion', 'plugins:approve'],
     ['/metric-template-revisions/{revision_id}/actions/approve', 'post', 'approveMetricTemplateRevision', 'metric-templates:approve'],
@@ -122,6 +123,26 @@ test('host plugin platform exposes the complete exact operation inventory', asyn
     'publishPluginVersion', 'revokePluginVersion', 'updatePluginAssignment', 'validateMetricTemplateRevision',
     'approveMetricTemplateRevision', 'publishMetricTemplateRevision',
   ]) requiredHeader(byId.get(operationId), 'If-Match');
+});
+
+test('host enrollment admin contract returns one bounded one-time token', async () => {
+  const document = await bundleContract();
+  const create = operations(document).get('createHostEnrollment');
+  assert.ok(create, 'createHostEnrollment is generated from the platform contract');
+  assert.equal(create.requestBody.required, true);
+  assert.equal(create.requestBody.content['application/json'].schema.$ref, '#/components/schemas/CreateHostEnrollmentRequest');
+  assert.equal(create.responses['201'].content['application/json'].schema.$ref, '#/components/schemas/HostEnrollment');
+  const request = document.components.schemas.CreateHostEnrollmentRequest;
+  assert.equal(request.additionalProperties, false);
+  assert.deepEqual(request.required, ['host_id', 'agent_id', 'display_name', 'expires_in_seconds']);
+  assert.equal(request.properties.expires_in_seconds.minimum, 60);
+  assert.equal(request.properties.expires_in_seconds.maximum, 3600);
+  const response = document.components.schemas.HostEnrollment;
+  assert.equal(response.additionalProperties, false);
+  assert.deepEqual(response.required, ['host_id', 'agent_id', 'enrollment_token', 'expires_at', 'enrollment_revision']);
+  assert.equal(response.properties.enrollment_token.minLength, 43);
+  assert.equal(response.properties.enrollment_token.maxLength, 43);
+  assert.equal(response.properties.enrollment_token.pattern, '^[A-Za-z0-9_-]{43}$');
 });
 
 test('plugin version upload is bounded streaming and lifecycle actions expose manifest-derived state', async () => {

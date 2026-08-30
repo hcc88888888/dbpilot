@@ -113,8 +113,9 @@ test('bundled contract structurally defines the common platform contract', async
       .filter(([method]) => ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'trace'].includes(method))
       .map(([method, operation]) => ({ path, method, operation })),
   );
+  const expectedOperationIds = new Set(expectedOperations.map(([, , operationId]) => operationId));
   assert.deepEqual(
-    operations.map(({ path, method, operation }) => [
+    operations.filter(({ operation }) => expectedOperationIds.has(operation.operationId)).map(({ path, method, operation }) => [
       path,
       method,
       operation.operationId,

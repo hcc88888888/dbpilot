@@ -57,17 +57,34 @@ type Server struct {
 	agentv1.UnimplementedAgentControlServer
 	registry *Registry
 	observer Observer
+	hosts    HostObserver
 	now      func() time.Time
 }
 
-func NewServer(registry *Registry, observer Observer) *Server {
+type ServerOption func(*Server)
+
+func WithHostObserver(observer HostObserver) ServerOption {
+	return func(server *Server) {
+		if observer != nil {
+			server.hosts = observer
+		}
+	}
+}
+
+func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
 	}
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	return &Server{registry: registry, observer: observer, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, now: time.Now}
+	for _, option := range options {
+		if option != nil {
+			option(server)
+		}
+	}
+	return server
 }
 
 func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
@@ -114,6 +131,7 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	if err := stream.Send(ack); err != nil {
 		return err
 	}
+	_ = s.hosts.SubmitHello(agentID, s.now().UTC())
 	type receiveResult struct {
 		message *agentv1.AgentMessage
 		err     error
@@ -176,7 +194,9 @@ func (s *Server) recordHeartbeat(agentID string, heartbeat *agentv1.Heartbeat) e
 	if heartbeat == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(heartbeat.GetAgentId())) != 1 {
 		return status.Error(codes.PermissionDenied, "heartbeat Agent ID does not match the session identity")
 	}
-	s.registry.renew(agentID, heartbeat, s.now())
+	at := s.now().UTC()
+	s.registry.renew(agentID, heartbeat, at)
+	_ = s.hosts.SubmitHeartbeat(agentID, at)
 	return nil
 }
 
@@ -248,6 +268,13 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		}
 	case *agentv1.AgentMessage_Inventory:
 		// Inventory is authenticated by this stream and consumed by the inventory service in a later task.
+	case *agentv1.AgentMessage_HostObservation:
+		if typed.HostObservation == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.HostObservation.GetAgentId())) != 1 {
+			return status.Error(codes.PermissionDenied, "Host observation Agent ID does not match the session identity")
+		}
+		if err := s.hosts.SubmitObservation(agentID, typed.HostObservation); errors.Is(err, ErrHostObservationInvalid) {
+			return status.Error(codes.InvalidArgument, "Host observation is invalid")
+		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}

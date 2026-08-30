@@ -20,6 +20,22 @@ grpc:
     key_file: "/run/secrets/controlplane_grpc_key"
     client_ca_file: "/run/secrets/agent_client_ca"
 
+# Enrollment is deliberately separate from the mTLS AgentControl listener.
+# It authenticates the Server only; the one-time token plus Ed25519 CSR proof
+# authenticates the enrolling Agent before a long-lived mTLS certificate is issued.
+enrollment:
+  listener:
+    address: "0.0.0.0:10443"
+    tls:
+      cert_file: "/run/secrets/controlplane_enrollment_cert"
+      key_file: "/run/secrets/controlplane_enrollment_key"
+  agent_ca:
+    cert_file: "/run/secrets/agent_enrollment_ca"
+    key_file: "/run/secrets/agent_enrollment_ca_key"
+  certificate_lifetime: 24h
+  maximum_pending_hosts: 1024
+  observation_delivery_timeout: 5s
+
 webhook_allowlist:
   - "hooks.example.com"
 
@@ -52,8 +68,9 @@ evaluation_scopes:
   - tenant_id: "tenant-1"
     project_id: "project-1"
 
-# Inventory is the trusted Agent-to-scope assignment. Agent payload fields can
-# never override this mapping.
+# Static assignments remain available for legacy inspection targets. Newly
+# enrolled Agent-to-scope assignments are resolved from managed_hosts; Agent
+# payload fields can never override either trusted mapping.
 agents:
   "spiffe-agent-id":
     tenant_id: "tenant-1"

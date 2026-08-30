@@ -813,6 +813,8 @@
         $ref: ../common/errors.yaml#/ProblemResponse
 /hosts:
   $ref: ./hosts.yaml#/HostsCollection
+/host-enrollments:
+  $ref: ./hosts.yaml#/HostEnrollments
 /hosts/{host_id}:
   $ref: ./hosts.yaml#/HostItem
 /hosts/{host_id}/actions/rediscover:

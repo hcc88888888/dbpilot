@@ -46,6 +46,26 @@ func TestServiceRecordHeartbeatUsesAuthenticatedAgentScope(t *testing.T) {
 	require.Equal(t, HostOnline, got.Status)
 }
 
+func TestServiceRecordHelloUsesAuthenticatedScopeWithoutInventingHeartbeat(t *testing.T) {
+	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	host := validHostFixture()
+	previousHeartbeat := host.LastHeartbeatAt
+	host.LastHelloAt = now
+	repository := &recordingRepository{recordHelloResult: host}
+	resolver := &fixedAgentScopes{scope: scope}
+	service := NewService(repository, resolver)
+	service.Now = func() time.Time { return now }
+
+	got, err := service.RecordHello(context.Background(), host.AgentID, now)
+
+	require.NoError(t, err)
+	require.Equal(t, scope, repository.recordHelloScope)
+	require.Equal(t, host.AgentID, repository.recordHelloAgentID)
+	require.Equal(t, now, got.LastHelloAt)
+	require.Equal(t, previousHeartbeat, got.LastHeartbeatAt, "Hello must never seed or advance real Heartbeat liveness")
+}
+
 func TestServiceRecordHeartbeatClassifiesAgainstCurrentTime(t *testing.T) {
 	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
 	heartbeatAt := now.Add(-2 * time.Minute)
@@ -174,6 +194,11 @@ type recordingRepository struct {
 	recordHeartbeatAt           time.Time
 	recordHeartbeatResult       Host
 	recordHeartbeatErr          error
+	recordHelloScope            platformscope.Scope
+	recordHelloAgentID          string
+	recordHelloAt               time.Time
+	recordHelloResult           Host
+	recordHelloErr              error
 	listScope                   platformscope.Scope
 	listFilter                  Filter
 	listResult                  Page
@@ -200,6 +225,14 @@ func (repository *recordingRepository) RecordHeartbeat(_ context.Context, scope 
 	repository.recordHeartbeatAgentID = agentID
 	repository.recordHeartbeatAt = at
 	return repository.recordHeartbeatResult, repository.recordHeartbeatErr
+}
+
+func (repository *recordingRepository) RecordHello(_ context.Context, scope platformscope.Scope, agentID string, at time.Time) (Host, error) {
+	repository.calls++
+	repository.recordHelloScope = scope
+	repository.recordHelloAgentID = agentID
+	repository.recordHelloAt = at
+	return repository.recordHelloResult, repository.recordHelloErr
 }
 
 func (repository *recordingRepository) List(_ context.Context, scope platformscope.Scope, filter Filter) (Page, error) {

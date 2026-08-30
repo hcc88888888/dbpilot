@@ -31,6 +31,8 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/enrollment"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
@@ -51,6 +53,10 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "oidc", config.Identity.Mode)
 	require.Equal(t, "https://identity.example.com", config.Identity.Issuer)
 	require.Equal(t, "dbpilot-control-plane", config.Identity.Audience)
+	require.Equal(t, "0.0.0.0:10443", config.Enrollment.Listener.Address)
+	require.Equal(t, "/run/secrets/agent_enrollment_ca", config.Enrollment.AgentCA.CertFile)
+	require.Equal(t, "/run/secrets/agent_enrollment_ca_key", config.Enrollment.AgentCA.KeyFile)
+	require.Equal(t, 24*time.Hour, config.Enrollment.CertificateLifetime)
 	require.Equal(t, "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", config.Command.SigningPrivateKeyRef)
 	require.Equal(t, "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY", config.Command.ExecutionTokenKeyRef)
 }
@@ -558,20 +564,21 @@ func TestDefaultMigrationSequenceRunsHostBeforeInspectionAndStopsOnHostFailure(t
 		alert:      func(context.Context) error { order = append(order, "alert"); return nil },
 		job:        func(context.Context) error { order = append(order, "job"); return nil },
 		platform:   func(context.Context) error { order = append(order, "platform"); return nil },
+		enrollment: func(context.Context) error { order = append(order, "enrollment"); return nil },
 		host:       func(context.Context) error { order = append(order, "host"); return nil },
 		inspection: func(context.Context) error { order = append(order, "inspection"); return nil },
 	}
 	migrate := composeDefaultMigrations(steps)
 
 	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform", "host", "inspection"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "enrollment", "host", "inspection"}, order)
 
 	want := errors.New("host migration failed")
 	order = nil
 	steps.host = func(context.Context) error { order = append(order, "host"); return want }
 	migrate = composeDefaultMigrations(steps)
 	require.ErrorIs(t, migrate(context.Background()), want)
-	require.Equal(t, []string{"alert", "job", "platform", "host"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "enrollment", "host"}, order)
 }
 
 func TestDefaultHostMigrationFailurePreventsListenersAndReadiness(t *testing.T) {
@@ -583,6 +590,7 @@ func TestDefaultHostMigrationFailurePreventsListenersAndReadiness(t *testing.T) 
 		alert:      func(context.Context) error { return nil },
 		job:        func(context.Context) error { return nil },
 		platform:   func(context.Context) error { return nil },
+		enrollment: func(context.Context) error { return nil },
 		host:       func(context.Context) error { return want },
 		inspection: func(context.Context) error { t.Fatal("inspection migration ran after Host failure"); return nil },
 	})
@@ -721,6 +729,44 @@ func TestLiveInspectionResolverCreateRunEvaluatorKeepsCollectNowSources(t *testi
 
 type staticInspectionSessionRegistry struct {
 	sessions map[string]agentcontrol.SessionInfo
+}
+
+func TestRuntimeAgentResolverAcceptsPersistedEnrollmentAndFallsBackToLegacyConfiguration(t *testing.T) {
+	persisted := platformscope.Scope{TenantID: "tenant-enrolled", ProjectID: "project-enrolled"}
+	resolver := runtimeAgentResolver{
+		configured: configuredAgentResolver{"legacy-agent": {TenantID: "tenant-legacy", ProjectID: "project-legacy"}, "decommissioned-agent": {TenantID: "tenant-legacy", ProjectID: "project-legacy"}},
+		enrolled: fixedEnrolledAgentScopes{
+			scopes: map[string]platformscope.Scope{"dynamic-agent": persisted},
+			errors: map[string]error{"decommissioned-agent": hostinventory.ErrDecommissioned},
+		},
+	}
+
+	scope, err := resolver.ScopeForAgent(context.Background(), "dynamic-agent")
+	require.NoError(t, err)
+	require.Equal(t, alert.Scope{TenantID: persisted.TenantID, ProjectID: persisted.ProjectID}, scope)
+	require.True(t, resolver.KnownAgent(context.Background(), "dynamic-agent"))
+	legacy, err := resolver.ScopeForAgent(context.Background(), "legacy-agent")
+	require.NoError(t, err)
+	require.Equal(t, alert.Scope{TenantID: "tenant-legacy", ProjectID: "project-legacy"}, legacy)
+	require.False(t, resolver.KnownAgent(context.Background(), "unknown-agent"))
+	_, err = resolver.ScopeForAgent(context.Background(), "decommissioned-agent")
+	require.ErrorIs(t, err, hostinventory.ErrDecommissioned, "static fallback must not resurrect a decommissioned enrollment")
+	require.False(t, resolver.KnownAgent(context.Background(), "decommissioned-agent"))
+}
+
+type fixedEnrolledAgentScopes struct {
+	scopes map[string]platformscope.Scope
+	errors map[string]error
+}
+
+func (resolver fixedEnrolledAgentScopes) ScopeForAgent(_ context.Context, agentID string) (platformscope.Scope, error) {
+	if err := resolver.errors[agentID]; err != nil {
+		return platformscope.Scope{}, err
+	}
+	if scope, ok := resolver.scopes[agentID]; ok {
+		return scope, nil
+	}
+	return platformscope.Scope{}, hostinventory.ErrNotFound
 }
 
 func (registry *staticInspectionSessionRegistry) Session(agentID string) (agentcontrol.SessionInfo, bool) {
@@ -887,6 +933,47 @@ func TestRunCancellationStopsBothListeners(t *testing.T) {
 	require.True(t, listeners[1].isClosed())
 }
 
+func TestEnrollmentUsesSeparateTLSOnlyListenerAndOwnedHostDispatcher(t *testing.T) {
+	config := validServerConfig()
+	config.Enrollment = EnrollmentSettings{Listener: ListenerConfig{Address: "127.0.0.1:10443"}}
+	config.EnrollmentServerTLS = &tls.Config{MinVersion: tls.VersionTLS12, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: x509.NewCertPool()}
+	config.EnrollmentService = &enrollment.ApplicationService{}
+	config.HostObservationSink = &recordingHostObservationSink{}
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	require.NotNil(t, server.enrollmentGRPCServer)
+	require.NotSame(t, server.grpcServer, server.enrollmentGRPCServer)
+	require.Equal(t, tls.NoClientCert, server.enrollmentTLS.ClientAuth, "enrollment accepts unauthenticated Agents only on its server-auth listener")
+	require.Nil(t, server.enrollmentTLS.ClientCAs)
+	require.Equal(t, tls.RequireAndVerifyClientCert, server.grpcTLS.ClientAuth, "AgentControl remains mTLS-only")
+	require.NotNil(t, server.hostObservations)
+}
+
+func TestRunCancellationStopsEnrollmentListenerAndClosesHostDispatcher(t *testing.T) {
+	config := validServerConfig()
+	config.Enrollment = EnrollmentSettings{Listener: ListenerConfig{Address: "127.0.0.1:10443"}}
+	config.EnrollmentServerTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+	config.EnrollmentService = &enrollment.ApplicationService{}
+	config.HostObservationSink = &recordingHostObservationSink{}
+	listeners := []*blockingListener{newBlockingListener(), newBlockingListener(), newBlockingListener()}
+	next := 0
+	config.Ping = func(context.Context) error { return nil }
+	config.Migrate = func(context.Context) error { return nil }
+	config.Listen = func(string, string) (net.Listener, error) { listener := listeners[next]; next++; return listener, nil }
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Run(ctx) }()
+	require.Eventually(t, func() bool { return next == 3 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	for _, listener := range listeners {
+		require.True(t, listener.isClosed())
+	}
+	require.ErrorIs(t, server.hostObservations.SubmitHeartbeat("agent-1", time.Now().UTC()), agentcontrol.ErrHostObservationClosed)
+}
+
 func TestRunCancellationWaitsForWorkersToExit(t *testing.T) {
 	config := validServerConfig()
 	listeners := []*blockingListener{newBlockingListener(), newBlockingListener()}
@@ -990,6 +1077,18 @@ func (verifier staticOIDCTokenVerifier) Verify(context.Context, string) (json.Ra
 }
 
 type testCommandObserver struct{}
+
+type recordingHostObservationSink struct{}
+
+func (*recordingHostObservationSink) RecordObservation(context.Context, string, *agentv1.HostObservation) error {
+	return nil
+}
+func (*recordingHostObservationSink) RecordHello(context.Context, string, time.Time) error {
+	return nil
+}
+func (*recordingHostObservationSink) RecordHeartbeat(context.Context, string, time.Time) error {
+	return nil
+}
 
 func (*testCommandObserver) Connected(context.Context, agentcontrol.SessionInfo)                   {}
 func (*testCommandObserver) Heartbeat(context.Context, string, *agentv1.Heartbeat)                 {}

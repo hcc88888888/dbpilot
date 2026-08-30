@@ -63,6 +63,54 @@ FilesystemSummary:
       type: integer
       format: int64
       minimum: 0
+CreateHostEnrollmentRequest:
+  type: object
+  additionalProperties: false
+  required: [host_id, agent_id, display_name, expires_in_seconds]
+  properties:
+    host_id:
+      $ref: '#/HostId'
+    agent_id:
+      $ref: '#/AgentId'
+    display_name:
+      type: string
+      minLength: 1
+      maxLength: 120
+    labels:
+      type: object
+      maxProperties: 32
+      propertyNames:
+        type: string
+        minLength: 1
+        maxLength: 64
+        pattern: '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$'
+      additionalProperties:
+        type: string
+        maxLength: 128
+    expires_in_seconds:
+      type: integer
+      minimum: 60
+      maximum: 3600
+HostEnrollment:
+  type: object
+  additionalProperties: false
+  required: [host_id, agent_id, enrollment_token, expires_at, enrollment_revision]
+  properties:
+    host_id:
+      $ref: '#/HostId'
+    agent_id:
+      $ref: '#/AgentId'
+    enrollment_token:
+      type: string
+      minLength: 43
+      maxLength: 43
+      pattern: '^[A-Za-z0-9_-]{43}$'
+    expires_at:
+      $ref: ./identifiers.yaml#/UtcTimestamp
+    enrollment_revision:
+      type: integer
+      format: int64
+      minimum: 1
 ManagedHost:
   type: object
   additionalProperties: false

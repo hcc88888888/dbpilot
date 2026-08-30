@@ -157,6 +157,61 @@ func TestConnectRecordsRealHeartbeatWhileCommandResultObserverIsBlocked(t *testi
 	require.NoError(t, <-done)
 }
 
+func TestBlockedHostPersistenceDoesNotBlockCommandEventsAndKeepsNewestHeartbeat(t *testing.T) {
+	base := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
+	sink := &blockingHostObservationSink{helloEntered: make(chan struct{}, 1), releaseHello: make(chan struct{}), observations: make(chan uint64, 4), heartbeats: make(chan time.Time, 4)}
+	dispatcher, err := NewHostObservationDispatcher(sink, HostObservationDispatcherConfig{MaximumPendingHosts: 1, DeliveryTimeout: time.Minute})
+	require.NoError(t, err)
+	require.NoError(t, dispatcher.Start(context.Background()))
+	observer := &recordingObserver{connected: make(chan SessionInfo, 1)}
+	server := NewServer(NewRegistry(8), observer, WithHostObserver(dispatcher))
+	var tick atomic.Int64
+	server.now = func() time.Time { return base.Add(time.Duration(tick.Add(1)) * time.Second) }
+	stream := newTestConnectStream(tlsPeerContext(t, true, "spiffe://dbpilot.local/agent/agent-a"), helloMessage("agent-a", ProtocolVersion, "collect_now"))
+	done := make(chan error, 1)
+	go func() { done <- server.Connect(stream) }()
+	_ = stream.nextSent(t)
+	<-observer.connected
+	select {
+	case <-sink.helloEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Host Hello persistence did not block")
+	}
+	token := testServerExecutionToken(0x45)
+	go func() {
+		for index := 0; index < 64; index++ {
+			stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: "agent-a"}}})
+			stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_HostObservation{HostObservation: &agentv1.HostObservation{HostId: "host-a", AgentId: "agent-a", ObservationRevision: uint64(index + 1)}}})
+		}
+		stream.push(
+			&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandAcknowledgement{CommandAcknowledgement: &agentv1.CommandAcknowledgement{CommandId: "command-a"}}},
+			&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandProgress{CommandProgress: &agentv1.CommandProgress{CommandId: "command-a", Percent: 50, ExecutionToken: token, LeaseRevision: 1}}},
+			&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CommandResult{CommandResult: &agentv1.CommandResult{CommandId: "command-a", State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: token, LeaseRevision: 1}}},
+		)
+	}()
+	require.Eventually(t, func() bool { return observer.counts() == [3]int{1, 1, 1} }, time.Second, time.Millisecond)
+	require.NotNil(t, stream.nextSent(t).GetCommandResultAcknowledgement(), "result ACK must not wait for Host PostgreSQL")
+	require.Greater(t, dispatcher.Stats().Coalesced, uint64(0))
+	close(sink.releaseHello)
+	select {
+	case revision := <-sink.observations:
+		require.Equal(t, uint64(64), revision)
+	case <-time.After(time.Second):
+		t.Fatal("coalesced Host observation did not persist after release")
+	}
+	select {
+	case persisted := <-sink.heartbeats:
+		require.True(t, persisted.After(base))
+	case <-time.After(time.Second):
+		t.Fatal("coalesced Heartbeat did not persist after release")
+	}
+	stream.closeReceive()
+	require.NoError(t, <-done)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, dispatcher.Close(ctx))
+}
+
 func TestRegistryDispatchValidatesAgentCapabilityExpiryAndQueueBound(t *testing.T) {
 	now := time.Unix(1_725_000_000, 0).UTC()
 	registry := NewRegistry(1)

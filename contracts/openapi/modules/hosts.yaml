@@ -25,6 +25,32 @@ HostsCollection:
       '401': { $ref: ../common/errors.yaml#/ProblemResponse }
       '403': { $ref: ../common/errors.yaml#/ProblemResponse }
       '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+HostEnrollments:
+  post:
+    operationId: createHostEnrollment
+    summary: Create a scoped one-time Agent enrollment token
+    x-dbpilot-permission: hosts:manage
+    parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema: { type: string, minLength: 1, maxLength: 128 }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema: { $ref: ../common/hosts.yaml#/CreateHostEnrollmentRequest }
+    responses:
+      '201':
+        description: One-time enrollment token. The token is returned only in this response.
+        content:
+          application/json:
+            schema: { $ref: ../common/hosts.yaml#/HostEnrollment }
+      '400': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '401': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '403': { $ref: ../common/errors.yaml#/ProblemResponse }
+      '405': { $ref: ../common/errors.yaml#/MethodNotAllowedProblemResponse }
+      '409': { $ref: ../common/errors.yaml#/ProblemResponse }
 HostItem:
   get:
     operationId: getHost

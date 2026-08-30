@@ -95,6 +95,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "enroll" {
+		return runEnroll(args[1:], stdout, stderr)
+	}
 	flags := flag.NewFlagSet("dbpilot-agent", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	showVersion := flags.Bool("version", false, "print version and exit")

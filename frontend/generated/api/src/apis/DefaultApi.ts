@@ -20,6 +20,7 @@ import type {
   Artifact,
   AuditEventPage,
   CapabilitySet,
+  CreateHostEnrollmentRequest,
   CreateInspectionItemRequest,
   CreateInspectionPolicyRequest,
   CreateInspectionRunRequest,
@@ -31,6 +32,7 @@ import type {
   DiscoveryCandidateStatus,
   DiscoverySource,
   DownloadDescriptor,
+  HostEnrollment,
   HostStatus,
   IgnoreDiscoveryCandidateRequest,
   InspectionItem,
@@ -79,6 +81,8 @@ import {
     AuditEventPageToJSON,
     CapabilitySetFromJSON,
     CapabilitySetToJSON,
+    CreateHostEnrollmentRequestFromJSON,
+    CreateHostEnrollmentRequestToJSON,
     CreateInspectionItemRequestFromJSON,
     CreateInspectionItemRequestToJSON,
     CreateInspectionPolicyRequestFromJSON,
@@ -101,6 +105,8 @@ import {
     DiscoverySourceToJSON,
     DownloadDescriptorFromJSON,
     DownloadDescriptorToJSON,
+    HostEnrollmentFromJSON,
+    HostEnrollmentToJSON,
     HostStatusFromJSON,
     HostStatusToJSON,
     IgnoreDiscoveryCandidateRequestFromJSON,
@@ -209,6 +215,11 @@ export interface CancelJobRequest {
 export interface CreateArtifactDownloadRequest {
     artifactId: string;
     idempotencyKey: string;
+}
+
+export interface CreateHostEnrollmentOperationRequest {
+    idempotencyKey: string;
+    createHostEnrollmentRequest: CreateHostEnrollmentRequest;
 }
 
 export interface CreateInspectionItemOperationRequest {
@@ -867,6 +878,64 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async createArtifactDownload(requestParameters: CreateArtifactDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DownloadDescriptor> {
         const response = await this.createArtifactDownloadRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    async createHostEnrollmentRaw(requestParameters: CreateHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<HostEnrollment>> {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError(
+                'idempotencyKey',
+                'Required parameter "idempotencyKey" was null or undefined when calling createHostEnrollment().'
+            );
+        }
+
+        if (requestParameters['createHostEnrollmentRequest'] == null) {
+            throw new runtime.RequiredError(
+                'createHostEnrollmentRequest',
+                'Required parameter "createHostEnrollmentRequest" was null or undefined when calling createHostEnrollment().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/host-enrollments`;
+
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateHostEnrollmentRequestToJSON(requestParameters['createHostEnrollmentRequest']),
+        }, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => HostEnrollmentFromJSON(jsonValue));
+    }
+
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    async createHostEnrollment(requestParameters: CreateHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<HostEnrollment> {
+        const response = await this.createHostEnrollmentRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

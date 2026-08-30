@@ -9,6 +9,7 @@ const (
 	PermissionCancelInspectionRun            = "inspection:execute"
 	PermissionCancelJob                      = "platform.jobs.cancel"
 	PermissionCreateArtifactDownload         = "platform.artifacts.download"
+	PermissionCreateHostEnrollment           = "hosts:manage"
 	PermissionCreateInspectionItem           = "inspection:manage"
 	PermissionCreateInspectionPolicy         = "inspection:manage"
 	PermissionCreateInspectionReportDownload = "inspection:view"
@@ -66,6 +67,7 @@ var OperationPermissions = map[string]string{
 	"cancelInspectionRun":            PermissionCancelInspectionRun,
 	"cancelJob":                      PermissionCancelJob,
 	"createArtifactDownload":         PermissionCreateArtifactDownload,
+	"createHostEnrollment":           PermissionCreateHostEnrollment,
 	"createInspectionItem":           PermissionCreateInspectionItem,
 	"createInspectionPolicy":         PermissionCreateInspectionPolicy,
 	"createInspectionReportDownload": PermissionCreateInspectionReportDownload,

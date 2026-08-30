@@ -17,6 +17,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -34,6 +36,7 @@ import (
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
 	platformdatabase "dbpilot.local/platform/internal/database"
+	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/ingest"
@@ -111,6 +114,14 @@ type PluginCatalogSettings struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+type EnrollmentSettings struct {
+	Listener                   ListenerConfig `yaml:"listener"`
+	AgentCA                    TLSMaterial    `yaml:"agent_ca"`
+	CertificateLifetime        time.Duration  `yaml:"certificate_lifetime,omitempty"`
+	MaximumPendingHosts        int            `yaml:"maximum_pending_hosts,omitempty"`
+	ObservationDeliveryTimeout time.Duration  `yaml:"observation_delivery_timeout,omitempty"`
+}
+
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
 }
@@ -145,6 +156,7 @@ type Config struct {
 	Artifact         ArtifactSettings           `yaml:"artifact"`
 	PluginCatalog    PluginCatalogSettings      `yaml:"plugin_catalog,omitempty"`
 	PluginPublishers []PluginPublisherSettings  `yaml:"plugin_publishers,omitempty"`
+	Enrollment       EnrollmentSettings         `yaml:"enrollment,omitempty"`
 
 	HTTPServerTLS           *tls.Config                                `yaml:"-"`
 	GRPCServerTLS           *tls.Config                                `yaml:"-"`
@@ -164,6 +176,9 @@ type Config struct {
 	ArtifactSecretResolver  platformdatabase.SecretResolver            `yaml:"-"`
 	CommandTargetAuthorizer commandvalidation.TargetAuthorizer         `yaml:"-"`
 	PluginCatalogService    plugincatalog.CatalogService               `yaml:"-"`
+	EnrollmentServerTLS     *tls.Config                                `yaml:"-"`
+	EnrollmentService       *enrollment.ApplicationService             `yaml:"-"`
+	HostObservationSink     agentcontrol.HostObservationSink           `yaml:"-"`
 }
 
 type Server struct {
@@ -175,8 +190,10 @@ type Server struct {
 	dispatcher             *alert.Dispatcher
 	httpServer             *http.Server
 	grpcServer             *grpc.Server
+	enrollmentGRPCServer   *grpc.Server
 	httpTLS                *tls.Config
 	grpcTLS                *tls.Config
+	enrollmentTLS          *tls.Config
 	ping                   func(context.Context) error
 	migrate                func(context.Context) error
 	listen                 func(string, string) (net.Listener, error)
@@ -194,6 +211,7 @@ type Server struct {
 	artifactBlobs          *artifact.LocalBlobStore
 	inspectionService      *inspection.Service
 	hostInventoryService   *hostinventory.ApplicationService
+	hostObservations       *agentcontrol.HostObservationDispatcher
 	inspectionWorker       *inspection.Worker
 	scheduleInspections    func(context.Context, time.Time) error
 	processInspections     func(context.Context, time.Time) error
@@ -271,13 +289,14 @@ type defaultMigrationSteps struct {
 	alert      func(context.Context) error
 	job        func(context.Context) error
 	platform   func(context.Context) error
+	enrollment func(context.Context) error
 	host       func(context.Context) error
 	plugin     func(context.Context) error
 	inspection func(context.Context) error
 }
 
 func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host}
+	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.enrollment, steps.host}
 	if steps.plugin != nil {
 		pipeline = append(pipeline, steps.plugin)
 	}
@@ -317,6 +336,23 @@ func NewServer(config Config) (*Server, error) {
 		grpcTLS.MinVersion = tls.VersionTLS12
 	}
 	grpcTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	var enrollmentTLS *tls.Config
+	if config.Enrollment.Listener.Address != "" {
+		enrollmentTLS = config.EnrollmentServerTLS
+		if enrollmentTLS == nil {
+			loaded, err := loadServerTLS(config.Enrollment.Listener.TLS, false)
+			if err != nil {
+				return nil, fmt.Errorf("load enrollment TLS: %w", err)
+			}
+			enrollmentTLS = loaded
+		}
+		enrollmentTLS = enrollmentTLS.Clone()
+		if enrollmentTLS.MinVersion < tls.VersionTLS12 {
+			enrollmentTLS.MinVersion = tls.VersionTLS12
+		}
+		enrollmentTLS.ClientAuth = tls.NoClientCert
+		enrollmentTLS.ClientCAs = nil
+	}
 	secrets := config.SecretResolver
 	if secrets == nil {
 		secrets = environmentSecretResolver{}
@@ -340,7 +376,8 @@ func NewServer(config Config) (*Server, error) {
 		ownsDatabase = true
 	}
 	repository := alert.NewPostgresRepository(database)
-	resolver := buildConfiguredAgentResolver(config.Agents)
+	hostRepository := hostinventory.NewPostgresRepository(database)
+	resolver := runtimeAgentResolver{configured: buildConfiguredAgentResolver(config.Agents), enrolled: hostRepository}
 	metricConsumer := controlplane.NewMetricConsumer(resolver, repository)
 	ingestService := ingest.NewDurableService(resolver, postgresLogBatchDeduplicator{database: database}, metricConsumer)
 	ingestService.SetPolicyStatusObserver(ingest.PolicyStatusObserverFunc(func(status ingest.PolicyStatusMetadata) {
@@ -375,7 +412,10 @@ func NewServer(config Config) (*Server, error) {
 			alert:    func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
 			job:      func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
 			platform: func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
-			host:     func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
+			enrollment: func(ctx context.Context) error {
+				return enrollment.RunMigrations(ctx, database)
+			},
+			host: func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
 			inspection: func(ctx context.Context) error {
 				if err := inspection.RunMigrations(ctx, database); err != nil {
 					return err
@@ -489,7 +529,53 @@ func NewServer(config Config) (*Server, error) {
 		return nil, fmt.Errorf("configure inspection targets: %w", err)
 	}
 	inspectionTargets := liveInspectionTargetResolver{configured: configuredTargets, registry: agentRegistry}
-	hostInventoryService := hostinventory.NewService(hostinventory.NewPostgresRepository(database), nil)
+	hostInventoryService := hostinventory.NewService(hostRepository, hostRepository)
+	hostSink := config.HostObservationSink
+	if hostSink == nil {
+		hostSink = persistedHostObservationSink{service: hostInventoryService}
+	}
+	maximumPendingHosts := config.Enrollment.MaximumPendingHosts
+	if maximumPendingHosts == 0 {
+		maximumPendingHosts = 1024
+	}
+	observationDeliveryTimeout := config.Enrollment.ObservationDeliveryTimeout
+	if observationDeliveryTimeout == 0 {
+		observationDeliveryTimeout = 5 * time.Second
+	}
+	hostObservations, err := agentcontrol.NewHostObservationDispatcher(hostSink, agentcontrol.HostObservationDispatcherConfig{
+		MaximumPendingHosts: maximumPendingHosts, DeliveryTimeout: observationDeliveryTimeout,
+		OnError: func(err error) { log.Printf("host observation persistence failed: %v", err) },
+	})
+	if err != nil {
+		if artifactBlobs != nil {
+			_ = artifactBlobs.Close()
+		}
+		if ownsDatabase {
+			_ = database.Close()
+		}
+		return nil, fmt.Errorf("configure Host observation delivery: %w", err)
+	}
+	enrollmentService := config.EnrollmentService
+	if enrollmentService == nil && config.Enrollment.Listener.Address != "" {
+		certificateLifetime := config.Enrollment.CertificateLifetime
+		if certificateLifetime == 0 {
+			certificateLifetime = 24 * time.Hour
+		}
+		issuer, err := loadEnrollmentIssuer(config.Enrollment.AgentCA, certificateLifetime)
+		if err != nil {
+			if artifactBlobs != nil {
+				_ = artifactBlobs.Close()
+			}
+			if ownsDatabase {
+				_ = database.Close()
+			}
+			return nil, err
+		}
+		enrollmentService = &enrollment.ApplicationService{
+			Tokens: enrollment.NewPostgresRepository(database), Certificates: issuer,
+			Hosts: persistedEnrollmentHostRecorder{repository: hostRepository}, Now: func() time.Time { return time.Now().UTC() },
+		}
+	}
 	inspectionRepository := inspection.NewPostgresRepository(database, jobRepository)
 	inspectionService := &inspection.Service{Repository: inspectionRepository, Targets: inspectionTargets}
 	inspectionWorker := &inspection.Worker{Runs: inspectionRepository, Jobs: jobRepository, Evaluator: &inspection.Evaluator{Evidence: inspectionRepository}, Artifacts: artifactStore, Audit: auditService}
@@ -515,6 +601,7 @@ func NewServer(config Config) (*Server, error) {
 		},
 		Idempotency: idempotencyService, Inspection: inspectionApplication,
 		Hosts:                      hostInventoryService,
+		Enrollment:                 enrollmentService,
 		PluginCatalog:              pluginCatalogService,
 		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {
@@ -536,6 +623,11 @@ func NewServer(config Config) (*Server, error) {
 	httpServer := &http.Server{Handler: controlplane.NewHTTPHandler(services, principalResolver), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: controlplane.PluginUploadReadTimeout, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(grpcTLS.Clone())), grpc.MaxRecvMsgSize(ingest.MaxBatchPayloadBytes+(64<<10)))
 	telemetryv1.RegisterTelemetryIngestServer(grpcServer, ingestService)
+	var enrollmentGRPCServer *grpc.Server
+	if enrollmentTLS != nil {
+		enrollmentGRPCServer = grpc.NewServer(grpc.Creds(credentials.NewTLS(enrollmentTLS.Clone())), grpc.MaxRecvMsgSize(1<<20))
+		telemetryv1.RegisterAgentEnrollmentServer(enrollmentGRPCServer, enrollment.NewGRPCServer(enrollmentService))
+	}
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
 		TargetAuthorizer: config.CommandTargetAuthorizer, TokenProtector: commandTokenProtector,
@@ -554,8 +646,8 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, dispatchCommands: func(ctx context.Context, at time.Time) error {
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations)))
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
@@ -649,6 +741,23 @@ func validateConfig(config Config) error {
 	}
 	if strings.TrimSpace(config.HTTP.Address) == "" || strings.TrimSpace(config.GRPC.Address) == "" {
 		return errors.New("HTTP and gRPC addresses are required")
+	}
+	if config.Enrollment.MaximumPendingHosts < 0 || config.Enrollment.ObservationDeliveryTimeout < 0 {
+		return errors.New("enrollment Host observation delivery settings are invalid")
+	}
+	if config.Enrollment.Listener.Address != "" {
+		if config.Enrollment.Listener.Address != strings.TrimSpace(config.Enrollment.Listener.Address) || config.Enrollment.Listener.Address == config.HTTP.Address || config.Enrollment.Listener.Address == config.GRPC.Address {
+			return errors.New("enrollment listener must use a separate canonical address")
+		}
+		if config.EnrollmentServerTLS == nil && (config.Enrollment.Listener.TLS.CertFile == "" || config.Enrollment.Listener.TLS.KeyFile == "") {
+			return errors.New("enrollment server-auth TLS certificate and key references are required")
+		}
+		if config.EnrollmentService == nil && (config.Enrollment.AgentCA.CertFile == "" || config.Enrollment.AgentCA.KeyFile == "") {
+			return errors.New("enrollment Agent CA certificate and key references are required")
+		}
+		if config.Enrollment.CertificateLifetime < 0 || config.Enrollment.CertificateLifetime > 365*24*time.Hour {
+			return errors.New("enrollment certificate lifetime is invalid")
+		}
 	}
 	if config.HTTPServerTLS == nil && (config.HTTP.TLS.CertFile == "" || config.HTTP.TLS.KeyFile == "") {
 		return errors.New("HTTP TLS certificate and key references are required")
@@ -809,6 +918,39 @@ func loadServerTLS(material TLSMaterial, requireClient bool) (*tls.Config, error
 	return config, nil
 }
 
+func loadEnrollmentIssuer(material TLSMaterial, lifetime time.Duration) (*enrollment.AgentCertificateIssuer, error) {
+	if !filepath.IsAbs(material.CertFile) || !filepath.IsAbs(material.KeyFile) {
+		return nil, errors.New("enrollment Agent CA paths must be absolute")
+	}
+	for _, path := range []string{material.CertFile, material.KeyFile} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New("enrollment Agent CA material is unavailable")
+		}
+		if runtime.GOOS == "linux" && path == material.KeyFile && info.Mode().Perm()&0o077 != 0 {
+			return nil, errors.New("enrollment Agent CA private key must not be group/world accessible")
+		}
+	}
+	certificatePEM, err := os.ReadFile(material.CertFile)
+	if err != nil {
+		return nil, errors.New("read enrollment Agent CA certificate")
+	}
+	privateKeyPEM, err := os.ReadFile(material.KeyFile)
+	if err != nil {
+		return nil, errors.New("read enrollment Agent CA private key")
+	}
+	defer func() {
+		for index := range privateKeyPEM {
+			privateKeyPEM[index] = 0
+		}
+	}()
+	issuer, err := enrollment.NewAgentCertificateIssuer(certificatePEM, privateKeyPEM, lifetime, func() time.Time { return time.Now().UTC() }, nil)
+	if err != nil {
+		return nil, errors.New("configure enrollment Agent certificate issuer")
+	}
+	return issuer, nil
+}
+
 func (server *Server) Run(ctx context.Context) error {
 	if server == nil {
 		return errors.New("control-plane server is nil")
@@ -836,29 +978,57 @@ func (server *Server) Run(ctx context.Context) error {
 		server.closeResources()
 		return fmt.Errorf("listen gRPC: %w", err)
 	}
+	var enrollmentListener net.Listener
+	if server.enrollmentGRPCServer != nil {
+		enrollmentListener, err = server.listen("tcp", server.config.Enrollment.Listener.Address)
+		if err != nil {
+			_ = httpListener.Close()
+			_ = grpcListener.Close()
+			server.closeResources()
+			return fmt.Errorf("listen enrollment gRPC: %w", err)
+		}
+	}
+	if err := server.hostObservations.Start(context.Background()); err != nil {
+		_ = httpListener.Close()
+		_ = grpcListener.Close()
+		if enrollmentListener != nil {
+			_ = enrollmentListener.Close()
+		}
+		server.closeResources()
+		return fmt.Errorf("start Host observation delivery: %w", err)
+	}
 	httpTLSListener := tls.NewListener(httpListener, server.httpTLS.Clone())
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	server.httpServer.BaseContext = func(net.Listener) context.Context { return runCtx }
 	server.startLoops(runCtx)
-	errorsChannel := make(chan error, 2)
+	errorsChannel := make(chan error, 3)
 	go func() { errorsChannel <- server.httpServer.Serve(httpTLSListener) }()
 	go func() { errorsChannel <- server.grpcServer.Serve(grpcListener) }()
+	if enrollmentListener != nil {
+		go func() { errorsChannel <- server.enrollmentGRPCServer.Serve(enrollmentListener) }()
+	}
 	select {
 	case <-ctx.Done():
 		cancel()
-		server.stop(httpTLSListener, grpcListener)
+		stopErr := server.stop(httpTLSListener, grpcListener, enrollmentListener)
 		workerErr := server.waitWorkers()
 		server.closeResources()
+		if stopErr != nil {
+			return stopErr
+		}
 		if workerErr != nil {
 			return workerErr
 		}
 		return ctx.Err()
 	case serveErr := <-errorsChannel:
 		cancel()
-		server.stop(httpTLSListener, grpcListener)
+		stopErr := server.stop(httpTLSListener, grpcListener, enrollmentListener)
 		workerErr := server.waitWorkers()
 		server.closeResources()
+		if stopErr != nil {
+			return stopErr
+		}
 		if workerErr != nil {
 			return workerErr
 		}
@@ -869,14 +1039,26 @@ func (server *Server) Run(ctx context.Context) error {
 	}
 }
 
-func (server *Server) stop(httpListener, grpcListener net.Listener) {
+func (server *Server) stop(httpListener, grpcListener, enrollmentListener net.Listener) error {
 	server.ready.Store(false)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.httpServer.Shutdown(shutdownCtx)
 	server.grpcServer.Stop()
+	if server.enrollmentGRPCServer != nil {
+		server.enrollmentGRPCServer.Stop()
+	}
 	_ = httpListener.Close()
 	_ = grpcListener.Close()
+	if enrollmentListener != nil {
+		_ = enrollmentListener.Close()
+	}
+	if server.hostObservations != nil {
+		if err := server.hostObservations.Close(shutdownCtx); err != nil {
+			return fmt.Errorf("close Host observation delivery: %w", err)
+		}
+	}
+	return nil
 }
 
 func (server *Server) closeDatabase() {
@@ -1028,6 +1210,100 @@ func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configu
 	}
 	return result
 }
+
+type enrolledAgentScopeResolver interface {
+	ScopeForAgent(context.Context, string) (platformscope.Scope, error)
+}
+
+// runtimeAgentResolver trusts persisted enrollment first and keeps static
+// assignments only as a compatibility fallback for pre-enrollment Agents.
+type runtimeAgentResolver struct {
+	configured configuredAgentResolver
+	enrolled   enrolledAgentScopeResolver
+}
+
+func (resolver runtimeAgentResolver) KnownAgent(ctx context.Context, agentID string) bool {
+	_, err := resolver.ScopeForAgent(ctx, agentID)
+	return err == nil
+}
+
+func (resolver runtimeAgentResolver) ScopeForAgent(ctx context.Context, agentID string) (alert.Scope, error) {
+	if resolver.enrolled != nil {
+		scope, err := resolver.enrolled.ScopeForAgent(ctx, agentID)
+		if err == nil {
+			return alert.Scope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}, nil
+		}
+		if !errors.Is(err, hostinventory.ErrNotFound) {
+			return alert.Scope{}, err
+		}
+	}
+	return resolver.configured.ScopeForAgent(ctx, agentID)
+}
+
+type persistedHostObservationSink struct {
+	service *hostinventory.ApplicationService
+}
+
+func (sink persistedHostObservationSink) RecordObservation(ctx context.Context, agentID string, provided *telemetryv1.HostObservation) error {
+	if sink.service == nil || provided == nil || provided.GetAgentId() != agentID || provided.GetObservedAt() == nil || provided.GetObservedAt().CheckValid() != nil {
+		return hostinventory.ErrInvalid
+	}
+	filesystems := make([]hostinventory.FilesystemSummary, len(provided.GetFilesystems()))
+	for index, filesystem := range provided.GetFilesystems() {
+		if filesystem == nil {
+			return hostinventory.ErrInvalid
+		}
+		filesystems[index] = hostinventory.FilesystemSummary{MountPoint: filesystem.GetMountPoint(), CapacityBytes: filesystem.GetCapacityBytes(), AvailableBytes: filesystem.GetAvailableBytes()}
+	}
+	_, err := sink.service.RecordObservation(ctx, hostinventory.Observation{
+		HostID: provided.GetHostId(), AgentID: agentID, Revision: provided.GetObservationRevision(), AgentVersion: provided.GetAgentVersion(),
+		Hostname: provided.GetHostname(), OS: provided.GetOperatingSystem(), OSVersion: provided.GetOperatingSystemVersion(), Kernel: provided.GetKernelVersion(),
+		Architecture: provided.GetArchitecture(), LogicalCPUCount: provided.GetLogicalCpuCount(), MemoryCapacityBytes: provided.GetMemoryCapacityBytes(),
+		Filesystems: filesystems, NetworkAddresses: append([]string(nil), provided.GetNetworkAddresses()...),
+		Capabilities: append([]string(nil), provided.GetCapabilities()...), ObservedAt: provided.GetObservedAt().AsTime().UTC(),
+	})
+	return err
+}
+
+func (sink persistedHostObservationSink) RecordHello(ctx context.Context, agentID string, at time.Time) error {
+	if sink.service == nil {
+		return hostinventory.ErrInvalid
+	}
+	_, err := sink.service.RecordHello(ctx, agentID, at)
+	return err
+}
+
+func (sink persistedHostObservationSink) RecordHeartbeat(ctx context.Context, agentID string, at time.Time) error {
+	if sink.service == nil {
+		return hostinventory.ErrInvalid
+	}
+	_, err := sink.service.RecordHeartbeat(ctx, agentID, at)
+	return err
+}
+
+type persistedEnrollmentHostRecorder struct {
+	repository *hostinventory.PostgresRepository
+}
+
+func (recorder persistedEnrollmentHostRecorder) RecordEnrollment(ctx context.Context, grant enrollment.EnrollmentGrant, observation hostinventory.Observation, receivedAt time.Time) error {
+	if recorder.repository == nil || grant.Validate() != nil || !receivedAt.IsZero() && receivedAt.Location() != time.UTC {
+		return hostinventory.ErrInvalid
+	}
+	value, err := recorder.repository.RecordEnrollment(ctx, grant.Scope, hostinventory.Enrollment{
+		HostID: grant.HostID, AgentID: grant.AgentID, DisplayName: grant.DisplayName, Labels: grant.Labels,
+		Revision: grant.EnrollmentRevision, EnrolledAt: receivedAt,
+	}, observation, receivedAt)
+	if err != nil {
+		return err
+	}
+	if value.Validate() != nil || value.Scope != grant.Scope || value.ID != grant.HostID || value.AgentID != grant.AgentID || value.EnrollmentRevision != grant.EnrollmentRevision || !value.LastHeartbeatAt.IsZero() {
+		return hostinventory.ErrInvalid
+	}
+	return nil
+}
+
+var _ agentcontrol.HostObservationSink = persistedHostObservationSink{}
+var _ enrollment.HostObservationRecorder = persistedEnrollmentHostRecorder{}
 
 func configuredInspectionTargets(assignments map[string]AgentAssignment) []inspection.HostTarget {
 	result := make([]inspection.HostTarget, 0, len(assignments))
@@ -1265,8 +1541,8 @@ func (dedup postgresLogBatchDeduplicator) AcceptBatchOnce(ctx context.Context, a
 	return true, nil
 }
 
-var _ ingest.AgentIdentityResolver = configuredAgentResolver{}
-var _ controlplane.AgentScopeResolver = configuredAgentResolver{}
+var _ ingest.AgentIdentityResolver = runtimeAgentResolver{}
+var _ controlplane.AgentScopeResolver = runtimeAgentResolver{}
 var _ ingest.DurableBatchDeduplicator = postgresLogBatchDeduplicator{}
 
 // Small constructor aliases keep the configuration-to-runtime mapping explicit.

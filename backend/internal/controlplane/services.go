@@ -9,6 +9,7 @@ import (
 	"dbpilot.local/platform/internal/artifact"
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/capability"
+	"dbpilot.local/platform/internal/enrollment"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/inspection"
@@ -44,6 +45,10 @@ type IdempotencyService interface {
 	BeginRecoverable(context.Context, idempotency.Key, string, []byte, idempotency.ReconcileFunc, idempotency.RecoverProcessingFunc) (idempotency.Claim, error)
 	Complete(context.Context, idempotency.Key, string, string, idempotency.Response, []byte, idempotency.ReconcileFunc) (idempotency.Response, error)
 	Abort(context.Context, idempotency.Key, string, string) error
+}
+
+type EnrollmentService interface {
+	Create(context.Context, platformscope.Scope, enrollment.CreateRequest) (enrollment.CreatedEnrollment, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host
@@ -97,6 +102,7 @@ type Services struct {
 	Idempotency                IdempotencyService
 	Inspection                 InspectionService
 	Hosts                      hostinventory.Service
+	Enrollment                 EnrollmentService
 	PluginCatalog              plugincatalog.CatalogService
 	PluginUploadRemove         func(string) error
 	PluginUploadCleanupFailure func(error)

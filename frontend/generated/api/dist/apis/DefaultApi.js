@@ -12,7 +12,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, PublishPluginVersionRequestToJSON, RevokePluginVersionRequestToJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
+import { AcceptDiscoveryCandidateRequestToJSON, ApprovePluginVersionRequestToJSON, ArtifactFromJSON, AuditEventPageFromJSON, CapabilitySetFromJSON, CreateHostEnrollmentRequestToJSON, CreateInspectionItemRequestToJSON, CreateInspectionPolicyRequestToJSON, CreateInspectionRunRequestToJSON, CreateMetricTemplateRequestToJSON, CreateMetricTemplateRevisionRequestToJSON, DiscoveryCandidateFromJSON, DiscoveryCandidatePageFromJSON, DownloadDescriptorFromJSON, HostEnrollmentFromJSON, IgnoreDiscoveryCandidateRequestToJSON, InspectionItemFromJSON, InspectionItemPageFromJSON, InspectionOverviewFromJSON, InspectionPolicyFromJSON, InspectionPolicyPageFromJSON, InspectionReportFromJSON, InspectionReportDownloadRequestToJSON, InspectionReportPageFromJSON, InspectionRunFromJSON, InspectionRunPageFromJSON, InspectionTargetPageFromJSON, JobFromJSON, ManagedDatabaseInstanceFromJSON, ManagedDatabaseInstancePageFromJSON, ManagedHostFromJSON, ManagedHostPageFromJSON, MetricTemplateFromJSON, MetricTemplateApprovalRequestToJSON, MetricTemplatePageFromJSON, MetricTemplateRevisionFromJSON, MetricTemplateRevisionPageFromJSON, MetricTemplateTrialRequestToJSON, PluginAssignmentFromJSON, PluginAssignmentPageFromJSON, PluginDefinitionPageFromJSON, PluginVersionFromJSON, PluginVersionPageFromJSON, PublishPluginVersionRequestToJSON, RevokePluginVersionRequestToJSON, UpdateDatabaseInstanceRequestToJSON, UpdateInspectionPolicyRequestToJSON, UpdatePluginAssignmentRequestToJSON, } from '../models/index.js';
 /**
  *
  */
@@ -282,6 +282,46 @@ export class DefaultApi extends runtime.BaseAPI {
      */
     async createArtifactDownload(requestParameters, initOverrides) {
         const response = await this.createArtifactDownloadRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    async createHostEnrollmentRaw(requestParameters, initOverrides) {
+        if (requestParameters['idempotencyKey'] == null) {
+            throw new runtime.RequiredError('idempotencyKey', 'Required parameter "idempotencyKey" was null or undefined when calling createHostEnrollment().');
+        }
+        if (requestParameters['createHostEnrollmentRequest'] == null) {
+            throw new runtime.RequiredError('createHostEnrollmentRequest', 'Required parameter "createHostEnrollmentRequest" was null or undefined when calling createHostEnrollment().');
+        }
+        const queryParameters = {};
+        const headerParameters = {};
+        headerParameters['Content-Type'] = 'application/json';
+        if (requestParameters['idempotencyKey'] != null) {
+            headerParameters['Idempotency-Key'] = String(requestParameters['idempotencyKey']);
+        }
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearerAuth", []);
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+        let urlPath = `/host-enrollments`;
+        const response = await this.request({
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateHostEnrollmentRequestToJSON(requestParameters['createHostEnrollmentRequest']),
+        }, initOverrides);
+        return new runtime.JSONApiResponse(response, (jsonValue) => HostEnrollmentFromJSON(jsonValue));
+    }
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    async createHostEnrollment(requestParameters, initOverrides) {
+        const response = await this.createHostEnrollmentRaw(requestParameters, initOverrides);
         return await response.value();
     }
     /**

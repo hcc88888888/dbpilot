@@ -57,6 +57,34 @@ func (service ApplicationService) RecordObservation(ctx context.Context, observa
 	return host, nil
 }
 
+// RecordHello records authenticated session establishment without changing
+// heartbeat-derived liveness. Host inventory must already exist from enrollment.
+func (service ApplicationService) RecordHello(ctx context.Context, agentID string, at time.Time) (Host, error) {
+	if ctx == nil || service.Repository == nil || service.AgentScopes == nil || !identifierPattern.MatchString(agentID) || !validUTC(at) {
+		return Host{}, ErrInvalid
+	}
+	scope, err := service.AgentScopes.ScopeForAgent(ctx, agentID)
+	if err != nil {
+		return Host{}, err
+	}
+	if scope.Validate() != nil {
+		return Host{}, ErrInvalid
+	}
+	now, staleAfter, offlineAfter, err := service.classification()
+	if err != nil {
+		return Host{}, err
+	}
+	host, err := service.Repository.RecordHello(ctx, scope, agentID, at)
+	if err != nil {
+		return Host{}, err
+	}
+	if host.Validate() != nil || host.Scope != scope || host.AgentID != agentID || (host.Status != HostDecommissioned && host.LastHelloAt.Before(at)) {
+		return Host{}, ErrInvalid
+	}
+	host.Status = ClassifyHost(now, host, staleAfter, offlineAfter)
+	return host, nil
+}
+
 // RecordHeartbeat is intentionally separate from inventory observations: only
 // a verified AgentControl Heartbeat is allowed to establish host liveness.
 func (service ApplicationService) RecordHeartbeat(ctx context.Context, agentID string, at time.Time) (Host, error) {

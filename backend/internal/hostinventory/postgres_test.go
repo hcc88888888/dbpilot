@@ -129,6 +129,82 @@ func TestPostgresRecordHeartbeatUsesScopeAndMonotonicTimestamp(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresRecordEnrollmentUsesTrustedScopeDisplayLabelsAndRevision(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	observation := validObservationFixture()
+	receivedAt := observation.ObservedAt.Add(time.Second)
+	enrollment := Enrollment{
+		HostID: observation.HostID, AgentID: observation.AgentID, DisplayName: "Primary database host",
+		Labels: map[string]string{"role": "database"}, Revision: 3, EnrolledAt: receivedAt,
+	}
+	host := validHostFixture()
+	host.DisplayName, host.Labels, host.EnrollmentRevision = enrollment.DisplayName, enrollment.Labels, enrollment.Revision
+	host.LastHelloAt, host.LastHeartbeatAt, host.Status = time.Time{}, time.Time{}, HostEnrolling
+	mock.ExpectQuery(`(?s)WITH enrolled AS \(\s*INSERT INTO managed_hosts.*display_name.*labels.*enrollment_revision.*VALUES.*ON CONFLICT DO NOTHING.*INSERT INTO host_observations.*SELECT .* FROM enrolled.*SELECT .* FROM enrolled`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(hostRows(host))
+
+	got, err := NewPostgresRepository(database).RecordEnrollment(context.Background(), scope, enrollment, observation, receivedAt)
+
+	require.NoError(t, err)
+	require.Equal(t, enrollment.DisplayName, got.DisplayName)
+	require.Equal(t, enrollment.Labels, got.Labels)
+	require.Equal(t, enrollment.Revision, got.EnrollmentRevision)
+	require.True(t, got.LastHeartbeatAt.IsZero())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresScopeForAgentResolvesPersistedEnrollmentWithoutConfiguredAssignment(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	want := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	mock.ExpectQuery(`SELECT tenant_id, project_id, status FROM managed_hosts WHERE agent_id = \$1`).
+		WithArgs("agent-1").WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "status"}).AddRow(want.TenantID, want.ProjectID, HostEnrolling))
+
+	got, err := NewPostgresRepository(database).ScopeForAgent(context.Background(), "agent-1")
+
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresScopeForAgentRejectsDecommissionedEnrollment(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	mock.ExpectQuery(`SELECT tenant_id, project_id, status FROM managed_hosts WHERE agent_id = \$1`).
+		WithArgs("agent-1").WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "project_id", "status"}).AddRow("tenant-1", "project-1", HostDecommissioned))
+
+	_, err = NewPostgresRepository(database).ScopeForAgent(context.Background(), "agent-1")
+
+	require.ErrorIs(t, err, ErrDecommissioned)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresRecordHelloUpdatesOnlyMonotonicHelloTimestamp(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	host := validHostFixture()
+	heartbeat := host.LastHeartbeatAt
+	at := host.LastHelloAt.Add(time.Minute)
+	host.LastHelloAt, host.Version = at, host.Version+1
+	mock.ExpectQuery(`(?s)UPDATE managed_hosts SET last_hello_at = \$1.*version = version \+ 1.*WHERE tenant_id = \$2 AND project_id = \$3 AND agent_id = \$4.*last_hello_at IS NULL OR last_hello_at < \$1.*RETURNING`).
+		WithArgs(at, host.Scope.TenantID, host.Scope.ProjectID, host.AgentID).
+		WillReturnRows(hostRows(host))
+
+	got, err := NewPostgresRepository(database).RecordHello(context.Background(), host.Scope, host.AgentID, at)
+
+	require.NoError(t, err)
+	require.Equal(t, at, got.LastHelloAt)
+	require.Equal(t, heartbeat, got.LastHeartbeatAt)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresDecommissionUsesScopedVersionCAS(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)

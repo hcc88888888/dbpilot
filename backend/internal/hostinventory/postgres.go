@@ -57,6 +57,29 @@ const recordObservationSQL = `WITH upserted AS (
 )
 SELECT ` + hostColumnsSQL + ` FROM upserted`
 
+const recordEnrollmentSQL = `WITH enrolled AS (
+    INSERT INTO managed_hosts (
+        tenant_id, project_id, host_id, agent_id, display_name, hostname,
+        operating_system, operating_system_version, kernel_version, architecture,
+        logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses,
+        labels, capabilities, agent_version, enrollment_revision, observation_revision,
+        enrolled_at, status, version, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'enrolling', 1, $22)
+    ON CONFLICT DO NOTHING
+    RETURNING ` + hostColumnsSQL + `
+), inserted_observation AS (
+    INSERT INTO host_observations (
+        tenant_id, project_id, host_id, agent_id, observation_revision,
+        snapshot, observed_at, received_at
+    )
+    SELECT tenant_id, project_id, host_id, agent_id, observation_revision, $23, $21, $22
+    FROM enrolled
+    RETURNING host_id
+)
+SELECT ` + hostColumnsSQL + ` FROM enrolled`
+
+const scopeForAgentSQL = "SELECT tenant_id, project_id, status FROM managed_hosts WHERE agent_id = $1"
+
 const recordHeartbeatSQL = `UPDATE managed_hosts SET
     last_heartbeat_at = $1,
     status = 'online',
@@ -65,6 +88,15 @@ const recordHeartbeatSQL = `UPDATE managed_hosts SET
 WHERE tenant_id = $2 AND project_id = $3 AND agent_id = $4
   AND status <> 'decommissioned'
   AND (last_heartbeat_at IS NULL OR last_heartbeat_at < $1)
+RETURNING ` + hostColumnsSQL
+
+const recordHelloSQL = `UPDATE managed_hosts SET
+    last_hello_at = $1,
+    version = version + 1,
+    updated_at = $1
+WHERE tenant_id = $2 AND project_id = $3 AND agent_id = $4
+  AND status <> 'decommissioned'
+  AND (last_hello_at IS NULL OR last_hello_at < $1)
 RETURNING ` + hostColumnsSQL
 
 const decommissionHostSQL = `UPDATE managed_hosts SET
@@ -148,6 +180,86 @@ func (repository *PostgresRepository) RecordHeartbeat(ctx context.Context, scope
 		return Host{}, ErrInvalid
 	}
 	host, err := scanHost(repository.database.QueryRowContext(ctx, recordHeartbeatSQL, at, scope.TenantID, scope.ProjectID, agentID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return repository.getByAgent(ctx, scope, agentID)
+	}
+	if err != nil {
+		return Host{}, mapPostgresError(err)
+	}
+	return host, nil
+}
+
+func (repository *PostgresRepository) RecordEnrollment(ctx context.Context, scope platformscope.Scope, enrollment Enrollment, observation Observation, receivedAt time.Time) (Host, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || enrollment.Validate() != nil || observation.Validate() != nil || !validUTC(receivedAt) ||
+		enrollment.HostID != observation.HostID || enrollment.AgentID != observation.AgentID {
+		return Host{}, ErrInvalid
+	}
+	filesystems, err := json.Marshal(observation.Filesystems)
+	if err != nil {
+		return Host{}, ErrInvalid
+	}
+	addresses, err := json.Marshal(observation.NetworkAddresses)
+	if err != nil {
+		return Host{}, ErrInvalid
+	}
+	labels, err := json.Marshal(enrollment.Labels)
+	if err != nil {
+		return Host{}, ErrInvalid
+	}
+	capabilities := make([]Capability, len(observation.Capabilities))
+	for index, name := range observation.Capabilities {
+		capabilities[index] = Capability{Name: name, Available: true}
+	}
+	capabilityJSON, err := json.Marshal(capabilities)
+	if err != nil {
+		return Host{}, ErrInvalid
+	}
+	snapshot, err := json.Marshal(observation)
+	if err != nil {
+		return Host{}, ErrInvalid
+	}
+	host, err := scanHost(repository.database.QueryRowContext(ctx, recordEnrollmentSQL,
+		scope.TenantID, scope.ProjectID, enrollment.HostID, enrollment.AgentID, enrollment.DisplayName, observation.Hostname,
+		observation.OS, observation.OSVersion, observation.Kernel, observation.Architecture, observation.LogicalCPUCount,
+		observation.MemoryCapacityBytes, filesystems, addresses, labels, capabilityJSON, observation.AgentVersion,
+		enrollment.Revision, observation.Revision, enrollment.EnrolledAt, observation.ObservedAt, receivedAt, snapshot,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Host{}, ErrConflict
+	}
+	if err != nil {
+		return Host{}, mapPostgresError(err)
+	}
+	return host, nil
+}
+
+func (repository *PostgresRepository) ScopeForAgent(ctx context.Context, agentID string) (platformscope.Scope, error) {
+	if repository == nil || repository.database == nil || ctx == nil || !identifierPattern.MatchString(agentID) {
+		return platformscope.Scope{}, ErrInvalid
+	}
+	var scope platformscope.Scope
+	var status HostStatus
+	err := repository.database.QueryRowContext(ctx, scopeForAgentSQL, agentID).Scan(&scope.TenantID, &scope.ProjectID, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return platformscope.Scope{}, ErrNotFound
+	}
+	if err != nil {
+		return platformscope.Scope{}, mapPostgresError(err)
+	}
+	if scope.Validate() != nil || !validHostStatus(status) {
+		return platformscope.Scope{}, ErrInvalid
+	}
+	if status == HostDecommissioned {
+		return platformscope.Scope{}, ErrDecommissioned
+	}
+	return scope, nil
+}
+
+func (repository *PostgresRepository) RecordHello(ctx context.Context, scope platformscope.Scope, agentID string, at time.Time) (Host, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(agentID) || !validUTC(at) {
+		return Host{}, ErrInvalid
+	}
+	host, err := scanHost(repository.database.QueryRowContext(ctx, recordHelloSQL, at, scope.TenantID, scope.ProjectID, agentID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return repository.getByAgent(ctx, scope, agentID)
 	}

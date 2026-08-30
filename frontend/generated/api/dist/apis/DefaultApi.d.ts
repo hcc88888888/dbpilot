@@ -10,7 +10,7 @@
  * Do not edit the class manually.
  */
 import * as runtime from '../runtime.js';
-import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, PublishPluginVersionRequest, RevokePluginVersionRequest, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
+import type { AcceptDiscoveryCandidateRequest, ApprovePluginVersionRequest, Artifact, AuditEventPage, CapabilitySet, CreateHostEnrollmentRequest, CreateInspectionItemRequest, CreateInspectionPolicyRequest, CreateInspectionRunRequest, CreateMetricTemplateRequest, CreateMetricTemplateRevisionRequest, DatabaseManagementStatus, DiscoveryCandidate, DiscoveryCandidatePage, DiscoveryCandidateStatus, DiscoverySource, DownloadDescriptor, HostEnrollment, HostStatus, IgnoreDiscoveryCandidateRequest, InspectionItem, InspectionItemPage, InspectionOverview, InspectionPolicy, InspectionPolicyPage, InspectionReport, InspectionReportDownloadRequest, InspectionReportPage, InspectionRun, InspectionRunPage, InspectionTargetPage, Job, ManagedDatabaseInstance, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage, MetricTemplate, MetricTemplateApprovalRequest, MetricTemplatePage, MetricTemplateRevision, MetricTemplateRevisionPage, MetricTemplateTrialRequest, PluginAssignment, PluginAssignmentPage, PluginDefinitionPage, PluginVersion, PluginVersionPage, PluginVersionStatus, PublishPluginVersionRequest, RevokePluginVersionRequest, UpdateDatabaseInstanceRequest, UpdateInspectionPolicyRequest, UpdatePluginAssignmentRequest } from '../models/index.js';
 export interface AcceptDiscoveryCandidateOperationRequest {
     candidateId: string;
     idempotencyKey: string;
@@ -40,6 +40,10 @@ export interface CancelJobRequest {
 export interface CreateArtifactDownloadRequest {
     artifactId: string;
     idempotencyKey: string;
+}
+export interface CreateHostEnrollmentOperationRequest {
+    idempotencyKey: string;
+    createHostEnrollmentRequest: CreateHostEnrollmentRequest;
 }
 export interface CreateInspectionItemOperationRequest {
     idempotencyKey: string;
@@ -302,6 +306,14 @@ export declare class DefaultApi extends runtime.BaseAPI {
      * Create a short-lived artifact download descriptor
      */
     createArtifactDownload(requestParameters: CreateArtifactDownloadRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<DownloadDescriptor>;
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    createHostEnrollmentRaw(requestParameters: CreateHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<HostEnrollment>>;
+    /**
+     * Create a scoped one-time Agent enrollment token
+     */
+    createHostEnrollment(requestParameters: CreateHostEnrollmentOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<HostEnrollment>;
     /**
      * Create a custom inspection item
      */

@@ -13,6 +13,7 @@ models/Capability.ts
 models/CapabilitySet.ts
 models/ConnectionTestStatus.ts
 models/ContainerRuntime.ts
+models/CreateHostEnrollmentRequest.ts
 models/CreateInspectionItemRequest.ts
 models/CreateInspectionPolicyRequest.ts
 models/CreateInspectionRunRequest.ts
@@ -31,6 +32,7 @@ models/FieldError.ts
 models/FilesystemSummary.ts
 models/HostCapability.ts
 models/HostCapabilityReason.ts
+models/HostEnrollment.ts
 models/HostResourceSummary.ts
 models/HostStatus.ts
 models/IgnoreDiscoveryCandidateRequest.ts

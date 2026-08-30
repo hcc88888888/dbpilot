@@ -9,6 +9,7 @@ import (
 
 type Repository interface {
 	RecordObservation(context.Context, platformscope.Scope, Observation, time.Time) (Host, error)
+	RecordHello(context.Context, platformscope.Scope, string, time.Time) (Host, error)
 	RecordHeartbeat(context.Context, platformscope.Scope, string, time.Time) (Host, error)
 	List(context.Context, platformscope.Scope, Filter) (Page, error)
 	Get(context.Context, platformscope.Scope, string) (Host, error)

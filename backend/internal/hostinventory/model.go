@@ -19,10 +19,11 @@ const (
 )
 
 var (
-	ErrInvalid       = errors.New("invalid host inventory value")
-	ErrNotFound      = errors.New("managed host not found")
-	ErrConflict      = errors.New("managed host version conflict")
-	ErrStaleRevision = errors.New("host observation revision is stale")
+	ErrInvalid        = errors.New("invalid host inventory value")
+	ErrNotFound       = errors.New("managed host not found")
+	ErrConflict       = errors.New("managed host version conflict")
+	ErrStaleRevision  = errors.New("host observation revision is stale")
+	ErrDecommissioned = errors.New("managed host is decommissioned")
 )
 
 type HostStatus string
@@ -142,6 +143,26 @@ type Observation struct {
 	NetworkAddresses    []string
 	Capabilities        []string
 	ObservedAt          time.Time
+}
+
+// Enrollment contains only trusted control-plane metadata bound to a consumed
+// one-time token. Agent observations never populate these fields.
+type Enrollment struct {
+	HostID      string
+	AgentID     string
+	DisplayName string
+	Labels      map[string]string
+	Revision    uint64
+	EnrolledAt  time.Time
+}
+
+func (enrollment Enrollment) Validate() error {
+	if !identifierPattern.MatchString(enrollment.HostID) || !identifierPattern.MatchString(enrollment.AgentID) ||
+		!boundedRequired(enrollment.DisplayName, 120) || !validLabels(enrollment.Labels) ||
+		!validPostgresRevision(enrollment.Revision, false) || !validUTC(enrollment.EnrolledAt) {
+		return ErrInvalid
+	}
+	return nil
 }
 
 type Filter struct {

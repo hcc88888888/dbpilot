@@ -153,6 +153,10 @@ components:
       $ref: ./common/hosts.yaml#/HostResourceSummary
     FilesystemSummary:
       $ref: ./common/hosts.yaml#/FilesystemSummary
+    CreateHostEnrollmentRequest:
+      $ref: ./common/hosts.yaml#/CreateHostEnrollmentRequest
+    HostEnrollment:
+      $ref: ./common/hosts.yaml#/HostEnrollment
     ManagedHost:
       $ref: ./common/hosts.yaml#/ManagedHost
     ManagedHostPage:
