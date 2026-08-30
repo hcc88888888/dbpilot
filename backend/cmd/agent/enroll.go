@@ -52,7 +52,7 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 	caFile := flags.String("ca-file", "", "absolute server CA file")
 	tokenFile := flags.String("token-file", "", "absolute one-time enrollment token file")
 	agentID := flags.String("agent-id", "", "Agent identity")
-	outputDirectory := flags.String("output-dir", "", "absolute output directory")
+	outputDirectory := flags.String("output-dir", "", "new absolute credential directory")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -66,11 +66,6 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "enrollment input is unavailable")
 			return 2
 		}
-	}
-	outputInfo, err := os.Lstat(*outputDirectory)
-	if err != nil || !outputInfo.IsDir() || outputInfo.Mode()&os.ModeSymlink != 0 {
-		fmt.Fprintln(stderr, "--output-dir must be an existing non-symlink directory")
-		return 2
 	}
 	encodedToken, err := readBoundedFile(*tokenFile, 128)
 	if err != nil {
@@ -100,12 +95,20 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "collect host observation failed")
 		return 1
 	}
-	request, material, err := generateEnrollmentMaterial(*agentID, token, observation, rand.Reader)
+	generation, err := prepareEnrollmentGeneration(*outputDirectory, *agentID, token, observation, rand.Reader)
 	if err != nil {
-		fmt.Fprintln(stderr, "generate enrollment CSR failed")
+		fmt.Fprintln(stderr, "prepare enrollment credentials failed")
 		return 1
 	}
-	defer zeroBytes(material.PrivateKeyPEM)
+	defer zeroBytes(generation.files.PrivateKeyPEM)
+	if generation.readyToPublish() {
+		if err := generation.publish(); err != nil {
+			fmt.Fprintln(stderr, "publish enrollment credentials failed")
+			return 1
+		}
+		fmt.Fprintf(stdout, "enrolled Agent %s as host %s\n", generation.manifest.AgentID, generation.manifest.HostID)
+		return 0
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	connection, err := grpc.DialContext(ctx, *serverAddress, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12})), grpc.WithBlock())
@@ -114,19 +117,17 @@ func runEnroll(arguments []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer connection.Close()
-	response, err := agentv1.NewAgentEnrollmentClient(connection).Enroll(ctx, request)
+	response, err := agentv1.NewAgentEnrollmentClient(connection).Enroll(ctx, generation.request)
 	if err != nil {
 		fmt.Fprintln(stderr, "Agent enrollment failed")
 		return 1
 	}
-	if err := verifyEnrollmentResponse(*agentID, material.PrivateKeyPEM, response); err != nil {
+	if err := generation.complete(response, serverCA); err != nil {
 		fmt.Fprintln(stderr, "Agent enrollment response is invalid")
 		return 1
 	}
-	material.CertificatePEM = append(append([]byte(nil), response.GetCertificatePem()...), response.GetCertificateChainPem()...)
-	material.ChainPEM = append([]byte(nil), serverCA...)
-	if err := writeEnrollmentFiles(*outputDirectory, material); err != nil {
-		fmt.Fprintln(stderr, err)
+	if err := generation.publish(); err != nil {
+		fmt.Fprintln(stderr, "publish enrollment credentials failed")
 		return 1
 	}
 	fmt.Fprintf(stdout, "enrolled Agent %s as host %s\n", response.GetAgentId(), response.GetHostId())
@@ -162,13 +163,18 @@ func generateEnrollmentMaterial(agentID string, token []byte, observation hostin
 	if err != nil {
 		return nil, enrollmentFiles{}, errors.New("encode enrollment private key")
 	}
+	request := newEnrollmentRequest(agentID, token, observation, csrPEM, publicDER, ed25519.Sign(privateKey, proofMessage))
+	return request, enrollmentFiles{PrivateKeyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})}, nil
+}
+
+func newEnrollmentRequest(agentID string, token []byte, observation hostinventory.Observation, csrPEM, publicDER, proof []byte) *agentv1.EnrollAgentRequest {
 	filesystems := make([]*agentv1.FilesystemObservation, len(observation.Filesystems))
 	for index, filesystem := range observation.Filesystems {
 		filesystems[index] = &agentv1.FilesystemObservation{MountPoint: filesystem.MountPoint, CapacityBytes: filesystem.CapacityBytes, AvailableBytes: filesystem.AvailableBytes}
 	}
-	request := &agentv1.EnrollAgentRequest{
-		EnrollmentToken: append([]byte(nil), token...), AgentId: agentID, CertificateSigningRequestPem: csrPEM,
-		CsrPublicKey: publicDER, CsrProof: ed25519.Sign(privateKey, proofMessage),
+	return &agentv1.EnrollAgentRequest{
+		EnrollmentToken: append([]byte(nil), token...), AgentId: agentID, CertificateSigningRequestPem: append([]byte(nil), csrPEM...),
+		CsrPublicKey: append([]byte(nil), publicDER...), CsrProof: append([]byte(nil), proof...),
 		HostObservation: &agentv1.HostObservation{
 			HostId: observation.HostID, AgentId: agentID, ObservationRevision: observation.Revision,
 			Hostname: observation.Hostname, OperatingSystem: observation.OS, OperatingSystemVersion: observation.OSVersion,
@@ -178,70 +184,6 @@ func generateEnrollmentMaterial(agentID string, token []byte, observation hostin
 			AgentVersion: observation.AgentVersion, ObservedAt: timestamppb.New(observation.ObservedAt),
 		},
 	}
-	return request, enrollmentFiles{PrivateKeyPEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER})}, nil
-}
-
-func writeEnrollmentFiles(directory string, material enrollmentFiles) error {
-	if !filepath.IsAbs(directory) || len(material.PrivateKeyPEM) == 0 || len(material.CertificatePEM) == 0 || len(material.ChainPEM) == 0 {
-		return errors.New("enrollment output is invalid")
-	}
-	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("enrollment output directory is unavailable")
-	}
-	outputs := []struct {
-		name string
-		body []byte
-	}{
-		{name: agentKeyFilename, body: material.PrivateKeyPEM},
-		{name: agentCertificateFilename, body: material.CertificatePEM},
-		{name: agentCAFilename, body: material.ChainPEM},
-	}
-	for _, output := range outputs {
-		if _, err := os.Lstat(filepath.Join(directory, output.name)); !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("enrollment output path already exists: %s", output.name)
-		}
-	}
-	type stagedFile struct{ temporary, final string }
-	staged := make([]stagedFile, 0, len(outputs))
-	cleanupStaged := func() {
-		for _, file := range staged {
-			_ = os.Remove(file.temporary)
-		}
-	}
-	defer cleanupStaged()
-	for _, output := range outputs {
-		file, err := os.CreateTemp(directory, ".dbpilot-enroll-")
-		if err != nil {
-			return errors.New("stage enrollment output failed")
-		}
-		temporary := file.Name()
-		if err := file.Chmod(0o600); err == nil {
-			_, err = file.Write(output.body)
-		}
-		if err == nil {
-			err = file.Sync()
-		}
-		closeErr := file.Close()
-		if err == nil {
-			err = closeErr
-		}
-		staged = append(staged, stagedFile{temporary: temporary, final: filepath.Join(directory, output.name)})
-		if err != nil {
-			return errors.New("stage enrollment output failed")
-		}
-	}
-	created := make([]string, 0, len(staged))
-	for _, file := range staged {
-		if err := os.Link(file.temporary, file.final); err != nil {
-			for _, path := range created {
-				_ = os.Remove(path)
-			}
-			return errors.New("commit enrollment output failed because a path collided or atomic linking is unavailable")
-		}
-		created = append(created, file.final)
-	}
-	return nil
 }
 
 func verifyEnrollmentResponse(agentID string, privateKeyPEM []byte, response *agentv1.EnrollAgentResponse) error {
