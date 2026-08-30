@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
@@ -307,8 +308,8 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	t.Cleanup(func() { require.NoError(t, blobs.Close()) })
 	now := time.Date(2026, 8, 30, 16, 30, 0, 123456789, time.UTC)
 	baseRepository := NewPostgresRepositoryWithClock(database, func() time.Time { return now })
-	repository := &failOnceFinalizeRepository{PostgresRepository: baseRepository, err: errors.New("injected finalize failure")}
-	application, err := NewService(repository, artifact.NewPostgresStore(database, blobs), verifier, func() time.Time { return now })
+	artifactWriter := &failOnceArtifactWriter{delegate: artifact.NewPostgresStore(database, blobs), err: errors.New("injected Artifact failure")}
+	application, err := NewService(baseRepository, artifactWriter, verifier, func() time.Time { return now })
 	require.NoError(t, err)
 	scope := platformscope.Scope{TenantID: "tenant-application", ProjectID: "project-application"}
 	key := OperationKey{Scope: scope, Actor: "publisher-application", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "application-upload", Fingerprint: "sha256:" + strings.Repeat("c", 64), OwnerToken: "owner-" + strings.Repeat("d", 64)}
@@ -318,12 +319,15 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	}
 	auditJSON := []byte(`{"action":"plugin.version_uploaded"}`)
 	_, err = application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(fixture.Archive))
-	require.EqualError(t, err, "injected finalize failure")
+	require.EqualError(t, err, "plugin artifact unavailable")
 	pending, err := baseRepository.GetOperation(ctx, key)
 	require.NoError(t, err)
 	require.Equal(t, OperationPending, pending.State)
 	originalResponse := pending.Response
-	now = now.Add(5 * time.Minute)
+	var artifactCount int
+	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM artifacts WHERE tenant_id=$1 AND project_id=$2 AND id=$3", scope.TenantID, scope.ProjectID, pending.ArtifactID).Scan(&artifactCount))
+	require.Zero(t, artifactCount)
+	now = now.Add(DefaultOperationLease + time.Minute)
 	first, err := application.UploadOperation(ctx, scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, auditJSON, builder, bytes.NewReader(fixture.Archive))
 	require.NoError(t, err)
 	require.Equal(t, time.Date(2026, 8, 30, 16, 30, 0, 123456000, time.UTC), first.Version.CreatedAt)
@@ -343,18 +347,18 @@ func TestPluginCatalogPostgres16ApplicationUploadCanonicalTimestampAndLostRespon
 	require.Equal(t, 1, operationCount)
 }
 
-type failOnceFinalizeRepository struct {
-	*PostgresRepository
-	err error
+type failOnceArtifactWriter struct {
+	delegate ArtifactWriter
+	err      error
 }
 
-func (repository *failOnceFinalizeRepository) FinalizeUploadOperation(ctx context.Context, key OperationKey, builder OperationResponseBuilder) (OperationSnapshot, error) {
-	if repository.err != nil {
-		err := repository.err
-		repository.err = nil
-		return OperationSnapshot{}, err
+func (writer *failOnceArtifactWriter) PutReader(ctx context.Context, value artifact.Artifact, reader io.Reader) (artifact.Artifact, error) {
+	if writer.err != nil {
+		err := writer.err
+		writer.err = nil
+		return artifact.Artifact{}, err
 	}
-	return repository.PostgresRepository.FinalizeUploadOperation(ctx, key, builder)
+	return writer.delegate.PutReader(ctx, value, reader)
 }
 
 func integrationVersion(scope platformscope.Scope, id, artifactID, version, digest string, createdAt time.Time) PluginVersion {

@@ -136,6 +136,36 @@ func TestUploadOperationReservesPublicationBeforeArtifactAndRecoversFinalizeFail
 	require.Equal(t, 2, repository.finalizeOperationCalls)
 }
 
+func TestUploadOperationRenewsExpiredPendingLeaseOnFirstRetryAfterArtifactFailure(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	fixture := newSignedPackageFixture(t, "publisher-1", "key-1", private, nil)
+	clock := time.Date(2026, 8, 30, 5, 0, 0, 987654321, time.UTC)
+	repository := &recordingCatalogRepository{at: clock}
+	artifacts := &recordingArtifactWriter{err: errors.New("artifact publication failed")}
+	service, err := NewService(repository, artifacts, newTestPackageVerifier(t, public, testPackageLimits()), func() time.Time { return clock })
+	require.NoError(t, err)
+	key := OperationKey{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, Actor: "publisher-user", OperationID: "uploadPluginVersionPackage", IdempotencyKey: "expired-artifact", Fingerprint: "sha256:" + stringsOfZeros(64), OwnerToken: "owner-" + stringsOfZeros(64)}
+	builder := func(value PluginVersion) (OperationResponse, error) {
+		return OperationResponse{Status: 201, ETag: value.ETag(), Body: []byte(`{"created_at":"` + value.CreatedAt.Format(time.RFC3339Nano) + `"}`)}, nil
+	}
+	_, err = service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.ErrorIs(t, err, ErrArtifactUnavailable)
+	require.Equal(t, OperationPending, repository.operation.State)
+	originalResponse, originalCreatedAt, originalLease := repository.operation.Response, repository.operation.Version.CreatedAt, repository.operation.LeaseExpiresAt
+
+	clock = clock.Add(DefaultOperationLease + time.Minute)
+	repository.at = clock
+	artifacts.err = nil
+	snapshot, err := service.UploadOperation(context.Background(), key.Scope, UploadMetadata{Actor: key.Actor, ContentLength: int64(len(fixture.Archive))}, key, []byte(`{"audit":"original"}`), builder, bytes.NewReader(fixture.Archive))
+	require.NoError(t, err)
+	require.Equal(t, OperationCommitted, snapshot.State)
+	require.Equal(t, originalResponse, snapshot.Response)
+	require.Equal(t, originalCreatedAt, snapshot.Version.CreatedAt)
+	require.True(t, snapshot.LeaseExpiresAt.After(originalLease))
+	require.Len(t, repository.created, 1)
+}
+
 type recordingArtifactWriter struct {
 	values   []artifact.Artifact
 	contents [][]byte
@@ -170,6 +200,7 @@ type recordingCatalogRepository struct {
 	beginOperationCalls    int
 	finalizeOperationCalls int
 	finalizeOperationErr   error
+	at                     time.Time
 }
 
 func (repository *recordingCatalogRepository) Create(_ context.Context, _ PluginDefinition, version PluginVersion) (PluginVersion, error) {
@@ -210,6 +241,19 @@ func (repository *recordingCatalogRepository) BeginUploadOperation(_ context.Con
 	if repository.operation.Key.Identity() == request.Key.Identity() {
 		if !operationMatchesUpload(repository.operation, request) {
 			return OperationSnapshot{}, ErrConflict
+		}
+		if !repository.at.IsZero() && repository.operation.State == OperationPending && !repository.operation.LeaseExpiresAt.After(repository.at) {
+			repository.operation.State = OperationAbandoned
+			abandonedAt := repository.at
+			repository.operation.AbandonedAt = &abandonedAt
+		}
+		if repository.operation.State == OperationAbandoned {
+			if !request.LeaseExpiresAt.After(repository.operation.LeaseExpiresAt) {
+				return OperationSnapshot{}, ErrConflict
+			}
+			repository.operation.State = OperationPending
+			repository.operation.LeaseExpiresAt = request.LeaseExpiresAt
+			repository.operation.AbandonedAt = nil
 		}
 		return repository.operation, nil
 	}

@@ -73,8 +73,9 @@ func (service *Application) publishVerifiedOperation(ctx context.Context, scope 
 	// PostgreSQL timestamptz is microsecond-precision. Canonicalize once before
 	// building both the immutable version and response snapshot so transaction
 	// round-trips never change replay bytes.
-	createdAt := service.now().UTC().Truncate(time.Microsecond)
-	definition, version, artifactValue, response, finalizeBuilder, leaseExpiresAt := PluginDefinition{}, PluginVersion{}, artifact.Artifact{}, OperationResponse{}, builder, createdAt.Add(DefaultOperationLease)
+	retryAt := service.now().UTC().Truncate(time.Microsecond)
+	createdAt := retryAt
+	definition, version, artifactValue, response, finalizeBuilder, leaseExpiresAt := PluginDefinition{}, PluginVersion{}, artifact.Artifact{}, OperationResponse{}, builder, retryAt.Add(DefaultOperationLease)
 	if authoritative == nil {
 		var err error
 		definition, version, artifactValue, err = service.valuesForVerified(scope, metadata, key.RecordID(), createdAt, verified)
@@ -96,8 +97,8 @@ func (service *Application) publishVerifiedOperation(ctx context.Context, scope 
 		}
 		definition, version, response, createdAt = authoritative.Definition, authoritative.Version, authoritative.Response, authoritative.Version.CreatedAt
 		leaseExpiresAt = authoritative.LeaseExpiresAt
-		if authoritative.State == OperationAbandoned {
-			leaseExpiresAt = service.now().UTC().Truncate(time.Microsecond).Add(DefaultOperationLease)
+		if authoritative.State == OperationAbandoned || !authoritative.LeaseExpiresAt.After(retryAt) {
+			leaseExpiresAt = retryAt.Add(DefaultOperationLease)
 		}
 		artifactValue = artifact.Artifact{ID: authoritative.ArtifactID, Scope: scope, Kind: "plugin-package", ContentType: "application/gzip", SizeBytes: authoritative.ArtifactBytes, Checksum: "sha256:" + authoritative.ArtifactSHA256, SourceResource: artifact.ResourceReference{ResourceType: "plugin_catalog_operation", ResourceID: key.RecordID()}, CreatedBy: metadata.Actor, CreatedAt: createdAt}
 		finalizeBuilder = func(PluginVersion) (OperationResponse, error) { return response, nil }
