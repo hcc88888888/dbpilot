@@ -46,3 +46,11 @@ func TestNormalizeBatchRejectsPluginScopeAndInvalidValues(t *testing.T) {
 	_, _, err = normalizeBatch(future, scope, now)
 	require.Error(t, err)
 }
+
+func TestNormalizeBatchPreservesFailedZeroSampleCollectionAsStatusMetric(t *testing.T) {
+	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
+	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "builtin", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_FAILED, ErrorCode: "instance_unreachable"}
+	payload, _, err := NormalizeBatch(batch, MetricScope{AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql"}, now)
+	require.NoError(t, err)
+	require.NotEmpty(t, payload)
+}

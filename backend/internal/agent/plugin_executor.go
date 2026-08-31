@@ -22,7 +22,14 @@ func (executor *ReconcilePluginExecutor) Execute(ctx context.Context, envelope *
 		return nil, pluginsupervisor.ErrInvalidRequest
 	}
 	command := envelope.GetReconcilePlugin()
-	request := pluginsupervisor.ReconcileRequest{AssignmentID: command.GetAssignmentId(), PluginID: command.GetPluginId(), DatabaseFamily: command.GetDatabaseFamily(), DesiredVersion: command.GetDesiredVersion(), DesiredState: desiredPluginState(command.GetDesiredState()), ArtifactID: command.GetArtifactId(), ArtifactSHA256: append([]byte(nil), command.GetArtifactSha256()...), ManifestDigest: append([]byte(nil), command.GetManifestDigest()...), ConfigurationRevision: command.GetConfigurationRevision(), OperationRevision: command.GetOperationRevision(), InstanceIDs: append([]string(nil), command.GetInstanceIds()...), TemplateIDs: append([]string(nil), command.GetTemplateIds()...)}
+	descriptors := make([]pluginsupervisor.InstanceDescriptor, 0, len(command.GetInstanceDescriptors()))
+	for _, descriptor := range command.GetInstanceDescriptors() {
+		if descriptor == nil {
+			return nil, pluginsupervisor.ErrInvalidRequest
+		}
+		descriptors = append(descriptors, pluginsupervisor.InstanceDescriptor{InstanceID: descriptor.GetInstanceId(), DatabaseVariant: descriptor.GetDatabaseVariant(), Endpoint: descriptor.GetEndpoint(), UnixSocket: descriptor.GetUnixSocket()})
+	}
+	request := pluginsupervisor.ReconcileRequest{AssignmentID: command.GetAssignmentId(), PluginID: command.GetPluginId(), DatabaseFamily: command.GetDatabaseFamily(), DesiredVersion: command.GetDesiredVersion(), DesiredState: desiredPluginState(command.GetDesiredState()), ArtifactID: command.GetArtifactId(), ArtifactSHA256: append([]byte(nil), command.GetArtifactSha256()...), ManifestDigest: append([]byte(nil), command.GetManifestDigest()...), ConfigurationRevision: command.GetConfigurationRevision(), OperationRevision: command.GetOperationRevision(), InstanceIDs: append([]string(nil), command.GetInstanceIds()...), InstanceDescriptors: descriptors, TemplateIDs: append([]string(nil), command.GetTemplateIds()...)}
 	prepared, err := executor.supervisor.Prepare(ctx, request)
 	if err != nil {
 		return nil, err

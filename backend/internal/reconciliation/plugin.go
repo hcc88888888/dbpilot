@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
@@ -29,6 +30,12 @@ type AssignmentRepository interface {
 	MarkWaiting(context.Context, pluginassignment.ReconcileClaim, string) error
 	Schedule(context.Context, pluginassignment.ReconcileClaim, job.Job, job.OutboxMessage) (job.Job, bool, error)
 	FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error)
+}
+
+// InstanceDescriptorLoader supplies the current non-secret Task6 routing
+// facts at scheduling time; Assignment deliberately stores only membership.
+type InstanceDescriptorLoader interface {
+	LoadPluginInstanceDescriptors(context.Context, pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error)
 }
 
 func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, assignment pluginassignment.Assignment, at time.Time) (job.Job, error) {
@@ -62,7 +69,11 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 		}
 		return job.Job{}, pluginassignment.ErrConflict
 	}
-	value, message, err := buildPluginJob(claim.Assignment, at.UTC())
+	descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
+	if err != nil {
+		return job.Job{}, err
+	}
+	value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
 	if err != nil {
 		return job.Job{}, err
 	}
@@ -79,10 +90,14 @@ type Reconciler interface {
 	Reconcile(context.Context, time.Time, int) (ReconcileResult, error)
 }
 
-type PluginReconciler struct{ repository AssignmentRepository }
+type PluginReconciler struct {
+	repository  AssignmentRepository
+	descriptors InstanceDescriptorLoader
+}
 
 func NewPluginReconciler(repository AssignmentRepository) *PluginReconciler {
-	return &PluginReconciler{repository: repository}
+	loader, _ := repository.(InstanceDescriptorLoader)
+	return &PluginReconciler{repository: repository, descriptors: loader}
 }
 
 func (reconciler *PluginReconciler) FindScheduledJob(ctx context.Context, assignment pluginassignment.Assignment) (job.Job, bool, error) {
@@ -129,7 +144,12 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
-		value, message, err := buildPluginJob(claim.Assignment, at.UTC())
+		descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -160,7 +180,26 @@ func rolloutEligible(value pluginassignment.Assignment) bool {
 }
 
 func buildPluginJob(assignment pluginassignment.Assignment, at time.Time) (job.Job, job.OutboxMessage, error) {
+	return buildPluginJobWithDescriptors(assignment, nil, at)
+}
+
+func (reconciler *PluginReconciler) loadDescriptors(ctx context.Context, assignment pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error) {
+	if reconciler == nil || reconciler.descriptors == nil {
+		return nil, pluginassignment.ErrInvalid
+	}
+	values, err := reconciler.descriptors.LoadPluginInstanceDescriptors(ctx, assignment)
+	if err != nil || validateDescriptors(assignment, values) != nil {
+		return nil, pluginassignment.ErrInvalid
+	}
+	sort.Slice(values, func(left, right int) bool { return values[left].GetInstanceId() < values[right].GetInstanceId() })
+	return values, nil
+}
+
+func buildPluginJobWithDescriptors(assignment pluginassignment.Assignment, descriptors []*agentv1.PluginInstanceDescriptor, at time.Time) (job.Job, job.OutboxMessage, error) {
 	if assignment.Validate() != nil || at.IsZero() || !assignment.NeedsReconcile() {
+		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
+	}
+	if len(descriptors) != 0 && validateDescriptors(assignment, descriptors) != nil {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
 	artifactDigest, err := hex.DecodeString(assignment.ArtifactSHA256)
@@ -175,7 +214,7 @@ func buildPluginJob(assignment pluginassignment.Assignment, at time.Time) (job.J
 	if !ok {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
-	command := &agentv1.CommandEnvelope{AgentId: assignment.AgentID, LeaseSeconds: PluginExecutionLeaseSeconds, Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: assignment.ID, PluginId: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, DesiredVersion: assignment.DesiredVersion, DesiredState: state, ArtifactId: assignment.ArtifactID, ArtifactSha256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: assignment.ConfigurationRevision, OperationRevision: assignment.OperationRevision, InstanceIds: append([]string(nil), assignment.InstanceIDs...), TemplateIds: append([]string(nil), assignment.TemplateRevisionIDs...)}}}
+	command := &agentv1.CommandEnvelope{AgentId: assignment.AgentID, LeaseSeconds: PluginExecutionLeaseSeconds, Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: assignment.ID, PluginId: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, DesiredVersion: assignment.DesiredVersion, DesiredState: state, ArtifactId: assignment.ArtifactID, ArtifactSha256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: assignment.ConfigurationRevision, OperationRevision: assignment.OperationRevision, InstanceIds: append([]string(nil), assignment.InstanceIDs...), TemplateIds: append([]string(nil), assignment.TemplateRevisionIDs...), InstanceDescriptors: cloneDescriptors(descriptors)}}}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(command)
 	if err != nil {
 		return job.Job{}, job.OutboxMessage{}, fmt.Errorf("marshal ReconcilePlugin: %w", err)
@@ -187,6 +226,40 @@ func buildPluginJob(assignment pluginassignment.Assignment, at time.Time) (job.J
 	value := job.Job{ID: jobID, Type: "plugin.reconcile", Scope: assignment.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{assignment.AgentID}, InitiatedBy: "plugin-reconciler", SourceResource: job.ResourceReference{ResourceType: "plugin_assignment", ResourceID: assignment.ID}, IdempotencyKey: "plugin-reconcile:" + identity, Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at.UTC(), TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: PluginJobTimeout - time.Minute, RequestID: "plugin-reconcile-" + assignment.ID, TraceID: pluginassignment.DeterministicID("trace-", assignment.Scope.Key(), identity)}
 	message := job.OutboxMessage{ID: commandID, Scope: assignment.Scope, JobID: jobID, TargetID: assignment.AgentID, Type: "agent.command", Payload: payload, AvailableAt: at.UTC(), CreatedAt: at.UTC()}
 	return value, message, nil
+}
+
+func validateDescriptors(assignment pluginassignment.Assignment, values []*agentv1.PluginInstanceDescriptor) error {
+	if len(values) != len(assignment.InstanceIDs) || len(values) > 128 {
+		return pluginassignment.ErrInvalid
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == nil || !containsAssignmentID(assignment.InstanceIDs, value.GetInstanceId()) || value.GetDatabaseVariant() == "" || len(value.GetDatabaseVariant()) > 128 || (value.GetEndpoint() == "") == (value.GetUnixSocket() == "") || len(value.GetEndpoint()) > 512 || len(value.GetUnixSocket()) > 512 {
+			return pluginassignment.ErrInvalid
+		}
+		if _, duplicate := seen[value.GetInstanceId()]; duplicate {
+			return pluginassignment.ErrInvalid
+		}
+		seen[value.GetInstanceId()] = struct{}{}
+	}
+	return nil
+}
+
+func containsAssignmentID(values []string, candidate string) bool {
+	for _, value := range values {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneDescriptors(values []*agentv1.PluginInstanceDescriptor) []*agentv1.PluginInstanceDescriptor {
+	result := make([]*agentv1.PluginInstanceDescriptor, len(values))
+	for index := range values {
+		result[index] = &agentv1.PluginInstanceDescriptor{InstanceId: values[index].GetInstanceId(), DatabaseVariant: values[index].GetDatabaseVariant(), Endpoint: values[index].GetEndpoint(), UnixSocket: values[index].GetUnixSocket()}
+	}
+	return result
 }
 
 func protoDesiredState(value pluginassignment.DesiredState) (agentv1.PluginDesiredState, bool) {

@@ -201,6 +201,17 @@ message ReconcilePlugin {
   repeated string instance_ids = 11;
   repeated string template_ids = 12;
   reserved 13 to 19;
+  repeated PluginInstanceDescriptor instance_descriptors = 20;
+}
+
+// Non-secret routing facts for the current assignment membership. Credential
+// material and template statements are delivered only by their dedicated
+// runtime flows.
+message PluginInstanceDescriptor {
+  string instance_id = 1;
+  string database_variant = 2;
+  string endpoint = 3;
+  string unix_socket = 4;
 }
 
 enum PluginDesiredState {

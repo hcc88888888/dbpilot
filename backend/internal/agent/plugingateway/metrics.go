@@ -80,7 +80,7 @@ var errInvalidMetric = errors.New("PLUGIN_METRIC_REJECTED")
 // Agent-owned OTLP payload. The identifier is derived from canonical payload
 // bytes, so the spool's (class,id) idempotency remains stable after reconnects.
 func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now time.Time) ([]byte, string, error) {
-	if batch == nil || scope.validate() != nil || !family(batch.GetPluginId()) || !family(batch.GetDatabaseFamily()) || batch.GetDatabaseFamily() != scope.DatabaseFamily || !version(batch.GetPluginVersion()) || !family(batch.GetDatabaseVariant()) || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() == 0 || !identifier(batch.GetTemplateId()) || !scope.permitsTemplate(batch.GetTemplateId()) || batch.GetTemplateRevision() == 0 || batch.GetSequence() == 0 || len(batch.GetSamples()) == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED {
+	if batch == nil || scope.validate() != nil || !family(batch.GetPluginId()) || !family(batch.GetDatabaseFamily()) || batch.GetDatabaseFamily() != scope.DatabaseFamily || !version(batch.GetPluginVersion()) || !family(batch.GetDatabaseVariant()) || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() == 0 || !identifier(batch.GetTemplateId()) || !scope.permitsTemplate(batch.GetTemplateId()) || batch.GetTemplateRevision() == 0 || batch.GetSequence() == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED || (len(batch.GetSamples()) == 0 && batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED) || (batch.GetErrorCode() != "" && !fixedCode.MatchString(batch.GetErrorCode())) {
 		return nil, "", errInvalidMetric
 	}
 	collectedAt := batch.GetCollectedAt()
@@ -113,6 +113,16 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 	resource.PutStr("plugin_sequence", fmt.Sprintf("%d", batch.GetSequence()))
 	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
 	scopeMetrics.Scope().SetName("dbpilot.plugin-runtime")
+	statusMetric := scopeMetrics.Metrics().AppendEmpty()
+	statusMetric.SetName("dbpilot.plugin.collection.status")
+	statusMetric.SetUnit("1")
+	statusPoint := statusMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+	statusPoint.SetTimestamp(pcommon.NewTimestampFromTime(collected))
+	statusPoint.SetDoubleValue(1)
+	statusPoint.Attributes().PutStr("status", collectionStatus(batch.GetCollectionStatus()))
+	if batch.GetErrorCode() != "" {
+		statusPoint.Attributes().PutStr("error_code", batch.GetErrorCode())
+	}
 
 	type sampleKey struct {
 		name, unit string
@@ -230,6 +240,21 @@ func canonicalLabels(labels map[string]string) string {
 		value.WriteByte(0)
 	}
 	return value.String()
+}
+
+func collectionStatus(value pluginv1.PluginCollectionStatus) string {
+	switch value {
+	case pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED:
+		return "succeeded"
+	case pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_PARTIAL:
+		return "partial"
+	case pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_FAILED:
+		return "failed"
+	case pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_STALE:
+		return "stale"
+	default:
+		return "invalid"
+	}
 }
 
 func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }

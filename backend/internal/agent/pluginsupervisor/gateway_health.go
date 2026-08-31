@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/plugingateway"
 )
 
@@ -15,10 +16,11 @@ type GatewayHealthChecker struct {
 	client   *plugingateway.Client
 	mu       sync.Mutex
 	sessions map[int]*plugingateway.Session
+	streams  map[int]context.CancelFunc
 }
 
 func NewGatewayHealthChecker(client *plugingateway.Client) *GatewayHealthChecker {
-	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session)}
+	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc)}
 }
 
 func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Process, request HealthRequest) error {
@@ -31,7 +33,7 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		DatabaseFamily: request.DatabaseFamily, Version: request.Version, ProtocolVersion: request.ProtocolVersion,
 		ExecutablePath: request.ExecutablePath, ExecutableSHA256: append([]byte(nil), request.ExecutableSHA256...),
 		LaunchNonce: append([]byte(nil), request.LaunchNonce...), ConfigurationRevision: request.ConfigurationRevision,
-		OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...),
+		OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), TemplateIDs: append([]string(nil), request.TemplateIDs...),
 	}
 	session, err := checker.client.Open(expected)
 	if err != nil {
@@ -40,8 +42,34 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 	if _, err = session.Handshake(ctx, expected); err != nil {
 		return ErrHealthHandshake
 	}
-	if err := session.CheckHealth(ctx); err != nil {
-		return ErrHealthHandshake
+	if len(request.InstanceDescriptors) == 0 {
+		if err := session.CheckHealth(ctx); err != nil {
+			return ErrHealthHandshake
+		}
+	} else {
+		instances := make([]*pluginv1.PluginInstanceConfiguration, 0, len(request.InstanceDescriptors))
+		for _, descriptor := range request.InstanceDescriptors {
+			instances = append(instances, &pluginv1.PluginInstanceConfiguration{InstanceId: descriptor.InstanceID, DatabaseVariant: descriptor.DatabaseVariant, Endpoint: descriptor.Endpoint, UnixSocket: descriptor.UnixSocket})
+		}
+		if err := session.ApplyConfiguration(ctx, plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}); err != nil {
+			return ErrHealthHandshake
+		}
+		for _, instanceID := range request.InstanceIDs {
+			result, validateErr := session.ValidateInstance(ctx, instanceID)
+			if validateErr != nil || !result.Valid {
+				return ErrHealthHandshake
+			}
+		}
+		if err := session.CheckHealth(ctx); err != nil {
+			return ErrHealthHandshake
+		}
+		streamContext, cancel := context.WithCancel(context.Background())
+		checker.mu.Lock()
+		checker.streams[process.PID()] = cancel
+		checker.mu.Unlock()
+		go func() {
+			_ = session.RunMetricStream(streamContext, checker.client.MetricSink())
+		}()
 	}
 	checker.mu.Lock()
 	checker.sessions[process.PID()] = session
@@ -57,6 +85,10 @@ func (checker *GatewayHealthChecker) Shutdown(ctx context.Context, process Proce
 	}
 	checker.mu.Lock()
 	session := checker.sessions[process.PID()]
+	if cancel := checker.streams[process.PID()]; cancel != nil {
+		cancel()
+		delete(checker.streams, process.PID())
+	}
 	delete(checker.sessions, process.PID())
 	checker.mu.Unlock()
 	if session == nil || session.Shutdown(ctx, timeout) != nil {

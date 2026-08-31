@@ -34,6 +34,7 @@ const (
 var (
 	resourceID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 	familyID   = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
+	fixedCode  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	errGateway = errors.New("PLUGIN_GATEWAY_REJECTED")
 )
 
@@ -50,6 +51,16 @@ type ClientConfig struct {
 }
 
 type Client struct{ config ClientConfig }
+
+// MetricSink returns the Agent-owned durable spool configured for this
+// client. It is deliberately exposed only as the narrow append interface so
+// Supervisor can own the stream lifetime without exposing spool internals.
+func (client *Client) MetricSink() MetricSink {
+	if client == nil {
+		return nil
+	}
+	return client.config.Store
+}
 
 // ExpectedPlugin comes only from the Supervisor's launch result, never from a
 // plugin response or control-plane supplied socket address.
@@ -107,6 +118,7 @@ type Session struct {
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
 	lastSequence          map[string]uint64
 	lastTimestamp         map[string]time.Time
+	lastDigest            map[string]string
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -126,7 +138,7 @@ func (client *Client) Open(expected ExpectedPlugin) (*Session, error) {
 	if client == nil || client.config.Scope.validateAgent() != nil || validateExpected(client.config.RuntimeRoot, expected) != nil {
 		return nil, errGateway
 	}
-	return &Session{client: client, expected: cloneExpected(expected), lastSequence: map[string]uint64{}, lastTimestamp: map[string]time.Time{}}, nil
+	return &Session{client: client, expected: cloneExpected(expected), lastSequence: map[string]uint64{}, lastTimestamp: map[string]time.Time{}, lastDigest: map[string]string{}}, nil
 }
 
 func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) (Capabilities, error) {
@@ -143,7 +155,11 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 		if err != nil || !validHandshake(response, session.expected, challenge) {
 			return errGateway
 		}
-		result = Capabilities{SupportedVariants: boundedSorted(response.GetSupportedVariants(), 64), DatabaseVersionRange: boundedText(response.GetDatabaseVersionRange(), 128), Capabilities: boundedSorted(response.GetCapabilities(), 64), MetricTemplateSchemaVersion: response.GetMetricTemplateSchemaVersion()}
+		variants, capabilities, versionRange := boundedSorted(response.GetSupportedVariants(), 64), boundedSorted(response.GetCapabilities(), 64), boundedText(response.GetDatabaseVersionRange(), 128)
+		if len(response.GetSupportedVariants()) > 0 && variants == nil || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersionRange() != "" && versionRange == "" {
+			return errGateway
+		}
+		result = Capabilities{SupportedVariants: variants, DatabaseVersionRange: versionRange, Capabilities: capabilities, MetricTemplateSchemaVersion: response.GetMetricTemplateSchemaVersion()}
 		return nil
 	})
 	if err != nil {
@@ -170,13 +186,17 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 		return responseErr
 	}
 	session.mu.Lock()
+	changed := session.configurationRevision != configuration.ConfigurationRevision
 	session.configurationRevision = configuration.ConfigurationRevision
 	session.instances = make(map[string]*pluginv1.PluginInstanceConfiguration, len(configuration.Instances))
 	for _, instance := range configuration.Instances {
 		session.instances[instance.GetInstanceId()] = proto.Clone(instance).(*pluginv1.PluginInstanceConfiguration)
 	}
-	session.lastSequence = map[string]uint64{}
-	session.lastTimestamp = map[string]time.Time{}
+	if changed {
+		session.lastSequence = map[string]uint64{}
+		session.lastTimestamp = map[string]time.Time{}
+		session.lastDigest = map[string]string{}
+	}
 	session.mu.Unlock()
 	return nil
 }
@@ -214,10 +234,11 @@ func (session *Session) ValidateInstance(ctx context.Context, instanceID string)
 	var result ValidationResult
 	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.ValidateInstance(callContext, &pluginv1.ValidatePluginInstanceRequest{AssignmentId: session.expected.AssignmentID, InstanceId: instanceID, ConfigurationRevision: session.currentRevision()})
-		if err != nil || response.GetInstanceId() != instanceID || len(response.GetDatabaseVersion()) > 128 || len(response.GetDatabaseEdition()) > 128 || len(response.GetErrorCode()) > 64 {
+		capabilities, databaseVersion, databaseEdition := boundedSorted(response.GetCapabilities(), 64), boundedText(response.GetDatabaseVersion(), 128), boundedText(response.GetDatabaseEdition(), 128)
+		if err != nil || response.GetInstanceId() != instanceID || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersion() != "" && databaseVersion == "" || response.GetDatabaseEdition() != "" && databaseEdition == "" || (response.GetErrorCode() != "" && !fixedCode.MatchString(response.GetErrorCode())) {
 			return errGateway
 		}
-		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: response.GetDatabaseVersion(), DatabaseEdition: response.GetDatabaseEdition(), Capabilities: boundedSorted(response.GetCapabilities(), 64), ErrorCode: response.GetErrorCode()}
+		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: databaseVersion, DatabaseEdition: databaseEdition, Capabilities: capabilities, ErrorCode: response.GetErrorCode()}
 		return nil
 	})
 	return result, err
@@ -287,24 +308,29 @@ func (session *Session) appendBatch(ctx context.Context, batch *pluginv1.PluginM
 	if err != nil {
 		return errGateway
 	}
+	digest := sha256.Sum256(payload)
 	session.mu.Lock()
+	defer session.mu.Unlock()
 	configured := session.instances[batch.GetInstanceId()]
 	if configured == nil || configured.GetDatabaseVariant() != batch.GetDatabaseVariant() || batch.GetConfigurationRevision() != session.configurationRevision {
-		session.mu.Unlock()
 		return errGateway
 	}
-	if batch.GetSequence() <= session.lastSequence[batch.GetInstanceId()] || (!session.lastTimestamp[batch.GetInstanceId()].IsZero() && batch.GetCollectedAt().AsTime().UTC().Before(session.lastTimestamp[batch.GetInstanceId()])) {
-		session.mu.Unlock()
+	instanceID := batch.GetInstanceId()
+	if batch.GetSequence() < session.lastSequence[instanceID] || (!session.lastTimestamp[instanceID].IsZero() && batch.GetCollectedAt().AsTime().UTC().Before(session.lastTimestamp[instanceID])) {
 		return errGateway
 	}
-	session.mu.Unlock()
+	if batch.GetSequence() == session.lastSequence[instanceID] {
+		if session.lastDigest[instanceID] == hex.EncodeToString(digest[:]) {
+			return nil
+		}
+		return errGateway
+	}
 	if err := sink.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: pluginMetricSourceID + ":" + session.expected.AssignmentID + ":" + batch.GetInstanceId(), CreatedAt: now, Priority: 1, Payload: payload}); err != nil {
 		return err
 	}
-	session.mu.Lock()
-	session.lastSequence[batch.GetInstanceId()] = batch.GetSequence()
-	session.lastTimestamp[batch.GetInstanceId()] = batch.GetCollectedAt().AsTime().UTC()
-	session.mu.Unlock()
+	session.lastSequence[instanceID] = batch.GetSequence()
+	session.lastTimestamp[instanceID] = batch.GetCollectedAt().AsTime().UTC()
+	session.lastDigest[instanceID] = hex.EncodeToString(digest[:])
 	return nil
 }
 
@@ -409,7 +435,7 @@ func launchProof(nonce, challenge []byte, assignment, version string, configurat
 
 func validateExpected(root string, expected ExpectedPlugin) error {
 	expectedSocket := filepath.Join(root, expected.DatabaseFamily, "plugin.sock")
-	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxGatewayMembers || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) == 0 || len(expected.TemplateIDs) > maxGatewayMembers || !unique(expected.TemplateIDs) || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
+	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxGatewayMembers || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) > maxGatewayMembers || !unique(expected.TemplateIDs) || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
 		return errGateway
 	}
 	return nil

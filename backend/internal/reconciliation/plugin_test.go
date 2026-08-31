@@ -36,6 +36,10 @@ func TestPluginReconcilerCreatesOneExactSecretFreeTypedJobOnlyForDrift(t *testin
 	require.NotNil(t, command)
 	require.Equal(t, "assignment-a", command.GetAssignmentId())
 	require.Equal(t, []string{"instance-a", "instance-b"}, command.GetInstanceIds())
+	require.Equal(t, []*agentv1.PluginInstanceDescriptor{
+		{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"},
+		{InstanceId: "instance-b", DatabaseVariant: "mysql", UnixSocket: "/run/mysql/mysql.sock"},
+	}, command.GetInstanceDescriptors())
 	require.Equal(t, []string{"template-a:3"}, command.GetTemplateIds())
 	require.Len(t, command.GetArtifactSha256(), 32)
 	require.Len(t, command.GetManifestDigest(), 32)
@@ -56,6 +60,16 @@ type memoryReconcileRepository struct {
 	messages []job.OutboxMessage
 	waiting  int
 	stored   *job.Job
+}
+
+func (repository *memoryReconcileRepository) LoadPluginInstanceDescriptors(_ context.Context, assignment pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error) {
+	if assignment.ID != "assignment-a" || assignment.Scope.TenantID != "tenant-a" || assignment.Scope.ProjectID != "project-a" || assignment.AgentID != "agent-a" || assignment.DatabaseFamily != "mysql" {
+		return nil, pluginassignment.ErrInvalid
+	}
+	return []*agentv1.PluginInstanceDescriptor{
+		{InstanceId: "instance-b", DatabaseVariant: "mysql", UnixSocket: "/run/mysql/mysql.sock"},
+		{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"},
+	}, nil
 }
 
 func (repository *memoryReconcileRepository) ClaimDue(context.Context, time.Time, int, time.Duration) ([]pluginassignment.ReconcileClaim, error) {

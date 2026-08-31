@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	MaxAssignedInstances = 1024
-	MaxAssignedTemplates = 1024
+	MaxAssignedInstances = 128
+	MaxAssignedTemplates = 128
 	MaxPluginOutputBytes = 64 << 10
 )
 
@@ -67,13 +67,23 @@ type ReconcileRequest struct {
 	ConfigurationRevision uint64
 	OperationRevision     uint64
 	InstanceIDs           []string
+	InstanceDescriptors   []InstanceDescriptor
 	TemplateIDs           []string
+}
+
+// InstanceDescriptor is the non-secret, canonical routing projection supplied
+// by the Server for the exact assignment membership.
+type InstanceDescriptor struct {
+	InstanceID      string
+	DatabaseVariant string
+	Endpoint        string
+	UnixSocket      string
 }
 
 func (request ReconcileRequest) Validate() error {
 	if !resourceIdentifier.MatchString(request.AssignmentID) || !familyIdentifier.MatchString(request.PluginID) || !familyIdentifier.MatchString(request.DatabaseFamily) ||
 		request.ConfigurationRevision == 0 || request.OperationRevision == 0 || len(request.InstanceIDs) > MaxAssignedInstances || len(request.TemplateIDs) > MaxAssignedTemplates ||
-		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) {
+		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) || !validInstanceDescriptors(request.InstanceIDs, request.InstanceDescriptors) {
 		return ErrInvalidRequest
 	}
 	switch request.DesiredState {
@@ -109,6 +119,12 @@ func (request ReconcileRequest) Fingerprint() string {
 	values := []string{request.AssignmentID, request.PluginID, request.DatabaseFamily, request.DesiredVersion, strconv.Itoa(int(request.DesiredState)), request.ArtifactID, hex.EncodeToString(request.ArtifactSHA256), hex.EncodeToString(request.ManifestDigest), strconv.FormatUint(request.ConfigurationRevision, 10), strconv.FormatUint(request.OperationRevision, 10)}
 	values = append(values, "instances", strconv.Itoa(len(instances)))
 	values = append(values, instances...)
+	descriptors := append([]InstanceDescriptor(nil), request.InstanceDescriptors...)
+	sort.Slice(descriptors, func(left, right int) bool { return descriptors[left].InstanceID < descriptors[right].InstanceID })
+	values = append(values, "descriptors", strconv.Itoa(len(descriptors)))
+	for _, descriptor := range descriptors {
+		values = append(values, descriptor.InstanceID, descriptor.DatabaseVariant, descriptor.Endpoint, descriptor.UnixSocket)
+	}
 	values = append(values, "templates", strconv.Itoa(len(templates)))
 	values = append(values, templates...)
 	hash := sha256.New()
@@ -235,6 +251,7 @@ type LaunchConfiguration struct {
 	ConfigurationRevision uint64
 	OperationRevision     uint64
 	InstanceIDs           []string
+	InstanceDescriptors   []InstanceDescriptor
 	TemplateIDs           []string
 	RuntimeDirectory      string
 	ExecutablePath        string
@@ -268,6 +285,8 @@ type HealthRequest struct {
 	ConfigurationRevision uint64
 	OperationRevision     uint64
 	InstanceIDs           []string
+	InstanceDescriptors   []InstanceDescriptor
+	TemplateIDs           []string
 	RuntimeDirectory      string
 	LaunchNonce           []byte
 	ExpectedUserID        uint32
@@ -309,6 +328,34 @@ func uniqueResources(values []string) bool {
 			return false
 		}
 		seen[value] = struct{}{}
+	}
+	return true
+}
+
+func validInstanceDescriptors(instanceIDs []string, descriptors []InstanceDescriptor) bool {
+	// Task9 persists requests without routing material for restart compatibility;
+	// a verified Task10 command always carries the complete projection.
+	if len(descriptors) == 0 {
+		return true
+	}
+	if len(descriptors) != len(instanceIDs) || len(descriptors) > MaxAssignedInstances {
+		return false
+	}
+	allowed, seen := make(map[string]struct{}, len(instanceIDs)), make(map[string]struct{}, len(descriptors))
+	for _, instanceID := range instanceIDs {
+		allowed[instanceID] = struct{}{}
+	}
+	for _, descriptor := range descriptors {
+		if !resourceIdentifier.MatchString(descriptor.InstanceID) || !familyIdentifier.MatchString(descriptor.DatabaseVariant) || (descriptor.Endpoint == "") == (descriptor.UnixSocket == "") || len(descriptor.Endpoint) > 512 || len(descriptor.UnixSocket) > 512 || (descriptor.Endpoint != "" && (strings.TrimSpace(descriptor.Endpoint) != descriptor.Endpoint || strings.ContainsAny(descriptor.Endpoint, "/?#@"))) || (descriptor.UnixSocket != "" && (!strings.HasPrefix(descriptor.UnixSocket, "/") || strings.Contains(descriptor.UnixSocket, ".."))) {
+			return false
+		}
+		if _, ok := allowed[descriptor.InstanceID]; !ok {
+			return false
+		}
+		if _, duplicate := seen[descriptor.InstanceID]; duplicate {
+			return false
+		}
+		seen[descriptor.InstanceID] = struct{}{}
 	}
 	return true
 }

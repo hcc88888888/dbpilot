@@ -13,6 +13,7 @@ import (
 	"sort"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
@@ -35,6 +36,45 @@ type PostgresRepository struct {
 
 func NewPostgresRepository(database *sql.DB, jobs JobStore) *PostgresRepository {
 	return &PostgresRepository{database: database, jobs: jobs, commit: func(tx *sql.Tx) error { return tx.Commit() }}
+}
+
+// LoadPluginInstanceDescriptors joins the assignment's immutable scope and
+// membership to the current Task6 projection. It intentionally selects no
+// credential, TLS, label, or discovery material.
+func (repository *PostgresRepository) LoadPluginInstanceDescriptors(ctx context.Context, assignment Assignment) ([]*agentv1.PluginInstanceDescriptor, error) {
+	if repository == nil || repository.database == nil || ctx == nil || assignment.Validate() != nil || len(assignment.InstanceIDs) > MaximumAssignmentItems {
+		return nil, ErrInvalid
+	}
+	if len(assignment.InstanceIDs) == 0 {
+		return []*agentv1.PluginInstanceDescriptor{}, nil
+	}
+	rows, err := repository.database.QueryContext(ctx, `SELECT instance_id,database_variant,endpoint,unix_socket FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND database_family=$4 AND management_status<>'retired' AND instance_id = ANY($5) ORDER BY instance_id`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.AgentID, assignment.DatabaseFamily, pq.Array(assignment.InstanceIDs))
+	if err != nil {
+		return nil, mapError(err)
+	}
+	defer rows.Close()
+	values := make([]*agentv1.PluginInstanceDescriptor, 0, len(assignment.InstanceIDs))
+	for rows.Next() {
+		value := new(agentv1.PluginInstanceDescriptor)
+		if err := rows.Scan(&value.InstanceId, &value.DatabaseVariant, &value.Endpoint, &value.UnixSocket); err != nil {
+			return nil, mapError(err)
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil || len(values) != len(assignment.InstanceIDs) {
+		return nil, ErrInvalid
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !contains(assignment.InstanceIDs, value.GetInstanceId()) || value.GetDatabaseVariant() == "" || (value.GetEndpoint() == "") == (value.GetUnixSocket() == "") {
+			return nil, ErrInvalid
+		}
+		if _, duplicate := seen[value.GetInstanceId()]; duplicate {
+			return nil, ErrInvalid
+		}
+		seen[value.GetInstanceId()] = struct{}{}
+	}
+	return values, nil
 }
 
 func (repository *PostgresRepository) Ready(ctx context.Context) error {

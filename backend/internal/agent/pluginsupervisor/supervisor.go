@@ -442,7 +442,7 @@ func (supervisor *PluginSupervisor) startProcess(request ReconcileRequest, insta
 		return nil, ErrProcessStart
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	config := LaunchConfiguration{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, Slot: installed.Slot, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), TemplateIDs: append([]string(nil), request.TemplateIDs...), RuntimeDirectory: runtimeDirectory, UserID: supervisor.userID, GroupID: supervisor.groupID, LaunchNonce: nonce}
+	config := LaunchConfiguration{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, Slot: installed.Slot, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), RuntimeDirectory: runtimeDirectory, UserID: supervisor.userID, GroupID: supervisor.groupID, LaunchNonce: nonce}
 	process, err := supervisor.processes.Start(lifetime, Executable{Path: installed.ExecutablePath, SHA256: slotExecutableDigest(installed)}, config)
 	if err != nil {
 		cancel()
@@ -710,13 +710,14 @@ func cloneRequest(request ReconcileRequest) ReconcileRequest {
 	request.ArtifactSHA256 = append([]byte(nil), request.ArtifactSHA256...)
 	request.ManifestDigest = append([]byte(nil), request.ManifestDigest...)
 	request.InstanceIDs = append([]string(nil), request.InstanceIDs...)
+	request.InstanceDescriptors = append([]InstanceDescriptor(nil), request.InstanceDescriptors...)
 	request.TemplateIDs = append([]string(nil), request.TemplateIDs...)
 	return request
 }
 
 func healthRequest(request ReconcileRequest, installed InstalledSlot, configurationRevision uint64, runtimeDirectory string, nonce []byte, uid, gid uint32) HealthRequest {
 	digest, _ := hex.DecodeString(installed.ExecutableSHA256)
-	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
+	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
 }
 
 func processStateForError(err error) pluginstate.ProcessState {

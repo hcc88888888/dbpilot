@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"path"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/discovery"
 )
 
 const (
@@ -77,7 +79,7 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		value := command.ReconcilePlugin
-		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) {
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) || !validPluginDescriptors(value.GetInstanceIds(), value.GetInstanceDescriptors()) {
 			return ErrInvalidCommand
 		}
 		targets = value.GetInstanceIds()
@@ -214,6 +216,38 @@ func validIdentifierList(values []string, required bool) bool {
 			return false
 		}
 		seen[value] = struct{}{}
+	}
+	return true
+}
+
+func validPluginDescriptors(instanceIDs []string, descriptors []*agentv1.PluginInstanceDescriptor) bool {
+	if len(descriptors) != len(instanceIDs) || len(descriptors) > maximumListItems {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(instanceIDs))
+	for _, instanceID := range instanceIDs {
+		allowed[instanceID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(descriptors))
+	for _, descriptor := range descriptors {
+		if descriptor == nil || !validIdentifier(descriptor.GetInstanceId()) || !validIdentifier(descriptor.GetDatabaseVariant()) || len(descriptor.GetEndpoint()) > 512 || len(descriptor.GetUnixSocket()) > 512 || (descriptor.GetEndpoint() == "") == (descriptor.GetUnixSocket() == "") {
+			return false
+		}
+		if descriptor.GetEndpoint() != "" {
+			normalized, err := discovery.NormalizeEndpoint(descriptor.GetEndpoint())
+			if err != nil || normalized != descriptor.GetEndpoint() {
+				return false
+			}
+		} else if !strings.HasPrefix(descriptor.GetUnixSocket(), "/") || path.Clean(descriptor.GetUnixSocket()) != descriptor.GetUnixSocket() || strings.Contains(descriptor.GetUnixSocket(), "..") {
+			return false
+		}
+		if _, ok := allowed[descriptor.GetInstanceId()]; !ok {
+			return false
+		}
+		if _, duplicate := seen[descriptor.GetInstanceId()]; duplicate {
+			return false
+		}
+		seen[descriptor.GetInstanceId()] = struct{}{}
 	}
 	return true
 }
