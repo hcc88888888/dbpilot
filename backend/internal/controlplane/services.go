@@ -122,6 +122,7 @@ type Services struct {
 	PluginUploadRemove         func(string) error
 	PluginUploadCleanupFailure func(error)
 	ArtifactContent            http.Handler
+	AgentPluginArtifactContent http.Handler
 	// CapabilityInput supplies deployment/database/Agent facts. The handler
 	// always derives the permission intersection from the authenticated
 	// principal and never trusts this callback for user authorization.

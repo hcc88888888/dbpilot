@@ -77,6 +77,9 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 	if services.ArtifactContent != nil {
 		mux.Handle("GET /api/v1/artifact-downloads/{artifactID}", services.ArtifactContent)
 	}
+	if services.AgentPluginArtifactContent != nil {
+		mux.Handle("GET /api/v1/agent/plugin-artifacts/{leaseID}", services.AgentPluginArtifactContent)
+	}
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 	})

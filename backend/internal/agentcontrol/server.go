@@ -58,12 +58,23 @@ func (NoopObserver) Result(_ context.Context, _ string, result *agentv1.CommandR
 
 type Server struct {
 	agentv1.UnimplementedAgentControlServer
-	registry  *Registry
-	observer  Observer
-	hosts     HostObserver
-	discovery DiscoveryObserver
-	plugins   PluginObserver
-	now       func() time.Time
+	registry        *Registry
+	observer        Observer
+	hosts           HostObserver
+	discovery       DiscoveryObserver
+	plugins         PluginObserver
+	pluginArtifacts PluginArtifactLeaseIssueService
+	now             func() time.Time
+}
+
+type PluginArtifactLeaseIssueService interface {
+	Issue(context.Context, string, *agentv1.PluginArtifactLeaseRequest) (*agentv1.PluginArtifactLeaseResponse, error)
+}
+
+type noopPluginArtifactLeaseIssuer struct{}
+
+func (noopPluginArtifactLeaseIssuer) Issue(context.Context, string, *agentv1.PluginArtifactLeaseRequest) (*agentv1.PluginArtifactLeaseResponse, error) {
+	return nil, ErrPluginArtifactLeaseRejected
 }
 
 type PluginObserver interface {
@@ -99,6 +110,14 @@ func WithPluginObserver(observer PluginObserver) ServerOption {
 	}
 }
 
+func WithPluginArtifactLeaseIssuer(issuer PluginArtifactLeaseIssueService) ServerOption {
+	return func(server *Server) {
+		if issuer != nil {
+			server.pluginArtifacts = issuer
+		}
+	}
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -106,7 +125,7 @@ func NewServer(registry *Registry, observer Observer, options ...ServerOption) *
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, pluginArtifacts: noopPluginArtifactLeaseIssuer{}, now: time.Now}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -331,6 +350,21 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 				return status.Error(codes.InvalidArgument, "Plugin observation is invalid")
 			}
 			return nil
+		}
+	case *agentv1.AgentMessage_PluginArtifactLeaseRequest:
+		request := typed.PluginArtifactLeaseRequest
+		if request == nil || len(request.GetRequestNonce()) != sha256.Size || !s.registry.Supports(agentID, "plugin.reconcile.v1") {
+			return status.Error(codes.InvalidArgument, "plugin artifact lease request is invalid")
+		}
+		response, issueErr := s.pluginArtifacts.Issue(ctx, agentID, request)
+		if issueErr != nil || response == nil {
+			response = &agentv1.PluginArtifactLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...)}
+		}
+		if subtle.ConstantTimeCompare(response.GetRequestNonce(), request.GetRequestNonce()) != 1 {
+			return status.Error(codes.Internal, "plugin artifact lease correlation failed")
+		}
+		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "plugin-artifact-lease", Message: &agentv1.ServerMessage_PluginArtifactLeaseResponse{PluginArtifactLeaseResponse: response}}); err != nil {
+			return status.Error(codes.Unavailable, "plugin artifact lease delivery is unavailable")
 		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
@@ -15,6 +16,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"dbpilot.local/platform/internal/commandvalidation"
 	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"google.golang.org/grpc/codes"
@@ -184,6 +186,9 @@ type ControlClientConfig struct {
 	ReconnectBackoff   time.Duration
 	ResultRetryBackoff time.Duration
 	Now                func() time.Time
+	PluginObservations interface {
+		Observation() *agentv1.PluginObservation
+	}
 }
 
 type ControlClient struct {
@@ -200,6 +205,9 @@ type ControlClient struct {
 	reconnectBackoff   time.Duration
 	resultRetryBackoff time.Duration
 	now                func() time.Time
+	pluginObservations interface {
+		Observation() *agentv1.PluginObservation
+	}
 
 	sessionMu                  sync.RWMutex
 	session                    *controlSession
@@ -214,6 +222,18 @@ type ControlClient struct {
 	discoveryCompatibility     atomic.Uint32
 	discoverySourceResults     atomic.Bool
 	discoverySourceResultsPeer atomic.Bool
+	artifactLeaseMu            sync.Mutex
+	artifactLeaseWaiters       map[string]*artifactLeaseWaiter
+}
+
+type artifactLeaseWaiter struct {
+	request pluginsupervisor.ArtifactLeaseRequest
+	result  chan artifactLeaseResult
+}
+
+type artifactLeaseResult struct {
+	lease pluginsupervisor.ArtifactLease
+	err   error
 }
 
 type discoveryAckWaiter struct {
@@ -269,12 +289,14 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		agentID: config.AgentID, agentVersion: config.AgentVersion, operatingSystem: config.OperatingSystem, architecture: config.Architecture,
 		databaseAdapters: append([]string(nil), config.DatabaseAdapters...), openStream: config.StreamOpener, journal: config.Journal,
 		verifier: config.Verifier, executors: config.Executors,
+		pluginObservations: config.PluginObservations,
 		heartbeatInterval:  boundedDuration(config.HeartbeatInterval, 30*time.Second, 10*time.Millisecond, 5*time.Minute),
 		reconnectBackoff:   boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
 		resultRetryBackoff: boundedDuration(config.ResultRetryBackoff, 100*time.Millisecond, 10*time.Millisecond, 5*time.Second),
 		now:                config.Now, running: make(map[string]runningCommand),
-		executionErrors:  make(chan error, 1),
-		discoveryWaiters: make(map[uint64]*discoveryAckWaiter),
+		executionErrors:      make(chan error, 1),
+		discoveryWaiters:     make(map[uint64]*discoveryAckWaiter),
+		artifactLeaseWaiters: make(map[string]*artifactLeaseWaiter),
 	}, nil
 }
 
@@ -542,6 +564,8 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		return errors.New("duplicate Hello acknowledgement")
 	case *agentv1.ServerMessage_DiscoveryReportAcknowledgement:
 		return c.handleDiscoveryAcknowledgement(typed.DiscoveryReportAcknowledgement)
+	case *agentv1.ServerMessage_PluginArtifactLeaseResponse:
+		return c.handlePluginArtifactLeaseResponse(typed.PluginArtifactLeaseResponse)
 	default:
 		return errors.New("unsupported control-plane message")
 	}
@@ -749,7 +773,7 @@ func (c *ControlClient) persistInterruptedStart(ctx context.Context, commandID s
 }
 
 func (c *ControlClient) execute(ctx context.Context, envelope *agentv1.CommandEnvelope, executionToken []byte, leaseRevision uint64, executor CommandExecutor) {
-	reporter := commandProgressReporter{client: c, commandID: envelope.GetCommandId(), executionToken: append([]byte(nil), executionToken...), leaseRevision: leaseRevision}
+	reporter := commandProgressReporter{client: c, commandID: envelope.GetCommandId(), executionToken: append([]byte(nil), executionToken...), leaseRevision: leaseRevision, startedAt: c.now().UTC()}
 	result, executionErr := executor.Execute(ctx, envelope, reporter)
 	if result == nil {
 		result = &agentv1.CommandResult{CommandId: envelope.GetCommandId()}
@@ -816,7 +840,16 @@ func (c *ControlClient) sendHeartbeat(session *controlSession) error {
 		active = append(active, &agentv1.ActiveCommand{CommandId: commandID, ExecutionToken: running.executionToken, LeaseRevision: running.leaseRevision})
 	}
 	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{AgentId: c.agentID, RunningCommands: uint32(len(active)), ActiveCommandIds: activeIDs, ActiveCommands: active}}}
-	return c.sendThroughSession(session, message)
+	if err := c.sendThroughSession(session, message); err != nil {
+		return err
+	}
+	if c.pluginObservations != nil {
+		observation := c.pluginObservations.Observation()
+		if observation != nil && observation.GetAgentId() == c.agentID && observation.GetHostId() != "" && observation.GetObservationRevision() != 0 && observation.GetObservedAt() != nil && observation.GetObservedAt().IsValid() && len(observation.GetAssignments()) <= 128 {
+			return c.sendThroughSession(session, &agentv1.AgentMessage{Message: &agentv1.AgentMessage_PluginObservation{PluginObservation: observation}})
+		}
+	}
+	return nil
 }
 
 func (c *ControlClient) sendAcknowledgement(commandID string, state agentv1.CommandAcknowledgementState, reason string) error {
@@ -828,6 +861,11 @@ type commandProgressReporter struct {
 	commandID      string
 	executionToken []byte
 	leaseRevision  uint64
+	startedAt      time.Time
+}
+
+func (r commandProgressReporter) ExecutionFence() pluginsupervisor.ExecutionFence {
+	return pluginsupervisor.ExecutionFence{CommandID: r.commandID, ExecutionToken: append([]byte(nil), r.executionToken...), LeaseRevision: r.leaseRevision, StartedAt: r.startedAt}
 }
 
 func (r commandProgressReporter) Report(progress *agentv1.CommandProgress) error {
@@ -900,6 +938,105 @@ func (c *ControlClient) clearSession(expected *controlSession) {
 		c.session = nil
 	}
 	c.sessionMu.Unlock()
+	c.failPluginArtifactLeaseWaiters()
+}
+
+// LeasePluginArtifact requests an operation-bound, ephemeral artifact lease on
+// the already authenticated AgentControl stream. The returned URL and headers
+// live only in the caller and are never written to the command journal.
+func (c *ControlClient) LeasePluginArtifact(ctx context.Context, request pluginsupervisor.ArtifactLeaseRequest) (pluginsupervisor.ArtifactLease, error) {
+	if c == nil || ctx == nil || ctx.Err() != nil || !validArtifactLeaseResource(request.AssignmentID) || !validArtifactLeaseResource(request.ArtifactID) || request.OperationRevision == 0 {
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	var nonce [sha256.Size]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	waiter := &artifactLeaseWaiter{request: request, result: make(chan artifactLeaseResult, 1)}
+	key := string(nonce[:])
+	c.artifactLeaseMu.Lock()
+	if _, duplicate := c.artifactLeaseWaiters[key]; duplicate {
+		c.artifactLeaseMu.Unlock()
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	c.artifactLeaseWaiters[key] = waiter
+	c.artifactLeaseMu.Unlock()
+	defer func() {
+		c.artifactLeaseMu.Lock()
+		if c.artifactLeaseWaiters[key] == waiter {
+			delete(c.artifactLeaseWaiters, key)
+		}
+		c.artifactLeaseMu.Unlock()
+	}()
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_PluginArtifactLeaseRequest{PluginArtifactLeaseRequest: &agentv1.PluginArtifactLeaseRequest{RequestNonce: nonce[:], AssignmentId: request.AssignmentID, ArtifactId: request.ArtifactID, OperationRevision: request.OperationRevision}}}
+	if err := c.sendAgentMessage(message); err != nil {
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	select {
+	case <-ctx.Done():
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	case result := <-waiter.result:
+		return result.lease, result.err
+	}
+}
+
+func (c *ControlClient) handlePluginArtifactLeaseResponse(response *agentv1.PluginArtifactLeaseResponse) error {
+	if response == nil || len(response.GetRequestNonce()) != sha256.Size {
+		return nil
+	}
+	key := string(response.GetRequestNonce())
+	c.artifactLeaseMu.Lock()
+	waiter := c.artifactLeaseWaiters[key]
+	if waiter != nil {
+		delete(c.artifactLeaseWaiters, key)
+	}
+	c.artifactLeaseMu.Unlock()
+	if waiter == nil {
+		return nil
+	}
+	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetArtifactId() == waiter.request.ArtifactID && response.GetOperationRevision() == waiter.request.OperationRevision && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(c.now()) && response.GetDownloadUrl() != "" && len(response.GetDownloadUrl()) <= 2048 && len(response.GetRequestHeaders()) <= 8
+	if !valid {
+		waiter.result <- artifactLeaseResult{err: pluginsupervisor.ErrArtifactLease}
+		return nil
+	}
+	headers := make(map[string]string, len(response.GetRequestHeaders()))
+	for name, value := range response.GetRequestHeaders() {
+		if name == "" || len(name) > 128 || value == "" || len(value) > 4096 || strings.ContainsAny(name+value, "\x00\r\n") {
+			waiter.result <- artifactLeaseResult{err: pluginsupervisor.ErrArtifactLease}
+			return nil
+		}
+		headers[name] = value
+	}
+	waiter.result <- artifactLeaseResult{lease: pluginsupervisor.ArtifactLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), ArtifactID: response.GetArtifactId(), OperationRevision: response.GetOperationRevision(), ExpiresAt: response.GetExpiresAt().AsTime().UTC(), DownloadURL: response.GetDownloadUrl(), RequestHeaders: headers}}
+	return nil
+}
+
+func (c *ControlClient) failPluginArtifactLeaseWaiters() {
+	c.artifactLeaseMu.Lock()
+	waiters := make([]*artifactLeaseWaiter, 0, len(c.artifactLeaseWaiters))
+	for key, waiter := range c.artifactLeaseWaiters {
+		delete(c.artifactLeaseWaiters, key)
+		waiters = append(waiters, waiter)
+	}
+	c.artifactLeaseMu.Unlock()
+	for _, waiter := range waiters {
+		select {
+		case waiter.result <- artifactLeaseResult{err: pluginsupervisor.ErrArtifactLease}:
+		default:
+		}
+	}
+}
+
+func validArtifactLeaseResource(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if index == 0 && !(character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character >= '0' && character <= '9') || index > 0 && !(character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '.' || character == ':' || character == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *ControlClient) sendAgentMessage(message *agentv1.AgentMessage) error {

@@ -145,6 +145,21 @@ func (r *Registry) Session(agentID string) (SessionInfo, bool) {
 	}, true
 }
 
+// ExecutionLeaseActive proves that CommandStart established a live execution
+// fence for the exact authenticated Agent and command. It exposes no token.
+func (r *Registry) ExecutionLeaseActive(agentID, commandID string, at time.Time) bool {
+	if r == nil || agentID == "" || commandID == "" || at.IsZero() {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current := r.sessions[agentID]
+	if current == nil || !current.leases[commandID].After(at.UTC()) || current.leaseRevisions[commandID] == 0 || len(current.executionTokens[commandID]) != sha256.Size {
+		return false
+	}
+	return true
+}
+
 func (r *Registry) snapshot(agentID string, expected *session) (SessionInfo, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

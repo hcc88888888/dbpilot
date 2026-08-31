@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,6 +57,21 @@ func TestConfiguredCommandExecutorsAdvertiseCollectNowWithHostCollector(t *testi
 	withCollector, err := configuredCommandExecutors(&mainHostCollector{}, collector)
 	require.NoError(t, err)
 	require.Equal(t, []string{string(agent.CommandKindCollectNow), agent.CapabilityCollectNowDependenciesV1, agent.CapabilityCollectNowHostV1}, withCollector.Capabilities())
+}
+
+func TestValidatePluginSupervisorConfigRequiresLinuxHTTPSAndTrustedPublishers(t *testing.T) {
+	publicKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	valid := agentPluginConfig{Enabled: true, ArtifactOrigin: "https://dbpilot.internal", Publishers: []agentPluginPublisherConfig{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: publicKey}}, UserID: 19001, GroupID: 19001}
+	require.NoError(t, validatePluginSupervisorConfig(valid, "linux"))
+
+	invalidOS := valid
+	require.Error(t, validatePluginSupervisorConfig(invalidOS, "windows"))
+	invalidOrigin := valid
+	invalidOrigin.ArtifactOrigin = "http://public.example"
+	require.Error(t, validatePluginSupervisorConfig(invalidOrigin, "linux"))
+	invalidPublisher := valid
+	invalidPublisher.Publishers[0].PublicKey = "not-base64"
+	require.Error(t, validatePluginSupervisorConfig(invalidPublisher, "linux"))
 }
 
 func TestProductionHostSnapshotCollectorSharesEngineLimitAndLogIndex(t *testing.T) {

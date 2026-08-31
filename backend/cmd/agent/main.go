@@ -5,17 +5,21 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,9 +27,12 @@ import (
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	agentdiscovery "dbpilot.local/platform/internal/agent/discovery"
+	"dbpilot.local/platform/internal/agent/pluginstate"
+	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"dbpilot.local/platform/internal/database"
 	discoverydomain "dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/exporter"
+	"dbpilot.local/platform/internal/plugincatalog"
 	"dbpilot.local/platform/internal/policy"
 	"dbpilot.local/platform/internal/spool"
 	"dbpilot.local/platform/internal/telemetry"
@@ -59,6 +66,23 @@ type agentConfig struct {
 	ComponentSecrets      componentSecretConfig          `yaml:"component_secrets"`
 	ComponentCollection   componentCollectionConfig      `yaml:"component_collection"`
 	Control               agentControlConfig             `yaml:"control"`
+	Plugin                agentPluginConfig              `yaml:"plugin,omitempty"`
+}
+
+type agentPluginConfig struct {
+	Enabled         bool                         `yaml:"enabled,omitempty"`
+	ArtifactOrigin  string                       `yaml:"artifact_origin,omitempty"`
+	Publishers      []agentPluginPublisherConfig `yaml:"publishers,omitempty"`
+	UserID          uint32                       `yaml:"user_id,omitempty"`
+	GroupID         uint32                       `yaml:"group_id,omitempty"`
+	MaximumBytes    int64                        `yaml:"maximum_artifact_bytes,omitempty"`
+	DownloadTimeout time.Duration                `yaml:"download_timeout,omitempty"`
+}
+
+type agentPluginPublisherConfig struct {
+	PublisherID string `yaml:"publisher_id"`
+	KeyID       string `yaml:"key_id"`
+	PublicKey   string `yaml:"public_key"`
 }
 
 type agentControlConfig struct {
@@ -241,7 +265,33 @@ func loadConfig(path string) (agentConfig, error) {
 	if err != nil {
 		return agentConfig{}, err
 	}
+	if err := validatePluginSupervisorConfig(settings.Plugin, runtime.GOOS); err != nil {
+		return agentConfig{}, err
+	}
 	return settings, nil
+}
+
+func validatePluginSupervisorConfig(config agentPluginConfig, operatingSystem string) error {
+	if !config.Enabled {
+		return nil
+	}
+	origin, err := url.Parse(config.ArtifactOrigin)
+	if operatingSystem != "linux" || err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || strings.TrimRight(origin.Path, "/") != "" || len(config.Publishers) == 0 || len(config.Publishers) > 64 || config.UserID == 0 || config.GroupID == 0 || config.MaximumBytes < 0 || config.MaximumBytes > 256<<20 || config.DownloadTimeout < 0 || config.DownloadTimeout > 5*time.Minute {
+		return errors.New("plugin supervisor requires Linux, canonical HTTPS origin, non-root identity and trusted publishers")
+	}
+	seen := map[string]struct{}{}
+	for _, publisher := range config.Publishers {
+		decoded, decodeErr := base64.StdEncoding.DecodeString(publisher.PublicKey)
+		identity := publisher.PublisherID + "\x00" + publisher.KeyID
+		if decodeErr != nil || base64.StdEncoding.EncodeToString(decoded) != publisher.PublicKey || len(decoded) != ed25519.PublicKeySize || publisher.PublisherID == "" || publisher.KeyID == "" || strings.TrimSpace(publisher.PublisherID) != publisher.PublisherID || strings.TrimSpace(publisher.KeyID) != publisher.KeyID {
+			return errors.New("plugin supervisor publisher key is invalid")
+		}
+		if _, duplicate := seen[identity]; duplicate {
+			return errors.New("plugin supervisor publisher key is duplicated")
+		}
+		seen[identity] = struct{}{}
+	}
+	return nil
 }
 
 func runRuntime(ctx context.Context, settings agentConfig) error {
@@ -367,6 +417,76 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		_ = store.Close()
 		return err
 	}
+	var pluginSupervisor *pluginsupervisor.PluginSupervisor
+	var pluginLeases *deferredPluginLeaseClient
+	if settings.Plugin.Enabled {
+		currentUID, currentGID, nonRoot := pluginsupervisor.CurrentProcessIdentity()
+		if !nonRoot || currentUID != settings.Plugin.UserID || currentGID != settings.Plugin.GroupID {
+			_ = store.Close()
+			return errors.New("plugin supervisor requires the configured non-root plugin identity to equal the Agent process identity")
+		}
+		pluginRoot := filepath.Join(settings.DataDirectory, "plugins")
+		pluginRuntimeRoot := filepath.Join(settings.DataDirectory, "plugin-runtime")
+		pluginStateRoot := filepath.Join(settings.DataDirectory, "plugin-state")
+		for _, root := range []string{pluginRoot, pluginRuntimeRoot, pluginStateRoot} {
+			if mkdirErr := os.MkdirAll(root, 0o700); mkdirErr != nil || os.Chmod(root, 0o700) != nil {
+				_ = store.Close()
+				return errors.New("configure plugin supervisor directories")
+			}
+		}
+		publisherKeys := make([]plugincatalog.PublisherKey, len(settings.Plugin.Publishers))
+		for index, configured := range settings.Plugin.Publishers {
+			decoded, decodeErr := base64.StdEncoding.DecodeString(configured.PublicKey)
+			if decodeErr != nil {
+				_ = store.Close()
+				return errors.New("configure plugin publisher key")
+			}
+			publisherKeys[index] = plugincatalog.PublisherKey{PublisherID: configured.PublisherID, KeyID: configured.KeyID, PublicKey: ed25519.PublicKey(decoded)}
+		}
+		publishers, publisherErr := plugincatalog.NewStaticPublisherKeyStore(publisherKeys)
+		if publisherErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin publisher trust")
+		}
+		installer, installerErr := pluginsupervisor.NewInstaller(pluginsupervisor.InstallerConfig{Root: pluginRoot, Publishers: publishers, OperatingSystem: runtime.GOOS, Architecture: runtime.GOARCH, Limits: plugincatalog.DefaultPackageLimits()})
+		if installerErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin installer")
+		}
+		stateStore, stateErr := pluginstate.NewFileStore(pluginStateRoot)
+		if stateErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin state")
+		}
+		maximumBytes := settings.Plugin.MaximumBytes
+		if maximumBytes == 0 {
+			maximumBytes = 256 << 20
+		}
+		downloadTimeout := settings.Plugin.DownloadTimeout
+		if downloadTimeout == 0 {
+			downloadTimeout = 2 * time.Minute
+		}
+		downloader, downloadErr := pluginsupervisor.NewHTTPSArtifactDownloader(pluginsupervisor.ArtifactDownloadConfig{Client: &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig.Clone(), DisableCompression: true}}, Origin: settings.Plugin.ArtifactOrigin, MaximumBytes: maximumBytes, Timeout: downloadTimeout})
+		if downloadErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin artifact downloader")
+		}
+		pluginLeases = &deferredPluginLeaseClient{}
+		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGRPCHealthChecker(pluginsupervisor.GRPCHealthCheckerConfig{Timeout: 15 * time.Second}), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+		if err != nil {
+			_ = store.Close()
+			return errors.New("configure plugin supervisor")
+		}
+		pluginExecutor, executorErr := agent.NewReconcilePluginExecutor(pluginSupervisor)
+		if executorErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin reconcile executor")
+		}
+		if registerErr := executors.Register(agent.CommandKindReconcilePlugin, pluginExecutor); registerErr != nil {
+			_ = store.Close()
+			return errors.New("register plugin reconcile executor")
+		}
+	}
 	commandVerifier, err := agent.NewCommandVerifier(settings.AgentID, controlPublicKey, executors.Capabilities())
 	if err != nil {
 		_ = store.Close()
@@ -377,11 +497,17 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		AgentID: settings.AgentID, AgentVersion: version, StreamOpener: func(streamContext context.Context) (agent.ControlStream, error) {
 			return controlAPI.Connect(streamContext)
 		}, Journal: journal, Verifier: commandVerifier, Executors: executors,
-		HeartbeatInterval: settings.Control.HeartbeatInterval, ReconnectBackoff: settings.Control.ReconnectBackoff,
+		HeartbeatInterval: settings.Control.HeartbeatInterval, ReconnectBackoff: settings.Control.ReconnectBackoff, PluginObservations: pluginSupervisor,
 	})
 	if err != nil {
 		_ = store.Close()
 		return err
+	}
+	if pluginLeases != nil {
+		pluginLeases.Set(controlClient)
+	}
+	if pluginSupervisor != nil {
+		defer pluginSupervisor.Stop(context.Background())
 	}
 	agentRuntime := agent.NewRuntime(agent.Dependencies{AgentID: settings.AgentID, PolicySource: agent.FilePolicySource{Path: settings.PolicyFile}, PolicyVerifier: verifier, Engine: telemetryEngine, Store: store, Exporter: exporter.NewClient(client, store, settings.AgentID), HealthReporter: agent.GRPCHealthReporter{Client: client}, ComponentCollector: componentCollector})
 	serviceContext, cancelServices := context.WithCancel(ctx)
@@ -418,6 +544,29 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	return nil
 }
+
+type deferredPluginLeaseClient struct {
+	mu     sync.RWMutex
+	client *agent.ControlClient
+}
+
+func (client *deferredPluginLeaseClient) Set(control *agent.ControlClient) {
+	client.mu.Lock()
+	client.client = control
+	client.mu.Unlock()
+}
+
+func (client *deferredPluginLeaseClient) LeasePluginArtifact(ctx context.Context, request pluginsupervisor.ArtifactLeaseRequest) (pluginsupervisor.ArtifactLease, error) {
+	client.mu.RLock()
+	control := client.client
+	client.mu.RUnlock()
+	if control == nil {
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	return control.LeasePluginArtifact(ctx, request)
+}
+
+var _ pluginsupervisor.LeaseClient = (*deferredPluginLeaseClient)(nil)
 
 func runProcHelper(arguments []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("proc-helper", flag.ContinueOnError)

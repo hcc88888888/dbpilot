@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -105,8 +106,9 @@ type CommandSettings struct {
 }
 
 type ArtifactSettings struct {
-	StorageRoot   string `yaml:"storage_root"`
-	SigningKeyRef string `yaml:"signing_key_ref"`
+	StorageRoot       string `yaml:"storage_root"`
+	SigningKeyRef     string `yaml:"signing_key_ref"`
+	PluginLeaseKeyRef string `yaml:"plugin_lease_key_ref,omitempty"`
 }
 
 type PluginPublisherSettings struct {
@@ -364,6 +366,29 @@ func NewServer(config Config) (*Server, error) {
 		grpcTLS.MinVersion = tls.VersionTLS12
 	}
 	grpcTLS.ClientAuth = tls.RequireAndVerifyClientCert
+	if config.PluginCatalog.Enabled {
+		if config.GRPC.TLS.ClientCAFile != "" {
+			combinedPool := x509.NewCertPool()
+			for _, caPath := range []string{config.HTTP.TLS.ClientCAFile, config.GRPC.TLS.ClientCAFile} {
+				if caPath == "" {
+					continue
+				}
+				caPEM, readErr := os.ReadFile(caPath)
+				if readErr != nil || !combinedPool.AppendCertsFromPEM(caPEM) {
+					return nil, errors.New("plugin artifact HTTPS client CA is invalid")
+				}
+			}
+			httpTLS.ClientCAs = combinedPool
+		} else if httpTLS.ClientCAs == nil {
+			httpTLS.ClientCAs = grpcTLS.ClientCAs
+		}
+		if httpTLS.ClientCAs == nil {
+			return nil, errors.New("plugin artifact HTTPS requires Agent client CA trust")
+		}
+		if httpTLS.ClientAuth == tls.NoClientCert {
+			httpTLS.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+	}
 	var enrollmentTLS *tls.Config
 	if config.Enrollment.Listener.Address != "" {
 		enrollmentTLS = config.EnrollmentServerTLS
@@ -589,6 +614,30 @@ func NewServer(config Config) (*Server, error) {
 		pluginReconciler = reconciliation.NewPluginReconciler(assignmentRepository)
 		acceptanceProvisioner = assignmentRepository
 	}
+	var pluginArtifactLeaseIssuer *agentcontrol.PluginArtifactLeaseIssuer
+	var pluginArtifactContent http.Handler
+	if config.PluginCatalog.Enabled {
+		leaseKeyRef := strings.TrimSpace(config.Artifact.PluginLeaseKeyRef)
+		if leaseKeyRef == "" {
+			leaseKeyRef = config.Artifact.SigningKeyRef
+		}
+		leaseKey, leaseKeyErr := artifactSecrets.ResolveSecret(context.Background(), leaseKeyRef)
+		if leaseKeyErr != nil || len(leaseKey) < sha256.Size {
+			return nil, errors.New("configure plugin artifact lease key")
+		}
+		authorizer := livePluginArtifactAuthorizer{AgentScopes: hostRepository, Assignments: assignmentService, Versions: pluginCatalogService, Artifacts: artifactService, ExecutionFences: agentRegistry, Now: time.Now}
+		pluginArtifactLeaseIssuer, err = agentcontrol.NewPluginArtifactLeaseIssuer(agentcontrol.PluginArtifactLeaseIssuerConfig{Origin: strings.TrimRight(config.EventURLBase, "/"), HMACKey: leaseKey, TTL: time.Minute, MaximumLeases: 4096, Authorizer: authorizer})
+		for index := range leaseKey {
+			leaseKey[index] = 0
+		}
+		if err != nil {
+			return nil, fmt.Errorf("configure plugin artifact leases: %w", err)
+		}
+		pluginArtifactContent, err = agentcontrol.NewPluginArtifactLeaseHTTPHandler(pluginArtifactLeaseIssuer, artifactBlobs)
+		if err != nil {
+			return nil, fmt.Errorf("configure plugin artifact content: %w", err)
+		}
+	}
 	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepositoryWithProvisioner(database, acceptanceProvisioner))
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
@@ -693,7 +742,7 @@ func NewServer(config Config) (*Server, error) {
 	services := controlplane.Services{
 		Repository: repository, Evaluator: evaluator,
 		Monitoring: monitoring.NewPostgresStoreWithLimits(database, monitoring.DefaultCapabilities(), monitoringLimits), MonitoringResponseBytes: monitoringLimits.MaximumResponseBytes,
-		Jobs: jobRepository, Artifacts: artifactService, Audit: auditService, ArtifactContent: artifactContent,
+		Jobs: jobRepository, Artifacts: artifactService, Audit: auditService, ArtifactContent: artifactContent, AgentPluginArtifactContent: pluginArtifactContent,
 		Capabilities: capability.NewService(capability.FoundationCatalog()),
 		CapabilityInput: func(_ context.Context, scope platformscope.Scope) capability.Input {
 			input := foundationCapabilityInput(scope, config.Agents, agentRegistry)
@@ -757,7 +806,7 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations)))
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer)))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
@@ -1058,6 +1107,65 @@ func configuredCertificatePrincipals(settings map[string]PrincipalSettings) (map
 	}
 	return principals, nil
 }
+
+type pluginArtifactAssignmentReader interface {
+	Get(context.Context, platformscope.Scope, string) (pluginassignment.Assignment, error)
+}
+
+type pluginArtifactVersionReader interface {
+	ListVersions(context.Context, platformscope.Scope, plugincatalog.VersionFilter) (plugincatalog.VersionPage, error)
+}
+
+type pluginArtifactMetadataReader interface {
+	Get(context.Context, platformscope.Scope, string) (artifact.Artifact, error)
+}
+
+type pluginArtifactExecutionFence interface {
+	ExecutionLeaseActive(string, string, time.Time) bool
+}
+
+type livePluginArtifactAuthorizer struct {
+	AgentScopes     pluginassignment.AgentScopeResolver
+	Assignments     pluginArtifactAssignmentReader
+	Versions        pluginArtifactVersionReader
+	Artifacts       pluginArtifactMetadataReader
+	ExecutionFences pluginArtifactExecutionFence
+	Now             func() time.Time
+}
+
+func (authorizer livePluginArtifactAuthorizer) AuthorizePluginArtifact(ctx context.Context, agentID, assignmentID, artifactID string, operationRevision uint64) (agentcontrol.PluginArtifactGrant, error) {
+	if ctx == nil || ctx.Err() != nil || authorizer.AgentScopes == nil || authorizer.Assignments == nil || authorizer.Versions == nil || authorizer.Artifacts == nil || authorizer.ExecutionFences == nil || authorizer.Now == nil || agentID == "" || assignmentID == "" || artifactID == "" || operationRevision == 0 {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	scope, err := authorizer.AgentScopes.ScopeForAgent(ctx, agentID)
+	if err != nil || scope.Validate() != nil {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	assignment, err := authorizer.Assignments.Get(ctx, scope, assignmentID)
+	if err != nil || assignment.Validate() != nil || assignment.AgentID != agentID || assignment.ID != assignmentID || assignment.ArtifactID != artifactID || assignment.OperationRevision != operationRevision || assignment.DesiredState == pluginassignment.DesiredAbsent || assignment.ConfigurationRevision == 0 {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	identity := fmt.Sprintf("%s:%d:%d", assignment.ID, assignment.ConfigurationRevision, assignment.OperationRevision)
+	commandID := pluginassignment.DeterministicID("command-plugin-", assignment.Scope.Key(), identity)
+	if !authorizer.ExecutionFences.ExecutionLeaseActive(agentID, commandID, authorizer.Now().UTC()) {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	page, err := authorizer.Versions.ListVersions(ctx, scope, plugincatalog.VersionFilter{VersionID: assignment.DesiredVersionID, Limit: 2})
+	if err != nil || len(page.Items) != 1 {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	pluginVersion := page.Items[0]
+	if pluginVersion.Validate() != nil || pluginVersion.Status != plugincatalog.StatusAvailable || pluginVersion.ID != assignment.DesiredVersionID || pluginVersion.PluginID != assignment.PluginID || pluginVersion.Version != assignment.DesiredVersion || pluginVersion.ArtifactID != assignment.ArtifactID || pluginVersion.PackageSHA256 != assignment.ArtifactSHA256 || pluginVersion.ManifestDigest != assignment.ManifestDigest {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	value, err := authorizer.Artifacts.Get(ctx, scope, artifactID)
+	if err != nil || value.ID != artifactID || value.Scope != scope || value.Kind != "plugin_package" || value.ContentType != "application/gzip" || value.SizeBytes <= 0 || value.SizeBytes > 256<<20 || value.Checksum != "sha256:"+assignment.ArtifactSHA256 || value.SourceResource.ResourceType != "plugin_version" || value.SourceResource.ResourceID != assignment.DesiredVersionID || value.StorageReference == "" {
+		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
+	}
+	return agentcontrol.PluginArtifactGrant{AgentID: agentID, AssignmentID: assignmentID, ArtifactID: artifactID, OperationRevision: operationRevision, Artifact: value}, nil
+}
+
+var _ agentcontrol.PluginArtifactAuthorizer = livePluginArtifactAuthorizer{}
 
 func loopbackAddress(address string) bool {
 	host, _, err := net.SplitHostPort(address)
