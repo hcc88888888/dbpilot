@@ -81,7 +81,15 @@ func NewHTTPHandler(services Services, resolver PrincipalResolver) http.Handler 
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /readyz", func(writer http.ResponseWriter, request *http.Request) {
-		if services.Repository == nil || services.Evaluator == nil || (services.Ready != nil && services.Ready(request.Context()) != nil) || !evaluatorHealthy(services.Evaluator.Health()) {
+		var readyErr error
+		if services.Ready != nil {
+			readyErr = services.Ready(request.Context())
+		}
+		if services.Repository == nil || services.Evaluator == nil || readyErr != nil || !evaluatorHealthy(services.Evaluator.Health()) {
+			if detail, ok := readyErr.(interface{ ReadinessDetail() map[string]int }); ok {
+				writeJSON(writer, http.StatusServiceUnavailable, map[string]any{"error": map[string]string{"code": "not_ready", "message": "control plane is not ready"}, "repair": detail.ReadinessDetail()})
+				return
+			}
 			writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "control plane is not ready")
 			return
 		}

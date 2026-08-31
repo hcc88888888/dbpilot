@@ -721,8 +721,11 @@ func NewServer(config Config) (*Server, error) {
 				if !ok || readyService.Ready(ctx) != nil {
 					return errors.New("plugin catalog is not ready")
 				}
-				if assignmentRepository == nil || assignmentRepository.Ready(ctx) != nil {
+				if assignmentRepository == nil {
 					return errors.New("plugin assignments are not ready")
+				}
+				if err := assignmentRepository.Ready(ctx); err != nil {
+					return err
 				}
 			}
 			return nil

@@ -48,17 +48,32 @@ func (repository *PostgresRepository) Ready(ctx context.Context) error {
 	if !ready {
 		return errors.New("plugin assignment schema is unavailable")
 	}
-	var backlog int
-	if err := repository.database.QueryRowContext(ctx, `SELECT count(*) FROM plugin_assignment_repair_backlog`).Scan(&backlog); err != nil {
+	status, err := repository.RepairStatus(ctx)
+	if err != nil {
 		return err
 	}
-	if backlog > 0 {
-		return fmt.Errorf("plugin assignment repair backlog: %d", backlog)
+	if status.Unassigned > 0 {
+		return RepairDegradedError{Status: status}
 	}
 	return nil
 }
 
 type RepairResult struct{ Repaired, Blocked int }
+type RepairStatus struct{ Unassigned, NoCompatibleVersion, CapacityExceeded int }
+type RepairDegradedError struct{ Status RepairStatus }
+
+func (value RepairDegradedError) Error() string { return "plugin assignment repair is pending" }
+func (value RepairDegradedError) ReadinessDetail() map[string]int {
+	return map[string]int{"unassigned": value.Status.Unassigned, "no_compatible_version": value.Status.NoCompatibleVersion, "capacity_exceeded": value.Status.CapacityExceeded}
+}
+func (repository *PostgresRepository) RepairStatus(ctx context.Context) (RepairStatus, error) {
+	if repository == nil || repository.database == nil || ctx == nil {
+		return RepairStatus{}, ErrInvalid
+	}
+	var value RepairStatus
+	err := repository.database.QueryRowContext(ctx, `SELECT count(*) FILTER (WHERE TRUE),count(*) FILTER (WHERE backlog.reason_code='no_compatible_version'),count(*) FILTER (WHERE backlog.reason_code='capacity_exceeded') FROM managed_database_instances instance LEFT JOIN plugin_assignment_repair_backlog backlog ON backlog.tenant_id=instance.tenant_id AND backlog.project_id=instance.project_id AND backlog.instance_id=instance.instance_id WHERE instance.management_status<>'retired' AND instance.plugin_assignment_revision=0`).Scan(&value.Unassigned, &value.NoCompatibleVersion, &value.CapacityExceeded)
+	return value, mapError(err)
+}
 
 func (repository *PostgresRepository) RepairUnassigned(ctx context.Context, limit int) (RepairResult, error) {
 	if repository == nil || repository.database == nil || ctx == nil || limit < 1 || limit > 128 {
@@ -69,6 +84,10 @@ func (repository *PostgresRepository) RepairUnassigned(ctx context.Context, limi
 		return RepairResult{}, err
 	}
 	rollback := func() { _ = tx.Rollback() }
+	if _, err := tx.ExecContext(ctx, `WITH stale AS (SELECT backlog.tenant_id,backlog.project_id,backlog.instance_id FROM plugin_assignment_repair_backlog backlog JOIN managed_database_instances instance ON instance.instance_id=backlog.instance_id WHERE instance.management_status='retired' OR instance.plugin_assignment_revision>0 ORDER BY backlog.updated_at,backlog.instance_id FOR UPDATE OF backlog SKIP LOCKED LIMIT $1) DELETE FROM plugin_assignment_repair_backlog backlog USING stale WHERE backlog.tenant_id=stale.tenant_id AND backlog.project_id=stale.project_id AND backlog.instance_id=stale.instance_id`, limit); err != nil {
+		rollback()
+		return RepairResult{}, mapError(err)
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT instance.instance_id,instance.tenant_id,instance.project_id,instance.host_id,instance.agent_id,instance.database_family,instance.database_variant FROM managed_database_instances instance LEFT JOIN plugin_assignment_repair_backlog backlog ON backlog.tenant_id=instance.tenant_id AND backlog.project_id=instance.project_id AND backlog.instance_id=instance.instance_id WHERE instance.management_status<>'retired' AND instance.plugin_assignment_revision=0 ORDER BY (backlog.instance_id IS NOT NULL),COALESCE(backlog.updated_at,instance.updated_at),instance.instance_id FOR UPDATE OF instance SKIP LOCKED LIMIT $1`, limit)
 	if err != nil {
 		rollback()
@@ -578,6 +597,12 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 			rollback()
 			return ErrConflict
 		}
+		var desiredVersionStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM plugin_versions WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3 FOR SHARE`, value.Scope.TenantID, value.Scope.ProjectID, value.DesiredVersionID).Scan(&desiredVersionStatus); err != nil {
+			rollback()
+			return mapError(err)
+		}
+		revokedRunning := desiredVersionStatus == "revoked" && (value.DesiredState == DesiredRunning || value.DesiredState == DesiredInstalled)
 		observed.Digest = observationDigest(observed)
 		observed.ReceivedAt = receivedAt
 		var previousRevision uint64
@@ -600,6 +625,12 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 				rollback()
 				return mapError(updateErr)
 			}
+			if revokedRunning {
+				if _, updateErr := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='blocked',blocked_reason='version_revoked',revision=CASE WHEN reconcile_state='blocked' AND blocked_reason='version_revoked' THEN revision ELSE revision+1 END,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.Scope.TenantID, value.Scope.ProjectID, value.ID); updateErr != nil {
+					rollback()
+					return mapError(updateErr)
+				}
+			}
 			continue
 		}
 		observationValues := append([]any{report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID}, observationArgs(observed)...)
@@ -609,13 +640,15 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 			return mapError(err)
 		}
 		value.Observed = &observed
-		state := ReconcilePending
-		if value.HasObservedRevisionConflict() {
+		state, reason := ReconcilePending, ""
+		if revokedRunning {
+			state, reason = ReconcileBlocked, "version_revoked"
+		} else if value.HasObservedRevisionConflict() {
 			state = ReconcileConflict
 		} else if !value.NeedsReconcile() {
 			state = ReconcileConverged
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state=$1,blocked_reason='',revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4`, state, report.Scope.TenantID, report.Scope.ProjectID, value.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state=$1,blocked_reason=$2,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$3 AND project_id=$4 AND assignment_id=$5`, state, reason, report.Scope.TenantID, report.Scope.ProjectID, value.ID); err != nil {
 			rollback()
 			return mapError(err)
 		}

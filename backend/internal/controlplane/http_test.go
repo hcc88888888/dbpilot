@@ -291,6 +291,23 @@ func TestHealthAndReadySeparateLivenessFromDependencyReadiness(t *testing.T) {
 	require.Contains(t, ready.Body.String(), `"code":"not_ready"`)
 }
 
+func TestReadyExposesBoundedPluginRepairCountsWithoutSecrets(t *testing.T) {
+	fixture := newHTTPFixture()
+	handler := NewHTTPHandler(Services{Repository: fixture.repository, Evaluator: healthyEvaluator{}, Ready: func(context.Context) error { return repairReadinessTestError{} }}, memberFor("t1", "p1"))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	require.Equal(t, http.StatusServiceUnavailable, response.Code)
+	require.JSONEq(t, `{"error":{"code":"not_ready","message":"control plane is not ready"},"repair":{"unassigned":7,"no_compatible_version":2,"capacity_exceeded":1}}`, response.Body.String())
+	require.NotContains(t, response.Body.String(), "secret://")
+}
+
+type repairReadinessTestError struct{}
+
+func (repairReadinessTestError) Error() string { return "repair pending" }
+func (repairReadinessTestError) ReadinessDetail() map[string]int {
+	return map[string]int{"unassigned": 7, "no_compatible_version": 2, "capacity_exceeded": 1}
+}
+
 func TestHTTPHandlerNeverSerializesRepositoryRecordsFromAnotherScope(t *testing.T) {
 	fixture := newHTTPFixture()
 	event := fixture.repository.events["event-1"]

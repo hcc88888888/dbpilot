@@ -146,6 +146,17 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.NoError(t, err)
 	require.Equal(t, pluginassignment.ReconcileBlocked, blocked.ReconcileState)
 	require.Equal(t, "version_revoked", blocked.BlockedReason)
+	revokedObserved := observed
+	revokedObserved.ObservationRevision = 6
+	revokedObserved.ObservedAt = time.Now().UTC()
+	require.NoError(t, service.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 6, Assignments: []pluginassignment.ObservedState{revokedObserved}, ObservedAt: revokedObserved.ObservedAt}))
+	blocked, err = service.Get(ctx, scope, assignment.ID)
+	require.NoError(t, err)
+	require.Equal(t, pluginassignment.ReconcileBlocked, blocked.ReconcileState)
+	require.Equal(t, "version_revoked", blocked.BlockedReason)
+	var jobsAfterRevokedReport int
+	require.NoError(t, database.QueryRow(`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND job_type='plugin.reconcile'`, scope.TenantID, scope.ProjectID).Scan(&jobsAfterRevokedReport))
+	require.Equal(t, 1, jobsAfterRevokedReport, "fresh matching revoked observation cannot clear block or create duplicate Job")
 	stopped := pluginassignment.DesiredStopped
 	stopping, err := service.SetDesiredState(ctx, scope, blocked.ID, blocked.Revision, pluginassignment.DesiredUpdate{DesiredState: &stopped, Audit: pluginassignment.MutationAudit{Actor: "operator", OperationID: "updatePluginAssignment", IdempotencyKey: "stop-revoked", RequestFingerprint: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", RequestID: "request-stop-revoked"}})
 	require.NoError(t, err)
@@ -308,6 +319,10 @@ func TestPluginAssignmentRepairBackfillsPreTask8InstanceIdempotently(t *testing.
 	require.Zero(t, replayed.PluginAssignmentRevision)
 	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
 	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	statusBefore, err := assignments.RepairStatus(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 1, statusBefore.Unassigned)
+	require.Error(t, assignments.Ready(ctx), "readiness is degraded before the first repair pass")
 	result, err := assignments.RepairUnassigned(ctx, 25)
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Repaired)
@@ -317,6 +332,50 @@ func TestPluginAssignmentRepairBackfillsPreTask8InstanceIdempotently(t *testing.
 	result, err = assignments.RepairUnassigned(ctx, 25)
 	require.NoError(t, err)
 	require.Zero(t, result.Repaired)
+	_, err = database.Exec(`INSERT INTO plugin_assignment_repair_backlog (tenant_id,project_id,instance_id,reason_code,attempts,updated_at) VALUES ($1,$2,$3,'no_compatible_version',1,CURRENT_TIMESTAMP)`, scope.TenantID, scope.ProjectID, instance.ID)
+	require.NoError(t, err)
+	_, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	var staleBacklog int
+	require.NoError(t, database.QueryRow(`SELECT count(*) FROM plugin_assignment_repair_backlog WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, instance.ID).Scan(&staleBacklog))
+	require.Zero(t, staleBacklog, "already-assigned stale backlog is swept")
+}
+
+func TestPluginAssignmentRepairBacklogRetireSweepRecoversReadiness(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "retire-backlog", "127.0.0.1:7690", 63)
+	_, err := database.Exec(`UPDATE discovery_candidates SET database_family='neo4j',database_variant='neo4j' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3`, scope.TenantID, scope.ProjectID, candidate)
+	require.NoError(t, err)
+	request.DatabaseFamily, request.DatabaseVariant = "neo4j", "neo4j"
+	legacy := databaseinstance.NewPostgresRepository(database)
+	instance, err := legacy.AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	result, err := assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Blocked)
+	current, err := legacy.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	start := make(chan struct{})
+	retireResult := make(chan error, 1)
+	repairResult := make(chan error, 1)
+	go func() {
+		<-start
+		_, retireErr := legacy.Retire(ctx, scope, current.ID, current.Revision, databaseinstance.MutationAudit{Actor: "operator", OperationID: "retireDatabaseInstance", IdempotencyKey: "retire-backlog", RequestFingerprint: "sha256:6363636363636363636363636363636363636363636363636363636363636363", RequestID: "request-retire-backlog"})
+		retireResult <- retireErr
+	}()
+	go func() { <-start; _, repairErr := assignments.RepairUnassigned(ctx, 25); repairResult <- repairErr }()
+	close(start)
+	require.NoError(t, <-retireResult)
+	_ = <-repairResult
+	_, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.NoError(t, assignments.Ready(ctx))
+	var backlog int
+	require.NoError(t, database.QueryRow(`SELECT count(*) FROM plugin_assignment_repair_backlog WHERE instance_id=$1`, instance.ID).Scan(&backlog))
+	require.Zero(t, backlog)
 }
 
 func TestPluginAssignmentRepairBacklogRetriesAfterCatalogChange(t *testing.T) {

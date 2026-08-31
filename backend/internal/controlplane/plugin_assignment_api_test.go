@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -111,17 +112,209 @@ func TestPluginAssignmentReconcileLostResponseRecoversExactAuthoritativeJob(t *t
 	require.GreaterOrEqual(t, reconciler.callCount(), 2)
 }
 
+func TestPluginAssignmentReconcileCompletesDurableConflictProblemForExactRetry(t *testing.T) {
+	now := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		state  pluginassignment.ReconcileState
+		reason string
+		err    error
+		code   string
+	}{
+		{name: "agent offline", state: pluginassignment.ReconcileWaiting, reason: "agent_offline", err: pluginassignment.ErrConflict, code: "conflict"},
+		{name: "observation stale", state: pluginassignment.ReconcileWaiting, reason: "observation_stale", err: pluginassignment.ErrConflict, code: "conflict"},
+		{name: "rollout pending", state: pluginassignment.ReconcileWaiting, reason: "rollout_pending", err: pluginassignment.ErrConflict, code: "conflict"},
+		{name: "version revoked", state: pluginassignment.ReconcileBlocked, reason: "version_revoked", err: pluginassignment.ErrVersionRevoked, code: "plugin_version_revoked"},
+		{name: "future revision conflict", state: pluginassignment.ReconcileConflict, err: pluginassignment.ErrConflict, code: "conflict"},
+		{name: "already converged", state: pluginassignment.ReconcileConverged, err: pluginassignment.ErrConflict, code: "conflict"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expectedReason := test.reason
+			if expectedReason == "" {
+				if test.state == pluginassignment.ReconcileConflict {
+					expectedReason = "state_conflict"
+				} else {
+					expectedReason = "already_converged"
+				}
+			}
+			assignment := validControlPlaneAssignment(now)
+			service := &recordingPluginAssignmentService{value: assignment}
+			reconciler := &recordingPluginAssignmentReconciler{err: test.err, after: func() {
+				service.setReconcileState(test.state, test.reason, 6)
+			}}
+			store := newHTTPIdempotencyStore()
+			services := Services{PluginAssignments: service, PluginReconciler: reconciler, Idempotency: idempotency.NewService(store), Now: func() time.Time { return now }}
+			request := func(requestID string) *http.Request {
+				value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-assignments/assignment-a/actions/reconcile", nil)
+				value.Header.Set("Idempotency-Key", "reconcile-fixed-"+expectedReason)
+				value.Header.Set("X-Request-ID", requestID)
+				return value
+			}
+
+			firstRequest := request("request-original-" + expectedReason)
+			first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), firstRequest)
+			firstProblem := requireProblem(t, first, http.StatusConflict, test.code, "request-original-"+expectedReason)
+			require.NotNil(t, firstProblem.Detail)
+			require.Equal(t, expectedReason, *firstProblem.Detail)
+			require.Equal(t, `"6"`, first.Header().Get("ETag"))
+			requireOpenAPIResponse(t, firstRequest, first)
+
+			retryRequest := request("request-retry-" + expectedReason)
+			retry := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), retryRequest)
+			require.Equal(t, first.Code, retry.Code)
+			require.Equal(t, first.Header().Get("Content-Type"), retry.Header().Get("Content-Type"))
+			require.Equal(t, first.Header().Get("ETag"), retry.Header().Get("ETag"))
+			require.Equal(t, first.Body.Bytes(), retry.Body.Bytes())
+			requireOpenAPIResponse(t, retryRequest, retry)
+			require.Equal(t, 1, service.forceCallCount())
+			require.Equal(t, 1, reconciler.callCount(), "a waiting or blocked assignment must not be claimed again")
+			require.Equal(t, 0, store.abortCalls)
+		})
+	}
+}
+
+func TestPluginAssignmentReconcileLostProblemResponseReplaysWithoutClaimingWaitingAssignment(t *testing.T) {
+	now := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
+	service := &recordingPluginAssignmentService{value: validControlPlaneAssignment(now)}
+	reconciler := &recordingPluginAssignmentReconciler{err: pluginassignment.ErrConflict, after: func() {
+		service.setReconcileState(pluginassignment.ReconcileWaiting, "agent_offline", 7)
+	}}
+	store := newHTTPIdempotencyStore()
+	store.commitUnknownErr = errors.New("lost response after durable Problem marker")
+	services := Services{PluginAssignments: service, PluginReconciler: reconciler, Idempotency: idempotency.NewService(store), Now: func() time.Time { return now }}
+	request := func(requestID string) *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-assignments/assignment-a/actions/reconcile", nil)
+		value.Header.Set("Idempotency-Key", "reconcile-lost-problem")
+		value.Header.Set("X-Request-ID", requestID)
+		return value
+	}
+
+	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request("request-lost-problem"))
+	require.Equal(t, http.StatusInternalServerError, first.Code, first.Body.String())
+	store.commitUnknownErr = nil
+
+	const consumers = 2
+	responses := make(chan *httptest.ResponseRecorder, consumers)
+	var wait sync.WaitGroup
+	for index := 0; index < consumers; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			responses <- servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request(fmt.Sprintf("request-lost-problem-retry-%d", index)))
+		}(index)
+	}
+	wait.Wait()
+	close(responses)
+	var body []byte
+	for response := range responses {
+		problem := requireProblem(t, response, http.StatusConflict, "conflict", "request-lost-problem")
+		require.NotNil(t, problem.Detail)
+		require.Equal(t, "agent_offline", *problem.Detail)
+		require.Equal(t, `"7"`, response.Header().Get("ETag"))
+		if body == nil {
+			body = append([]byte(nil), response.Body.Bytes()...)
+		} else {
+			require.Equal(t, body, response.Body.Bytes())
+		}
+	}
+	require.Equal(t, 1, service.forceCallCount())
+	require.Equal(t, 1, reconciler.callCount(), "lost-response recovery must not call ClaimOne on waiting state")
+}
+
+func TestPluginAssignmentReconcileConcurrentProcessingRetryDoesNotClaimWaitingAssignment(t *testing.T) {
+	now := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
+	service := &recordingPluginAssignmentService{value: validControlPlaneAssignment(now)}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	reconciler := &recordingPluginAssignmentReconciler{
+		err:          pluginassignment.ErrConflict,
+		firstStarted: started,
+		releaseFirst: release,
+		after: func() {
+			service.setReconcileState(pluginassignment.ReconcileWaiting, "observation_stale", 8)
+		},
+	}
+	services := Services{PluginAssignments: service, PluginReconciler: reconciler, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Now: func() time.Time { return now }}
+	request := func(requestID string) *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-assignments/assignment-a/actions/reconcile", nil)
+		value.Header.Set("Idempotency-Key", "reconcile-concurrent-waiting")
+		value.Header.Set("X-Request-ID", requestID)
+		return value
+	}
+
+	firstResponses := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstResponses <- servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request("request-concurrent-original"))
+	}()
+	<-started
+	second := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request("request-concurrent-retry"))
+	close(release)
+	first := <-firstResponses
+
+	for _, response := range []*httptest.ResponseRecorder{first, second} {
+		problem := requireProblem(t, response, http.StatusConflict, "conflict", "request-concurrent-original")
+		require.NotNil(t, problem.Detail)
+		require.Equal(t, "observation_stale", *problem.Detail)
+		require.Equal(t, `"8"`, response.Header().Get("ETag"))
+		require.Equal(t, "request-concurrent-original", response.Header().Get("X-Request-ID"))
+	}
+	require.Equal(t, first.Body.Bytes(), second.Body.Bytes())
+	require.Equal(t, 1, reconciler.callCount(), "processing recovery must load the waiting Assignment before invoking ClaimOne")
+}
+
+func TestPluginAssignmentReconcileAbortsPreMutationNotFoundClaim(t *testing.T) {
+	now := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
+	service := &recordingPluginAssignmentService{forceErr: pluginassignment.ErrNotFound}
+	reconciler := &recordingPluginAssignmentReconciler{}
+	store := newHTTPIdempotencyStore()
+	services := Services{PluginAssignments: service, PluginReconciler: reconciler, Idempotency: idempotency.NewService(store), Now: func() time.Time { return now }}
+	request := func() *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-assignments/missing-assignment/actions/reconcile", nil)
+		value.Header.Set("Idempotency-Key", "reconcile-missing")
+		value.Header.Set("X-Request-ID", "request-reconcile-missing")
+		return value
+	}
+
+	firstRequest := request()
+	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), firstRequest)
+	requireProblem(t, first, http.StatusNotFound, "not_found", "request-reconcile-missing")
+	requireOpenAPIResponse(t, firstRequest, first)
+	retryRequest := request()
+	retry := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), retryRequest)
+	requireProblem(t, retry, http.StatusNotFound, "not_found", "request-reconcile-missing")
+	require.Equal(t, first.Body.Bytes(), retry.Body.Bytes())
+	requireOpenAPIResponse(t, retryRequest, retry)
+	require.Equal(t, 2, service.forceCallCount(), "aborting the failed claim must permit a fresh exact-key attempt")
+	require.Equal(t, 0, reconciler.callCount())
+	require.Equal(t, 2, store.abortCalls)
+}
+
 type recordingPluginAssignmentReconciler struct {
-	value job.Job
-	calls int
-	mu    sync.Mutex
+	value        job.Job
+	err          error
+	after        func()
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	calls        int
+	mu           sync.Mutex
 }
 
 func (value *recordingPluginAssignmentReconciler) ReconcileAssignment(context.Context, pluginassignment.Assignment, time.Time) (job.Job, error) {
 	value.mu.Lock()
-	defer value.mu.Unlock()
 	value.calls++
-	return value.value, nil
+	call := value.calls
+	result, err, after := value.value, value.err, value.after
+	firstStarted, releaseFirst := value.firstStarted, value.releaseFirst
+	value.mu.Unlock()
+	if after != nil {
+		after()
+	}
+	if call == 1 && firstStarted != nil {
+		close(firstStarted)
+		<-releaseFirst
+	}
+	return result, err
 }
 func (value *recordingPluginAssignmentReconciler) callCount() int {
 	value.mu.Lock()
@@ -162,8 +355,10 @@ func TestPluginAssignmentGetUsesGeneratedPermissionScopeAndETag(t *testing.T) {
 
 type recordingPluginAssignmentService struct {
 	value      pluginassignment.Assignment
+	forceErr   error
 	scope      platformscope.Scope
 	forceCalls int
+	mu         sync.Mutex
 }
 
 func (service *recordingPluginAssignmentService) EnsureForInstance(context.Context, databaseinstance.Instance) (pluginassignment.Assignment, error) {
@@ -174,6 +369,8 @@ func (service *recordingPluginAssignmentService) List(_ context.Context, scope p
 	return pluginassignment.Page{Items: []pluginassignment.Assignment{service.value}}, nil
 }
 func (service *recordingPluginAssignmentService) Get(_ context.Context, scope platformscope.Scope, _ string) (pluginassignment.Assignment, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	service.scope = scope
 	return service.value, nil
 }
@@ -184,6 +381,20 @@ func (service *recordingPluginAssignmentService) RecordObservation(context.Conte
 	return nil
 }
 func (service *recordingPluginAssignmentService) ForceReconcile(context.Context, platformscope.Scope, string, pluginassignment.MutationAudit) (pluginassignment.Assignment, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	service.forceCalls++
-	return service.value, nil
+	return service.value, service.forceErr
+}
+func (service *recordingPluginAssignmentService) setReconcileState(state pluginassignment.ReconcileState, reason string, revision uint64) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	service.value.ReconcileState = state
+	service.value.BlockedReason = reason
+	service.value.Revision = revision
+}
+func (service *recordingPluginAssignmentService) forceCallCount() int {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return service.forceCalls
 }

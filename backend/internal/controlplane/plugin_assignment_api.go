@@ -131,21 +131,52 @@ func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request op
 	}
 	audit := pluginassignment.MutationAudit{Actor: principal.Subject, OperationID: "reconcilePluginAssignment", IdempotencyKey: request.Params.IdempotencyKey, RequestFingerprint: fingerprint, RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx)}
 	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "reconcilePluginAssignment", IdempotencyKey: request.Params.IdempotencyKey}
+	recovery := reconcilePluginAssignmentRecovery{RequestID: audit.RequestID}
+	if metadata, ok := ctx.Value(platformRequestMetadataContextKey{}).(platformRequestMetadata); ok {
+		recovery.Instance = metadata.Path
+	}
+	recoveryJSON, err := json.Marshal(recovery)
+	if err != nil {
+		return nil, err
+	}
 	reconcile := func(context.Context, idempotency.Response, []byte) error { return nil }
-	run := func(callContext context.Context) (idempotency.Response, error) {
+	run := func(callContext context.Context, responseContext reconcilePluginAssignmentRecovery) (idempotency.Response, error) {
 		assignment, err := api.services.PluginAssignments.ForceReconcile(callContext, scope, request.AssignmentId, audit)
 		if err != nil {
-			return idempotency.Response{}, err
+			return idempotency.Response{}, reconcilePreMutationError{err: err}
+		}
+		if current, getErr := api.services.PluginAssignments.Get(callContext, scope, request.AssignmentId); getErr == nil && current.OperationRevision == assignment.OperationRevision {
+			if cause, ok := durableReconcileProblem(current); ok {
+				return storedPluginReconcileProblem(cause, current, responseContext)
+			}
 		}
 		value, err := api.services.PluginReconciler.ReconcileAssignment(callContext, assignment, api.now())
 		if err != nil {
+			current, getErr := api.services.PluginAssignments.Get(callContext, scope, request.AssignmentId)
+			if getErr == nil {
+				if cause, ok := durableReconcileProblem(current); ok {
+					return storedPluginReconcileProblem(cause, current, responseContext)
+				}
+			}
 			return idempotency.Response{}, err
 		}
 		return storedPluginReconcileResponse(value, scope)
 	}
 	begin := func() (idempotency.Claim, error) {
-		return api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, []byte(`{}`), reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
-			return run(recoveryContext)
+		return api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, recoveryJSON, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+			var original reconcilePluginAssignmentRecovery
+			if err := json.Unmarshal(processing.Reconciliation, &original); err != nil || original.RequestID == "" {
+				return idempotency.Response{}, idempotency.ErrInvalid
+			}
+			stored, runErr := run(recoveryContext, original)
+			var before reconcilePreMutationError
+			if errors.As(runErr, &before) {
+				if abortErr := api.services.Idempotency.Abort(recoveryContext, key, fingerprint, processing.OwnerToken); abortErr != nil {
+					return idempotency.Response{}, abortErr
+				}
+				return idempotency.Response{}, before.err
+			}
+			return stored, runErr
 		})
 	}
 	var claim idempotency.Claim
@@ -156,16 +187,27 @@ func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request op
 		}
 	}
 	if err != nil {
+		var before reconcilePreMutationError
+		if errors.As(err, &before) {
+			return nil, before.err
+		}
 		return nil, err
 	}
 	if claim.Response != nil {
 		return reconcilePluginAssignmentIdempotentResponse{response: *claim.Response}, nil
 	}
-	stored, err := run(ctx)
+	stored, err := run(ctx, recovery)
 	if err != nil {
+		var before reconcilePreMutationError
+		if errors.As(err, &before) {
+			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, claim.OwnerToken); abortErr != nil {
+				return nil, abortErr
+			}
+			return nil, before.err
+		}
 		return nil, err
 	}
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, []byte(`{}`), reconcile)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, recoveryJSON, reconcile)
 	if errors.Is(err, idempotency.ErrOwnershipConflict) {
 		for attempt := 0; attempt < 4; attempt++ {
 			replayed, replayErr := begin()
@@ -186,6 +228,55 @@ func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request op
 	return reconcilePluginAssignmentIdempotentResponse{response: completed}, nil
 }
 
+type reconcilePreMutationError struct{ err error }
+
+func (value reconcilePreMutationError) Error() string { return value.err.Error() }
+func (value reconcilePreMutationError) Unwrap() error { return value.err }
+
+type reconcilePluginAssignmentRecovery struct {
+	RequestID string `json:"request_id"`
+	Instance  string `json:"instance,omitempty"`
+}
+
+func storedPluginReconcileProblem(cause error, assignment pluginassignment.Assignment, responseContext reconcilePluginAssignmentRecovery) (idempotency.Response, error) {
+	problem := problemForError(cause, responseContext.RequestID, responseContext.Instance)
+	reason := assignment.BlockedReason
+	if reason == "" {
+		if assignment.ReconcileState == pluginassignment.ReconcileConflict {
+			reason = "state_conflict"
+		} else if assignment.ReconcileState == pluginassignment.ReconcileConverged {
+			reason = "already_converged"
+		}
+	}
+	problem.Detail = &reason
+	encoded, err := json.Marshal(problem)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	return idempotency.Response{Status: problem.Status, Header: http.Header{"Content-Type": []string{"application/problem+json"}, "ETag": []string{assignment.ETag()}, "X-Request-ID": []string{problem.RequestId}}, Body: encoded}, nil
+}
+
+func durableReconcileProblem(value pluginassignment.Assignment) (error, bool) {
+	switch value.ReconcileState {
+	case pluginassignment.ReconcileWaiting:
+		if value.BlockedReason != "" {
+			return pluginassignment.ErrConflict, true
+		}
+	case pluginassignment.ReconcileBlocked:
+		if value.BlockedReason == "version_revoked" {
+			return pluginassignment.ErrVersionRevoked, true
+		}
+		if value.BlockedReason != "" {
+			return pluginassignment.ErrConflict, true
+		}
+	case pluginassignment.ReconcileConflict:
+		return pluginassignment.ErrConflict, true
+	case pluginassignment.ReconcileConverged:
+		return pluginassignment.ErrConflict, true
+	}
+	return nil, false
+}
+
 func storedPluginReconcileResponse(value job.Job, scope platformscope.Scope) (idempotency.Response, error) {
 	body, err := openAPIJob(value)
 	if err != nil {
@@ -203,6 +294,7 @@ type reconcilePluginAssignmentIdempotentResponse struct{ response idempotency.Re
 
 func (value reconcilePluginAssignmentIdempotentResponse) VisitReconcilePluginAssignmentResponse(writer http.ResponseWriter) error {
 	for key, items := range value.response.Header {
+		writer.Header().Del(key)
 		for _, item := range items {
 			writer.Header().Add(key, item)
 		}
