@@ -145,6 +145,11 @@ func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request op
 		if err != nil {
 			return idempotency.Response{}, reconcilePreMutationError{err: err}
 		}
+		if stored, found, findErr := api.services.PluginReconciler.FindScheduledJob(callContext, assignment); findErr != nil {
+			return idempotency.Response{}, findErr
+		} else if found {
+			return storedPluginReconcileResponse(stored, scope)
+		}
 		if current, getErr := api.services.PluginAssignments.Get(callContext, scope, request.AssignmentId); getErr == nil && current.OperationRevision == assignment.OperationRevision {
 			if cause, ok := durableReconcileProblem(current); ok {
 				return storedPluginReconcileProblem(cause, current, responseContext)

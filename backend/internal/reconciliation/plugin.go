@@ -85,6 +85,13 @@ func NewPluginReconciler(repository AssignmentRepository) *PluginReconciler {
 	return &PluginReconciler{repository: repository}
 }
 
+func (reconciler *PluginReconciler) FindScheduledJob(ctx context.Context, assignment pluginassignment.Assignment) (job.Job, bool, error) {
+	if reconciler == nil || reconciler.repository == nil {
+		return job.Job{}, false, pluginassignment.ErrInvalid
+	}
+	return reconciler.repository.FindScheduledJob(ctx, assignment)
+}
+
 func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time, limit int) (ReconcileResult, error) {
 	if reconciler == nil || reconciler.repository == nil || ctx == nil || at.IsZero() || limit < 1 || limit > 100 {
 		return ReconcileResult{}, pluginassignment.ErrInvalid

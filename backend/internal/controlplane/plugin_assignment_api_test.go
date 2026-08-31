@@ -3,6 +3,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,11 +15,15 @@ import (
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/databaseinstance"
+	"dbpilot.local/platform/internal/discovery"
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
+	"dbpilot.local/platform/internal/plugincatalog"
+	"dbpilot.local/platform/internal/reconciliation"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,7 +39,7 @@ func TestPluginAssignmentReconcileConcurrentExactRetriesUsePostgresResponse(t *t
 	service := &recordingPluginAssignmentService{value: assignment}
 	timeout := now.Add(time.Hour)
 	authoritative := job.Job{ID: "job-plugin-pg", Type: "plugin.reconcile", Scope: platformTestScope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{"agent-a"}, InitiatedBy: "plugin-reconciler", SourceResource: job.ResourceReference{ResourceType: "plugin_assignment", ResourceID: assignment.ID}, IdempotencyKey: "plugin-reconcile:pg", Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: now, TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: time.Minute, RequestID: "request-job-pg", TraceID: "trace-job-pg"}
-	reconciler := &recordingPluginAssignmentReconciler{value: authoritative}
+	reconciler := &recordingPluginAssignmentReconciler{value: authoritative, after: func() { service.setReconcileState(pluginassignment.ReconcileWaiting, "operation_in_flight", 5) }}
 	gap := &commitSideEffectGapStore{inner: idempotency.NewPostgresStore(database), fail: true, commitThenFail: true}
 	services := Services{PluginAssignments: service, PluginReconciler: reconciler, Idempotency: idempotency.NewService(gap), Now: func() time.Time { return now }}
 	request := func() *http.Request {
@@ -68,6 +73,96 @@ func TestPluginAssignmentReconcileConcurrentExactRetriesUsePostgresResponse(t *t
 	}
 }
 
+func TestPluginAssignmentReconcileLost202PrefersRealPersistedJobOverLaterState(t *testing.T) {
+	if os.Getenv("DBPILOT_HTTP_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_HTTP_POSTGRES_INTEGRATION=1")
+	}
+	ctx := context.Background()
+	database := openHTTPIntegrationDatabase(t, ctx, os.Getenv("DBPILOT_HTTP_POSTGRES_DSN"), "plugin_reconcile_real_job")
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	require.NoError(t, job.RunMigrations(ctx, database))
+	require.NoError(t, hostinventory.RunMigrations(ctx, database))
+	require.NoError(t, discovery.RunMigrations(ctx, database))
+	require.NoError(t, databaseinstance.RunMigrations(ctx, database))
+	require.NoError(t, plugincatalog.RunMigrations(ctx, database))
+	require.NoError(t, pluginassignment.RunMigrations(ctx, database))
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	hostID, agentID := "host-real", "agent-real"
+	hostRepo := hostinventory.NewPostgresRepository(database)
+	_, err := hostRepo.RecordObservation(ctx, platformTestScope, hostinventory.Observation{HostID: hostID, AgentID: agentID, Revision: 1, AgentVersion: "test", Hostname: "real.test", OS: "linux", Architecture: "amd64", LogicalCPUCount: 2, MemoryCapacityBytes: 1024, NetworkAddresses: []string{}, Capabilities: []string{"plugin.reconcile.v1"}, ObservedAt: now}, now)
+	require.NoError(t, err)
+	_, err = hostRepo.RecordHeartbeat(ctx, platformTestScope, agentID, now)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO artifacts (id,tenant_id,project_id,kind,content_type,size_bytes,checksum,created_by,created_at,storage_reference) VALUES ('artifact-real',$1,$2,'plugin_package','application/gzip',1,$3,'test',$4,'sha256/test')`, platformTestScope.TenantID, platformTestScope.ProjectID, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO plugin_definitions (tenant_id,project_id,plugin_id,name,database_family,protocol_version,supported_variants,capabilities) VALUES ($1,$2,'dbpilot.mysql','MySQL','mysql','1','["mysql"]'::jsonb,'["metrics"]'::jsonb)`, platformTestScope.TenantID, platformTestScope.ProjectID)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO plugin_versions (version_id,tenant_id,project_id,plugin_id,semantic_version,status,artifact_id,package_sha256,manifest_digest,publisher_id,signing_key_id,protocol_version,minimum_agent_protocol_version,maximum_agent_protocol_version,supported_variants,database_version_range,capabilities,metric_template_schema_version,platforms,revision,created_at,approved_at) VALUES ('version-real',$1,$2,'dbpilot.mysql','1.0.0','available','artifact-real',$3,$4,'publisher','key','1','1','1','["mysql"]'::jsonb,'>=5.7','["metrics"]'::jsonb,1,'[{"operating_system":"linux","architecture":"amd64","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","size_bytes":1}]'::jsonb,1,$5,$5)`, platformTestScope.TenantID, platformTestScope.ProjectID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now)
+	require.NoError(t, err)
+	fingerprint := sha256.Sum256([]byte("candidate-real"))
+	digest := make([]byte, 32)
+	_, err = database.Exec(`INSERT INTO discovery_scan_state (tenant_id,project_id,host_id,agent_id,observation_revision,rule_revision,report_digest,observed_at,received_at,rule_set_digest,disappearance_grace_seconds,agent_observed_at) VALUES ($1,$2,$3,$4,1,1,$5,$6,$6,$5,600,$6)`, platformTestScope.TenantID, platformTestScope.ProjectID, hostID, agentID, digest, now)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO discovery_scan_sources (tenant_id,project_id,host_id,discovery_source,result_status,reason_code,observation_revision,rule_revision,rule_set_digest,observed_at,updated_at) VALUES ($1,$2,$3,'native','completed','healthy',1,1,$4,$5,$5)`, platformTestScope.TenantID, platformTestScope.ProjectID, hostID, digest, now)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO discovery_candidates (candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,normalized_endpoint,process_identity,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at) VALUES ('candidate-real',$1,$2,$3,$4,'candidate-real','native','mysql','mysql','127.0.0.1:3306','mysql-real',0.9,'[]'::jsonb,$5,1,1,$6,$6,'awaiting_confirmation',$6)`, platformTestScope.TenantID, platformTestScope.ProjectID, hostID, agentID, fingerprint[:], now)
+	require.NoError(t, err)
+	jobRepo := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignmentRepo := pluginassignment.NewPostgresRepository(database, jobRepo)
+	instanceRepo := databaseinstance.NewPostgresRepositoryWithProvisioner(database, assignmentRepo)
+	_, err = instanceRepo.AcceptCandidate(ctx, platformTestScope, "candidate-real", databaseinstance.AcceptCandidateRequest{DisplayName: "real", DatabaseFamily: "mysql", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialRef: "secret://vault/mysql", Labels: map[string]string{}, ExpectedCandidateRevision: 1, CandidateFingerprint: fmt.Sprintf("%x", fingerprint[:]), Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "acceptDiscoveryCandidate", IdempotencyKey: "accept-real", RequestFingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RequestID: "request-accept-real"}})
+	require.NoError(t, err)
+	page, err := assignmentRepo.List(ctx, platformTestScope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assignmentService := pluginassignment.NewService(assignmentRepo)
+	pluginReconciler := reconciliation.NewPluginReconciler(assignmentRepo)
+	gap := &commitSideEffectGapStore{inner: idempotency.NewPostgresStore(database), fail: true, commitThenFail: true}
+	services := Services{PluginAssignments: assignmentService, PluginReconciler: pluginReconciler, Idempotency: idempotency.NewService(gap), Now: func() time.Time { return now }}
+	request := func() *http.Request {
+		value := httptest.NewRequest(http.MethodPost, platformBasePath+"/plugin-assignments/"+page.Items[0].ID+"/actions/reconcile", nil)
+		value.Header.Set("Idempotency-Key", "reconcile-real-lost")
+		value.Header.Set("X-Request-ID", "request-real-original")
+		return value
+	}
+	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request())
+	require.Equal(t, http.StatusInternalServerError, first.Code)
+	_, err = database.Exec(`UPDATE plugin_assignments SET reconcile_state='converged',blocked_reason='',revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, platformTestScope.TenantID, platformTestScope.ProjectID, page.Items[0].ID)
+	require.NoError(t, err)
+	gap.fail = false
+	services.Now = func() time.Time { return now.Add(8 * time.Hour) }
+	const consumers = 24
+	responses := make(chan *httptest.ResponseRecorder, consumers)
+	var wait sync.WaitGroup
+	for index := 0; index < consumers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			responses <- servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request())
+		}()
+	}
+	wait.Wait()
+	close(responses)
+	var body []byte
+	var location string
+	for response := range responses {
+		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+		if body == nil {
+			body = append([]byte(nil), response.Body.Bytes()...)
+			location = response.Header().Get("Location")
+			require.NotEmpty(t, location)
+		} else {
+			require.Equal(t, body, response.Body.Bytes())
+			require.Equal(t, location, response.Header().Get("Location"))
+		}
+	}
+	var jobCount, outboxCount int
+	require.NoError(t, database.QueryRow(`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND job_type='plugin.reconcile'`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&jobCount))
+	require.NoError(t, database.QueryRow(`SELECT count(*) FROM command_outbox WHERE tenant_id=$1 AND project_id=$2`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&outboxCount))
+	require.Equal(t, 1, jobCount)
+	require.Equal(t, 1, outboxCount)
+}
+
 func TestPluginAssignmentReconcileLostResponseRecoversExactAuthoritativeJob(t *testing.T) {
 	now := time.Date(2026, 8, 31, 4, 0, 0, 0, time.UTC)
 	assignment := validControlPlaneAssignment(now)
@@ -85,6 +180,7 @@ func TestPluginAssignmentReconcileLostResponseRecoversExactAuthoritativeJob(t *t
 	}
 	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request())
 	require.Equal(t, http.StatusInternalServerError, first.Code)
+	service.setReconcileState(pluginassignment.ReconcileConverged, "", 6)
 	store.completeErr = nil
 	services.Now = func() time.Time { return now.Add(8 * time.Hour) }
 	var wait sync.WaitGroup
@@ -109,7 +205,7 @@ func TestPluginAssignmentReconcileLostResponseRecoversExactAuthoritativeJob(t *t
 		}
 	}
 	require.Equal(t, authoritative.ID, reconciler.value.ID)
-	require.GreaterOrEqual(t, reconciler.callCount(), 2)
+	require.Equal(t, 1, reconciler.callCount(), "exact recovery must load persisted Job before current assignment state or a second reconcile")
 }
 
 func TestPluginAssignmentReconcileCompletesDurableConflictProblemForExactRetry(t *testing.T) {
@@ -298,6 +394,7 @@ type recordingPluginAssignmentReconciler struct {
 	releaseFirst chan struct{}
 	calls        int
 	mu           sync.Mutex
+	scheduled    *job.Job
 }
 
 func (value *recordingPluginAssignmentReconciler) ReconcileAssignment(context.Context, pluginassignment.Assignment, time.Time) (job.Job, error) {
@@ -305,6 +402,10 @@ func (value *recordingPluginAssignmentReconciler) ReconcileAssignment(context.Co
 	value.calls++
 	call := value.calls
 	result, err, after := value.value, value.err, value.after
+	if err == nil && result.ID != "" {
+		copy := result
+		value.scheduled = &copy
+	}
 	firstStarted, releaseFirst := value.firstStarted, value.releaseFirst
 	value.mu.Unlock()
 	if after != nil {
@@ -315,6 +416,14 @@ func (value *recordingPluginAssignmentReconciler) ReconcileAssignment(context.Co
 		<-releaseFirst
 	}
 	return result, err
+}
+func (value *recordingPluginAssignmentReconciler) FindScheduledJob(_ context.Context, _ pluginassignment.Assignment) (job.Job, bool, error) {
+	value.mu.Lock()
+	defer value.mu.Unlock()
+	if value.scheduled == nil {
+		return job.Job{}, false, nil
+	}
+	return *value.scheduled, true, nil
 }
 func (value *recordingPluginAssignmentReconciler) callCount() int {
 	value.mu.Lock()

@@ -59,6 +59,7 @@ type EnrollmentService interface {
 
 type PluginAssignmentReconciler interface {
 	ReconcileAssignment(context.Context, pluginassignment.Assignment, time.Time) (job.Job, error)
+	FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host
