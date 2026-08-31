@@ -41,6 +41,7 @@ func TestValidateReconcilePluginRequiresCanonicalBoundedArtifactAndConfiguration
 		"secret template":               func(value *agentv1.ReconcilePlugin) { value.TemplateIds = []string{"secret://vault/password"} },
 		"descriptor ownership mismatch": func(value *agentv1.ReconcilePlugin) { value.InstanceDescriptors[1].InstanceId = "other" },
 		"descriptor duplicate":          func(value *agentv1.ReconcilePlugin) { value.InstanceDescriptors[1].InstanceId = "instance-a" },
+		"missing field20 descriptors":   func(value *agentv1.ReconcilePlugin) { value.InstanceDescriptors = nil },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -228,8 +228,8 @@ func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agent
 	if envelope.GetExpiresAt() == nil || !envelope.GetExpiresAt().IsValid() || !envelope.GetExpiresAt().AsTime().After(r.now()) {
 		return &dispatchError{err: ErrCommandExpired}
 	}
-	capability, ok := commandCapability(envelope)
-	if !ok {
+	capabilities := commandCapabilities(envelope)
+	if len(capabilities) == 0 {
 		return &dispatchError{err: ErrInvalidCommand}
 	}
 
@@ -239,8 +239,10 @@ func (r *Registry) Dispatch(ctx context.Context, agentID string, envelope *agent
 	if !exists {
 		return &dispatchError{err: ErrAgentUnavailable, retryable: true}
 	}
-	if _, advertised := current.capabilities[capability]; !advertised {
-		return &dispatchError{err: fmt.Errorf("%w: %s", ErrCapabilityNotAdvertised, capability)}
+	for _, capability := range capabilities {
+		if _, advertised := current.capabilities[capability]; !advertised {
+			return &dispatchError{err: fmt.Errorf("%w: %s", ErrCapabilityNotAdvertised, capability)}
+		}
 	}
 	cloned := proto.Clone(envelope).(*agentv1.CommandEnvelope)
 	message := &agentv1.ServerMessage{MessageId: cloned.GetCommandId(), Message: &agentv1.ServerMessage_Command{Command: cloned}}
@@ -396,21 +398,29 @@ func matchingExecutionToken(left, right []byte) bool {
 }
 
 func commandCapability(envelope *agentv1.CommandEnvelope) (string, bool) {
+	capabilities := commandCapabilities(envelope)
+	if len(capabilities) == 0 {
+		return "", false
+	}
+	return capabilities[0], true
+}
+
+func commandCapabilities(envelope *agentv1.CommandEnvelope) []string {
 	switch envelope.GetCommand().(type) {
 	case *agentv1.CommandEnvelope_CollectNow:
-		return "collect_now", true
+		return []string{"collect_now"}
 	case *agentv1.CommandEnvelope_InspectInstance:
-		return "inspect_instance", true
+		return []string{"inspect_instance"}
 	case *agentv1.CommandEnvelope_ExecuteSql:
-		return "execute_sql", true
+		return []string{"execute_sql"}
 	case *agentv1.CommandEnvelope_ExecuteRegisteredProcess:
-		return "execute_registered_process", true
+		return []string{"execute_registered_process"}
 	case *agentv1.CommandEnvelope_CollectDiagnostic:
-		return "collect_diagnostic", true
+		return []string{"collect_diagnostic"}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
-		return "plugin.reconcile.v1", true
+		return []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1"}
 	default:
-		return "", false
+		return nil
 	}
 }
 

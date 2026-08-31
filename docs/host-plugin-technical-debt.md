@@ -1,5 +1,11 @@
 # Host and plugin platform technical debt
 
+## Task 12 template transport bound
+
+- A plugin assignment may contain at most 128 instances, 128 immutable template revisions and 16,384 configured instance-template pairs.
+- The canonical persisted template projection is limited to 256 KiB. The fully expanded `ApplyConfiguration`, initial `CollectNow`, resume-cursor and application-ACK protobuf messages are each limited to 4 MiB before a private UDS RPC or partial Agent spool admission.
+- Task 12 must measure the deterministic protobuf projection before publishing a reconciliation command. A definition set above either byte bound must be rejected or explicitly paged/reference-shared; it must never be truncated or partially applied.
+
 ## TD-PLUGIN-001: Agent and database plugin share one non-root UID
 
 - Affected module: Agent Plugin Supervisor and private plugin runtime.

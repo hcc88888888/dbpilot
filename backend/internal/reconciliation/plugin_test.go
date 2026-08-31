@@ -54,12 +54,37 @@ func TestPluginReconcilerCreatesOneExactSecretFreeTypedJobOnlyForDrift(t *testin
 	require.Empty(t, repository.jobs)
 }
 
+func TestPluginReconcilerWaitsWithoutCreatingJobForOldAgent(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	drift := reconcileAssignmentFixture(now)
+	repository := &memoryReconcileRepository{claims: []pluginassignment.ReconcileClaim{{Assignment: drift, Token: "claim-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LeasedUntil: now.Add(time.Minute)}}}
+	capabilities := staticPluginCapabilities{supported: false}
+	result, err := NewPluginReconciler(repository, capabilities).Reconcile(context.Background(), now, 10)
+	require.NoError(t, err)
+	require.Equal(t, ReconcileResult{Claimed: 1, Waiting: 1}, result)
+	require.Empty(t, repository.jobs)
+	require.Equal(t, "instance_descriptors_capability_unavailable", repository.waitingReason)
+
+	capabilities.supported = true
+	repository = &memoryReconcileRepository{claims: []pluginassignment.ReconcileClaim{{Assignment: drift, Token: "claim-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", LeasedUntil: now.Add(time.Minute)}}}
+	result, err = NewPluginReconciler(repository, capabilities).Reconcile(context.Background(), now, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Enqueued)
+}
+
+type staticPluginCapabilities struct{ supported bool }
+
+func (value staticPluginCapabilities) Supports(_ string, required ...string) bool {
+	return value.supported && len(required) == 2 && required[0] == "plugin.reconcile.v1" && required[1] == "plugin_reconcile.instance_descriptors.v1"
+}
+
 type memoryReconcileRepository struct {
-	claims   []pluginassignment.ReconcileClaim
-	jobs     []job.Job
-	messages []job.OutboxMessage
-	waiting  int
-	stored   *job.Job
+	claims        []pluginassignment.ReconcileClaim
+	jobs          []job.Job
+	messages      []job.OutboxMessage
+	waiting       int
+	waitingReason string
+	stored        *job.Job
 }
 
 func (repository *memoryReconcileRepository) LoadPluginInstanceDescriptors(_ context.Context, assignment pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error) {
@@ -87,8 +112,9 @@ func (repository *memoryReconcileRepository) MarkConverged(context.Context, plug
 func (repository *memoryReconcileRepository) MarkConflict(context.Context, pluginassignment.ReconcileClaim) error {
 	return nil
 }
-func (repository *memoryReconcileRepository) MarkWaiting(context.Context, pluginassignment.ReconcileClaim, string) error {
+func (repository *memoryReconcileRepository) MarkWaiting(_ context.Context, _ pluginassignment.ReconcileClaim, reason string) error {
 	repository.waiting++
+	repository.waitingReason = reason
 	return nil
 }
 func (repository *memoryReconcileRepository) FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error) {

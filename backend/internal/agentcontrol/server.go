@@ -353,7 +353,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		}
 	case *agentv1.AgentMessage_PluginArtifactLeaseRequest:
 		request := typed.PluginArtifactLeaseRequest
-		if request == nil || len(request.GetRequestNonce()) != sha256.Size || !s.registry.Supports(agentID, "plugin.reconcile.v1") {
+		if request == nil || len(request.GetRequestNonce()) != sha256.Size || !s.registry.Supports(agentID, "plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1") {
 			return status.Error(codes.InvalidArgument, "plugin artifact lease request is invalid")
 		}
 		response, issueErr := s.pluginArtifacts.Issue(ctx, agentID, request)

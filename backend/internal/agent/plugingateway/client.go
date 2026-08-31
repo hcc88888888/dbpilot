@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	maxRPCMessageBytes = 1 << 20
+	maxRPCMessageBytes = 4 << 20
 	maxGatewayMembers  = 128
+	maxConfiguredPairs = maxGatewayMembers * maxGatewayMembers
 )
 
 var (
@@ -135,6 +136,8 @@ type Session struct {
 	client                *Client
 	expected              ExpectedPlugin
 	mu                    sync.Mutex
+	lanesMu               sync.Mutex
+	lanes                 map[cursorKey]*sync.Mutex
 	handshaken            bool
 	configurationRevision uint64
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
@@ -194,8 +197,9 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 	if session == nil || ctx == nil || ctx.Err() != nil || configuration.validate(session.expected) != nil || !session.isHandshaken() {
 		return errGateway
 	}
+	request := canonicalApplyRequest(configuration)
 	responseErr := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
-		response, err := client.ApplyConfiguration(callContext, &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: configuration.AssignmentID, ConfigurationRevision: configuration.ConfigurationRevision, Instances: cloneInstances(configuration.Instances)})
+		response, err := client.ApplyConfiguration(callContext, request)
 		if err != nil || !validApplyResponse(response, configuration) {
 			return errGateway
 		}
@@ -260,14 +264,29 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 	if session == nil || ctx == nil || ctx.Err() != nil || !session.readyForCollect(instanceIDs, templateIDs) {
 		return errGateway
 	}
+	request := canonicalCollectRequest(session.expected.AssignmentID, session.currentRevision(), instanceIDs, templateIDs)
+	instances, templates := request.GetInstanceIds(), request.GetTemplateIds()
+	if len(instances) > 0 && len(templates) > maxConfiguredPairs/len(instances) || proto.Size(request) > maxRPCMessageBytes {
+		return errGateway
+	}
 	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
-		response, err := client.CollectNow(callContext, &pluginv1.CollectPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), InstanceIds: append([]string(nil), instanceIDs...), TemplateIds: append([]string(nil), templateIDs...)})
-		if err != nil || len(response.GetBatches()) != len(instanceIDs)*len(templateIDs) {
+		response, err := client.CollectNow(callContext, request)
+		if err != nil || !validCollectResponseEnvelope(response, len(instances)*len(templates)) {
 			return errGateway
 		}
-		seen := make(map[string]struct{}, len(response.GetBatches()))
-		for _, batch := range response.GetBatches() {
-			if batch == nil || !contains(instanceIDs, batch.GetInstanceId()) || !contains(templateIDs, batch.GetTemplateId()) {
+		batches := append([]*pluginv1.PluginMetricBatch(nil), response.GetBatches()...)
+		sort.Slice(batches, func(left, right int) bool {
+			if batches[left].GetInstanceId() != batches[right].GetInstanceId() {
+				return batches[left].GetInstanceId() < batches[right].GetInstanceId()
+			}
+			if batches[left].GetTemplateId() != batches[right].GetTemplateId() {
+				return batches[left].GetTemplateId() < batches[right].GetTemplateId()
+			}
+			return batches[left].GetSequence() < batches[right].GetSequence()
+		})
+		seen := make(map[string]struct{}, len(batches))
+		for _, batch := range batches {
+			if batch == nil || !contains(instances, batch.GetInstanceId()) || !contains(templates, batch.GetTemplateId()) || !session.isBatchConfigured(batch) {
 				return errGateway
 			}
 			key := batch.GetInstanceId() + "\x00" + batch.GetTemplateId()
@@ -275,10 +294,9 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 				return errGateway
 			}
 			seen[key] = struct{}{}
-			if err := session.appendBatch(callContext, batch, session.client.config.Store); err != nil {
-				return err
-			}
-			if err := acknowledgeBatch(callContext, client, session.expected.AssignmentID, session.currentRevision(), batch); err != nil {
+		}
+		for _, batch := range batches {
+			if err := session.appendAndAcknowledge(callContext, batch, session.client.config.Store, client); err != nil {
 				return err
 			}
 		}
@@ -349,14 +367,8 @@ func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, re
 		if errors.Is(receiveErr, io.EOF) || receiveErr != nil {
 			return errGateway
 		}
-		if err := session.appendBatch(streamContext, batch, sink); err != nil {
+		if err := session.appendAndAcknowledge(streamContext, batch, sink, runtimeClient); err != nil {
 			return err
-		}
-		ackContext, ackCancel := context.WithTimeout(streamContext, session.client.config.Timeout)
-		ackErr := acknowledgeBatch(ackContext, runtimeClient, session.expected.AssignmentID, session.currentRevision(), batch)
-		ackCancel()
-		if ackErr != nil {
-			return ackErr
 		}
 	}
 }
@@ -395,7 +407,8 @@ func (session *Session) resumeCursors(ctx context.Context, sink MetricSink) ([]*
 			}
 		}
 	}
-	if len(result) > maxGatewayMembers {
+	request := &pluginv1.StreamPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), ResumeCursors: result}
+	if len(result) > maxConfiguredPairs || proto.Size(request) > maxRPCMessageBytes {
 		return nil, errGateway
 	}
 	return result, nil
@@ -403,15 +416,30 @@ func (session *Session) resumeCursors(ctx context.Context, sink MetricSink) ([]*
 
 func acknowledgeBatch(ctx context.Context, client pluginv1.PluginRuntimeClient, assignmentID string, revision uint64, batch *pluginv1.PluginMetricBatch) error {
 	cursors := []*pluginv1.PluginMetricCursor{{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()}}
-	response, err := client.AcknowledgeMetrics(ctx, &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: assignmentID, ConfigurationRevision: revision, Cursors: cursors})
+	request := &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: assignmentID, ConfigurationRevision: revision, Cursors: cursors}
+	if proto.Size(request) > maxRPCMessageBytes {
+		return errGateway
+	}
+	response, err := client.AcknowledgeMetrics(ctx, request)
 	if err != nil || !validAckResponse(response, cursors) {
 		return errGateway
 	}
 	return nil
 }
 
+func canonicalCollectRequest(assignmentID string, revision uint64, instanceIDs, templateIDs []string) *pluginv1.CollectPluginMetricsRequest {
+	instances, templates := append([]string(nil), instanceIDs...), append([]string(nil), templateIDs...)
+	sort.Strings(instances)
+	sort.Strings(templates)
+	return &pluginv1.CollectPluginMetricsRequest{AssignmentId: assignmentID, ConfigurationRevision: revision, InstanceIds: instances, TemplateIds: templates}
+}
+
+func validCollectResponseEnvelope(response *pluginv1.CollectPluginMetricsResponse, expectedPairs int) bool {
+	return response != nil && expectedPairs >= 0 && expectedPairs <= maxConfiguredPairs && len(response.GetBatches()) == expectedPairs && proto.Size(response) <= maxRPCMessageBytes
+}
+
 func validAckResponse(response *pluginv1.AcknowledgePluginMetricsResponse, expected []*pluginv1.PluginMetricCursor) bool {
-	if response == nil || response.GetErrorCode() != "" || len(response.GetAcceptedCursors()) != len(expected) || len(expected) == 0 || len(expected) > maxGatewayMembers {
+	if response == nil || response.GetErrorCode() != "" || len(response.GetAcceptedCursors()) != len(expected) || len(expected) == 0 || len(expected) > maxConfiguredPairs || proto.Size(response) > maxRPCMessageBytes {
 		return false
 	}
 	for index, cursor := range expected {
@@ -440,14 +468,65 @@ func (session *Session) appendBatch(ctx context.Context, batch *pluginv1.PluginM
 	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || session.client == nil {
 		return errGateway
 	}
+	lane, err := session.batchLane(batch)
+	if err != nil {
+		return err
+	}
+	lane.Lock()
+	defer lane.Unlock()
+	return session.appendBatchInLane(ctx, batch, sink)
+}
+
+func (session *Session) appendAndAcknowledge(ctx context.Context, batch *pluginv1.PluginMetricBatch, sink MetricSink, client pluginv1.PluginRuntimeClient) error {
+	if client == nil {
+		return errGateway
+	}
+	lane, err := session.batchLane(batch)
+	if err != nil {
+		return err
+	}
+	lane.Lock()
+	defer lane.Unlock()
+	if err := session.appendBatchInLane(ctx, batch, sink); err != nil {
+		return err
+	}
+	ackContext, cancel := context.WithTimeout(ctx, session.client.config.Timeout)
+	defer cancel()
+	return acknowledgeBatch(ackContext, client, session.expected.AssignmentID, batch.GetConfigurationRevision(), batch)
+}
+
+func (session *Session) batchLane(batch *pluginv1.PluginMetricBatch) (*sync.Mutex, error) {
+	if session == nil || batch == nil || batch.GetConfigurationRevision() != session.expected.ConfigurationRevision || !contains(session.expected.InstanceIDs, batch.GetInstanceId()) || !contains(session.expected.TemplateIDs, batch.GetTemplateId()) {
+		return nil, errGateway
+	}
+	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: batch.GetConfigurationRevision(), TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
+	session.lanesMu.Lock()
+	defer session.lanesMu.Unlock()
+	if session.lanes == nil {
+		session.lanes = make(map[cursorKey]*sync.Mutex)
+	}
+	lane := session.lanes[key]
+	if lane == nil {
+		lane = &sync.Mutex{}
+		session.lanes[key] = lane
+	}
+	return lane, nil
+}
+
+func (session *Session) appendBatchInLane(ctx context.Context, batch *pluginv1.PluginMetricBatch, sink MetricSink) error {
+	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || session.client == nil {
+		return errGateway
+	}
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	if !session.isBatchConfigured(batch) {
+		session.mu.Unlock()
 		return errGateway
 	}
 	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.configurationRevision, TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
+	scope := session.metricScope(batch)
+	session.mu.Unlock()
 	now := session.client.config.Now().UTC()
-	payload, id, err := normalizeBatch(batch, session.metricScope(batch), now)
+	payload, id, err := normalizeBatch(batch, scope, now)
 	if err != nil {
 		return errGateway
 	}
@@ -529,6 +608,7 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 		return errGateway
 	}
 	seen := map[string]struct{}{}
+	pairs := 0
 	for _, instance := range configuration.Instances {
 		if instance == nil || !contains(expected.InstanceIDs, instance.GetInstanceId()) || instance.GetInstanceId() == "" || !family(instance.GetDatabaseVariant()) || (instance.GetEndpoint() == "" && instance.GetUnixSocket() == "") || (instance.GetEndpoint() != "" && instance.GetUnixSocket() != "") || len(instance.GetTemplates()) > maxGatewayMembers {
 			return errGateway
@@ -547,9 +627,16 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 			return errGateway
 		}
 		seen[instance.GetInstanceId()] = struct{}{}
+		pairs += len(instance.GetTemplates())
+		if pairs > maxConfiguredPairs {
+			return errGateway
+		}
 		if !sameSet(mapKeys(templates), expected.TemplateIDs) {
 			return errGateway
 		}
+	}
+	if proto.Size(canonicalApplyRequest(configuration)) > maxRPCMessageBytes {
+		return errGateway
 	}
 	return nil
 }
@@ -792,6 +879,39 @@ func cloneInstances(values []*pluginv1.PluginInstanceConfiguration) []*pluginv1.
 		result[index] = proto.Clone(value).(*pluginv1.PluginInstanceConfiguration)
 	}
 	return result
+}
+
+func canonicalApplyRequest(configuration PluginConfiguration) *pluginv1.ApplyPluginConfigurationRequest {
+	instances := cloneInstances(configuration.Instances)
+	for _, instance := range instances {
+		sort.Slice(instance.Templates, func(left, right int) bool {
+			return instance.Templates[left].GetTemplateId() < instance.Templates[right].GetTemplateId()
+		})
+		for _, template := range instance.Templates {
+			sort.Slice(template.ValueMappings, func(left, right int) bool {
+				leftValue, rightValue := template.ValueMappings[left], template.ValueMappings[right]
+				if leftValue.GetSourceColumn() != rightValue.GetSourceColumn() {
+					return leftValue.GetSourceColumn() < rightValue.GetSourceColumn()
+				}
+				if leftValue.GetMetricName() != rightValue.GetMetricName() {
+					return leftValue.GetMetricName() < rightValue.GetMetricName()
+				}
+				if leftValue.GetMetricType() != rightValue.GetMetricType() {
+					return leftValue.GetMetricType() < rightValue.GetMetricType()
+				}
+				return leftValue.GetUnit() < rightValue.GetUnit()
+			})
+			sort.Slice(template.LabelMappings, func(left, right int) bool {
+				leftValue, rightValue := template.LabelMappings[left], template.LabelMappings[right]
+				if leftValue.GetSourceColumn() != rightValue.GetSourceColumn() {
+					return leftValue.GetSourceColumn() < rightValue.GetSourceColumn()
+				}
+				return leftValue.GetLabel() < rightValue.GetLabel()
+			})
+		}
+	}
+	sort.Slice(instances, func(left, right int) bool { return instances[left].GetInstanceId() < instances[right].GetInstanceId() })
+	return &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: configuration.AssignmentID, ConfigurationRevision: configuration.ConfigurationRevision, Instances: instances}
 }
 func containsInstance(values []*pluginv1.PluginInstanceConfiguration, instanceID string) bool {
 	for _, value := range values {

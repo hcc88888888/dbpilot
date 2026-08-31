@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,6 +65,18 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 	require.NoError(t, err)
 	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
 	require.NoError(t, session.ApplyConfiguration(context.Background(), configuration))
+	oversizedInstances, oversizedTemplates := canonicalPairFixture(2, 65)
+	for _, template := range oversizedTemplates {
+		template.ReadOnlyStatement = "SELECT '" + strings.Repeat("x", 40<<10) + "'"
+	}
+	for _, instance := range oversizedInstances {
+		instance.Templates = cloneTemplateConfigurations(oversizedTemplates)
+	}
+	oversizedExpected := expected
+	oversizedExpected.InstanceIDs = mapInstanceIDs(oversizedInstances)
+	oversizedExpected.TemplateIDs = mapTemplateIDs(oversizedTemplates)
+	oversizedExpected.TemplateConfigurations = oversizedTemplates
+	require.Error(t, (PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: mapInstances(oversizedInstances)}).validate(oversizedExpected), "oversized protocol configuration must fail before RPC side effects")
 	require.NoError(t, session.CollectNow(context.Background(), []string{"mysql-1", "mysql-2"}, []string{"template-1", "template-2"}))
 	require.Error(t, session.RunMetricStream(context.Background(), store), "an unexpected completed metric stream must surface to Supervisor")
 	stats, err := store.Stats()
@@ -77,6 +90,18 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 	badSession, err := client.Open(badPeer)
 	require.NoError(t, err)
 	_, err = badSession.Handshake(context.Background(), badPeer)
+	require.Error(t, err)
+	badGroup := expected
+	badGroup.ExpectedGroupID++
+	groupSession, err := client.Open(badGroup)
+	require.NoError(t, err)
+	_, err = groupSession.Handshake(context.Background(), badGroup)
+	require.Error(t, err)
+	badPID := expected
+	badPID.PID++
+	pidSession, err := client.Open(badPID)
+	require.NoError(t, err)
+	_, err = pidSession.Handshake(context.Background(), badPID)
 	require.Error(t, err)
 	badDigest := expected
 	badDigest.ExecutableSHA256 = make([]byte, sha256.Size)

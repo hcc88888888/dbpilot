@@ -17,9 +17,12 @@ import (
 )
 
 const (
-	DefaultClaimLease                  = 45 * time.Second
-	PluginExecutionLeaseSeconds uint32 = 900
-	PluginJobTimeout                   = 20 * time.Minute
+	DefaultClaimLease                          = 45 * time.Second
+	PluginExecutionLeaseSeconds         uint32 = 900
+	PluginJobTimeout                           = 20 * time.Minute
+	PluginReconcileCapability                  = "plugin.reconcile.v1"
+	PluginInstanceDescriptorsCapability        = "plugin_reconcile.instance_descriptors.v1"
+	PluginCapabilityWaitingReason              = "instance_descriptors_capability_unavailable"
 )
 
 type AssignmentRepository interface {
@@ -69,6 +72,12 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 		}
 		return job.Job{}, pluginassignment.ErrConflict
 	}
+	if !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
+		if err := reconciler.repository.MarkWaiting(ctx, claim, PluginCapabilityWaitingReason); err != nil {
+			return job.Job{}, err
+		}
+		return job.Job{}, pluginassignment.ErrConflict
+	}
 	descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
 	if err != nil {
 		return job.Job{}, err
@@ -91,13 +100,22 @@ type Reconciler interface {
 }
 
 type PluginReconciler struct {
-	repository  AssignmentRepository
-	descriptors InstanceDescriptorLoader
+	repository   AssignmentRepository
+	descriptors  InstanceDescriptorLoader
+	capabilities AgentCapabilitySource
 }
 
-func NewPluginReconciler(repository AssignmentRepository) *PluginReconciler {
+type AgentCapabilitySource interface {
+	Supports(string, ...string) bool
+}
+
+func NewPluginReconciler(repository AssignmentRepository, sources ...AgentCapabilitySource) *PluginReconciler {
 	loader, _ := repository.(InstanceDescriptorLoader)
-	return &PluginReconciler{repository: repository, descriptors: loader}
+	var source AgentCapabilitySource
+	if len(sources) > 0 {
+		source = sources[0]
+	}
+	return &PluginReconciler{repository: repository, descriptors: loader, capabilities: source}
 }
 
 func (reconciler *PluginReconciler) FindScheduledJob(ctx context.Context, assignment pluginassignment.Assignment) (job.Job, bool, error) {
@@ -144,6 +162,14 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
+		if !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
+			if err := reconciler.repository.MarkWaiting(ctx, claim, PluginCapabilityWaitingReason); err != nil {
+				failures = append(failures, err)
+			} else {
+				result.Waiting++
+			}
+			continue
+		}
 		descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
 		if err != nil {
 			failures = append(failures, err)
@@ -168,6 +194,10 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 		}
 	}
 	return result, errors.Join(failures...)
+}
+
+func (reconciler *PluginReconciler) supportsDescriptorReconcile(agentID string) bool {
+	return reconciler.capabilities == nil || reconciler.capabilities.Supports(agentID, PluginReconcileCapability, PluginInstanceDescriptorsCapability)
 }
 
 func rolloutEligible(value pluginassignment.Assignment) bool {

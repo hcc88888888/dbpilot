@@ -611,7 +611,7 @@ func NewServer(config Config) (*Server, error) {
 	if config.PluginCatalog.Enabled {
 		assignmentRepository = pluginassignment.NewPostgresRepository(database, jobRepository)
 		assignmentService = pluginassignment.NewService(assignmentRepository)
-		pluginReconciler = reconciliation.NewPluginReconciler(assignmentRepository)
+		pluginReconciler = reconciliation.NewPluginReconciler(assignmentRepository, agentRegistry)
 		acceptanceProvisioner = assignmentRepository
 	}
 	var pluginArtifactLeaseIssuer *agentcontrol.PluginArtifactLeaseIssuer

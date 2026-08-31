@@ -91,7 +91,7 @@ func TestPluginArtifactLeaseHTTPHandlerBindsTLSAgentAndRevalidatesOperation(t *t
 
 func TestAgentControlRoutesLeaseRequestThroughAuthenticatedSession(t *testing.T) {
 	registry := NewRegistry(4)
-	require.NoError(t, registry.register("agent-1", []string{"plugin.reconcile.v1"}, nil, func() {}))
+	require.NoError(t, registry.register("agent-1", []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1"}, nil, func() {}))
 	issuer := &recordingLeaseIssuer{response: &agentv1.PluginArtifactLeaseResponse{RequestNonce: bytes.Repeat([]byte{4}, 32), LeaseId: "lease-1"}}
 	server := NewServer(registry, NoopObserver{}, WithPluginArtifactLeaseIssuer(issuer))
 	request := &agentv1.PluginArtifactLeaseRequest{RequestNonce: bytes.Repeat([]byte{4}, 32), AssignmentId: "assignment-1", ArtifactId: "artifact-1", OperationRevision: 7}
@@ -111,7 +111,7 @@ func TestPluginArtifactLeaseExecutionFenceExistsOnlyAfterLiveCommandStart(t *tes
 	now := time.Now().UTC()
 	registry := NewRegistry(4)
 	registry.now = func() time.Time { return now }
-	require.NoError(t, registry.register("agent-1", []string{"plugin.reconcile.v1"}, nil, func() {}))
+	require.NoError(t, registry.register("agent-1", []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1"}, nil, func() {}))
 	require.False(t, registry.ExecutionLeaseActive("agent-1", "command-1", now))
 	start := &agentv1.CommandStart{CommandId: "command-1", ExecutionToken: bytes.Repeat([]byte{8}, 32), LeaseRevision: 1, LeaseSeconds: 60, StartDeadline: timestamppb.New(now.Add(time.Minute))}
 	require.NoError(t, registry.Start(context.Background(), "agent-1", start))

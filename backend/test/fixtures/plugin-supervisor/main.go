@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -12,12 +13,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -28,6 +31,10 @@ func main() {
 	}
 	var instances []string
 	if json.Unmarshal([]byte(values["--instance-ids"]), &instances) != nil || len(instances) == 0 {
+		os.Exit(2)
+	}
+	var templates []string
+	if json.Unmarshal([]byte(values["--template-ids"]), &templates) != nil || len(templates) == 0 {
 		os.Exit(2)
 	}
 	runtimeDirectory := values["--runtime-dir"]
@@ -78,14 +85,11 @@ func main() {
 	}
 	defer os.Remove(socket)
 	server := grpc.NewServer()
-	fixture := &runtimeServer{assignmentID: values["--assignment-id"], pluginID: values["--plugin-id"], family: values["--database-family"], version: values["--version"], configurationRevision: configurationRevision, operationRevision: operationRevision, instances: instances, executableDigest: digest[:], launchNonce: launchNonce}
+	fixture := &runtimeServer{assignmentID: values["--assignment-id"], pluginID: values["--plugin-id"], family: values["--database-family"], version: values["--version"], configurationRevision: configurationRevision, operationRevision: operationRevision, instances: instances, templates: templates, runtimeDirectory: runtimeDirectory, collectedAt: persistentCollectionTime(runtimeDirectory, configurationRevision), cursors: loadPluginCursors(runtimeDirectory), executableDigest: digest[:], launchNonce: launchNonce}
 	pluginv1.RegisterPluginRuntimeServer(server, fixture)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { _ = server.Serve(listener) }()
-	if values["--version"] == "1.2.0" {
-		go func() { time.Sleep(150 * time.Millisecond); os.Exit(17) }()
-	}
 	<-ctx.Done()
 	server.GracefulStop()
 }
@@ -99,8 +103,110 @@ type runtimeServer struct {
 	configurationRevision uint64
 	operationRevision     uint64
 	instances             []string
+	templates             []string
+	runtimeDirectory      string
+	collectedAt           time.Time
 	executableDigest      []byte
 	launchNonce           []byte
+	mu                    sync.Mutex
+	applied               bool
+	cursors               map[string]uint64
+}
+
+func (server *runtimeServer) ApplyConfiguration(_ context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
+	if request.GetAssignmentId() != server.assignmentID || request.GetConfigurationRevision() != server.configurationRevision || len(request.GetInstances()) != len(server.instances) {
+		return nil, errors.New("configuration mismatch")
+	}
+	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(server.instances))
+	for _, instance := range request.GetInstances() {
+		if len(instance.GetTemplates()) != len(server.templates) {
+			return nil, errors.New("template coverage mismatch")
+		}
+		results = append(results, &pluginv1.PluginInstanceConfigurationResult{InstanceId: instance.GetInstanceId(), Applied: true})
+	}
+	server.mu.Lock()
+	server.applied = true
+	server.mu.Unlock()
+	server.record("apply")
+	return &pluginv1.ApplyPluginConfigurationResponse{ActiveConfigurationRevision: server.configurationRevision, Results: results}, nil
+}
+
+func (server *runtimeServer) ValidateInstance(_ context.Context, request *pluginv1.ValidatePluginInstanceRequest) (*pluginv1.ValidatePluginInstanceResponse, error) {
+	if request.GetAssignmentId() != server.assignmentID || request.GetConfigurationRevision() != server.configurationRevision || !contains(server.instances, request.GetInstanceId()) {
+		return nil, errors.New("validation mismatch")
+	}
+	server.record("validate:" + request.GetInstanceId())
+	return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: true, DatabaseVersion: "8.4.0", DatabaseEdition: "community", Capabilities: []string{"metrics.collect"}}, nil
+}
+
+func (server *runtimeServer) CollectNow(_ context.Context, request *pluginv1.CollectPluginMetricsRequest) (*pluginv1.CollectPluginMetricsResponse, error) {
+	if request.GetAssignmentId() != server.assignmentID || request.GetConfigurationRevision() != server.configurationRevision {
+		return nil, errors.New("collect mismatch")
+	}
+	batches := make([]*pluginv1.PluginMetricBatch, 0, len(request.GetInstanceIds())*len(request.GetTemplateIds()))
+	for _, instanceID := range request.GetInstanceIds() {
+		for _, templateID := range request.GetTemplateIds() {
+			batches = append(batches, server.batch(instanceID, templateID, server.nextSequence(instanceID, templateID)))
+		}
+	}
+	server.record("collect")
+	return &pluginv1.CollectPluginMetricsResponse{Batches: batches}, nil
+}
+
+func (server *runtimeServer) StreamMetrics(request *pluginv1.StreamPluginMetricsRequest, stream pluginv1.PluginRuntime_StreamMetricsServer) error {
+	if request.GetAssignmentId() != server.assignmentID || request.GetConfigurationRevision() != server.configurationRevision || len(request.GetResumeCursors()) != len(server.instances)*len(server.templates) {
+		return errors.New("resume coverage mismatch")
+	}
+	server.record(fmt.Sprintf("stream:%d:%d", len(request.GetResumeCursors()), request.GetResumeCursors()[0].GetSequence()))
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	if server.version == "1.2.0" {
+		time.Sleep(150 * time.Millisecond)
+		return errors.New("injected stream failure")
+	}
+	timer := time.NewTimer(1500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-stream.Context().Done():
+		return stream.Context().Err()
+	}
+	streamSequence := request.GetResumeCursors()[0].GetSequence() + 1
+	if err := stream.Send(server.batch(server.instances[0], server.templates[0], streamSequence)); err != nil {
+		return err
+	}
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+func (server *runtimeServer) batch(instanceID, templateID string, sequence uint64) *pluginv1.PluginMetricBatch {
+	now := server.collectedAt.Add(time.Duration(sequence) * time.Second)
+	return &pluginv1.PluginMetricBatch{PluginId: server.pluginID, PluginVersion: server.version, DatabaseFamily: server.family, DatabaseVariant: "mysql", InstanceId: instanceID, ConfigurationRevision: server.configurationRevision, TemplateId: templateID, TemplateRevision: 1, CollectedAt: timestamppb.New(now), Sequence: sequence, CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: float64(sequence), Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
+}
+
+func persistentCollectionTime(directory string, revision uint64) time.Time {
+	path := filepath.Join(directory, fmt.Sprintf("collection-%d.timestamp", revision))
+	if body, err := os.ReadFile(path); err == nil {
+		if value, parseErr := time.Parse(time.RFC3339Nano, string(body)); parseErr == nil {
+			return value.UTC()
+		}
+	}
+	value := time.Now().UTC().Truncate(time.Millisecond)
+	_ = os.WriteFile(path, []byte(value.Format(time.RFC3339Nano)), 0o600)
+	return value
+}
+
+func (server *runtimeServer) record(value string) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	file, err := os.OpenFile(filepath.Join(server.runtimeDirectory, "protocol.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = file.WriteString(value + "\n")
+	_ = file.Sync()
+	_ = file.Close()
 }
 
 func (server *runtimeServer) Handshake(_ context.Context, request *pluginv1.PluginHandshakeRequest) (*pluginv1.PluginHandshakeResponse, error) {
@@ -126,8 +232,47 @@ func (*runtimeServer) Shutdown(context.Context, *pluginv1.ShutdownPluginRequest)
 	return &pluginv1.ShutdownPluginResponse{Drained: true}, nil
 }
 
-func (*runtimeServer) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
+func (server *runtimeServer) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
+	server.mu.Lock()
+	for _, cursor := range request.GetCursors() {
+		key := pluginCursorKey(server.configurationRevision, cursor.GetInstanceId(), cursor.GetTemplateId())
+		if cursor.GetSequence() > server.cursors[key] {
+			server.cursors[key] = cursor.GetSequence()
+		}
+	}
+	encoded, _ := json.Marshal(server.cursors)
+	_ = os.WriteFile(filepath.Join(server.runtimeDirectory, "plugin-cursors.json"), encoded, 0o600)
+	server.mu.Unlock()
+	server.record(fmt.Sprintf("ack:%d", request.GetCursors()[0].GetSequence()))
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: request.GetCursors()}, nil
+}
+
+func (server *runtimeServer) nextSequence(instanceID, templateID string) uint64 {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.cursors[pluginCursorKey(server.configurationRevision, instanceID, templateID)] + 1
+}
+
+func pluginCursorKey(revision uint64, instanceID, templateID string) string {
+	return fmt.Sprintf("%d:%s:%s", revision, instanceID, templateID)
+}
+
+func loadPluginCursors(directory string) map[string]uint64 {
+	result := map[string]uint64{}
+	body, err := os.ReadFile(filepath.Join(directory, "plugin-cursors.json"))
+	if err == nil {
+		_ = json.Unmarshal(body, &result)
+	}
+	return result
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func arguments(values []string) (map[string]string, bool) {

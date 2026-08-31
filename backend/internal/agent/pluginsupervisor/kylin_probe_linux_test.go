@@ -19,13 +19,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"dbpilot.local/platform/internal/plugincatalog"
+	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/require"
 )
 
@@ -53,11 +56,15 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	require.NoError(t, err)
 	stateStore, err := pluginstate.NewFileStore(filepath.Join(root, "state"))
 	require.NoError(t, err)
+	spoolStore, err := spool.Open(filepath.Join(root, "spool"), spool.Limits{MaxBytes: 16 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, spoolStore.Close()) })
+	metricSpool := &probeMetricSpool{Store: spoolStore}
 	uid, gid, nonRoot := CurrentProcessIdentity()
 	require.True(t, nonRoot)
 	leasing := &probeLeaseClient{packages: map[string]probePackage{"artifact-1": stable, "artifact-2": failing, "artifact-3": crashing}}
 	processRunner := NewOSProcessRunner(OSProcessRunnerConfig{OutputLimit: 1024})
-	gateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: plugingateway.MetricScope{AgentID: "agent-1", HostID: "host-1"}, Timeout: 5 * time.Second})
+	gateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: plugingateway.MetricScope{AgentID: "agent-1", HostID: "host-1"}, Store: metricSpool, Timeout: time.Second})
 	require.NoError(t, gatewayErr)
 	newSupervisor := func() *PluginSupervisor {
 		supervisor, supervisorErr := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: filepath.Join(root, "runtime"), Store: stateStore, Installer: installer, Leases: leasing, Downloader: leasing, Processes: processRunner, Health: NewGatewayHealthChecker(gateway), UserID: uid, GroupID: gid, DrainTimeout: 3 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: 20 * time.Millisecond, RestartMaximum: 50 * time.Millisecond})
@@ -80,6 +87,29 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	require.Zero(t, linuxCapabilityValue(t, firstPID, "CapEff:"))
 	require.Zero(t, linuxCapabilityValue(t, firstPID, "CapAmb:"))
 	assertProbeLaunch(t, filepath.Join(root, "runtime", "mysql", "launch.json"), int(uid))
+	require.Eventually(t, func() bool {
+		return strings.Contains(string(requireReadFile(t, filepath.Join(root, "runtime", "mysql", "protocol.log"))), "stream:2")
+	}, time.Second, 20*time.Millisecond)
+
+	metricSpool.failNext.Store(true)
+	var streamRecovered pluginstate.FamilyState
+	var receipt spool.CursorReceipt
+	require.Eventually(t, func() bool {
+		var ok bool
+		streamRecovered, ok = stateStore.Get("mysql")
+		var found bool
+		receipt, found, _ = spoolStore.Cursor(context.Background(), "assignment-1\x001\x00template-1\x00mysql-1")
+		return ok && streamRecovered.ProcessState == pluginstate.ProcessRunning && streamRecovered.ProcessID > 0 && streamRecovered.ProcessID != firstPID && found && receipt.Sequence == 2
+	}, 8*time.Second, 20*time.Millisecond)
+	require.False(t, processExists(firstPID), "spool failure must terminate the monitored plugin process")
+	require.Equal(t, uint64(2), receipt.Sequence, "restart must resume the exact failed stream cursor")
+	protocolEvidence := string(requireReadFile(t, filepath.Join(root, "runtime", "mysql", "protocol.log")))
+	for _, evidence := range []string{"apply", "validate:mysql-1", "validate:mysql-2", "collect", "stream:2", "ack:1", "ack:2"} {
+		require.Contains(t, protocolEvidence, evidence)
+	}
+	require.Contains(t, protocolEvidence, "stream:2:1")
+	require.Contains(t, protocolEvidence, "stream:2:2", "lost spool write must restart from the exact durable sequence")
+	firstPID = streamRecovered.ProcessID
 
 	upgrade := probeRequest(failing, "artifact-2", "1.1.0", 2)
 	prepared, err = supervisor.Prepare(context.Background(), upgrade)
@@ -216,7 +246,20 @@ func probeContentDigest(entries map[string][]byte) [sha256.Size]byte {
 }
 
 func probeRequest(value probePackage, artifactID, version string, operation uint64) ReconcileRequest {
-	return ReconcileRequest{AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", DesiredVersion: version, DesiredState: DesiredRunning, ArtifactID: artifactID, ArtifactSHA256: append([]byte(nil), value.artifactDigest[:]...), ManifestDigest: append([]byte(nil), value.manifestDigest[:]...), ConfigurationRevision: operation, OperationRevision: operation, InstanceIDs: []string{"mysql-1", "mysql-2"}, TemplateIDs: []string{"template-1"}}
+	template := &pluginv1.MetricTemplateConfiguration{TemplateId: "template-1", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, sha256.Size), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}}
+	return ReconcileRequest{AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", DesiredVersion: version, DesiredState: DesiredRunning, ArtifactID: artifactID, ArtifactSHA256: append([]byte(nil), value.artifactDigest[:]...), ManifestDigest: append([]byte(nil), value.manifestDigest[:]...), ConfigurationRevision: operation, OperationRevision: operation, InstanceIDs: []string{"mysql-1", "mysql-2"}, InstanceDescriptors: []InstanceDescriptor{{InstanceID: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}, {InstanceID: "mysql-2", DatabaseVariant: "mysql", UnixSocket: "/run/mysql-2.sock"}}, TemplateIDs: []string{"template-1"}, TemplateConfigurations: []*pluginv1.MetricTemplateConfiguration{template}, CredentialsComplete: true}
+}
+
+type probeMetricSpool struct {
+	*spool.Store
+	failNext atomic.Bool
+}
+
+func (value *probeMetricSpool) AppendWithCursor(ctx context.Context, class spool.DataClass, batch spool.Batch, receipt spool.CursorReceipt) (spool.CursorAppendResult, error) {
+	if value.failNext.Swap(false) {
+		return 0, errors.New("injected spool failure")
+	}
+	return value.Store.AppendWithCursor(ctx, class, batch, receipt)
 }
 
 func linuxCapabilityValue(t *testing.T, pid int, name string) uint64 {
