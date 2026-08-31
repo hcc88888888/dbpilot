@@ -79,7 +79,7 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		value := command.ReconcilePlugin
-		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) || !validPluginDescriptors(value.GetInstanceIds(), value.GetInstanceDescriptors()) {
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) || !validPluginDescriptorShape(value) {
 			return ErrInvalidCommand
 		}
 		targets = value.GetInstanceIds()
@@ -103,6 +103,14 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	}
 	return nil
+}
+
+func validPluginDescriptorShape(value *agentv1.ReconcilePlugin) bool {
+	requires := value.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || value.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_INSTALLED
+	if requires {
+		return validPluginDescriptors(value.GetInstanceIds(), value.GetInstanceDescriptors())
+	}
+	return len(value.GetInstanceDescriptors()) == 0
 }
 
 // ValidateStart enforces the execution fence and bounded authorization window

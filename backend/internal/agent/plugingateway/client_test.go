@@ -198,6 +198,130 @@ func TestACKFailureRetainsReceiptAndExactRestartRetryReACKsWithoutAppend(t *test
 	require.Equal(t, []uint64{7, 7, 8}, ackClient.sequences())
 }
 
+func TestFailedACKDurablyFencesAlreadyQueuedNextSequence(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	store, err := spool.Open(filepath.Join(root, "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	client, err := NewClient(ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: MetricScope{AgentID: "agent-1", HostID: "host-1"}, Store: store, Now: func() time.Time { return now }})
+	require.NoError(t, err)
+	session := configuredTestSession(client)
+	ackClient := newPendingFenceACKClient()
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() {
+		firstDone <- session.appendAndAcknowledge(context.Background(), testBatch(now, 7, 1), store, ackClient)
+	}()
+	<-ackClient.firstBlocked
+	go func() {
+		secondDone <- session.appendAndAcknowledge(context.Background(), testBatch(now, 8, 2), store, ackClient)
+	}()
+	close(ackClient.firstRelease)
+	require.Error(t, <-firstDone)
+	<-ackClient.retryBlocked
+	pending, err := store.Pending(context.Background(), spool.Metric, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.Contains(t, pending[0].ID, "-7")
+	receipt, found, err := store.Cursor(context.Background(), "assignment-1\x004\x00builtin\x00mysql-1")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, receipt.ACKPending)
+	select {
+	case sequence := <-ackClient.laterACK:
+		t.Fatalf("ACK %d advanced while durable ACK 7 was pending", sequence)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(ackClient.retryRelease)
+	require.NoError(t, <-secondDone)
+	require.Equal(t, []uint64{7, 7, 8}, ackClient.sequences())
+	pending, err = store.Pending(context.Background(), spool.Metric, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 2)
+	receipt, found, err = store.Cursor(context.Background(), "assignment-1\x004\x00builtin\x00mysql-1")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(8), receipt.Sequence)
+	require.False(t, receipt.ACKPending)
+}
+
+func TestCrashWindowAfterPluginACKBeforeDurableMarkSafelyReACKs(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	limits := spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 20}
+	store, err := spool.Open(filepath.Join(root, "spool"), limits)
+	require.NoError(t, err)
+	failingSink := &markFailingSink{Store: store, fail: true}
+	client, err := NewClient(ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: MetricScope{AgentID: "agent-1", HostID: "host-1"}, Store: failingSink, Now: func() time.Time { return now }})
+	require.NoError(t, err)
+	session := configuredTestSession(client)
+	ackClient := newOrderedACKClient(0)
+	require.Error(t, session.appendAndAcknowledge(context.Background(), testBatch(now, 7, 1), failingSink, ackClient))
+	receipt, found, err := store.Cursor(context.Background(), "assignment-1\x004\x00builtin\x00mysql-1")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, receipt.ACKPending)
+	require.NoError(t, store.Close())
+
+	store, err = spool.Open(filepath.Join(root, "spool"), limits)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	restartedClient, err := NewClient(ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: MetricScope{AgentID: "agent-1", HostID: "host-1"}, Store: store, Now: func() time.Time { return now }})
+	require.NoError(t, err)
+	restarted := configuredTestSession(restartedClient)
+	require.NoError(t, restarted.appendAndAcknowledge(context.Background(), testBatch(now, 7, 1), store, ackClient))
+	require.Equal(t, []uint64{7, 7}, ackClient.sequences())
+	pending, err := store.Pending(context.Background(), spool.Metric, 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+}
+
+type markFailingSink struct {
+	*spool.Store
+	fail bool
+}
+
+func (sink *markFailingSink) MarkCursorAcknowledged(ctx context.Context, key string, sequence uint64) error {
+	if sink.fail {
+		sink.fail = false
+		return errors.New("injected durable ACK mark failure")
+	}
+	return sink.Store.MarkCursorAcknowledged(ctx, key, sequence)
+}
+
+type pendingFenceACKClient struct {
+	orderedACKClient
+	firstBlocked chan struct{}
+	firstRelease chan struct{}
+	retryBlocked chan struct{}
+	retryRelease chan struct{}
+	laterACK     chan uint64
+}
+
+func newPendingFenceACKClient() *pendingFenceACKClient {
+	return &pendingFenceACKClient{orderedACKClient: *newOrderedACKClient(0), firstBlocked: make(chan struct{}), firstRelease: make(chan struct{}), retryBlocked: make(chan struct{}), retryRelease: make(chan struct{}), laterACK: make(chan uint64, 1)}
+}
+
+func (client *pendingFenceACKClient) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest, _ ...grpc.CallOption) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
+	sequence := request.GetCursors()[0].GetSequence()
+	client.mu.Lock()
+	client.acks = append(client.acks, sequence)
+	call := len(client.acks)
+	client.mu.Unlock()
+	switch call {
+	case 1:
+		close(client.firstBlocked)
+		<-client.firstRelease
+		return nil, errors.New("injected ACK response loss")
+	case 2:
+		close(client.retryBlocked)
+		<-client.retryRelease
+	default:
+		client.laterACK <- sequence
+	}
+	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: request.GetCursors()}, nil
+}
+
 type orderedACKClient struct {
 	mu            sync.Mutex
 	acks          []uint64
@@ -329,6 +453,7 @@ func (allCursorSink) AppendWithCursor(context.Context, spool.DataClass, spool.Ba
 func (allCursorSink) Cursor(_ context.Context, key string) (spool.CursorReceipt, bool, error) {
 	return spool.CursorReceipt{Key: key, Sequence: 1, Digest: bytes.Repeat([]byte{1}, 32), CollectedAt: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)}, true, nil
 }
+func (allCursorSink) MarkCursorAcknowledged(context.Context, string, uint64) error { return nil }
 
 func canonicalPairFixture(instanceCount, templateCount int) (map[string]*pluginv1.PluginInstanceConfiguration, []*pluginv1.MetricTemplateConfiguration) {
 	templates := make([]*pluginv1.MetricTemplateConfiguration, templateCount)
@@ -458,4 +583,7 @@ func (sink *recordingMetricSink) AppendWithCursor(_ context.Context, _ spool.Dat
 
 func (sink *recordingMetricSink) Cursor(context.Context, string) (spool.CursorReceipt, bool, error) {
 	return spool.CursorReceipt{}, false, nil
+}
+func (sink *recordingMetricSink) MarkCursorAcknowledged(context.Context, string, uint64) error {
+	return nil
 }

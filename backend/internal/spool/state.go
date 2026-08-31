@@ -18,12 +18,13 @@ import (
 )
 
 var (
-	ErrInvalidRoot    = errors.New("invalid spool root")
-	ErrAuditCapacity  = errors.New("audit spool capacity exhausted")
-	ErrNoActivePolicy = errors.New("no active policy")
-	ErrNoCheckpoint   = errors.New("no checkpoint")
-	ErrClosed         = errors.New("spool closed")
-	ErrCursorConflict = errors.New("spool cursor conflicts with durable receipt")
+	ErrInvalidRoot      = errors.New("invalid spool root")
+	ErrAuditCapacity    = errors.New("audit spool capacity exhausted")
+	ErrNoActivePolicy   = errors.New("no active policy")
+	ErrNoCheckpoint     = errors.New("no checkpoint")
+	ErrClosed           = errors.New("spool closed")
+	ErrCursorConflict   = errors.New("spool cursor conflicts with durable receipt")
+	ErrCursorACKPending = errors.New("spool cursor acknowledgement is pending")
 )
 
 const (
@@ -78,10 +79,15 @@ type Batch struct {
 // sequence. The receipt outlives delivery acknowledgement so the same logical
 // sequence can never be accepted with different bytes after restart.
 type CursorReceipt struct {
-	Key         string
-	Sequence    uint64
-	Digest      []byte
-	CollectedAt time.Time
+	Key                   string
+	AssignmentID          string
+	ConfigurationRevision uint64
+	TemplateID            string
+	InstanceID            string
+	Sequence              uint64
+	Digest                []byte
+	CollectedAt           time.Time
+	ACKPending            bool
 }
 
 type CursorAppendResult uint8

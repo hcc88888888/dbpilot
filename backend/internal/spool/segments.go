@@ -43,10 +43,16 @@ type recordHeader struct {
 }
 
 type persistedCursorReceipt struct {
-	Key         string    `json:"key"`
-	Sequence    uint64    `json:"sequence"`
-	Digest      []byte    `json:"digest"`
-	CollectedAt time.Time `json:"collected_at"`
+	Version               uint8     `json:"version"`
+	Key                   string    `json:"key"`
+	AssignmentID          string    `json:"assignment_id"`
+	ConfigurationRevision uint64    `json:"configuration_revision"`
+	TemplateID            string    `json:"template_id"`
+	InstanceID            string    `json:"instance_id"`
+	Sequence              uint64    `json:"sequence"`
+	Digest                []byte    `json:"digest"`
+	CollectedAt           time.Time `json:"collected_at"`
+	ACKPending            bool      `json:"ack_pending"`
 }
 
 type entry struct {
@@ -74,7 +80,7 @@ func (s *Store) AppendWithCursor(ctx context.Context, class DataClass, batch Bat
 	if !validCursorReceipt(receipt) || !bytes.Equal(payloadDigest[:], receipt.Digest) {
 		return 0, fmt.Errorf("invalid spool cursor receipt")
 	}
-	value := &persistedCursorReceipt{Key: receipt.Key, Sequence: receipt.Sequence, Digest: append([]byte(nil), receipt.Digest...), CollectedAt: receipt.CollectedAt.UTC()}
+	value := &persistedCursorReceipt{Version: 1, Key: receipt.Key, AssignmentID: receipt.AssignmentID, ConfigurationRevision: receipt.ConfigurationRevision, TemplateID: receipt.TemplateID, InstanceID: receipt.InstanceID, Sequence: receipt.Sequence, Digest: append([]byte(nil), receipt.Digest...), CollectedAt: receipt.CollectedAt.UTC(), ACKPending: true}
 	return s.append(ctx, class, batch, value)
 }
 
@@ -96,7 +102,45 @@ func (s *Store) Cursor(ctx context.Context, key string) (CursorReceipt, bool, er
 	if err != nil || value == nil {
 		return CursorReceipt{}, false, err
 	}
-	return CursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC()}, true, nil
+	return publicCursorReceipt(value), true, nil
+}
+
+func (s *Store) MarkCursorAcknowledged(ctx context.Context, key string, sequence uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if key == "" || sequence == 0 {
+		return ErrCursorConflict
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return ErrClosed
+	}
+	current, err := loadCursorReceipt(s.db, key)
+	if err != nil || current == nil || current.Sequence != sequence {
+		return ErrCursorConflict
+	}
+	if !current.ACKPending {
+		return nil
+	}
+	current.ACKPending = false
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bucketCursorReceipt).Put([]byte(key), encoded) }); err != nil {
+		return err
+	}
+	for class := range s.entries {
+		for index := range s.entries[class] {
+			cursor := s.entries[class][index].cursor
+			if cursor != nil && cursor.Key == key && cursor.Sequence == sequence {
+				cursor.ACKPending = false
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) append(ctx context.Context, class DataClass, batch Batch, receipt *persistedCursorReceipt) (CursorAppendResult, error) {
@@ -117,6 +161,9 @@ func (s *Store) append(ctx context.Context, class DataClass, batch Batch, receip
 			return 0, err
 		}
 		if current != nil {
+			if current.ACKPending && receipt.Sequence > current.Sequence {
+				return 0, ErrCursorACKPending
+			}
 			if receipt.Sequence < current.Sequence || receipt.Sequence == current.Sequence && (!bytes.Equal(receipt.Digest, current.Digest) || !receipt.CollectedAt.Equal(current.CollectedAt)) || receipt.Sequence > current.Sequence && receipt.CollectedAt.Before(current.CollectedAt) {
 				return 0, ErrCursorConflict
 			}
@@ -723,18 +770,40 @@ func dedupKey(class DataClass, id string) []byte { return []byte(string(class) +
 func sequenceKey(sequence uint64) []byte         { return []byte(fmt.Sprintf("%020d", sequence)) }
 
 func validCursorReceipt(value CursorReceipt) bool {
-	return value.Key != "" && len(value.Key) <= 1024 && !strings.ContainsAny(value.Key, "\r\n") && value.Sequence > 0 && len(value.Digest) == sha256.Size && !value.CollectedAt.IsZero()
+	wantKey := value.AssignmentID + "\x00" + strconv.FormatUint(value.ConfigurationRevision, 10) + "\x00" + value.TemplateID + "\x00" + value.InstanceID
+	return value.Key == wantKey && len(value.Key) <= 1024 && !strings.ContainsAny(value.Key, "\r\n") && value.AssignmentID != "" && value.ConfigurationRevision > 0 && value.TemplateID != "" && value.InstanceID != "" && value.Sequence > 0 && len(value.Digest) == sha256.Size && !value.CollectedAt.IsZero()
 }
 
 func validPersistedCursorReceipt(value *persistedCursorReceipt) bool {
-	return value != nil && validCursorReceipt(CursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: value.Digest, CollectedAt: value.CollectedAt})
+	if value == nil {
+		return false
+	}
+	if value.Version == 0 {
+		parts := strings.Split(value.Key, "\x00")
+		if len(parts) != 4 {
+			return false
+		}
+		revision, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil || revision == 0 {
+			return false
+		}
+		value.Version, value.AssignmentID, value.ConfigurationRevision, value.TemplateID, value.InstanceID, value.ACKPending = 1, parts[0], revision, parts[2], parts[3], true
+	}
+	return value.Version == 1 && validCursorReceipt(publicCursorReceipt(value))
 }
 
 func clonePersistedCursor(value *persistedCursorReceipt) *persistedCursorReceipt {
 	if value == nil {
 		return nil
 	}
-	return &persistedCursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC()}
+	return &persistedCursorReceipt{Version: value.Version, Key: value.Key, AssignmentID: value.AssignmentID, ConfigurationRevision: value.ConfigurationRevision, TemplateID: value.TemplateID, InstanceID: value.InstanceID, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC(), ACKPending: value.ACKPending}
+}
+
+func publicCursorReceipt(value *persistedCursorReceipt) CursorReceipt {
+	if value == nil {
+		return CursorReceipt{}
+	}
+	return CursorReceipt{Key: value.Key, AssignmentID: value.AssignmentID, ConfigurationRevision: value.ConfigurationRevision, TemplateID: value.TemplateID, InstanceID: value.InstanceID, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC(), ACKPending: value.ACKPending}
 }
 
 func loadCursorReceipt(db *bolt.DB, key string) (*persistedCursorReceipt, error) {

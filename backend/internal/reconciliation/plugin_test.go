@@ -72,6 +72,26 @@ func TestPluginReconcilerWaitsWithoutCreatingJobForOldAgent(t *testing.T) {
 	require.Equal(t, 1, result.Enqueued)
 }
 
+func TestPluginReconcilerSchedulesDescriptorFreeSafetyCommandsForOldAgent(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	for _, desired := range []pluginassignment.DesiredState{pluginassignment.DesiredStopped, pluginassignment.DesiredAbsent} {
+		t.Run(string(desired), func(t *testing.T) {
+			assignment := reconcileAssignmentFixture(now)
+			assignment.DesiredState = desired
+			assignment.Observed = &pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 2, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision - 1, ObservationRevision: 1, ObservedAt: now}
+			repository := &memoryReconcileRepository{claims: []pluginassignment.ReconcileClaim{{Assignment: assignment, Token: "claim-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LeasedUntil: now.Add(time.Minute)}}}
+			result, err := NewPluginReconciler(repository, staticPluginCapabilities{supported: false}).Reconcile(context.Background(), now, 10)
+			require.NoError(t, err)
+			require.Equal(t, 1, result.Enqueued)
+			require.Zero(t, repository.descriptorCalls)
+			require.Len(t, repository.messages, 1)
+			envelope := new(agentv1.CommandEnvelope)
+			require.NoError(t, proto.Unmarshal(repository.messages[0].Payload, envelope))
+			require.Empty(t, envelope.GetReconcilePlugin().GetInstanceDescriptors())
+		})
+	}
+}
+
 type staticPluginCapabilities struct{ supported bool }
 
 func (value staticPluginCapabilities) Supports(_ string, required ...string) bool {
@@ -79,15 +99,17 @@ func (value staticPluginCapabilities) Supports(_ string, required ...string) boo
 }
 
 type memoryReconcileRepository struct {
-	claims        []pluginassignment.ReconcileClaim
-	jobs          []job.Job
-	messages      []job.OutboxMessage
-	waiting       int
-	waitingReason string
-	stored        *job.Job
+	claims          []pluginassignment.ReconcileClaim
+	jobs            []job.Job
+	messages        []job.OutboxMessage
+	waiting         int
+	waitingReason   string
+	descriptorCalls int
+	stored          *job.Job
 }
 
 func (repository *memoryReconcileRepository) LoadPluginInstanceDescriptors(_ context.Context, assignment pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error) {
+	repository.descriptorCalls++
 	if assignment.ID != "assignment-a" || assignment.Scope.TenantID != "tenant-a" || assignment.Scope.ProjectID != "project-a" || assignment.AgentID != "agent-a" || assignment.DatabaseFamily != "mysql" {
 		return nil, pluginassignment.ErrInvalid
 	}
@@ -127,7 +149,9 @@ func (repository *memoryReconcileRepository) FindScheduledJob(context.Context, p
 func TestReconcileAssignmentReturnsAuthoritativeStoredJobAtAdvancedClock(t *testing.T) {
 	now := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
 	assignment := reconcileAssignmentFixture(now)
-	stored, _, err := buildPluginJob(assignment, now)
+	descriptors, err := (&memoryReconcileRepository{}).LoadPluginInstanceDescriptors(context.Background(), assignment)
+	require.NoError(t, err)
+	stored, _, err := buildPluginJobWithDescriptors(assignment, descriptors, now)
 	require.NoError(t, err)
 	repository := &memoryReconcileRepository{stored: &stored}
 	got, err := NewPluginReconciler(repository).ReconcileAssignment(context.Background(), assignment, now.Add(8*time.Hour))

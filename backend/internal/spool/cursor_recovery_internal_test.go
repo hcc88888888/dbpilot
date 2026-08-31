@@ -41,4 +41,5 @@ func TestCursorRecoveryAfterSegmentFsyncBeforeBboltVisibilityCommit(t *testing.T
 	require.True(t, found)
 	require.Equal(t, uint64(7), persisted.Sequence)
 	require.Equal(t, digest[:], persisted.Digest)
+	require.True(t, persisted.ACKPending, "legacy receipt without ACK state must migrate conservatively")
 }

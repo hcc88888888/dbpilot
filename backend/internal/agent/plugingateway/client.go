@@ -41,6 +41,7 @@ var (
 type Spool interface {
 	AppendWithCursor(context.Context, spool.DataClass, spool.Batch, spool.CursorReceipt) (spool.CursorAppendResult, error)
 	Cursor(context.Context, string) (spool.CursorReceipt, bool, error)
+	MarkCursorAcknowledged(context.Context, string, uint64) error
 }
 
 type ClientConfig struct {
@@ -115,6 +116,7 @@ type ValidationResult struct {
 type MetricSink interface {
 	AppendWithCursor(context.Context, spool.DataClass, spool.Batch, spool.CursorReceipt) (spool.CursorAppendResult, error)
 	Cursor(context.Context, string) (spool.CursorReceipt, bool, error)
+	MarkCursorAcknowledged(context.Context, string, uint64) error
 }
 
 type cursorKey struct {
@@ -415,7 +417,11 @@ func (session *Session) resumeCursors(ctx context.Context, sink MetricSink) ([]*
 }
 
 func acknowledgeBatch(ctx context.Context, client pluginv1.PluginRuntimeClient, assignmentID string, revision uint64, batch *pluginv1.PluginMetricBatch) error {
-	cursors := []*pluginv1.PluginMetricCursor{{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()}}
+	return acknowledgeCursor(ctx, client, assignmentID, revision, &pluginv1.PluginMetricCursor{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()})
+}
+
+func acknowledgeCursor(ctx context.Context, client pluginv1.PluginRuntimeClient, assignmentID string, revision uint64, cursor *pluginv1.PluginMetricCursor) error {
+	cursors := []*pluginv1.PluginMetricCursor{cursor}
 	request := &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: assignmentID, ConfigurationRevision: revision, Cursors: cursors}
 	if proto.Size(request) > maxRPCMessageBytes {
 		return errGateway
@@ -487,12 +493,60 @@ func (session *Session) appendAndAcknowledge(ctx context.Context, batch *pluginv
 	}
 	lane.Lock()
 	defer lane.Unlock()
+	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: batch.GetConfigurationRevision(), TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
+	current, found, err := sink.Cursor(ctx, key.string())
+	if err != nil {
+		return errGateway
+	}
+	if found && current.ACKPending {
+		if batch.GetSequence() < current.Sequence {
+			return errGateway
+		}
+		if batch.GetSequence() == current.Sequence {
+			if err := session.appendBatchInLane(ctx, batch, sink); err != nil {
+				return err
+			}
+			return session.acknowledgeReceipt(ctx, sink, client, current)
+		}
+		if err := session.validateBatchInLane(batch); err != nil {
+			return err
+		}
+		if err := session.acknowledgeReceipt(ctx, sink, client, current); err != nil {
+			return err
+		}
+	}
 	if err := session.appendBatchInLane(ctx, batch, sink); err != nil {
 		return err
 	}
 	ackContext, cancel := context.WithTimeout(ctx, session.client.config.Timeout)
 	defer cancel()
-	return acknowledgeBatch(ackContext, client, session.expected.AssignmentID, batch.GetConfigurationRevision(), batch)
+	if err := acknowledgeBatch(ackContext, client, session.expected.AssignmentID, batch.GetConfigurationRevision(), batch); err != nil {
+		return err
+	}
+	return sink.MarkCursorAcknowledged(ctx, key.string(), batch.GetSequence())
+}
+
+func (session *Session) acknowledgeReceipt(ctx context.Context, sink MetricSink, client pluginv1.PluginRuntimeClient, receipt spool.CursorReceipt) error {
+	ackContext, cancel := context.WithTimeout(ctx, session.client.config.Timeout)
+	defer cancel()
+	if err := acknowledgeCursor(ackContext, client, receipt.AssignmentID, receipt.ConfigurationRevision, &pluginv1.PluginMetricCursor{InstanceId: receipt.InstanceID, TemplateId: receipt.TemplateID, Sequence: receipt.Sequence}); err != nil {
+		return err
+	}
+	return sink.MarkCursorAcknowledged(ctx, receipt.Key, receipt.Sequence)
+}
+
+func (session *Session) validateBatchInLane(batch *pluginv1.PluginMetricBatch) error {
+	session.mu.Lock()
+	if !session.isBatchConfigured(batch) {
+		session.mu.Unlock()
+		return errGateway
+	}
+	scope := session.metricScope(batch)
+	session.mu.Unlock()
+	if _, _, err := normalizeBatch(batch, scope, session.client.config.Now().UTC()); err != nil {
+		return errGateway
+	}
+	return nil
 }
 
 func (session *Session) batchLane(batch *pluginv1.PluginMetricBatch) (*sync.Mutex, error) {
@@ -531,7 +585,7 @@ func (session *Session) appendBatchInLane(ctx context.Context, batch *pluginv1.P
 		return errGateway
 	}
 	digest := sha256.Sum256(payload)
-	receipt := spool.CursorReceipt{Key: key.string(), Sequence: batch.GetSequence(), Digest: digest[:], CollectedAt: batch.GetCollectedAt().AsTime().UTC()}
+	receipt := spool.CursorReceipt{Key: key.string(), AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.configurationRevision, TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId(), Sequence: batch.GetSequence(), Digest: digest[:], CollectedAt: batch.GetCollectedAt().AsTime().UTC()}
 	if _, err := sink.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: id, SourceID: pluginMetricSourceID + ":" + session.expected.AssignmentID + ":" + batch.GetInstanceId(), CreatedAt: now, Priority: 1, Payload: payload}, receipt); err != nil {
 		return err
 	}

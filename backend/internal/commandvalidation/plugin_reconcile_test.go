@@ -51,4 +51,10 @@ func TestValidateReconcilePluginRequiresCanonicalBoundedArtifactAndConfiguration
 		})
 	}
 	require.ErrorIs(t, Validate(context.Background(), envelope, nil), ErrTargetUnauthorized)
+	for _, desired := range []agentv1.PluginDesiredState{agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_STOPPED, agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT} {
+		safety := proto.Clone(envelope).(*agentv1.CommandEnvelope)
+		safety.GetReconcilePlugin().DesiredState = desired
+		safety.GetReconcilePlugin().InstanceDescriptors = nil
+		require.NoError(t, Validate(context.Background(), safety, authorizer))
+	}
 }

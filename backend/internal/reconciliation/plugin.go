@@ -72,15 +72,18 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 		}
 		return job.Job{}, pluginassignment.ErrConflict
 	}
-	if !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
+	if requiresPluginDescriptors(claim.Assignment.DesiredState) && !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
 		if err := reconciler.repository.MarkWaiting(ctx, claim, PluginCapabilityWaitingReason); err != nil {
 			return job.Job{}, err
 		}
 		return job.Job{}, pluginassignment.ErrConflict
 	}
-	descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
-	if err != nil {
-		return job.Job{}, err
+	var descriptors []*agentv1.PluginInstanceDescriptor
+	if requiresPluginDescriptors(claim.Assignment.DesiredState) {
+		descriptors, err = reconciler.loadDescriptors(ctx, claim.Assignment)
+		if err != nil {
+			return job.Job{}, err
+		}
 	}
 	value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
 	if err != nil {
@@ -162,7 +165,7 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
-		if !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
+		if requiresPluginDescriptors(claim.Assignment.DesiredState) && !reconciler.supportsDescriptorReconcile(claim.Assignment.AgentID) {
 			if err := reconciler.repository.MarkWaiting(ctx, claim, PluginCapabilityWaitingReason); err != nil {
 				failures = append(failures, err)
 			} else {
@@ -170,10 +173,13 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
-		descriptors, err := reconciler.loadDescriptors(ctx, claim.Assignment)
-		if err != nil {
-			failures = append(failures, err)
-			continue
+		var descriptors []*agentv1.PluginInstanceDescriptor
+		if requiresPluginDescriptors(claim.Assignment.DesiredState) {
+			descriptors, err = reconciler.loadDescriptors(ctx, claim.Assignment)
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
 		}
 		value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
 		if err != nil {
@@ -198,6 +204,10 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 
 func (reconciler *PluginReconciler) supportsDescriptorReconcile(agentID string) bool {
 	return reconciler.capabilities == nil || reconciler.capabilities.Supports(agentID, PluginReconcileCapability, PluginInstanceDescriptorsCapability)
+}
+
+func requiresPluginDescriptors(state pluginassignment.DesiredState) bool {
+	return state == pluginassignment.DesiredRunning || state == pluginassignment.DesiredInstalled
 }
 
 func rolloutEligible(value pluginassignment.Assignment) bool {
@@ -229,7 +239,7 @@ func buildPluginJobWithDescriptors(assignment pluginassignment.Assignment, descr
 	if assignment.Validate() != nil || at.IsZero() || !assignment.NeedsReconcile() {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
-	if len(descriptors) != 0 && validateDescriptors(assignment, descriptors) != nil {
+	if requiresPluginDescriptors(assignment.DesiredState) && validateDescriptors(assignment, descriptors) != nil || !requiresPluginDescriptors(assignment.DesiredState) && len(descriptors) != 0 {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
 	artifactDigest, err := hex.DecodeString(assignment.ArtifactSHA256)

@@ -418,7 +418,12 @@ func commandCapabilities(envelope *agentv1.CommandEnvelope) []string {
 	case *agentv1.CommandEnvelope_CollectDiagnostic:
 		return []string{"collect_diagnostic"}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
-		return []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1"}
+		command := envelope.GetReconcilePlugin()
+		capabilities := []string{"plugin.reconcile.v1"}
+		if len(command.GetInstanceDescriptors()) > 0 || command.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || command.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_INSTALLED {
+			capabilities = append(capabilities, "plugin_reconcile.instance_descriptors.v1")
+		}
+		return capabilities
 	default:
 		return nil
 	}

@@ -108,7 +108,7 @@ func TestAppendWithCursorRetainsExactReceiptAfterAckAndReopen(t *testing.T) {
 	store, err := spool.Open(root, limits)
 	require.NoError(t, err)
 	digest := sha256.Sum256([]byte("first"))
-	receipt := spool.CursorReceipt{Key: "assignment-1\x004\x00template-1\x00instance-1", Sequence: 7, Digest: digest[:], CollectedAt: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)}
+	receipt := pluginCursorReceipt(7, digest[:], time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC))
 	original := spool.Batch{ID: "plugin-batch-7", SourceID: "plugin-runtime:assignment-1:instance-1", CreatedAt: receipt.CollectedAt, Payload: []byte("first")}
 
 	result, err := store.AppendWithCursor(ctx, spool.Metric, original, receipt)
@@ -125,6 +125,12 @@ func TestAppendWithCursorRetainsExactReceiptAfterAckAndReopen(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, receipt.Sequence, persisted.Sequence)
 	require.Equal(t, receipt.Digest, persisted.Digest)
+	require.True(t, persisted.ACKPending)
+	require.NoError(t, store.MarkCursorAcknowledged(ctx, receipt.Key, receipt.Sequence))
+	persisted, found, err = store.Cursor(ctx, receipt.Key)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.False(t, persisted.ACKPending)
 	result, err = store.AppendWithCursor(ctx, spool.Metric, original, receipt)
 	require.NoError(t, err)
 	require.Equal(t, spool.CursorAppendDuplicate, result)
@@ -143,7 +149,7 @@ func TestAppendWithCursorSerializesConcurrentSameSequence(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t, spool.Limits{MaxBytes: 8192, SegmentBytes: 1024})
 	digest := sha256.Sum256([]byte("first"))
-	receipt := spool.CursorReceipt{Key: "assignment-1\x004\x00template-1\x00instance-1", Sequence: 7, Digest: digest[:], CollectedAt: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)}
+	receipt := pluginCursorReceipt(7, digest[:], time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC))
 	batch := spool.Batch{ID: "plugin-batch-7", SourceID: "plugin-runtime:assignment-1:instance-1", CreatedAt: receipt.CollectedAt, Payload: []byte("first")}
 	results := make(chan spool.CursorAppendResult, 2)
 	errors := make(chan error, 2)
@@ -165,6 +171,33 @@ func TestAppendWithCursorSerializesConcurrentSameSequence(t *testing.T) {
 	require.NoError(t, <-errors)
 	require.NoError(t, <-errors)
 	require.ElementsMatch(t, []spool.CursorAppendResult{spool.CursorAppendStored, spool.CursorAppendDuplicate}, []spool.CursorAppendResult{first, second})
+}
+
+func TestPendingCursorFencesHigherSequenceUntilDurableAcknowledgement(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, spool.Limits{MaxBytes: 8192, SegmentBytes: 1024})
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	firstPayload := []byte("first")
+	firstDigest := sha256.Sum256(firstPayload)
+	first := pluginCursorReceipt(7, firstDigest[:], now)
+	_, err := store.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: "batch-7", SourceID: "source", CreatedAt: now, Payload: firstPayload}, first)
+	require.NoError(t, err)
+	secondPayload := []byte("second")
+	secondDigest := sha256.Sum256(secondPayload)
+	second := pluginCursorReceipt(8, secondDigest[:], now.Add(time.Second))
+	_, err = store.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: "batch-8", SourceID: "source", CreatedAt: now, Payload: secondPayload}, second)
+	require.ErrorIs(t, err, spool.ErrCursorACKPending)
+	require.NoError(t, store.MarkCursorAcknowledged(ctx, first.Key, first.Sequence))
+	_, err = store.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: "batch-8", SourceID: "source", CreatedAt: now, Payload: secondPayload}, second)
+	require.NoError(t, err)
+	persisted, found, err := store.Cursor(ctx, second.Key)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, persisted.ACKPending)
+}
+
+func pluginCursorReceipt(sequence uint64, digest []byte, collectedAt time.Time) spool.CursorReceipt {
+	return spool.CursorReceipt{Key: "assignment-1\x004\x00template-1\x00instance-1", AssignmentID: "assignment-1", ConfigurationRevision: 4, TemplateID: "template-1", InstanceID: "instance-1", Sequence: sequence, Digest: digest, CollectedAt: collectedAt}
 }
 
 func TestSegmentRotationAndRecoveryTruncatesIncompleteFinalRecord(t *testing.T) {
