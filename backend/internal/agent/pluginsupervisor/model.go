@@ -14,7 +14,9 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginstate"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -56,19 +58,21 @@ const (
 )
 
 type ReconcileRequest struct {
-	AssignmentID          string
-	PluginID              string
-	DatabaseFamily        string
-	DesiredVersion        string
-	DesiredState          DesiredState
-	ArtifactID            string
-	ArtifactSHA256        []byte
-	ManifestDigest        []byte
-	ConfigurationRevision uint64
-	OperationRevision     uint64
-	InstanceIDs           []string
-	InstanceDescriptors   []InstanceDescriptor
-	TemplateIDs           []string
+	AssignmentID           string
+	PluginID               string
+	DatabaseFamily         string
+	DesiredVersion         string
+	DesiredState           DesiredState
+	ArtifactID             string
+	ArtifactSHA256         []byte
+	ManifestDigest         []byte
+	ConfigurationRevision  uint64
+	OperationRevision      uint64
+	InstanceIDs            []string
+	InstanceDescriptors    []InstanceDescriptor
+	TemplateIDs            []string
+	TemplateConfigurations []*pluginv1.MetricTemplateConfiguration
+	CredentialsComplete    bool
 }
 
 // InstanceDescriptor is the non-secret, canonical routing projection supplied
@@ -83,7 +87,7 @@ type InstanceDescriptor struct {
 func (request ReconcileRequest) Validate() error {
 	if !resourceIdentifier.MatchString(request.AssignmentID) || !familyIdentifier.MatchString(request.PluginID) || !familyIdentifier.MatchString(request.DatabaseFamily) ||
 		request.ConfigurationRevision == 0 || request.OperationRevision == 0 || len(request.InstanceIDs) > MaxAssignedInstances || len(request.TemplateIDs) > MaxAssignedTemplates ||
-		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) || !validInstanceDescriptors(request.InstanceIDs, request.InstanceDescriptors) {
+		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) || !validInstanceDescriptors(request.InstanceIDs, request.InstanceDescriptors) || !validTemplateConfigurations(request.TemplateIDs, request.TemplateConfigurations) || request.CredentialsComplete && len(request.TemplateConfigurations) == 0 {
 		return ErrInvalidRequest
 	}
 	switch request.DesiredState {
@@ -127,6 +131,16 @@ func (request ReconcileRequest) Fingerprint() string {
 	}
 	values = append(values, "templates", strconv.Itoa(len(templates)))
 	values = append(values, templates...)
+	values = append(values, "credentials_complete", strconv.FormatBool(request.CredentialsComplete))
+	configurations := append([]*pluginv1.MetricTemplateConfiguration(nil), request.TemplateConfigurations...)
+	sort.Slice(configurations, func(left, right int) bool {
+		return configurations[left].GetTemplateId() < configurations[right].GetTemplateId()
+	})
+	values = append(values, "template_configurations", strconv.Itoa(len(configurations)))
+	for _, configuration := range configurations {
+		encoded, _ := proto.MarshalOptions{Deterministic: true}.Marshal(configuration)
+		values = append(values, hex.EncodeToString(encoded))
+	}
 	hash := sha256.New()
 	for _, value := range values {
 		_, _ = io.WriteString(hash, strconv.Itoa(len(value))+":"+value)
@@ -201,13 +215,16 @@ type ArtifactDownloader interface {
 }
 
 type InstalledSlot struct {
-	Slot             pluginstate.Slot
-	Version          string
-	ExecutablePath   string
-	ExecutableSHA256 string
-	ManifestPath     string
-	ArtifactSHA256   string
-	ManifestDigest   string
+	Slot                        pluginstate.Slot
+	Version                     string
+	ExecutablePath              string
+	ExecutableSHA256            string
+	ManifestPath                string
+	ArtifactSHA256              string
+	ManifestDigest              string
+	SupportedVariants           []string
+	Capabilities                []string
+	MetricTemplateSchemaVersion uint32
 }
 
 type InstallRequest struct {
@@ -275,22 +292,27 @@ type ProcessRunner interface {
 }
 
 type HealthRequest struct {
-	AssignmentID          string
-	PluginID              string
-	DatabaseFamily        string
-	Version               string
-	ProtocolVersion       string
-	ExecutableSHA256      []byte
-	ExecutablePath        string
-	ConfigurationRevision uint64
-	OperationRevision     uint64
-	InstanceIDs           []string
-	InstanceDescriptors   []InstanceDescriptor
-	TemplateIDs           []string
-	RuntimeDirectory      string
-	LaunchNonce           []byte
-	ExpectedUserID        uint32
-	ExpectedGroupID       uint32
+	AssignmentID                string
+	PluginID                    string
+	DatabaseFamily              string
+	Version                     string
+	ProtocolVersion             string
+	ExecutableSHA256            []byte
+	ExecutablePath              string
+	ConfigurationRevision       uint64
+	OperationRevision           uint64
+	InstanceIDs                 []string
+	InstanceDescriptors         []InstanceDescriptor
+	TemplateIDs                 []string
+	SupportedVariants           []string
+	SignedCapabilities          []string
+	MetricTemplateSchemaVersion uint32
+	TemplateConfigurations      []*pluginv1.MetricTemplateConfiguration
+	CredentialsComplete         bool
+	RuntimeDirectory            string
+	LaunchNonce                 []byte
+	ExpectedUserID              uint32
+	ExpectedGroupID             uint32
 }
 
 type HealthChecker interface {
@@ -356,6 +378,37 @@ func validInstanceDescriptors(instanceIDs []string, descriptors []InstanceDescri
 			return false
 		}
 		seen[descriptor.InstanceID] = struct{}{}
+	}
+	return true
+}
+
+func validTemplateConfigurations(templateIDs []string, values []*pluginv1.MetricTemplateConfiguration) bool {
+	if len(values) == 0 {
+		return true
+	}
+	if len(values) != len(templateIDs) || len(values) > MaxAssignedTemplates {
+		return false
+	}
+	allowed, seen := map[string]struct{}{}, map[string]struct{}{}
+	totalBytes := 0
+	for _, id := range templateIDs {
+		allowed[id] = struct{}{}
+	}
+	for _, value := range values {
+		totalBytes += proto.Size(value)
+		if value == nil || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || strings.ContainsAny(value.GetReadOnlyStatement(), "\x00\r") || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || len(value.GetValueMappings()) == 0 || len(value.GetValueMappings()) > 32 || len(value.GetLabelMappings()) > 16 {
+			return false
+		}
+		if totalBytes > 256<<10 {
+			return false
+		}
+		if _, ok := allowed[value.GetTemplateId()]; !ok {
+			return false
+		}
+		if _, duplicate := seen[value.GetTemplateId()]; duplicate {
+			return false
+		}
+		seen[value.GetTemplateId()] = struct{}{}
 	}
 	return true
 }

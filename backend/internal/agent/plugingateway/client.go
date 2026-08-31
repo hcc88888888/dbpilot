@@ -38,16 +38,12 @@ var (
 )
 
 type Spool interface {
-	Append(context.Context, spool.DataClass, spool.Batch) error
-}
-
-type spoolLookup interface {
-	Lookup(context.Context, spool.DataClass, string, []byte) (found bool, matches bool, err error)
+	AppendWithCursor(context.Context, spool.DataClass, spool.Batch, spool.CursorReceipt) (spool.CursorAppendResult, error)
+	Cursor(context.Context, string) (spool.CursorReceipt, bool, error)
 }
 
 type ClientConfig struct {
 	RuntimeRoot string
-	CursorRoot  string
 	Scope       MetricScope
 	Store       Spool
 	Timeout     time.Duration
@@ -55,8 +51,7 @@ type ClientConfig struct {
 }
 
 type Client struct {
-	config  ClientConfig
-	cursors *CursorStore
+	config ClientConfig
 }
 
 // MetricSink returns the Agent-owned durable spool configured for this
@@ -72,22 +67,26 @@ func (client *Client) MetricSink() MetricSink {
 // ExpectedPlugin comes only from the Supervisor's launch result, never from a
 // plugin response or control-plane supplied socket address.
 type ExpectedPlugin struct {
-	PID                   int
-	ExpectedUserID        uint32
-	ExpectedGroupID       uint32
-	RuntimeDirectory      string
-	AssignmentID          string
-	PluginID              string
-	DatabaseFamily        string
-	Version               string
-	ProtocolVersion       string
-	ExecutablePath        string
-	ExecutableSHA256      []byte
-	LaunchNonce           []byte
-	ConfigurationRevision uint64
-	OperationRevision     uint64
-	InstanceIDs           []string
-	TemplateIDs           []string
+	PID                         int
+	ExpectedUserID              uint32
+	ExpectedGroupID             uint32
+	RuntimeDirectory            string
+	AssignmentID                string
+	PluginID                    string
+	DatabaseFamily              string
+	Version                     string
+	ProtocolVersion             string
+	ExecutablePath              string
+	ExecutableSHA256            []byte
+	LaunchNonce                 []byte
+	ConfigurationRevision       uint64
+	OperationRevision           uint64
+	InstanceIDs                 []string
+	TemplateIDs                 []string
+	SupportedVariants           []string
+	SignedCapabilities          []string
+	MetricTemplateSchemaVersion uint32
+	TemplateConfigurations      []*pluginv1.MetricTemplateConfiguration
 }
 
 type Capabilities struct {
@@ -113,7 +112,23 @@ type ValidationResult struct {
 }
 
 type MetricSink interface {
-	Append(context.Context, spool.DataClass, spool.Batch) error
+	AppendWithCursor(context.Context, spool.DataClass, spool.Batch, spool.CursorReceipt) (spool.CursorAppendResult, error)
+	Cursor(context.Context, string) (spool.CursorReceipt, bool, error)
+}
+
+type cursorKey struct {
+	AssignmentID          string
+	ConfigurationRevision uint64
+	TemplateID            string
+	InstanceID            string
+}
+
+func (key cursorKey) string() string {
+	return key.AssignmentID + "\x00" + stringRevision(key.ConfigurationRevision) + "\x00" + key.TemplateID + "\x00" + key.InstanceID
+}
+
+func stringRevision(value uint64) string {
+	return fmt.Sprintf("%d", value)
 }
 
 type Session struct {
@@ -123,11 +138,10 @@ type Session struct {
 	handshaken            bool
 	configurationRevision uint64
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
-	handshakeCapabilities []string
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
-	if !filepath.IsAbs(config.RuntimeRoot) || filepath.Clean(config.RuntimeRoot) != config.RuntimeRoot || !filepath.IsAbs(config.CursorRoot) || filepath.Clean(config.CursorRoot) != config.CursorRoot || config.Scope.validateAgent() != nil || config.Timeout < 0 || config.Timeout > time.Minute {
+	if !filepath.IsAbs(config.RuntimeRoot) || filepath.Clean(config.RuntimeRoot) != config.RuntimeRoot || config.Scope.validateAgent() != nil || config.Timeout < 0 || config.Timeout > time.Minute {
 		return nil, errGateway
 	}
 	if config.Timeout == 0 {
@@ -136,11 +150,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	cursors, err := NewCursorStore(config.CursorRoot)
-	if err != nil {
-		return nil, errGateway
-	}
-	return &Client{config: config, cursors: cursors}, nil
+	return &Client{config: config}, nil
 }
 
 func (client *Client) Open(expected ExpectedPlugin) (*Session, error) {
@@ -161,7 +171,7 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 			return errGateway
 		}
 		response, err := client.Handshake(callContext, &pluginv1.PluginHandshakeRequest{ExpectedPluginId: session.expected.PluginID, ExpectedDatabaseFamily: session.expected.DatabaseFamily, ExpectedVersion: session.expected.Version, ExpectedProtocolVersion: session.expected.ProtocolVersion, LaunchNonceChallenge: challenge})
-		if err != nil || !validHandshake(response, session.expected, challenge) {
+		if err != nil || !validHandshake(response, session.expected, challenge) || !matchesSignedManifest(response, session.expected) {
 			return errGateway
 		}
 		variants, capabilities, versionRange := boundedSorted(response.GetSupportedVariants(), 64), boundedSorted(response.GetCapabilities(), 64), boundedText(response.GetDatabaseVersionRange(), 128)
@@ -176,7 +186,6 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 	}
 	session.mu.Lock()
 	session.handshaken = true
-	session.handshakeCapabilities = append([]string(nil), result.Capabilities...)
 	session.mu.Unlock()
 	return result, nil
 }
@@ -238,11 +247,10 @@ func (session *Session) ValidateInstance(ctx context.Context, instanceID string)
 	var result ValidationResult
 	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.ValidateInstance(callContext, &pluginv1.ValidatePluginInstanceRequest{AssignmentId: session.expected.AssignmentID, InstanceId: instanceID, ConfigurationRevision: session.currentRevision()})
-		capabilities, databaseVersion, databaseEdition := boundedSorted(response.GetCapabilities(), 64), boundedText(response.GetDatabaseVersion(), 128), boundedText(response.GetDatabaseEdition(), 128)
-		if err != nil || response.GetInstanceId() != instanceID || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersion() != "" && databaseVersion == "" || response.GetDatabaseEdition() != "" && databaseEdition == "" {
+		if err != nil || !validValidationResponse(response, instanceID, session.expected.SignedCapabilities) {
 			return errGateway
 		}
-		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: databaseVersion, DatabaseEdition: databaseEdition, Capabilities: intersectCapabilities(capabilities, session.handshakeCapabilities), ErrorCode: fixedPluginCode(response.GetErrorCode())}
+		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: response.GetDatabaseVersion(), DatabaseEdition: response.GetDatabaseEdition(), Capabilities: boundedSorted(response.GetCapabilities(), 64), ErrorCode: fixedPluginCode(response.GetErrorCode())}
 		return nil
 	})
 	return result, err
@@ -270,33 +278,149 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 			if err := session.appendBatch(callContext, batch, session.client.config.Store); err != nil {
 				return err
 			}
+			if err := acknowledgeBatch(callContext, client, session.expected.AssignmentID, session.currentRevision(), batch); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
 }
 
 func (session *Session) RunMetricStream(ctx context.Context, sink MetricSink) error {
+	return session.runMetricStream(ctx, sink, nil)
+}
+
+// RunMetricStreamReady reports readiness only after the verified stream has
+// received server headers. Dial/header setup is bounded by the unary timeout;
+// the receive loop is owned solely by the Supervisor lifetime context.
+func (session *Session) RunMetricStreamReady(ctx context.Context, sink MetricSink, ready chan<- error) error {
+	return session.runMetricStream(ctx, sink, ready)
+}
+
+func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, ready chan<- error) error {
 	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || !session.isConfigured() {
+		reportStreamReady(ready, errGateway)
 		return errGateway
 	}
-	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
-		stream, err := client.StreamMetrics(callContext, &pluginv1.StreamPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision()})
-		if err != nil {
+	dialContext, dialCancel := context.WithTimeout(ctx, session.client.config.Timeout)
+	connection, err := dialVerifiedPlugin(dialContext, session.client.config.RuntimeRoot, session.expected)
+	dialCancel()
+	if err != nil {
+		reportStreamReady(ready, errGateway)
+		return errGateway
+	}
+	defer connection.Close()
+	streamContext, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+	resume, err := session.resumeCursors(streamContext, sink)
+	if err != nil {
+		reportStreamReady(ready, errGateway)
+		return errGateway
+	}
+	runtimeClient := pluginv1.NewPluginRuntimeClient(connection)
+	stream, err := runtimeClient.StreamMetrics(streamContext, &pluginv1.StreamPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), ResumeCursors: resume})
+	if err != nil {
+		reportStreamReady(ready, errGateway)
+		return errGateway
+	}
+	headerResult := make(chan error, 1)
+	go func() {
+		_, headerErr := stream.Header()
+		headerResult <- headerErr
+	}()
+	headerTimer := time.NewTimer(session.client.config.Timeout)
+	defer headerTimer.Stop()
+	select {
+	case headerErr := <-headerResult:
+		if headerErr != nil {
+			reportStreamReady(ready, errGateway)
 			return errGateway
 		}
-		for {
-			batch, receiveErr := stream.Recv()
-			if errors.Is(receiveErr, io.EOF) {
-				return errGateway
+	case <-headerTimer.C:
+		reportStreamReady(ready, errGateway)
+		return errGateway
+	case <-ctx.Done():
+		reportStreamReady(ready, errGateway)
+		return errGateway
+	}
+	reportStreamReady(ready, nil)
+	for {
+		batch, receiveErr := stream.Recv()
+		if errors.Is(receiveErr, io.EOF) || receiveErr != nil {
+			return errGateway
+		}
+		if err := session.appendBatch(streamContext, batch, sink); err != nil {
+			return err
+		}
+		ackContext, ackCancel := context.WithTimeout(streamContext, session.client.config.Timeout)
+		ackErr := acknowledgeBatch(ackContext, runtimeClient, session.expected.AssignmentID, session.currentRevision(), batch)
+		ackCancel()
+		if ackErr != nil {
+			return ackErr
+		}
+	}
+}
+
+func reportStreamReady(ready chan<- error, err error) {
+	if ready != nil {
+		ready <- err
+	}
+}
+
+func (session *Session) resumeCursors(ctx context.Context, sink MetricSink) ([]*pluginv1.PluginMetricCursor, error) {
+	if session == nil || ctx == nil || sink == nil {
+		return nil, errGateway
+	}
+	instanceIDs := append([]string(nil), session.expected.InstanceIDs...)
+	sort.Strings(instanceIDs)
+	result := make([]*pluginv1.PluginMetricCursor, 0)
+	for _, instanceID := range instanceIDs {
+		configured := session.instances[instanceID]
+		if configured == nil {
+			return nil, errGateway
+		}
+		templateIDs := make([]string, 0, len(configured.GetTemplates()))
+		for _, template := range configured.GetTemplates() {
+			templateIDs = append(templateIDs, template.GetTemplateId())
+		}
+		sort.Strings(templateIDs)
+		for _, templateID := range templateIDs {
+			key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), TemplateID: templateID, InstanceID: instanceID}
+			receipt, found, err := sink.Cursor(ctx, key.string())
+			if err != nil {
+				return nil, errGateway
 			}
-			if receiveErr != nil {
-				return errGateway
-			}
-			if err := session.appendBatch(callContext, batch, sink); err != nil {
-				return err
+			if found {
+				result = append(result, &pluginv1.PluginMetricCursor{InstanceId: instanceID, TemplateId: templateID, Sequence: receipt.Sequence})
 			}
 		}
-	})
+	}
+	if len(result) > maxGatewayMembers {
+		return nil, errGateway
+	}
+	return result, nil
+}
+
+func acknowledgeBatch(ctx context.Context, client pluginv1.PluginRuntimeClient, assignmentID string, revision uint64, batch *pluginv1.PluginMetricBatch) error {
+	cursors := []*pluginv1.PluginMetricCursor{{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()}}
+	response, err := client.AcknowledgeMetrics(ctx, &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: assignmentID, ConfigurationRevision: revision, Cursors: cursors})
+	if err != nil || !validAckResponse(response, cursors) {
+		return errGateway
+	}
+	return nil
+}
+
+func validAckResponse(response *pluginv1.AcknowledgePluginMetricsResponse, expected []*pluginv1.PluginMetricCursor) bool {
+	if response == nil || response.GetErrorCode() != "" || len(response.GetAcceptedCursors()) != len(expected) || len(expected) == 0 || len(expected) > maxGatewayMembers {
+		return false
+	}
+	for index, cursor := range expected {
+		accepted := response.GetAcceptedCursors()[index]
+		if cursor == nil || accepted == nil || accepted.GetInstanceId() != cursor.GetInstanceId() || accepted.GetTemplateId() != cursor.GetTemplateId() || accepted.GetSequence() != cursor.GetSequence() || accepted.GetSequence() == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (session *Session) Shutdown(ctx context.Context, timeout time.Duration) error {
@@ -313,7 +437,7 @@ func (session *Session) Shutdown(ctx context.Context, timeout time.Duration) err
 }
 
 func (session *Session) appendBatch(ctx context.Context, batch *pluginv1.PluginMetricBatch, sink MetricSink) error {
-	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || session.client == nil || session.client.cursors == nil {
+	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || session.client == nil {
 		return errGateway
 	}
 	session.mu.Lock()
@@ -322,37 +446,17 @@ func (session *Session) appendBatch(ctx context.Context, batch *pluginv1.PluginM
 		return errGateway
 	}
 	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.configurationRevision, TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
-	unlock := session.client.cursors.Lock(key)
-	defer unlock()
 	now := session.client.config.Now().UTC()
 	payload, id, err := normalizeBatch(batch, session.metricScope(batch), now)
 	if err != nil {
 		return errGateway
 	}
 	digest := sha256.Sum256(payload)
-	cursor, err := session.client.cursors.Load(key)
-	if err != nil || batch.GetSequence() < cursor.Sequence || (!cursor.CollectedAt.IsZero() && batch.GetSequence() > cursor.Sequence && batch.GetCollectedAt().AsTime().UTC().Before(cursor.CollectedAt)) {
-		return errGateway
-	}
-	if batch.GetSequence() == cursor.Sequence {
-		if equalBytes(digest[:], cursor.Digest) {
-			return nil
-		}
-		return errGateway
-	}
-	if existing, ok := sink.(spoolLookup); ok {
-		found, matches, lookupErr := existing.Lookup(ctx, spool.Metric, id, payload)
-		if lookupErr != nil || (found && !matches) {
-			return errGateway
-		}
-		if found {
-			return session.client.cursors.Commit(key, batch.GetSequence(), digest[:], batch.GetCollectedAt().AsTime().UTC())
-		}
-	}
-	if err := sink.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: pluginMetricSourceID + ":" + session.expected.AssignmentID + ":" + batch.GetInstanceId(), CreatedAt: now, Priority: 1, Payload: payload}); err != nil {
+	receipt := spool.CursorReceipt{Key: key.string(), Sequence: batch.GetSequence(), Digest: digest[:], CollectedAt: batch.GetCollectedAt().AsTime().UTC()}
+	if _, err := sink.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: id, SourceID: pluginMetricSourceID + ":" + session.expected.AssignmentID + ":" + batch.GetInstanceId(), CreatedAt: now, Priority: 1, Payload: payload}, receipt); err != nil {
 		return err
 	}
-	return session.client.cursors.Commit(key, batch.GetSequence(), digest[:], batch.GetCollectedAt().AsTime().UTC())
+	return nil
 }
 
 func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) bool {
@@ -365,7 +469,7 @@ func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) boo
 	}
 	for _, template := range configured.GetTemplates() {
 		if template != nil && template.GetTemplateId() == batch.GetTemplateId() && template.GetRevision() == batch.GetTemplateRevision() {
-			return true
+			return validateBatchAgainstTemplate(batch, template)
 		}
 	}
 	return false
@@ -431,7 +535,7 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 		}
 		templates := map[string]struct{}{}
 		for _, template := range instance.GetTemplates() {
-			if template == nil || !contains(expected.TemplateIDs, template.GetTemplateId()) || template.GetRevision() == 0 {
+			if template == nil || !contains(expected.TemplateIDs, template.GetTemplateId()) || !validTemplateConfiguration(template) || !matchesExpectedTemplate(template, expected.TemplateConfigurations) {
 				return errGateway
 			}
 			if _, duplicate := templates[template.GetTemplateId()]; duplicate {
@@ -443,6 +547,9 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 			return errGateway
 		}
 		seen[instance.GetInstanceId()] = struct{}{}
+		if !sameSet(mapKeys(templates), expected.TemplateIDs) {
+			return errGateway
+		}
 	}
 	return nil
 }
@@ -469,6 +576,136 @@ func validHandshake(response *pluginv1.PluginHandshakeResponse, expected Expecte
 	return response != nil && response.GetPluginId() == expected.PluginID && response.GetDatabaseFamily() == expected.DatabaseFamily && response.GetVersion() == expected.Version && response.GetProtocolVersion() == expected.ProtocolVersion && bytes.Equal(response.GetExecutableDigest(), expected.ExecutableSHA256) && len(proof) == len(response.GetLaunchNonceProof()) && subtle.ConstantTimeCompare(proof, response.GetLaunchNonceProof()) == 1
 }
 
+func matchesSignedManifest(response *pluginv1.PluginHandshakeResponse, expected ExpectedPlugin) bool {
+	if response == nil {
+		return false
+	}
+	return sameSet(response.GetSupportedVariants(), expected.SupportedVariants) && sameSet(response.GetCapabilities(), expected.SignedCapabilities) && response.GetMetricTemplateSchemaVersion() == expected.MetricTemplateSchemaVersion
+}
+
+func validValidationResponse(response *pluginv1.ValidatePluginInstanceResponse, instanceID string, signedCapabilities []string) bool {
+	if response == nil || response.GetInstanceId() != instanceID {
+		return false
+	}
+	capabilities := boundedSorted(response.GetCapabilities(), 64)
+	if len(response.GetCapabilities()) > 0 && capabilities == nil || !subset(capabilities, signedCapabilities) {
+		return false
+	}
+	if response.GetDatabaseVersion() != "" && !canonicalDatabaseText(response.GetDatabaseVersion()) || response.GetDatabaseEdition() != "" && !canonicalDatabaseText(response.GetDatabaseEdition()) {
+		return false
+	}
+	if response.GetValid() {
+		return response.GetErrorCode() == "" && response.GetDatabaseVersion() != ""
+	}
+	return response.GetErrorCode() != ""
+}
+
+func canonicalDatabaseText(value string) bool {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value || strings.Contains(value, "  ") || strings.ContainsAny(value, "\x00\r\n\t/:\\=@") {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"password", "passwd", "secret", "token", "credential", "dsn"} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune(" ._()+-", character) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validTemplateConfiguration(value *pluginv1.MetricTemplateConfiguration) bool {
+	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || len(value.GetValueMappings()) == 0 || len(value.GetValueMappings()) > 32 || len(value.GetLabelMappings()) > 16 {
+		return false
+	}
+	metrics, labels := map[string]struct{}{}, map[string]struct{}{}
+	for _, mapping := range value.GetValueMappings() {
+		if mapping == nil || !identifier(mapping.GetSourceColumn()) || !pluginMetricName.MatchString(mapping.GetMetricName()) || !pluginUnit.MatchString(mapping.GetUnit()) || metricTypeFromName(mapping.GetMetricType()) == pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED {
+			return false
+		}
+		key := mapping.GetMetricName() + "\x00" + mapping.GetMetricType() + "\x00" + mapping.GetUnit()
+		if _, duplicate := metrics[key]; duplicate {
+			return false
+		}
+		metrics[key] = struct{}{}
+	}
+	for _, mapping := range value.GetLabelMappings() {
+		normalized := normalizeMetricLabelKey(mapping.GetLabel())
+		_, reserved := reservedNormalizedLabels[normalized]
+		if mapping == nil || !identifier(mapping.GetSourceColumn()) || !pluginLabelName.MatchString(mapping.GetLabel()) || normalized == "" || reserved || strings.HasSuffix(normalized, "_tenant_id") || strings.HasSuffix(normalized, "_project_id") || strings.HasSuffix(normalized, "_agent_id") || strings.HasPrefix(normalized, "dbpilot_") {
+			return false
+		}
+		if _, duplicate := labels[mapping.GetLabel()]; duplicate {
+			return false
+		}
+		labels[mapping.GetLabel()] = struct{}{}
+	}
+	return true
+}
+
+func validateBatchAgainstTemplate(batch *pluginv1.PluginMetricBatch, template *pluginv1.MetricTemplateConfiguration) bool {
+	if !validTemplateConfiguration(template) {
+		return false
+	}
+	allowedMetrics, allowedLabels := map[string]struct{}{}, map[string]struct{}{}
+	for _, mapping := range template.GetValueMappings() {
+		key := mapping.GetMetricName() + "\x00" + fmt.Sprint(metricTypeFromName(mapping.GetMetricType())) + "\x00" + mapping.GetUnit()
+		allowedMetrics[key] = struct{}{}
+	}
+	for _, mapping := range template.GetLabelMappings() {
+		allowedLabels[mapping.GetLabel()] = struct{}{}
+	}
+	for _, sample := range batch.GetSamples() {
+		key := sample.GetMetricName() + "\x00" + fmt.Sprint(sample.GetMetricType()) + "\x00" + sample.GetUnit()
+		if _, ok := allowedMetrics[key]; !ok {
+			return false
+		}
+		for label := range sample.GetLabels() {
+			if _, ok := allowedLabels[label]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func metricTypeFromName(value string) pluginv1.PluginMetricType {
+	switch value {
+	case "gauge":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE
+	case "monotonic_gauge":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_GAUGE
+	case "counter":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_COUNTER
+	case "monotonic_counter":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER
+	default:
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED
+	}
+}
+
+func subset(values, allowed []string) bool {
+	for _, value := range values {
+		if !contains(allowed, value) {
+			return false
+		}
+	}
+	return true
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	return result
+}
+
 func launchProof(nonce, challenge []byte, assignment, version string, configurationRevision, operationRevision uint64, instances []string) []byte {
 	if len(nonce) != sha256.Size || len(challenge) != sha256.Size {
 		return nil
@@ -487,8 +724,20 @@ func launchProof(nonce, challenge []byte, assignment, version string, configurat
 
 func validateExpected(root string, expected ExpectedPlugin) error {
 	expectedSocket := filepath.Join(root, expected.DatabaseFamily, "plugin.sock")
-	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxGatewayMembers || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) > maxGatewayMembers || !unique(expected.TemplateIDs) || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
+	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxGatewayMembers || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) > maxGatewayMembers || !unique(expected.TemplateIDs) || len(expected.SupportedVariants) == 0 || len(expected.SupportedVariants) > 16 || !unique(expected.SupportedVariants) || len(expected.SignedCapabilities) == 0 || len(expected.SignedCapabilities) > 64 || !unique(expected.SignedCapabilities) || expected.MetricTemplateSchemaVersion == 0 || expected.MetricTemplateSchemaVersion > 65535 || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
 		return errGateway
+	}
+	if len(expected.TemplateConfigurations) > 0 {
+		ids := make([]string, 0, len(expected.TemplateConfigurations))
+		for _, template := range expected.TemplateConfigurations {
+			if !validTemplateConfiguration(template) {
+				return errGateway
+			}
+			ids = append(ids, template.GetTemplateId())
+		}
+		if !sameSet(ids, expected.TemplateIDs) {
+			return errGateway
+		}
 	}
 	return nil
 }
@@ -498,10 +747,44 @@ func cloneExpected(value ExpectedPlugin) ExpectedPlugin {
 	value.LaunchNonce = append([]byte(nil), value.LaunchNonce...)
 	value.InstanceIDs = append([]string(nil), value.InstanceIDs...)
 	value.TemplateIDs = append([]string(nil), value.TemplateIDs...)
+	value.SupportedVariants = append([]string(nil), value.SupportedVariants...)
+	value.SignedCapabilities = append([]string(nil), value.SignedCapabilities...)
+	value.TemplateConfigurations = cloneTemplateConfigurations(value.TemplateConfigurations)
 	return value
 }
 func sameExpected(left, right ExpectedPlugin) bool {
-	return left.PID == right.PID && left.ExpectedUserID == right.ExpectedUserID && left.ExpectedGroupID == right.ExpectedGroupID && left.RuntimeDirectory == right.RuntimeDirectory && left.AssignmentID == right.AssignmentID && left.PluginID == right.PluginID && left.DatabaseFamily == right.DatabaseFamily && left.Version == right.Version && left.ProtocolVersion == right.ProtocolVersion && left.ExecutablePath == right.ExecutablePath && bytes.Equal(left.ExecutableSHA256, right.ExecutableSHA256) && bytes.Equal(left.LaunchNonce, right.LaunchNonce) && left.ConfigurationRevision == right.ConfigurationRevision && left.OperationRevision == right.OperationRevision && sameSet(left.InstanceIDs, right.InstanceIDs) && sameSet(left.TemplateIDs, right.TemplateIDs)
+	return left.PID == right.PID && left.ExpectedUserID == right.ExpectedUserID && left.ExpectedGroupID == right.ExpectedGroupID && left.RuntimeDirectory == right.RuntimeDirectory && left.AssignmentID == right.AssignmentID && left.PluginID == right.PluginID && left.DatabaseFamily == right.DatabaseFamily && left.Version == right.Version && left.ProtocolVersion == right.ProtocolVersion && left.ExecutablePath == right.ExecutablePath && bytes.Equal(left.ExecutableSHA256, right.ExecutableSHA256) && bytes.Equal(left.LaunchNonce, right.LaunchNonce) && left.ConfigurationRevision == right.ConfigurationRevision && left.OperationRevision == right.OperationRevision && sameSet(left.InstanceIDs, right.InstanceIDs) && sameSet(left.TemplateIDs, right.TemplateIDs) && sameSet(left.SupportedVariants, right.SupportedVariants) && sameSet(left.SignedCapabilities, right.SignedCapabilities) && left.MetricTemplateSchemaVersion == right.MetricTemplateSchemaVersion && sameTemplateConfigurations(left.TemplateConfigurations, right.TemplateConfigurations)
+}
+
+func cloneTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) []*pluginv1.MetricTemplateConfiguration {
+	result := make([]*pluginv1.MetricTemplateConfiguration, len(values))
+	for index, value := range values {
+		if value != nil {
+			result[index] = proto.Clone(value).(*pluginv1.MetricTemplateConfiguration)
+		}
+	}
+	return result
+}
+
+func sameTemplateConfigurations(left, right []*pluginv1.MetricTemplateConfiguration) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for _, value := range left {
+		if value == nil || !matchesExpectedTemplate(value, right) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesExpectedTemplate(value *pluginv1.MetricTemplateConfiguration, expected []*pluginv1.MetricTemplateConfiguration) bool {
+	for _, candidate := range expected {
+		if candidate != nil && candidate.GetTemplateId() == value.GetTemplateId() {
+			return proto.Equal(candidate, value)
+		}
+	}
+	return false
 }
 func cloneInstances(values []*pluginv1.PluginInstanceConfiguration) []*pluginv1.PluginInstanceConfiguration {
 	result := make([]*pluginv1.PluginInstanceConfiguration, len(values))
@@ -536,15 +819,6 @@ func boundedText(value string, max int) string {
 		return ""
 	}
 	return value
-}
-func intersectCapabilities(values, allowed []string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if contains(allowed, value) {
-			result = append(result, value)
-		}
-	}
-	return result
 }
 func identifier(value string) bool { return resourceID.MatchString(value) }
 func family(value string) bool     { return familyID.MatchString(value) }

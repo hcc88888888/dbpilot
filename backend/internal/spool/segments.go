@@ -3,6 +3,7 @@ package spool
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -31,13 +32,21 @@ var (
 )
 
 type recordHeader struct {
-	ID        string    `json:"id"`
-	SourceID  string    `json:"source_id"`
-	CreatedAt time.Time `json:"created_at"`
-	Priority  int       `json:"priority"`
-	Checksum  uint32    `json:"checksum"`
-	Class     DataClass `json:"class"`
-	Sequence  uint64    `json:"sequence"`
+	ID        string                  `json:"id"`
+	SourceID  string                  `json:"source_id"`
+	CreatedAt time.Time               `json:"created_at"`
+	Priority  int                     `json:"priority"`
+	Checksum  uint32                  `json:"checksum"`
+	Class     DataClass               `json:"class"`
+	Sequence  uint64                  `json:"sequence"`
+	Cursor    *persistedCursorReceipt `json:"cursor,omitempty"`
+}
+
+type persistedCursorReceipt struct {
+	Key         string    `json:"key"`
+	Sequence    uint64    `json:"sequence"`
+	Digest      []byte    `json:"digest"`
+	CollectedAt time.Time `json:"collected_at"`
 }
 
 type entry struct {
@@ -46,37 +55,97 @@ type entry struct {
 	sequence uint64
 	file     string
 	bytes    int64
+	cursor   *persistedCursorReceipt
 }
 
 // Append durably adds a batch. A repeated (class, ID) is a no-op so retries
 // cannot duplicate telemetry.
 func (s *Store) Append(ctx context.Context, class DataClass, batch Batch) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	_, err := s.append(ctx, class, batch, nil)
+	return err
+}
+
+// AppendWithCursor makes a plugin batch visible and advances its durable
+// logical cursor in the same bbolt transaction. The segment record also
+// carries the receipt so recovery of a crash after segment fsync but before
+// the bbolt commit cannot expose payload bytes without their conflict fence.
+func (s *Store) AppendWithCursor(ctx context.Context, class DataClass, batch Batch, receipt CursorReceipt) (CursorAppendResult, error) {
+	payloadDigest := sha256.Sum256(batch.Payload)
+	if !validCursorReceipt(receipt) || !bytes.Equal(payloadDigest[:], receipt.Digest) {
+		return 0, fmt.Errorf("invalid spool cursor receipt")
 	}
-	if !validClass(class) || batch.ID == "" || batch.SourceID == "" {
-		return fmt.Errorf("invalid spool batch")
+	value := &persistedCursorReceipt{Key: receipt.Key, Sequence: receipt.Sequence, Digest: append([]byte(nil), receipt.Digest...), CollectedAt: receipt.CollectedAt.UTC()}
+	return s.append(ctx, class, batch, value)
+}
+
+// Cursor returns the retained producer receipt, including after the payload
+// has been acknowledged and removed from the pending delivery set.
+func (s *Store) Cursor(ctx context.Context, key string) (CursorReceipt, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return CursorReceipt{}, false, err
+	}
+	if key == "" || len(key) > 1024 {
+		return CursorReceipt{}, false, fmt.Errorf("invalid spool cursor key")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.db == nil {
-		return ErrClosed
+		return CursorReceipt{}, false, ErrClosed
+	}
+	value, err := loadCursorReceipt(s.db, key)
+	if err != nil || value == nil {
+		return CursorReceipt{}, false, err
+	}
+	return CursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC()}, true, nil
+}
+
+func (s *Store) append(ctx context.Context, class DataClass, batch Batch, receipt *persistedCursorReceipt) (CursorAppendResult, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if !validClass(class) || batch.ID == "" || batch.SourceID == "" {
+		return 0, fmt.Errorf("invalid spool batch")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return 0, ErrClosed
+	}
+	if receipt != nil {
+		current, err := loadCursorReceipt(s.db, receipt.Key)
+		if err != nil {
+			return 0, err
+		}
+		if current != nil {
+			if receipt.Sequence < current.Sequence || receipt.Sequence == current.Sequence && (!bytes.Equal(receipt.Digest, current.Digest) || !receipt.CollectedAt.Equal(current.CollectedAt)) || receipt.Sequence > current.Sequence && receipt.CollectedAt.Before(current.CollectedAt) {
+				return 0, ErrCursorConflict
+			}
+			if receipt.Sequence == current.Sequence {
+				return CursorAppendDuplicate, nil
+			}
+		}
 	}
 	if s.find(class, batch.ID) != nil {
-		return nil
+		if receipt != nil {
+			return 0, ErrCursorConflict
+		}
+		return CursorAppendDuplicate, nil
 	}
 	sequence := s.nextSeq + 1
 	encoded, err := encodeRecord(recordHeader{ID: batch.ID, SourceID: batch.SourceID, CreatedAt: batch.CreatedAt.UTC(), Priority: batch.Priority, Checksum: batch.Checksum, Class: class, Sequence: sequence}, batch.Payload)
+	if receipt != nil {
+		encoded, err = encodeRecord(recordHeader{ID: batch.ID, SourceID: batch.SourceID, CreatedAt: batch.CreatedAt.UTC(), Priority: batch.Priority, Checksum: batch.Checksum, Class: class, Sequence: sequence, Cursor: receipt}, batch.Payload)
+	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if s.activeFile != "" && s.activeSize > 0 && s.activeSize+int64(len(encoded)) > s.limits.SegmentBytes {
 		if err := s.sealActive(); err != nil {
-			return s.auditIOFailure(class, err)
+			return 0, s.auditIOFailure(class, err)
 		}
 	}
 	if err := s.makeCapacity(class, int64(len(encoded))); err != nil {
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	if s.activeFile == "" {
 		s.activeFile = "active.open"
@@ -85,41 +154,51 @@ func (s *Store) Append(ctx context.Context, class DataClass, batch Batch) error 
 	path := filepath.Join(s.segments, s.activeFile)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	if _, err := file.Write(encoded); err != nil {
 		_ = file.Close()
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	if err := file.Close(); err != nil {
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	stored := batch
 	stored.Payload = append([]byte(nil), batch.Payload...)
 	stored.CreatedAt = stored.CreatedAt.UTC()
-	item := entry{batch: stored, class: class, sequence: sequence, file: s.activeFile, bytes: int64(len(encoded))}
+	item := entry{batch: stored, class: class, sequence: sequence, file: s.activeFile, bytes: int64(len(encoded)), cursor: clonePersistedCursor(receipt)}
 	if err := s.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketSegmentIndex).Put(sequenceKey(sequence), []byte(s.activeFile)); err != nil {
 			return err
 		}
-		return tx.Bucket(bucketDedup).Put(dedupKey(class, batch.ID), sequenceKey(sequence))
+		if err := tx.Bucket(bucketDedup).Put(dedupKey(class, batch.ID), sequenceKey(sequence)); err != nil {
+			return err
+		}
+		if receipt != nil {
+			encodedReceipt, err := json.Marshal(receipt)
+			if err != nil {
+				return err
+			}
+			return tx.Bucket(bucketCursorReceipt).Put([]byte(receipt.Key), encodedReceipt)
+		}
+		return nil
 	}); err != nil {
 		_ = os.Truncate(path, s.activeSize)
-		return s.auditIOFailure(class, err)
+		return 0, s.auditIOFailure(class, err)
 	}
 	s.entries[class] = append(s.entries[class], item)
 	s.nextSeq = sequence
 	s.activeSize += int64(len(encoded))
 	if s.activeSize >= s.limits.SegmentBytes {
 		if err := s.sealActive(); err != nil {
-			return s.auditIOFailure(class, err)
+			return 0, s.auditIOFailure(class, err)
 		}
 	}
-	return nil
+	return CursorAppendStored, nil
 }
 
 // Lookup returns whether a pending batch has the supplied logical identity
@@ -267,6 +346,24 @@ func (s *Store) recover() error {
 				}
 				if err := tx.Bucket(bucketDedup).Put(dedupKey(class, item.batch.ID), sequenceKey(item.sequence)); err != nil {
 					return err
+				}
+				if item.cursor != nil {
+					current, err := loadCursorReceiptTx(tx, item.cursor.Key)
+					if err != nil {
+						return err
+					}
+					if current != nil && (item.cursor.Sequence < current.Sequence || item.cursor.Sequence == current.Sequence && (!bytes.Equal(item.cursor.Digest, current.Digest) || !item.cursor.CollectedAt.Equal(current.CollectedAt))) {
+						return ErrCursorConflict
+					}
+					if current == nil || item.cursor.Sequence > current.Sequence {
+						encoded, err := json.Marshal(item.cursor)
+						if err != nil {
+							return err
+						}
+						if err := tx.Bucket(bucketCursorReceipt).Put([]byte(item.cursor.Key), encoded); err != nil {
+							return err
+						}
+					}
 				}
 			}
 		}
@@ -428,7 +525,7 @@ func (s *Store) rewriteWithout(exclude entry) (int64, error) {
 	}
 	var contents []byte
 	for _, item := range remaining {
-		record, err := encodeRecord(recordHeader{ID: item.batch.ID, SourceID: item.batch.SourceID, CreatedAt: item.batch.CreatedAt.UTC(), Priority: item.batch.Priority, Checksum: item.batch.Checksum, Class: item.class, Sequence: item.sequence}, item.batch.Payload)
+		record, err := encodeRecord(recordHeader{ID: item.batch.ID, SourceID: item.batch.SourceID, CreatedAt: item.batch.CreatedAt.UTC(), Priority: item.batch.Priority, Checksum: item.batch.Checksum, Class: item.class, Sequence: item.sequence, Cursor: clonePersistedCursor(item.cursor)}, item.batch.Payload)
 		if err != nil {
 			return 0, err
 		}
@@ -603,11 +700,11 @@ func recoverFile(path string) ([]entry, error) {
 			return nil, errCorruptRecord
 		}
 		var header recordHeader
-		if err := json.Unmarshal(contents[offset+17:offset+17+headerLength], &header); err != nil || !validClass(header.Class) || header.ID == "" || header.SourceID == "" || header.Sequence == 0 {
+		if err := json.Unmarshal(contents[offset+17:offset+17+headerLength], &header); err != nil || !validClass(header.Class) || header.ID == "" || header.SourceID == "" || header.Sequence == 0 || header.Cursor != nil && !validPersistedCursorReceipt(header.Cursor) {
 			return nil, errCorruptRecord
 		}
 		payload := append([]byte(nil), contents[offset+17+headerLength:bodyEnd]...)
-		items = append(items, entry{batch: Batch{ID: header.ID, SourceID: header.SourceID, CreatedAt: header.CreatedAt, Priority: header.Priority, Payload: payload, Checksum: header.Checksum}, class: header.Class, sequence: header.Sequence, bytes: int64(total)})
+		items = append(items, entry{batch: Batch{ID: header.ID, SourceID: header.SourceID, CreatedAt: header.CreatedAt, Priority: header.Priority, Payload: payload, Checksum: header.Checksum}, class: header.Class, sequence: header.Sequence, bytes: int64(total), cursor: clonePersistedCursor(header.Cursor)})
 		offset += total
 	}
 	return items, nil
@@ -624,6 +721,43 @@ func (s *Store) quarantineFile(path string) error {
 
 func dedupKey(class DataClass, id string) []byte { return []byte(string(class) + "\x00" + id) }
 func sequenceKey(sequence uint64) []byte         { return []byte(fmt.Sprintf("%020d", sequence)) }
+
+func validCursorReceipt(value CursorReceipt) bool {
+	return value.Key != "" && len(value.Key) <= 1024 && !strings.ContainsAny(value.Key, "\r\n") && value.Sequence > 0 && len(value.Digest) == sha256.Size && !value.CollectedAt.IsZero()
+}
+
+func validPersistedCursorReceipt(value *persistedCursorReceipt) bool {
+	return value != nil && validCursorReceipt(CursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: value.Digest, CollectedAt: value.CollectedAt})
+}
+
+func clonePersistedCursor(value *persistedCursorReceipt) *persistedCursorReceipt {
+	if value == nil {
+		return nil
+	}
+	return &persistedCursorReceipt{Key: value.Key, Sequence: value.Sequence, Digest: append([]byte(nil), value.Digest...), CollectedAt: value.CollectedAt.UTC()}
+}
+
+func loadCursorReceipt(db *bolt.DB, key string) (*persistedCursorReceipt, error) {
+	var result *persistedCursorReceipt
+	err := db.View(func(tx *bolt.Tx) error {
+		var err error
+		result, err = loadCursorReceiptTx(tx, key)
+		return err
+	})
+	return result, err
+}
+
+func loadCursorReceiptTx(tx *bolt.Tx, key string) (*persistedCursorReceipt, error) {
+	encoded := tx.Bucket(bucketCursorReceipt).Get([]byte(key))
+	if encoded == nil {
+		return nil, nil
+	}
+	var result persistedCursorReceipt
+	if json.Unmarshal(encoded, &result) != nil || !validPersistedCursorReceipt(&result) {
+		return nil, ErrCursorConflict
+	}
+	return clonePersistedCursor(&result), nil
+}
 func syncDirectory(path string) error {
 	// Windows does not allow Sync on directory handles. Rename itself is the
 	// atomic durability boundary there; Linux gets the directory fsync needed

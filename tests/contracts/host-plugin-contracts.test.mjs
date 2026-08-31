@@ -333,10 +333,13 @@ test('plugin and Docker discovery protobuf services expose only bounded domain o
     'rpc ValidateInstance(ValidatePluginInstanceRequest) returns (ValidatePluginInstanceResponse);',
     'rpc CollectNow(CollectPluginMetricsRequest) returns (CollectPluginMetricsResponse);',
     'rpc StreamMetrics(StreamPluginMetricsRequest) returns (stream PluginMetricBatch);',
+    'rpc AcknowledgeMetrics(AcknowledgePluginMetricsRequest) returns (AcknowledgePluginMetricsResponse);',
     'rpc GetHealth(GetPluginHealthRequest) returns (PluginHealth);',
     'rpc Shutdown(ShutdownPluginRequest) returns (ShutdownPluginResponse);',
     'rpc Snapshot(DockerSnapshotRequest) returns (DockerSnapshotResponse);',
     'rpc Watch(DockerWatchRequest) returns (stream DockerEvent);',
   ]) assert.match(source, new RegExp(rpc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(source, /message StreamPluginMetricsRequest \{[\s\S]*?repeated PluginMetricCursor resume_cursors = 3;/);
+  assert.match(source, /message AcknowledgePluginMetricsRequest \{[\s\S]*?repeated PluginMetricCursor cursors = 3;/);
   assert.doesNotMatch(source, /tenant_id|project_id|docker_socket|container_exec|shell_command|executable_path|script_body/);
 });

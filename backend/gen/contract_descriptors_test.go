@@ -217,6 +217,7 @@ func TestPluginAndDockerDescriptorsExposeExactServices(t *testing.T) {
 		"ValidateInstance":   {"dbpilot.plugin.v1.ValidatePluginInstanceRequest", "dbpilot.plugin.v1.ValidatePluginInstanceResponse", "false"},
 		"CollectNow":         {"dbpilot.plugin.v1.CollectPluginMetricsRequest", "dbpilot.plugin.v1.CollectPluginMetricsResponse", "false"},
 		"StreamMetrics":      {"dbpilot.plugin.v1.StreamPluginMetricsRequest", "dbpilot.plugin.v1.PluginMetricBatch", "true"},
+		"AcknowledgeMetrics": {"dbpilot.plugin.v1.AcknowledgePluginMetricsRequest", "dbpilot.plugin.v1.AcknowledgePluginMetricsResponse", "false"},
 		"GetHealth":          {"dbpilot.plugin.v1.GetPluginHealthRequest", "dbpilot.plugin.v1.PluginHealth", "false"},
 		"Shutdown":           {"dbpilot.plugin.v1.ShutdownPluginRequest", "dbpilot.plugin.v1.ShutdownPluginResponse", "false"},
 	}

@@ -199,7 +199,7 @@ func (installer *Installer) InstallInactive(ctx context.Context, request Install
 		return InstalledSlot{}, ErrInstallFailed
 	}
 	committed = true
-	return InstalledSlot{Slot: slot, Version: request.Version, ExecutablePath: filepath.Join(target, filepath.FromSlash(relativeExecutable)), ExecutableSHA256: binaryDigest, ManifestPath: filepath.Join(target, "manifest.json"), ArtifactSHA256: wantArtifact, ManifestDigest: wantManifest}, nil
+	return InstalledSlot{Slot: slot, Version: request.Version, ExecutablePath: filepath.Join(target, filepath.FromSlash(relativeExecutable)), ExecutableSHA256: binaryDigest, ManifestPath: filepath.Join(target, "manifest.json"), ArtifactSHA256: wantArtifact, ManifestDigest: wantManifest, SupportedVariants: append([]string(nil), manifest.SupportedVariants...), Capabilities: append([]string(nil), manifest.Capabilities...), MetricTemplateSchemaVersion: uint32(manifest.MetricTemplateSchemaVersion)}, nil
 }
 
 func (installer *Installer) ActiveSlot(family string) (pluginstate.Slot, error) {
@@ -263,7 +263,7 @@ func (installer *Installer) Installed(ctx context.Context, expected SlotIdentity
 	if !withinRoot(root, executable) || requirePrivateRegular(executable, 0o500) != nil {
 		return InstalledSlot{}, ErrInstallFailed
 	}
-	return InstalledSlot{Slot: slot, Version: expected.Version, ExecutablePath: executable, ExecutableSHA256: binaryDigest, ManifestPath: filepath.Join(root, "manifest.json"), ArtifactSHA256: expected.ArtifactSHA256, ManifestDigest: expected.ManifestDigest}, nil
+	return InstalledSlot{Slot: slot, Version: expected.Version, ExecutablePath: executable, ExecutableSHA256: binaryDigest, ManifestPath: filepath.Join(root, "manifest.json"), ArtifactSHA256: expected.ArtifactSHA256, ManifestDigest: expected.ManifestDigest, SupportedVariants: append([]string(nil), verified.Manifest.SupportedVariants...), Capabilities: append([]string(nil), verified.Manifest.Capabilities...), MetricTemplateSchemaVersion: uint32(verified.Manifest.MetricTemplateSchemaVersion)}, nil
 }
 
 func verifyInstalledFiles(root string, manifest plugincatalog.Manifest, binaryPath, manifestDigest string) error {

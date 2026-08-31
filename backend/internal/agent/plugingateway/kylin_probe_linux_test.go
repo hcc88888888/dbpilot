@@ -16,6 +16,7 @@ import (
 	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -54,20 +55,21 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 	store, err := spool.Open(filepath.Join(t.TempDir(), "spool"), spool.Limits{MaxBytes: 1 << 20, SegmentBytes: 1 << 16})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
-	client, err := NewClient(ClientConfig{RuntimeRoot: runtimeRoot, CursorRoot: filepath.Join(root, "state", "gateway-cursors"), Scope: MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1"}, Store: store, Timeout: 3 * time.Second, Now: func() time.Time { return now }})
+	client, err := NewClient(ClientConfig{RuntimeRoot: runtimeRoot, Scope: MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1"}, Store: store, Timeout: time.Second, Now: func() time.Time { return now }})
 	require.NoError(t, err)
-	expected := ExpectedPlugin{PID: os.Getpid(), ExpectedUserID: uint32(os.Geteuid()), ExpectedGroupID: uint32(os.Getegid()), RuntimeDirectory: runtimeDirectory, AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", ProtocolVersion: "v1", ExecutablePath: executable, ExecutableSHA256: digest[:], LaunchNonce: nonce, ConfigurationRevision: 4, OperationRevision: 8, InstanceIDs: []string{"mysql-1", "mysql-2"}, TemplateIDs: []string{"template-1", "template-2"}}
+	expected := ExpectedPlugin{PID: os.Getpid(), ExpectedUserID: uint32(os.Geteuid()), ExpectedGroupID: uint32(os.Getegid()), RuntimeDirectory: runtimeDirectory, AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", ProtocolVersion: "v1", ExecutablePath: executable, ExecutableSHA256: digest[:], LaunchNonce: nonce, ConfigurationRevision: 4, OperationRevision: 8, InstanceIDs: []string{"mysql-1", "mysql-2"}, TemplateIDs: []string{"template-1", "template-2"}, SupportedVariants: []string{"mysql"}, SignedCapabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1, TemplateConfigurations: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}
 	session, err := client.Open(expected)
 	require.NoError(t, err)
 	_, err = session.Handshake(context.Background(), expected)
 	require.NoError(t, err)
-	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{{TemplateId: "template-1", Revision: 1}, {TemplateId: "template-2", Revision: 1}}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", Templates: []*pluginv1.MetricTemplateConfiguration{{TemplateId: "template-1", Revision: 1}, {TemplateId: "template-2", Revision: 1}}}}}
+	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
 	require.NoError(t, session.ApplyConfiguration(context.Background(), configuration))
 	require.NoError(t, session.CollectNow(context.Background(), []string{"mysql-1", "mysql-2"}, []string{"template-1", "template-2"}))
 	require.Error(t, session.RunMetricStream(context.Background(), store), "an unexpected completed metric stream must surface to Supervisor")
 	stats, err := store.Stats()
 	require.NoError(t, err)
 	require.Equal(t, 5, stats.PendingBatches)
+	require.Equal(t, 5, server.acks, "Agent ACKs only after each durable append")
 	require.NoError(t, session.Shutdown(context.Background(), time.Second))
 
 	badPeer := expected
@@ -109,13 +111,14 @@ type gatewayFixture struct {
 	pluginv1.UnimplementedPluginRuntimeServer
 	nonce, digest []byte
 	now           time.Time
+	acks          int
 }
 
 func (fixture *gatewayFixture) Handshake(_ context.Context, request *pluginv1.PluginHandshakeRequest) (*pluginv1.PluginHandshakeResponse, error) {
 	if request.GetExpectedProtocolVersion() != "v1" {
 		return nil, errors.New("protocol mismatch")
 	}
-	return &pluginv1.PluginHandshakeResponse{PluginId: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", ProtocolVersion: "v1", ExecutableDigest: fixture.digest, LaunchNonceProof: launchProof(fixture.nonce, request.GetLaunchNonceChallenge(), "assignment-1", "1.0.0", 4, 8, []string{"mysql-1", "mysql-2"})}, nil
+	return &pluginv1.PluginHandshakeResponse{PluginId: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1, ExecutableDigest: fixture.digest, LaunchNonceProof: launchProof(fixture.nonce, request.GetLaunchNonceChallenge(), "assignment-1", "1.0.0", 4, 8, []string{"mysql-1", "mysql-2"})}, nil
 }
 func (*gatewayFixture) ApplyConfiguration(_ context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
 	return &pluginv1.ApplyPluginConfigurationResponse{ActiveConfigurationRevision: request.GetConfigurationRevision(), Results: []*pluginv1.PluginInstanceConfigurationResult{{InstanceId: "mysql-1", Applied: true}, {InstanceId: "mysql-2", Applied: true}}}, nil
@@ -123,11 +126,26 @@ func (*gatewayFixture) ApplyConfiguration(_ context.Context, request *pluginv1.A
 func (fixture *gatewayFixture) CollectNow(_ context.Context, request *pluginv1.CollectPluginMetricsRequest) (*pluginv1.CollectPluginMetricsResponse, error) {
 	return &pluginv1.CollectPluginMetricsResponse{Batches: []*pluginv1.PluginMetricBatch{fixture.batch("mysql-1", "template-1", 1), fixture.batch("mysql-1", "template-2", 1), fixture.batch("mysql-2", "template-1", 1), fixture.batch("mysql-2", "template-2", 1)}}, nil
 }
-func (fixture *gatewayFixture) StreamMetrics(_ *pluginv1.StreamPluginMetricsRequest, stream pluginv1.PluginRuntime_StreamMetricsServer) error {
+func (fixture *gatewayFixture) StreamMetrics(request *pluginv1.StreamPluginMetricsRequest, stream pluginv1.PluginRuntime_StreamMetricsServer) error {
+	if len(request.GetResumeCursors()) != 4 {
+		return errors.New("resume cursor coverage mismatch")
+	}
+	if err := stream.SendHeader(metadata.MD{}); err != nil {
+		return err
+	}
+	time.Sleep(1500 * time.Millisecond)
 	if err := stream.Send(fixture.batch("mysql-1", "template-1", 2)); err != nil {
 		return err
 	}
 	return nil
+}
+
+func probeTemplate(id string) *pluginv1.MetricTemplateConfiguration {
+	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: make([]byte, sha256.Size), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}}
+}
+func (fixture *gatewayFixture) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
+	fixture.acks += len(request.GetCursors())
+	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: request.GetCursors()}, nil
 }
 func (*gatewayFixture) Shutdown(context.Context, *pluginv1.ShutdownPluginRequest) (*pluginv1.ShutdownPluginResponse, error) {
 	return &pluginv1.ShutdownPluginResponse{Drained: true}, nil

@@ -10,11 +10,17 @@ import (
 
 type ReconcilePluginExecutor struct{ supervisor pluginsupervisor.Supervisor }
 
+const PluginReconcileInstanceDescriptorsCapability = "plugin_reconcile.instance_descriptors.v1"
+
 func NewReconcilePluginExecutor(supervisor pluginsupervisor.Supervisor) (*ReconcilePluginExecutor, error) {
 	if supervisor == nil {
 		return nil, errors.New("plugin supervisor is required")
 	}
 	return &ReconcilePluginExecutor{supervisor: supervisor}, nil
+}
+
+func (*ReconcilePluginExecutor) AdditionalCapabilities() []string {
+	return []string{PluginReconcileInstanceDescriptorsCapability}
 }
 
 func (executor *ReconcilePluginExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, reporter ProgressReporter) (*agentv1.CommandResult, error) {

@@ -126,6 +126,10 @@ func (*runtimeServer) Shutdown(context.Context, *pluginv1.ShutdownPluginRequest)
 	return &pluginv1.ShutdownPluginResponse{Drained: true}, nil
 }
 
+func (*runtimeServer) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
+	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: request.GetCursors()}, nil
+}
+
 func arguments(values []string) (map[string]string, bool) {
 	if len(values) == 0 || len(values)%2 != 0 {
 		return nil, false

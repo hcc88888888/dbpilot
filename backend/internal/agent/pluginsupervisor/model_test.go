@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,8 +60,12 @@ func validReconcileRequest() ReconcileRequest {
 		DesiredVersion: "1.0.0", DesiredState: DesiredRunning, ArtifactID: "artifact-1",
 		ArtifactSHA256: bytesOf(2, sha256.Size), ManifestDigest: bytesOf(3, sha256.Size),
 		ConfigurationRevision: 1, OperationRevision: 1,
-		InstanceIDs: []string{"mysql-1", "mysql-2"}, TemplateIDs: []string{"template-1"},
+		InstanceIDs: []string{"mysql-1", "mysql-2"}, InstanceDescriptors: []InstanceDescriptor{{InstanceID: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}, {InstanceID: "mysql-2", DatabaseVariant: "mysql", UnixSocket: "/run/mysql-2.sock"}}, TemplateIDs: []string{"template-1"}, TemplateConfigurations: []*pluginv1.MetricTemplateConfiguration{testTemplateConfiguration("template-1")}, CredentialsComplete: true,
 	}
+}
+
+func testTemplateConfiguration(id string) *pluginv1.MetricTemplateConfiguration {
+	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: bytesOf(4, sha256.Size), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}}
 }
 
 func bytesOf(value byte, count int) []byte {

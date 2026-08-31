@@ -99,6 +99,19 @@ func TestMetricConsumerAcceptsAgentNormalizedPluginOTLP(t *testing.T) {
 	require.Equal(t, "succeeded", store.samples[0].Labels["status"])
 }
 
+func TestPluginNormalizationRejectsForgedAliasesBeforeServerAdmission(t *testing.T) {
+	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
+	scope := plugingateway.MetricScope{TenantID: "t1", ProjectID: "p1", AgentID: "agent-a", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"template-1"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}
+	for _, alias := range []string{"tenant-id", "project_id", "agent-id", "host.name", "service.instance.id", "assignment_id", "plugin-id", "template_revision", "configuration-revision", "dbpilot.source.id"} {
+		t.Run(alias, func(t *testing.T) {
+			batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "template-1", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: map[string]string{alias: "forged"}, SampledAt: timestamppb.New(now)}}}
+			payload, _, err := plugingateway.NormalizeBatch(batch, scope, now)
+			require.Error(t, err)
+			require.Empty(t, payload)
+		})
+	}
+}
+
 func TestMetricConsumerRejectsOTLPScopeClaims(t *testing.T) {
 	now := time.Date(2026, time.August, 27, 10, 0, 0, 0, time.UTC)
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), &recordingStore{})

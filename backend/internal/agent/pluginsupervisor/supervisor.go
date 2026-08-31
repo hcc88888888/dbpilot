@@ -13,7 +13,9 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginstate"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -182,7 +184,10 @@ func (supervisor *PluginSupervisor) Start(ctx context.Context, prepared Prepared
 	current.DesiredManifestDigest = hex.EncodeToString(request.ManifestDigest)
 	current.DesiredConfigurationRevision = request.ConfigurationRevision
 	current.DesiredInstanceIDs = append([]string(nil), request.InstanceIDs...)
+	current.DesiredInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
 	current.DesiredTemplateIDs = append([]string(nil), request.TemplateIDs...)
+	current.DesiredTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	current.DesiredCredentialsComplete = request.CredentialsComplete
 	sort.Strings(current.DesiredInstanceIDs)
 	sort.Strings(current.DesiredTemplateIDs)
 	current.RequestFingerprint = request.Fingerprint()
@@ -239,7 +244,8 @@ func (supervisor *PluginSupervisor) makeAbsent(ctx context.Context, request Reco
 	}
 	state.ProcessState, state.ActiveSlot, state.InstalledVersion, state.Slots = pluginstate.ProcessAbsent, pluginstate.SlotNone, "", nil
 	state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest = "", "", ""
-	state.ActiveInstanceIDs, state.ActiveTemplateIDs, state.BoundInstanceCount = nil, nil, 0
+	state.ActiveInstanceIDs, state.ActiveInstanceDescriptors, state.ActiveTemplateIDs, state.ActiveTemplateConfigurations, state.BoundInstanceCount = nil, nil, nil, nil, 0
+	state.ActiveCredentialsComplete = false
 	state.ProcessID, state.ProcessStartTicks, state.RestartCount = 0, 0, 0
 	state.StartedAt, state.Failures, state.LastErrorCode = time.Time{}, nil, ""
 	saved, err := supervisor.store.Put(ctx, state)
@@ -324,8 +330,7 @@ func (supervisor *PluginSupervisor) makeRunning(ctx context.Context, request Rec
 	}
 	state.ProcessState = pluginstate.ProcessHandshaking
 	if _, persistErr := supervisor.store.Put(ctx, state); persistErr != nil {
-		_ = process.process.Kill()
-		process.cancel()
+		_ = supervisor.drainProcess(ctx, process)
 		return ObservedState{}, persistErr
 	}
 	if healthErr := supervisor.health.Handshake(ctx, process.process, healthRequest(request, installed, request.ConfigurationRevision, filepath.Join(supervisor.runtimeRoot, request.DatabaseFamily), process.launchNonce, supervisor.userID, supervisor.groupID)); healthErr != nil {
@@ -339,9 +344,10 @@ func (supervisor *PluginSupervisor) makeRunning(ctx context.Context, request Rec
 	supervisor.running[request.DatabaseFamily] = process
 	state.ActiveSlot, state.InstalledVersion = installed.Slot, installed.Version
 	applyActiveConfiguration(&state, request, installed)
-	state.ProcessState, state.HealthState, state.CircuitState = pluginstate.ProcessRunning, pluginstate.HealthHealthy, pluginstate.CircuitClosed
+	healthState, activationCode := supervisor.activationState(process.process)
+	state.ProcessState, state.HealthState, state.CircuitState = pluginstate.ProcessRunning, healthState, pluginstate.CircuitClosed
 	state.ProcessID, state.ProcessStartTicks, state.StartedAt = process.process.PID(), process.process.StartTicks(), process.process.StartedAt()
-	state.LastErrorCode, state.Failures = "", nil
+	state.LastErrorCode, state.Failures = activationCode, nil
 	saved, saveErr := supervisor.store.Put(ctx, state)
 	if saveErr == nil {
 		go supervisor.monitorProcess(request.DatabaseFamily, process)
@@ -402,15 +408,15 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 	rollbackProcess, err := supervisor.startProcess(rollbackRequest, oldInstalled, old.ActiveConfigurationRevision)
 	if err != nil || supervisor.health.Handshake(ctx, rollbackProcess.process, healthRequest(rollbackRequest, oldInstalled, old.ActiveConfigurationRevision, filepath.Join(supervisor.runtimeRoot, request.DatabaseFamily), rollbackProcess.launchNonce, supervisor.userID, supervisor.groupID)) != nil {
 		if rollbackProcess != nil {
-			_ = rollbackProcess.process.Kill()
-			rollbackProcess.cancel()
+			_ = supervisor.drainProcess(ctx, rollbackProcess)
 		}
 		return supervisor.fail(ctx, failed, pluginstate.ProcessRollback, "plugin_rollback_failed", ErrRollbackFailed)
 	}
 	supervisor.running[request.DatabaseFamily] = rollbackProcess
 	old.ObservedOperationRevision = request.OperationRevision
 	old.DesiredState = stateForDesired(request.DesiredState)
-	old.ProcessState, old.HealthState = pluginstate.ProcessRunning, pluginstate.HealthHealthy
+	rollbackHealth, _ := supervisor.activationState(rollbackProcess.process)
+	old.ProcessState, old.HealthState = pluginstate.ProcessRunning, rollbackHealth
 	old.ProcessID, old.ProcessStartTicks, old.StartedAt = rollbackProcess.process.PID(), rollbackProcess.process.StartTicks(), rollbackProcess.process.StartedAt()
 	old.ObservationRevision++
 	old.DesiredState = stateForDesired(request.DesiredState)
@@ -418,6 +424,9 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 	old.DesiredArtifactSHA256, old.DesiredManifestDigest, old.RequestFingerprint = hex.EncodeToString(request.ArtifactSHA256), hex.EncodeToString(request.ManifestDigest), request.Fingerprint()
 	old.DesiredConfigurationRevision = request.ConfigurationRevision
 	old.DesiredInstanceIDs, old.DesiredTemplateIDs = append([]string(nil), request.InstanceIDs...), append([]string(nil), request.TemplateIDs...)
+	old.DesiredInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
+	old.DesiredTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	old.DesiredCredentialsComplete = request.CredentialsComplete
 	sort.Strings(old.DesiredInstanceIDs)
 	sort.Strings(old.DesiredTemplateIDs)
 	old = supervisor.recordFailure(old, "plugin_rollback_"+errorCode(cause))
@@ -456,17 +465,20 @@ func slotExecutableDigest(installed InstalledSlot) string {
 }
 
 func (supervisor *PluginSupervisor) drainProcess(ctx context.Context, process *managedProcess) error {
+	if process == nil || process.process == nil {
+		return nil
+	}
 	process.expected.Store(true)
+	defer process.cancel()
 	drainContext, cancel := context.WithTimeout(ctx, supervisor.drainTimeout)
 	defer cancel()
 	if gateway, ok := supervisor.health.(interface {
 		Shutdown(context.Context, Process, time.Duration) error
 	}); ok {
-		// A configured private Gateway must complete its bounded shutdown before
-		// the Supervisor signals the process.
-		if err := gateway.Shutdown(drainContext, process.process, supervisor.drainTimeout); err != nil {
-			return err
-		}
+		// Gateway shutdown is advisory. The Supervisor always continues through
+		// the OS-owned bounded termination and join path, including when no
+		// Session was registered or the plugin RPC is unresponsive.
+		_ = gateway.Shutdown(drainContext, process.process, supervisor.drainTimeout)
 	}
 	if err := process.process.Drain(drainContext); err != nil {
 		if killErr := process.process.Kill(); killErr != nil {
@@ -474,7 +486,36 @@ func (supervisor *PluginSupervisor) drainProcess(ctx context.Context, process *m
 		}
 	}
 	process.cancel()
-	return nil
+	joined := make(chan error, 1)
+	go func() { joined <- process.process.Wait() }()
+	select {
+	case <-joined:
+		return nil
+	case <-drainContext.Done():
+		if err := process.process.Kill(); err != nil {
+			return err
+		}
+	}
+	joinTimer := time.NewTimer(supervisor.drainTimeout)
+	defer joinTimer.Stop()
+	select {
+	case <-joined:
+		return nil
+	case <-joinTimer.C:
+		return ErrProcessExited
+	}
+}
+
+func (supervisor *PluginSupervisor) activationState(process Process) (pluginstate.HealthState, string) {
+	if provider, ok := supervisor.health.(interface {
+		ActivationState(Process) (pluginstate.HealthState, string)
+	}); ok {
+		health, code := provider.ActivationState(process)
+		if health == pluginstate.HealthDegraded && (code == "waiting_templates" || code == "waiting_credentials" || code == "plugin_reconcile_unavailable") {
+			return health, code
+		}
+	}
+	return pluginstate.HealthHealthy, ""
 }
 
 func (supervisor *PluginSupervisor) stopFamily(ctx context.Context, family string) error {
@@ -598,9 +639,7 @@ func (supervisor *PluginSupervisor) restartPersisted(family, fingerprint string,
 	}
 	if err != nil {
 		if managed != nil {
-			managed.expected.Store(true)
-			_ = managed.process.Kill()
-			managed.cancel()
+			_ = supervisor.drainProcess(context.Background(), managed)
 		}
 		state = supervisor.recordFailure(state, "plugin_restart_failed")
 		state.ProcessState = pluginstate.ProcessRestarting
@@ -611,9 +650,10 @@ func (supervisor *PluginSupervisor) restartPersisted(family, fingerprint string,
 		return
 	}
 	supervisor.running[family] = managed
-	state.ProcessState, state.HealthState = pluginstate.ProcessRunning, pluginstate.HealthHealthy
+	healthState, activationCode := supervisor.activationState(managed.process)
+	state.ProcessState, state.HealthState = pluginstate.ProcessRunning, healthState
 	state.ProcessID, state.ProcessStartTicks, state.StartedAt = managed.process.PID(), managed.process.StartTicks(), managed.process.StartedAt()
-	state.LastErrorCode = ""
+	state.LastErrorCode = activationCode
 	_, _ = supervisor.store.Put(context.Background(), state)
 	go supervisor.monitorProcess(family, managed)
 }
@@ -676,7 +716,7 @@ func assignmentObservation(state pluginstate.FamilyState, at time.Time) *agentv1
 }
 
 func baseState(request ReconcileRequest) pluginstate.FamilyState {
-	state := pluginstate.FamilyState{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, ActiveSlot: pluginstate.SlotNone, DesiredState: stateForDesired(request.DesiredState), DesiredVersion: request.DesiredVersion, DesiredArtifactID: request.ArtifactID, DesiredArtifactSHA256: hex.EncodeToString(request.ArtifactSHA256), DesiredManifestDigest: hex.EncodeToString(request.ManifestDigest), DesiredConfigurationRevision: request.ConfigurationRevision, DesiredInstanceIDs: append([]string(nil), request.InstanceIDs...), DesiredTemplateIDs: append([]string(nil), request.TemplateIDs...), RequestFingerprint: request.Fingerprint(), ProcessState: pluginstate.ProcessAbsent, HealthState: pluginstate.HealthUnknown, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: request.ConfigurationRevision, ObservedOperationRevision: request.OperationRevision}
+	state := pluginstate.FamilyState{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, ActiveSlot: pluginstate.SlotNone, DesiredState: stateForDesired(request.DesiredState), DesiredVersion: request.DesiredVersion, DesiredArtifactID: request.ArtifactID, DesiredArtifactSHA256: hex.EncodeToString(request.ArtifactSHA256), DesiredManifestDigest: hex.EncodeToString(request.ManifestDigest), DesiredConfigurationRevision: request.ConfigurationRevision, DesiredInstanceIDs: append([]string(nil), request.InstanceIDs...), DesiredInstanceDescriptors: stateDescriptors(request.InstanceDescriptors), DesiredTemplateIDs: append([]string(nil), request.TemplateIDs...), DesiredTemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), DesiredCredentialsComplete: request.CredentialsComplete, RequestFingerprint: request.Fingerprint(), ProcessState: pluginstate.ProcessAbsent, HealthState: pluginstate.HealthUnknown, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: request.ConfigurationRevision, ObservedOperationRevision: request.OperationRevision}
 	sort.Strings(state.DesiredInstanceIDs)
 	sort.Strings(state.DesiredTemplateIDs)
 	return state
@@ -686,7 +726,10 @@ func applyActiveConfiguration(state *pluginstate.FamilyState, request ReconcileR
 	state.ActiveConfigurationRevision = request.ConfigurationRevision
 	state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest = request.ArtifactID, installed.ArtifactSHA256, installed.ManifestDigest
 	state.ActiveInstanceIDs = append([]string(nil), request.InstanceIDs...)
+	state.ActiveInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
 	state.ActiveTemplateIDs = append([]string(nil), request.TemplateIDs...)
+	state.ActiveTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	state.ActiveCredentialsComplete = request.CredentialsComplete
 	sort.Strings(state.ActiveInstanceIDs)
 	sort.Strings(state.ActiveTemplateIDs)
 	state.BoundInstanceCount = uint32(len(state.ActiveInstanceIDs))
@@ -695,7 +738,23 @@ func applyActiveConfiguration(state *pluginstate.FamilyState, request ReconcileR
 func requestFromActiveState(state pluginstate.FamilyState) ReconcileRequest {
 	artifactDigest, _ := hex.DecodeString(state.ActiveArtifactSHA256)
 	manifestDigest, _ := hex.DecodeString(state.ActiveManifestDigest)
-	return ReconcileRequest{AssignmentID: state.AssignmentID, PluginID: state.PluginID, DatabaseFamily: state.DatabaseFamily, DesiredVersion: state.InstalledVersion, DesiredState: DesiredRunning, ArtifactID: state.ActiveArtifactID, ArtifactSHA256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: state.ActiveConfigurationRevision, OperationRevision: state.ObservedOperationRevision, InstanceIDs: append([]string(nil), state.ActiveInstanceIDs...), TemplateIDs: append([]string(nil), state.ActiveTemplateIDs...)}
+	return ReconcileRequest{AssignmentID: state.AssignmentID, PluginID: state.PluginID, DatabaseFamily: state.DatabaseFamily, DesiredVersion: state.InstalledVersion, DesiredState: DesiredRunning, ArtifactID: state.ActiveArtifactID, ArtifactSHA256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: state.ActiveConfigurationRevision, OperationRevision: state.ObservedOperationRevision, InstanceIDs: append([]string(nil), state.ActiveInstanceIDs...), InstanceDescriptors: supervisorDescriptors(state.ActiveInstanceDescriptors), TemplateIDs: append([]string(nil), state.ActiveTemplateIDs...), TemplateConfigurations: cloneTemplateConfigurations(state.ActiveTemplateConfigurations), CredentialsComplete: state.ActiveCredentialsComplete}
+}
+
+func stateDescriptors(values []InstanceDescriptor) []pluginstate.InstanceDescriptor {
+	result := make([]pluginstate.InstanceDescriptor, len(values))
+	for index, value := range values {
+		result[index] = pluginstate.InstanceDescriptor{InstanceID: value.InstanceID, DatabaseVariant: value.DatabaseVariant, Endpoint: value.Endpoint, UnixSocket: value.UnixSocket}
+	}
+	return result
+}
+
+func supervisorDescriptors(values []pluginstate.InstanceDescriptor) []InstanceDescriptor {
+	result := make([]InstanceDescriptor, len(values))
+	for index, value := range values {
+		result[index] = InstanceDescriptor{InstanceID: value.InstanceID, DatabaseVariant: value.DatabaseVariant, Endpoint: value.Endpoint, UnixSocket: value.UnixSocket}
+	}
+	return result
 }
 
 func identityFromRequest(request ReconcileRequest) SlotIdentity {
@@ -712,12 +771,23 @@ func cloneRequest(request ReconcileRequest) ReconcileRequest {
 	request.InstanceIDs = append([]string(nil), request.InstanceIDs...)
 	request.InstanceDescriptors = append([]InstanceDescriptor(nil), request.InstanceDescriptors...)
 	request.TemplateIDs = append([]string(nil), request.TemplateIDs...)
+	request.TemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
 	return request
 }
 
 func healthRequest(request ReconcileRequest, installed InstalledSlot, configurationRevision uint64, runtimeDirectory string, nonce []byte, uid, gid uint32) HealthRequest {
 	digest, _ := hex.DecodeString(installed.ExecutableSHA256)
-	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
+	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), SupportedVariants: append([]string(nil), installed.SupportedVariants...), SignedCapabilities: append([]string(nil), installed.Capabilities...), MetricTemplateSchemaVersion: installed.MetricTemplateSchemaVersion, TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), CredentialsComplete: request.CredentialsComplete, RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
+}
+
+func cloneTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) []*pluginv1.MetricTemplateConfiguration {
+	result := make([]*pluginv1.MetricTemplateConfiguration, len(values))
+	for index, value := range values {
+		if value != nil {
+			result[index] = proto.Clone(value).(*pluginv1.MetricTemplateConfiguration)
+		}
+	}
+	return result
 }
 
 func processStateForError(err error) pluginstate.ProcessState {

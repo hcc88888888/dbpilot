@@ -20,6 +20,24 @@ message CollectPluginMetricsResponse {
 message StreamPluginMetricsRequest {
   string assignment_id = 1;
   uint64 configuration_revision = 2;
+  repeated PluginMetricCursor resume_cursors = 3;
+}
+
+message PluginMetricCursor {
+  string instance_id = 1;
+  string template_id = 2;
+  uint64 sequence = 3;
+}
+
+message AcknowledgePluginMetricsRequest {
+  string assignment_id = 1;
+  uint64 configuration_revision = 2;
+  repeated PluginMetricCursor cursors = 3;
+}
+
+message AcknowledgePluginMetricsResponse {
+  repeated PluginMetricCursor accepted_cursors = 1;
+  string error_code = 2;
 }
 
 message PluginMetricBatch {

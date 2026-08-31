@@ -3,10 +3,12 @@ package spool_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +99,72 @@ func TestAppendPendingOrderDuplicateAndAck(t *testing.T) {
 	if err != nil || len(pending) != 1 || pending[0].ID != "second" {
 		t.Fatalf("after ack = %#v, %v", pending, err)
 	}
+}
+
+func TestAppendWithCursorRetainsExactReceiptAfterAckAndReopen(t *testing.T) {
+	ctx := context.Background()
+	root := secureSpoolRoot(t)
+	limits := spool.Limits{MaxBytes: 8192, SegmentBytes: 1024}
+	store, err := spool.Open(root, limits)
+	require.NoError(t, err)
+	digest := sha256.Sum256([]byte("first"))
+	receipt := spool.CursorReceipt{Key: "assignment-1\x004\x00template-1\x00instance-1", Sequence: 7, Digest: digest[:], CollectedAt: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)}
+	original := spool.Batch{ID: "plugin-batch-7", SourceID: "plugin-runtime:assignment-1:instance-1", CreatedAt: receipt.CollectedAt, Payload: []byte("first")}
+
+	result, err := store.AppendWithCursor(ctx, spool.Metric, original, receipt)
+	require.NoError(t, err)
+	require.Equal(t, spool.CursorAppendStored, result)
+	require.NoError(t, store.Ack(ctx, spool.Metric, original.ID))
+	require.NoError(t, store.Close())
+
+	store, err = spool.Open(root, limits)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	persisted, found, err := store.Cursor(ctx, receipt.Key)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, receipt.Sequence, persisted.Sequence)
+	require.Equal(t, receipt.Digest, persisted.Digest)
+	result, err = store.AppendWithCursor(ctx, spool.Metric, original, receipt)
+	require.NoError(t, err)
+	require.Equal(t, spool.CursorAppendDuplicate, result)
+	pending, err := store.Pending(ctx, spool.Metric, 10)
+	require.NoError(t, err)
+	require.Empty(t, pending, "an ACKed exact retry must not re-enter delivery")
+
+	conflict := receipt
+	conflictDigest := sha256.Sum256([]byte("different"))
+	conflict.Digest = conflictDigest[:]
+	_, err = store.AppendWithCursor(ctx, spool.Metric, spool.Batch{ID: original.ID, SourceID: original.SourceID, CreatedAt: original.CreatedAt, Payload: []byte("different")}, conflict)
+	require.ErrorIs(t, err, spool.ErrCursorConflict)
+}
+
+func TestAppendWithCursorSerializesConcurrentSameSequence(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, spool.Limits{MaxBytes: 8192, SegmentBytes: 1024})
+	digest := sha256.Sum256([]byte("first"))
+	receipt := spool.CursorReceipt{Key: "assignment-1\x004\x00template-1\x00instance-1", Sequence: 7, Digest: digest[:], CollectedAt: time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)}
+	batch := spool.Batch{ID: "plugin-batch-7", SourceID: "plugin-runtime:assignment-1:instance-1", CreatedAt: receipt.CollectedAt, Payload: []byte("first")}
+	results := make(chan spool.CursorAppendResult, 2)
+	errors := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			result, err := store.AppendWithCursor(ctx, spool.Metric, batch, receipt)
+			results <- result
+			errors <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	first, second := <-results, <-results
+	require.NoError(t, <-errors)
+	require.NoError(t, <-errors)
+	require.ElementsMatch(t, []spool.CursorAppendResult{spool.CursorAppendStored, spool.CursorAppendDuplicate}, []spool.CursorAppendResult{first, second})
 }
 
 func TestSegmentRotationAndRecoveryTruncatesIncompleteFinalRecord(t *testing.T) {

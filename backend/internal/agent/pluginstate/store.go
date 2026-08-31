@@ -11,8 +11,12 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 const stateFileName = "plugin-state.json"
@@ -91,44 +95,57 @@ type SlotState struct {
 	CompletedAt    time.Time `json:"completed_at"`
 }
 
+type InstanceDescriptor struct {
+	InstanceID      string `json:"instance_id"`
+	DatabaseVariant string `json:"database_variant"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	UnixSocket      string `json:"unix_socket,omitempty"`
+}
+
 // FamilyState contains only durable, non-secret reconciliation facts. Lease
 // URLs, request headers, credentials, command tokens and plugin output never
 // cross this persistence boundary.
 type FamilyState struct {
-	StateRevision                uint64             `json:"state_revision"`
-	AssignmentID                 string             `json:"assignment_id"`
-	PluginID                     string             `json:"plugin_id"`
-	DatabaseFamily               string             `json:"database_family"`
-	InstalledVersion             string             `json:"installed_version,omitempty"`
-	ActiveArtifactID             string             `json:"active_artifact_id,omitempty"`
-	ActiveArtifactSHA256         string             `json:"active_artifact_sha256,omitempty"`
-	ActiveManifestDigest         string             `json:"active_manifest_digest,omitempty"`
-	ActiveInstanceIDs            []string           `json:"active_instance_ids,omitempty"`
-	ActiveTemplateIDs            []string           `json:"active_template_ids,omitempty"`
-	DesiredVersion               string             `json:"desired_version,omitempty"`
-	DesiredArtifactID            string             `json:"desired_artifact_id,omitempty"`
-	DesiredArtifactSHA256        string             `json:"desired_artifact_sha256,omitempty"`
-	DesiredManifestDigest        string             `json:"desired_manifest_digest,omitempty"`
-	DesiredConfigurationRevision uint64             `json:"desired_configuration_revision"`
-	DesiredInstanceIDs           []string           `json:"desired_instance_ids,omitempty"`
-	DesiredTemplateIDs           []string           `json:"desired_template_ids,omitempty"`
-	RequestFingerprint           string             `json:"request_fingerprint"`
-	ActiveSlot                   Slot               `json:"active_slot"`
-	Slots                        map[Slot]SlotState `json:"slots,omitempty"`
-	DesiredState                 DesiredState       `json:"desired_state"`
-	ProcessState                 ProcessState       `json:"process_state"`
-	ProcessID                    int                `json:"process_id,omitempty"`
-	ProcessStartTicks            uint64             `json:"process_start_ticks,omitempty"`
-	StartedAt                    time.Time          `json:"started_at,omitempty"`
-	RestartCount                 uint32             `json:"restart_count"`
-	Failures                     []time.Time        `json:"failures,omitempty"`
-	CircuitState                 CircuitState       `json:"circuit_state"`
-	HealthState                  HealthState        `json:"health_state"`
-	ActiveConfigurationRevision  uint64             `json:"active_configuration_revision"`
-	ObservedOperationRevision    uint64             `json:"observed_operation_revision"`
-	ObservationRevision          uint64             `json:"observation_revision"`
-	BoundInstanceCount           uint32             `json:"bound_instance_count"`
-	LastErrorCode                string             `json:"last_error_code,omitempty"`
+	StateRevision                 uint64                                  `json:"state_revision"`
+	AssignmentID                  string                                  `json:"assignment_id"`
+	PluginID                      string                                  `json:"plugin_id"`
+	DatabaseFamily                string                                  `json:"database_family"`
+	InstalledVersion              string                                  `json:"installed_version,omitempty"`
+	ActiveArtifactID              string                                  `json:"active_artifact_id,omitempty"`
+	ActiveArtifactSHA256          string                                  `json:"active_artifact_sha256,omitempty"`
+	ActiveManifestDigest          string                                  `json:"active_manifest_digest,omitempty"`
+	ActiveInstanceIDs             []string                                `json:"active_instance_ids,omitempty"`
+	ActiveInstanceDescriptors     []InstanceDescriptor                    `json:"active_instance_descriptors,omitempty"`
+	ActiveTemplateIDs             []string                                `json:"active_template_ids,omitempty"`
+	ActiveTemplateConfigurations  []*pluginv1.MetricTemplateConfiguration `json:"active_template_configurations,omitempty"`
+	ActiveCredentialsComplete     bool                                    `json:"active_credentials_complete,omitempty"`
+	DesiredVersion                string                                  `json:"desired_version,omitempty"`
+	DesiredArtifactID             string                                  `json:"desired_artifact_id,omitempty"`
+	DesiredArtifactSHA256         string                                  `json:"desired_artifact_sha256,omitempty"`
+	DesiredManifestDigest         string                                  `json:"desired_manifest_digest,omitempty"`
+	DesiredConfigurationRevision  uint64                                  `json:"desired_configuration_revision"`
+	DesiredInstanceIDs            []string                                `json:"desired_instance_ids,omitempty"`
+	DesiredInstanceDescriptors    []InstanceDescriptor                    `json:"desired_instance_descriptors,omitempty"`
+	DesiredTemplateIDs            []string                                `json:"desired_template_ids,omitempty"`
+	DesiredTemplateConfigurations []*pluginv1.MetricTemplateConfiguration `json:"desired_template_configurations,omitempty"`
+	DesiredCredentialsComplete    bool                                    `json:"desired_credentials_complete,omitempty"`
+	RequestFingerprint            string                                  `json:"request_fingerprint"`
+	ActiveSlot                    Slot                                    `json:"active_slot"`
+	Slots                         map[Slot]SlotState                      `json:"slots,omitempty"`
+	DesiredState                  DesiredState                            `json:"desired_state"`
+	ProcessState                  ProcessState                            `json:"process_state"`
+	ProcessID                     int                                     `json:"process_id,omitempty"`
+	ProcessStartTicks             uint64                                  `json:"process_start_ticks,omitempty"`
+	StartedAt                     time.Time                               `json:"started_at,omitempty"`
+	RestartCount                  uint32                                  `json:"restart_count"`
+	Failures                      []time.Time                             `json:"failures,omitempty"`
+	CircuitState                  CircuitState                            `json:"circuit_state"`
+	HealthState                   HealthState                             `json:"health_state"`
+	ActiveConfigurationRevision   uint64                                  `json:"active_configuration_revision"`
+	ObservedOperationRevision     uint64                                  `json:"observed_operation_revision"`
+	ObservationRevision           uint64                                  `json:"observation_revision"`
+	BoundInstanceCount            uint32                                  `json:"bound_instance_count"`
+	LastErrorCode                 string                                  `json:"last_error_code,omitempty"`
 }
 
 func (state FamilyState) Validate() error {
@@ -148,7 +165,7 @@ func (state FamilyState) Validate() error {
 	if state.InstalledVersion != "" && !boundedText(state.InstalledVersion, 64) || state.DesiredVersion != "" && !boundedText(state.DesiredVersion, 64) || state.LastErrorCode != "" && !identifierPattern.MatchString(state.LastErrorCode) || int(state.BoundInstanceCount) != len(state.ActiveInstanceIDs) {
 		return ErrInvalidState
 	}
-	if !validOptionalArtifact(state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest) || !validOptionalArtifact(state.DesiredArtifactID, state.DesiredArtifactSHA256, state.DesiredManifestDigest) || !validIDs(state.ActiveInstanceIDs) || !validIDs(state.ActiveTemplateIDs) || !validIDs(state.DesiredInstanceIDs) || !validIDs(state.DesiredTemplateIDs) {
+	if !validOptionalArtifact(state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest) || !validOptionalArtifact(state.DesiredArtifactID, state.DesiredArtifactSHA256, state.DesiredManifestDigest) || !validIDs(state.ActiveInstanceIDs) || !validIDs(state.ActiveTemplateIDs) || !validIDs(state.DesiredInstanceIDs) || !validIDs(state.DesiredTemplateIDs) || !validDescriptors(state.ActiveInstanceIDs, state.ActiveInstanceDescriptors) || !validDescriptors(state.DesiredInstanceIDs, state.DesiredInstanceDescriptors) || !validTemplateProjection(state.ActiveTemplateIDs, state.ActiveTemplateConfigurations) || !validTemplateProjection(state.DesiredTemplateIDs, state.DesiredTemplateConfigurations) {
 		return ErrInvalidState
 	}
 	for slot, value := range state.Slots {
@@ -378,9 +395,13 @@ func ensureEOF(decoder *json.Decoder) error {
 func cloneFamily(state FamilyState) FamilyState {
 	state.Failures = append([]time.Time(nil), state.Failures...)
 	state.ActiveInstanceIDs = append([]string(nil), state.ActiveInstanceIDs...)
+	state.ActiveInstanceDescriptors = append([]InstanceDescriptor(nil), state.ActiveInstanceDescriptors...)
 	state.ActiveTemplateIDs = append([]string(nil), state.ActiveTemplateIDs...)
+	state.ActiveTemplateConfigurations = cloneTemplates(state.ActiveTemplateConfigurations)
 	state.DesiredInstanceIDs = append([]string(nil), state.DesiredInstanceIDs...)
+	state.DesiredInstanceDescriptors = append([]InstanceDescriptor(nil), state.DesiredInstanceDescriptors...)
 	state.DesiredTemplateIDs = append([]string(nil), state.DesiredTemplateIDs...)
+	state.DesiredTemplateConfigurations = cloneTemplates(state.DesiredTemplateConfigurations)
 	if state.Slots != nil {
 		state.Slots = make(map[Slot]SlotState, len(state.Slots))
 		for slot, value := range state.Slots {
@@ -419,6 +440,73 @@ func validIDs(values []string) bool {
 		seen[value] = struct{}{}
 	}
 	return true
+}
+
+func validDescriptors(instanceIDs []string, values []InstanceDescriptor) bool {
+	// Empty is retained as an explicit legacy/unavailable projection. New
+	// reconciliations persist the complete set and can therefore restart
+	// without a Server replay.
+	if len(values) == 0 {
+		return true
+	}
+	if len(values) != len(instanceIDs) || len(values) > 128 {
+		return false
+	}
+	allowed, seen := map[string]struct{}{}, map[string]struct{}{}
+	for _, id := range instanceIDs {
+		allowed[id] = struct{}{}
+	}
+	for _, value := range values {
+		if _, ok := allowed[value.InstanceID]; !ok || !resourcePattern.MatchString(value.InstanceID) || !identifierPattern.MatchString(value.DatabaseVariant) || (value.Endpoint == "") == (value.UnixSocket == "") || len(value.Endpoint) > 512 || len(value.UnixSocket) > 512 {
+			return false
+		}
+		if _, duplicate := seen[value.InstanceID]; duplicate {
+			return false
+		}
+		seen[value.InstanceID] = struct{}{}
+	}
+	return true
+}
+
+func validTemplateProjection(templateIDs []string, values []*pluginv1.MetricTemplateConfiguration) bool {
+	if len(values) == 0 {
+		return true
+	}
+	if len(values) != len(templateIDs) || len(values) > 128 {
+		return false
+	}
+	allowed, seen := map[string]struct{}{}, map[string]struct{}{}
+	totalBytes := 0
+	for _, id := range templateIDs {
+		allowed[id] = struct{}{}
+	}
+	for _, value := range values {
+		totalBytes += proto.Size(value)
+		if value == nil || value.GetRevision() == 0 || len(value.GetQueryDigest()) != 32 || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || strings.ContainsAny(value.GetReadOnlyStatement(), "\x00\r") || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || len(value.GetValueMappings()) == 0 || len(value.GetValueMappings()) > 32 || len(value.GetLabelMappings()) > 16 {
+			return false
+		}
+		if totalBytes > 256<<10 {
+			return false
+		}
+		if _, ok := allowed[value.GetTemplateId()]; !ok {
+			return false
+		}
+		if _, duplicate := seen[value.GetTemplateId()]; duplicate {
+			return false
+		}
+		seen[value.GetTemplateId()] = struct{}{}
+	}
+	return true
+}
+
+func cloneTemplates(values []*pluginv1.MetricTemplateConfiguration) []*pluginv1.MetricTemplateConfiguration {
+	result := make([]*pluginv1.MetricTemplateConfiguration, len(values))
+	for index, value := range values {
+		if value != nil {
+			result[index] = proto.Clone(value).(*pluginv1.MetricTemplateConfiguration)
+		}
+	}
+	return result
 }
 
 func cloneFamilies(values map[string]FamilyState) map[string]FamilyState {

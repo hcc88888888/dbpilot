@@ -48,7 +48,7 @@ func (repository *PostgresRepository) LoadPluginInstanceDescriptors(ctx context.
 	if len(assignment.InstanceIDs) == 0 {
 		return []*agentv1.PluginInstanceDescriptor{}, nil
 	}
-	rows, err := repository.database.QueryContext(ctx, `SELECT instance_id,database_variant,endpoint,unix_socket FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND database_family=$4 AND management_status<>'retired' AND instance_id = ANY($5) ORDER BY instance_id`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.AgentID, assignment.DatabaseFamily, pq.Array(assignment.InstanceIDs))
+	rows, err := repository.database.QueryContext(ctx, `SELECT instance_id,database_variant,endpoint,unix_socket FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4 AND database_family=$5 AND management_status<>'retired' AND instance_id = ANY($6) ORDER BY instance_id`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.HostID, assignment.AgentID, assignment.DatabaseFamily, pq.Array(assignment.InstanceIDs))
 	if err != nil {
 		return nil, mapError(err)
 	}

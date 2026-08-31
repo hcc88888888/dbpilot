@@ -28,6 +28,12 @@ func TestReconcilePluginExecutorConsumesTypedCommandOnlyAfterExecutionFence(t *t
 	require.Equal(t, []uint32{10, 100}, reporter.percents)
 }
 
+func TestReconcilePluginExecutorAdvertisesExactDescriptorProtocolCapability(t *testing.T) {
+	executor, err := NewReconcilePluginExecutor(&recordingPluginSupervisor{})
+	require.NoError(t, err)
+	require.Equal(t, []string{PluginReconcileInstanceDescriptorsCapability}, executor.AdditionalCapabilities())
+}
+
 func TestReconcilePluginExecutorRejectsMissingFenceAndNonTypedEnvelope(t *testing.T) {
 	supervisor := &recordingPluginSupervisor{}
 	executor, err := NewReconcilePluginExecutor(supervisor)

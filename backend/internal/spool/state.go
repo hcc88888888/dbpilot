@@ -23,6 +23,7 @@ var (
 	ErrNoActivePolicy = errors.New("no active policy")
 	ErrNoCheckpoint   = errors.New("no checkpoint")
 	ErrClosed         = errors.New("spool closed")
+	ErrCursorConflict = errors.New("spool cursor conflicts with durable receipt")
 )
 
 const (
@@ -32,11 +33,12 @@ const (
 )
 
 var (
-	bucketAgentState   = []byte("agent_state")
-	bucketPolicyState  = []byte("policy_state")
-	bucketCheckpoints  = []byte("checkpoints")
-	bucketSegmentIndex = []byte("segment_index")
-	bucketDedup        = []byte("dedup")
+	bucketAgentState    = []byte("agent_state")
+	bucketPolicyState   = []byte("policy_state")
+	bucketCheckpoints   = []byte("checkpoints")
+	bucketSegmentIndex  = []byte("segment_index")
+	bucketDedup         = []byte("dedup")
+	bucketCursorReceipt = []byte("cursor_receipts")
 )
 
 // Limits bounds the total on-disk payload and the preferred segment size.
@@ -71,6 +73,23 @@ type Batch struct {
 	Payload   []byte
 	Checksum  uint32
 }
+
+// CursorReceipt is the durable identity of a producer-owned logical
+// sequence. The receipt outlives delivery acknowledgement so the same logical
+// sequence can never be accepted with different bytes after restart.
+type CursorReceipt struct {
+	Key         string
+	Sequence    uint64
+	Digest      []byte
+	CollectedAt time.Time
+}
+
+type CursorAppendResult uint8
+
+const (
+	CursorAppendStored CursorAppendResult = iota + 1
+	CursorAppendDuplicate
+)
 
 // Store owns a single process's bbolt metadata database and segment files.
 type Store struct {
@@ -159,7 +178,7 @@ func Open(root string, limits Limits) (*Store, error) {
 	}
 	s := &Store{root: root, segments: segments, quarantine: quarantine, limits: limits, db: db, entries: make(map[DataClass][]entry), findings: make(map[string]struct{})}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, bucket := range [][]byte{bucketAgentState, bucketPolicyState, bucketCheckpoints, bucketSegmentIndex, bucketDedup} {
+		for _, bucket := range [][]byte{bucketAgentState, bucketPolicyState, bucketCheckpoints, bucketSegmentIndex, bucketDedup, bucketCursorReceipt} {
 			if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
 				return err
 			}

@@ -69,7 +69,7 @@ func NewCommandVerifier(agentID string, publicKey ed25519.PublicKey, capabilitie
 	for _, raw := range capabilities {
 		kind := CommandKind(raw)
 		if !knownCommandKind(kind) {
-			if raw == CapabilityCollectNowDependenciesV1 || raw == CapabilityCollectNowHostV1 {
+			if raw == CapabilityCollectNowDependenciesV1 || raw == CapabilityCollectNowHostV1 || raw == PluginReconcileInstanceDescriptorsCapability {
 				continue
 			}
 			return nil, fmt.Errorf("unknown command capability %q", raw)

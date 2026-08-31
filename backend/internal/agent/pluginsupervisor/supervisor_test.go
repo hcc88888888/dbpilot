@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -52,7 +53,9 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	upgrade.OperationRevision = 2
 	upgrade.ConfigurationRevision = 2
 	upgrade.InstanceIDs = []string{"mysql-3"}
+	upgrade.InstanceDescriptors = []InstanceDescriptor{{InstanceID: "mysql-3", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307"}}
 	upgrade.TemplateIDs = []string{"template-2"}
+	upgrade.TemplateConfigurations = []*pluginv1.MetricTemplateConfiguration{testTemplateConfiguration("template-2")}
 	upgrade.ArtifactID = "artifact-2"
 	upgrade.ArtifactSHA256 = bytesOf(4, sha256.Size)
 	upgrade.ManifestDigest = bytesOf(5, sha256.Size)
@@ -67,6 +70,8 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	require.Equal(t, 3, fixture.runner.startCount(), "old, failed new, restored old")
 	require.Equal(t, "1.0.0", fixture.runner.configurations[2].Version)
 	require.Equal(t, []string{"mysql-1", "mysql-2"}, fixture.runner.configurations[2].InstanceIDs)
+	require.Equal(t, first.InstanceDescriptors, fixture.runner.configurations[2].InstanceDescriptors)
+	require.True(t, proto.Equal(first.TemplateConfigurations[0], fixture.health.requests[2].TemplateConfigurations[0]))
 	require.Equal(t, []string{"template-1"}, fixture.runner.configurations[2].TemplateIDs)
 }
 
@@ -157,6 +162,54 @@ func TestSupervisorRejectsStaleOperationAndSafelyStopsOrRemovesFamily(t *testing
 	require.Equal(t, 1, fixture.lease.calls, "absent must not download")
 }
 
+func TestSupervisorGatewayShutdownFailureStillDrainsAndJoinsProcess(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	running := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), running)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	fixture.health.shutdownErr = ErrHealthHandshake
+
+	stopped := running
+	stopped.OperationRevision++
+	stopped.DesiredState = DesiredStopped
+	prepared, err = fixture.supervisor.Prepare(context.Background(), stopped)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err, "gateway shutdown is best effort before mandatory OS cleanup")
+	require.True(t, fixture.runner.processes[0].stopped)
+	require.Equal(t, 1, fixture.health.shutdownCalls)
+}
+
+func TestSupervisorPersistsWaitingTemplatesWithoutFalseHealthyMetrics(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	fixture.health.activationHealth = pluginstate.HealthDegraded
+	fixture.health.activationCode = "waiting_templates"
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	observed, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	require.Equal(t, pluginstate.ProcessRunning, observed.State.ProcessState)
+	require.Equal(t, pluginstate.HealthDegraded, observed.State.HealthState)
+	require.Equal(t, "waiting_templates", observed.State.LastErrorCode)
+	require.Empty(t, observed.State.Failures)
+}
+
+func TestSupervisorPreSessionHandshakeFailureStillTerminatesRejectedProcess(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	fixture.health.failVersion = request.DesiredVersion
+	fixture.health.shutdownErr = ErrHealthHandshake
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.Error(t, err)
+	require.True(t, fixture.runner.processes[0].stopped)
+	require.Equal(t, 1, fixture.health.shutdownCalls)
+}
+
 func TestSupervisorRejectsEqualRevisionSemanticConflictAcrossRestart(t *testing.T) {
 	fixture := newSupervisorFixture(t)
 	request := validReconcileRequest()
@@ -166,6 +219,7 @@ func TestSupervisorRejectsEqualRevisionSemanticConflictAcrossRestart(t *testing.
 	require.NoError(t, err)
 	conflict := request
 	conflict.InstanceIDs = []string{"mysql-other"}
+	conflict.InstanceDescriptors = []InstanceDescriptor{{InstanceID: "mysql-other", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3308"}}
 	_, err = fixture.supervisor.Prepare(context.Background(), conflict)
 	require.ErrorIs(t, err, ErrOperationConflict)
 	restarted, err := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: t.TempDir(), Store: fixture.store, Installer: fixture.installer, Leases: fixture.lease, Downloader: fakeDownloader{}, Processes: fixture.runner, Health: fixture.health, DrainTimeout: time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: time.Millisecond, RestartMaximum: 10 * time.Millisecond})
@@ -188,6 +242,11 @@ func TestSupervisorUnexpectedExitRestartsAndFiveCrashesOpenCircuit(t *testing.T)
 		process.finish()
 		if crash < 5 {
 			require.Eventually(t, func() bool { return fixture.runner.startCount() >= crash+1 }, time.Second, time.Millisecond)
+			fixture.runner.mu.Lock()
+			restarted := fixture.runner.configurations[len(fixture.runner.configurations)-1]
+			fixture.runner.mu.Unlock()
+			require.Equal(t, request.InstanceDescriptors, restarted.InstanceDescriptors)
+			require.True(t, proto.Equal(request.TemplateConfigurations[0], fixture.health.requests[len(fixture.health.requests)-1].TemplateConfigurations[0]))
 		}
 	}
 	require.Eventually(t, func() bool {
@@ -333,7 +392,7 @@ type fakeInstaller struct {
 }
 
 func (installer *fakeInstaller) InstallInactive(_ context.Context, request InstallRequest, slot pluginstate.Slot) (InstalledSlot, error) {
-	installed := InstalledSlot{Slot: slot, Version: request.Version, ExecutablePath: "/plugins/" + request.DatabaseFamily + "/" + string(slot) + "/plugin", ExecutableSHA256: hexBytes(request.ArtifactSHA256), ManifestPath: "/plugins/manifest", ArtifactSHA256: hexBytes(request.ArtifactSHA256), ManifestDigest: hexBytes(request.ManifestDigest)}
+	installed := InstalledSlot{Slot: slot, Version: request.Version, ExecutablePath: "/plugins/" + request.DatabaseFamily + "/" + string(slot) + "/plugin", ExecutableSHA256: hexBytes(request.ArtifactSHA256), ManifestPath: "/plugins/manifest", ArtifactSHA256: hexBytes(request.ArtifactSHA256), ManifestDigest: hexBytes(request.ManifestDigest), SupportedVariants: []string{"mysql"}, Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1}
 	installer.slots[slot] = installed
 	return installed, nil
 }
@@ -433,13 +492,30 @@ func (process *fakeProcess) Wait() error {
 	return nil
 }
 
-type fakeHealthChecker struct{ failVersion string }
+type fakeHealthChecker struct {
+	failVersion      string
+	shutdownErr      error
+	shutdownCalls    int
+	activationHealth pluginstate.HealthState
+	activationCode   string
+	requests         []HealthRequest
+}
+
+func (checker *fakeHealthChecker) ActivationState(Process) (pluginstate.HealthState, string) {
+	return checker.activationHealth, checker.activationCode
+}
 
 func (checker *fakeHealthChecker) Handshake(_ context.Context, _ Process, request HealthRequest) error {
+	checker.requests = append(checker.requests, request)
 	if request.Version == checker.failVersion {
 		return ErrHealthHandshake
 	}
 	return nil
+}
+
+func (checker *fakeHealthChecker) Shutdown(context.Context, Process, time.Duration) error {
+	checker.shutdownCalls++
+	return checker.shutdownErr
 }
 
 func hexBytes(value []byte) string {

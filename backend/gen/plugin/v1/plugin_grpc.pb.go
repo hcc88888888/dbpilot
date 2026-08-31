@@ -24,6 +24,7 @@ const (
 	PluginRuntime_ValidateInstance_FullMethodName   = "/dbpilot.plugin.v1.PluginRuntime/ValidateInstance"
 	PluginRuntime_CollectNow_FullMethodName         = "/dbpilot.plugin.v1.PluginRuntime/CollectNow"
 	PluginRuntime_StreamMetrics_FullMethodName      = "/dbpilot.plugin.v1.PluginRuntime/StreamMetrics"
+	PluginRuntime_AcknowledgeMetrics_FullMethodName = "/dbpilot.plugin.v1.PluginRuntime/AcknowledgeMetrics"
 	PluginRuntime_GetHealth_FullMethodName          = "/dbpilot.plugin.v1.PluginRuntime/GetHealth"
 	PluginRuntime_Shutdown_FullMethodName           = "/dbpilot.plugin.v1.PluginRuntime/Shutdown"
 )
@@ -37,6 +38,7 @@ type PluginRuntimeClient interface {
 	ValidateInstance(ctx context.Context, in *ValidatePluginInstanceRequest, opts ...grpc.CallOption) (*ValidatePluginInstanceResponse, error)
 	CollectNow(ctx context.Context, in *CollectPluginMetricsRequest, opts ...grpc.CallOption) (*CollectPluginMetricsResponse, error)
 	StreamMetrics(ctx context.Context, in *StreamPluginMetricsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PluginMetricBatch], error)
+	AcknowledgeMetrics(ctx context.Context, in *AcknowledgePluginMetricsRequest, opts ...grpc.CallOption) (*AcknowledgePluginMetricsResponse, error)
 	GetHealth(ctx context.Context, in *GetPluginHealthRequest, opts ...grpc.CallOption) (*PluginHealth, error)
 	Shutdown(ctx context.Context, in *ShutdownPluginRequest, opts ...grpc.CallOption) (*ShutdownPluginResponse, error)
 }
@@ -108,6 +110,16 @@ func (c *pluginRuntimeClient) StreamMetrics(ctx context.Context, in *StreamPlugi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PluginRuntime_StreamMetricsClient = grpc.ServerStreamingClient[PluginMetricBatch]
 
+func (c *pluginRuntimeClient) AcknowledgeMetrics(ctx context.Context, in *AcknowledgePluginMetricsRequest, opts ...grpc.CallOption) (*AcknowledgePluginMetricsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcknowledgePluginMetricsResponse)
+	err := c.cc.Invoke(ctx, PluginRuntime_AcknowledgeMetrics_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *pluginRuntimeClient) GetHealth(ctx context.Context, in *GetPluginHealthRequest, opts ...grpc.CallOption) (*PluginHealth, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PluginHealth)
@@ -137,6 +149,7 @@ type PluginRuntimeServer interface {
 	ValidateInstance(context.Context, *ValidatePluginInstanceRequest) (*ValidatePluginInstanceResponse, error)
 	CollectNow(context.Context, *CollectPluginMetricsRequest) (*CollectPluginMetricsResponse, error)
 	StreamMetrics(*StreamPluginMetricsRequest, grpc.ServerStreamingServer[PluginMetricBatch]) error
+	AcknowledgeMetrics(context.Context, *AcknowledgePluginMetricsRequest) (*AcknowledgePluginMetricsResponse, error)
 	GetHealth(context.Context, *GetPluginHealthRequest) (*PluginHealth, error)
 	Shutdown(context.Context, *ShutdownPluginRequest) (*ShutdownPluginResponse, error)
 	mustEmbedUnimplementedPluginRuntimeServer()
@@ -163,6 +176,9 @@ func (UnimplementedPluginRuntimeServer) CollectNow(context.Context, *CollectPlug
 }
 func (UnimplementedPluginRuntimeServer) StreamMetrics(*StreamPluginMetricsRequest, grpc.ServerStreamingServer[PluginMetricBatch]) error {
 	return status.Error(codes.Unimplemented, "method StreamMetrics not implemented")
+}
+func (UnimplementedPluginRuntimeServer) AcknowledgeMetrics(context.Context, *AcknowledgePluginMetricsRequest) (*AcknowledgePluginMetricsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeMetrics not implemented")
 }
 func (UnimplementedPluginRuntimeServer) GetHealth(context.Context, *GetPluginHealthRequest) (*PluginHealth, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetHealth not implemented")
@@ -274,6 +290,24 @@ func _PluginRuntime_StreamMetrics_Handler(srv interface{}, stream grpc.ServerStr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type PluginRuntime_StreamMetricsServer = grpc.ServerStreamingServer[PluginMetricBatch]
 
+func _PluginRuntime_AcknowledgeMetrics_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcknowledgePluginMetricsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PluginRuntimeServer).AcknowledgeMetrics(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PluginRuntime_AcknowledgeMetrics_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PluginRuntimeServer).AcknowledgeMetrics(ctx, req.(*AcknowledgePluginMetricsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PluginRuntime_GetHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetPluginHealthRequest)
 	if err := dec(in); err != nil {
@@ -332,6 +366,10 @@ var PluginRuntime_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CollectNow",
 			Handler:    _PluginRuntime_CollectNow_Handler,
+		},
+		{
+			MethodName: "AcknowledgeMetrics",
+			Handler:    _PluginRuntime_AcknowledgeMetrics_Handler,
 		},
 		{
 			MethodName: "GetHealth",
