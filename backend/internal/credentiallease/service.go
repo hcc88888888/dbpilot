@@ -25,20 +25,30 @@ type Config struct {
 }
 
 type ApplicationService struct {
-	authorizer     Authorizer
-	renewals       RenewalAuthorizer
-	provider       SecretProvider
-	clock          DatabaseClock
-	audit          AuditRecorder
-	ttl            time.Duration
-	maximumLive    int
-	random         io.Reader
-	mu             sync.Mutex
-	leases         map[string]*liveLease
-	issued         map[string]bool
-	tombstones     map[string]time.Time
-	tombstoneOrder []string
-	closed         bool
+	authorizer          Authorizer
+	renewals            RenewalAuthorizer
+	provider            SecretProvider
+	clock               DatabaseClock
+	audit               AuditRecorder
+	ttl                 time.Duration
+	maximumLive         int
+	random              io.Reader
+	mu                  sync.Mutex
+	leases              map[string]*liveLease
+	issued              map[string]bool
+	tombstones          map[string]nonceTombstone
+	tombstoneOrder      []tombstoneOrderEntry
+	tombstoneGeneration uint64
+	closed              bool
+}
+
+type nonceTombstone struct {
+	until      time.Time
+	generation uint64
+}
+type tombstoneOrderEntry struct {
+	key        string
+	generation uint64
 }
 
 type liveLease struct {
@@ -73,7 +83,7 @@ func NewService(config Config) (*ApplicationService, error) {
 	if maximum < 1 || maximum > DefaultMaximumLive {
 		return nil, ErrLeaseRejected
 	}
-	return &ApplicationService{authorizer: config.Authorizer, renewals: config.Renewals, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease), issued: make(map[string]bool), tombstones: make(map[string]time.Time)}, nil
+	return &ApplicationService{authorizer: config.Authorizer, renewals: config.Renewals, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease), issued: make(map[string]bool), tombstones: make(map[string]nonceTombstone)}, nil
 }
 
 func (service *ApplicationService) Lease(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest) (Lease, error) {
@@ -132,7 +142,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 			return Lease{}, ErrLeaseRejected
 		}
 	}
-	if until, reused := service.tombstones[key]; reused && until.After(now) {
+	if tombstone, reused := service.tombstones[key]; reused && tombstone.until.After(now) {
 		service.mu.Unlock()
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
@@ -234,8 +244,8 @@ func (service *ApplicationService) failRecord(key string, record *liveLease) {
 }
 
 func (service *ApplicationService) pruneLocked(now time.Time) {
-	for key, until := range service.tombstones {
-		if !until.After(now) {
+	for key, tombstone := range service.tombstones {
+		if !tombstone.until.After(now) {
 			delete(service.tombstones, key)
 		}
 	}
@@ -286,14 +296,16 @@ func (service *ApplicationService) Close() {
 }
 
 func (service *ApplicationService) addTombstoneLocked(key string, until time.Time) {
-	if _, exists := service.tombstones[key]; !exists {
-		service.tombstoneOrder = append(service.tombstoneOrder, key)
-	}
-	service.tombstones[key] = until
+	service.tombstoneGeneration++
+	generation := service.tombstoneGeneration
+	service.tombstones[key] = nonceTombstone{until: until, generation: generation}
+	service.tombstoneOrder = append(service.tombstoneOrder, tombstoneOrderEntry{key: key, generation: generation})
 	for len(service.tombstoneOrder) > service.maximumLive*4 {
 		oldest := service.tombstoneOrder[0]
 		service.tombstoneOrder = service.tombstoneOrder[1:]
-		delete(service.tombstones, oldest)
+		if current, exists := service.tombstones[oldest.key]; exists && current.generation == oldest.generation {
+			delete(service.tombstones, oldest.key)
+		}
 	}
 }
 

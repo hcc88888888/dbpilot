@@ -564,6 +564,9 @@ func (supervisor *PluginSupervisor) monitorProcess(family string, managed *manag
 	if managed.expected.Load() || supervisor.shuttingDown.Load() {
 		return
 	}
+	if cleaner, ok := supervisor.health.(UnexpectedExitCleaner); ok {
+		cleaner.CleanupUnexpectedExit(managed.process)
+	}
 	supervisor.mu.Lock()
 	if supervisor.running[family] != managed {
 		supervisor.mu.Unlock()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -176,6 +177,31 @@ func TestSubsequentNonceUsesDurableRenewalAuthorization(t *testing.T) {
 	second.Release()
 	require.Equal(t, 2, initial.calls)
 	require.Equal(t, 2, renewal.calls)
+}
+
+func TestTombstoneEvictionNeverDeletesNewGenerationOrConsumesLiveCapacity(t *testing.T) {
+	now := time.Now().UTC()
+	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("capacity-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, MaximumLive: 1, Random: bytes.NewReader(bytes.Repeat([]byte{0x7a}, 64))})
+	require.NoError(t, err)
+	service.mu.Lock()
+	service.addTombstoneLocked("nonce-reused", now.Add(time.Minute))
+	first := service.tombstones["nonce-reused"].generation
+	service.addTombstoneLocked("nonce-reused", now.Add(2*time.Minute))
+	second := service.tombstones["nonce-reused"].generation
+	for index := 0; index < 3; index++ {
+		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute))
+	}
+	current, exists := service.tombstones["nonce-reused"]
+	for index := 3; index < 20; index++ {
+		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute))
+	}
+	service.mu.Unlock()
+	require.NotEqual(t, first, second)
+	require.True(t, exists)
+	require.Equal(t, second, current.generation)
+	lease, err := service.Lease(context.Background(), AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}, validRequest())
+	require.NoError(t, err, "bounded tombstones must not consume active lease capacity")
+	lease.Release()
 }
 
 func validRequest() LeaseRequest {

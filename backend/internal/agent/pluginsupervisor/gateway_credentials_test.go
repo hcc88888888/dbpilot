@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,6 +52,24 @@ func TestGatewayCredentialRemoteRequestIsSingleflight(t *testing.T) {
 		require.Equal(t, []byte("singleflight-secret"), lease.SecretBytes)
 		lease.Release()
 	}
+}
+
+func TestGatewayUnexpectedExitZerosActiveCredentialsAndCancelsLifetimes(t *testing.T) {
+	checker := NewGatewayHealthChecker(nil)
+	process := &fakeProcess{pid: 4242}
+	secret := []byte("unexpected-exit-secret")
+	configuration := plugingateway.PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 5, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "instance-1", CredentialLease: &pluginv1.CredentialLease{SecretBytes: secret}}}}
+	checker.activeCredentials[process.pid] = activeCredentialConfiguration{configuration: configuration, deadline: time.Now().Add(time.Minute)}
+	streamCancelled, renewalCancelled := false, false
+	checker.streams[process.pid] = func() { streamCancelled = true }
+	checker.expiries[process.pid] = func() { renewalCancelled = true }
+	checker.CleanupUnexpectedExit(process)
+	require.True(t, streamCancelled)
+	require.True(t, renewalCancelled)
+	require.Equal(t, make([]byte, len(secret)), secret)
+	require.Empty(t, checker.activeCredentials)
+	require.Empty(t, checker.streams)
+	require.Empty(t, checker.expiries)
 }
 
 type slowCredentialLeaser struct {

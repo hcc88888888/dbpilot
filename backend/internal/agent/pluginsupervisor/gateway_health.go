@@ -549,6 +549,34 @@ func (checker *GatewayHealthChecker) Shutdown(ctx context.Context, process Proce
 	return nil
 }
 
+func (checker *GatewayHealthChecker) CleanupUnexpectedExit(process Process) {
+	if checker == nil || process == nil {
+		return
+	}
+	pid := process.PID()
+	checker.mu.Lock()
+	session := checker.sessions[pid]
+	if cancel := checker.streams[pid]; cancel != nil {
+		cancel()
+	}
+	if cancel := checker.expiries[pid]; cancel != nil {
+		cancel()
+	}
+	active := checker.activeCredentials[pid]
+	delete(checker.streams, pid)
+	delete(checker.expiries, pid)
+	delete(checker.sessions, pid)
+	delete(checker.activation, pid)
+	delete(checker.activeCredentials, pid)
+	checker.mu.Unlock()
+	active.configuration.Release()
+	if session != nil {
+		assignmentID := session.AssignmentID()
+		checker.cache.InvalidateAssignment(assignmentID)
+		checker.invalidateCredentialFlights(assignmentID)
+	}
+}
+
 func sameTemplateProjection(ids []string, templates []*pluginv1.MetricTemplateConfiguration) bool {
 	if len(ids) == 0 || len(ids) != len(templates) {
 		return false
@@ -576,3 +604,4 @@ func containsString(values []string, want string) bool {
 }
 
 var _ HealthChecker = (*GatewayHealthChecker)(nil)
+var _ UnexpectedExitCleaner = (*GatewayHealthChecker)(nil)

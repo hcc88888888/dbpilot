@@ -361,6 +361,10 @@ type HealthChecker interface {
 	Handshake(context.Context, Process, HealthRequest) error
 }
 
+type UnexpectedExitCleaner interface {
+	CleanupUnexpectedExit(Process)
+}
+
 type StateStore interface {
 	Get(string) (pluginstate.FamilyState, bool)
 	List() []pluginstate.FamilyState
