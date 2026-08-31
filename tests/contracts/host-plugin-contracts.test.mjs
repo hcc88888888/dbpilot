@@ -198,6 +198,16 @@ test('database retirement and synchronous template validation expose exact CAS r
   assert.equal(validate.responses['202'], undefined);
 });
 
+test('plugin reconciliation success identifies the persisted job version', async () => {
+  const document = await bundleContract();
+  const reconcile = operations(document).get('reconcilePluginAssignment');
+  assert.equal(reconcile.responses['202'].content['application/json'].schema.$ref, '#/components/schemas/Job');
+  assert.equal(reconcile.responses['202'].headers.Location.required, true);
+  assert.equal(reconcile.responses['202'].headers.ETag.required, true);
+  assert.equal(reconcile.responses['202'].headers.ETag.schema.minLength, 3);
+  assert.equal(reconcile.responses['202'].headers.ETag.schema.maxLength, 128);
+});
+
 test('host database plugin and metric template DTOs are closed and bounded', async () => {
   const document = await bundleContract();
   const schemas = document.components.schemas;

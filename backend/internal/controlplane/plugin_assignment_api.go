@@ -292,7 +292,7 @@ func storedPluginReconcileResponse(value job.Job, scope platformscope.Scope) (id
 		return idempotency.Response{}, err
 	}
 	location := fmt.Sprintf("/api/v1/tenants/%s/projects/%s/jobs/%s", scope.TenantID, scope.ProjectID, value.ID)
-	return idempotency.Response{Status: http.StatusAccepted, Header: http.Header{"Content-Type": []string{"application/json"}, "Location": []string{location}}, Body: encoded}, nil
+	return idempotency.Response{Status: http.StatusAccepted, Header: http.Header{"Content-Type": []string{"application/json"}, "ETag": []string{entityTag(value.Version)}, "Location": []string{location}}, Body: encoded}, nil
 }
 
 type reconcilePluginAssignmentIdempotentResponse struct{ response idempotency.Response }

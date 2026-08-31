@@ -65,6 +65,7 @@ func TestPluginAssignmentReconcileConcurrentExactRetriesUsePostgresResponse(t *t
 	var body string
 	for response := range responses {
 		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+		require.Equal(t, `"1"`, response.Header().Get("ETag"))
 		if body == "" {
 			body = response.Body.String()
 		} else {
@@ -127,6 +128,12 @@ func TestPluginAssignmentReconcileLost202PrefersRealPersistedJobOverLaterState(t
 	}
 	first := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request())
 	require.Equal(t, http.StatusInternalServerError, first.Code)
+	var storedStatus int
+	var storedETag, storedLocation string
+	require.NoError(t, database.QueryRow(`SELECT response_status,response_headers->'ETag'->>0,response_headers->'Location'->>0 FROM idempotency_records WHERE tenant_id=$1 AND project_id=$2 AND operation_id='reconcilePluginAssignment' AND idempotency_key='reconcile-real-lost'`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&storedStatus, &storedETag, &storedLocation))
+	require.Equal(t, http.StatusAccepted, storedStatus)
+	require.Equal(t, `"1"`, storedETag)
+	require.NotEmpty(t, storedLocation)
 	_, err = database.Exec(`UPDATE plugin_assignments SET reconcile_state='converged',blocked_reason='',revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, platformTestScope.TenantID, platformTestScope.ProjectID, page.Items[0].ID)
 	require.NoError(t, err)
 	gap.fail = false
@@ -145,17 +152,28 @@ func TestPluginAssignmentReconcileLost202PrefersRealPersistedJobOverLaterState(t
 	close(responses)
 	var body []byte
 	var location string
+	var etag string
 	for response := range responses {
 		require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
 		if body == nil {
 			body = append([]byte(nil), response.Body.Bytes()...)
 			location = response.Header().Get("Location")
+			etag = response.Header().Get("ETag")
 			require.NotEmpty(t, location)
+			require.Equal(t, `"1"`, etag)
 		} else {
 			require.Equal(t, body, response.Body.Bytes())
 			require.Equal(t, location, response.Header().Get("Location"))
+			require.Equal(t, etag, response.Header().Get("ETag"))
 		}
 	}
+	_, err = database.Exec(`UPDATE plugin_assignments SET reconcile_state='state_conflict',blocked_reason='',revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, platformTestScope.TenantID, platformTestScope.ProjectID, page.Items[0].ID)
+	require.NoError(t, err)
+	conflicted := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionReconcilePluginAssignment), request())
+	require.Equal(t, http.StatusAccepted, conflicted.Code, conflicted.Body.String())
+	require.Equal(t, body, conflicted.Body.Bytes())
+	require.Equal(t, location, conflicted.Header().Get("Location"))
+	require.Equal(t, etag, conflicted.Header().Get("ETag"))
 	var jobCount, outboxCount int
 	require.NoError(t, database.QueryRow(`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND job_type='plugin.reconcile'`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&jobCount))
 	require.NoError(t, database.QueryRow(`SELECT count(*) FROM command_outbox WHERE tenant_id=$1 AND project_id=$2`, platformTestScope.TenantID, platformTestScope.ProjectID).Scan(&outboxCount))
@@ -197,6 +215,7 @@ func TestPluginAssignmentReconcileLostResponseRecoversExactAuthoritativeJob(t *t
 	var body string
 	for retry := range responses {
 		require.Equal(t, http.StatusAccepted, retry.Code, retry.Body.String())
+		require.Equal(t, `"1"`, retry.Header().Get("ETag"))
 		require.Contains(t, retry.Body.String(), now.Format(time.RFC3339))
 		if body == "" {
 			body = retry.Body.String()

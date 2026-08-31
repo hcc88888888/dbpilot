@@ -306,6 +306,7 @@ ReconcilePluginAssignment:
         description: Reconciliation job accepted.
         headers:
           Location: { required: true, schema: { type: string, format: uri-reference } }
+          ETag: { required: true, schema: { type: string, minLength: 3, maxLength: 128 } }
         content:
           application/json:
             schema: { $ref: ../common/jobs.yaml#/Job }
