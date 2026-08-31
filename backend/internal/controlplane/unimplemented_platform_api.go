@@ -23,10 +23,6 @@ func (unimplementedPlatformAPI) CreateMetricTemplateRevision(context.Context, op
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) GetPluginAssignment(context.Context, openapi.GetPluginAssignmentRequestObject) (openapi.GetPluginAssignmentResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) ListMetricTemplateRevisions(context.Context, openapi.ListMetricTemplateRevisionsRequestObject) (openapi.ListMetricTemplateRevisionsResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
@@ -35,15 +31,7 @@ func (unimplementedPlatformAPI) ListMetricTemplates(context.Context, openapi.Lis
 	return nil, ErrServiceUnavailable
 }
 
-func (unimplementedPlatformAPI) ListPluginAssignments(context.Context, openapi.ListPluginAssignmentsRequestObject) (openapi.ListPluginAssignmentsResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
 func (unimplementedPlatformAPI) PublishMetricTemplateRevision(context.Context, openapi.PublishMetricTemplateRevisionRequestObject) (openapi.PublishMetricTemplateRevisionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) ReconcilePluginAssignment(context.Context, openapi.ReconcilePluginAssignmentRequestObject) (openapi.ReconcilePluginAssignmentResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 
@@ -52,10 +40,6 @@ func (unimplementedPlatformAPI) RediscoverHost(context.Context, openapi.Rediscov
 }
 
 func (unimplementedPlatformAPI) TrialMetricTemplateRevision(context.Context, openapi.TrialMetricTemplateRevisionRequestObject) (openapi.TrialMetricTemplateRevisionResponseObject, error) {
-	return nil, ErrServiceUnavailable
-}
-
-func (unimplementedPlatformAPI) UpdatePluginAssignment(context.Context, openapi.UpdatePluginAssignmentRequestObject) (openapi.UpdatePluginAssignmentResponseObject, error) {
 	return nil, ErrServiceUnavailable
 }
 

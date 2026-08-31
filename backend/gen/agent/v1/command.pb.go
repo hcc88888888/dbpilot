@@ -1911,6 +1911,8 @@ type ReconcilePlugin struct {
 	ManifestDigest        []byte                 `protobuf:"bytes,8,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
 	ConfigurationRevision uint64                 `protobuf:"varint,9,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
 	OperationRevision     uint64                 `protobuf:"varint,10,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	InstanceIds           []string               `protobuf:"bytes,11,rep,name=instance_ids,json=instanceIds,proto3" json:"instance_ids,omitempty"`
+	TemplateIds           []string               `protobuf:"bytes,12,rep,name=template_ids,json=templateIds,proto3" json:"template_ids,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -2013,6 +2015,20 @@ func (x *ReconcilePlugin) GetOperationRevision() uint64 {
 		return x.OperationRevision
 	}
 	return 0
+}
+
+func (x *ReconcilePlugin) GetInstanceIds() []string {
+	if x != nil {
+		return x.InstanceIds
+	}
+	return nil
+}
+
+func (x *ReconcilePlugin) GetTemplateIds() []string {
+	if x != nil {
+		return x.TemplateIds
+	}
+	return nil
 }
 
 type ApplyPluginConfiguration struct {
@@ -3576,7 +3592,7 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12#\n" +
 	"\rrule_revision\x18\x02 \x01(\x04R\fruleRevision\x12%\n" +
 	"\x0einclude_native\x18\x03 \x01(\bR\rincludeNative\x12%\n" +
-	"\x0einclude_docker\x18\x04 \x01(\bR\rincludeDocker\"\xc9\x03\n" +
+	"\x0einclude_docker\x18\x04 \x01(\bR\rincludeDocker\"\x95\x04\n" +
 	"\x0fReconcilePlugin\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x12\x1b\n" +
 	"\tplugin_id\x18\x02 \x01(\tR\bpluginId\x12'\n" +
@@ -3589,7 +3605,9 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x0fmanifest_digest\x18\b \x01(\fR\x0emanifestDigest\x125\n" +
 	"\x16configuration_revision\x18\t \x01(\x04R\x15configurationRevision\x12-\n" +
 	"\x12operation_revision\x18\n" +
-	" \x01(\x04R\x11operationRevision\"\xc3\x01\n" +
+	" \x01(\x04R\x11operationRevision\x12!\n" +
+	"\finstance_ids\x18\v \x03(\tR\vinstanceIds\x12!\n" +
+	"\ftemplate_ids\x18\f \x03(\tR\vtemplateIdsJ\x04\b\r\x10\x14\"\xc3\x01\n" +
 	"\x18ApplyPluginConfiguration\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12K\n" +

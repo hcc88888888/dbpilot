@@ -399,6 +399,7 @@ func TestNewServerWiresDefaultCommandLifecycleToRegistryAndWorker(t *testing.T) 
 
 	require.NoError(t, err)
 	require.NotNil(t, server.commandLifecycle)
+	require.True(t, server.commandLifecycle.HasTargetAuthorizer(), "default plugin commands must retain the resolved database-backed target authorizer through dispatch")
 	require.Same(t, server.commandLifecycle, server.commandObserver)
 	require.NotNil(t, server.dispatchCommands)
 	require.NotNil(t, server.hostInventoryService)

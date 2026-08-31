@@ -75,6 +75,12 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		if value == nil || !validIdentifier(value.GetHostId()) || value.GetRuleRevision() == 0 || (!value.GetIncludeNative() && !value.GetIncludeDocker()) {
 			return ErrInvalidCommand
 		}
+	case *agentv1.CommandEnvelope_ReconcilePlugin:
+		value := command.ReconcilePlugin
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) {
+			return ErrInvalidCommand
+		}
+		targets = value.GetInstanceIds()
 	default:
 		return ErrInvalidCommand
 	}
@@ -172,6 +178,23 @@ func validExecutionFence(commandID string, executionToken []byte, leaseRevision 
 
 func validTransactionPolicy(value agentv1.TransactionPolicy) bool {
 	return value == agentv1.TransactionPolicy_TRANSACTION_POLICY_REQUIRED || value == agentv1.TransactionPolicy_TRANSACTION_POLICY_FORBIDDEN || value == agentv1.TransactionPolicy_TRANSACTION_POLICY_AUTO_COMMIT
+}
+
+func validPluginDesiredState(value agentv1.PluginDesiredState) bool {
+	return value == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT || value == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_INSTALLED || value == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || value == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_STOPPED
+}
+
+func validVersion(value string) bool {
+	if value == "" || value != strings.TrimSpace(value) || len(value) > 64 || !utf8.ValidString(value) || strings.ContainsAny(value, "\x00\r\n\t/\\") {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || strings.ContainsRune(".+_-", character) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validIdentifier(value string) bool {

@@ -154,6 +154,12 @@ func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, erro
 	}, nil
 }
 
+// HasTargetAuthorizer reports whether instance-bound commands are validated
+// again at dispatch, after their durable Outbox payload is decoded.
+func (lifecycle *CommandLifecycle) HasTargetAuthorizer() bool {
+	return lifecycle != nil && lifecycle.targetAuthorizer != nil
+}
+
 func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.Time) (int, error) {
 	if lifecycle == nil || at.IsZero() {
 		return 0, errors.New("command lifecycle and dispatch time are required")

@@ -19,12 +19,17 @@ import (
 const instanceColumns = `instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,unix_socket,version_hint,edition,discovered_role,topology,credential_ref,tls_ref,plugin_id,desired_plugin_version,template_profile_id,labels,capabilities,capability_state,connection_test_status,connection_test_at,plugin_assignment_revision,management_status,revision,created_at,updated_at,retired_at`
 
 type PostgresRepository struct {
-	database *sql.DB
-	commit   func(*sql.Tx) error
+	database    *sql.DB
+	commit      func(*sql.Tx) error
+	provisioner AcceptanceProvisioner
 }
 
 func NewPostgresRepository(database *sql.DB) *PostgresRepository {
 	return &PostgresRepository{database: database, commit: func(transaction *sql.Tx) error { return transaction.Commit() }}
+}
+
+func NewPostgresRepositoryWithProvisioner(database *sql.DB, provisioner AcceptanceProvisioner) *PostgresRepository {
+	return &PostgresRepository{database: database, provisioner: provisioner, commit: func(transaction *sql.Tx) error { return transaction.Commit() }}
 }
 
 func (repository *PostgresRepository) AcceptCandidate(ctx context.Context, scope platformscope.Scope, candidateID string, request AcceptCandidateRequest) (Instance, error) {
@@ -99,6 +104,10 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 			}
 			return Instance{}, ErrConflict
 		}
+		if err := repository.ensureAssignmentProjection(ctx, transaction, &value, request.Audit, now); err != nil {
+			rollback()
+			return Instance{}, err
+		}
 		if err := persistMutationAndAudit(ctx, transaction, scope, request.Audit, "accept", candidateID, request.ExpectedCandidateRevision, value, "database_instance.accepted", candidateID); err != nil {
 			rollback()
 			return Instance{}, err
@@ -139,6 +148,10 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 				return Instance{}, ErrConflict
 			}
 		}
+		if err := repository.ensureAssignmentProjection(ctx, transaction, &existing, request.Audit, now); err != nil {
+			rollback()
+			return Instance{}, err
+		}
 		result, updateErr := transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='accepted',accepted_instance_id=$4,updated_at=$5 WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3 AND observation_revision=$6 AND fingerprint=$7 AND status IN ('discovered','awaiting_confirmation')`, scope.TenantID, scope.ProjectID, candidateID, existing.ID, now, request.ExpectedCandidateRevision, fingerprint)
 		if updateErr != nil {
 			rollback()
@@ -176,6 +189,10 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 		rollback()
 		return Instance{}, mapPostgresError(err)
 	}
+	if err := repository.ensureAssignmentProjection(ctx, transaction, &value, request.Audit, now); err != nil {
+		rollback()
+		return Instance{}, err
+	}
 	result, err := transaction.ExecContext(ctx, `UPDATE discovery_candidates SET status='accepted',accepted_instance_id=$4,updated_at=$5 WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3 AND observation_revision=$6 AND fingerprint=$7 AND status IN ('discovered','awaiting_confirmation')`, scope.TenantID, scope.ProjectID, candidateID, value.ID, now, request.ExpectedCandidateRevision, fingerprint)
 	if err != nil {
 		rollback()
@@ -193,6 +210,36 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 		return Instance{}, err
 	}
 	return value, nil
+}
+
+func (repository *PostgresRepository) ensureAssignmentProjection(ctx context.Context, transaction *sql.Tx, value *Instance, audit MutationAudit, now time.Time) error {
+	if repository.provisioner == nil {
+		return nil
+	}
+	binding, err := repository.provisioner.EnsureForInstanceTx(ctx, transaction, *value, audit)
+	if err != nil {
+		return err
+	}
+	if !identifierPattern.MatchString(binding.AssignmentID) || !identifierPattern.MatchString(binding.PluginID) || !bounded(binding.DesiredVersion, 64, true) || binding.ConfigurationRevision == 0 {
+		return ErrInvalid
+	}
+	if value.PluginID == binding.PluginID && value.DesiredPluginVersion == binding.DesiredVersion && value.PluginAssignmentRevision == binding.ConfigurationRevision {
+		return nil
+	}
+	value.PluginID = binding.PluginID
+	value.DesiredPluginVersion = binding.DesiredVersion
+	value.PluginAssignmentRevision = binding.ConfigurationRevision
+	value.Revision++
+	value.UpdatedAt = now.UTC()
+	result, err := transaction.ExecContext(ctx, `UPDATE managed_database_instances SET plugin_id=$4,desired_plugin_version=$5,plugin_assignment_revision=$6,revision=$7,updated_at=$8 WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3 AND management_status<>'retired'`, value.Scope.TenantID, value.Scope.ProjectID, value.ID, value.PluginID, value.DesiredPluginVersion, value.PluginAssignmentRevision, value.Revision, value.UpdatedAt)
+	if err != nil {
+		return mapPostgresError(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return ErrConflict
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) List(ctx context.Context, scope platformscope.Scope, filter Filter) (Page, error) {
@@ -396,6 +443,14 @@ func (repository *PostgresRepository) mutateOnce(ctx context.Context, scope plat
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		rollback()
 		return Instance{}, ErrPrecondition
+	}
+	if action == "retire" {
+		if provisioner, ok := repository.provisioner.(RetirementProvisioner); ok {
+			if err := provisioner.DetachInstanceTx(ctx, transaction, value, audit); err != nil {
+				rollback()
+				return Instance{}, err
+			}
+		}
 	}
 	if err := persistMutationAndAudit(ctx, transaction, scope, audit, action, instanceID, revision, value, auditAction, instanceID); err != nil {
 		rollback()

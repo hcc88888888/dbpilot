@@ -48,7 +48,9 @@ import (
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
+	"dbpilot.local/platform/internal/reconciliation"
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -194,6 +196,7 @@ type Config struct {
 	EnrollmentService       *enrollment.ApplicationService             `yaml:"-"`
 	HostObservationSink     agentcontrol.HostObservationSink           `yaml:"-"`
 	DiscoveryReportSink     agentcontrol.DiscoveryReportSink           `yaml:"-"`
+	PluginObservationSink   agentcontrol.PluginObservationSink         `yaml:"-"`
 }
 
 type Server struct {
@@ -228,10 +231,12 @@ type Server struct {
 	hostInventoryService   *hostinventory.ApplicationService
 	hostObservations       *agentcontrol.HostObservationDispatcher
 	discoveryObservations  *agentcontrol.DiscoveryDispatcher
+	pluginObservations     *agentcontrol.PluginObservationDispatcher
 	inspectionWorker       *inspection.Worker
 	scheduleInspections    func(context.Context, time.Time) error
 	processInspections     func(context.Context, time.Time) error
 	reconcilePluginCatalog func(context.Context, time.Time) error
+	reconcilePlugins       func(context.Context, time.Time) error
 	workers                sync.WaitGroup
 }
 
@@ -310,6 +315,7 @@ type defaultMigrationSteps struct {
 	discovery        func(context.Context) error
 	databaseInstance func(context.Context) error
 	plugin           func(context.Context) error
+	assignment       func(context.Context) error
 	inspection       func(context.Context) error
 }
 
@@ -317,6 +323,9 @@ func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context)
 	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.databaseInstance, steps.enrollment}
 	if steps.plugin != nil {
 		pipeline = append(pipeline, steps.plugin)
+	}
+	if steps.assignment != nil {
+		pipeline = append(pipeline, steps.assignment)
 	}
 	pipeline = append(pipeline, steps.inspection)
 	return composeMigrations(pipeline...)
@@ -445,6 +454,7 @@ func NewServer(config Config) (*Server, error) {
 		}
 		if config.PluginCatalog.Enabled {
 			steps.plugin = func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) }
+			steps.assignment = func(ctx context.Context) error { return pluginassignment.RunMigrations(ctx, database) }
 		}
 		migrate = composeDefaultMigrations(steps)
 	}
@@ -454,7 +464,11 @@ func NewServer(config Config) (*Server, error) {
 	}
 	ready := &atomic.Bool{}
 	monitoringLimits := monitoring.NormalizeQueryLimits(config.Monitoring.limits())
-	jobRepository := job.NewPostgresRepositoryWithTargetAuthorizer(database, config.CommandTargetAuthorizer)
+	targetAuthorizer := config.CommandTargetAuthorizer
+	if targetAuthorizer == nil {
+		targetAuthorizer = pluginassignment.InstanceTargetAuthorizer{Database: database}
+	}
+	jobRepository := job.NewPostgresRepositoryWithTargetAuthorizer(database, targetAuthorizer)
 	auditService := audit.NewService(audit.NewPostgresStore(database))
 	idempotencyService := idempotency.NewService(idempotency.NewPostgresStore(database))
 	artifactSecrets := config.ArtifactSecretResolver
@@ -562,7 +576,19 @@ func NewServer(config Config) (*Server, error) {
 		return nil, policyErr
 	}
 	discoveryService.Policies = discovery.StaticRulePolicyRegistry{Allowed: discoveryPolicies}
-	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepository(database))
+	var assignmentRepository *pluginassignment.PostgresRepository
+	var assignmentService *pluginassignment.ApplicationService
+	var pluginReconciler *reconciliation.PluginReconciler
+	var acceptanceProvisioner databaseinstance.AcceptanceProvisioner = databaseinstance.AcceptanceProvisionerFunc(func(context.Context, *sql.Tx, databaseinstance.Instance, databaseinstance.MutationAudit) (databaseinstance.AssignmentBinding, error) {
+		return databaseinstance.AssignmentBinding{}, databaseinstance.ErrPluginMissing
+	})
+	if config.PluginCatalog.Enabled {
+		assignmentRepository = pluginassignment.NewPostgresRepository(database, jobRepository)
+		assignmentService = pluginassignment.NewService(assignmentRepository)
+		pluginReconciler = reconciliation.NewPluginReconciler(assignmentRepository)
+		acceptanceProvisioner = assignmentRepository
+	}
+	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepositoryWithProvisioner(database, acceptanceProvisioner))
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -608,6 +634,17 @@ func NewServer(config Config) (*Server, error) {
 			_ = database.Close()
 		}
 		return nil, fmt.Errorf("configure discovery report delivery: %w", err)
+	}
+	pluginSink := config.PluginObservationSink
+	if pluginSink == nil && assignmentService != nil {
+		pluginSink = pluginassignment.ProtoSink{Service: assignmentService, AgentScopes: hostRepository}
+	}
+	var pluginObservations *agentcontrol.PluginObservationDispatcher
+	if pluginSink != nil {
+		pluginObservations, err = agentcontrol.NewPluginObservationDispatcher(pluginSink, agentcontrol.PluginObservationDispatcherConfig{MaximumPendingAgents: maximumPendingHosts, DeliveryTimeout: observationDeliveryTimeout, OnError: func(err error) { log.Printf("plugin observation persistence failed: %v", err) }})
+		if err != nil {
+			return nil, fmt.Errorf("configure plugin observation delivery: %w", err)
+		}
 	}
 	enrollmentService := config.EnrollmentService
 	if enrollmentService == nil && config.Enrollment.Listener.Address != "" {
@@ -668,6 +705,8 @@ func NewServer(config Config) (*Server, error) {
 		Discovery:                  discoveryService,
 		DatabaseInstances:          databaseInstanceService,
 		PluginCatalog:              pluginCatalogService,
+		PluginAssignments:          assignmentService,
+		PluginReconciler:           pluginReconciler,
 		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
@@ -680,6 +719,9 @@ func NewServer(config Config) (*Server, error) {
 				readyService, ok := pluginCatalogService.(interface{ Ready(context.Context) error })
 				if !ok || readyService.Ready(ctx) != nil {
 					return errors.New("plugin catalog is not ready")
+				}
+				if assignmentRepository == nil || assignmentRepository.Ready(ctx) != nil {
+					return errors.New("plugin assignments are not ready")
 				}
 			}
 			return nil
@@ -695,7 +737,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
-		TargetAuthorizer: config.CommandTargetAuthorizer, TokenProtector: commandTokenProtector,
+		TargetAuthorizer: targetAuthorizer, TokenProtector: commandTokenProtector,
 		OnError: func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
@@ -711,12 +753,12 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations)))
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations)))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
-		inspectionService: inspectionService, inspectionWorker: inspectionWorker, hostInventoryService: hostInventoryService, discoveryObservations: discoveryObservations,
+		inspectionService: inspectionService, inspectionWorker: inspectionWorker, hostInventoryService: hostInventoryService, discoveryObservations: discoveryObservations, pluginObservations: pluginObservations,
 		scheduleInspections: func(ctx context.Context, at time.Time) error {
 			_, err := inspectionService.ScheduleDue(ctx, at.UTC())
 			return err
@@ -753,6 +795,13 @@ func NewServer(config Config) (*Server, error) {
 				}
 			}
 			return nil
+		},
+		reconcilePlugins: func(ctx context.Context, at time.Time) error {
+			if pluginReconciler == nil {
+				return nil
+			}
+			_, err := pluginReconciler.Reconcile(ctx, at.UTC(), 25)
+			return err
 		},
 	}, nil
 }
@@ -1178,6 +1227,9 @@ func (server *Server) stop(httpListener, grpcListener, enrollmentListener net.Li
 	if server.discoveryObservations != nil {
 		server.discoveryObservations.Close()
 	}
+	if server.pluginObservations != nil {
+		server.pluginObservations.Close()
+	}
 	return nil
 }
 
@@ -1205,7 +1257,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(6)
+	server.workers.Add(7)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -1239,6 +1291,14 @@ func (server *Server) startLoops(ctx context.Context) {
 		periodic(ctx, time.Minute, func(at time.Time) {
 			if err := server.reconcilePluginCatalog(ctx, at); err != nil && ctx.Err() == nil {
 				log.Printf("plugin catalog reconciliation pass failed: %v", err)
+			}
+		})
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, 2*time.Second, func(at time.Time) {
+			if err := server.reconcilePlugins(ctx, at); err != nil && ctx.Err() == nil {
+				log.Printf("plugin assignment reconciliation pass failed: %v", err)
 			}
 		})
 	}()

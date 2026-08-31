@@ -18,15 +18,11 @@ var task1UnimplementedOperationNames = []string{
 	"ApproveMetricTemplateRevision",
 	"CreateMetricTemplate",
 	"CreateMetricTemplateRevision",
-	"GetPluginAssignment",
 	"ListMetricTemplateRevisions",
 	"ListMetricTemplates",
-	"ListPluginAssignments",
 	"PublishMetricTemplateRevision",
-	"ReconcilePluginAssignment",
 	"RediscoverHost",
 	"TrialMetricTemplateRevision",
-	"UpdatePluginAssignment",
 	"ValidateMetricTemplateRevision",
 }
 

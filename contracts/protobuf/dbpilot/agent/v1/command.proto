@@ -198,6 +198,9 @@ message ReconcilePlugin {
   bytes manifest_digest = 8;
   uint64 configuration_revision = 9;
   uint64 operation_revision = 10;
+  repeated string instance_ids = 11;
+  repeated string template_ids = 12;
+  reserved 13 to 19;
 }
 
 enum PluginDesiredState {

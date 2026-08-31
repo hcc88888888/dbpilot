@@ -18,6 +18,7 @@ import (
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
 )
 
@@ -54,6 +55,10 @@ type EnrollmentService interface {
 	Create(context.Context, platformscope.Scope, enrollment.CreateRequest) (enrollment.CreatedEnrollment, error)
 	Replace(context.Context, platformscope.Scope, enrollment.CreateRequest, uint64) (enrollment.CreatedEnrollment, error)
 	ResolveReplacement(context.Context, platformscope.Scope, enrollment.ReplacementLookup) (enrollment.ReplacementState, error)
+}
+
+type PluginAssignmentReconciler interface {
+	ReconcileAssignment(context.Context, pluginassignment.Assignment, time.Time) (job.Job, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host
@@ -111,6 +116,8 @@ type Services struct {
 	Discovery                  discovery.Service
 	DatabaseInstances          databaseinstance.Service
 	PluginCatalog              plugincatalog.CatalogService
+	PluginAssignments          pluginassignment.Service
+	PluginReconciler           PluginAssignmentReconciler
 	PluginUploadRemove         func(string) error
 	PluginUploadCleanupFailure func(error)
 	ArtifactContent            http.Handler

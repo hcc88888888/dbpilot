@@ -392,6 +392,8 @@ func commandCapability(envelope *agentv1.CommandEnvelope) (string, bool) {
 		return "execute_registered_process", true
 	case *agentv1.CommandEnvelope_CollectDiagnostic:
 		return "collect_diagnostic", true
+	case *agentv1.CommandEnvelope_ReconcilePlugin:
+		return "plugin.reconcile.v1", true
 	default:
 		return "", false
 	}

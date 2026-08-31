@@ -62,8 +62,16 @@ type Server struct {
 	observer  Observer
 	hosts     HostObserver
 	discovery DiscoveryObserver
+	plugins   PluginObserver
 	now       func() time.Time
 }
+
+type PluginObserver interface {
+	SubmitPlugin(string, *agentv1.PluginObservation) error
+}
+type noopPluginObserver struct{}
+
+func (noopPluginObserver) SubmitPlugin(string, *agentv1.PluginObservation) error { return nil }
 
 type ServerOption func(*Server)
 
@@ -83,6 +91,14 @@ func WithDiscoveryObserver(observer DiscoveryObserver) ServerOption {
 	}
 }
 
+func WithPluginObserver(observer PluginObserver) ServerOption {
+	return func(server *Server) {
+		if observer != nil {
+			server.plugins = observer
+		}
+	}
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -90,7 +106,7 @@ func NewServer(registry *Registry, observer Observer, options ...ServerOption) *
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, now: time.Now}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -305,6 +321,13 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 			default:
 				return status.Error(codes.Unavailable, "Discovery report delivery is unavailable")
 			}
+		}
+	case *agentv1.AgentMessage_PluginObservation:
+		if typed.PluginObservation == nil || subtle.ConstantTimeCompare([]byte(agentID), []byte(typed.PluginObservation.GetAgentId())) != 1 {
+			return status.Error(codes.PermissionDenied, "Plugin observation Agent ID does not match the session identity")
+		}
+		if err := s.plugins.SubmitPlugin(agentID, typed.PluginObservation); err != nil {
+			return status.Error(codes.Unavailable, "Plugin observation persistence is unavailable")
 		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
