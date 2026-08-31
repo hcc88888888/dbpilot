@@ -2,11 +2,16 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"dbpilot.local/platform/gen/openapi"
+	"dbpilot.local/platform/internal/idempotency"
+	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
 )
 
@@ -110,7 +115,7 @@ func (api platformAPI) UpdatePluginAssignment(ctx context.Context, request opena
 }
 
 func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request openapi.ReconcilePluginAssignmentRequestObject) (openapi.ReconcilePluginAssignmentResponseObject, error) {
-	if api.services.PluginAssignments == nil || api.services.PluginReconciler == nil {
+	if api.services.PluginAssignments == nil || api.services.PluginReconciler == nil || api.services.Idempotency == nil {
 		return nil, ErrServiceUnavailable
 	}
 	if !validIdempotencyKey(request.Params.IdempotencyKey) {
@@ -125,27 +130,96 @@ func (api platformAPI) ReconcilePluginAssignment(ctx context.Context, request op
 		return nil, err
 	}
 	audit := pluginassignment.MutationAudit{Actor: principal.Subject, OperationID: "reconcilePluginAssignment", IdempotencyKey: request.Params.IdempotencyKey, RequestFingerprint: fingerprint, RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx)}
-	assignment, err := api.services.PluginAssignments.ForceReconcile(ctx, scope, request.AssignmentId, audit)
+	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "reconcilePluginAssignment", IdempotencyKey: request.Params.IdempotencyKey}
+	reconcile := func(context.Context, idempotency.Response, []byte) error { return nil }
+	run := func(callContext context.Context) (idempotency.Response, error) {
+		assignment, err := api.services.PluginAssignments.ForceReconcile(callContext, scope, request.AssignmentId, audit)
+		if err != nil {
+			return idempotency.Response{}, err
+		}
+		value, err := api.services.PluginReconciler.ReconcileAssignment(callContext, assignment, api.now())
+		if err != nil {
+			return idempotency.Response{}, err
+		}
+		return storedPluginReconcileResponse(value, scope)
+	}
+	begin := func() (idempotency.Claim, error) {
+		return api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, []byte(`{}`), reconcile, func(recoveryContext context.Context, _ idempotency.ProcessingClaim) (idempotency.Response, error) {
+			return run(recoveryContext)
+		})
+	}
+	var claim idempotency.Claim
+	for attempt := 0; attempt < 4; attempt++ {
+		claim, err = begin()
+		if !errors.Is(err, idempotency.ErrOwnershipConflict) {
+			break
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	value, err := api.services.PluginReconciler.ReconcileAssignment(ctx, assignment, api.now())
+	if claim.Response != nil {
+		return reconcilePluginAssignmentIdempotentResponse{response: *claim.Response}, nil
+	}
+	stored, err := run(ctx)
 	if err != nil {
 		return nil, err
 	}
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, []byte(`{}`), reconcile)
+	if errors.Is(err, idempotency.ErrOwnershipConflict) {
+		for attempt := 0; attempt < 4; attempt++ {
+			replayed, replayErr := begin()
+			if replayErr == nil && replayed.Response != nil {
+				return reconcilePluginAssignmentIdempotentResponse{response: *replayed.Response}, nil
+			}
+			if !errors.Is(replayErr, idempotency.ErrOwnershipConflict) {
+				if replayErr == nil {
+					return nil, idempotency.ErrInProgress
+				}
+				return nil, replayErr
+			}
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return reconcilePluginAssignmentIdempotentResponse{response: completed}, nil
+}
+
+func storedPluginReconcileResponse(value job.Job, scope platformscope.Scope) (idempotency.Response, error) {
 	body, err := openAPIJob(value)
 	if err != nil {
-		return nil, err
+		return idempotency.Response{}, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return idempotency.Response{}, err
 	}
 	location := fmt.Sprintf("/api/v1/tenants/%s/projects/%s/jobs/%s", scope.TenantID, scope.ProjectID, value.ID)
-	return openapi.ReconcilePluginAssignment202JSONResponse{Body: body, Headers: openapi.ReconcilePluginAssignment202ResponseHeaders{Location: location}}, nil
+	return idempotency.Response{Status: http.StatusAccepted, Header: http.Header{"Content-Type": []string{"application/json"}, "Location": []string{location}}, Body: encoded}, nil
+}
+
+type reconcilePluginAssignmentIdempotentResponse struct{ response idempotency.Response }
+
+func (value reconcilePluginAssignmentIdempotentResponse) VisitReconcilePluginAssignmentResponse(writer http.ResponseWriter) error {
+	for key, items := range value.response.Header {
+		for _, item := range items {
+			writer.Header().Add(key, item)
+		}
+	}
+	writer.WriteHeader(value.response.Status)
+	_, err := writer.Write(value.response.Body)
+	return err
 }
 
 func openAPIPluginAssignment(value pluginassignment.Assignment) (openapi.PluginAssignment, error) {
 	if value.Validate() != nil {
 		return openapi.PluginAssignment{}, errors.New("plugin assignment cannot be represented by the platform contract")
 	}
-	result := openapi.PluginAssignment{AssignmentId: value.ID, HostId: openapi.HostId(value.HostID), AgentId: openapi.AgentId(value.AgentID), PluginId: value.PluginID, DatabaseFamily: openapi.DatabaseFamily(value.DatabaseFamily), DesiredVersion: value.DesiredVersion, DesiredState: openapi.PluginDesiredState(value.DesiredState), ConfigurationRevision: int64(value.ConfigurationRevision), OperationRevision: int64(value.OperationRevision), RolloutPercentage: value.RolloutPercentage, CreatedAt: value.CreatedAt.UTC(), UpdatedAt: value.UpdatedAt.UTC(), Etag: value.ETag()}
+	result := openapi.PluginAssignment{AssignmentId: value.ID, HostId: openapi.HostId(value.HostID), AgentId: openapi.AgentId(value.AgentID), PluginId: value.PluginID, DatabaseFamily: openapi.DatabaseFamily(value.DatabaseFamily), DesiredVersion: value.DesiredVersion, DesiredState: openapi.PluginDesiredState(value.DesiredState), ConfigurationRevision: int64(value.ConfigurationRevision), OperationRevision: int64(value.OperationRevision), RolloutPercentage: value.RolloutPercentage, ReconcileState: openapi.PluginReconcileState(value.ReconcileState), CreatedAt: value.CreatedAt.UTC(), UpdatedAt: value.UpdatedAt.UTC(), Etag: value.ETag()}
+	if value.BlockedReason != "" {
+		result.ReconcileReason = &value.BlockedReason
+	}
 	if value.Observed != nil {
 		observed := value.Observed
 		wire := openapi.PluginObservedState{AssignmentId: observed.AssignmentID, ProcessState: openapi.PluginProcessState(observed.ProcessState), Health: openapi.PluginHealthStatus(observed.Health), CircuitState: openapi.PluginCircuitState(observed.CircuitState), RestartCount: int(observed.RestartCount), BoundInstanceCount: int(observed.BoundInstanceCount), ActiveConfigurationRevision: int64(observed.ActiveConfigurationRevision), ObservedOperationRevision: int64(observed.ObservedOperationRevision), ObservedAt: observed.ObservedAt.UTC()}

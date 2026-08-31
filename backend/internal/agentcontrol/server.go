@@ -327,7 +327,10 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 			return status.Error(codes.PermissionDenied, "Plugin observation Agent ID does not match the session identity")
 		}
 		if err := s.plugins.SubmitPlugin(agentID, typed.PluginObservation); err != nil {
-			return status.Error(codes.Unavailable, "Plugin observation persistence is unavailable")
+			if errors.Is(err, ErrPluginObservationInvalid) {
+				return status.Error(codes.InvalidArgument, "Plugin observation is invalid")
+			}
+			return nil
 		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")

@@ -121,6 +121,12 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM command_outbox o JOIN jobs j ON j.tenant_id=o.tenant_id AND j.project_id=o.project_id AND j.id=o.job_id WHERE j.tenant_id=$1 AND j.project_id=$2 AND j.job_type='plugin.reconcile'`, scope.TenantID, scope.ProjectID).Scan(&outboxCount))
 	require.Equal(t, 1, jobCount)
 	require.Equal(t, 1, outboxCount)
+	authoritative, found, err := assignments.FindScheduledJob(ctx, assignment)
+	require.NoError(t, err)
+	require.True(t, found)
+	retried, err := reconciler.ReconcileAssignment(ctx, assignment, time.Now().UTC().Add(8*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, authoritative, retried)
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 2, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 5, ObservedAt: now}
@@ -134,12 +140,8 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 
 	_, err = database.ExecContext(ctx, `UPDATE plugin_versions SET status='revoked',revision=revision+1,revocation_reason='security_revoke' WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3`, scope.TenantID, scope.ProjectID, assignment.DesiredVersionID)
 	require.NoError(t, err)
-	current, err := service.Get(ctx, scope, assignment.ID)
+	_, err = reconciler.Reconcile(ctx, time.Now().UTC(), 10)
 	require.NoError(t, err)
-	forced, err := service.ForceReconcile(ctx, scope, current.ID, pluginassignment.MutationAudit{Actor: "operator", OperationID: "reconcilePluginAssignment", IdempotencyKey: "revoked", RequestFingerprint: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", RequestID: "request-revoked"})
-	require.NoError(t, err)
-	_, err = reconciler.ReconcileAssignment(ctx, forced, time.Now().UTC())
-	require.ErrorIs(t, err, pluginassignment.ErrVersionRevoked)
 	blocked, err := service.Get(ctx, scope, assignment.ID)
 	require.NoError(t, err)
 	require.Equal(t, pluginassignment.ReconcileBlocked, blocked.ReconcileState)
@@ -224,6 +226,187 @@ func TestPluginAssignmentRetirementDetachesMembershipAndLastInstanceQueuesAbsent
 	var jobsCreated int
 	require.NoError(t, database.QueryRow(`SELECT count(*) FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND job_type='plugin.reconcile'`, scope.TenantID, scope.ProjectID).Scan(&jobsCreated))
 	require.Equal(t, 1, jobsCreated)
+	originalAssignmentID := page.Items[0].ID
+	_, err = database.Exec(`UPDATE plugin_versions SET status='revoked',revision=revision+1,revocation_reason='retired_version' WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3`, scope.TenantID, scope.ProjectID, page.Items[0].DesiredVersionID)
+	require.NoError(t, err)
+	seedCompatiblePluginVersion(t, database, scope, time.Now().UTC())
+	newCandidate, newRequest := insertAssignmentCandidate(t, database, scope, hostID, agentID, "reactivated", "127.0.0.1:3323", 42)
+	newInstance, err := instances.AcceptCandidate(ctx, scope, newCandidate, newRequest)
+	require.NoError(t, err)
+	page, err = assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Equal(t, originalAssignmentID, page.Items[0].ID)
+	require.Equal(t, pluginassignment.DesiredRunning, page.Items[0].DesiredState)
+	require.Equal(t, "3.0.0", page.Items[0].DesiredVersion)
+	require.Equal(t, []string{newInstance.ID}, page.Items[0].InstanceIDs)
+	_, err = reconciliation.NewPluginReconciler(assignments).ReconcileAssignment(ctx, page.Items[0], time.Now().UTC())
+	require.NoError(t, err)
+}
+
+func TestPluginAssignmentFreshnessWaitsForOnlineHostAndFreshObservation(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	instances := databaseinstance.NewPostgresRepositoryWithProvisioner(database, assignments)
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "freshness", "127.0.0.1:3331", 51)
+	_, err := instances.AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	_, err = database.Exec(`UPDATE managed_hosts SET status='offline',last_heartbeat_at=CURRENT_TIMESTAMP-INTERVAL '10 minutes',updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, hostID)
+	require.NoError(t, err)
+	reconciler := reconciliation.NewPluginReconciler(assignments)
+	result, err := reconciler.Reconcile(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Zero(t, result.Enqueued)
+	page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Equal(t, pluginassignment.ReconcileWaiting, page.Items[0].ReconcileState)
+	require.Equal(t, "agent_offline", page.Items[0].BlockedReason)
+	_, err = database.Exec(`UPDATE managed_hosts SET status='online',last_heartbeat_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, hostID)
+	require.NoError(t, err)
+	result, err = reconciler.Reconcile(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Enqueued)
+	assignment, err := assignments.Get(ctx, scope, page.Items[0].ID)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 1, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 2, ObservedAt: now}
+	report := pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 2, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}
+	require.NoError(t, assignments.RecordObservation(ctx, report))
+	stopped := pluginassignment.DesiredStopped
+	assignment, err = assignments.SetDesiredState(ctx, scope, assignment.ID, assignment.Revision+1, pluginassignment.DesiredUpdate{DesiredState: &stopped, Audit: pluginassignment.MutationAudit{Actor: "operator", OperationID: "updatePluginAssignment", IdempotencyKey: "fresh-stop", RequestFingerprint: "sha256:5151515151515151515151515151515151515151515151515151515151515151", RequestID: "request-fresh-stop"}})
+	if errors.Is(err, pluginassignment.ErrPrecondition) {
+		assignment, err = assignments.Get(ctx, scope, page.Items[0].ID)
+		require.NoError(t, err)
+		assignment, err = assignments.SetDesiredState(ctx, scope, assignment.ID, assignment.Revision, pluginassignment.DesiredUpdate{DesiredState: &stopped, Audit: pluginassignment.MutationAudit{Actor: "operator", OperationID: "updatePluginAssignment", IdempotencyKey: "fresh-stop", RequestFingerprint: "sha256:5151515151515151515151515151515151515151515151515151515151515151", RequestID: "request-fresh-stop"}})
+	}
+	require.NoError(t, err)
+	_, err = database.Exec(`UPDATE plugin_observations SET received_at=CURRENT_TIMESTAMP-INTERVAL '10 minutes' WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, scope.TenantID, scope.ProjectID, assignment.ID)
+	require.NoError(t, err)
+	result, err = reconciler.Reconcile(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Zero(t, result.Enqueued)
+	waiting, err := assignments.Get(ctx, scope, assignment.ID)
+	require.NoError(t, err)
+	require.Equal(t, "observation_stale", waiting.BlockedReason)
+	require.NoError(t, assignments.RecordObservation(ctx, report), "exact duplicate refreshes receipt freshness without changing revision")
+	result, err = reconciler.Reconcile(ctx, time.Now().UTC(), 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Enqueued)
+}
+
+func TestPluginAssignmentRepairBackfillsPreTask8InstanceIdempotently(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "legacy", "127.0.0.1:3341", 61)
+	legacy := databaseinstance.NewPostgresRepository(database)
+	instance, err := legacy.AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	require.Zero(t, instance.PluginAssignmentRevision)
+	replayed, err := legacy.AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	require.Zero(t, replayed.PluginAssignmentRevision)
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	result, err := assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Repaired)
+	current, err := legacy.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.NotZero(t, current.PluginAssignmentRevision)
+	result, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Zero(t, result.Repaired)
+}
+
+func TestPluginAssignmentRepairBacklogRetriesAfterCatalogChange(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "legacy-neo4j", "127.0.0.1:7687", 62)
+	_, err := database.Exec(`UPDATE discovery_candidates SET database_family='neo4j',database_variant='neo4j' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3`, scope.TenantID, scope.ProjectID, candidate)
+	require.NoError(t, err)
+	request.DatabaseFamily, request.DatabaseVariant = "neo4j", "neo4j"
+	_, err = databaseinstance.NewPostgresRepository(database).AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	result, err := assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Blocked)
+	require.Error(t, assignments.Ready(ctx))
+	seedNeo4jPluginVersion(t, database, scope, time.Now().UTC())
+	result, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Repaired)
+	require.NoError(t, assignments.Ready(ctx))
+	result, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Zero(t, result.Repaired)
+}
+
+func TestPluginAssignmentCapacityAllows128AndRollsBack129thCandidate(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	instances := databaseinstance.NewPostgresRepositoryWithProvisioner(database, assignments)
+	const revision = 71
+	for index := 0; index < pluginassignment.MaximumAssignmentItems; index++ {
+		name := fmt.Sprintf("capacity-%03d", index)
+		candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, name, fmt.Sprintf("127.0.0.1:%d", 3400+index), revision)
+		_, err := instances.AcceptCandidate(ctx, scope, candidate, request)
+		require.NoError(t, err, name)
+	}
+	page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items[0].InstanceIDs, pluginassignment.MaximumAssignmentItems)
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "capacity-129", "127.0.0.1:3599", revision)
+	_, err = instances.AcceptCandidate(ctx, scope, candidate, request)
+	require.ErrorIs(t, err, pluginassignment.ErrCapacity)
+	var status, accepted string
+	require.NoError(t, database.QueryRow(`SELECT status,accepted_instance_id FROM discovery_candidates WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3`, scope.TenantID, scope.ProjectID, candidate).Scan(&status, &accepted))
+	require.Equal(t, "awaiting_confirmation", status)
+	require.Empty(t, accepted)
+	legacyInstance, err := databaseinstance.NewPostgresRepository(database).AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	require.Zero(t, legacyInstance.PluginAssignmentRevision)
+	repair, err := assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, repair.Blocked)
+	var reason string
+	var attempts int
+	require.NoError(t, database.QueryRow(`SELECT reason_code,attempts FROM plugin_assignment_repair_backlog WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, legacyInstance.ID).Scan(&reason, &attempts))
+	require.Equal(t, "capacity_exceeded", reason)
+	require.Equal(t, 1, attempts)
+	require.Error(t, assignments.Ready(ctx))
+	repair, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, repair.Blocked)
+	require.NoError(t, database.QueryRow(`SELECT attempts FROM plugin_assignment_repair_backlog WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, legacyInstance.ID).Scan(&attempts))
+	require.Equal(t, 2, attempts)
+	legacyRepo := databaseinstance.NewPostgresRepository(database)
+	for index := 0; index < 24; index++ {
+		name := fmt.Sprintf("legacy-overflow-%02d", index)
+		extraCandidate, extraRequest := insertAssignmentCandidate(t, database, scope, hostID, agentID, name, fmt.Sprintf("127.0.0.1:%d", 3600+index), revision)
+		_, err = legacyRepo.AcceptCandidate(ctx, scope, extraCandidate, extraRequest)
+		require.NoError(t, err)
+	}
+	repair, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 25, repair.Blocked)
+	seedNeo4jPluginVersion(t, database, scope, time.Now().UTC())
+	repairCandidate, repairRequest := insertAssignmentCandidate(t, database, scope, hostID, agentID, "repairable-after-capacity", "127.0.0.1:7688", revision)
+	_, err = database.Exec(`UPDATE discovery_candidates SET database_family='neo4j',database_variant='neo4j' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id=$3`, scope.TenantID, scope.ProjectID, repairCandidate)
+	require.NoError(t, err)
+	repairRequest.DatabaseFamily, repairRequest.DatabaseVariant = "neo4j", "neo4j"
+	repairable, err := legacyRepo.AcceptCandidate(ctx, scope, repairCandidate, repairRequest)
+	require.NoError(t, err)
+	repair, err = assignments.RepairUnassigned(ctx, 25)
+	require.NoError(t, err)
+	require.Equal(t, 1, repair.Repaired, "new unbacklogged repairable instance must not starve behind permanent capacity backlog")
+	current, err := legacyRepo.Get(ctx, scope, repairable.ID)
+	require.NoError(t, err)
+	require.NotZero(t, current.PluginAssignmentRevision)
 }
 
 func pluginAssignmentPostgresFixture(t *testing.T) (*sql.DB, platformscope.Scope, string, string) {
@@ -267,6 +450,8 @@ func pluginAssignmentPostgresFixture(t *testing.T) (*sql.DB, platformscope.Scope
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	_, err = hostinventory.NewPostgresRepository(database).RecordObservation(ctx, scope, hostinventory.Observation{HostID: hostID, AgentID: agentID, Revision: 1, AgentVersion: "test", Hostname: "host.test", OS: "linux", Architecture: "amd64", LogicalCPUCount: 2, MemoryCapacityBytes: 1024, NetworkAddresses: []string{}, Capabilities: []string{"plugin.reconcile.v1"}, ObservedAt: now}, now)
 	require.NoError(t, err)
+	_, err = hostinventory.NewPostgresRepository(database).RecordHeartbeat(ctx, scope, agentID, now)
+	require.NoError(t, err)
 	seedAvailablePlugin(t, database, scope, now)
 	return database, scope, hostID, agentID
 }
@@ -284,6 +469,18 @@ func seedAvailablePlugin(t *testing.T, database *sql.DB, scope platformscope.Sco
 func seedIncompatiblePluginVersion(t *testing.T, database *sql.DB, scope platformscope.Scope, now time.Time) {
 	t.Helper()
 	_, err := database.Exec(`INSERT INTO plugin_versions (version_id,tenant_id,project_id,plugin_id,semantic_version,status,artifact_id,package_sha256,manifest_digest,publisher_id,signing_key_id,protocol_version,minimum_agent_protocol_version,maximum_agent_protocol_version,supported_variants,database_version_range,capabilities,metric_template_schema_version,platforms,revision,created_at,approved_at) VALUES ('mysql-version-2',$1,$2,'dbpilot.mysql','2.0.0','available','artifact-mysql',$3,$4,'publisher','key','1','1','1','["mysql"]'::jsonb,'>=5.7','["metrics"]'::jsonb,1,'[{"operating_system":"linux","architecture":"arm64","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","size_bytes":1}]'::jsonb,1,$5,$5)`, scope.TenantID, scope.ProjectID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", now)
+	require.NoError(t, err)
+}
+func seedCompatiblePluginVersion(t *testing.T, database *sql.DB, scope platformscope.Scope, now time.Time) {
+	t.Helper()
+	_, err := database.Exec(`INSERT INTO plugin_versions (version_id,tenant_id,project_id,plugin_id,semantic_version,status,artifact_id,package_sha256,manifest_digest,publisher_id,signing_key_id,protocol_version,minimum_agent_protocol_version,maximum_agent_protocol_version,supported_variants,database_version_range,capabilities,metric_template_schema_version,platforms,revision,created_at,approved_at) VALUES ('mysql-version-3',$1,$2,'dbpilot.mysql','3.0.0','available','artifact-mysql',$3,$4,'publisher','key','1','1','1','["mysql"]'::jsonb,'>=5.7','["metrics"]'::jsonb,1,'[{"operating_system":"linux","architecture":"amd64","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size_bytes":1}]'::jsonb,1,$5,$5)`, scope.TenantID, scope.ProjectID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", now)
+	require.NoError(t, err)
+}
+func seedNeo4jPluginVersion(t *testing.T, database *sql.DB, scope platformscope.Scope, now time.Time) {
+	t.Helper()
+	_, err := database.Exec(`INSERT INTO plugin_definitions (tenant_id,project_id,plugin_id,name,database_family,protocol_version,supported_variants,capabilities) VALUES ($1,$2,'dbpilot.neo4j','Neo4j','neo4j','1','["neo4j"]'::jsonb,'["metrics"]'::jsonb)`, scope.TenantID, scope.ProjectID)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO plugin_versions (version_id,tenant_id,project_id,plugin_id,semantic_version,status,artifact_id,package_sha256,manifest_digest,publisher_id,signing_key_id,protocol_version,minimum_agent_protocol_version,maximum_agent_protocol_version,supported_variants,database_version_range,capabilities,metric_template_schema_version,platforms,revision,created_at,approved_at) VALUES ('neo4j-version-1',$1,$2,'dbpilot.neo4j','1.0.0','available','artifact-mysql',$3,$4,'publisher','key','1','1','1','["neo4j"]'::jsonb,'>=4','["metrics"]'::jsonb,1,'[{"operating_system":"linux","architecture":"amd64","sha256":"abababababababababababababababababababababababababababababababab","size_bytes":1}]'::jsonb,1,$5,$5)`, scope.TenantID, scope.ProjectID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", now)
 	require.NoError(t, err)
 }
 

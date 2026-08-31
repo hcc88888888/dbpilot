@@ -91,6 +91,8 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusUnprocessableEntity, "plugin_version_unavailable", "Plugin version is unavailable"
 	case errors.Is(err, pluginassignment.ErrVersionRevoked):
 		status, code, title = http.StatusConflict, "plugin_version_revoked", "Plugin version is revoked"
+	case errors.Is(err, pluginassignment.ErrCapacity):
+		status, code, title = http.StatusUnprocessableEntity, "plugin_assignment_capacity", "Plugin assignment capacity is exceeded"
 	case errors.Is(err, plugincatalog.ErrPackageTooLarge):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_manifest_rejected", "Plugin package exceeds verification limits"
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, databaseinstance.ErrInvalid), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, enrollment.ErrEnrollmentRequestInvalid), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, discovery.ErrInvalid), errors.Is(err, discovery.ErrSecretEvidence), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets), errors.Is(err, plugincatalog.ErrInvalid), errors.Is(err, pluginassignment.ErrInvalid):

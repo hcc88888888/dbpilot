@@ -25,11 +25,14 @@ type PluginObservationSink interface {
 type PluginObservationDispatcherConfig struct {
 	MaximumPendingAgents          int
 	DeliveryTimeout, RetryBackoff time.Duration
+	DuplicateRefreshInterval      time.Duration
+	Now                           func() time.Time
 	OnError                       func(error)
 }
 type pluginObservationRevision struct {
-	revision uint64
-	digest   [sha256.Size]byte
+	revision    uint64
+	digest      [sha256.Size]byte
+	deliveredAt time.Time
 }
 type pluginObservationLane struct {
 	agentID        string
@@ -65,7 +68,13 @@ func NewPluginObservationDispatcher(sink PluginObservationSink, config PluginObs
 	if config.RetryBackoff == 0 {
 		config.RetryBackoff = time.Second
 	}
-	if config.MaximumPendingAgents < 1 || config.DeliveryTimeout <= 0 || config.RetryBackoff <= 0 {
+	if config.DuplicateRefreshInterval == 0 {
+		config.DuplicateRefreshInterval = time.Minute
+	}
+	if config.Now == nil {
+		config.Now = time.Now
+	}
+	if config.MaximumPendingAgents < 1 || config.DeliveryTimeout <= 0 || config.RetryBackoff <= 0 || config.DuplicateRefreshInterval <= 0 {
 		return nil, ErrPluginObservationInvalid
 	}
 	return &PluginObservationDispatcher{sink: sink, config: config, lanes: map[string]*pluginObservationLane{}, last: map[string]pluginObservationRevision{}, stop: make(chan struct{})}, nil
@@ -94,7 +103,9 @@ func (dispatcher *PluginObservationDispatcher) SubmitPlugin(agentID string, repo
 			if digest != previous.digest {
 				return ErrPluginObservationInvalid
 			}
-			return nil
+			if dispatcher.config.Now().UTC().Sub(previous.deliveredAt) < dispatcher.config.DuplicateRefreshInterval {
+				return nil
+			}
 		}
 	}
 	lane := dispatcher.lanes[agentID]
@@ -105,9 +116,6 @@ func (dispatcher *PluginObservationDispatcher) SubmitPlugin(agentID string, repo
 		lane = &pluginObservationLane{agentID: agentID, dispatcher: dispatcher, wake: make(chan struct{}, 1)}
 		dispatcher.lanes[agentID] = lane
 		go lane.run()
-	}
-	if lane.quarantined {
-		return ErrPluginObservationCapacity
 	}
 	highest, highestDigest := lane.activeRevision, lane.activeDigest
 	if lane.pending != nil && lane.pending.GetObservationRevision() >= highest {
@@ -240,7 +248,7 @@ func (lane *pluginObservationLane) awaitQuarantined(result <-chan error, report 
 func (lane *pluginObservationLane) persisted(report *agentv1.PluginObservation, digest [sha256.Size]byte) {
 	lane.dispatcher.mu.Lock()
 	defer lane.dispatcher.mu.Unlock()
-	lane.dispatcher.last[lane.agentID] = pluginObservationRevision{revision: report.GetObservationRevision(), digest: digest}
+	lane.dispatcher.last[lane.agentID] = pluginObservationRevision{revision: report.GetObservationRevision(), digest: digest, deliveredAt: lane.dispatcher.config.Now().UTC()}
 	for index, value := range lane.dispatcher.lastOrder {
 		if value == lane.agentID {
 			lane.dispatcher.lastOrder = append(lane.dispatcher.lastOrder[:index], lane.dispatcher.lastOrder[index+1:]...)

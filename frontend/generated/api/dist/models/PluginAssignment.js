@@ -13,6 +13,7 @@
  */
 import { PluginDesiredStateFromJSON, PluginDesiredStateToJSON, } from './PluginDesiredState.js';
 import { PluginObservedStateFromJSON, PluginObservedStateToJSON, } from './PluginObservedState.js';
+import { PluginReconcileStateFromJSON, PluginReconcileStateToJSON, } from './PluginReconcileState.js';
 /**
  * Check if a given object implements the PluginAssignment interface.
  */
@@ -36,6 +37,8 @@ export function instanceOfPluginAssignment(value) {
     if (!('operationRevision' in value) || value['operationRevision'] === undefined)
         return false;
     if (!('rolloutPercentage' in value) || value['rolloutPercentage'] === undefined)
+        return false;
+    if (!('reconcileState' in value) || value['reconcileState'] === undefined)
         return false;
     if (!('createdAt' in value) || value['createdAt'] === undefined)
         return false;
@@ -63,6 +66,8 @@ export function PluginAssignmentFromJSONTyped(json, ignoreDiscriminator) {
         'configurationRevision': json['configuration_revision'],
         'operationRevision': json['operation_revision'],
         'rolloutPercentage': json['rollout_percentage'],
+        'reconcileState': PluginReconcileStateFromJSON(json['reconcile_state']),
+        'reconcileReason': json['reconcile_reason'] == null ? undefined : json['reconcile_reason'],
         'observedState': json['observed_state'] == null ? undefined : PluginObservedStateFromJSON(json['observed_state']),
         'createdAt': (new Date(json['created_at'])),
         'updatedAt': (new Date(json['updated_at'])),
@@ -87,6 +92,8 @@ export function PluginAssignmentToJSONTyped(value, ignoreDiscriminator = false) 
         'configuration_revision': value['configurationRevision'],
         'operation_revision': value['operationRevision'],
         'rollout_percentage': value['rolloutPercentage'],
+        'reconcile_state': PluginReconcileStateToJSON(value['reconcileState']),
+        'reconcile_reason': value['reconcileReason'],
         'observed_state': PluginObservedStateToJSON(value['observedState']),
         'created_at': ((value['createdAt']).toISOString()),
         'updated_at': ((value['updatedAt']).toISOString()),

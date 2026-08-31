@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -53,6 +54,8 @@ type memoryReconcileRepository struct {
 	claims   []pluginassignment.ReconcileClaim
 	jobs     []job.Job
 	messages []job.OutboxMessage
+	waiting  int
+	stored   *job.Job
 }
 
 func (repository *memoryReconcileRepository) ClaimDue(context.Context, time.Time, int, time.Duration) ([]pluginassignment.ReconcileClaim, error) {
@@ -70,10 +73,54 @@ func (repository *memoryReconcileRepository) MarkConverged(context.Context, plug
 func (repository *memoryReconcileRepository) MarkConflict(context.Context, pluginassignment.ReconcileClaim) error {
 	return nil
 }
-func (repository *memoryReconcileRepository) Schedule(_ context.Context, _ pluginassignment.ReconcileClaim, value job.Job, message job.OutboxMessage) (bool, error) {
+func (repository *memoryReconcileRepository) MarkWaiting(context.Context, pluginassignment.ReconcileClaim, string) error {
+	repository.waiting++
+	return nil
+}
+func (repository *memoryReconcileRepository) FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error) {
+	if repository.stored != nil {
+		return *repository.stored, true, nil
+	}
+	return job.Job{}, false, nil
+}
+
+func TestReconcileAssignmentReturnsAuthoritativeStoredJobAtAdvancedClock(t *testing.T) {
+	now := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
+	assignment := reconcileAssignmentFixture(now)
+	stored, _, err := buildPluginJob(assignment, now)
+	require.NoError(t, err)
+	repository := &memoryReconcileRepository{stored: &stored}
+	got, err := NewPluginReconciler(repository).ReconcileAssignment(context.Background(), assignment, now.Add(8*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, stored, got)
+	require.Equal(t, now, got.CreatedAt)
+}
+
+func TestRolloutUsesStableAssignmentBucketAndSafetyBypassesDelay(t *testing.T) {
+	now := time.Date(2026, 8, 31, 3, 0, 0, 0, time.UTC)
+	eligible, ineligible := reconcileAssignmentFixture(now), reconcileAssignmentFixture(now)
+	eligible.RolloutPercentage, ineligible.RolloutPercentage = 50, 50
+	for index := 0; index < 10000 && rolloutEligible(eligible) == rolloutEligible(ineligible); index++ {
+		ineligible.ID = fmt.Sprintf("assignment-%d", index)
+	}
+	require.NotEqual(t, rolloutEligible(eligible), rolloutEligible(ineligible))
+	claims := []pluginassignment.ReconcileClaim{{Assignment: eligible, Token: "claim-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LeasedUntil: now.Add(time.Minute)}, {Assignment: ineligible, Token: "claim-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", LeasedUntil: now.Add(time.Minute)}}
+	repository := &memoryReconcileRepository{claims: claims}
+	result, err := NewPluginReconciler(repository).Reconcile(context.Background(), now, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Enqueued)
+	require.Equal(t, 1, result.Waiting)
+	safety := ineligible
+	safety.DesiredState = pluginassignment.DesiredStopped
+	require.True(t, rolloutEligible(safety))
+	safety.DesiredState = pluginassignment.DesiredAbsent
+	safety.InstanceIDs = []string{}
+	require.True(t, rolloutEligible(safety))
+}
+func (repository *memoryReconcileRepository) Schedule(_ context.Context, _ pluginassignment.ReconcileClaim, value job.Job, message job.OutboxMessage) (job.Job, bool, error) {
 	repository.jobs = append(repository.jobs, value)
 	repository.messages = append(repository.messages, message)
-	return true, nil
+	return value, true, nil
 }
 
 func reconcileAssignmentFixture(now time.Time) pluginassignment.Assignment {

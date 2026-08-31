@@ -20,19 +20,20 @@ import (
 )
 
 const assignmentColumns = `assignment_id,tenant_id,project_id,host_id,agent_id,plugin_id,database_family,desired_version_id,desired_version,artifact_id,artifact_sha256,manifest_digest,desired_state,configuration_revision,operation_revision,rollout_percentage,instance_ids,template_revision_ids,reconcile_state,blocked_reason,revision,created_at,updated_at`
-const observationColumns = `assignment_id,plugin_id,database_family,installed_version,active_slot,process_state,process_id,started_at,health,restart_count,circuit_state,bound_instance_count,active_configuration_revision,observed_operation_revision,last_error_code,observation_revision,observation_digest,observed_at`
+const observationColumns = `assignment_id,plugin_id,database_family,installed_version,active_slot,process_state,process_id,started_at,health,restart_count,circuit_state,bound_instance_count,active_configuration_revision,observed_operation_revision,last_error_code,observation_revision,observation_digest,observed_at,received_at`
 
-type JobCreator interface {
+type JobStore interface {
 	CreateInTx(context.Context, *sql.Tx, job.Job, []job.OutboxMessage) error
+	Get(context.Context, platformscope.Scope, string) (job.Job, error)
 }
 
 type PostgresRepository struct {
 	database *sql.DB
-	jobs     JobCreator
+	jobs     JobStore
 	commit   func(*sql.Tx) error
 }
 
-func NewPostgresRepository(database *sql.DB, jobs JobCreator) *PostgresRepository {
+func NewPostgresRepository(database *sql.DB, jobs JobStore) *PostgresRepository {
 	return &PostgresRepository{database: database, jobs: jobs, commit: func(tx *sql.Tx) error { return tx.Commit() }}
 }
 
@@ -47,7 +48,83 @@ func (repository *PostgresRepository) Ready(ctx context.Context) error {
 	if !ready {
 		return errors.New("plugin assignment schema is unavailable")
 	}
+	var backlog int
+	if err := repository.database.QueryRowContext(ctx, `SELECT count(*) FROM plugin_assignment_repair_backlog`).Scan(&backlog); err != nil {
+		return err
+	}
+	if backlog > 0 {
+		return fmt.Errorf("plugin assignment repair backlog: %d", backlog)
+	}
 	return nil
+}
+
+type RepairResult struct{ Repaired, Blocked int }
+
+func (repository *PostgresRepository) RepairUnassigned(ctx context.Context, limit int) (RepairResult, error) {
+	if repository == nil || repository.database == nil || ctx == nil || limit < 1 || limit > 128 {
+		return RepairResult{}, ErrInvalid
+	}
+	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return RepairResult{}, err
+	}
+	rollback := func() { _ = tx.Rollback() }
+	rows, err := tx.QueryContext(ctx, `SELECT instance.instance_id,instance.tenant_id,instance.project_id,instance.host_id,instance.agent_id,instance.database_family,instance.database_variant FROM managed_database_instances instance LEFT JOIN plugin_assignment_repair_backlog backlog ON backlog.tenant_id=instance.tenant_id AND backlog.project_id=instance.project_id AND backlog.instance_id=instance.instance_id WHERE instance.management_status<>'retired' AND instance.plugin_assignment_revision=0 ORDER BY (backlog.instance_id IS NOT NULL),COALESCE(backlog.updated_at,instance.updated_at),instance.instance_id FOR UPDATE OF instance SKIP LOCKED LIMIT $1`, limit)
+	if err != nil {
+		rollback()
+		return RepairResult{}, mapError(err)
+	}
+	var instances []databaseinstance.Instance
+	for rows.Next() {
+		var value databaseinstance.Instance
+		if err := rows.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.HostID, &value.AgentID, &value.DatabaseFamily, &value.DatabaseVariant); err != nil {
+			_ = rows.Close()
+			rollback()
+			return RepairResult{}, err
+		}
+		instances = append(instances, value)
+	}
+	if err := rows.Close(); err != nil {
+		rollback()
+		return RepairResult{}, err
+	}
+	result := RepairResult{}
+	for _, instance := range instances {
+		fingerprint := "sha256:" + hex.EncodeToString(sha256Bytes(instance.Scope.Key()+"\x00repair\x00"+instance.ID))
+		audit := databaseinstance.MutationAudit{Actor: "plugin-assignment-repair", OperationID: "repairPluginAssignment", IdempotencyKey: "repair:" + instance.ID, RequestFingerprint: fingerprint, RequestID: "repair-" + instance.ID}
+		binding, ensureErr := repository.EnsureForInstanceTx(ctx, tx, instance, audit)
+		if errors.Is(ensureErr, ErrVersionUnavailable) || errors.Is(ensureErr, ErrCapacity) {
+			reason := "no_compatible_version"
+			if errors.Is(ensureErr, ErrCapacity) {
+				reason = "capacity_exceeded"
+			}
+			_, err = tx.ExecContext(ctx, `INSERT INTO plugin_assignment_repair_backlog (tenant_id,project_id,instance_id,reason_code,attempts,updated_at) VALUES ($1,$2,$3,$4,1,CURRENT_TIMESTAMP) ON CONFLICT (tenant_id,project_id,instance_id) DO UPDATE SET reason_code=EXCLUDED.reason_code,attempts=plugin_assignment_repair_backlog.attempts+1,updated_at=CURRENT_TIMESTAMP`, instance.Scope.TenantID, instance.Scope.ProjectID, instance.ID, reason)
+			if err != nil {
+				rollback()
+				return RepairResult{}, mapError(err)
+			}
+			result.Blocked++
+			continue
+		}
+		if ensureErr != nil {
+			rollback()
+			return RepairResult{}, ensureErr
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE managed_database_instances SET plugin_id=$1,desired_plugin_version=$2,plugin_assignment_revision=$3,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$4 AND project_id=$5 AND instance_id=$6 AND plugin_assignment_revision=0`, binding.PluginID, binding.DesiredVersion, binding.ConfigurationRevision, instance.Scope.TenantID, instance.Scope.ProjectID, instance.ID); err != nil {
+			rollback()
+			return RepairResult{}, mapError(err)
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM plugin_assignment_repair_backlog WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, instance.Scope.TenantID, instance.Scope.ProjectID, instance.ID)
+		if err != nil {
+			rollback()
+			return RepairResult{}, mapError(err)
+		}
+		result.Repaired++
+	}
+	if err := repository.commit(tx); err != nil {
+		return RepairResult{}, err
+	}
+	return result, nil
 }
 
 type InstanceTargetAuthorizer struct{ Database *sql.DB }
@@ -112,27 +189,39 @@ func (repository *PostgresRepository) EnsureForInstanceTx(ctx context.Context, t
 	}
 	value, err := scanAssignment(tx.QueryRowContext(ctx, `SELECT `+assignmentColumns+` FROM plugin_assignments WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND database_family=$4 FOR UPDATE`, instance.Scope.TenantID, instance.Scope.ProjectID, instance.AgentID, instance.DatabaseFamily))
 	if err == nil {
-		var status string
-		var variantSupported bool
-		if err := tx.QueryRowContext(ctx, `SELECT status,supported_variants ? $4 FROM plugin_versions WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3 FOR SHARE`, value.Scope.TenantID, value.Scope.ProjectID, value.DesiredVersionID, instance.DatabaseVariant).Scan(&status, &variantSupported); err != nil {
-			return databaseinstance.AssignmentBinding{}, mapError(err)
-		}
-		if status == "revoked" {
-			return databaseinstance.AssignmentBinding{}, ErrVersionRevoked
-		}
-		if !variantSupported {
-			return databaseinstance.AssignmentBinding{}, ErrVersionUnavailable
-		}
 		if value.HostID != instance.HostID || value.PluginID == "" {
 			return databaseinstance.AssignmentBinding{}, ErrConflict
 		}
 		if !contains(value.InstanceIDs, instance.ID) {
+			if len(value.InstanceIDs) >= MaximumAssignmentItems {
+				return databaseinstance.AssignmentBinding{}, ErrCapacity
+			}
+			if len(value.InstanceIDs) == 0 {
+				versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest, selectErr := selectCompatibleVersionTx(ctx, tx, instance)
+				if selectErr != nil {
+					return databaseinstance.AssignmentBinding{}, selectErr
+				}
+				value.DesiredVersionID, value.PluginID, value.DesiredVersion, value.ArtifactID, value.ArtifactSHA256, value.ManifestDigest = versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest
+				value.DesiredState = DesiredRunning
+			} else {
+				var status string
+				var variantSupported bool
+				if err := tx.QueryRowContext(ctx, `SELECT status,supported_variants ? $4 FROM plugin_versions WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3 FOR SHARE`, value.Scope.TenantID, value.Scope.ProjectID, value.DesiredVersionID, instance.DatabaseVariant).Scan(&status, &variantSupported); err != nil {
+					return databaseinstance.AssignmentBinding{}, mapError(err)
+				}
+				if status == "revoked" {
+					return databaseinstance.AssignmentBinding{}, ErrVersionRevoked
+				}
+				if !variantSupported {
+					return databaseinstance.AssignmentBinding{}, ErrVersionUnavailable
+				}
+			}
 			value.InstanceIDs = sortedUnique(append(value.InstanceIDs, instance.ID))
 			value.ConfigurationRevision++
 			value.OperationRevision++
 			value.Revision++
 			value.ReconcileState, value.BlockedReason = ReconcilePending, ""
-			if err := tx.QueryRowContext(ctx, `UPDATE plugin_assignments SET instance_ids=$1,configuration_revision=$2,operation_revision=$3,reconcile_state='pending',blocked_reason='',revision=$4,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$5 AND project_id=$6 AND assignment_id=$7 RETURNING updated_at`, jsonValue(value.InstanceIDs), value.ConfigurationRevision, value.OperationRevision, value.Revision, value.Scope.TenantID, value.Scope.ProjectID, value.ID).Scan(&value.UpdatedAt); err != nil {
+			if err := tx.QueryRowContext(ctx, `UPDATE plugin_assignments SET instance_ids=$1,desired_version_id=$2,plugin_id=$3,desired_version=$4,artifact_id=$5,artifact_sha256=$6,manifest_digest=$7,desired_state=$8,configuration_revision=$9,operation_revision=$10,reconcile_state='pending',blocked_reason='',revision=$11,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$12 AND project_id=$13 AND assignment_id=$14 RETURNING updated_at`, jsonValue(value.InstanceIDs), value.DesiredVersionID, value.PluginID, value.DesiredVersion, value.ArtifactID, value.ArtifactSHA256, value.ManifestDigest, value.DesiredState, value.ConfigurationRevision, value.OperationRevision, value.Revision, value.Scope.TenantID, value.Scope.ProjectID, value.ID).Scan(&value.UpdatedAt); err != nil {
 				return databaseinstance.AssignmentBinding{}, mapError(err)
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_assignment_instances (tenant_id,project_id,assignment_id,instance_id,template_revision_ids,created_at,updated_at) VALUES ($1,$2,$3,$4,'[]'::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, value.Scope.TenantID, value.Scope.ProjectID, value.ID, instance.ID); err != nil {
@@ -151,13 +240,9 @@ func (repository *PostgresRepository) EnsureForInstanceTx(ctx context.Context, t
 		return databaseinstance.AssignmentBinding{}, mapError(err)
 	}
 
-	var versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest string
-	err = tx.QueryRowContext(ctx, `SELECT v.version_id,v.plugin_id,v.semantic_version,v.artifact_id,v.package_sha256,v.manifest_digest FROM plugin_versions v JOIN plugin_definitions d ON d.tenant_id=v.tenant_id AND d.project_id=v.project_id AND d.plugin_id=v.plugin_id JOIN managed_hosts h ON h.tenant_id=v.tenant_id AND h.project_id=v.project_id AND h.host_id=$4 WHERE v.tenant_id=$1 AND v.project_id=$2 AND d.database_family=$3 AND v.status='available' AND v.supported_variants ? $5 AND EXISTS (SELECT 1 FROM jsonb_array_elements(v.platforms) platform WHERE platform->>'operating_system'=h.operating_system AND platform->>'architecture'=h.architecture) ORDER BY v.created_at DESC,v.version_id DESC LIMIT 1 FOR SHARE OF v`, instance.Scope.TenantID, instance.Scope.ProjectID, instance.DatabaseFamily, instance.HostID, instance.DatabaseVariant).Scan(&versionID, &pluginID, &semanticVersion, &artifactID, &artifactSHA, &manifestDigest)
-	if errors.Is(err, sql.ErrNoRows) {
-		return databaseinstance.AssignmentBinding{}, ErrVersionUnavailable
-	}
+	versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest, err := selectCompatibleVersionTx(ctx, tx, instance)
 	if err != nil {
-		return databaseinstance.AssignmentBinding{}, mapError(err)
+		return databaseinstance.AssignmentBinding{}, err
 	}
 	var now time.Time
 	if err := tx.QueryRowContext(ctx, `SELECT CURRENT_TIMESTAMP`).Scan(&now); err != nil {
@@ -178,6 +263,18 @@ func (repository *PostgresRepository) EnsureForInstanceTx(ctx context.Context, t
 		return databaseinstance.AssignmentBinding{}, err
 	}
 	return binding(value), nil
+}
+
+func selectCompatibleVersionTx(ctx context.Context, tx *sql.Tx, instance databaseinstance.Instance) (string, string, string, string, string, string, error) {
+	var versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest string
+	err := tx.QueryRowContext(ctx, `SELECT v.version_id,v.plugin_id,v.semantic_version,v.artifact_id,v.package_sha256,v.manifest_digest FROM plugin_versions v JOIN plugin_definitions d ON d.tenant_id=v.tenant_id AND d.project_id=v.project_id AND d.plugin_id=v.plugin_id JOIN managed_hosts h ON h.tenant_id=v.tenant_id AND h.project_id=v.project_id AND h.host_id=$4 WHERE v.tenant_id=$1 AND v.project_id=$2 AND d.database_family=$3 AND v.status='available' AND v.supported_variants ? $5 AND EXISTS (SELECT 1 FROM jsonb_array_elements(v.platforms) platform WHERE platform->>'operating_system'=h.operating_system AND platform->>'architecture'=h.architecture) ORDER BY v.created_at DESC,v.version_id DESC LIMIT 1 FOR SHARE OF v`, instance.Scope.TenantID, instance.Scope.ProjectID, instance.DatabaseFamily, instance.HostID, instance.DatabaseVariant).Scan(&versionID, &pluginID, &semanticVersion, &artifactID, &artifactSHA, &manifestDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", "", "", "", "", ErrVersionUnavailable
+	}
+	if err != nil {
+		return "", "", "", "", "", "", mapError(err)
+	}
+	return versionID, pluginID, semanticVersion, artifactID, artifactSHA, manifestDigest, nil
 }
 
 func (repository *PostgresRepository) DetachInstanceTx(ctx context.Context, tx *sql.Tx, instance databaseinstance.Instance, audit databaseinstance.MutationAudit) error {
@@ -461,6 +558,12 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 		return err
 	}
 	rollback := func() { _ = tx.Rollback() }
+	var receivedAt time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT CURRENT_TIMESTAMP`).Scan(&receivedAt); err != nil {
+		rollback()
+		return err
+	}
+	receivedAt = receivedAt.UTC()
 	for _, observed := range report.Assignments {
 		value, err := scanAssignment(tx.QueryRowContext(ctx, `SELECT `+assignmentColumns+` FROM plugin_assignments WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 FOR UPDATE`, report.Scope.TenantID, report.Scope.ProjectID, observed.AssignmentID))
 		if errors.Is(err, sql.ErrNoRows) {
@@ -476,6 +579,7 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 			return ErrConflict
 		}
 		observed.Digest = observationDigest(observed)
+		observed.ReceivedAt = receivedAt
 		var previousRevision uint64
 		var previousDigest string
 		err = tx.QueryRowContext(ctx, `SELECT observation_revision,observation_digest FROM plugin_observations WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 FOR UPDATE`, report.Scope.TenantID, report.Scope.ProjectID, value.ID).Scan(&previousRevision, &previousDigest)
@@ -492,10 +596,14 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 				rollback()
 				return ErrConflict
 			}
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE plugin_observations SET received_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4 AND observation_revision=$5 AND observation_digest=$6`, receivedAt, report.Scope.TenantID, report.Scope.ProjectID, value.ID, previousRevision, previousDigest); updateErr != nil {
+				rollback()
+				return mapError(updateErr)
+			}
 			continue
 		}
 		observationValues := append([]any{report.Scope.TenantID, report.Scope.ProjectID, report.HostID, report.AgentID}, observationArgs(observed)...)
-		_, err = tx.ExecContext(ctx, `INSERT INTO plugin_observations (tenant_id,project_id,host_id,agent_id,`+observationColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) ON CONFLICT (tenant_id,project_id,assignment_id) DO UPDATE SET installed_version=EXCLUDED.installed_version,active_slot=EXCLUDED.active_slot,process_state=EXCLUDED.process_state,process_id=EXCLUDED.process_id,started_at=EXCLUDED.started_at,health=EXCLUDED.health,restart_count=EXCLUDED.restart_count,circuit_state=EXCLUDED.circuit_state,bound_instance_count=EXCLUDED.bound_instance_count,active_configuration_revision=EXCLUDED.active_configuration_revision,observed_operation_revision=EXCLUDED.observed_operation_revision,last_error_code=EXCLUDED.last_error_code,observation_revision=EXCLUDED.observation_revision,observation_digest=EXCLUDED.observation_digest,observed_at=EXCLUDED.observed_at`, observationValues...)
+		_, err = tx.ExecContext(ctx, `INSERT INTO plugin_observations (tenant_id,project_id,host_id,agent_id,`+observationColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) ON CONFLICT (tenant_id,project_id,assignment_id) DO UPDATE SET installed_version=EXCLUDED.installed_version,active_slot=EXCLUDED.active_slot,process_state=EXCLUDED.process_state,process_id=EXCLUDED.process_id,started_at=EXCLUDED.started_at,health=EXCLUDED.health,restart_count=EXCLUDED.restart_count,circuit_state=EXCLUDED.circuit_state,bound_instance_count=EXCLUDED.bound_instance_count,active_configuration_revision=EXCLUDED.active_configuration_revision,observed_operation_revision=EXCLUDED.observed_operation_revision,last_error_code=EXCLUDED.last_error_code,observation_revision=EXCLUDED.observation_revision,observation_digest=EXCLUDED.observation_digest,observed_at=EXCLUDED.observed_at,received_at=EXCLUDED.received_at`, observationValues...)
 		if err != nil {
 			rollback()
 			return mapError(err)
@@ -539,7 +647,19 @@ func (repository *PostgresRepository) ClaimDue(ctx context.Context, at time.Time
 	}
 	databaseNow = databaseNow.UTC()
 	leasedUntil := databaseNow.Add(lease)
-	rows, err := tx.QueryContext(ctx, `SELECT tenant_id,project_id,assignment_id FROM plugin_assignments WHERE reconcile_state='pending' AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at<=CURRENT_TIMESTAMP) ORDER BY updated_at,assignment_id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+	if _, err := tx.ExecContext(ctx, `WITH candidates AS (SELECT a.tenant_id,a.project_id,a.assignment_id FROM plugin_assignments a JOIN plugin_versions v ON v.tenant_id=a.tenant_id AND v.project_id=a.project_id AND v.version_id=a.desired_version_id WHERE v.status='revoked' AND a.desired_state IN ('running','installed') AND (a.reconcile_state<>'blocked' OR a.blocked_reason<>'version_revoked') ORDER BY a.updated_at,a.assignment_id FOR UPDATE OF a SKIP LOCKED LIMIT $1) UPDATE plugin_assignments a SET reconcile_state='blocked',blocked_reason='version_revoked',reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=a.revision+1,updated_at=CURRENT_TIMESTAMP FROM candidates c WHERE a.tenant_id=c.tenant_id AND a.project_id=c.project_id AND a.assignment_id=c.assignment_id`, limit); err != nil {
+		rollback()
+		return nil, mapError(err)
+	}
+	if _, err := tx.ExecContext(ctx, `WITH candidates AS (SELECT a.tenant_id,a.project_id,a.assignment_id,CASE WHEN h.status<>'online' OR COALESCE(h.last_heartbeat_at,h.updated_at)<CURRENT_TIMESTAMP-INTERVAL '2 minutes' THEN 'agent_offline' ELSE 'observation_stale' END reason FROM plugin_assignments a JOIN managed_hosts h ON h.tenant_id=a.tenant_id AND h.project_id=a.project_id AND h.host_id=a.host_id LEFT JOIN plugin_observations o ON o.tenant_id=a.tenant_id AND o.project_id=a.project_id AND o.assignment_id=a.assignment_id WHERE a.reconcile_state='pending' AND (h.status<>'online' OR COALESCE(h.last_heartbeat_at,h.updated_at)<CURRENT_TIMESTAMP-INTERVAL '2 minutes' OR (o.assignment_id IS NOT NULL AND o.received_at<CURRENT_TIMESTAMP-INTERVAL '2 minutes')) ORDER BY a.updated_at,a.assignment_id FOR UPDATE OF a SKIP LOCKED LIMIT $1) UPDATE plugin_assignments a SET reconcile_state='waiting',blocked_reason=c.reason,reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=a.revision+1,updated_at=CURRENT_TIMESTAMP FROM candidates c WHERE a.tenant_id=c.tenant_id AND a.project_id=c.project_id AND a.assignment_id=c.assignment_id`, limit); err != nil {
+		rollback()
+		return nil, mapError(err)
+	}
+	if _, err := tx.ExecContext(ctx, `WITH candidates AS (SELECT a.tenant_id,a.project_id,a.assignment_id FROM plugin_assignments a JOIN managed_hosts h ON h.tenant_id=a.tenant_id AND h.project_id=a.project_id AND h.host_id=a.host_id LEFT JOIN plugin_observations o ON o.tenant_id=a.tenant_id AND o.project_id=a.project_id AND o.assignment_id=a.assignment_id WHERE a.reconcile_state='waiting' AND a.blocked_reason IN ('agent_offline','observation_stale') AND h.status='online' AND COALESCE(h.last_heartbeat_at,h.updated_at)>=CURRENT_TIMESTAMP-INTERVAL '2 minutes' AND (o.assignment_id IS NULL OR o.received_at>=CURRENT_TIMESTAMP-INTERVAL '2 minutes') ORDER BY a.updated_at,a.assignment_id FOR UPDATE OF a SKIP LOCKED LIMIT $1) UPDATE plugin_assignments a SET reconcile_state='pending',blocked_reason='',revision=a.revision+1,updated_at=CURRENT_TIMESTAMP FROM candidates c WHERE a.tenant_id=c.tenant_id AND a.project_id=c.project_id AND a.assignment_id=c.assignment_id`, limit); err != nil {
+		rollback()
+		return nil, mapError(err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.tenant_id,a.project_id,a.assignment_id FROM plugin_assignments a JOIN managed_hosts h ON h.tenant_id=a.tenant_id AND h.project_id=a.project_id AND h.host_id=a.host_id LEFT JOIN plugin_observations o ON o.tenant_id=a.tenant_id AND o.project_id=a.project_id AND o.assignment_id=a.assignment_id WHERE a.reconcile_state='pending' AND h.status='online' AND COALESCE(h.last_heartbeat_at,h.updated_at)>=CURRENT_TIMESTAMP-INTERVAL '2 minutes' AND (o.assignment_id IS NULL OR o.received_at>=CURRENT_TIMESTAMP-INTERVAL '2 minutes') AND (a.reconcile_lease_expires_at IS NULL OR a.reconcile_lease_expires_at<=CURRENT_TIMESTAMP) ORDER BY a.updated_at,a.assignment_id FOR UPDATE OF a SKIP LOCKED LIMIT $1`, limit)
 	if err != nil {
 		rollback()
 		return nil, mapError(err)
@@ -606,6 +726,31 @@ func (repository *PostgresRepository) ClaimOne(ctx context.Context, assignment A
 		rollback()
 		return ReconcileClaim{}, err
 	}
+	var hostFresh, observationFresh bool
+	err = tx.QueryRowContext(ctx, `SELECT h.status='online' AND COALESCE(h.last_heartbeat_at,h.updated_at)>=CURRENT_TIMESTAMP-INTERVAL '2 minutes',COALESCE(o.received_at>=CURRENT_TIMESTAMP-INTERVAL '2 minutes',TRUE) FROM managed_hosts h LEFT JOIN plugin_observations o ON o.tenant_id=$1 AND o.project_id=$2 AND o.assignment_id=$3 WHERE h.tenant_id=$1 AND h.project_id=$2 AND h.host_id=$4`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.ID, assignment.HostID).Scan(&hostFresh, &observationFresh)
+	if errors.Is(err, sql.ErrNoRows) {
+		rollback()
+		return ReconcileClaim{}, ErrNotFound
+	}
+	if err != nil {
+		rollback()
+		return ReconcileClaim{}, mapError(err)
+	}
+	if !hostFresh || !observationFresh {
+		reason := "agent_offline"
+		if hostFresh {
+			reason = "observation_stale"
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='waiting',blocked_reason=$1,reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4 AND revision=$5`, reason, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.ID, assignment.Revision)
+		if err != nil {
+			rollback()
+			return ReconcileClaim{}, mapError(err)
+		}
+		if err := repository.commit(tx); err != nil {
+			return ReconcileClaim{}, err
+		}
+		return ReconcileClaim{}, ErrConflict
+	}
 	leasedUntil := databaseNow.UTC().Add(lease)
 	random := make([]byte, 32)
 	if _, err := rand.Read(random); err != nil {
@@ -670,96 +815,141 @@ func (repository *PostgresRepository) MarkConflict(ctx context.Context, claim Re
 	return nil
 }
 
-func (repository *PostgresRepository) Schedule(ctx context.Context, claim ReconcileClaim, value job.Job, message job.OutboxMessage) (bool, error) {
+func (repository *PostgresRepository) MarkWaiting(ctx context.Context, claim ReconcileClaim, reason string) error {
+	if repository == nil || repository.database == nil || ctx == nil || claim.Validate() != nil || !pluginIDPattern.MatchString(reason) {
+		return ErrInvalid
+	}
+	result, err := repository.database.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='waiting',blocked_reason=$1,reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4 AND revision=$5 AND reconcile_claim_token=$6 AND reconcile_lease_expires_at>CURRENT_TIMESTAMP`, reason, claim.Assignment.Scope.TenantID, claim.Assignment.Scope.ProjectID, claim.Assignment.ID, claim.Assignment.Revision, claim.Token)
+	if err != nil {
+		return mapError(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil || rows != 1 {
+		return ErrClaimLost
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) Schedule(ctx context.Context, claim ReconcileClaim, value job.Job, message job.OutboxMessage) (job.Job, bool, error) {
 	if repository == nil || repository.database == nil || repository.jobs == nil || ctx == nil || claim.Validate() != nil {
-		return false, ErrInvalid
+		return job.Job{}, false, ErrInvalid
 	}
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
-		return false, err
+		return job.Job{}, false, err
 	}
 	rollback := func() { _ = tx.Rollback() }
 	current, err := scanAssignment(tx.QueryRowContext(ctx, `SELECT `+assignmentColumns+` FROM plugin_assignments WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 AND revision=$4 AND reconcile_claim_token=$5 AND reconcile_lease_expires_at>CURRENT_TIMESTAMP FOR UPDATE`, claim.Assignment.Scope.TenantID, claim.Assignment.Scope.ProjectID, claim.Assignment.ID, claim.Assignment.Revision, claim.Token))
 	if errors.Is(err, sql.ErrNoRows) {
 		rollback()
-		return false, ErrClaimLost
+		return job.Job{}, false, ErrClaimLost
 	}
 	if err != nil {
 		rollback()
-		return false, mapError(err)
+		return job.Job{}, false, mapError(err)
 	}
 	observed, observationErr := getObservationTx(ctx, tx, current.Scope, current.ID)
 	if observationErr == nil {
 		current.Observed = &observed
 	} else if !errors.Is(observationErr, ErrNotFound) {
 		rollback()
-		return false, observationErr
+		return job.Job{}, false, observationErr
 	}
 	var versionStatus string
 	if err := tx.QueryRowContext(ctx, `SELECT status FROM plugin_versions WHERE tenant_id=$1 AND project_id=$2 AND version_id=$3 FOR SHARE`, current.Scope.TenantID, current.Scope.ProjectID, current.DesiredVersionID).Scan(&versionStatus); err != nil {
 		rollback()
-		return false, mapError(err)
+		return job.Job{}, false, mapError(err)
 	}
 	if versionStatus == "revoked" && current.DesiredState != DesiredStopped && current.DesiredState != DesiredAbsent {
 		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='blocked',blocked_reason='version_revoked',reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, current.Scope.TenantID, current.Scope.ProjectID, current.ID); err != nil {
 			rollback()
-			return false, mapError(err)
+			return job.Job{}, false, mapError(err)
 		}
 		if err := repository.commit(tx); err != nil {
-			return false, err
+			return job.Job{}, false, err
 		}
-		return false, ErrVersionRevoked
+		return job.Job{}, false, ErrVersionRevoked
 	}
 	if versionStatus != "available" && versionStatus != "deprecated" && !(versionStatus == "revoked" && (current.DesiredState == DesiredStopped || current.DesiredState == DesiredAbsent)) {
 		rollback()
-		return false, ErrVersionUnavailable
+		return job.Job{}, false, ErrVersionUnavailable
 	}
 	if !current.NeedsReconcile() {
 		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='converged',reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, current.Scope.TenantID, current.Scope.ProjectID, current.ID); err != nil {
 			rollback()
-			return false, mapError(err)
+			return job.Job{}, false, mapError(err)
 		}
-		return false, repository.commit(tx)
+		return job.Job{}, false, repository.commit(tx)
 	}
 	var existingJob string
 	err = tx.QueryRowContext(ctx, `SELECT job_id FROM plugin_reconcile_operations WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 AND configuration_revision=$4 AND operation_revision=$5`, current.Scope.TenantID, current.Scope.ProjectID, current.ID, current.ConfigurationRevision, current.OperationRevision).Scan(&existingJob)
 	if err == nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,last_scheduled_job_id=$1 WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4`, existingJob, current.Scope.TenantID, current.Scope.ProjectID, current.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='waiting',blocked_reason='operation_in_flight',reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,last_scheduled_job_id=$1,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4`, existingJob, current.Scope.TenantID, current.Scope.ProjectID, current.ID); err != nil {
 			rollback()
-			return false, mapError(err)
+			return job.Job{}, false, mapError(err)
 		}
-		return false, repository.commit(tx)
+		if err := repository.commit(tx); err != nil {
+			return job.Job{}, false, err
+		}
+		stored, err := repository.jobs.Get(ctx, current.Scope, existingJob)
+		return stored, false, err
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		rollback()
-		return false, mapError(err)
+		return job.Job{}, false, mapError(err)
 	}
 	if value.Scope != current.Scope || value.SourceResource.ResourceType != "plugin_assignment" || value.SourceResource.ResourceID != current.ID || message.JobID != value.ID || message.TargetID != current.AgentID {
 		rollback()
-		return false, ErrInvalid
+		return job.Job{}, false, ErrInvalid
 	}
 	if err := repository.jobs.CreateInTx(ctx, tx, value, []job.OutboxMessage{message}); err != nil {
 		rollback()
-		return false, err
+		return job.Job{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO plugin_reconcile_operations (tenant_id,project_id,assignment_id,configuration_revision,operation_revision,job_id,command_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_TIMESTAMP)`, current.Scope.TenantID, current.Scope.ProjectID, current.ID, current.ConfigurationRevision, current.OperationRevision, value.ID, message.ID); err != nil {
 		rollback()
-		return false, mapError(err)
+		return job.Job{}, false, mapError(err)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET last_scheduled_configuration_revision=$1,last_scheduled_operation_revision=$2,last_scheduled_job_id=$3,reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$4 AND project_id=$5 AND assignment_id=$6 AND reconcile_claim_token=$7`, current.ConfigurationRevision, current.OperationRevision, value.ID, current.Scope.TenantID, current.Scope.ProjectID, current.ID, claim.Token)
+	result, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state='waiting',blocked_reason='operation_in_flight',last_scheduled_configuration_revision=$1,last_scheduled_operation_revision=$2,last_scheduled_job_id=$3,reconcile_claim_token=NULL,reconcile_lease_expires_at=NULL,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$4 AND project_id=$5 AND assignment_id=$6 AND reconcile_claim_token=$7`, current.ConfigurationRevision, current.OperationRevision, value.ID, current.Scope.TenantID, current.Scope.ProjectID, current.ID, claim.Token)
 	if err != nil {
 		rollback()
-		return false, mapError(err)
+		return job.Job{}, false, mapError(err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil || rowsAffected != 1 {
 		rollback()
-		return false, ErrClaimLost
+		return job.Job{}, false, ErrClaimLost
 	}
 	if err := repository.commit(tx); err != nil {
-		return false, err
+		if stored, getErr := repository.jobs.Get(ctx, current.Scope, value.ID); getErr == nil {
+			return stored, true, nil
+		}
+		return job.Job{}, false, err
 	}
-	return true, nil
+	stored, err := repository.jobs.Get(ctx, current.Scope, value.ID)
+	return stored, true, err
+}
+
+func (repository *PostgresRepository) FindScheduledJob(ctx context.Context, assignment Assignment) (job.Job, bool, error) {
+	if repository == nil || repository.database == nil || repository.jobs == nil || ctx == nil || assignment.Validate() != nil {
+		return job.Job{}, false, ErrInvalid
+	}
+	var jobID string
+	err := repository.database.QueryRowContext(ctx, `SELECT job_id FROM plugin_reconcile_operations WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 AND configuration_revision=$4 AND operation_revision=$5`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.ID, assignment.ConfigurationRevision, assignment.OperationRevision).Scan(&jobID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return job.Job{}, false, nil
+	}
+	if err != nil {
+		return job.Job{}, false, mapError(err)
+	}
+	value, err := repository.jobs.Get(ctx, assignment.Scope, jobID)
+	if err != nil {
+		return job.Job{}, false, err
+	}
+	if value.SourceResource.ResourceType != "plugin_assignment" || value.SourceResource.ResourceID != assignment.ID {
+		return job.Job{}, false, ErrConflict
+	}
+	return value, true, nil
 }
 
 func getObservationTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, id string) (ObservedState, error) {
@@ -795,7 +985,7 @@ func scanObservation(scanner rowScanner) (ObservedState, error) {
 	var value ObservedState
 	var pid, restarts, bound, config, operation, revision int64
 	var started sql.NullTime
-	err := scanner.Scan(&value.AssignmentID, &value.PluginID, &value.DatabaseFamily, &value.InstalledVersion, &value.ActiveSlot, &value.ProcessState, &pid, &started, &value.Health, &restarts, &value.CircuitState, &bound, &config, &operation, &value.LastErrorCode, &revision, &value.Digest, &value.ObservedAt)
+	err := scanner.Scan(&value.AssignmentID, &value.PluginID, &value.DatabaseFamily, &value.InstalledVersion, &value.ActiveSlot, &value.ProcessState, &pid, &started, &value.Health, &restarts, &value.CircuitState, &bound, &config, &operation, &value.LastErrorCode, &revision, &value.Digest, &value.ObservedAt, &value.ReceivedAt)
 	if err != nil {
 		return ObservedState{}, err
 	}
@@ -809,6 +999,7 @@ func scanObservation(scanner rowScanner) (ObservedState, error) {
 	value.ObservedOperationRevision = uint64(operation)
 	value.ObservationRevision = uint64(revision)
 	value.ObservedAt = value.ObservedAt.UTC()
+	value.ReceivedAt = value.ReceivedAt.UTC()
 	if started.Valid {
 		at := started.Time.UTC()
 		value.StartedAt = &at
@@ -822,7 +1013,7 @@ func assignmentArgs(v Assignment) []any {
 	return []any{v.ID, v.Scope.TenantID, v.Scope.ProjectID, v.HostID, v.AgentID, v.PluginID, v.DatabaseFamily, v.DesiredVersionID, v.DesiredVersion, v.ArtifactID, v.ArtifactSHA256, v.ManifestDigest, v.DesiredState, v.ConfigurationRevision, v.OperationRevision, v.RolloutPercentage, jsonValue(v.InstanceIDs), jsonValue(v.TemplateRevisionIDs), v.ReconcileState, v.BlockedReason, v.Revision, v.CreatedAt, v.UpdatedAt}
 }
 func observationArgs(v ObservedState) []any {
-	return []any{v.AssignmentID, v.PluginID, v.DatabaseFamily, v.InstalledVersion, v.ActiveSlot, v.ProcessState, v.PID, v.StartedAt, v.Health, v.RestartCount, v.CircuitState, v.BoundInstanceCount, v.ActiveConfigurationRevision, v.ObservedOperationRevision, v.LastErrorCode, v.ObservationRevision, v.Digest, v.ObservedAt}
+	return []any{v.AssignmentID, v.PluginID, v.DatabaseFamily, v.InstalledVersion, v.ActiveSlot, v.ProcessState, v.PID, v.StartedAt, v.Health, v.RestartCount, v.CircuitState, v.BoundInstanceCount, v.ActiveConfigurationRevision, v.ObservedOperationRevision, v.LastErrorCode, v.ObservationRevision, v.Digest, v.ObservedAt, v.ReceivedAt}
 }
 func jsonValue(value any) []byte { encoded, _ := json.Marshal(value); return encoded }
 func binding(value Assignment) databaseinstance.AssignmentBinding {
@@ -843,6 +1034,7 @@ func sha256Bytes(value string) []byte { digest := sha256.Sum256([]byte(value)); 
 func observationDigest(value ObservedState) string {
 	copy := value
 	copy.Digest = ""
+	copy.ReceivedAt = time.Time{}
 	encoded, _ := json.Marshal(copy)
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])

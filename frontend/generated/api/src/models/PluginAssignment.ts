@@ -27,6 +27,13 @@ import {
     PluginObservedStateToJSON,
     PluginObservedStateToJSONTyped,
 } from './PluginObservedState.js';
+import type { PluginReconcileState } from './PluginReconcileState.js';
+import {
+    PluginReconcileStateFromJSON,
+    PluginReconcileStateFromJSONTyped,
+    PluginReconcileStateToJSON,
+    PluginReconcileStateToJSONTyped,
+} from './PluginReconcileState.js';
 
 /**
  *
@@ -96,6 +103,18 @@ export interface PluginAssignment {
     rolloutPercentage: number;
     /**
      *
+     * @type {PluginReconcileState}
+     * @memberof PluginAssignment
+     */
+    reconcileState: PluginReconcileState;
+    /**
+     *
+     * @type {string}
+     * @memberof PluginAssignment
+     */
+    reconcileReason?: string;
+    /**
+     *
      * @type {PluginObservedState}
      * @memberof PluginAssignment
      */
@@ -136,6 +155,7 @@ export function instanceOfPluginAssignment(value: object): value is PluginAssign
     if (!('configurationRevision' in value) || value['configurationRevision'] === undefined) return false;
     if (!('operationRevision' in value) || value['operationRevision'] === undefined) return false;
     if (!('rolloutPercentage' in value) || value['rolloutPercentage'] === undefined) return false;
+    if (!('reconcileState' in value) || value['reconcileState'] === undefined) return false;
     if (!('createdAt' in value) || value['createdAt'] === undefined) return false;
     if (!('updatedAt' in value) || value['updatedAt'] === undefined) return false;
     if (!('etag' in value) || value['etag'] === undefined) return false;
@@ -161,6 +181,8 @@ export function PluginAssignmentFromJSONTyped(json: any, ignoreDiscriminator: bo
         'configurationRevision': json['configuration_revision'],
         'operationRevision': json['operation_revision'],
         'rolloutPercentage': json['rollout_percentage'],
+        'reconcileState': PluginReconcileStateFromJSON(json['reconcile_state']),
+        'reconcileReason': json['reconcile_reason'] == null ? undefined : json['reconcile_reason'],
         'observedState': json['observed_state'] == null ? undefined : PluginObservedStateFromJSON(json['observed_state']),
         'createdAt': (new Date(json['created_at'])),
         'updatedAt': (new Date(json['updated_at'])),
@@ -188,6 +210,8 @@ export function PluginAssignmentToJSONTyped(value?: PluginAssignment | null, ign
         'configuration_revision': value['configurationRevision'],
         'operation_revision': value['operationRevision'],
         'rollout_percentage': value['rolloutPercentage'],
+        'reconcile_state': PluginReconcileStateToJSON(value['reconcileState']),
+        'reconcile_reason': value['reconcileReason'],
         'observed_state': PluginObservedStateToJSON(value['observedState']),
         'created_at': ((value['createdAt']).toISOString()),
         'updated_at': ((value['updatedAt']).toISOString()),

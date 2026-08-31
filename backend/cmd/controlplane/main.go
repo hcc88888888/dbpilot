@@ -200,44 +200,45 @@ type Config struct {
 }
 
 type Server struct {
-	config                 Config
-	database               *sql.DB
-	ownsDatabase           bool
-	repository             *alert.PostgresRepository
-	evaluator              *alert.Evaluator
-	dispatcher             *alert.Dispatcher
-	httpServer             *http.Server
-	grpcServer             *grpc.Server
-	enrollmentGRPCServer   *grpc.Server
-	httpTLS                *tls.Config
-	grpcTLS                *tls.Config
-	enrollmentTLS          *tls.Config
-	ping                   func(context.Context) error
-	migrate                func(context.Context) error
-	listen                 func(string, string) (net.Listener, error)
-	scopes                 []alert.Scope
-	ready                  *atomic.Bool
-	evaluateScope          func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
-	listEvents             func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
-	dispatch               func(context.Context, alert.AlertEvent, alert.EventState) error
-	retryDue               func(context.Context, time.Time) error
-	agentRegistry          *agentcontrol.Registry
-	commandObserver        agentcontrol.Observer
-	commandLifecycle       *job.CommandLifecycle
-	dispatchCommands       func(context.Context, time.Time) error
-	idempotency            *idempotency.Service
-	artifactBlobs          *artifact.LocalBlobStore
-	inspectionService      *inspection.Service
-	hostInventoryService   *hostinventory.ApplicationService
-	hostObservations       *agentcontrol.HostObservationDispatcher
-	discoveryObservations  *agentcontrol.DiscoveryDispatcher
-	pluginObservations     *agentcontrol.PluginObservationDispatcher
-	inspectionWorker       *inspection.Worker
-	scheduleInspections    func(context.Context, time.Time) error
-	processInspections     func(context.Context, time.Time) error
-	reconcilePluginCatalog func(context.Context, time.Time) error
-	reconcilePlugins       func(context.Context, time.Time) error
-	workers                sync.WaitGroup
+	config                  Config
+	database                *sql.DB
+	ownsDatabase            bool
+	repository              *alert.PostgresRepository
+	evaluator               *alert.Evaluator
+	dispatcher              *alert.Dispatcher
+	httpServer              *http.Server
+	grpcServer              *grpc.Server
+	enrollmentGRPCServer    *grpc.Server
+	httpTLS                 *tls.Config
+	grpcTLS                 *tls.Config
+	enrollmentTLS           *tls.Config
+	ping                    func(context.Context) error
+	migrate                 func(context.Context) error
+	listen                  func(string, string) (net.Listener, error)
+	scopes                  []alert.Scope
+	ready                   *atomic.Bool
+	evaluateScope           func(context.Context, alert.Scope, time.Time) (alert.EvaluationSummary, error)
+	listEvents              func(context.Context, alert.Scope, alert.EventFilter) ([]alert.AlertEvent, error)
+	dispatch                func(context.Context, alert.AlertEvent, alert.EventState) error
+	retryDue                func(context.Context, time.Time) error
+	agentRegistry           *agentcontrol.Registry
+	commandObserver         agentcontrol.Observer
+	commandLifecycle        *job.CommandLifecycle
+	dispatchCommands        func(context.Context, time.Time) error
+	idempotency             *idempotency.Service
+	artifactBlobs           *artifact.LocalBlobStore
+	inspectionService       *inspection.Service
+	hostInventoryService    *hostinventory.ApplicationService
+	hostObservations        *agentcontrol.HostObservationDispatcher
+	discoveryObservations   *agentcontrol.DiscoveryDispatcher
+	pluginObservations      *agentcontrol.PluginObservationDispatcher
+	inspectionWorker        *inspection.Worker
+	scheduleInspections     func(context.Context, time.Time) error
+	processInspections      func(context.Context, time.Time) error
+	reconcilePluginCatalog  func(context.Context, time.Time) error
+	reconcilePlugins        func(context.Context, time.Time) error
+	repairPluginAssignments func(context.Context, time.Time) error
+	workers                 sync.WaitGroup
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -803,6 +804,13 @@ func NewServer(config Config) (*Server, error) {
 			_, err := pluginReconciler.Reconcile(ctx, at.UTC(), 25)
 			return err
 		},
+		repairPluginAssignments: func(ctx context.Context, _ time.Time) error {
+			if assignmentRepository == nil {
+				return nil
+			}
+			_, err := assignmentRepository.RepairUnassigned(ctx, 25)
+			return err
+		},
 	}, nil
 }
 
@@ -1257,7 +1265,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(7)
+	server.workers.Add(8)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -1299,6 +1307,14 @@ func (server *Server) startLoops(ctx context.Context) {
 		periodic(ctx, 2*time.Second, func(at time.Time) {
 			if err := server.reconcilePlugins(ctx, at); err != nil && ctx.Err() == nil {
 				log.Printf("plugin assignment reconciliation pass failed: %v", err)
+			}
+		})
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, 5*time.Second, func(at time.Time) {
+			if err := server.repairPluginAssignments(ctx, at); err != nil && ctx.Err() == nil {
+				log.Printf("plugin assignment repair pass failed: %v", err)
 			}
 		})
 	}()

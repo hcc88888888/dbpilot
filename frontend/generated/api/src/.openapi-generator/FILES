@@ -103,6 +103,7 @@ models/PluginObservedState.ts
 models/PluginOperatingSystem.ts
 models/PluginPlatform.ts
 models/PluginProcessState.ts
+models/PluginReconcileState.ts
 models/PluginVersion.ts
 models/PluginVersionPage.ts
 models/PluginVersionStatus.ts

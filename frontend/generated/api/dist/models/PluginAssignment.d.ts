@@ -11,6 +11,7 @@
  */
 import type { PluginDesiredState } from './PluginDesiredState.js';
 import type { PluginObservedState } from './PluginObservedState.js';
+import type { PluginReconcileState } from './PluginReconcileState.js';
 /**
  *
  * @export
@@ -77,6 +78,18 @@ export interface PluginAssignment {
      * @memberof PluginAssignment
      */
     rolloutPercentage: number;
+    /**
+     *
+     * @type {PluginReconcileState}
+     * @memberof PluginAssignment
+     */
+    reconcileState: PluginReconcileState;
+    /**
+     *
+     * @type {string}
+     * @memberof PluginAssignment
+     */
+    reconcileReason?: string;
     /**
      *
      * @type {PluginObservedState}

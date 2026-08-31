@@ -2,6 +2,8 @@ package reconciliation
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,12 +26,19 @@ type AssignmentRepository interface {
 	ClaimOne(context.Context, pluginassignment.Assignment, time.Time, time.Duration) (pluginassignment.ReconcileClaim, error)
 	MarkConverged(context.Context, pluginassignment.ReconcileClaim) error
 	MarkConflict(context.Context, pluginassignment.ReconcileClaim) error
-	Schedule(context.Context, pluginassignment.ReconcileClaim, job.Job, job.OutboxMessage) (bool, error)
+	MarkWaiting(context.Context, pluginassignment.ReconcileClaim, string) error
+	Schedule(context.Context, pluginassignment.ReconcileClaim, job.Job, job.OutboxMessage) (job.Job, bool, error)
+	FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error)
 }
 
 func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, assignment pluginassignment.Assignment, at time.Time) (job.Job, error) {
 	if reconciler == nil || reconciler.repository == nil || ctx == nil || assignment.Validate() != nil || at.IsZero() {
 		return job.Job{}, pluginassignment.ErrInvalid
+	}
+	if stored, found, err := reconciler.repository.FindScheduledJob(ctx, assignment); err != nil {
+		return job.Job{}, err
+	} else if found {
+		return stored, nil
 	}
 	claim, err := reconciler.repository.ClaimOne(ctx, assignment, at.UTC(), DefaultClaimLease)
 	if err != nil {
@@ -37,6 +46,12 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 	}
 	if claim.Assignment.HasObservedRevisionConflict() {
 		if err := reconciler.repository.MarkConflict(ctx, claim); err != nil {
+			return job.Job{}, err
+		}
+		return job.Job{}, pluginassignment.ErrConflict
+	}
+	if !rolloutEligible(claim.Assignment) {
+		if err := reconciler.repository.MarkWaiting(ctx, claim, "rollout_pending"); err != nil {
 			return job.Job{}, err
 		}
 		return job.Job{}, pluginassignment.ErrConflict
@@ -51,14 +66,14 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 	if err != nil {
 		return job.Job{}, err
 	}
-	_, err = reconciler.repository.Schedule(ctx, claim, value, message)
+	stored, _, err := reconciler.repository.Schedule(ctx, claim, value, message)
 	if err != nil {
 		return job.Job{}, err
 	}
-	return value, nil
+	return stored, nil
 }
 
-type ReconcileResult struct{ Claimed, Enqueued, Converged, Blocked int }
+type ReconcileResult struct{ Claimed, Enqueued, Converged, Blocked, Waiting int }
 
 type Reconciler interface {
 	Reconcile(context.Context, time.Time, int) (ReconcileResult, error)
@@ -91,6 +106,14 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
+		if !rolloutEligible(claim.Assignment) {
+			if err := reconciler.repository.MarkWaiting(ctx, claim, "rollout_pending"); err != nil {
+				failures = append(failures, err)
+			} else {
+				result.Waiting++
+			}
+			continue
+		}
 		if !claim.Assignment.NeedsReconcile() {
 			if err := reconciler.repository.MarkConverged(ctx, claim); err != nil {
 				failures = append(failures, err)
@@ -104,7 +127,7 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			failures = append(failures, err)
 			continue
 		}
-		created, err := reconciler.repository.Schedule(ctx, claim, value, message)
+		_, created, err := reconciler.repository.Schedule(ctx, claim, value, message)
 		if errors.Is(err, pluginassignment.ErrVersionRevoked) {
 			result.Blocked++
 			continue
@@ -118,6 +141,15 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 		}
 	}
 	return result, errors.Join(failures...)
+}
+
+func rolloutEligible(value pluginassignment.Assignment) bool {
+	if value.DesiredState == pluginassignment.DesiredStopped || value.DesiredState == pluginassignment.DesiredAbsent || value.RolloutPercentage >= 100 {
+		return true
+	}
+	digest := sha256.Sum256([]byte(value.Scope.Key() + "\x00" + value.ID))
+	bucket := int(binary.BigEndian.Uint16(digest[:2])%100) + 1
+	return bucket <= value.RolloutPercentage
 }
 
 func buildPluginJob(assignment pluginassignment.Assignment, at time.Time) (job.Job, job.OutboxMessage, error) {

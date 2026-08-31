@@ -101,6 +101,7 @@ export * from './PluginObservedState.js';
 export * from './PluginOperatingSystem.js';
 export * from './PluginPlatform.js';
 export * from './PluginProcessState.js';
+export * from './PluginReconcileState.js';
 export * from './PluginVersion.js';
 export * from './PluginVersionPage.js';
 export * from './PluginVersionStatus.js';

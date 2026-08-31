@@ -17,9 +17,9 @@ CREATE TABLE plugin_assignments (
     configuration_revision BIGINT NOT NULL CHECK (configuration_revision >= 1),
     operation_revision BIGINT NOT NULL CHECK (operation_revision >= 1),
     rollout_percentage INTEGER NOT NULL CHECK (rollout_percentage BETWEEN 1 AND 100),
-    instance_ids JSONB NOT NULL CHECK (jsonb_typeof(instance_ids) = 'array' AND jsonb_array_length(instance_ids) BETWEEN 0 AND 1000),
-    template_revision_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(template_revision_ids) = 'array' AND jsonb_array_length(template_revision_ids) <= 1000),
-    reconcile_state TEXT NOT NULL CHECK (reconcile_state IN ('pending','converged','blocked','state_conflict')),
+    instance_ids JSONB NOT NULL CHECK (jsonb_typeof(instance_ids) = 'array' AND jsonb_array_length(instance_ids) BETWEEN 0 AND 128),
+    template_revision_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(template_revision_ids) = 'array' AND jsonb_array_length(template_revision_ids) <= 128),
+    reconcile_state TEXT NOT NULL CHECK (reconcile_state IN ('pending','converged','blocked','state_conflict','waiting')),
     blocked_reason TEXT NOT NULL DEFAULT '',
     revision BIGINT NOT NULL CHECK (revision >= 1),
     reconcile_claim_token TEXT,
@@ -35,7 +35,7 @@ CREATE TABLE plugin_assignments (
     FOREIGN KEY (tenant_id, project_id, plugin_id) REFERENCES plugin_definitions (tenant_id, project_id, plugin_id),
     FOREIGN KEY (tenant_id, project_id, desired_version_id) REFERENCES plugin_versions (tenant_id, project_id, version_id),
     CHECK ((reconcile_claim_token IS NULL) = (reconcile_lease_expires_at IS NULL)),
-    CHECK ((reconcile_state = 'blocked' AND blocked_reason <> '') OR (reconcile_state <> 'blocked' AND blocked_reason = ''))
+    CHECK ((reconcile_state IN ('blocked','waiting') AND blocked_reason <> '') OR (reconcile_state NOT IN ('blocked','waiting') AND blocked_reason = ''))
 );
 
 CREATE INDEX plugin_assignments_scope_cursor_idx ON plugin_assignments (tenant_id,project_id,assignment_id);
@@ -46,7 +46,7 @@ CREATE TABLE plugin_assignment_instances (
     project_id TEXT NOT NULL,
     assignment_id TEXT NOT NULL,
     instance_id TEXT NOT NULL,
-    template_revision_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(template_revision_ids)='array' AND jsonb_array_length(template_revision_ids)<=1000),
+    template_revision_ids JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(template_revision_ids)='array' AND jsonb_array_length(template_revision_ids)<=128),
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id,project_id,assignment_id,instance_id),
@@ -71,15 +71,23 @@ CREATE TABLE plugin_observations (
     health TEXT NOT NULL CHECK (health IN ('unknown','healthy','degraded','unhealthy')),
     restart_count BIGINT NOT NULL CHECK (restart_count >= 0),
     circuit_state TEXT NOT NULL CHECK (circuit_state IN ('closed','open','half_open')),
-    bound_instance_count INTEGER NOT NULL CHECK (bound_instance_count BETWEEN 0 AND 1000),
+    bound_instance_count INTEGER NOT NULL CHECK (bound_instance_count BETWEEN 0 AND 128),
     active_configuration_revision BIGINT NOT NULL CHECK (active_configuration_revision >= 0),
     observed_operation_revision BIGINT NOT NULL CHECK (observed_operation_revision >= 0),
     last_error_code TEXT NOT NULL DEFAULT '',
     observation_revision BIGINT NOT NULL CHECK (observation_revision >= 1),
     observation_digest TEXT NOT NULL CHECK (observation_digest ~ '^[0-9a-f]{64}$'),
     observed_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id,project_id,assignment_id),
     FOREIGN KEY (tenant_id,project_id,assignment_id) REFERENCES plugin_assignments (tenant_id,project_id,assignment_id)
+);
+
+CREATE TABLE plugin_assignment_repair_backlog (
+    tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, instance_id TEXT NOT NULL,
+    reason_code TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id,project_id,instance_id),
+    FOREIGN KEY (instance_id) REFERENCES managed_database_instances(instance_id)
 );
 
 CREATE TABLE plugin_assignment_mutations (

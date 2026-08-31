@@ -25,9 +25,13 @@ var (
 	ErrVersionRevoked     = errors.New("plugin version is revoked")
 	ErrStaleObservation   = errors.New("plugin observation is stale")
 	ErrClaimLost          = errors.New("plugin reconciliation claim was lost")
+	ErrCapacity           = errors.New("plugin assignment capacity exceeded")
 )
 
-const DefaultListLimit = 50
+const (
+	DefaultListLimit       = 50
+	MaximumAssignmentItems = 128
+)
 
 var (
 	idPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -59,10 +63,11 @@ const (
 	ReconcileConverged ReconcileState = "converged"
 	ReconcileBlocked   ReconcileState = "blocked"
 	ReconcileConflict  ReconcileState = "state_conflict"
+	ReconcileWaiting   ReconcileState = "waiting"
 )
 
 func (value ReconcileState) Valid() bool {
-	return value == ReconcilePending || value == ReconcileConverged || value == ReconcileBlocked || value == ReconcileConflict
+	return value == ReconcilePending || value == ReconcileConverged || value == ReconcileBlocked || value == ReconcileConflict || value == ReconcileWaiting
 }
 
 type ProcessState string
@@ -119,11 +124,12 @@ type ObservedState struct {
 	LastErrorCode               string
 	ObservationRevision         uint64
 	ObservedAt                  time.Time
+	ReceivedAt                  time.Time
 	Digest                      string
 }
 
 func (value ObservedState) Validate() error {
-	if !idPattern.MatchString(value.AssignmentID) || !pluginIDPattern.MatchString(value.PluginID) || !familyPattern.MatchString(value.DatabaseFamily) || value.InstalledVersion != "" && !versionPattern.MatchString(value.InstalledVersion) || !validProcessState(value.ProcessState) || !validHealth(value.Health) || !validCircuit(value.CircuitState) || !validSlot(value.ActiveSlot) || value.BoundInstanceCount > 1000 || value.ObservationRevision == 0 || !validUTC(value.ObservedAt) || value.Digest != "" && !digestPattern.MatchString(value.Digest) || value.LastErrorCode != "" && !pluginIDPattern.MatchString(value.LastErrorCode) {
+	if !idPattern.MatchString(value.AssignmentID) || !pluginIDPattern.MatchString(value.PluginID) || !familyPattern.MatchString(value.DatabaseFamily) || value.InstalledVersion != "" && !versionPattern.MatchString(value.InstalledVersion) || !validProcessState(value.ProcessState) || !validHealth(value.Health) || !validCircuit(value.CircuitState) || !validSlot(value.ActiveSlot) || value.BoundInstanceCount > MaximumAssignmentItems || value.ObservationRevision == 0 || !validUTC(value.ObservedAt) || value.Digest != "" && !digestPattern.MatchString(value.Digest) || value.LastErrorCode != "" && !pluginIDPattern.MatchString(value.LastErrorCode) {
 		return ErrInvalid
 	}
 	if value.StartedAt != nil && !validUTC(*value.StartedAt) {
@@ -168,13 +174,13 @@ func NormalizeAssignment(value Assignment) (Assignment, error) {
 }
 
 func (value Assignment) Validate() error {
-	if !idPattern.MatchString(value.ID) || value.Scope.Validate() != nil || !idPattern.MatchString(value.HostID) || !idPattern.MatchString(value.AgentID) || !pluginIDPattern.MatchString(value.PluginID) || !familyPattern.MatchString(value.DatabaseFamily) || !idPattern.MatchString(value.DesiredVersionID) || !versionPattern.MatchString(value.DesiredVersion) || !idPattern.MatchString(value.ArtifactID) || !digestPattern.MatchString(value.ArtifactSHA256) || !digestPattern.MatchString(value.ManifestDigest) || !value.DesiredState.Valid() || value.ConfigurationRevision == 0 || value.OperationRevision == 0 || value.RolloutPercentage < 1 || value.RolloutPercentage > 100 || len(value.InstanceIDs) > 1000 || (len(value.InstanceIDs) == 0 && value.DesiredState != DesiredAbsent) || len(value.TemplateRevisionIDs) > 1000 || !value.ReconcileState.Valid() || value.BlockedReason != "" && !pluginIDPattern.MatchString(value.BlockedReason) || value.Revision == 0 || !validUTC(value.CreatedAt) || !validUTC(value.UpdatedAt) || value.UpdatedAt.Before(value.CreatedAt) {
+	if !idPattern.MatchString(value.ID) || value.Scope.Validate() != nil || !idPattern.MatchString(value.HostID) || !idPattern.MatchString(value.AgentID) || !pluginIDPattern.MatchString(value.PluginID) || !familyPattern.MatchString(value.DatabaseFamily) || !idPattern.MatchString(value.DesiredVersionID) || !versionPattern.MatchString(value.DesiredVersion) || !idPattern.MatchString(value.ArtifactID) || !digestPattern.MatchString(value.ArtifactSHA256) || !digestPattern.MatchString(value.ManifestDigest) || !value.DesiredState.Valid() || value.ConfigurationRevision == 0 || value.OperationRevision == 0 || value.RolloutPercentage < 1 || value.RolloutPercentage > 100 || len(value.InstanceIDs) > MaximumAssignmentItems || (len(value.InstanceIDs) == 0 && value.DesiredState != DesiredAbsent) || len(value.TemplateRevisionIDs) > MaximumAssignmentItems || !value.ReconcileState.Valid() || value.BlockedReason != "" && !pluginIDPattern.MatchString(value.BlockedReason) || value.Revision == 0 || !validUTC(value.CreatedAt) || !validUTC(value.UpdatedAt) || value.UpdatedAt.Before(value.CreatedAt) {
 		return ErrInvalid
 	}
 	if !strictSortedIdentifiers(value.InstanceIDs) || !strictSortedIdentifiers(value.TemplateRevisionIDs) {
 		return ErrInvalid
 	}
-	if value.ReconcileState == ReconcileBlocked && value.BlockedReason == "" || value.ReconcileState != ReconcileBlocked && value.BlockedReason != "" {
+	if (value.ReconcileState == ReconcileBlocked || value.ReconcileState == ReconcileWaiting) != (value.BlockedReason != "") {
 		return ErrInvalid
 	}
 	if value.Observed != nil {
@@ -284,7 +290,7 @@ type ObservationReport struct {
 }
 
 func (value ObservationReport) Validate() error {
-	if value.Scope.Validate() != nil || !idPattern.MatchString(value.HostID) || !idPattern.MatchString(value.AgentID) || value.ObservationRevision == 0 || len(value.Assignments) > 128 || !validUTC(value.ObservedAt) {
+	if value.Scope.Validate() != nil || !idPattern.MatchString(value.HostID) || !idPattern.MatchString(value.AgentID) || value.ObservationRevision == 0 || len(value.Assignments) > MaximumAssignmentItems || !validUTC(value.ObservedAt) {
 		return ErrInvalid
 	}
 	seen := make(map[string]struct{}, len(value.Assignments))

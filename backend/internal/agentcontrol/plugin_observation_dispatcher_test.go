@@ -31,6 +31,30 @@ func TestPluginObservationDispatcherCoalescesHotAgentAndDoesNotStarveColdAgent(t
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestPluginObservationDispatcherQuarantineCoalescesNewestReportWithoutOverlappingSink(t *testing.T) {
+	sink := &controlledPluginSink{release: make(chan struct{}), delivered: make(chan string, 4)}
+	dispatcher, err := NewPluginObservationDispatcher(sink, PluginObservationDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: 20 * time.Millisecond, RetryBackoff: time.Millisecond})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+	require.NoError(t, dispatcher.SubmitPlugin("agent-stuck", pluginReport("agent-stuck", 1)))
+	require.Equal(t, "agent-stuck:1", <-sink.delivered)
+	time.Sleep(40 * time.Millisecond)
+	require.NoError(t, dispatcher.SubmitPlugin("agent-stuck", pluginReport("agent-stuck", 2)))
+	require.NoError(t, dispatcher.SubmitPlugin("agent-stuck", pluginReport("agent-stuck", 3)))
+	select {
+	case delivered := <-sink.delivered:
+		t.Fatalf("quarantined lane overlapped the stuck sink with %s", delivered)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(sink.release)
+	require.Equal(t, "agent-stuck:3", <-sink.delivered)
+	require.Eventually(t, func() bool {
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		return sink.persisted["agent-stuck"] == 3
+	}, time.Second, time.Millisecond)
+}
+
 func TestPluginObservationDispatcherQuarantinesContextIgnoringSinkAndCloseIsBounded(t *testing.T) {
 	sink := &controlledPluginSink{never: true, delivered: make(chan string, 2)}
 	dispatcher, err := NewPluginObservationDispatcher(sink, PluginObservationDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: 20 * time.Millisecond, RetryBackoff: time.Millisecond})
@@ -42,6 +66,32 @@ func TestPluginObservationDispatcherQuarantinesContextIgnoringSinkAndCloseIsBoun
 	dispatcher.Close()
 	require.Less(t, time.Since(started), 50*time.Millisecond)
 	require.ErrorIs(t, dispatcher.SubmitPlugin("agent-after-close", pluginReport("agent-after-close", 1)), ErrPluginObservationClosed)
+}
+
+func TestPluginObservationDispatcherRateLimitsButEventuallyRefreshesExactDuplicate(t *testing.T) {
+	now := time.Date(2026, 8, 31, 5, 0, 0, 0, time.UTC)
+	sink := &controlledPluginSink{delivered: make(chan string, 4)}
+	dispatcher, err := NewPluginObservationDispatcher(sink, PluginObservationDispatcherConfig{MaximumPendingAgents: 2, DeliveryTimeout: time.Second, RetryBackoff: time.Millisecond, DuplicateRefreshInterval: time.Minute, Now: func() time.Time { return now }})
+	require.NoError(t, err)
+	defer dispatcher.Close()
+	report := pluginReport("agent-refresh", 7)
+	require.NoError(t, dispatcher.SubmitPlugin("agent-refresh", report))
+	require.Equal(t, "agent-refresh:7", <-sink.delivered)
+	require.Eventually(t, func() bool {
+		dispatcher.mu.Lock()
+		defer dispatcher.mu.Unlock()
+		_, ok := dispatcher.last["agent-refresh"]
+		return ok
+	}, time.Second, time.Millisecond)
+	require.NoError(t, dispatcher.SubmitPlugin("agent-refresh", report))
+	select {
+	case value := <-sink.delivered:
+		t.Fatalf("duplicate was not rate limited: %s", value)
+	case <-time.After(20 * time.Millisecond):
+	}
+	now = now.Add(2 * time.Minute)
+	require.NoError(t, dispatcher.SubmitPlugin("agent-refresh", report))
+	require.Equal(t, "agent-refresh:7", <-sink.delivered)
 }
 
 type controlledPluginSink struct {
