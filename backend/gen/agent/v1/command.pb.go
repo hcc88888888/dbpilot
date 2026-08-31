@@ -2600,6 +2600,7 @@ type CredentialLeaseResponse struct {
 	DatabaseFamily        string                 `protobuf:"bytes,8,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
 	ConfigurationRevision uint64                 `protobuf:"varint,9,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
 	OperationRevision     uint64                 `protobuf:"varint,10,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	ValidForSeconds       uint32                 `protobuf:"varint,11,opt,name=valid_for_seconds,json=validForSeconds,proto3" json:"valid_for_seconds,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -2700,6 +2701,13 @@ func (x *CredentialLeaseResponse) GetConfigurationRevision() uint64 {
 func (x *CredentialLeaseResponse) GetOperationRevision() uint64 {
 	if x != nil {
 		return x.OperationRevision
+	}
+	return 0
+}
+
+func (x *CredentialLeaseResponse) GetValidForSeconds() uint32 {
+	if x != nil {
+		return x.ValidForSeconds
 	}
 	return 0
 }
@@ -3774,7 +3782,7 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\rassignment_id\x18\x03 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x04 \x01(\x04R\x15configurationRevision\x12'\n" +
 	"\x0fdatabase_family\x18\x05 \x01(\tR\x0edatabaseFamily\x12-\n" +
-	"\x12operation_revision\x18\x06 \x01(\x04R\x11operationRevision\"\xe0\x03\n" +
+	"\x12operation_revision\x18\x06 \x01(\x04R\x11operationRevision\"\x8c\x04\n" +
 	"\x17CredentialLeaseResponse\x12#\n" +
 	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x19\n" +
 	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x1f\n" +
@@ -3790,7 +3798,8 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x0fdatabase_family\x18\b \x01(\tR\x0edatabaseFamily\x125\n" +
 	"\x16configuration_revision\x18\t \x01(\x04R\x15configurationRevision\x12-\n" +
 	"\x12operation_revision\x18\n" +
-	" \x01(\x04R\x11operationRevision\"S\n" +
+	" \x01(\x04R\x11operationRevision\x12*\n" +
+	"\x11valid_for_seconds\x18\v \x01(\rR\x0fvalidForSeconds\"S\n" +
 	"\x12CredentialMaterial\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12!\n" +
 	"\fsecret_bytes\x18\x02 \x01(\fR\vsecretBytes\"\xb6\x01\n" +

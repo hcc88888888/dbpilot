@@ -58,7 +58,7 @@ JOIN plugin_assignment_instances pai ON pai.tenant_id=pa.tenant_id AND pai.proje
 JOIN managed_database_instances di ON di.tenant_id=pa.tenant_id AND di.project_id=pa.project_id AND di.instance_id=pai.instance_id AND di.host_id=pa.host_id AND di.agent_id=pa.agent_id AND di.database_family=pa.database_family
 JOIN plugin_reconcile_operations op ON op.tenant_id=pa.tenant_id AND op.project_id=pa.project_id AND op.assignment_id=pa.assignment_id AND op.configuration_revision=pa.configuration_revision AND op.operation_revision=pa.operation_revision
 JOIN jobs j ON j.tenant_id=op.tenant_id AND j.project_id=op.project_id AND j.id=op.job_id AND j.status='succeeded'
-JOIN command_outbox co ON co.tenant_id=op.tenant_id AND co.project_id=op.project_id AND co.job_id=op.job_id AND co.command_id=op.command_id AND co.command_status='succeeded'
+JOIN command_outbox co ON co.tenant_id=op.tenant_id AND co.project_id=op.project_id AND co.job_id=op.job_id AND co.id=op.command_id AND co.command_status='succeeded'
 JOIN plugin_versions pv ON pv.tenant_id=pa.tenant_id AND pv.project_id=pa.project_id AND pv.version_id=pa.desired_version_id AND pv.status='available'
 JOIN plugin_observations po ON po.tenant_id=pa.tenant_id AND po.project_id=pa.project_id AND po.assignment_id=pa.assignment_id AND po.process_state='running' AND po.health='healthy' AND po.active_configuration_revision=pa.configuration_revision AND po.observed_operation_revision=pa.operation_revision
 WHERE pa.agent_id=$1 AND pa.assignment_id=$2 AND di.instance_id=$3 AND pa.configuration_revision=$4

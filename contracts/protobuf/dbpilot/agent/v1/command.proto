@@ -284,6 +284,7 @@ message CredentialLeaseResponse {
   string database_family = 8;
   uint64 configuration_revision = 9;
   uint64 operation_revision = 10;
+  uint32 valid_for_seconds = 11;
 }
 
 message CredentialMaterial {

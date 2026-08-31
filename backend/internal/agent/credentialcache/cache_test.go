@@ -17,7 +17,7 @@ func TestCacheSingleflightsAndReturnsReleasableCopies(t *testing.T) {
 	var calls atomic.Int32
 	loader := func(context.Context) (Lease, error) {
 		calls.Add(1)
-		return Lease{ID: "lease-1", Key: key, ExpiresAt: now.Add(time.Minute), Username: "monitor", SecretBytes: []byte("fixture-password")}, nil
+		return Lease{ID: "lease-1", Key: key, ExpiresAt: now.Add(time.Minute), ValidFor: time.Minute, Username: "monitor", SecretBytes: []byte("fixture-password")}, nil
 	}
 
 	const callers = 8
@@ -48,7 +48,7 @@ func TestCacheExpiryAndRotationZeroizeStoredBuffers(t *testing.T) {
 	cache := New(func() time.Time { return now })
 	firstKey := validKey()
 	first, err := cache.Get(context.Background(), firstKey, func(context.Context) (Lease, error) {
-		return Lease{ID: "lease-1", Key: firstKey, ExpiresAt: now.Add(time.Minute), Username: "monitor", SecretBytes: []byte("old-password")}, nil
+		return Lease{ID: "lease-1", Key: firstKey, ExpiresAt: now.Add(time.Minute), ValidFor: time.Minute, Username: "monitor", SecretBytes: []byte("old-password")}, nil
 	})
 	require.NoError(t, err)
 	first.Release()
@@ -57,7 +57,7 @@ func TestCacheExpiryAndRotationZeroizeStoredBuffers(t *testing.T) {
 	rotatedKey := firstKey
 	rotatedKey.CredentialRevision++
 	rotated, err := cache.Get(context.Background(), rotatedKey, func(context.Context) (Lease, error) {
-		return Lease{ID: "lease-2", Key: rotatedKey, ExpiresAt: now.Add(time.Minute), Username: "monitor", SecretBytes: []byte("new-password")}, nil
+		return Lease{ID: "lease-2", Key: rotatedKey, ExpiresAt: now.Add(time.Minute), ValidFor: 50 * time.Millisecond, Username: "monitor", SecretBytes: []byte("new-password")}, nil
 	})
 	require.NoError(t, err)
 	rotated.Release()
@@ -67,7 +67,8 @@ func TestCacheExpiryAndRotationZeroizeStoredBuffers(t *testing.T) {
 	newBuffer := cache.entries[rotatedKey].lease.SecretBytes
 	now = now.Add(2 * time.Minute)
 	cache.Prune()
-	require.Empty(t, cache.entries)
+	require.NotEmpty(t, cache.entries, "local wall-clock skew must not expire a duration-fenced lease")
+	require.Eventually(t, func() bool { cache.mu.Lock(); defer cache.mu.Unlock(); return len(cache.entries) == 0 }, time.Second, 10*time.Millisecond)
 	require.Equal(t, make([]byte, len(newBuffer)), newBuffer)
 }
 
@@ -82,7 +83,7 @@ func TestCacheTimerZerosAndRemovesWithoutAnotherGet(t *testing.T) {
 	cache := New(time.Now)
 	key := validKey()
 	handle, err := cache.Get(context.Background(), key, func(context.Context) (Lease, error) {
-		return Lease{ID: "lease-timer", Key: key, ExpiresAt: time.Now().UTC().Add(50 * time.Millisecond), Username: "monitor", SecretBytes: []byte("timer-secret")}, nil
+		return Lease{ID: "lease-timer", Key: key, ExpiresAt: time.Now().UTC().Add(50 * time.Millisecond), ValidFor: 50 * time.Millisecond, Username: "monitor", SecretBytes: []byte("timer-secret")}, nil
 	})
 	require.NoError(t, err)
 	handle.Release()

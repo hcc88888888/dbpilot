@@ -440,6 +440,8 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	defer func() {
 		session.cancel()
 		_ = stream.CloseSend()
+		c.clearSession(session)
+		session.wait.Wait()
 		for {
 			select {
 			case pending := <-received:
@@ -451,8 +453,6 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 			}
 		}
 	drainedReceived:
-		c.clearSession(session)
-		session.wait.Wait()
 	}()
 
 	var first receiveResult
@@ -1044,13 +1044,13 @@ func (c *ControlClient) handleCredentialLeaseResponse(response *agentv1.Credenti
 		return nil
 	}
 	credential := response.GetCredential()
-	now := c.now()
-	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetInstanceId() == waiter.request.InstanceID && response.GetDatabaseFamily() == waiter.request.DatabaseFamily && response.GetConfigurationRevision() == waiter.request.ConfigurationRevision && response.GetOperationRevision() == waiter.request.OperationRevision && response.GetCredentialRevision() > 0 && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(now) && !response.GetExpiresAt().AsTime().After(now.Add(5*time.Minute)) && credential != nil && len(credential.GetUsername()) <= 256 && strings.TrimSpace(credential.GetUsername()) == credential.GetUsername() && !strings.ContainsAny(credential.GetUsername(), "\x00\r\n") && len(credential.GetSecretBytes()) > 0 && len(credential.GetSecretBytes()) <= 64<<10 && proto.Size(response) <= (68<<10)
+	validFor := time.Duration(response.GetValidForSeconds()) * time.Second
+	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetInstanceId() == waiter.request.InstanceID && response.GetDatabaseFamily() == waiter.request.DatabaseFamily && response.GetConfigurationRevision() == waiter.request.ConfigurationRevision && response.GetOperationRevision() == waiter.request.OperationRevision && response.GetCredentialRevision() > 0 && validFor >= 5*time.Second && validFor <= 5*time.Minute && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && credential != nil && len(credential.GetUsername()) <= 256 && strings.TrimSpace(credential.GetUsername()) == credential.GetUsername() && !strings.ContainsAny(credential.GetUsername(), "\x00\r\n") && len(credential.GetSecretBytes()) > 0 && len(credential.GetSecretBytes()) <= 64<<10 && proto.Size(response) <= (68<<10)
 	if !valid {
 		waiter.deliver(credentialLeaseResult{err: ErrCredentialLease})
 		return nil
 	}
-	waiter.deliver(credentialLeaseResult{lease: CredentialLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), DatabaseFamily: response.GetDatabaseFamily(), CredentialRevision: response.GetCredentialRevision(), ConfigurationRevision: response.GetConfigurationRevision(), OperationRevision: response.GetOperationRevision(), ExpiresAt: response.GetExpiresAt().AsTime().UTC(), Username: credential.GetUsername(), SecretBytes: append([]byte(nil), credential.GetSecretBytes()...)}})
+	waiter.deliver(credentialLeaseResult{lease: CredentialLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), DatabaseFamily: response.GetDatabaseFamily(), CredentialRevision: response.GetCredentialRevision(), ConfigurationRevision: response.GetConfigurationRevision(), OperationRevision: response.GetOperationRevision(), ExpiresAt: response.GetExpiresAt().AsTime().UTC(), ValidFor: validFor, Username: credential.GetUsername(), SecretBytes: append([]byte(nil), credential.GetSecretBytes()...)}})
 	return nil
 }
 

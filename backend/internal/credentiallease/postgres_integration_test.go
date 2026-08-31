@@ -131,7 +131,7 @@ func credentialLeasePostgresFixture(t *testing.T) *sql.DB {
 		`CREATE TABLE managed_database_instances (tenant_id TEXT,project_id TEXT,host_id TEXT,agent_id TEXT,instance_id TEXT,database_family TEXT,revision BIGINT,credential_ref TEXT,tls_ref TEXT,management_status TEXT,plugin_assignment_revision BIGINT)`,
 		`CREATE TABLE plugin_reconcile_operations (tenant_id TEXT,project_id TEXT,assignment_id TEXT,configuration_revision BIGINT,operation_revision BIGINT,command_id TEXT,job_id TEXT)`,
 		`CREATE TABLE jobs (tenant_id TEXT,project_id TEXT,id TEXT,status TEXT)`,
-		`CREATE TABLE command_outbox (tenant_id TEXT,project_id TEXT,job_id TEXT,command_id TEXT,command_status TEXT)`,
+		`CREATE TABLE command_outbox (tenant_id TEXT,project_id TEXT,job_id TEXT,id TEXT,command_status TEXT)`,
 		`CREATE TABLE plugin_versions (tenant_id TEXT,project_id TEXT,version_id TEXT,status TEXT)`,
 		`CREATE TABLE plugin_observations (tenant_id TEXT,project_id TEXT,assignment_id TEXT,process_state TEXT,health TEXT,active_configuration_revision BIGINT,observed_operation_revision BIGINT)`,
 		`CREATE TABLE credential_lease_audits (tenant_id TEXT,project_id TEXT,agent_id TEXT,assignment_id TEXT,instance_id TEXT,configuration_revision BIGINT,operation_revision BIGINT,result TEXT)`,

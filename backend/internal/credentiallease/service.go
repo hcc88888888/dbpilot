@@ -25,28 +25,31 @@ type Config struct {
 }
 
 type ApplicationService struct {
-	authorizer  Authorizer
-	renewals    RenewalAuthorizer
-	provider    SecretProvider
-	clock       DatabaseClock
-	audit       AuditRecorder
-	ttl         time.Duration
-	maximumLive int
-	random      io.Reader
-	mu          sync.Mutex
-	leases      map[string]*liveLease
-	issued      map[string]bool
-	closed      bool
+	authorizer     Authorizer
+	renewals       RenewalAuthorizer
+	provider       SecretProvider
+	clock          DatabaseClock
+	audit          AuditRecorder
+	ttl            time.Duration
+	maximumLive    int
+	random         io.Reader
+	mu             sync.Mutex
+	leases         map[string]*liveLease
+	issued         map[string]bool
+	tombstones     map[string]time.Time
+	tombstoneOrder []string
+	closed         bool
 }
 
 type liveLease struct {
-	fingerprint [sha256.Size]byte
-	ready       chan struct{}
-	lease       Lease
-	err         error
-	timer       *time.Timer
-	expired     bool
-	completed   bool
+	fingerprint    [sha256.Size]byte
+	ready          chan struct{}
+	lease          Lease
+	err            error
+	timer          *time.Timer
+	expired        bool
+	completed      bool
+	tombstoneUntil time.Time
 }
 
 func NewService(config Config) (*ApplicationService, error) {
@@ -70,7 +73,7 @@ func NewService(config Config) (*ApplicationService, error) {
 	if maximum < 1 || maximum > DefaultMaximumLive {
 		return nil, ErrLeaseRejected
 	}
-	return &ApplicationService{authorizer: config.Authorizer, renewals: config.Renewals, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease), issued: make(map[string]bool)}, nil
+	return &ApplicationService{authorizer: config.Authorizer, renewals: config.Renewals, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease), issued: make(map[string]bool), tombstones: make(map[string]time.Time)}, nil
 }
 
 func (service *ApplicationService) Lease(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest) (Lease, error) {
@@ -129,12 +132,17 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 			return Lease{}, ErrLeaseRejected
 		}
 	}
+	if until, reused := service.tombstones[key]; reused && until.After(now) {
+		service.mu.Unlock()
+		service.recordRejected(ctx, authorization, agent, request, now)
+		return Lease{}, ErrLeaseRejected
+	}
 	if len(service.leases) >= service.maximumLive {
 		service.mu.Unlock()
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
-	record := &liveLease{fingerprint: fingerprint, ready: make(chan struct{})}
+	record := &liveLease{fingerprint: fingerprint, ready: make(chan struct{}), tombstoneUntil: now.Add(service.ttl * 3)}
 	service.leases[key] = record
 	service.mu.Unlock()
 
@@ -155,6 +163,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 	}
 	authorization = freshAuthorization
 	finalNow = finalNow.UTC()
+	record.tombstoneUntil = finalNow.Add(service.ttl * 3)
 	leaseIDBytes := make([]byte, 16)
 	if _, err = io.ReadFull(service.random, leaseIDBytes); err != nil {
 		credential.Release()
@@ -162,9 +171,9 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
-	lease := Lease{ID: hex.EncodeToString(leaseIDBytes), InstanceID: request.InstanceID, AssignmentID: request.AssignmentID, DatabaseFamily: authorization.DatabaseFamily, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, CredentialRevision: credential.Revision, ExpiresAt: finalNow.Add(service.ttl), Username: credential.Username, SecretBytes: append([]byte(nil), credential.SecretBytes...)}
+	lease := Lease{ID: hex.EncodeToString(leaseIDBytes), InstanceID: request.InstanceID, AssignmentID: request.AssignmentID, DatabaseFamily: authorization.DatabaseFamily, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, CredentialRevision: credential.Revision, ExpiresAt: finalNow.Add(service.ttl), ValidFor: service.ttl, Username: credential.Username, SecretBytes: append([]byte(nil), credential.SecretBytes...)}
 	credential.Release()
-	remaining := time.Until(lease.ExpiresAt)
+	remaining := lease.ExpiresAt.Sub(finalNow)
 	if remaining <= 0 {
 		lease.Release()
 		service.failRecord(key, record)
@@ -196,6 +205,8 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		if service.leases[key] == record {
 			record.lease.Release()
 			record.expired = true
+			delete(service.leases, key)
+			service.addTombstoneLocked(key, finalNow.Add(service.ttl*3))
 		}
 		service.mu.Unlock()
 	})
@@ -216,10 +227,19 @@ func (service *ApplicationService) failRecord(key string, record *liveLease) {
 	}
 	record.completed = true
 	close(record.ready)
+	if service.leases[key] == record {
+		delete(service.leases, key)
+		service.addTombstoneLocked(key, record.tombstoneUntil)
+	}
 }
 
 func (service *ApplicationService) pruneLocked(now time.Time) {
-	for _, record := range service.leases {
+	for key, until := range service.tombstones {
+		if !until.After(now) {
+			delete(service.tombstones, key)
+		}
+	}
+	for key, record := range service.leases {
 		select {
 		case <-record.ready:
 			if record.err != nil || !record.lease.ExpiresAt.After(now) {
@@ -228,6 +248,8 @@ func (service *ApplicationService) pruneLocked(now time.Time) {
 				}
 				record.lease.Release()
 				record.expired = true
+				delete(service.leases, key)
+				service.addTombstoneLocked(key, now.Add(service.ttl*3))
 			}
 		default:
 		}
@@ -258,7 +280,21 @@ func (service *ApplicationService) Close() {
 		delete(service.leases, key)
 	}
 	clear(service.issued)
+	clear(service.tombstones)
+	service.tombstoneOrder = nil
 	service.mu.Unlock()
+}
+
+func (service *ApplicationService) addTombstoneLocked(key string, until time.Time) {
+	if _, exists := service.tombstones[key]; !exists {
+		service.tombstoneOrder = append(service.tombstoneOrder, key)
+	}
+	service.tombstones[key] = until
+	for len(service.tombstoneOrder) > service.maximumLive*4 {
+		oldest := service.tombstoneOrder[0]
+		service.tombstoneOrder = service.tombstoneOrder[1:]
+		delete(service.tombstones, oldest)
+	}
 }
 
 func (service *ApplicationService) authorize(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest, renewal bool) (Authorization, error) {

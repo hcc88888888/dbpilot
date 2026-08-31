@@ -87,6 +87,7 @@ type Lease struct {
 	OperationRevision     uint64
 	CredentialRevision    uint64
 	ExpiresAt             time.Time
+	ValidFor              time.Duration
 	Username              string
 	SecretBytes           []byte
 }

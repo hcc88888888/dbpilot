@@ -30,6 +30,7 @@ type Lease struct {
 	ID          string
 	Key         Key
 	ExpiresAt   time.Time
+	ValidFor    time.Duration
 	Username    string
 	SecretBytes []byte
 }
@@ -52,6 +53,7 @@ type Handle struct {
 	ID          string
 	Key         Key
 	ExpiresAt   time.Time
+	ValidFor    time.Duration
 	Username    string
 	SecretBytes []byte
 }
@@ -107,7 +109,7 @@ func (cache *Cache) Get(ctx context.Context, key Key, loader Loader) (*Handle, e
 		case <-ready:
 			cache.mu.Lock()
 			defer cache.mu.Unlock()
-			if current.err != nil || !current.lease.ExpiresAt.After(cache.now().UTC()) || cache.entries[key] != current {
+			if current.err != nil || cache.entries[key] != current {
 				return nil, ErrUnavailable
 			}
 			return handle(current.lease), nil
@@ -133,7 +135,7 @@ func (cache *Cache) Get(ctx context.Context, key Key, loader Loader) (*Handle, e
 		return nil, ErrUnavailable
 	}
 	current.lease = loaded.clone()
-	remaining := time.Until(current.lease.ExpiresAt)
+	remaining := current.lease.ValidFor
 	if remaining <= 0 {
 		current.lease.zero()
 		current.err = ErrUnavailable
@@ -228,7 +230,7 @@ func (cache *Cache) pruneLocked(now time.Time) {
 	for key, current := range cache.entries {
 		select {
 		case <-current.ready:
-			if current.err != nil || !current.lease.ExpiresAt.After(now) {
+			if current.err != nil {
 				if current.timer != nil {
 					current.timer.Stop()
 				}
@@ -245,11 +247,11 @@ func (value Key) valid() bool {
 }
 
 func (value Lease) valid(now time.Time) bool {
-	return resourceID.MatchString(value.ID) && value.Key.valid() && value.ExpiresAt.Location() == time.UTC && value.ExpiresAt.After(now) && len(value.Username) <= 256 && strings.TrimSpace(value.Username) == value.Username && !strings.ContainsAny(value.Username, "\x00\r\n") && len(value.SecretBytes) > 0 && len(value.SecretBytes) <= maximumSecretBytes
+	return resourceID.MatchString(value.ID) && value.Key.valid() && value.ExpiresAt.Location() == time.UTC && value.ValidFor > 0 && value.ValidFor <= 5*time.Minute && len(value.Username) <= 256 && strings.TrimSpace(value.Username) == value.Username && !strings.ContainsAny(value.Username, "\x00\r\n") && len(value.SecretBytes) > 0 && len(value.SecretBytes) <= maximumSecretBytes
 }
 
 func handle(value Lease) *Handle {
-	return &Handle{ID: value.ID, Key: value.Key, ExpiresAt: value.ExpiresAt, Username: value.Username, SecretBytes: append([]byte(nil), value.SecretBytes...)}
+	return &Handle{ID: value.ID, Key: value.Key, ExpiresAt: value.ExpiresAt, ValidFor: value.ValidFor, Username: value.Username, SecretBytes: append([]byte(nil), value.SecretBytes...)}
 }
 
 func zero(value []byte) {
