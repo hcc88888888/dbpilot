@@ -478,7 +478,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return errors.New("configure plugin gateway")
 		}
-		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGatewayHealthChecker(pluginGateway), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGatewayHealthCheckerWithCredentials(pluginGateway, pluginLeases), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
 		if err != nil {
 			_ = store.Close()
 			return errors.New("configure plugin supervisor")
@@ -572,7 +572,18 @@ func (client *deferredPluginLeaseClient) LeasePluginArtifact(ctx context.Context
 	return control.LeasePluginArtifact(ctx, request)
 }
 
+func (client *deferredPluginLeaseClient) LeaseCredential(ctx context.Context, request pluginsupervisor.CredentialLeaseRequest) (pluginsupervisor.CredentialLease, error) {
+	client.mu.RLock()
+	control := client.client
+	client.mu.RUnlock()
+	if control == nil {
+		return pluginsupervisor.CredentialLease{}, agent.ErrCredentialLease
+	}
+	return control.LeaseCredential(ctx, request)
+}
+
 var _ pluginsupervisor.LeaseClient = (*deferredPluginLeaseClient)(nil)
+var _ pluginsupervisor.CredentialLeaser = (*deferredPluginLeaseClient)(nil)
 
 func runProcHelper(arguments []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("proc-helper", flag.ContinueOnError)

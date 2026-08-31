@@ -1095,6 +1095,16 @@ func TestRunCancellationWaitsForInspectionSchedulerAndWorker(t *testing.T) {
 	require.ElementsMatch(t, []string{"scheduler", "worker"}, []string{<-exited, <-exited})
 }
 
+func TestNewServerFailsClosedWhenCredentialLeasingEnabledWithoutProvider(t *testing.T) {
+	config := validServerConfig()
+	config.CredentialLeases.Enabled = true
+	config.CredentialLeaseProvider = nil
+	server, err := NewServer(config)
+	require.Error(t, err)
+	require.Nil(t, server)
+	require.Contains(t, err.Error(), "credential lease provider")
+}
+
 func validServerConfig() Config {
 	return Config{
 		DatabaseURL:             "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",

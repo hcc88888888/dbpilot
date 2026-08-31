@@ -507,6 +507,22 @@ func TestSessionRejectsApplyBeforeHandshake(t *testing.T) {
 	require.Error(t, session.ApplyConfiguration(context.Background(), PluginConfiguration{}))
 }
 
+func TestCredentialConfigurationIsScrubbedAndNeverRetainedInSessionState(t *testing.T) {
+	secret := []byte("fixture-password")
+	instances := []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialLease: &pluginv1.CredentialLease{LeaseId: "lease-1", CredentialRevision: 9, Username: "monitor", SecretBytes: secret, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute))}}}
+	request := &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: "assignment-1", ConfigurationRevision: 5, Instances: cloneInstances(instances)}
+	retained := cloneInstancesWithoutCredentials(instances)
+	require.Nil(t, retained[0].GetCredentialLease())
+	wireBuffer := request.GetInstances()[0].GetCredentialLease().GetSecretBytes()
+	clearConfigurationSecrets(request)
+	require.Equal(t, make([]byte, len(wireBuffer)), wireBuffer)
+	require.Empty(t, request.GetInstances()[0].GetCredentialLease().GetSecretBytes())
+	require.Empty(t, request.GetInstances()[0].GetCredentialLease().GetUsername())
+	require.True(t, validCredentialLease(instances[0].GetCredentialLease()))
+	instances[0].CredentialLease.SecretBytes = bytes.Repeat([]byte{'x'}, (64<<10)+1)
+	require.False(t, validCredentialLease(instances[0].GetCredentialLease()))
+}
+
 func TestAppendBatchSerializesSameLogicalSequenceAndMakesExactRetryIdempotent(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	root := t.TempDir()

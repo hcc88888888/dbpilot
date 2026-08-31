@@ -30,8 +30,10 @@ const CapabilityDiscoveryReportACKV1 = "discovery_report_ack_v1"
 const CapabilityDiscoverySourceResultsV1 = "discovery_source_results_v1"
 const CapabilityDiscoverySourceResultsPendingLegacyV1 = "discovery_source_results_pending_legacy_v1"
 const CapabilityDiscoveryPolicyAttestationV1 = "discovery_policy_attestation_v1"
+const CredentialLeaseCapability = "credential_lease.v1"
 
 var ErrControlStreamDisconnected = errors.New("Agent control stream is disconnected")
+var ErrCredentialLease = errors.New("credential lease unavailable")
 
 type discoveryControlIncompatibleError struct{}
 
@@ -224,6 +226,21 @@ type ControlClient struct {
 	discoverySourceResultsPeer atomic.Bool
 	artifactLeaseMu            sync.Mutex
 	artifactLeaseWaiters       map[string]*artifactLeaseWaiter
+	credentialLeaseMu          sync.Mutex
+	credentialLeaseWaiters     map[string]*credentialLeaseWaiter
+}
+
+type CredentialLeaseRequest = pluginsupervisor.CredentialLeaseRequest
+type CredentialLease = pluginsupervisor.CredentialLease
+
+type credentialLeaseWaiter struct {
+	request CredentialLeaseRequest
+	result  chan credentialLeaseResult
+}
+
+type credentialLeaseResult struct {
+	lease CredentialLease
+	err   error
 }
 
 type artifactLeaseWaiter struct {
@@ -294,9 +311,10 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		reconnectBackoff:   boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
 		resultRetryBackoff: boundedDuration(config.ResultRetryBackoff, 100*time.Millisecond, 10*time.Millisecond, 5*time.Second),
 		now:                config.Now, running: make(map[string]runningCommand),
-		executionErrors:      make(chan error, 1),
-		discoveryWaiters:     make(map[uint64]*discoveryAckWaiter),
-		artifactLeaseWaiters: make(map[string]*artifactLeaseWaiter),
+		executionErrors:        make(chan error, 1),
+		discoveryWaiters:       make(map[uint64]*discoveryAckWaiter),
+		artifactLeaseWaiters:   make(map[string]*artifactLeaseWaiter),
+		credentialLeaseWaiters: make(map[string]*credentialLeaseWaiter),
 	}, nil
 }
 
@@ -379,7 +397,7 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 		}
 		recovery = append(recovery, &agentv1.CommandRecoveryState{CommandId: entry.CommandID, State: state, ExecutionToken: append([]byte(nil), entry.ExecutionToken...), LeaseRevision: entry.LeaseRevision})
 	}
-	capabilities := append(c.executors.Capabilities(), CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1)
+	capabilities := append(c.executors.Capabilities(), CapabilityDiscoveryPolicyAttestationV1, CapabilityDiscoveryReportACKV1, CredentialLeaseCapability)
 	sort.Strings(capabilities)
 	advertisesSourceResults := hasCapabilities(capabilities, CapabilityDiscoverySourceResultsV1)
 	hello := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_Hello{Hello: &agentv1.Hello{
@@ -566,6 +584,8 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		return c.handleDiscoveryAcknowledgement(typed.DiscoveryReportAcknowledgement)
 	case *agentv1.ServerMessage_PluginArtifactLeaseResponse:
 		return c.handlePluginArtifactLeaseResponse(typed.PluginArtifactLeaseResponse)
+	case *agentv1.ServerMessage_CredentialLeaseResponse:
+		return c.handleCredentialLeaseResponse(typed.CredentialLeaseResponse)
 	default:
 		return errors.New("unsupported control-plane message")
 	}
@@ -939,6 +959,114 @@ func (c *ControlClient) clearSession(expected *controlSession) {
 	}
 	c.sessionMu.Unlock()
 	c.failPluginArtifactLeaseWaiters()
+	c.failCredentialLeaseWaiters()
+}
+
+// LeaseCredential requests database credentials only on the authenticated
+// live control stream. Nothing from this exchange is written to the command
+// journal or any Agent state store.
+func (c *ControlClient) LeaseCredential(ctx context.Context, request CredentialLeaseRequest) (CredentialLease, error) {
+	if c == nil || ctx == nil || ctx.Err() != nil || !validArtifactLeaseResource(request.AssignmentID) || !validArtifactLeaseResource(request.InstanceID) || !validDatabaseFamily(request.DatabaseFamily) || request.ConfigurationRevision == 0 || request.OperationRevision == 0 {
+		return CredentialLease{}, ErrCredentialLease
+	}
+	var nonce [sha256.Size]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return CredentialLease{}, ErrCredentialLease
+	}
+	waiter := &credentialLeaseWaiter{request: request, result: make(chan credentialLeaseResult, 1)}
+	key := string(nonce[:])
+	c.credentialLeaseMu.Lock()
+	if _, duplicate := c.credentialLeaseWaiters[key]; duplicate {
+		c.credentialLeaseMu.Unlock()
+		return CredentialLease{}, ErrCredentialLease
+	}
+	c.credentialLeaseWaiters[key] = waiter
+	c.credentialLeaseMu.Unlock()
+	defer func() {
+		c.credentialLeaseMu.Lock()
+		if c.credentialLeaseWaiters[key] == waiter {
+			delete(c.credentialLeaseWaiters, key)
+		}
+		c.credentialLeaseMu.Unlock()
+	}()
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CredentialLeaseRequest{CredentialLeaseRequest: &agentv1.CredentialLeaseRequest{RequestNonce: nonce[:], InstanceId: request.InstanceID, AssignmentId: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision}}}
+	if err := c.sendAgentMessage(message); err != nil {
+		return CredentialLease{}, ErrCredentialLease
+	}
+	select {
+	case <-ctx.Done():
+		return CredentialLease{}, ErrCredentialLease
+	case result := <-waiter.result:
+		return result.lease, result.err
+	}
+}
+
+func (c *ControlClient) handleCredentialLeaseResponse(response *agentv1.CredentialLeaseResponse) error {
+	if response == nil {
+		return nil
+	}
+	defer clearWireCredential(response)
+	if len(response.GetRequestNonce()) != sha256.Size {
+		return nil
+	}
+	key := string(response.GetRequestNonce())
+	c.credentialLeaseMu.Lock()
+	waiter := c.credentialLeaseWaiters[key]
+	if waiter != nil {
+		delete(c.credentialLeaseWaiters, key)
+	}
+	c.credentialLeaseMu.Unlock()
+	if waiter == nil {
+		return nil
+	}
+	credential := response.GetCredential()
+	now := c.now()
+	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetInstanceId() == waiter.request.InstanceID && response.GetCredentialRevision() > 0 && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(now) && !response.GetExpiresAt().AsTime().After(now.Add(5*time.Minute)) && credential != nil && len(credential.GetUsername()) <= 256 && strings.TrimSpace(credential.GetUsername()) == credential.GetUsername() && !strings.ContainsAny(credential.GetUsername(), "\x00\r\n") && len(credential.GetSecretBytes()) > 0 && len(credential.GetSecretBytes()) <= 64<<10 && proto.Size(response) <= (68<<10)
+	if !valid {
+		waiter.result <- credentialLeaseResult{err: ErrCredentialLease}
+		return nil
+	}
+	waiter.result <- credentialLeaseResult{lease: CredentialLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), DatabaseFamily: waiter.request.DatabaseFamily, CredentialRevision: response.GetCredentialRevision(), ConfigurationRevision: waiter.request.ConfigurationRevision, OperationRevision: waiter.request.OperationRevision, ExpiresAt: response.GetExpiresAt().AsTime().UTC(), Username: credential.GetUsername(), SecretBytes: append([]byte(nil), credential.GetSecretBytes()...)}}
+	return nil
+}
+
+func (c *ControlClient) failCredentialLeaseWaiters() {
+	c.credentialLeaseMu.Lock()
+	waiters := make([]*credentialLeaseWaiter, 0, len(c.credentialLeaseWaiters))
+	for key, waiter := range c.credentialLeaseWaiters {
+		delete(c.credentialLeaseWaiters, key)
+		waiters = append(waiters, waiter)
+	}
+	c.credentialLeaseMu.Unlock()
+	for _, waiter := range waiters {
+		select {
+		case waiter.result <- credentialLeaseResult{err: ErrCredentialLease}:
+		default:
+		}
+	}
+}
+
+func clearWireCredential(response *agentv1.CredentialLeaseResponse) {
+	if response == nil || response.Credential == nil {
+		return
+	}
+	for index := range response.Credential.SecretBytes {
+		response.Credential.SecretBytes[index] = 0
+	}
+	response.Credential.SecretBytes = nil
+	response.Credential.Username = ""
+}
+
+func validDatabaseFamily(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for index, character := range value {
+		if index == 0 && !(character >= 'a' && character <= 'z') || index > 0 && !(character >= 'a' && character <= 'z' || character >= '0' && character <= '9' || character == '_' || character == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // LeasePluginArtifact requests an operation-bound, ephemeral artifact lease on

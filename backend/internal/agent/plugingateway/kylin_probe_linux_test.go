@@ -63,8 +63,22 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 	require.NoError(t, err)
 	_, err = session.Handshake(context.Background(), expected)
 	require.NoError(t, err)
-	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
+	secret := []byte("kylin-task11-memory-only-credential")
+	lease := func(revision uint64, value []byte) *pluginv1.CredentialLease {
+		return &pluginv1.CredentialLease{LeaseId: "lease-task11", CredentialRevision: revision, Username: "monitor", SecretBytes: append([]byte(nil), value...), ExpiresAt: timestamppb.New(now.Add(time.Minute))}
+	}
+	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialLease: lease(9, secret), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", CredentialLease: lease(9, secret), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
 	require.NoError(t, session.ApplyConfiguration(context.Background(), configuration))
+	require.Equal(t, string(secret), server.lastCredential)
+	firstWireBuffer := configuration.Instances[0].CredentialLease.SecretBytes
+	configuration.Release()
+	require.Equal(t, make([]byte, len(firstWireBuffer)), firstWireBuffer)
+	rotated := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialLease: lease(10, []byte("kylin-task11-rotated-credential")), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", CredentialLease: lease(10, []byte("kylin-task11-rotated-credential")), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
+	require.NoError(t, session.ApplyConfiguration(context.Background(), rotated))
+	require.Equal(t, "kylin-task11-rotated-credential", server.lastCredential)
+	rotated.Release()
+	require.NoError(t, session.RemoveCredentials(context.Background()))
+	require.Equal(t, 1, server.credentialClears)
 	oversizedInstances, oversizedTemplates := canonicalPairFixture(2, 65)
 	for _, template := range oversizedTemplates {
 		template.ReadOnlyStatement = "SELECT '" + strings.Repeat("x", 40<<10) + "'"
@@ -84,6 +98,16 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 	require.Equal(t, 5, stats.PendingBatches)
 	require.Equal(t, 5, server.acks, "Agent ACKs only after each durable append")
 	require.NoError(t, session.Shutdown(context.Background(), time.Second))
+	restartSession, err := client.Open(expected)
+	require.NoError(t, err)
+	_, err = restartSession.Handshake(context.Background(), expected)
+	require.NoError(t, err)
+	require.Error(t, restartSession.CollectNow(context.Background(), expected.InstanceIDs, expected.TemplateIDs), "Agent restart must not restore a credential lease or configured session")
+	releasedAfterRestart := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialLease: lease(11, secret), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}, {InstanceId: "mysql-2", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307", CredentialLease: lease(11, secret), Templates: []*pluginv1.MetricTemplateConfiguration{probeTemplate("template-1"), probeTemplate("template-2")}}}}
+	require.NoError(t, restartSession.ApplyConfiguration(context.Background(), releasedAfterRestart))
+	releasedAfterRestart.Release()
+	require.NoError(t, restartSession.Shutdown(context.Background(), time.Second))
+	assertCredentialAbsentFromKylinArtifacts(t, root, "kylin-task11-memory-only-credential", "kylin-task11-rotated-credential")
 
 	badPeer := expected
 	badPeer.ExpectedUserID++
@@ -134,9 +158,11 @@ func TestKylinPrivatePluginGatewayProbe(t *testing.T) {
 
 type gatewayFixture struct {
 	pluginv1.UnimplementedPluginRuntimeServer
-	nonce, digest []byte
-	now           time.Time
-	acks          int
+	nonce, digest    []byte
+	now              time.Time
+	acks             int
+	lastCredential   string
+	credentialClears int
 }
 
 func (fixture *gatewayFixture) Handshake(_ context.Context, request *pluginv1.PluginHandshakeRequest) (*pluginv1.PluginHandshakeResponse, error) {
@@ -145,8 +171,48 @@ func (fixture *gatewayFixture) Handshake(_ context.Context, request *pluginv1.Pl
 	}
 	return &pluginv1.PluginHandshakeResponse{PluginId: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1, ExecutableDigest: fixture.digest, LaunchNonceProof: launchProof(fixture.nonce, request.GetLaunchNonceChallenge(), "assignment-1", "1.0.0", 4, 8, []string{"mysql-1", "mysql-2"})}, nil
 }
-func (*gatewayFixture) ApplyConfiguration(_ context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
-	return &pluginv1.ApplyPluginConfigurationResponse{ActiveConfigurationRevision: request.GetConfigurationRevision(), Results: []*pluginv1.PluginInstanceConfigurationResult{{InstanceId: "mysql-1", Applied: true}, {InstanceId: "mysql-2", Applied: true}}}, nil
+func (fixture *gatewayFixture) ApplyConfiguration(_ context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
+	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(request.GetInstances()))
+	hasCredential := false
+	for _, instance := range request.GetInstances() {
+		if lease := instance.GetCredentialLease(); lease != nil {
+			if lease.GetUsername() != "monitor" || len(lease.GetSecretBytes()) == 0 {
+				return nil, errors.New("credential lease rejected")
+			}
+			hasCredential = true
+			fixture.lastCredential = string(append([]byte(nil), lease.GetSecretBytes()...))
+		}
+		results = append(results, &pluginv1.PluginInstanceConfigurationResult{InstanceId: instance.GetInstanceId(), Applied: true})
+	}
+	if !hasCredential {
+		fixture.credentialClears++
+		fixture.lastCredential = ""
+	}
+	return &pluginv1.ApplyPluginConfigurationResponse{ActiveConfigurationRevision: request.GetConfigurationRevision(), Results: results}, nil
+}
+
+func assertCredentialAbsentFromKylinArtifacts(t *testing.T, root string, secrets ...string) {
+	t.Helper()
+	for _, processPath := range []string{"/proc/self/cmdline", "/proc/self/environ"} {
+		body, err := os.ReadFile(processPath)
+		require.NoError(t, err)
+		for _, secret := range secrets {
+			require.NotContains(t, string(body), secret)
+		}
+	}
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || entry.Type()&os.ModeSocket != 0 {
+			return err
+		}
+		body, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		for _, secret := range secrets {
+			require.NotContains(t, string(body), secret, "credential leaked to %s", path)
+		}
+		return nil
+	}))
 }
 func (fixture *gatewayFixture) CollectNow(_ context.Context, request *pluginv1.CollectPluginMetricsRequest) (*pluginv1.CollectPluginMetricsResponse, error) {
 	return &pluginv1.CollectPluginMetricsResponse{Batches: []*pluginv1.PluginMetricBatch{fixture.batch("mysql-1", "template-1", 1), fixture.batch("mysql-1", "template-2", 1), fixture.batch("mysql-2", "template-1", 1), fixture.batch("mysql-2", "template-2", 1)}}, nil

@@ -11,6 +11,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/commandvalidation"
+	"dbpilot.local/platform/internal/credentiallease"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -64,11 +65,22 @@ type Server struct {
 	discovery       DiscoveryObserver
 	plugins         PluginObserver
 	pluginArtifacts PluginArtifactLeaseIssueService
+	credentials     CredentialLeaseIssueService
 	now             func() time.Time
 }
 
 type PluginArtifactLeaseIssueService interface {
 	Issue(context.Context, string, *agentv1.PluginArtifactLeaseRequest) (*agentv1.PluginArtifactLeaseResponse, error)
+}
+
+type CredentialLeaseIssueService interface {
+	Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.CredentialLeaseRequest) (*agentv1.CredentialLeaseResponse, error)
+}
+
+type noopCredentialLeaseIssuer struct{}
+
+func (noopCredentialLeaseIssuer) Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.CredentialLeaseRequest) (*agentv1.CredentialLeaseResponse, error) {
+	return nil, credentiallease.ErrLeaseRejected
 }
 
 type noopPluginArtifactLeaseIssuer struct{}
@@ -118,6 +130,14 @@ func WithPluginArtifactLeaseIssuer(issuer PluginArtifactLeaseIssueService) Serve
 	}
 }
 
+func WithCredentialLeaseIssuer(issuer CredentialLeaseIssueService) ServerOption {
+	return func(server *Server) {
+		if issuer != nil {
+			server.credentials = issuer
+		}
+	}
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -125,7 +145,7 @@ func NewServer(registry *Registry, observer Observer, options ...ServerOption) *
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, pluginArtifacts: noopPluginArtifactLeaseIssuer{}, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, pluginArtifacts: noopPluginArtifactLeaseIssuer{}, credentials: noopCredentialLeaseIssuer{}, now: time.Now}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -219,8 +239,10 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 		case message := <-current.send:
 			message.SentAt = timestamppb.New(s.now())
 			if err := stream.Send(message); err != nil {
+				clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
 				return err
 			}
+			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
 		case item := <-received:
 			if errors.Is(item.err, io.EOF) {
 				return nil
@@ -366,10 +388,46 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "plugin-artifact-lease", Message: &agentv1.ServerMessage_PluginArtifactLeaseResponse{PluginArtifactLeaseResponse: response}}); err != nil {
 			return status.Error(codes.Unavailable, "plugin artifact lease delivery is unavailable")
 		}
+	case *agentv1.AgentMessage_CredentialLeaseRequest:
+		request := typed.CredentialLeaseRequest
+		if request == nil || len(request.GetRequestNonce()) != credentiallease.RequestNonceBytes || !s.registry.Supports(agentID, "plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1", "credential_lease.v1") {
+			return status.Error(codes.InvalidArgument, "credential lease request is invalid")
+		}
+		session, ok := s.registry.Session(agentID)
+		if !ok || session.SessionID == "" {
+			return status.Error(codes.Unauthenticated, "Agent session is unavailable")
+		}
+		response, issueErr := s.credentials.Issue(ctx, credentiallease.AuthenticatedAgent{AgentID: agentID, SessionID: session.SessionID}, request)
+		if issueErr != nil || !validCredentialLeaseResponse(response, request, s.now()) {
+			clearCredentialLeaseResponse(response)
+			response = &agentv1.CredentialLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), InstanceId: request.GetInstanceId(), AssignmentId: request.GetAssignmentId()}
+		}
+		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "credential-lease", Message: &agentv1.ServerMessage_CredentialLeaseResponse{CredentialLeaseResponse: response}}); err != nil {
+			clearCredentialLeaseResponse(response)
+			return status.Error(codes.Unavailable, "credential lease delivery is unavailable")
+		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}
 	return nil
+}
+
+func validCredentialLeaseResponse(response *agentv1.CredentialLeaseResponse, request *agentv1.CredentialLeaseRequest, now time.Time) bool {
+	if response == nil || request == nil || len(response.GetRequestNonce()) != credentiallease.RequestNonceBytes || subtle.ConstantTimeCompare(response.GetRequestNonce(), request.GetRequestNonce()) != 1 || response.GetLeaseId() == "" || len(response.GetLeaseId()) > 128 || response.GetInstanceId() != request.GetInstanceId() || response.GetAssignmentId() != request.GetAssignmentId() || response.GetCredentialRevision() == 0 || response.GetExpiresAt() == nil || !response.GetExpiresAt().IsValid() || !response.GetExpiresAt().AsTime().After(now) || response.GetExpiresAt().AsTime().After(now.Add(credentiallease.MaximumLeaseTTL)) || response.GetCredential() == nil || len(response.GetCredential().GetUsername()) > credentiallease.MaximumUsernameBytes || len(response.GetCredential().GetSecretBytes()) == 0 || len(response.GetCredential().GetSecretBytes()) > credentiallease.MaximumSecretBytes || proto.Size(response) > credentiallease.MaximumSecretBytes+(4<<10) {
+		return false
+	}
+	return true
+}
+
+func clearCredentialLeaseResponse(response *agentv1.CredentialLeaseResponse) {
+	if response == nil || response.Credential == nil {
+		return
+	}
+	for index := range response.Credential.SecretBytes {
+		response.Credential.SecretBytes[index] = 0
+	}
+	response.Credential.SecretBytes = nil
+	response.Credential.Username = ""
 }
 
 func (s *Server) rejectDiscoveryReport(agentID string, report *agentv1.DiscoveryReport, reason string) {

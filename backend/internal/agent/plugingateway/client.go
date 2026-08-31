@@ -104,6 +104,15 @@ type PluginConfiguration struct {
 	Instances             []*pluginv1.PluginInstanceConfiguration
 }
 
+func (configuration *PluginConfiguration) Release() {
+	if configuration == nil {
+		return
+	}
+	for _, instance := range configuration.Instances {
+		clearInstanceCredential(instance)
+	}
+}
+
 type ValidationResult struct {
 	InstanceID      string
 	Valid           bool
@@ -200,6 +209,7 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 		return errGateway
 	}
 	request := canonicalApplyRequest(configuration)
+	defer clearConfigurationSecrets(request)
 	responseErr := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.ApplyConfiguration(callContext, request)
 		if err != nil || !validApplyResponse(response, configuration) {
@@ -214,10 +224,34 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 	session.configurationRevision = configuration.ConfigurationRevision
 	session.instances = make(map[string]*pluginv1.PluginInstanceConfiguration, len(configuration.Instances))
 	for _, instance := range configuration.Instances {
-		session.instances[instance.GetInstanceId()] = proto.Clone(instance).(*pluginv1.PluginInstanceConfiguration)
+		session.instances[instance.GetInstanceId()] = cloneInstanceWithoutCredential(instance)
 	}
 	session.mu.Unlock()
 	return nil
+}
+
+func (session *Session) AssignmentID() string {
+	if session == nil {
+		return ""
+	}
+	return session.expected.AssignmentID
+}
+
+// RemoveCredentials applies the current routing and templates without a lease,
+// requiring the plugin to close its database pools before shutdown or expiry.
+func (session *Session) RemoveCredentials(ctx context.Context) error {
+	if session == nil || ctx == nil || ctx.Err() != nil || !session.isConfigured() {
+		return errGateway
+	}
+	session.mu.Lock()
+	instances := make([]*pluginv1.PluginInstanceConfiguration, 0, len(session.instances))
+	for _, instance := range session.instances {
+		instances = append(instances, cloneInstanceWithoutCredential(instance))
+	}
+	revision := session.configurationRevision
+	session.mu.Unlock()
+	configuration := PluginConfiguration{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: revision, Instances: instances}
+	return session.ApplyConfiguration(ctx, configuration)
 }
 
 // CheckHealth is used by the Supervisor activation gate after the nonce-backed
@@ -667,6 +701,9 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 		if instance == nil || !contains(expected.InstanceIDs, instance.GetInstanceId()) || instance.GetInstanceId() == "" || !family(instance.GetDatabaseVariant()) || (instance.GetEndpoint() == "" && instance.GetUnixSocket() == "") || (instance.GetEndpoint() != "" && instance.GetUnixSocket() != "") || len(instance.GetTemplates()) > maxGatewayMembers {
 			return errGateway
 		}
+		if instance.GetCredentialLease() != nil && !validCredentialLease(instance.GetCredentialLease()) {
+			return errGateway
+		}
 		templates := map[string]struct{}{}
 		for _, template := range instance.GetTemplates() {
 			if template == nil || !contains(expected.TemplateIDs, template.GetTemplateId()) || !validTemplateConfiguration(template) || !matchesExpectedTemplate(template, expected.TemplateConfigurations) {
@@ -693,6 +730,10 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 		return errGateway
 	}
 	return nil
+}
+
+func validCredentialLease(value *pluginv1.CredentialLease) bool {
+	return value != nil && resourceID.MatchString(value.GetLeaseId()) && value.GetCredentialRevision() > 0 && len(value.GetUsername()) <= 256 && strings.TrimSpace(value.GetUsername()) == value.GetUsername() && !strings.ContainsAny(value.GetUsername(), "\x00\r\n") && len(value.GetSecretBytes()) > 0 && len(value.GetSecretBytes()) <= 64<<10 && value.GetExpiresAt() != nil && value.GetExpiresAt().IsValid()
 }
 
 func validApplyResponse(response *pluginv1.ApplyPluginConfigurationResponse, configuration PluginConfiguration) bool {
@@ -933,6 +974,41 @@ func cloneInstances(values []*pluginv1.PluginInstanceConfiguration) []*pluginv1.
 		result[index] = proto.Clone(value).(*pluginv1.PluginInstanceConfiguration)
 	}
 	return result
+}
+
+func cloneInstancesWithoutCredentials(values []*pluginv1.PluginInstanceConfiguration) []*pluginv1.PluginInstanceConfiguration {
+	result := make([]*pluginv1.PluginInstanceConfiguration, len(values))
+	for index, value := range values {
+		result[index] = cloneInstanceWithoutCredential(value)
+	}
+	return result
+}
+
+func cloneInstanceWithoutCredential(value *pluginv1.PluginInstanceConfiguration) *pluginv1.PluginInstanceConfiguration {
+	cloned := proto.Clone(value).(*pluginv1.PluginInstanceConfiguration)
+	clearInstanceCredential(cloned)
+	cloned.CredentialLease = nil
+	return cloned
+}
+
+func clearConfigurationSecrets(request *pluginv1.ApplyPluginConfigurationRequest) {
+	if request == nil {
+		return
+	}
+	for _, instance := range request.Instances {
+		clearInstanceCredential(instance)
+	}
+}
+
+func clearInstanceCredential(instance *pluginv1.PluginInstanceConfiguration) {
+	if instance == nil || instance.CredentialLease == nil {
+		return
+	}
+	for index := range instance.CredentialLease.SecretBytes {
+		instance.CredentialLease.SecretBytes[index] = 0
+	}
+	instance.CredentialLease.SecretBytes = nil
+	instance.CredentialLease.Username = ""
 }
 
 func canonicalApplyRequest(configuration PluginConfiguration) *pluginv1.ApplyPluginConfigurationRequest {

@@ -41,6 +41,7 @@ func IsRetryableDispatchError(err error) bool {
 }
 
 type session struct {
+	sessionID       string
 	agentID         string
 	capabilities    map[string]struct{}
 	capabilityList  []string
@@ -56,6 +57,7 @@ type session struct {
 
 // SessionInfo is a defensive snapshot of an authenticated live Agent session.
 type SessionInfo struct {
+	SessionID      string
 	AgentID        string
 	Capabilities   []string
 	ActiveCommands []*agentv1.CommandRecoveryState
@@ -66,10 +68,11 @@ type SessionInfo struct {
 
 // Registry owns the single live session for each Agent and is the command Dispatcher.
 type Registry struct {
-	mu            sync.RWMutex
-	queueCapacity int
-	sessions      map[string]*session
-	now           func() time.Time
+	mu              sync.RWMutex
+	queueCapacity   int
+	sessions        map[string]*session
+	now             func() time.Time
+	sessionSequence uint64
 }
 
 func NewRegistry(queueCapacity int) *Registry {
@@ -98,8 +101,10 @@ func (r *Registry) register(agentID string, capabilities []string, active []*age
 	if _, exists := r.sessions[agentID]; exists {
 		return ErrDuplicateSession
 	}
+	r.sessionSequence++
 	r.sessions[agentID] = &session{
-		agentID: agentID, capabilities: capabilitySet, capabilityList: capabilityList,
+		sessionID: fmt.Sprintf("session-%d", r.sessionSequence),
+		agentID:   agentID, capabilities: capabilitySet, capabilityList: capabilityList,
 		active: cloneRecoveryStates(active), send: make(chan *agentv1.ServerMessage, r.queueCapacity), cancel: cancel,
 		leaseDurations: make(map[string]time.Duration), leases: make(map[string]time.Time),
 		executionTokens: make(map[string][]byte), leaseRevisions: make(map[string]uint64),
@@ -140,7 +145,8 @@ func (r *Registry) Session(agentID string) (SessionInfo, bool) {
 		revisions[commandID] = revision
 	}
 	return SessionInfo{
-		AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...),
+		SessionID: current.sessionID,
+		AgentID:   current.agentID, Capabilities: append([]string(nil), current.capabilityList...),
 		ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leases, LeaseRevisions: revisions,
 	}, true
 }
@@ -175,7 +181,7 @@ func (r *Registry) snapshot(agentID string, expected *session) (SessionInfo, boo
 	for commandID, revision := range current.leaseRevisions {
 		revisions[commandID] = revision
 	}
-	return SessionInfo{AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing, LeaseRevisions: revisions}, true
+	return SessionInfo{SessionID: current.sessionID, AgentID: current.agentID, Capabilities: append([]string(nil), current.capabilityList...), ActiveCommands: cloneRecoveryStates(current.active), LastHeartbeat: current.lastHeartbeat, Leases: leasing, LeaseRevisions: revisions}, true
 }
 
 func (r *Registry) enqueue(agentID string, message *agentv1.ServerMessage) error {

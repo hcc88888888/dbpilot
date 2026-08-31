@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,6 +38,7 @@ import (
 	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/credentiallease"
 	platformdatabase "dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
@@ -121,6 +123,11 @@ type PluginCatalogSettings struct {
 	Enabled bool `yaml:"enabled"`
 }
 
+type CredentialLeaseSettings struct {
+	Enabled bool          `yaml:"enabled"`
+	TTL     time.Duration `yaml:"ttl,omitempty"`
+}
+
 type DiscoveryRulePolicySettings struct {
 	KeyID              string        `yaml:"key_id"`
 	Revision           uint64        `yaml:"revision"`
@@ -171,6 +178,7 @@ type Config struct {
 	Command               CommandSettings               `yaml:"command"`
 	Artifact              ArtifactSettings              `yaml:"artifact"`
 	PluginCatalog         PluginCatalogSettings         `yaml:"plugin_catalog,omitempty"`
+	CredentialLeases      CredentialLeaseSettings       `yaml:"credential_leases,omitempty"`
 	PluginPublishers      []PluginPublisherSettings     `yaml:"plugin_publishers,omitempty"`
 	DiscoveryRuleKeys     map[string]string             `yaml:"discovery_rule_keys,omitempty"`
 	DiscoveryRulePolicies []DiscoveryRulePolicySettings `yaml:"discovery_rule_policies,omitempty"`
@@ -199,6 +207,7 @@ type Config struct {
 	HostObservationSink     agentcontrol.HostObservationSink           `yaml:"-"`
 	DiscoveryReportSink     agentcontrol.DiscoveryReportSink           `yaml:"-"`
 	PluginObservationSink   agentcontrol.PluginObservationSink         `yaml:"-"`
+	CredentialLeaseProvider credentiallease.SecretProvider             `yaml:"-"`
 }
 
 type Server struct {
@@ -319,6 +328,7 @@ type defaultMigrationSteps struct {
 	databaseInstance func(context.Context) error
 	plugin           func(context.Context) error
 	assignment       func(context.Context) error
+	credentialLease  func(context.Context) error
 	inspection       func(context.Context) error
 }
 
@@ -330,6 +340,9 @@ func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context)
 	if steps.assignment != nil {
 		pipeline = append(pipeline, steps.assignment)
 	}
+	if steps.credentialLease != nil {
+		pipeline = append(pipeline, steps.credentialLease)
+	}
 	pipeline = append(pipeline, steps.inspection)
 	return composeMigrations(pipeline...)
 }
@@ -337,6 +350,9 @@ func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context)
 func NewServer(config Config) (*Server, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
+	}
+	if config.CredentialLeases.Enabled && config.CredentialLeaseProvider == nil {
+		return nil, errors.New("credential lease provider is required when credential leasing is enabled")
 	}
 	httpTLS := config.HTTPServerTLS
 	if httpTLS == nil {
@@ -481,6 +497,9 @@ func NewServer(config Config) (*Server, error) {
 		if config.PluginCatalog.Enabled {
 			steps.plugin = func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) }
 			steps.assignment = func(ctx context.Context) error { return pluginassignment.RunMigrations(ctx, database) }
+		}
+		if config.CredentialLeases.Enabled {
+			steps.credentialLease = func(ctx context.Context) error { return credentiallease.RunMigrations(ctx, database) }
 		}
 		migrate = composeDefaultMigrations(steps)
 	}
@@ -639,6 +658,17 @@ func NewServer(config Config) (*Server, error) {
 		}
 	}
 	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepositoryWithProvisioner(database, acceptanceProvisioner))
+	var credentialLeaseIssuer agentcontrol.CredentialLeaseIssueService
+	if config.CredentialLeases.Enabled {
+		if !config.PluginCatalog.Enabled {
+			return nil, errors.New("credential leasing requires plugin catalog")
+		}
+		leaseService, leaseErr := credentiallease.NewService(credentiallease.Config{Authorizer: credentiallease.PostgresAuthorizer{Database: database, Fences: agentRegistry}, Provider: config.CredentialLeaseProvider, Clock: credentiallease.PostgresClock{Database: database}, Audit: credentiallease.PostgresAuditRecorder{Database: database}, TTL: config.CredentialLeases.TTL, Random: rand.Reader})
+		if leaseErr != nil {
+			return nil, errors.New("configure credential leases")
+		}
+		credentialLeaseIssuer = agentcontrol.CredentialLeaseIssuer{Service: leaseService}
+	}
 	hostSink := config.HostObservationSink
 	if hostSink == nil {
 		hostSink = persistedHostObservationSink{service: hostInventoryService}
@@ -806,7 +836,7 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer)))
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer)))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err

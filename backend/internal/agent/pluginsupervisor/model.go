@@ -205,6 +205,47 @@ type LeaseClient interface {
 	LeasePluginArtifact(context.Context, ArtifactLeaseRequest) (ArtifactLease, error)
 }
 
+type CredentialLeaseRequest struct {
+	AssignmentID          string
+	InstanceID            string
+	DatabaseFamily        string
+	ConfigurationRevision uint64
+	OperationRevision     uint64
+}
+
+type CredentialLease struct {
+	LeaseID               string
+	AssignmentID          string
+	InstanceID            string
+	DatabaseFamily        string
+	CredentialRevision    uint64
+	ConfigurationRevision uint64
+	OperationRevision     uint64
+	ExpiresAt             time.Time
+	Username              string
+	SecretBytes           []byte
+}
+
+func (value CredentialLease) Clone() CredentialLease {
+	value.SecretBytes = append([]byte(nil), value.SecretBytes...)
+	return value
+}
+
+func (value *CredentialLease) Release() {
+	if value == nil {
+		return
+	}
+	for index := range value.SecretBytes {
+		value.SecretBytes[index] = 0
+	}
+	value.SecretBytes = nil
+	value.Username = ""
+}
+
+type CredentialLeaser interface {
+	LeaseCredential(context.Context, CredentialLeaseRequest) (CredentialLease, error)
+}
+
 type DownloadedArtifact struct {
 	Body io.ReadCloser
 	Size int64
