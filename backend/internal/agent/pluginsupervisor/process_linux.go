@@ -61,13 +61,29 @@ func (runner *OSProcessRunner) Start(ctx context.Context, executable Executable,
 		return nil, runner.failure("process_identity", ErrProcessStart)
 	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
+	nonceReader, nonceWriter, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		return nil, runner.failure("launch_nonce_pipe", pipeErr)
+	}
+	if _, pipeErr = nonceWriter.Write(config.LaunchNonce); pipeErr != nil {
+		_ = nonceReader.Close()
+		_ = nonceWriter.Close()
+		return nil, runner.failure("launch_nonce_write", pipeErr)
+	}
+	if pipeErr = nonceWriter.Close(); pipeErr != nil {
+		_ = nonceReader.Close()
+		return nil, runner.failure("launch_nonce_close", pipeErr)
+	}
+	command.ExtraFiles = []*os.File{nonceReader}
 	stdout := newBoundedOutput(runner.outputLimit)
 	stderr := newBoundedOutput(runner.outputLimit)
 	command.Stdout, command.Stderr = stdout, stderr
 	startedAt := runner.now().UTC()
 	if err := command.Start(); err != nil {
+		_ = nonceReader.Close()
 		return nil, runner.failure("direct_exec", err)
 	}
+	_ = nonceReader.Close()
 	startTicks, err := readProcessStartTicks(command.Process.Pid)
 	if err != nil {
 		_ = command.Process.Kill()
@@ -167,7 +183,7 @@ func (process *osProcess) Output() (string, string) {
 }
 
 func validateLaunch(executable Executable, config LaunchConfiguration) error {
-	if !filepath.IsAbs(executable.Path) || filepath.Clean(executable.Path) != executable.Path || len(executable.SHA256) != sha256.Size*2 || !resourceIdentifier.MatchString(config.AssignmentID) || !familyIdentifier.MatchString(config.PluginID) || !familyIdentifier.MatchString(config.DatabaseFamily) || !boundedVersion(config.Version) || config.Slot != "A" && config.Slot != "B" || config.ConfigurationRevision == 0 || config.OperationRevision == 0 || !filepath.IsAbs(config.RuntimeDirectory) || filepath.Clean(config.RuntimeDirectory) != config.RuntimeDirectory || len(config.InstanceIDs) > MaxAssignedInstances || len(config.TemplateIDs) > MaxAssignedTemplates || !uniqueResources(config.InstanceIDs) || !uniqueResources(config.TemplateIDs) {
+	if !filepath.IsAbs(executable.Path) || filepath.Clean(executable.Path) != executable.Path || len(executable.SHA256) != sha256.Size*2 || !resourceIdentifier.MatchString(config.AssignmentID) || !familyIdentifier.MatchString(config.PluginID) || !familyIdentifier.MatchString(config.DatabaseFamily) || !boundedVersion(config.Version) || config.Slot != "A" && config.Slot != "B" || config.ConfigurationRevision == 0 || config.OperationRevision == 0 || !filepath.IsAbs(config.RuntimeDirectory) || filepath.Clean(config.RuntimeDirectory) != config.RuntimeDirectory || len(config.InstanceIDs) > MaxAssignedInstances || len(config.TemplateIDs) > MaxAssignedTemplates || !uniqueResources(config.InstanceIDs) || !uniqueResources(config.TemplateIDs) || len(config.LaunchNonce) != sha256.Size {
 		return ErrProcessStart
 	}
 	return nil
@@ -210,6 +226,7 @@ func buildLaunch(config LaunchConfiguration) ([]string, []string, error) {
 		"--operation-revision", strconv.FormatUint(config.OperationRevision, 10),
 		"--instance-ids", string(instances),
 		"--template-ids", string(templates),
+		"--launch-nonce-fd", "3",
 	}
 	environment := []string{"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "HOME=" + config.RuntimeDirectory, "DBPILOT_PLUGIN_PROCESS=1"}
 	return args, environment, nil
@@ -288,9 +305,9 @@ func normalizeExit(err error) error {
 	}
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {
-		return nil
+		return ErrProcessExited
 	}
-	return fmt.Errorf("%w", ErrProcessStart)
+	return fmt.Errorf("%w", ErrProcessExited)
 }
 
 var _ ProcessRunner = (*OSProcessRunner)(nil)

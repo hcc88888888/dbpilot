@@ -42,6 +42,18 @@ func TestReconcilePluginExecutorRejectsMissingFenceAndNonTypedEnvelope(t *testin
 	require.Zero(t, supervisor.startCalls)
 }
 
+func TestReconcilePluginExecutorAcceptsTask8AbsentCommandWithArtifactMetadata(t *testing.T) {
+	supervisor := &recordingPluginSupervisor{}
+	executor, err := NewReconcilePluginExecutor(supervisor)
+	require.NoError(t, err)
+	reporter := fencedProgressReporter{fence: pluginsupervisor.ExecutionFence{CommandID: "command-absent", ExecutionToken: bytesOfAgent(7, sha256.Size), LeaseRevision: 1, StartedAt: time.Now().UTC()}}
+	envelope := &agentv1.CommandEnvelope{CommandId: "command-absent", Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: "assignment-1", PluginId: "mysql", DatabaseFamily: "mysql", DesiredVersion: "1.0.0", DesiredState: agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT, ArtifactId: "artifact-1", ArtifactSha256: bytesOfAgent(1, 32), ManifestDigest: bytesOfAgent(2, 32), ConfigurationRevision: 3, OperationRevision: 4}}}
+	_, err = executor.Execute(context.Background(), envelope, &reporter)
+	require.NoError(t, err)
+	require.Equal(t, pluginsupervisor.DesiredAbsent, supervisor.request.DesiredState)
+	require.NoError(t, supervisor.request.Validate())
+}
+
 type recordingPluginSupervisor struct {
 	prepareCalls int
 	startCalls   int

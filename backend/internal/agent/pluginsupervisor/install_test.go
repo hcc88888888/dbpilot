@@ -53,7 +53,7 @@ func TestInstallerConsumesSharedSignatureCorpusAndCreatesPrivateInactiveSlot(t *
 		require.Equal(t, os.FileMode(0o400), manifest.Mode().Perm())
 	}
 
-	require.NoError(t, installer.Activate(context.Background(), "mysql", pluginstate.SlotB))
+	require.NoError(t, installer.Activate(context.Background(), SlotIdentity{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: hex.EncodeToString(packageDigest[:]), ManifestDigest: hex.EncodeToString(manifestDigest)}, pluginstate.SlotB))
 	active, err := installer.ActiveSlot("mysql")
 	require.NoError(t, err)
 	require.Equal(t, pluginstate.SlotB, active)
@@ -85,7 +85,7 @@ func TestInstallerRejectsDigestSignaturePlatformAndActiveOverwrite(t *testing.T)
 	request := InstallRequest{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: packageDigest[:], ManifestDigest: manifestDigest, Archive: bytes.NewReader(archive), ArchiveSize: int64(len(archive))}
 	_, err := installer.InstallInactive(context.Background(), request, pluginstate.SlotA)
 	require.NoError(t, err)
-	require.NoError(t, installer.Activate(context.Background(), "mysql", pluginstate.SlotA))
+	require.NoError(t, installer.Activate(context.Background(), identityFromRequest(ReconcileRequest{DatabaseFamily: "mysql", PluginID: "mysql", DesiredVersion: "1.0.0", ArtifactSHA256: packageDigest[:], ManifestDigest: manifestDigest}), pluginstate.SlotA))
 	request.Archive = bytes.NewReader(archive)
 	_, err = installer.InstallInactive(context.Background(), request, pluginstate.SlotA)
 	require.ErrorIs(t, err, ErrInstallFailed)
@@ -163,9 +163,45 @@ func TestInstallerRejectsSignedCaseCollisionAndInstalledHardlinkMutation(t *test
 	outsideLink := filepath.Join(root, "unexpected-hardlink")
 	if linkErr := os.Link(installed.ExecutablePath, outsideLink); linkErr == nil {
 		if runtime.GOOS == "linux" {
-			require.ErrorIs(t, installer.Activate(context.Background(), "mysql", pluginstate.SlotA), ErrInstallFailed)
+			require.ErrorIs(t, installer.Activate(context.Background(), SlotIdentity{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: hex.EncodeToString(validDigest[:]), ManifestDigest: hex.EncodeToString(validManifestDigest)}, pluginstate.SlotA), ErrInstallFailed)
 		}
 	}
+}
+
+func TestInstallerReauthenticatesRetainedPackageAndRejectsSameUIDTamper(t *testing.T) {
+	var archive []byte
+	var publicKey ed25519.PublicKey
+	var manifestDigest []byte
+	if fixturePath := os.Getenv("DBPILOT_PLUGIN_PROCESS_FIXTURE"); fixturePath != "" {
+		archive, publicKey, manifestDigest = signedSingleBinaryArchive(t, requireReadFile(t, fixturePath))
+	} else {
+		archive, publicKey, manifestDigest = sharedCorpusArchive(t)
+	}
+	artifactDigest := sha256.Sum256(archive)
+	identity := SlotIdentity{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: hex.EncodeToString(artifactDigest[:]), ManifestDigest: hex.EncodeToString(manifestDigest)}
+	root := t.TempDir()
+	installer := newTestInstaller(t, root, publicKey)
+	installed, err := installer.InstallInactive(context.Background(), InstallRequest{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: artifactDigest[:], ManifestDigest: manifestDigest, Archive: bytes.NewReader(archive), ArchiveSize: int64(len(archive))}, pluginstate.SlotA)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(installed.ExecutablePath, 0o600))
+	require.NoError(t, os.WriteFile(installed.ExecutablePath, []byte("attacker executable"), 0o600))
+	require.NoError(t, os.Chmod(installed.ExecutablePath, 0o500))
+	require.NoError(t, os.Chmod(filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(installed.ExecutablePath))), completionMarkerName), 0o600))
+	_, err = installer.Installed(context.Background(), identity, pluginstate.SlotA)
+	require.Error(t, err)
+
+	root = t.TempDir()
+	installer = newTestInstaller(t, root, publicKey)
+	installed, err = installer.InstallInactive(context.Background(), InstallRequest{DatabaseFamily: "mysql", PluginID: "mysql", Version: "1.0.0", ArtifactSHA256: artifactDigest[:], ManifestDigest: manifestDigest, Archive: bytes.NewReader(archive), ArchiveSize: int64(len(archive))}, pluginstate.SlotA)
+	require.NoError(t, err)
+	archivePath := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(installed.ExecutablePath))), retainedArchiveName)
+	require.NoError(t, os.Chmod(archivePath, 0o600))
+	body := requireReadFile(t, archivePath)
+	body[len(body)/2] ^= 0xff
+	require.NoError(t, os.WriteFile(archivePath, body, 0o600))
+	require.NoError(t, os.Chmod(archivePath, 0o400))
+	_, err = installer.Installed(context.Background(), identity, pluginstate.SlotA)
+	require.Error(t, err)
 }
 
 func newTestInstaller(t *testing.T, root string, publicKey ed25519.PublicKey) *Installer {

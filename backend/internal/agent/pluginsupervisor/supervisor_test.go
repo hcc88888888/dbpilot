@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestSupervisorRunsOneFamilyProcessForTwoInstancesAndDuplicateIsIdempotent(t *testing.T) {
@@ -48,6 +51,8 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	upgrade.DesiredVersion = "1.1.0"
 	upgrade.OperationRevision = 2
 	upgrade.ConfigurationRevision = 2
+	upgrade.InstanceIDs = []string{"mysql-3"}
+	upgrade.TemplateIDs = []string{"template-2"}
 	upgrade.ArtifactID = "artifact-2"
 	upgrade.ArtifactSHA256 = bytesOf(4, sha256.Size)
 	upgrade.ManifestDigest = bytesOf(5, sha256.Size)
@@ -61,6 +66,8 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	require.Equal(t, pluginstate.ProcessRunning, observed.State.ProcessState)
 	require.Equal(t, 3, fixture.runner.startCount(), "old, failed new, restored old")
 	require.Equal(t, "1.0.0", fixture.runner.configurations[2].Version)
+	require.Equal(t, []string{"mysql-1", "mysql-2"}, fixture.runner.configurations[2].InstanceIDs)
+	require.Equal(t, []string{"template-1"}, fixture.runner.configurations[2].TemplateIDs)
 }
 
 func TestSupervisorHigherConfigurationRevisionRestartsSameVersion(t *testing.T) {
@@ -134,6 +141,7 @@ func TestSupervisorRejectsStaleOperationAndSafelyStopsOrRemovesFamily(t *testing
 	state, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
 	require.NoError(t, err)
 	require.Equal(t, pluginstate.ProcessStopped, state.State.ProcessState)
+	require.Equal(t, 1, fixture.lease.calls, "safe stop must not request a revoked or missing artifact")
 
 	absent := running
 	absent.OperationRevision = 5
@@ -146,11 +154,71 @@ func TestSupervisorRejectsStaleOperationAndSafelyStopsOrRemovesFamily(t *testing
 	require.NoError(t, err)
 	require.Equal(t, pluginstate.ProcessAbsent, state.State.ProcessState)
 	require.True(t, fixture.installer.removed)
+	require.Equal(t, 1, fixture.lease.calls, "absent must not download")
+}
+
+func TestSupervisorRejectsEqualRevisionSemanticConflictAcrossRestart(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	conflict := request
+	conflict.InstanceIDs = []string{"mysql-other"}
+	_, err = fixture.supervisor.Prepare(context.Background(), conflict)
+	require.ErrorIs(t, err, ErrOperationConflict)
+	restarted, err := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: t.TempDir(), Store: fixture.store, Installer: fixture.installer, Leases: fixture.lease, Downloader: fakeDownloader{}, Processes: fixture.runner, Health: fixture.health, DrainTimeout: time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: time.Millisecond, RestartMaximum: 10 * time.Millisecond})
+	require.NoError(t, err)
+	_, err = restarted.Prepare(context.Background(), conflict)
+	require.ErrorIs(t, err, ErrOperationConflict)
+}
+
+func TestSupervisorUnexpectedExitRestartsAndFiveCrashesOpenCircuit(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	for crash := 1; crash <= 5; crash++ {
+		fixture.runner.mu.Lock()
+		process := fixture.runner.processes[len(fixture.runner.processes)-1]
+		fixture.runner.mu.Unlock()
+		process.finish()
+		if crash < 5 {
+			require.Eventually(t, func() bool { return fixture.runner.startCount() >= crash+1 }, time.Second, time.Millisecond)
+		}
+	}
+	require.Eventually(t, func() bool {
+		state, ok := fixture.store.Get("mysql")
+		return ok && state.CircuitState == pluginstate.CircuitOpen && state.ProcessState == pluginstate.ProcessCircuitOpen
+	}, time.Second, time.Millisecond)
+	count := fixture.runner.startCount()
+	time.Sleep(30 * time.Millisecond)
+	require.Equal(t, count, fixture.runner.startCount())
+}
+
+func TestPluginObservationIsByteIdenticalUntilPersistedStateChanges(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	request.DesiredState = DesiredStopped
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	first, _ := proto.MarshalOptions{Deterministic: true}.Marshal(fixture.supervisor.Observation())
+	second, _ := proto.MarshalOptions{Deterministic: true}.Marshal(fixture.supervisor.Observation())
+	require.Equal(t, first, second)
+	restarted, err := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: t.TempDir(), Store: fixture.store, Installer: fixture.installer, Leases: fixture.lease, Downloader: fakeDownloader{}, Processes: fixture.runner, Health: fixture.health, DrainTimeout: time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+	require.NoError(t, err)
+	replayed, _ := proto.MarshalOptions{Deterministic: true}.Marshal(restarted.Observation())
+	require.Equal(t, first, replayed)
 }
 
 func TestSupervisorPluginObservationRevisionAdvancesWhenAnotherFamilyChanges(t *testing.T) {
 	fixture := newSupervisorFixture(t)
-	mysql := pluginstate.FamilyState{AssignmentID: "assignment-mysql", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredRunning, ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 5, BoundInstanceCount: 1}
+	mysql := pluginstate.FamilyState{AssignmentID: "assignment-mysql", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredRunning, RequestFingerprint: strings.Repeat("a", 64), ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, DesiredConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 5, BoundInstanceCount: 1, ActiveInstanceIDs: []string{"mysql-1"}}
 	for index := 0; index < 5; index++ {
 		_, err := fixture.store.Put(context.Background(), mysql)
 		require.NoError(t, err)
@@ -166,7 +234,7 @@ func TestSupervisorPluginObservationRevisionAdvancesWhenAnotherFamilyChanges(t *
 
 func TestNewSupervisorRecoversPersistedFamilySlotsBeforeAcceptingCommands(t *testing.T) {
 	fixture := newSupervisorFixture(t)
-	state := pluginstate.FamilyState{AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredRunning, ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 1, BoundInstanceCount: 1}
+	state := pluginstate.FamilyState{AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredStopped, RequestFingerprint: strings.Repeat("a", 64), ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, DesiredConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 1, BoundInstanceCount: 1, ActiveInstanceIDs: []string{"mysql-1"}}
 	state.ProcessID, state.ProcessStartTicks, state.StartedAt = 999999, 1, time.Now().UTC()
 	_, err := fixture.store.Put(context.Background(), state)
 	require.NoError(t, err)
@@ -201,15 +269,16 @@ func newSupervisorFixture(t *testing.T) supervisorFixture {
 	downloader := fakeDownloader{}
 	runner := &fakeProcessRunner{}
 	health := &fakeHealthChecker{}
-	supervisor, err := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: t.TempDir(), Store: store, Installer: installer, Leases: lease, Downloader: downloader, Processes: runner, Health: health, DrainTimeout: 50 * time.Millisecond, FailureWindow: 10 * time.Minute, FailureThreshold: 5, Now: time.Now})
+	supervisor, err := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: t.TempDir(), Store: store, Installer: installer, Leases: lease, Downloader: downloader, Processes: runner, Health: health, DrainTimeout: 50 * time.Millisecond, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: time.Millisecond, RestartMaximum: 10 * time.Millisecond, Now: time.Now})
 	require.NoError(t, err)
 	return supervisorFixture{supervisor: supervisor, store: store, installer: installer, lease: lease, runner: runner, health: health}
 }
 
 type memoryStateStore struct {
-	mu       sync.Mutex
-	revision uint64
-	families map[string]pluginstate.FamilyState
+	mu         sync.Mutex
+	revision   uint64
+	families   map[string]pluginstate.FamilyState
+	observedAt time.Time
 }
 
 func (store *memoryStateStore) Get(family string) (pluginstate.FamilyState, bool) {
@@ -227,6 +296,16 @@ func (store *memoryStateStore) List() []pluginstate.FamilyState {
 	}
 	return result
 }
+func (store *memoryStateStore) Snapshot() (uint64, time.Time, []pluginstate.FamilyState) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	result := make([]pluginstate.FamilyState, 0, len(store.families))
+	for _, state := range store.families {
+		result = append(result, state)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].DatabaseFamily < result[j].DatabaseFamily })
+	return store.revision, store.observedAt, result
+}
 func (store *memoryStateStore) Put(_ context.Context, state pluginstate.FamilyState) (pluginstate.FamilyState, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -234,6 +313,7 @@ func (store *memoryStateStore) Put(_ context.Context, state pluginstate.FamilySt
 		return pluginstate.FamilyState{}, pluginstate.ErrStaleOperation
 	}
 	store.revision++
+	store.observedAt = time.Unix(int64(store.revision), 0).UTC()
 	state.StateRevision = store.revision
 	store.families[state.DatabaseFamily] = state
 	return state, nil
@@ -257,7 +337,7 @@ func (installer *fakeInstaller) InstallInactive(_ context.Context, request Insta
 	installer.slots[slot] = installed
 	return installed, nil
 }
-func (installer *fakeInstaller) Activate(_ context.Context, _ string, slot pluginstate.Slot) error {
+func (installer *fakeInstaller) Activate(_ context.Context, _ SlotIdentity, slot pluginstate.Slot) error {
 	installer.active = slot
 	return nil
 }
@@ -278,7 +358,7 @@ func (installer *fakeInstaller) Recover(_ context.Context, family string) error 
 	installer.recovered = append(installer.recovered, family)
 	return nil
 }
-func (installer *fakeInstaller) Installed(_ string, slot pluginstate.Slot) (InstalledSlot, error) {
+func (installer *fakeInstaller) Installed(_ context.Context, _ SlotIdentity, slot pluginstate.Slot) (InstalledSlot, error) {
 	value, ok := installer.slots[slot]
 	if !ok {
 		return InstalledSlot{}, ErrInstallFailed
@@ -313,7 +393,7 @@ func (runner *fakeProcessRunner) Start(_ context.Context, _ Executable, config L
 	if runner.alwaysFail {
 		return nil, ErrProcessStart
 	}
-	process := &fakeProcess{pid: 100 + len(runner.processes), started: time.Now().UTC()}
+	process := &fakeProcess{pid: 100 + len(runner.processes), started: time.Now().UTC(), done: make(chan struct{})}
 	runner.processes = append(runner.processes, process)
 	return process, nil
 }
@@ -327,18 +407,29 @@ type fakeProcess struct {
 	pid     int
 	started time.Time
 	stopped bool
+	done    chan struct{}
+	once    sync.Once
 }
 
-func (process *fakeProcess) PID() int                    { return process.pid }
-func (process *fakeProcess) StartTicks() uint64          { return uint64(process.pid) }
-func (process *fakeProcess) StartedAt() time.Time        { return process.started }
-func (process *fakeProcess) Drain(context.Context) error { process.stopped = true; return nil }
-func (process *fakeProcess) Stop(context.Context) error  { process.stopped = true; return nil }
-func (process *fakeProcess) Kill() error                 { process.stopped = true; return nil }
+func (process *fakeProcess) PID() int             { return process.pid }
+func (process *fakeProcess) StartTicks() uint64   { return uint64(process.pid) }
+func (process *fakeProcess) StartedAt() time.Time { return process.started }
+func (process *fakeProcess) finish() {
+	process.once.Do(func() {
+		process.stopped = true
+		if process.done != nil {
+			close(process.done)
+		}
+	})
+}
+func (process *fakeProcess) Drain(context.Context) error { process.finish(); return nil }
+func (process *fakeProcess) Stop(context.Context) error  { process.finish(); return nil }
+func (process *fakeProcess) Kill() error                 { process.finish(); return nil }
 func (process *fakeProcess) Wait() error {
-	if !process.stopped {
-		return errors.New("running")
+	if process.done == nil {
+		return errors.New("missing done")
 	}
+	<-process.done
 	return nil
 }
 

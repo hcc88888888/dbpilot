@@ -3,7 +3,6 @@ package pluginsupervisor
 import (
 	"archive/tar"
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -28,6 +27,7 @@ const (
 	slotsDirectoryName   = "slots"
 	activeMarkerName     = "active.json"
 	completionMarkerName = ".complete.json"
+	retainedArchiveName  = ".package.tar.gz"
 	packageRootName      = "plugin-package"
 )
 
@@ -147,6 +147,22 @@ func (installer *Installer) InstallInactive(ctx context.Context, request Install
 			_ = safeRemoveTree(familyRoot, stage)
 		}
 	}()
+	archiveSource, err := verified.Open()
+	if err != nil {
+		return InstalledSlot{}, ErrInstallFailed
+	}
+	archivePath := filepath.Join(stage, retainedArchiveName)
+	archiveFile, err := os.OpenFile(archivePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o400)
+	if err != nil {
+		_ = archiveSource.Close()
+		return InstalledSlot{}, ErrInstallFailed
+	}
+	archiveHash := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(archiveFile, archiveHash), archiveSource)
+	archiveErr := errors.Join(copyErr, archiveFile.Sync(), archiveFile.Chmod(0o400), archiveFile.Close(), archiveSource.Close())
+	if archiveErr != nil || written != request.ArchiveSize || hex.EncodeToString(archiveHash.Sum(nil)) != wantArtifact {
+		return InstalledSlot{}, ErrInstallFailed
+	}
 
 	source, err := verified.Open()
 	if err != nil {
@@ -212,36 +228,85 @@ func (installer *Installer) ActiveSlot(family string) (pluginstate.Slot, error) 
 	return record.Slot, nil
 }
 
-func (installer *Installer) Installed(family string, slot pluginstate.Slot) (InstalledSlot, error) {
-	if installer == nil || !familyIdentifier.MatchString(family) || slot != pluginstate.SlotA && slot != pluginstate.SlotB {
+func (installer *Installer) Installed(ctx context.Context, expected SlotIdentity, slot pluginstate.Slot) (InstalledSlot, error) {
+	if installer == nil || ctx == nil || ctx.Err() != nil || !familyIdentifier.MatchString(expected.DatabaseFamily) || !familyIdentifier.MatchString(expected.PluginID) || !boundedVersion(expected.Version) || len(expected.ArtifactSHA256) != 64 || len(expected.ManifestDigest) != 64 || slot != pluginstate.SlotA && slot != pluginstate.SlotB {
 		return InstalledSlot{}, ErrInstallFailed
 	}
-	root := filepath.Join(installer.root, family, slotsDirectoryName, string(slot))
+	root := filepath.Join(installer.root, expected.DatabaseFamily, slotsDirectoryName, string(slot))
 	if err := requireCompletedSlot(root); err != nil {
 		return InstalledSlot{}, err
 	}
-	body, err := os.ReadFile(filepath.Join(root, completionMarkerName))
-	if err != nil || len(body) > 4096 {
+	archivePath := filepath.Join(root, retainedArchiveName)
+	info, err := os.Lstat(archivePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || runtime.GOOS != "windows" && info.Mode().Perm() != 0o400 || linkCount(info) > 1 || info.Size() <= 0 {
 		return InstalledSlot{}, ErrInstallFailed
 	}
-	var record completionRecord
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&record) != nil || record.DatabaseFamily != family || !familyIdentifier.MatchString(record.PluginID) || !boundedVersion(record.Version) || len(record.ArtifactSHA256) != 64 || len(record.ManifestDigest) != 64 || len(record.ExecutableSHA256) != 64 || record.ExecutablePath == "" || record.CompletedAt == "" {
+	archive, err := os.Open(archivePath)
+	if err != nil {
 		return InstalledSlot{}, ErrInstallFailed
 	}
-	executable := filepath.Join(root, filepath.FromSlash(record.ExecutablePath))
+	verified, verifyErr := installer.verifier.Verify(ctx, archive, info.Size())
+	closeErr := archive.Close()
+	if verifyErr != nil || closeErr != nil {
+		return InstalledSlot{}, classifyVerificationError(verifyErr)
+	}
+	defer verified.Close()
+	if verified.PackageSHA256 != expected.ArtifactSHA256 || verified.ManifestDigest != expected.ManifestDigest || verified.Manifest.PluginID != expected.PluginID || verified.Manifest.DatabaseFamily != expected.DatabaseFamily || verified.Manifest.Version != expected.Version {
+		return InstalledSlot{}, ErrManifestRejected
+	}
+	binaryPath, binaryDigest, ok := platformBinary(verified.Manifest, installer.operatingSystem, installer.architecture)
+	if !ok || verifyInstalledFiles(root, verified.Manifest, binaryPath, expected.ManifestDigest) != nil {
+		return InstalledSlot{}, ErrInstallFailed
+	}
+	relativeExecutable := strings.TrimPrefix(binaryPath, packageRootName+"/")
+	executable := filepath.Join(root, filepath.FromSlash(relativeExecutable))
 	if !withinRoot(root, executable) || requirePrivateRegular(executable, 0o500) != nil {
 		return InstalledSlot{}, ErrInstallFailed
 	}
-	return InstalledSlot{Slot: slot, Version: record.Version, ExecutablePath: executable, ExecutableSHA256: record.ExecutableSHA256, ManifestPath: filepath.Join(root, "manifest.json"), ArtifactSHA256: record.ArtifactSHA256, ManifestDigest: record.ManifestDigest}, nil
+	return InstalledSlot{Slot: slot, Version: expected.Version, ExecutablePath: executable, ExecutableSHA256: binaryDigest, ManifestPath: filepath.Join(root, "manifest.json"), ArtifactSHA256: expected.ArtifactSHA256, ManifestDigest: expected.ManifestDigest}, nil
 }
 
-func (installer *Installer) Activate(ctx context.Context, family string, slot pluginstate.Slot) error {
-	if installer == nil || ctx == nil || ctx.Err() != nil || !familyIdentifier.MatchString(family) || slot != pluginstate.SlotA && slot != pluginstate.SlotB {
+func verifyInstalledFiles(root string, manifest plugincatalog.Manifest, binaryPath, manifestDigest string) error {
+	for _, declared := range manifest.Files {
+		relative := strings.TrimPrefix(declared.Path, packageRootName+"/")
+		path := filepath.Join(root, filepath.FromSlash(relative))
+		mode := os.FileMode(0o400)
+		if declared.Path == binaryPath || strings.HasPrefix(relative, "bin/") {
+			mode = 0o500
+		}
+		if err := requirePrivateRegular(path, mode); err != nil {
+			return err
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		hash := sha256.New()
+		size, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil || size != declared.SizeBytes || hex.EncodeToString(hash.Sum(nil)) != declared.SHA256 {
+			return ErrInstallFailed
+		}
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(manifestBytes)
+	if hex.EncodeToString(digest[:]) != manifestDigest {
 		return ErrInstallFailed
 	}
-	familyRoot := filepath.Join(installer.root, family)
+	return nil
+}
+
+func (installer *Installer) Activate(ctx context.Context, identity SlotIdentity, slot pluginstate.Slot) error {
+	if installer == nil || ctx == nil || ctx.Err() != nil || !familyIdentifier.MatchString(identity.DatabaseFamily) || slot != pluginstate.SlotA && slot != pluginstate.SlotB {
+		return ErrInstallFailed
+	}
+	if _, err := installer.Installed(ctx, identity, slot); err != nil {
+		return err
+	}
+	familyRoot := filepath.Join(installer.root, identity.DatabaseFamily)
 	if err := requireCompletedSlot(filepath.Join(familyRoot, slotsDirectoryName, string(slot))); err != nil {
 		return err
 	}

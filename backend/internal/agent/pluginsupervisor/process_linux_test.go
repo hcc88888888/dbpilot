@@ -36,6 +36,7 @@ func TestLinuxProcessRunnerDirectExecUsesFixedArgvCleanEnvironmentAndBoundedOutp
 		AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql", Version: "1.0.0", Slot: pluginstate.SlotA,
 		ConfigurationRevision: 7, OperationRevision: 9, InstanceIDs: []string{"mysql-1", "mysql-2"}, TemplateIDs: []string{"template-1"}, RuntimeDirectory: runtimeDir,
 		UserID: uint32(os.Geteuid()), GroupID: uint32(os.Getegid()),
+		LaunchNonce: bytesOf(4, 32),
 	})
 	require.NoError(t, err, "stage=%s detail=%v", failureStage, failureDetail)
 	require.Positive(t, process.PID())

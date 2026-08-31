@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -12,8 +13,10 @@ import (
 	"sort"
 	"strconv"
 	"syscall"
+	"time"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -33,6 +36,24 @@ func main() {
 	}
 	configurationRevision, err := strconv.ParseUint(values["--configuration-revision"], 10, 64)
 	if err != nil || configurationRevision == 0 {
+		os.Exit(2)
+	}
+	operationRevision, err := strconv.ParseUint(values["--operation-revision"], 10, 64)
+	if err != nil || operationRevision == 0 {
+		os.Exit(2)
+	}
+	nonceFD, err := strconv.Atoi(values["--launch-nonce-fd"])
+	if err != nil || nonceFD != 3 {
+		os.Exit(2)
+	}
+	nonceFile := os.NewFile(uintptr(nonceFD), "launch-nonce")
+	launchNonce := make([]byte, sha256.Size)
+	if nonceFile == nil {
+		os.Exit(2)
+	}
+	_, nonceErr := io.ReadFull(nonceFile, launchNonce)
+	closeErr := nonceFile.Close()
+	if nonceErr != nil || closeErr != nil {
 		os.Exit(2)
 	}
 	self, err := os.Executable()
@@ -57,11 +78,14 @@ func main() {
 	}
 	defer os.Remove(socket)
 	server := grpc.NewServer()
-	fixture := &runtimeServer{assignmentID: values["--assignment-id"], pluginID: values["--plugin-id"], family: values["--database-family"], version: values["--version"], configurationRevision: configurationRevision, instances: instances, executableDigest: digest[:]}
+	fixture := &runtimeServer{assignmentID: values["--assignment-id"], pluginID: values["--plugin-id"], family: values["--database-family"], version: values["--version"], configurationRevision: configurationRevision, operationRevision: operationRevision, instances: instances, executableDigest: digest[:], launchNonce: launchNonce}
 	pluginv1.RegisterPluginRuntimeServer(server, fixture)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { _ = server.Serve(listener) }()
+	if values["--version"] == "1.2.0" {
+		go func() { time.Sleep(150 * time.Millisecond); os.Exit(17) }()
+	}
 	<-ctx.Done()
 	server.GracefulStop()
 }
@@ -73,15 +97,18 @@ type runtimeServer struct {
 	family                string
 	version               string
 	configurationRevision uint64
+	operationRevision     uint64
 	instances             []string
 	executableDigest      []byte
+	launchNonce           []byte
 }
 
 func (server *runtimeServer) Handshake(_ context.Context, request *pluginv1.PluginHandshakeRequest) (*pluginv1.PluginHandshakeResponse, error) {
 	if server.version == "1.1.0" {
 		return nil, errors.New("fixture upgrade handshake failure")
 	}
-	return &pluginv1.PluginHandshakeResponse{PluginId: server.pluginID, DatabaseFamily: server.family, Version: server.version, ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, DatabaseVersionRange: ">=8 <9", Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1, ExecutableDigest: append([]byte(nil), server.executableDigest...), LaunchNonceProof: append([]byte(nil), request.GetLaunchNonceChallenge()...)}, nil
+	proof := pluginsupervisor.LaunchProof(server.launchNonce, request.GetLaunchNonceChallenge(), server.assignmentID, server.version, server.configurationRevision, server.operationRevision, server.instances)
+	return &pluginv1.PluginHandshakeResponse{PluginId: server.pluginID, DatabaseFamily: server.family, Version: server.version, ProtocolVersion: "v1", SupportedVariants: []string{"mysql"}, DatabaseVersionRange: ">=8 <9", Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1, ExecutableDigest: append([]byte(nil), server.executableDigest...), LaunchNonceProof: proof}, nil
 }
 
 func (server *runtimeServer) GetHealth(_ context.Context, request *pluginv1.GetPluginHealthRequest) (*pluginv1.PluginHealth, error) {
@@ -99,7 +126,7 @@ func arguments(values []string) (map[string]string, bool) {
 	if len(values) == 0 || len(values)%2 != 0 {
 		return nil, false
 	}
-	allowed := map[string]struct{}{"--runtime-dir": {}, "--assignment-id": {}, "--plugin-id": {}, "--database-family": {}, "--version": {}, "--slot": {}, "--configuration-revision": {}, "--operation-revision": {}, "--instance-ids": {}, "--template-ids": {}}
+	allowed := map[string]struct{}{"--runtime-dir": {}, "--assignment-id": {}, "--plugin-id": {}, "--database-family": {}, "--version": {}, "--slot": {}, "--configuration-revision": {}, "--operation-revision": {}, "--instance-ids": {}, "--template-ids": {}, "--launch-nonce-fd": {}}
 	result := make(map[string]string, len(allowed))
 	for index := 0; index < len(values); index += 2 {
 		if _, ok := allowed[values[index]]; !ok || values[index+1] == "" {

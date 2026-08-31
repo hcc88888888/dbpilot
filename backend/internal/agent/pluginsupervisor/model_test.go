@@ -21,7 +21,7 @@ func TestReconcileRequestRejectsUnsafeOrUnboundedAssignments(t *testing.T) {
 		"duplicate instance":       func(value *ReconcileRequest) { value.InstanceIDs = []string{"instance-1", "instance-1"} },
 		"too many instances":       func(value *ReconcileRequest) { value.InstanceIDs = make([]string, MaxAssignedInstances+1) },
 		"unknown desired state":    func(value *ReconcileRequest) { value.DesiredState = DesiredState(99) },
-		"artifact while absent":    func(value *ReconcileRequest) { value.DesiredState = DesiredAbsent },
+		"partial artifact absent":  func(value *ReconcileRequest) { value.DesiredState = DesiredAbsent; value.ManifestDigest = nil },
 		"missing artifact running": func(value *ReconcileRequest) { value.ArtifactID = "" },
 	}
 	for name, mutate := range tests {
@@ -40,6 +40,9 @@ func TestReconcileRequestRejectsUnsafeOrUnboundedAssignments(t *testing.T) {
 	absent.ArtifactSHA256 = nil
 	absent.ManifestDigest = nil
 	require.NoError(t, absent.Validate())
+	withTask8Metadata := valid
+	withTask8Metadata.DesiredState = DesiredAbsent
+	require.NoError(t, withTask8Metadata.Validate())
 }
 
 func TestExecutionFenceRequiresExactStartedCommandBoundary(t *testing.T) {

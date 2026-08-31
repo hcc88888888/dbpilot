@@ -95,32 +95,45 @@ type SlotState struct {
 // URLs, request headers, credentials, command tokens and plugin output never
 // cross this persistence boundary.
 type FamilyState struct {
-	StateRevision               uint64             `json:"state_revision"`
-	AssignmentID                string             `json:"assignment_id"`
-	PluginID                    string             `json:"plugin_id"`
-	DatabaseFamily              string             `json:"database_family"`
-	InstalledVersion            string             `json:"installed_version,omitempty"`
-	ActiveSlot                  Slot               `json:"active_slot"`
-	Slots                       map[Slot]SlotState `json:"slots,omitempty"`
-	DesiredState                DesiredState       `json:"desired_state"`
-	ProcessState                ProcessState       `json:"process_state"`
-	ProcessID                   int                `json:"process_id,omitempty"`
-	ProcessStartTicks           uint64             `json:"process_start_ticks,omitempty"`
-	StartedAt                   time.Time          `json:"started_at,omitempty"`
-	RestartCount                uint32             `json:"restart_count"`
-	Failures                    []time.Time        `json:"failures,omitempty"`
-	CircuitState                CircuitState       `json:"circuit_state"`
-	HealthState                 HealthState        `json:"health_state"`
-	ActiveConfigurationRevision uint64             `json:"active_configuration_revision"`
-	ObservedOperationRevision   uint64             `json:"observed_operation_revision"`
-	ObservationRevision         uint64             `json:"observation_revision"`
-	BoundInstanceCount          uint32             `json:"bound_instance_count"`
-	LastErrorCode               string             `json:"last_error_code,omitempty"`
+	StateRevision                uint64             `json:"state_revision"`
+	AssignmentID                 string             `json:"assignment_id"`
+	PluginID                     string             `json:"plugin_id"`
+	DatabaseFamily               string             `json:"database_family"`
+	InstalledVersion             string             `json:"installed_version,omitempty"`
+	ActiveArtifactID             string             `json:"active_artifact_id,omitempty"`
+	ActiveArtifactSHA256         string             `json:"active_artifact_sha256,omitempty"`
+	ActiveManifestDigest         string             `json:"active_manifest_digest,omitempty"`
+	ActiveInstanceIDs            []string           `json:"active_instance_ids,omitempty"`
+	ActiveTemplateIDs            []string           `json:"active_template_ids,omitempty"`
+	DesiredVersion               string             `json:"desired_version,omitempty"`
+	DesiredArtifactID            string             `json:"desired_artifact_id,omitempty"`
+	DesiredArtifactSHA256        string             `json:"desired_artifact_sha256,omitempty"`
+	DesiredManifestDigest        string             `json:"desired_manifest_digest,omitempty"`
+	DesiredConfigurationRevision uint64             `json:"desired_configuration_revision"`
+	DesiredInstanceIDs           []string           `json:"desired_instance_ids,omitempty"`
+	DesiredTemplateIDs           []string           `json:"desired_template_ids,omitempty"`
+	RequestFingerprint           string             `json:"request_fingerprint"`
+	ActiveSlot                   Slot               `json:"active_slot"`
+	Slots                        map[Slot]SlotState `json:"slots,omitempty"`
+	DesiredState                 DesiredState       `json:"desired_state"`
+	ProcessState                 ProcessState       `json:"process_state"`
+	ProcessID                    int                `json:"process_id,omitempty"`
+	ProcessStartTicks            uint64             `json:"process_start_ticks,omitempty"`
+	StartedAt                    time.Time          `json:"started_at,omitempty"`
+	RestartCount                 uint32             `json:"restart_count"`
+	Failures                     []time.Time        `json:"failures,omitempty"`
+	CircuitState                 CircuitState       `json:"circuit_state"`
+	HealthState                  HealthState        `json:"health_state"`
+	ActiveConfigurationRevision  uint64             `json:"active_configuration_revision"`
+	ObservedOperationRevision    uint64             `json:"observed_operation_revision"`
+	ObservationRevision          uint64             `json:"observation_revision"`
+	BoundInstanceCount           uint32             `json:"bound_instance_count"`
+	LastErrorCode                string             `json:"last_error_code,omitempty"`
 }
 
 func (state FamilyState) Validate() error {
 	if !resourcePattern.MatchString(state.AssignmentID) || !identifierPattern.MatchString(state.PluginID) || !identifierPattern.MatchString(state.DatabaseFamily) ||
-		state.ObservedOperationRevision == 0 || state.ActiveConfigurationRevision == 0 || state.BoundInstanceCount > 4096 || len(state.Failures) > 32 {
+		state.ObservedOperationRevision == 0 || state.ActiveConfigurationRevision == 0 || state.DesiredConfigurationRevision == 0 || state.BoundInstanceCount > 128 || len(state.Failures) > 32 || !hexDigest(state.RequestFingerprint) || len(state.ActiveInstanceIDs) > 128 || len(state.ActiveTemplateIDs) > 128 || len(state.DesiredInstanceIDs) > 128 || len(state.DesiredTemplateIDs) > 128 {
 		return ErrInvalidState
 	}
 	if state.ActiveSlot != SlotNone && state.ActiveSlot != SlotA && state.ActiveSlot != SlotB {
@@ -132,7 +145,10 @@ func (state FamilyState) Validate() error {
 	if state.ProcessID < 0 || state.ProcessID == 0 && state.ProcessStartTicks != 0 || state.ProcessID != 0 && state.ProcessStartTicks == 0 {
 		return ErrInvalidState
 	}
-	if state.InstalledVersion != "" && !boundedText(state.InstalledVersion, 64) || state.LastErrorCode != "" && !identifierPattern.MatchString(state.LastErrorCode) {
+	if state.InstalledVersion != "" && !boundedText(state.InstalledVersion, 64) || state.DesiredVersion != "" && !boundedText(state.DesiredVersion, 64) || state.LastErrorCode != "" && !identifierPattern.MatchString(state.LastErrorCode) || int(state.BoundInstanceCount) != len(state.ActiveInstanceIDs) {
+		return ErrInvalidState
+	}
+	if !validOptionalArtifact(state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest) || !validOptionalArtifact(state.DesiredArtifactID, state.DesiredArtifactSHA256, state.DesiredManifestDigest) || !validIDs(state.ActiveInstanceIDs) || !validIDs(state.ActiveTemplateIDs) || !validIDs(state.DesiredInstanceIDs) || !validIDs(state.DesiredTemplateIDs) {
 		return ErrInvalidState
 	}
 	for slot, value := range state.Slots {
@@ -149,15 +165,17 @@ func (state FamilyState) Validate() error {
 }
 
 type diskSnapshot struct {
-	Revision uint64                 `json:"revision"`
-	Families map[string]FamilyState `json:"families"`
+	Revision   uint64                 `json:"revision"`
+	ObservedAt time.Time              `json:"observed_at"`
+	Families   map[string]FamilyState `json:"families"`
 }
 
 type FileStore struct {
-	mu       sync.RWMutex
-	root     string
-	revision uint64
-	families map[string]FamilyState
+	mu         sync.RWMutex
+	root       string
+	revision   uint64
+	observedAt time.Time
+	families   map[string]FamilyState
 }
 
 func NewFileStore(root string) (*FileStore, error) {
@@ -181,6 +199,7 @@ func NewFileStore(root string) (*FileStore, error) {
 			valid++
 			if snapshot.Revision > store.revision {
 				store.revision = snapshot.Revision
+				store.observedAt = snapshot.ObservedAt
 				store.families = cloneFamilies(snapshot.Families)
 			}
 		}
@@ -189,6 +208,15 @@ func NewFileStore(root string) (*FileStore, error) {
 		return nil, invalid
 	}
 	return store, nil
+}
+
+func (store *FileStore) Snapshot() (uint64, time.Time, []FamilyState) {
+	if store == nil {
+		return 0, time.Time{}, nil
+	}
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	return store.revision, store.observedAt, sortedFamilies(store.families)
 }
 
 func (store *FileStore) Get(family string) (FamilyState, bool) {
@@ -234,11 +262,12 @@ func (store *FileStore) Put(ctx context.Context, state FamilyState) (FamilyState
 	}
 	next := cloneFamilies(store.families)
 	next[state.DatabaseFamily] = cloneFamily(state)
-	snapshot := diskSnapshot{Revision: state.StateRevision, Families: next}
+	snapshot := diskSnapshot{Revision: state.StateRevision, ObservedAt: time.Now().UTC(), Families: next}
 	if err := store.writeSnapshot(ctx, snapshot); err != nil {
 		return FamilyState{}, err
 	}
 	store.revision = snapshot.Revision
+	store.observedAt = snapshot.ObservedAt
 	store.families = next
 	return cloneFamily(state), nil
 }
@@ -258,7 +287,7 @@ func (store *FileStore) Delete(ctx context.Context, family string, operationRevi
 	}
 	next := cloneFamilies(store.families)
 	delete(next, family)
-	snapshot := diskSnapshot{Revision: store.revision + 1, Families: next}
+	snapshot := diskSnapshot{Revision: store.revision + 1, ObservedAt: time.Now().UTC(), Families: next}
 	if snapshot.Revision == 0 {
 		return ErrInvalidState
 	}
@@ -266,6 +295,7 @@ func (store *FileStore) Delete(ctx context.Context, family string, operationRevi
 		return err
 	}
 	store.revision = snapshot.Revision
+	store.observedAt = snapshot.ObservedAt
 	store.families = next
 	return nil
 }
@@ -326,7 +356,7 @@ func readSnapshot(path string) (diskSnapshot, bool, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var snapshot diskSnapshot
-	if decoder.Decode(&snapshot) != nil || ensureEOF(decoder) != nil || snapshot.Revision == 0 || snapshot.Families == nil {
+	if decoder.Decode(&snapshot) != nil || ensureEOF(decoder) != nil || snapshot.Revision == 0 || snapshot.Families == nil || snapshot.ObservedAt.IsZero() {
 		return diskSnapshot{}, false, ErrInvalidState
 	}
 	for family, state := range snapshot.Families {
@@ -347,6 +377,10 @@ func ensureEOF(decoder *json.Decoder) error {
 
 func cloneFamily(state FamilyState) FamilyState {
 	state.Failures = append([]time.Time(nil), state.Failures...)
+	state.ActiveInstanceIDs = append([]string(nil), state.ActiveInstanceIDs...)
+	state.ActiveTemplateIDs = append([]string(nil), state.ActiveTemplateIDs...)
+	state.DesiredInstanceIDs = append([]string(nil), state.DesiredInstanceIDs...)
+	state.DesiredTemplateIDs = append([]string(nil), state.DesiredTemplateIDs...)
 	if state.Slots != nil {
 		state.Slots = make(map[Slot]SlotState, len(state.Slots))
 		for slot, value := range state.Slots {
@@ -354,6 +388,37 @@ func cloneFamily(state FamilyState) FamilyState {
 		}
 	}
 	return state
+}
+
+func sortedFamilies(values map[string]FamilyState) []FamilyState {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]FamilyState, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, cloneFamily(values[key]))
+	}
+	return result
+}
+
+func validOptionalArtifact(id, artifactDigest, manifestDigest string) bool {
+	return id == "" && artifactDigest == "" && manifestDigest == "" || resourcePattern.MatchString(id) && hexDigest(artifactDigest) && hexDigest(manifestDigest)
+}
+
+func validIDs(values []string) bool {
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		if !resourcePattern.MatchString(value) {
+			return false
+		}
+		if _, ok := seen[value]; ok {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
 }
 
 func cloneFamilies(values map[string]FamilyState) map[string]FamilyState {

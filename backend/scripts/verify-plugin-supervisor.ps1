@@ -44,7 +44,7 @@ test "$(id -u)" = "19001"
 test "$(id -g)" = "19001"
 grep '^CapEff:[[:space:]]*0000000000000000$' /proc/self/status
 grep '^CapAmb:[[:space:]]*0000000000000000$' /proc/self/status
-DBPILOT_KYLIN_SUPERVISOR_PROBE=1 DBPILOT_PLUGIN_PROCESS_FIXTURE=/probe/dbpilot-plugin-fixture DBPILOT_SECRET_SENTINEL=must-not-leak /probe/pluginsupervisor.test -test.v -test.run 'Test(LinuxProcessRunnerDirectExecUsesFixedArgvCleanEnvironmentAndBoundedOutput|GRPCHealthCheckerRequiresExactPrivateHandshakeAndAssignmentHealth|KylinPluginSupervisorLifecycleProbe|InstallerRejectsSignedCaseCollisionAndInstalledHardlinkMutation)$'
+DBPILOT_KYLIN_SUPERVISOR_PROBE=1 DBPILOT_PLUGIN_PROCESS_FIXTURE=/probe/dbpilot-plugin-fixture DBPILOT_SECRET_SENTINEL=must-not-leak /probe/pluginsupervisor.test -test.v -test.run 'Test(LinuxProcessRunnerDirectExecUsesFixedArgvCleanEnvironmentAndBoundedOutput|GRPCHealthCheckerRequiresExactPrivateHandshakeAndAssignmentHealth|KylinPluginSupervisorLifecycleProbe|InstallerRejectsSignedCaseCollisionAndInstalledHardlinkMutation|InstallerReauthenticatesRetainedPackageAndRejectsSameUIDTamper)$'
 '@
     & $DockerBinary run --rm --name $containerName --network none --user '19001:19001' --cap-drop ALL --security-opt 'no-new-privileges:true' --read-only --tmpfs '/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777' -v "${mount}:/probe:ro" $KylinImage /bin/sh -c $probeScript
     if ($LASTEXITCODE -ne 0) { throw 'Kylin plugin supervisor probe failed' }

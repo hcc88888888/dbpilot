@@ -40,6 +40,7 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	stable := buildProbePackage(t, binary, privateKey, "1.0.0")
 	failing := buildProbePackage(t, binary, privateKey, "1.1.0")
+	crashing := buildProbePackage(t, binary, privateKey, "1.2.0")
 
 	root := t.TempDir()
 	for _, directory := range []string{"plugins", "runtime", "state"} {
@@ -53,10 +54,10 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	require.NoError(t, err)
 	uid, gid, nonRoot := CurrentProcessIdentity()
 	require.True(t, nonRoot)
-	leasing := &probeLeaseClient{packages: map[string]probePackage{"artifact-1": stable, "artifact-2": failing}}
+	leasing := &probeLeaseClient{packages: map[string]probePackage{"artifact-1": stable, "artifact-2": failing, "artifact-3": crashing}}
 	processRunner := NewOSProcessRunner(OSProcessRunnerConfig{OutputLimit: 1024})
 	newSupervisor := func() *PluginSupervisor {
-		supervisor, supervisorErr := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: filepath.Join(root, "runtime"), Store: stateStore, Installer: installer, Leases: leasing, Downloader: leasing, Processes: processRunner, Health: NewGRPCHealthChecker(GRPCHealthCheckerConfig{Timeout: 5 * time.Second}), UserID: uid, GroupID: gid, DrainTimeout: 3 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+		supervisor, supervisorErr := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: filepath.Join(root, "runtime"), Store: stateStore, Installer: installer, Leases: leasing, Downloader: leasing, Processes: processRunner, Health: NewGRPCHealthChecker(GRPCHealthCheckerConfig{Timeout: 5 * time.Second}), UserID: uid, GroupID: gid, DrainTimeout: 3 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: 20 * time.Millisecond, RestartMaximum: 50 * time.Millisecond})
 		require.NoError(t, supervisorErr)
 		return supervisor
 	}
@@ -64,11 +65,15 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	request := probeRequest(stable, "artifact-1", "1.0.0", 1)
 	prepared, err := supervisor.Prepare(context.Background(), request)
 	require.NoError(t, err)
-	running, err := supervisor.Start(context.Background(), prepared, validFence())
+	commandContext, cancelCommand := context.WithCancel(context.Background())
+	running, err := supervisor.Start(commandContext, prepared, validFence())
 	require.NoError(t, err)
+	cancelCommand()
+	time.Sleep(50 * time.Millisecond)
 	require.Equal(t, pluginstate.ProcessRunning, running.State.ProcessState)
 	require.Equal(t, uint32(2), running.State.BoundInstanceCount)
 	firstPID := running.State.ProcessID
+	require.True(t, processExists(firstPID), "terminal command context must not own the healthy plugin lifetime")
 	require.Zero(t, linuxCapabilityValue(t, firstPID, "CapEff:"))
 	require.Zero(t, linuxCapabilityValue(t, firstPID, "CapAmb:"))
 	assertProbeLaunch(t, filepath.Join(root, "runtime", "mysql", "launch.json"), int(uid))
@@ -86,26 +91,24 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	require.NoError(t, supervisor.Stop(context.Background()))
 	require.False(t, processExists(rolledBack.State.ProcessID))
 	restartedSupervisor := newSupervisor()
-	restartRequest := probeRequest(stable, "artifact-1", "1.0.0", 3)
-	prepared, err = restartedSupervisor.Prepare(context.Background(), restartRequest)
-	require.NoError(t, err)
-	restarted, err := restartedSupervisor.Start(context.Background(), prepared, validFence())
-	require.NoError(t, err)
-	require.Equal(t, pluginstate.ProcessRunning, restarted.State.ProcessState)
-	require.True(t, processExists(restarted.State.ProcessID))
+	var restarted pluginstate.FamilyState
+	require.Eventually(t, func() bool {
+		var ok bool
+		restarted, ok = stateStore.Get("mysql")
+		return ok && restarted.ProcessState == pluginstate.ProcessRunning && restarted.ProcessID > 0
+	}, 5*time.Second, 20*time.Millisecond)
+	require.True(t, processExists(restarted.ProcessID), "desired-running plugin must self-recover after Agent restart without a new command")
 
-	stoppedRequest := restartRequest
-	stoppedRequest.OperationRevision = 4
+	stoppedRequest := probeRequest(stable, "artifact-1", "1.0.0", 3)
 	stoppedRequest.DesiredState = DesiredStopped
 	prepared, err = restartedSupervisor.Prepare(context.Background(), stoppedRequest)
 	require.NoError(t, err)
 	stopped, err := restartedSupervisor.Start(context.Background(), prepared, validFence())
 	require.NoError(t, err)
 	require.Equal(t, pluginstate.ProcessStopped, stopped.State.ProcessState)
-	require.False(t, processExists(restarted.State.ProcessID))
+	require.False(t, processExists(restarted.ProcessID))
 
-	absentRequest := restartRequest
-	absentRequest.OperationRevision = 5
+	absentRequest := probeRequest(stable, "artifact-1", "1.0.0", 4)
 	absentRequest.DesiredState = DesiredAbsent
 	absentRequest.DesiredVersion, absentRequest.ArtifactID = "", ""
 	absentRequest.ArtifactSHA256, absentRequest.ManifestDigest = nil, nil
@@ -119,6 +122,16 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 		_, statErr := os.Lstat(filepath.Join(root, "runtime", "mysql", "plugin.sock"))
 		return errors.Is(statErr, os.ErrNotExist)
 	}, time.Second, 10*time.Millisecond)
+
+	crashRequest := probeRequest(crashing, "artifact-3", "1.2.0", 5)
+	prepared, err = restartedSupervisor.Prepare(context.Background(), crashRequest)
+	require.NoError(t, err)
+	_, err = restartedSupervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		state, ok := stateStore.Get("mysql")
+		return ok && state.CircuitState == pluginstate.CircuitOpen && state.ProcessState == pluginstate.ProcessCircuitOpen
+	}, 5*time.Second, 20*time.Millisecond)
 }
 
 type probePackage struct {

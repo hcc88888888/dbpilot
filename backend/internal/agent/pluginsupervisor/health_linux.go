@@ -7,14 +7,19 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -32,8 +37,11 @@ func NewGRPCHealthChecker(config GRPCHealthCheckerConfig) *GRPCHealthChecker {
 	return &GRPCHealthChecker{timeout: config.Timeout}
 }
 
-func (checker *GRPCHealthChecker) Handshake(ctx context.Context, _ Process, request HealthRequest) error {
-	if checker == nil || ctx == nil || ctx.Err() != nil || !resourceIdentifier.MatchString(request.AssignmentID) || !familyIdentifier.MatchString(request.PluginID) || !familyIdentifier.MatchString(request.DatabaseFamily) || !boundedVersion(request.Version) || request.ProtocolVersion != "v1" || len(request.ExecutableSHA256) != sha256.Size || request.ConfigurationRevision == 0 || request.OperationRevision == 0 || !uniqueResources(request.InstanceIDs) || !filepath.IsAbs(request.RuntimeDirectory) || filepath.Clean(request.RuntimeDirectory) != request.RuntimeDirectory {
+func (checker *GRPCHealthChecker) Handshake(ctx context.Context, process Process, request HealthRequest) error {
+	if checker == nil || ctx == nil || ctx.Err() != nil || !resourceIdentifier.MatchString(request.AssignmentID) || !familyIdentifier.MatchString(request.PluginID) || !familyIdentifier.MatchString(request.DatabaseFamily) || !boundedVersion(request.Version) || request.ProtocolVersion != "v1" || len(request.ExecutableSHA256) != sha256.Size || len(request.LaunchNonce) != sha256.Size || request.ConfigurationRevision == 0 || request.OperationRevision == 0 || !uniqueResources(request.InstanceIDs) || !filepath.IsAbs(request.RuntimeDirectory) || filepath.Clean(request.RuntimeDirectory) != request.RuntimeDirectory || !filepath.IsAbs(request.ExecutablePath) || request.ExpectedUserID == 0 || request.ExpectedGroupID == 0 {
+		return ErrHealthHandshake
+	}
+	if process == nil || process.PID() <= 0 || verifyProcessExecutable(process.PID(), request.ExecutablePath, request.ExecutableSHA256) != nil {
 		return ErrHealthHandshake
 	}
 	socket := filepath.Join(request.RuntimeDirectory, "plugin.sock")
@@ -43,7 +51,29 @@ func (checker *GRPCHealthChecker) Handshake(ctx context.Context, _ Process, requ
 		return ErrHealthHandshake
 	}
 	connection, err := grpc.DialContext(handshakeContext, "unix://"+socket, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(dialContext context.Context, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(dialContext, "unix", socket)
+		connection, dialErr := (&net.Dialer{}).DialContext(dialContext, "unix", socket)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		unixConnection, ok := connection.(*net.UnixConn)
+		if !ok {
+			_ = connection.Close()
+			return nil, ErrHealthHandshake
+		}
+		raw, controlErr := unixConnection.SyscallConn()
+		if controlErr != nil {
+			_ = connection.Close()
+			return nil, controlErr
+		}
+		var credential *unix.Ucred
+		var credentialErr error
+		if controlErr = raw.Control(func(fd uintptr) {
+			credential, credentialErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+		}); controlErr != nil || credentialErr != nil || credential == nil || int(credential.Pid) != process.PID() || credential.Uid != request.ExpectedUserID || credential.Gid != request.ExpectedGroupID {
+			_ = connection.Close()
+			return nil, ErrHealthHandshake
+		}
+		return connection, nil
 	}), grpc.WithBlock())
 	if err != nil {
 		return ErrHealthHandshake
@@ -55,7 +85,8 @@ func (checker *GRPCHealthChecker) Handshake(ctx context.Context, _ Process, requ
 		return ErrHealthHandshake
 	}
 	response, err := client.Handshake(handshakeContext, &pluginv1.PluginHandshakeRequest{ExpectedPluginId: request.PluginID, ExpectedDatabaseFamily: request.DatabaseFamily, ExpectedVersion: request.Version, ExpectedProtocolVersion: request.ProtocolVersion, LaunchNonceChallenge: challenge})
-	if err != nil || response.GetPluginId() != request.PluginID || response.GetDatabaseFamily() != request.DatabaseFamily || response.GetVersion() != request.Version || response.GetProtocolVersion() != request.ProtocolVersion || !bytes.Equal(response.GetExecutableDigest(), request.ExecutableSHA256) || !bytes.Equal(response.GetLaunchNonceProof(), challenge) {
+	expectedProof := LaunchProof(request.LaunchNonce, challenge, request.AssignmentID, request.Version, request.ConfigurationRevision, request.OperationRevision, request.InstanceIDs)
+	if err != nil || response.GetPluginId() != request.PluginID || response.GetDatabaseFamily() != request.DatabaseFamily || response.GetVersion() != request.Version || response.GetProtocolVersion() != request.ProtocolVersion || !bytes.Equal(response.GetExecutableDigest(), request.ExecutableSHA256) || len(expectedProof) == 0 || len(response.GetLaunchNonceProof()) != len(expectedProof) || subtle.ConstantTimeCompare(response.GetLaunchNonceProof(), expectedProof) != 1 {
 		return ErrHealthHandshake
 	}
 	health, err := client.GetHealth(handshakeContext, &pluginv1.GetPluginHealthRequest{AssignmentId: request.AssignmentID})
@@ -73,6 +104,34 @@ func (checker *GRPCHealthChecker) Handshake(ctx context.Context, _ Process, requ
 	sort.Strings(want)
 	sort.Strings(got)
 	if !equalStrings(want, got) {
+		return ErrHealthHandshake
+	}
+	return nil
+}
+
+func verifyProcessExecutable(pid int, expectedPath string, expectedDigest []byte) error {
+	actualPath, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
+	if err != nil {
+		return err
+	}
+	actualInfo, err := os.Stat(actualPath)
+	if err != nil {
+		return err
+	}
+	expectedInfo, err := os.Stat(expectedPath)
+	if err != nil || !os.SameFile(actualInfo, expectedInfo) {
+		return ErrHealthHandshake
+	}
+	file, err := os.Open(actualPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err = io.Copy(hash, file); err != nil {
+		return err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != hex.EncodeToString(expectedDigest) {
 		return ErrHealthHandshake
 	}
 	return nil

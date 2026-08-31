@@ -115,6 +115,9 @@ func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandE
 	v.mu.Lock()
 	targetAuthorizer := v.targetAuthorizer
 	v.mu.Unlock()
+	if reconcile := envelope.GetReconcilePlugin(); reconcile != nil {
+		targetAuthorizer = signedPluginMembership{agentID: v.agentID, instanceIDs: append([]string(nil), reconcile.GetInstanceIds()...), delegate: targetAuthorizer}
+	}
 	if err := commandvalidation.Validate(ctx, envelope, targetAuthorizer); err != nil {
 		if errors.Is(err, commandvalidation.ErrTargetUnauthorized) {
 			return ErrCommandTargetUnauthorized
@@ -135,6 +138,27 @@ func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandE
 	}
 	v.nonces[nonceKey] = nonceRecord{commandID: envelope.GetCommandId(), expiresAt: expiresAt}
 	return nil
+}
+
+type signedPluginMembership struct {
+	agentID     string
+	instanceIDs []string
+	delegate    commandvalidation.TargetAuthorizer
+}
+
+func (membership signedPluginMembership) AuthorizeTarget(ctx context.Context, agentID, targetID string) error {
+	if subtle.ConstantTimeCompare([]byte(membership.agentID), []byte(agentID)) != 1 {
+		return ErrCommandTargetUnauthorized
+	}
+	for _, allowed := range membership.instanceIDs {
+		if subtle.ConstantTimeCompare([]byte(allowed), []byte(targetID)) == 1 {
+			if membership.delegate != nil {
+				return membership.delegate.AuthorizeTarget(ctx, agentID, targetID)
+			}
+			return nil
+		}
+	}
+	return ErrCommandTargetUnauthorized
 }
 
 func CommandSigningBytes(envelope *agentv1.CommandEnvelope) ([]byte, error) {
