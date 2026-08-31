@@ -27,6 +27,7 @@ import (
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	agentdiscovery "dbpilot.local/platform/internal/agent/discovery"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"dbpilot.local/platform/internal/database"
@@ -472,7 +473,12 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			return errors.New("configure plugin artifact downloader")
 		}
 		pluginLeases = &deferredPluginLeaseClient{}
-		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGRPCHealthChecker(pluginsupervisor.GRPCHealthCheckerConfig{Timeout: 15 * time.Second}), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+		pluginGateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: pluginRuntimeRoot, Scope: plugingateway.MetricScope{AgentID: settings.AgentID, HostID: settings.HostID}, Store: store, Timeout: 15 * time.Second})
+		if gatewayErr != nil {
+			_ = store.Close()
+			return errors.New("configure plugin gateway")
+		}
+		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGatewayHealthChecker(pluginGateway), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
 		if err != nil {
 			_ = store.Close()
 			return errors.New("configure plugin supervisor")

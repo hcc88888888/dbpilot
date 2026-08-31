@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"dbpilot.local/platform/internal/plugincatalog"
 	"github.com/stretchr/testify/require"
@@ -56,8 +57,10 @@ func TestKylinPluginSupervisorLifecycleProbe(t *testing.T) {
 	require.True(t, nonRoot)
 	leasing := &probeLeaseClient{packages: map[string]probePackage{"artifact-1": stable, "artifact-2": failing, "artifact-3": crashing}}
 	processRunner := NewOSProcessRunner(OSProcessRunnerConfig{OutputLimit: 1024})
+	gateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: filepath.Join(root, "runtime"), Scope: plugingateway.MetricScope{AgentID: "agent-1", HostID: "host-1"}, Timeout: 5 * time.Second})
+	require.NoError(t, gatewayErr)
 	newSupervisor := func() *PluginSupervisor {
-		supervisor, supervisorErr := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: filepath.Join(root, "runtime"), Store: stateStore, Installer: installer, Leases: leasing, Downloader: leasing, Processes: processRunner, Health: NewGRPCHealthChecker(GRPCHealthCheckerConfig{Timeout: 5 * time.Second}), UserID: uid, GroupID: gid, DrainTimeout: 3 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: 20 * time.Millisecond, RestartMaximum: 50 * time.Millisecond})
+		supervisor, supervisorErr := NewPluginSupervisor(PluginSupervisorConfig{AgentID: "agent-1", HostID: "host-1", RuntimeRoot: filepath.Join(root, "runtime"), Store: stateStore, Installer: installer, Leases: leasing, Downloader: leasing, Processes: processRunner, Health: NewGatewayHealthChecker(gateway), UserID: uid, GroupID: gid, DrainTimeout: 3 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5, RestartBase: 20 * time.Millisecond, RestartMaximum: 50 * time.Millisecond})
 		require.NoError(t, supervisorErr)
 		return supervisor
 	}
