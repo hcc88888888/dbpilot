@@ -63,13 +63,20 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		if err := session.CheckHealth(ctx); err != nil {
 			return ErrHealthHandshake
 		}
-		streamContext, cancel := context.WithCancel(context.Background())
-		checker.mu.Lock()
-		checker.streams[process.PID()] = cancel
-		checker.mu.Unlock()
-		go func() {
-			_ = session.RunMetricStream(streamContext, checker.client.MetricSink())
-		}()
+		if sink := checker.client.MetricSink(); sink != nil {
+			streamContext, cancel := context.WithCancel(context.Background())
+			checker.mu.Lock()
+			checker.streams[process.PID()] = cancel
+			checker.mu.Unlock()
+			go func() {
+				if streamErr := session.RunMetricStream(streamContext, sink); streamErr != nil && streamContext.Err() == nil {
+					// A plugin whose metric stream ends has lost a core correctness
+					// boundary. Terminate it so Task9's monitored process lifecycle
+					// records the failure and applies its restart/circuit policy.
+					_ = process.Kill()
+				}
+			}()
+		}
 	}
 	checker.mu.Lock()
 	checker.sessions[process.PID()] = session

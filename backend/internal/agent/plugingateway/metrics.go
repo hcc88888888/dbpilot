@@ -37,18 +37,23 @@ var (
 // MetricScope contains Agent-owned dimensions. Plugins are not allowed to set
 // any of these values, including through labels.
 type MetricScope struct {
-	TenantID       string
-	ProjectID      string
-	AgentID        string
-	HostID         string
-	AssignmentID   string
-	InstanceIDs    []string
-	TemplateIDs    []string
-	DatabaseFamily string
+	TenantID              string
+	ProjectID             string
+	AgentID               string
+	HostID                string
+	AssignmentID          string
+	InstanceIDs           []string
+	TemplateIDs           []string
+	DatabaseFamily        string
+	PluginID              string
+	PluginVersion         string
+	ConfigurationRevision uint64
+	DatabaseVariant       string
+	TemplateRevision      uint64
 }
 
 func (scope MetricScope) validate() error {
-	if scope.validateAgent() != nil || !identifier(scope.AssignmentID) || !family(scope.DatabaseFamily) || len(scope.InstanceIDs) == 0 || len(scope.InstanceIDs) > maxGatewayMembers || !unique(scope.InstanceIDs) || len(scope.TemplateIDs) == 0 || len(scope.TemplateIDs) > maxGatewayMembers || !unique(scope.TemplateIDs) {
+	if scope.validateAgent() != nil || !identifier(scope.AssignmentID) || !family(scope.DatabaseFamily) || !family(scope.PluginID) || !version(scope.PluginVersion) || scope.ConfigurationRevision == 0 || !family(scope.DatabaseVariant) || scope.TemplateRevision == 0 || len(scope.InstanceIDs) == 0 || len(scope.InstanceIDs) > maxGatewayMembers || !unique(scope.InstanceIDs) || len(scope.TemplateIDs) == 0 || len(scope.TemplateIDs) > maxGatewayMembers || !unique(scope.TemplateIDs) {
 		return errInvalidMetric
 	}
 	return nil
@@ -80,7 +85,7 @@ var errInvalidMetric = errors.New("PLUGIN_METRIC_REJECTED")
 // Agent-owned OTLP payload. The identifier is derived from canonical payload
 // bytes, so the spool's (class,id) idempotency remains stable after reconnects.
 func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now time.Time) ([]byte, string, error) {
-	if batch == nil || scope.validate() != nil || !family(batch.GetPluginId()) || !family(batch.GetDatabaseFamily()) || batch.GetDatabaseFamily() != scope.DatabaseFamily || !version(batch.GetPluginVersion()) || !family(batch.GetDatabaseVariant()) || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() == 0 || !identifier(batch.GetTemplateId()) || !scope.permitsTemplate(batch.GetTemplateId()) || batch.GetTemplateRevision() == 0 || batch.GetSequence() == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED || (len(batch.GetSamples()) == 0 && batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED) || (batch.GetErrorCode() != "" && !fixedCode.MatchString(batch.GetErrorCode())) {
+	if batch == nil || scope.validate() != nil || batch.GetPluginId() != scope.PluginID || batch.GetPluginVersion() != scope.PluginVersion || batch.GetDatabaseFamily() != scope.DatabaseFamily || batch.GetDatabaseVariant() != scope.DatabaseVariant || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() != scope.ConfigurationRevision || !identifier(batch.GetTemplateId()) || !scope.permitsTemplate(batch.GetTemplateId()) || batch.GetTemplateRevision() != scope.TemplateRevision || batch.GetSequence() == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED || (len(batch.GetSamples()) == 0 && batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED) {
 		return nil, "", errInvalidMetric
 	}
 	collectedAt := batch.GetCollectedAt()
@@ -104,12 +109,12 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 	resource.PutStr("db.system", scope.DatabaseFamily)
 	resource.PutStr("dbpilot.source.id", pluginMetricSourceID+":"+scope.AssignmentID)
 	resource.PutStr("assignment_id", scope.AssignmentID)
-	resource.PutStr("configuration_revision", fmt.Sprintf("%d", batch.GetConfigurationRevision()))
+	resource.PutStr("configuration_revision", fmt.Sprintf("%d", scope.ConfigurationRevision))
 	resource.PutStr("template_id", batch.GetTemplateId())
-	resource.PutStr("template_revision", fmt.Sprintf("%d", batch.GetTemplateRevision()))
-	resource.PutStr("plugin_id", batch.GetPluginId())
-	resource.PutStr("plugin_version", batch.GetPluginVersion())
-	resource.PutStr("database_variant", batch.GetDatabaseVariant())
+	resource.PutStr("template_revision", fmt.Sprintf("%d", scope.TemplateRevision))
+	resource.PutStr("plugin_id", scope.PluginID)
+	resource.PutStr("plugin_version", scope.PluginVersion)
+	resource.PutStr("database_variant", scope.DatabaseVariant)
 	resource.PutStr("plugin_sequence", fmt.Sprintf("%d", batch.GetSequence()))
 	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
 	scopeMetrics.Scope().SetName("dbpilot.plugin-runtime")
@@ -120,8 +125,8 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 	statusPoint.SetTimestamp(pcommon.NewTimestampFromTime(collected))
 	statusPoint.SetDoubleValue(1)
 	statusPoint.Attributes().PutStr("status", collectionStatus(batch.GetCollectionStatus()))
-	if batch.GetErrorCode() != "" {
-		statusPoint.Attributes().PutStr("error_code", batch.GetErrorCode())
+	if errorCode := fixedPluginCode(batch.GetErrorCode()); errorCode != "" {
+		statusPoint.Attributes().PutStr("error_code", errorCode)
 	}
 
 	type sampleKey struct {
@@ -254,6 +259,20 @@ func collectionStatus(value pluginv1.PluginCollectionStatus) string {
 		return "stale"
 	default:
 		return "invalid"
+	}
+}
+
+// fixedPluginCode prevents arbitrary plugin-provided error vocabulary from
+// becoming Agent telemetry. Deferred definitions are explicit Task11/12
+// states, all other plugin failures collapse to one stable operational code.
+func fixedPluginCode(value string) string {
+	switch value {
+	case "":
+		return ""
+	case "waiting_credentials", "waiting_templates", "instance_unreachable", "authentication_failed", "timeout", "unsupported":
+		return value
+	default:
+		return "plugin_failed"
 	}
 }
 

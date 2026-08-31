@@ -84,15 +84,19 @@ func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
 func TestMetricConsumerAcceptsAgentNormalizedPluginOTLP(t *testing.T) {
 	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
 	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "template-1", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
-	payload, _, err := plugingateway.NormalizeBatch(batch, plugingateway.MetricScope{TenantID: "t1", ProjectID: "p1", AgentID: "agent-a", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"template-1"}, DatabaseFamily: "mysql"}, now)
+	payload, _, err := plugingateway.NormalizeBatch(batch, plugingateway.MetricScope{TenantID: "t1", ProjectID: "p1", AgentID: "agent-a", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"template-1"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}, now)
 	require.NoError(t, err)
 	store := &recordingStore{}
 	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
 	require.NoError(t, consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now))
-	require.Len(t, store.samples, 1)
-	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
-	require.Equal(t, "agent-a", store.samples[0].AgentID)
-	require.Equal(t, "mysql-1", store.samples[0].InstanceID)
+	require.Len(t, store.samples, 2)
+	for _, sample := range store.samples {
+		require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, sample.Scope)
+		require.Equal(t, "agent-a", sample.AgentID)
+		require.Equal(t, "mysql-1", sample.InstanceID)
+	}
+	require.Equal(t, "dbpilot.plugin.collection.status", store.samples[0].Name)
+	require.Equal(t, "succeeded", store.samples[0].Labels["status"])
 }
 
 func TestMetricConsumerRejectsOTLPScopeClaims(t *testing.T) {

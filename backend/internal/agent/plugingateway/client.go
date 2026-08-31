@@ -34,7 +34,6 @@ const (
 var (
 	resourceID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 	familyID   = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
-	fixedCode  = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	errGateway = errors.New("PLUGIN_GATEWAY_REJECTED")
 )
 
@@ -42,15 +41,23 @@ type Spool interface {
 	Append(context.Context, spool.DataClass, spool.Batch) error
 }
 
+type spoolLookup interface {
+	Lookup(context.Context, spool.DataClass, string, []byte) (found bool, matches bool, err error)
+}
+
 type ClientConfig struct {
 	RuntimeRoot string
+	CursorRoot  string
 	Scope       MetricScope
 	Store       Spool
 	Timeout     time.Duration
 	Now         func() time.Time
 }
 
-type Client struct{ config ClientConfig }
+type Client struct {
+	config  ClientConfig
+	cursors *CursorStore
+}
 
 // MetricSink returns the Agent-owned durable spool configured for this
 // client. It is deliberately exposed only as the narrow append interface so
@@ -116,13 +123,11 @@ type Session struct {
 	handshaken            bool
 	configurationRevision uint64
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
-	lastSequence          map[string]uint64
-	lastTimestamp         map[string]time.Time
-	lastDigest            map[string]string
+	handshakeCapabilities []string
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
-	if !filepath.IsAbs(config.RuntimeRoot) || filepath.Clean(config.RuntimeRoot) != config.RuntimeRoot || config.Scope.validateAgent() != nil || config.Timeout < 0 || config.Timeout > time.Minute {
+	if !filepath.IsAbs(config.RuntimeRoot) || filepath.Clean(config.RuntimeRoot) != config.RuntimeRoot || !filepath.IsAbs(config.CursorRoot) || filepath.Clean(config.CursorRoot) != config.CursorRoot || config.Scope.validateAgent() != nil || config.Timeout < 0 || config.Timeout > time.Minute {
 		return nil, errGateway
 	}
 	if config.Timeout == 0 {
@@ -131,14 +136,18 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Client{config: config}, nil
+	cursors, err := NewCursorStore(config.CursorRoot)
+	if err != nil {
+		return nil, errGateway
+	}
+	return &Client{config: config, cursors: cursors}, nil
 }
 
 func (client *Client) Open(expected ExpectedPlugin) (*Session, error) {
 	if client == nil || client.config.Scope.validateAgent() != nil || validateExpected(client.config.RuntimeRoot, expected) != nil {
 		return nil, errGateway
 	}
-	return &Session{client: client, expected: cloneExpected(expected), lastSequence: map[string]uint64{}, lastTimestamp: map[string]time.Time{}, lastDigest: map[string]string{}}, nil
+	return &Session{client: client, expected: cloneExpected(expected)}, nil
 }
 
 func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) (Capabilities, error) {
@@ -167,6 +176,7 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 	}
 	session.mu.Lock()
 	session.handshaken = true
+	session.handshakeCapabilities = append([]string(nil), result.Capabilities...)
 	session.mu.Unlock()
 	return result, nil
 }
@@ -186,16 +196,10 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 		return responseErr
 	}
 	session.mu.Lock()
-	changed := session.configurationRevision != configuration.ConfigurationRevision
 	session.configurationRevision = configuration.ConfigurationRevision
 	session.instances = make(map[string]*pluginv1.PluginInstanceConfiguration, len(configuration.Instances))
 	for _, instance := range configuration.Instances {
 		session.instances[instance.GetInstanceId()] = proto.Clone(instance).(*pluginv1.PluginInstanceConfiguration)
-	}
-	if changed {
-		session.lastSequence = map[string]uint64{}
-		session.lastTimestamp = map[string]time.Time{}
-		session.lastDigest = map[string]string{}
 	}
 	session.mu.Unlock()
 	return nil
@@ -235,10 +239,10 @@ func (session *Session) ValidateInstance(ctx context.Context, instanceID string)
 	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.ValidateInstance(callContext, &pluginv1.ValidatePluginInstanceRequest{AssignmentId: session.expected.AssignmentID, InstanceId: instanceID, ConfigurationRevision: session.currentRevision()})
 		capabilities, databaseVersion, databaseEdition := boundedSorted(response.GetCapabilities(), 64), boundedText(response.GetDatabaseVersion(), 128), boundedText(response.GetDatabaseEdition(), 128)
-		if err != nil || response.GetInstanceId() != instanceID || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersion() != "" && databaseVersion == "" || response.GetDatabaseEdition() != "" && databaseEdition == "" || (response.GetErrorCode() != "" && !fixedCode.MatchString(response.GetErrorCode())) {
+		if err != nil || response.GetInstanceId() != instanceID || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersion() != "" && databaseVersion == "" || response.GetDatabaseEdition() != "" && databaseEdition == "" {
 			return errGateway
 		}
-		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: databaseVersion, DatabaseEdition: databaseEdition, Capabilities: capabilities, ErrorCode: response.GetErrorCode()}
+		result = ValidationResult{InstanceID: response.GetInstanceId(), Valid: response.GetValid(), DatabaseVersion: databaseVersion, DatabaseEdition: databaseEdition, Capabilities: intersectCapabilities(capabilities, session.handshakeCapabilities), ErrorCode: fixedPluginCode(response.GetErrorCode())}
 		return nil
 	})
 	return result, err
@@ -250,10 +254,19 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 	}
 	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.CollectNow(callContext, &pluginv1.CollectPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), InstanceIds: append([]string(nil), instanceIDs...), TemplateIds: append([]string(nil), templateIDs...)})
-		if err != nil || len(response.GetBatches()) > maxGatewayMembers {
+		if err != nil || len(response.GetBatches()) != len(instanceIDs)*len(templateIDs) {
 			return errGateway
 		}
+		seen := make(map[string]struct{}, len(response.GetBatches()))
 		for _, batch := range response.GetBatches() {
+			if batch == nil || !contains(instanceIDs, batch.GetInstanceId()) || !contains(templateIDs, batch.GetTemplateId()) {
+				return errGateway
+			}
+			key := batch.GetInstanceId() + "\x00" + batch.GetTemplateId()
+			if _, duplicate := seen[key]; duplicate {
+				return errGateway
+			}
+			seen[key] = struct{}{}
 			if err := session.appendBatch(callContext, batch, session.client.config.Store); err != nil {
 				return err
 			}
@@ -274,10 +287,10 @@ func (session *Session) RunMetricStream(ctx context.Context, sink MetricSink) er
 		for {
 			batch, receiveErr := stream.Recv()
 			if errors.Is(receiveErr, io.EOF) {
-				return nil
+				return errGateway
 			}
 			if receiveErr != nil {
-				return receiveErr
+				return errGateway
 			}
 			if err := session.appendBatch(callContext, batch, sink); err != nil {
 				return err
@@ -300,46 +313,75 @@ func (session *Session) Shutdown(ctx context.Context, timeout time.Duration) err
 }
 
 func (session *Session) appendBatch(ctx context.Context, batch *pluginv1.PluginMetricBatch, sink MetricSink) error {
-	if sink == nil {
+	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || session.client == nil || session.client.cursors == nil {
 		return errGateway
 	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !session.isBatchConfigured(batch) {
+		return errGateway
+	}
+	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.configurationRevision, TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
+	unlock := session.client.cursors.Lock(key)
+	defer unlock()
 	now := session.client.config.Now().UTC()
-	payload, id, err := normalizeBatch(batch, session.metricScope(), now)
+	payload, id, err := normalizeBatch(batch, session.metricScope(batch), now)
 	if err != nil {
 		return errGateway
 	}
 	digest := sha256.Sum256(payload)
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	configured := session.instances[batch.GetInstanceId()]
-	if configured == nil || configured.GetDatabaseVariant() != batch.GetDatabaseVariant() || batch.GetConfigurationRevision() != session.configurationRevision {
+	cursor, err := session.client.cursors.Load(key)
+	if err != nil || batch.GetSequence() < cursor.Sequence || (!cursor.CollectedAt.IsZero() && batch.GetSequence() > cursor.Sequence && batch.GetCollectedAt().AsTime().UTC().Before(cursor.CollectedAt)) {
 		return errGateway
 	}
-	instanceID := batch.GetInstanceId()
-	if batch.GetSequence() < session.lastSequence[instanceID] || (!session.lastTimestamp[instanceID].IsZero() && batch.GetCollectedAt().AsTime().UTC().Before(session.lastTimestamp[instanceID])) {
-		return errGateway
-	}
-	if batch.GetSequence() == session.lastSequence[instanceID] {
-		if session.lastDigest[instanceID] == hex.EncodeToString(digest[:]) {
+	if batch.GetSequence() == cursor.Sequence {
+		if equalBytes(digest[:], cursor.Digest) {
 			return nil
 		}
 		return errGateway
 	}
+	if existing, ok := sink.(spoolLookup); ok {
+		found, matches, lookupErr := existing.Lookup(ctx, spool.Metric, id, payload)
+		if lookupErr != nil || (found && !matches) {
+			return errGateway
+		}
+		if found {
+			return session.client.cursors.Commit(key, batch.GetSequence(), digest[:], batch.GetCollectedAt().AsTime().UTC())
+		}
+	}
 	if err := sink.Append(ctx, spool.Metric, spool.Batch{ID: id, SourceID: pluginMetricSourceID + ":" + session.expected.AssignmentID + ":" + batch.GetInstanceId(), CreatedAt: now, Priority: 1, Payload: payload}); err != nil {
 		return err
 	}
-	session.lastSequence[instanceID] = batch.GetSequence()
-	session.lastTimestamp[instanceID] = batch.GetCollectedAt().AsTime().UTC()
-	session.lastDigest[instanceID] = hex.EncodeToString(digest[:])
-	return nil
+	return session.client.cursors.Commit(key, batch.GetSequence(), digest[:], batch.GetCollectedAt().AsTime().UTC())
 }
 
-func (session *Session) metricScope() MetricScope {
+func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) bool {
+	if batch == nil || batch.GetPluginId() != session.expected.PluginID || batch.GetPluginVersion() != session.expected.Version || batch.GetDatabaseFamily() != session.expected.DatabaseFamily || batch.GetConfigurationRevision() != session.configurationRevision || !contains(session.expected.TemplateIDs, batch.GetTemplateId()) {
+		return false
+	}
+	configured := session.instances[batch.GetInstanceId()]
+	if configured == nil || batch.GetDatabaseVariant() != configured.GetDatabaseVariant() {
+		return false
+	}
+	for _, template := range configured.GetTemplates() {
+		if template != nil && template.GetTemplateId() == batch.GetTemplateId() && template.GetRevision() == batch.GetTemplateRevision() {
+			return true
+		}
+	}
+	return false
+}
+
+func (session *Session) metricScope(batch *pluginv1.PluginMetricBatch) MetricScope {
 	scope := session.client.config.Scope
 	scope.AssignmentID = session.expected.AssignmentID
 	scope.InstanceIDs = append([]string(nil), session.expected.InstanceIDs...)
 	scope.TemplateIDs = append([]string(nil), session.expected.TemplateIDs...)
 	scope.DatabaseFamily = session.expected.DatabaseFamily
+	scope.PluginID = session.expected.PluginID
+	scope.PluginVersion = session.expected.Version
+	scope.ConfigurationRevision = session.configurationRevision
+	scope.DatabaseVariant = session.instances[batch.GetInstanceId()].GetDatabaseVariant()
+	scope.TemplateRevision = batch.GetTemplateRevision()
 	return scope
 }
 func (session *Session) isHandshaken() bool {
@@ -386,6 +428,16 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 	for _, instance := range configuration.Instances {
 		if instance == nil || !contains(expected.InstanceIDs, instance.GetInstanceId()) || instance.GetInstanceId() == "" || !family(instance.GetDatabaseVariant()) || (instance.GetEndpoint() == "" && instance.GetUnixSocket() == "") || (instance.GetEndpoint() != "" && instance.GetUnixSocket() != "") || len(instance.GetTemplates()) > maxGatewayMembers {
 			return errGateway
+		}
+		templates := map[string]struct{}{}
+		for _, template := range instance.GetTemplates() {
+			if template == nil || !contains(expected.TemplateIDs, template.GetTemplateId()) || template.GetRevision() == 0 {
+				return errGateway
+			}
+			if _, duplicate := templates[template.GetTemplateId()]; duplicate {
+				return errGateway
+			}
+			templates[template.GetTemplateId()] = struct{}{}
 		}
 		if _, duplicate := seen[instance.GetInstanceId()]; duplicate {
 			return errGateway
@@ -484,6 +536,15 @@ func boundedText(value string, max int) string {
 		return ""
 	}
 	return value
+}
+func intersectCapabilities(values, allowed []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if contains(allowed, value) {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 func identifier(value string) bool { return resourceID.MatchString(value) }
 func family(value string) bool     { return familyID.MatchString(value) }

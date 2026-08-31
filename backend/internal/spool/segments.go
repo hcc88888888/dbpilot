@@ -1,6 +1,7 @@
 package spool
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -119,6 +120,28 @@ func (s *Store) Append(ctx context.Context, class DataClass, batch Batch) error 
 		}
 	}
 	return nil
+}
+
+// Lookup returns whether a pending batch has the supplied logical identity
+// and whether its durable payload exactly matches. Gateway cursor recovery
+// uses this after a crash between Append and its own cursor fsync.
+func (s *Store) Lookup(ctx context.Context, class DataClass, id string, payload []byte) (bool, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, false, err
+	}
+	if !validClass(class) || id == "" {
+		return false, false, fmt.Errorf("invalid spool lookup")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return false, false, ErrClosed
+	}
+	item := s.find(class, id)
+	if item == nil {
+		return false, false, nil
+	}
+	return true, bytes.Equal(item.batch.Payload, payload), nil
 }
 
 // Pending returns the oldest unacknowledged batches of a data class.

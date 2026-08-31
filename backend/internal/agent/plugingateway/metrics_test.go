@@ -18,7 +18,7 @@ func TestNormalizeBatchInjectsAuthoritativeScope(t *testing.T) {
 		CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED,
 		Samples:          []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "{connections}", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: map[string]string{"role": "primary"}, SampledAt: timestamppb.New(now)}},
 	}
-	payload, id, err := normalizeBatch(batch, MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql"}, now)
+	payload, id, err := normalizeBatch(batch, MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}, now)
 	require.NoError(t, err)
 	require.NotEmpty(t, payload)
 	require.Contains(t, id, "plugin-metrics-v1-")
@@ -29,7 +29,7 @@ func TestNormalizeBatchRejectsPluginScopeAndInvalidValues(t *testing.T) {
 	base := func() *pluginv1.PluginMetricBatch {
 		return &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "builtin", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 1, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
 	}
-	scope := MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql"}
+	scope := MetricScope{TenantID: "tenant-1", ProjectID: "project-1", AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}
 
 	reserved := base()
 	reserved.Samples[0].Labels = map[string]string{"tenant.id": "forged"}
@@ -50,7 +50,12 @@ func TestNormalizeBatchRejectsPluginScopeAndInvalidValues(t *testing.T) {
 func TestNormalizeBatchPreservesFailedZeroSampleCollectionAsStatusMetric(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "builtin", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_FAILED, ErrorCode: "instance_unreachable"}
-	payload, _, err := NormalizeBatch(batch, MetricScope{AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql"}, now)
+	payload, _, err := NormalizeBatch(batch, MetricScope{AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}, now)
 	require.NoError(t, err)
 	require.NotEmpty(t, payload)
+}
+
+func TestFixedPluginCodeNeverLeaksPluginVocabulary(t *testing.T) {
+	require.Equal(t, "waiting_templates", fixedPluginCode("waiting_templates"))
+	require.Equal(t, "plugin_failed", fixedPluginCode("plugin says: secret=do-not-log"))
 }

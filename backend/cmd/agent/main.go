@@ -473,7 +473,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			return errors.New("configure plugin artifact downloader")
 		}
 		pluginLeases = &deferredPluginLeaseClient{}
-		pluginGateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: pluginRuntimeRoot, Scope: plugingateway.MetricScope{AgentID: settings.AgentID, HostID: settings.HostID}, Store: store, Timeout: 15 * time.Second})
+		pluginGateway, gatewayErr := plugingateway.NewClient(plugingateway.ClientConfig{RuntimeRoot: pluginRuntimeRoot, CursorRoot: filepath.Join(pluginStateRoot, "gateway-cursors"), Scope: plugingateway.MetricScope{AgentID: settings.AgentID, HostID: settings.HostID}, Store: store, Timeout: 15 * time.Second})
 		if gatewayErr != nil {
 			_ = store.Close()
 			return errors.New("configure plugin gateway")
