@@ -27,9 +27,8 @@ import (
 )
 
 const (
-	maxRPCMessageBytes   = 1 << 20
-	maxAssignedInstances = 1024
-	maxAssignedTemplates = 1024
+	maxRPCMessageBytes = 1 << 20
+	maxGatewayMembers  = 128
 )
 
 var (
@@ -230,7 +229,7 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 	}
 	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		response, err := client.CollectNow(callContext, &pluginv1.CollectPluginMetricsRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), InstanceIds: append([]string(nil), instanceIDs...), TemplateIds: append([]string(nil), templateIDs...)})
-		if err != nil || len(response.GetBatches()) > maxAssignedInstances {
+		if err != nil || len(response.GetBatches()) > maxGatewayMembers {
 			return errGateway
 		}
 		for _, batch := range response.GetBatches() {
@@ -313,6 +312,7 @@ func (session *Session) metricScope() MetricScope {
 	scope := session.client.config.Scope
 	scope.AssignmentID = session.expected.AssignmentID
 	scope.InstanceIDs = append([]string(nil), session.expected.InstanceIDs...)
+	scope.TemplateIDs = append([]string(nil), session.expected.TemplateIDs...)
 	scope.DatabaseFamily = session.expected.DatabaseFamily
 	return scope
 }
@@ -358,7 +358,7 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 	}
 	seen := map[string]struct{}{}
 	for _, instance := range configuration.Instances {
-		if instance == nil || !contains(expected.InstanceIDs, instance.GetInstanceId()) || instance.GetInstanceId() == "" || !family(instance.GetDatabaseVariant()) || (instance.GetEndpoint() == "" && instance.GetUnixSocket() == "") || (instance.GetEndpoint() != "" && instance.GetUnixSocket() != "") || len(instance.GetTemplates()) > maxAssignedTemplates {
+		if instance == nil || !contains(expected.InstanceIDs, instance.GetInstanceId()) || instance.GetInstanceId() == "" || !family(instance.GetDatabaseVariant()) || (instance.GetEndpoint() == "" && instance.GetUnixSocket() == "") || (instance.GetEndpoint() != "" && instance.GetUnixSocket() != "") || len(instance.GetTemplates()) > maxGatewayMembers {
 			return errGateway
 		}
 		if _, duplicate := seen[instance.GetInstanceId()]; duplicate {
@@ -409,7 +409,7 @@ func launchProof(nonce, challenge []byte, assignment, version string, configurat
 
 func validateExpected(root string, expected ExpectedPlugin) error {
 	expectedSocket := filepath.Join(root, expected.DatabaseFamily, "plugin.sock")
-	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxAssignedInstances || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) > maxAssignedTemplates || !unique(expected.TemplateIDs) || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
+	if expected.PID <= 0 || expected.ExpectedUserID == 0 || expected.ExpectedGroupID == 0 || !resourceID.MatchString(expected.AssignmentID) || !family(expected.PluginID) || !family(expected.DatabaseFamily) || !version(expected.Version) || expected.ProtocolVersion != "v1" || len(expected.ExecutableSHA256) != sha256.Size || !filepath.IsAbs(expected.ExecutablePath) || filepath.Clean(expected.ExecutablePath) != expected.ExecutablePath || len(expected.LaunchNonce) != sha256.Size || expected.ConfigurationRevision == 0 || expected.OperationRevision == 0 || len(expected.InstanceIDs) == 0 || len(expected.InstanceIDs) > maxGatewayMembers || !unique(expected.InstanceIDs) || len(expected.TemplateIDs) == 0 || len(expected.TemplateIDs) > maxGatewayMembers || !unique(expected.TemplateIDs) || expected.RuntimeDirectory != filepath.Join(root, expected.DatabaseFamily) || filepath.Join(expected.RuntimeDirectory, "plugin.sock") != expectedSocket {
 		return errGateway
 	}
 	return nil

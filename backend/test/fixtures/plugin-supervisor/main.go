@@ -122,6 +122,10 @@ func (server *runtimeServer) GetHealth(_ context.Context, request *pluginv1.GetP
 	return &pluginv1.PluginHealth{AssignmentId: server.assignmentID, State: pluginv1.PluginHealthState_PLUGIN_HEALTH_STATE_HEALTHY, ActiveConfigurationRevision: server.configurationRevision, BoundInstanceCount: uint32(len(instances)), Instances: instances, ObservedAt: timestamppb.Now()}, nil
 }
 
+func (*runtimeServer) Shutdown(context.Context, *pluginv1.ShutdownPluginRequest) (*pluginv1.ShutdownPluginResponse, error) {
+	return &pluginv1.ShutdownPluginResponse{Drained: true}, nil
+}
+
 func arguments(values []string) (map[string]string, bool) {
 	if len(values) == 0 || len(values)%2 != 0 {
 		return nil, false

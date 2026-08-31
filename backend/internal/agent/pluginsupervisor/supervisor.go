@@ -459,6 +459,15 @@ func (supervisor *PluginSupervisor) drainProcess(ctx context.Context, process *m
 	process.expected.Store(true)
 	drainContext, cancel := context.WithTimeout(ctx, supervisor.drainTimeout)
 	defer cancel()
+	if gateway, ok := supervisor.health.(interface {
+		Shutdown(context.Context, Process, time.Duration) error
+	}); ok {
+		// A configured private Gateway must complete its bounded shutdown before
+		// the Supervisor signals the process.
+		if err := gateway.Shutdown(drainContext, process.process, supervisor.drainTimeout); err != nil {
+			return err
+		}
+	}
 	if err := process.process.Drain(drainContext); err != nil {
 		if killErr := process.process.Kill(); killErr != nil {
 			return killErr

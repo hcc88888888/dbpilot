@@ -1,8 +1,6 @@
 package plugingateway
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -45,11 +43,12 @@ type MetricScope struct {
 	HostID         string
 	AssignmentID   string
 	InstanceIDs    []string
+	TemplateIDs    []string
 	DatabaseFamily string
 }
 
 func (scope MetricScope) validate() error {
-	if scope.validateAgent() != nil || !identifier(scope.AssignmentID) || !family(scope.DatabaseFamily) || len(scope.InstanceIDs) == 0 || len(scope.InstanceIDs) > maxAssignedInstances || !unique(scope.InstanceIDs) {
+	if scope.validateAgent() != nil || !identifier(scope.AssignmentID) || !family(scope.DatabaseFamily) || len(scope.InstanceIDs) == 0 || len(scope.InstanceIDs) > maxGatewayMembers || !unique(scope.InstanceIDs) || len(scope.TemplateIDs) == 0 || len(scope.TemplateIDs) > maxGatewayMembers || !unique(scope.TemplateIDs) {
 		return errInvalidMetric
 	}
 	return nil
@@ -71,13 +70,17 @@ func (scope MetricScope) permitsInstance(instanceID string) bool {
 	return false
 }
 
+func (scope MetricScope) permitsTemplate(templateID string) bool {
+	return contains(scope.TemplateIDs, templateID)
+}
+
 var errInvalidMetric = errors.New("PLUGIN_METRIC_REJECTED")
 
 // normalizeBatch converts only strictly validated plugin observations to an
 // Agent-owned OTLP payload. The identifier is derived from canonical payload
 // bytes, so the spool's (class,id) idempotency remains stable after reconnects.
 func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now time.Time) ([]byte, string, error) {
-	if batch == nil || scope.validate() != nil || !family(batch.GetPluginId()) || !family(batch.GetDatabaseFamily()) || batch.GetDatabaseFamily() != scope.DatabaseFamily || !version(batch.GetPluginVersion()) || !family(batch.GetDatabaseVariant()) || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() == 0 || !identifier(batch.GetTemplateId()) || batch.GetTemplateRevision() == 0 || batch.GetSequence() == 0 || len(batch.GetSamples()) == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED {
+	if batch == nil || scope.validate() != nil || !family(batch.GetPluginId()) || !family(batch.GetDatabaseFamily()) || batch.GetDatabaseFamily() != scope.DatabaseFamily || !version(batch.GetPluginVersion()) || !family(batch.GetDatabaseVariant()) || !scope.permitsInstance(batch.GetInstanceId()) || batch.GetConfigurationRevision() == 0 || !identifier(batch.GetTemplateId()) || !scope.permitsTemplate(batch.GetTemplateId()) || batch.GetTemplateRevision() == 0 || batch.GetSequence() == 0 || len(batch.GetSamples()) == 0 || len(batch.GetSamples()) > maxPluginSamples || batch.GetCollectionStatus() == pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_UNSPECIFIED {
 		return nil, "", errInvalidMetric
 	}
 	collectedAt := batch.GetCollectedAt()
@@ -92,19 +95,22 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 	metrics := pmetric.NewMetrics()
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
 	resource := resourceMetrics.Resource().Attributes()
-	resource.PutStr("tenant.id", scope.TenantID)
-	resource.PutStr("project.id", scope.ProjectID)
-	resource.PutStr("agent.id", scope.AgentID)
-	resource.PutStr("host.id", scope.HostID)
-	resource.PutStr("assignment.id", scope.AssignmentID)
-	resource.PutStr("instance.id", batch.GetInstanceId())
-	resource.PutStr("database.family", scope.DatabaseFamily)
-	resource.PutStr("database.variant", batch.GetDatabaseVariant())
-	resource.PutStr("plugin.id", batch.GetPluginId())
-	resource.PutStr("plugin.version", batch.GetPluginVersion())
-	resource.PutStr("template.id", batch.GetTemplateId())
-	resource.PutInt("template.revision", int64(batch.GetTemplateRevision()))
-	resource.PutInt("plugin.sequence", int64(batch.GetSequence()))
+	// The Server deliberately rejects tenant/project claims in telemetry. Scope
+	// is resolved from the authenticated Agent envelope there; only the
+	// allowlisted operational dimensions below are Agent-owned.
+	resource.PutStr("host.name", scope.HostID)
+	resource.PutStr("service.name", "dbpilot-plugin-"+scope.DatabaseFamily)
+	resource.PutStr("service.instance.id", batch.GetInstanceId())
+	resource.PutStr("db.system", scope.DatabaseFamily)
+	resource.PutStr("dbpilot.source.id", pluginMetricSourceID+":"+scope.AssignmentID)
+	resource.PutStr("assignment_id", scope.AssignmentID)
+	resource.PutStr("configuration_revision", fmt.Sprintf("%d", batch.GetConfigurationRevision()))
+	resource.PutStr("template_id", batch.GetTemplateId())
+	resource.PutStr("template_revision", fmt.Sprintf("%d", batch.GetTemplateRevision()))
+	resource.PutStr("plugin_id", batch.GetPluginId())
+	resource.PutStr("plugin_version", batch.GetPluginVersion())
+	resource.PutStr("database_variant", batch.GetDatabaseVariant())
+	resource.PutStr("plugin_sequence", fmt.Sprintf("%d", batch.GetSequence()))
 	scopeMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
 	scopeMetrics.Scope().SetName("dbpilot.plugin-runtime")
 
@@ -174,8 +180,17 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 	if err != nil || len(payload) == 0 || len(payload) > maxRPCMessageBytes {
 		return nil, "", errInvalidMetric
 	}
-	digest := sha256.Sum256(payload)
-	return payload, "plugin-metrics-v1-" + hex.EncodeToString(digest[:]), nil
+	return payload, canonicalBatchID(scope.AssignmentID, batch.GetConfigurationRevision(), batch.GetTemplateId(), batch.GetInstanceId(), batch.GetSequence()), nil
+}
+
+// NormalizeBatch is the Server-compatible, Agent-owned metric envelope
+// boundary. It never carries tenant/project claims from a plugin.
+func NormalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now time.Time) ([]byte, string, error) {
+	return normalizeBatch(batch, scope, now)
+}
+
+func canonicalBatchID(assignmentID string, configurationRevision uint64, templateID, instanceID string, sequence uint64) string {
+	return fmt.Sprintf("plugin-metrics-v1-%s-%d-%s-%s-%d", assignmentID, configurationRevision, templateID, instanceID, sequence)
 }
 
 func validateSample(sample *pluginv1.PluginMetricSample, collected, now time.Time) error {

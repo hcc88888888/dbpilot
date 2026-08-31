@@ -8,13 +8,16 @@ import (
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/alert"
 	"dbpilot.local/platform/internal/controlplane"
 	"dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestMetricConsumerRejectsPayloadScopeClaim(t *testing.T) {
@@ -76,6 +79,20 @@ func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
 	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
 	require.Equal(t, "agent-a", store.samples[0].AgentID)
 	require.Equal(t, "postgres-1.internal", store.samples[0].Host)
+}
+
+func TestMetricConsumerAcceptsAgentNormalizedPluginOTLP(t *testing.T) {
+	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
+	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "template-1", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
+	payload, _, err := plugingateway.NormalizeBatch(batch, plugingateway.MetricScope{TenantID: "t1", ProjectID: "p1", AgentID: "agent-a", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"template-1"}, DatabaseFamily: "mysql"}, now)
+	require.NoError(t, err)
+	store := &recordingStore{}
+	consumer := controlplane.NewMetricConsumer(resolverFor("agent-a", alert.Scope{TenantID: "t1", ProjectID: "p1"}), store)
+	require.NoError(t, consumer.ConsumeMetricBatch(context.Background(), "agent-a", payload, now))
+	require.Len(t, store.samples, 1)
+	require.Equal(t, alert.Scope{TenantID: "t1", ProjectID: "p1"}, store.samples[0].Scope)
+	require.Equal(t, "agent-a", store.samples[0].AgentID)
+	require.Equal(t, "mysql-1", store.samples[0].InstanceID)
 }
 
 func TestMetricConsumerRejectsOTLPScopeClaims(t *testing.T) {
