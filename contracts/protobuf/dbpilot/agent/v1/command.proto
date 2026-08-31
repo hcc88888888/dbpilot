@@ -269,6 +269,8 @@ message CredentialLeaseRequest {
   string instance_id = 2;
   string assignment_id = 3;
   uint64 configuration_revision = 4;
+  string database_family = 5;
+  uint64 operation_revision = 6;
 }
 
 message CredentialLeaseResponse {
@@ -279,6 +281,9 @@ message CredentialLeaseResponse {
   uint64 credential_revision = 5;
   google.protobuf.Timestamp expires_at = 6;
   CredentialMaterial credential = 7;
+  string database_family = 8;
+  uint64 configuration_revision = 9;
+  uint64 operation_revision = 10;
 }
 
 message CredentialMaterial {

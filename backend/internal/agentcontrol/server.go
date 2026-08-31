@@ -390,7 +390,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 		}
 	case *agentv1.AgentMessage_CredentialLeaseRequest:
 		request := typed.CredentialLeaseRequest
-		if request == nil || len(request.GetRequestNonce()) != credentiallease.RequestNonceBytes || !s.registry.Supports(agentID, "plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1", "credential_lease.v1") {
+		if request == nil || len(request.GetRequestNonce()) != credentiallease.RequestNonceBytes || request.GetDatabaseFamily() == "" || request.GetOperationRevision() == 0 || !s.registry.Supports(agentID, "plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1", "credential_lease.v1") {
 			return status.Error(codes.InvalidArgument, "credential lease request is invalid")
 		}
 		session, ok := s.registry.Session(agentID)
@@ -413,7 +413,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 }
 
 func validCredentialLeaseResponse(response *agentv1.CredentialLeaseResponse, request *agentv1.CredentialLeaseRequest, now time.Time) bool {
-	if response == nil || request == nil || len(response.GetRequestNonce()) != credentiallease.RequestNonceBytes || subtle.ConstantTimeCompare(response.GetRequestNonce(), request.GetRequestNonce()) != 1 || response.GetLeaseId() == "" || len(response.GetLeaseId()) > 128 || response.GetInstanceId() != request.GetInstanceId() || response.GetAssignmentId() != request.GetAssignmentId() || response.GetCredentialRevision() == 0 || response.GetExpiresAt() == nil || !response.GetExpiresAt().IsValid() || !response.GetExpiresAt().AsTime().After(now) || response.GetExpiresAt().AsTime().After(now.Add(credentiallease.MaximumLeaseTTL)) || response.GetCredential() == nil || len(response.GetCredential().GetUsername()) > credentiallease.MaximumUsernameBytes || len(response.GetCredential().GetSecretBytes()) == 0 || len(response.GetCredential().GetSecretBytes()) > credentiallease.MaximumSecretBytes || proto.Size(response) > credentiallease.MaximumSecretBytes+(4<<10) {
+	if response == nil || request == nil || len(response.GetRequestNonce()) != credentiallease.RequestNonceBytes || subtle.ConstantTimeCompare(response.GetRequestNonce(), request.GetRequestNonce()) != 1 || response.GetLeaseId() == "" || len(response.GetLeaseId()) > 128 || response.GetInstanceId() != request.GetInstanceId() || response.GetAssignmentId() != request.GetAssignmentId() || response.GetDatabaseFamily() != request.GetDatabaseFamily() || response.GetConfigurationRevision() != request.GetConfigurationRevision() || response.GetOperationRevision() != request.GetOperationRevision() || response.GetCredentialRevision() == 0 || response.GetExpiresAt() == nil || !response.GetExpiresAt().IsValid() || !response.GetExpiresAt().AsTime().After(now) || response.GetExpiresAt().AsTime().After(now.Add(credentiallease.MaximumLeaseTTL)) || response.GetCredential() == nil || len(response.GetCredential().GetUsername()) > credentiallease.MaximumUsernameBytes || len(response.GetCredential().GetSecretBytes()) == 0 || len(response.GetCredential().GetSecretBytes()) > credentiallease.MaximumSecretBytes || proto.Size(response) > credentiallease.MaximumSecretBytes+(4<<10) {
 		return false
 	}
 	return true

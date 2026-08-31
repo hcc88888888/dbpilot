@@ -2510,6 +2510,8 @@ type CredentialLeaseRequest struct {
 	InstanceId            string                 `protobuf:"bytes,2,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
 	AssignmentId          string                 `protobuf:"bytes,3,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
 	ConfigurationRevision uint64                 `protobuf:"varint,4,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	DatabaseFamily        string                 `protobuf:"bytes,5,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	OperationRevision     uint64                 `protobuf:"varint,6,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -2572,17 +2574,34 @@ func (x *CredentialLeaseRequest) GetConfigurationRevision() uint64 {
 	return 0
 }
 
+func (x *CredentialLeaseRequest) GetDatabaseFamily() string {
+	if x != nil {
+		return x.DatabaseFamily
+	}
+	return ""
+}
+
+func (x *CredentialLeaseRequest) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
+}
+
 type CredentialLeaseResponse struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	RequestNonce       []byte                 `protobuf:"bytes,1,opt,name=request_nonce,json=requestNonce,proto3" json:"request_nonce,omitempty"`
-	LeaseId            string                 `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
-	InstanceId         string                 `protobuf:"bytes,3,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
-	AssignmentId       string                 `protobuf:"bytes,4,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
-	CredentialRevision uint64                 `protobuf:"varint,5,opt,name=credential_revision,json=credentialRevision,proto3" json:"credential_revision,omitempty"`
-	ExpiresAt          *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
-	Credential         *CredentialMaterial    `protobuf:"bytes,7,opt,name=credential,proto3" json:"credential,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RequestNonce          []byte                 `protobuf:"bytes,1,opt,name=request_nonce,json=requestNonce,proto3" json:"request_nonce,omitempty"`
+	LeaseId               string                 `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	InstanceId            string                 `protobuf:"bytes,3,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	AssignmentId          string                 `protobuf:"bytes,4,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	CredentialRevision    uint64                 `protobuf:"varint,5,opt,name=credential_revision,json=credentialRevision,proto3" json:"credential_revision,omitempty"`
+	ExpiresAt             *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	Credential            *CredentialMaterial    `protobuf:"bytes,7,opt,name=credential,proto3" json:"credential,omitempty"`
+	DatabaseFamily        string                 `protobuf:"bytes,8,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	ConfigurationRevision uint64                 `protobuf:"varint,9,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	OperationRevision     uint64                 `protobuf:"varint,10,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *CredentialLeaseResponse) Reset() {
@@ -2662,6 +2681,27 @@ func (x *CredentialLeaseResponse) GetCredential() *CredentialMaterial {
 		return x.Credential
 	}
 	return nil
+}
+
+func (x *CredentialLeaseResponse) GetDatabaseFamily() string {
+	if x != nil {
+		return x.DatabaseFamily
+	}
+	return ""
+}
+
+func (x *CredentialLeaseResponse) GetConfigurationRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationRevision
+	}
+	return 0
+}
+
+func (x *CredentialLeaseResponse) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
 }
 
 type CredentialMaterial struct {
@@ -3726,13 +3766,15 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12!\n" +
 	"\finstance_ids\x18\x03 \x03(\tR\vinstanceIds\x12!\n" +
-	"\ftemplate_ids\x18\x04 \x03(\tR\vtemplateIds\"\xba\x01\n" +
+	"\ftemplate_ids\x18\x04 \x03(\tR\vtemplateIds\"\x92\x02\n" +
 	"\x16CredentialLeaseRequest\x12#\n" +
 	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
 	"instanceId\x12#\n" +
 	"\rassignment_id\x18\x03 \x01(\tR\fassignmentId\x125\n" +
-	"\x16configuration_revision\x18\x04 \x01(\x04R\x15configurationRevision\"\xd1\x02\n" +
+	"\x16configuration_revision\x18\x04 \x01(\x04R\x15configurationRevision\x12'\n" +
+	"\x0fdatabase_family\x18\x05 \x01(\tR\x0edatabaseFamily\x12-\n" +
+	"\x12operation_revision\x18\x06 \x01(\x04R\x11operationRevision\"\xe0\x03\n" +
 	"\x17CredentialLeaseResponse\x12#\n" +
 	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x19\n" +
 	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x1f\n" +
@@ -3744,7 +3786,11 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"expires_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12D\n" +
 	"\n" +
 	"credential\x18\a \x01(\v2$.dbpilot.agent.v1.CredentialMaterialR\n" +
-	"credential\"S\n" +
+	"credential\x12'\n" +
+	"\x0fdatabase_family\x18\b \x01(\tR\x0edatabaseFamily\x125\n" +
+	"\x16configuration_revision\x18\t \x01(\x04R\x15configurationRevision\x12-\n" +
+	"\x12operation_revision\x18\n" +
+	" \x01(\x04R\x11operationRevision\"S\n" +
 	"\x12CredentialMaterial\x12\x1a\n" +
 	"\busername\x18\x01 \x01(\tR\busername\x12!\n" +
 	"\fsecret_bytes\x18\x02 \x01(\fR\vsecretBytes\"\xb6\x01\n" +

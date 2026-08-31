@@ -22,12 +22,23 @@ func TestCredentialLeaseRequestUsesAuthenticatedLiveSessionAndNeverCommandPersis
 	require.NotNil(t, stream.nextSent(t).GetHelloAck())
 	require.Eventually(t, func() bool { _, ok := registry.Session("agent-a"); return ok }, time.Second, time.Millisecond)
 	nonce := bytes.Repeat([]byte{0x44}, 32)
-	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CredentialLeaseRequest{CredentialLeaseRequest: &agentv1.CredentialLeaseRequest{RequestNonce: nonce, InstanceId: "instance-1", AssignmentId: "assignment-1", ConfigurationRevision: 5}}})
+	stream.push(&agentv1.AgentMessage{Message: &agentv1.AgentMessage_CredentialLeaseRequest{CredentialLeaseRequest: &agentv1.CredentialLeaseRequest{RequestNonce: nonce, InstanceId: "instance-1", AssignmentId: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7}}})
 	require.Equal(t, "lease-1", stream.nextSent(t).GetCredentialLeaseResponse().GetLeaseId())
 	require.Equal(t, "agent-a", issuer.agent.AgentID)
 	require.NotEmpty(t, issuer.agent.SessionID)
 	stream.closeReceive()
 	require.NoError(t, <-done)
+}
+
+func TestRegistryUnregisterDrainsAndZerosQueuedCredentialResponse(t *testing.T) {
+	registry := NewRegistry(4)
+	require.NoError(t, registry.register("agent-a", nil, nil, func() {}))
+	session, ok := registry.liveSession("agent-a")
+	require.True(t, ok)
+	secret := []byte("queued-secret")
+	require.NoError(t, registry.enqueue("agent-a", &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CredentialLeaseResponse{CredentialLeaseResponse: &agentv1.CredentialLeaseResponse{Credential: &agentv1.CredentialMaterial{SecretBytes: secret}}}}))
+	registry.unregister("agent-a", session)
+	require.Equal(t, make([]byte, len(secret)), secret)
 }
 
 type recordingCredentialLeaseIssuer struct {
@@ -36,5 +47,5 @@ type recordingCredentialLeaseIssuer struct {
 
 func (issuer *recordingCredentialLeaseIssuer) Issue(_ context.Context, agent credentiallease.AuthenticatedAgent, request *agentv1.CredentialLeaseRequest) (*agentv1.CredentialLeaseResponse, error) {
 	issuer.agent = agent
-	return &agentv1.CredentialLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), LeaseId: "lease-1", InstanceId: request.GetInstanceId(), AssignmentId: request.GetAssignmentId(), CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: []byte("fixture-password")}}, nil
+	return &agentv1.CredentialLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), LeaseId: "lease-1", InstanceId: request.GetInstanceId(), AssignmentId: request.GetAssignmentId(), DatabaseFamily: request.GetDatabaseFamily(), ConfigurationRevision: request.GetConfigurationRevision(), OperationRevision: request.GetOperationRevision(), CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: []byte("fixture-password")}}, nil
 }

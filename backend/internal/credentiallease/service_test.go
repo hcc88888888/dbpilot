@@ -92,8 +92,94 @@ func TestLeaseRejectsNonSecretReferenceAndChangedAuthorizationFence(t *testing.T
 	require.Zero(t, provider.calls)
 }
 
+func TestLeaseReauthorizesAfterBlockedProviderAndUsesFreshDatabaseTime(t *testing.T) {
+	initial := time.Now().UTC().Add(10 * time.Second)
+	clock := &mutableClock{now: initial}
+	authorizer := &testAuthorizer{grant: validGrant(initial)}
+	provider := &blockingProvider{started: make(chan struct{}), release: make(chan struct{}), credential: Credential{Username: "monitor", SecretBytes: []byte("blocked-provider-secret"), Revision: 11}}
+	service, err := NewService(Config{Authorizer: authorizer, Provider: provider, Clock: clock, Audit: &testAudit{}, TTL: time.Minute, Random: bytes.NewReader(bytes.Repeat([]byte{0x55}, 64))})
+	require.NoError(t, err)
+	result := make(chan error, 1)
+	go func() {
+		_, leaseErr := service.Lease(context.Background(), AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}, validRequest())
+		result <- leaseErr
+	}()
+	<-provider.started
+	authorizer.mu.Lock()
+	authorizer.grant.OperationRevision++
+	authorizer.mu.Unlock()
+	clock.mu.Lock()
+	clock.now = initial.Add(30 * time.Second)
+	clock.mu.Unlock()
+	close(provider.release)
+	require.ErrorIs(t, <-result, ErrLeaseRejected)
+	require.Equal(t, make([]byte, len(provider.returned)), provider.returned)
+	require.Equal(t, 2, authorizer.calls)
+}
+
+func TestNonceConflictPreservesExactReplayAndExpiredNonceIsTombstoned(t *testing.T) {
+	now := time.Now().UTC().Add(10 * time.Second)
+	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("nonce-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: 5 * time.Second, Random: bytes.NewReader(bytes.Repeat([]byte{0x66}, 64))})
+	require.NoError(t, err)
+	agent := AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}
+	first, err := service.Lease(context.Background(), agent, validRequest())
+	require.NoError(t, err)
+	conflict := validRequest()
+	conflict.InstanceID = "instance-2"
+	_, err = service.Lease(context.Background(), agent, conflict)
+	require.ErrorIs(t, err, ErrLeaseRejected)
+	replayed, err := service.Lease(context.Background(), agent, validRequest())
+	require.NoError(t, err)
+	require.Equal(t, first.ID, replayed.ID)
+	service.mu.Lock()
+	record := service.leases[agent.SessionID+"\x00"+string(validRequest().Nonce)]
+	record.lease.Release()
+	record.expired = true
+	service.mu.Unlock()
+	_, err = service.Lease(context.Background(), agent, validRequest())
+	require.ErrorIs(t, err, ErrLeaseRejected)
+	first.Release()
+	replayed.Release()
+}
+
+func TestServiceCloseZerosReadyAndBlockedProviderLeases(t *testing.T) {
+	now := time.Now().UTC().Add(10 * time.Second)
+	provider := &blockingProvider{started: make(chan struct{}), release: make(chan struct{}), credential: Credential{Username: "monitor", SecretBytes: []byte("close-secret"), Revision: 11}}
+	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: provider, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, Random: bytes.NewReader(bytes.Repeat([]byte{0x77}, 64))})
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() {
+		_, leaseErr := service.Lease(context.Background(), AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}, validRequest())
+		done <- leaseErr
+	}()
+	<-provider.started
+	service.Close()
+	close(provider.release)
+	require.ErrorIs(t, <-done, ErrLeaseRejected)
+	require.Equal(t, make([]byte, len(provider.returned)), provider.returned)
+}
+
+func TestSubsequentNonceUsesDurableRenewalAuthorization(t *testing.T) {
+	now := time.Now().UTC().Add(10 * time.Second)
+	initial := &testAuthorizer{grant: validGrant(now)}
+	renewal := &testRenewalAuthorizer{grant: validGrant(now)}
+	service, err := NewService(Config{Authorizer: initial, Renewals: renewal, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("renewal-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, Random: bytes.NewReader(bytes.Repeat([]byte{0x78}, 64))})
+	require.NoError(t, err)
+	agent := AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}
+	first, err := service.Lease(context.Background(), agent, validRequest())
+	require.NoError(t, err)
+	first.Release()
+	renewRequest := validRequest()
+	renewRequest.Nonce = bytes.Repeat([]byte{0x79}, 32)
+	second, err := service.Lease(context.Background(), agent, renewRequest)
+	require.NoError(t, err)
+	second.Release()
+	require.Equal(t, 2, initial.calls)
+	require.Equal(t, 2, renewal.calls)
+}
+
 func validRequest() LeaseRequest {
-	return LeaseRequest{Nonce: bytes.Repeat([]byte{0x01}, 32), InstanceID: "instance-1", AssignmentID: "assignment-1", ConfigurationRevision: 5}
+	return LeaseRequest{Nonce: bytes.Repeat([]byte{0x01}, 32), InstanceID: "instance-1", AssignmentID: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7}
 }
 
 func validGrant(now time.Time) Authorization {
@@ -121,6 +207,16 @@ type testProvider struct {
 	calls      int
 }
 
+type testRenewalAuthorizer struct {
+	grant Authorization
+	calls int
+}
+
+func (value *testRenewalAuthorizer) AuthorizeRenewal(context.Context, AuthenticatedAgent, LeaseRequest) (Authorization, error) {
+	value.calls++
+	return value.grant, nil
+}
+
 func (value *testProvider) Resolve(context.Context, string) (Credential, error) {
 	value.mu.Lock()
 	defer value.mu.Unlock()
@@ -132,6 +228,32 @@ func (value *testProvider) Resolve(context.Context, string) (Credential, error) 
 type testClock struct{ now time.Time }
 
 func (value testClock) Now(context.Context) (time.Time, error) { return value.now, nil }
+
+type mutableClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (value *mutableClock) Now(context.Context) (time.Time, error) {
+	value.mu.Lock()
+	defer value.mu.Unlock()
+	return value.now, nil
+}
+
+type blockingProvider struct {
+	started    chan struct{}
+	release    chan struct{}
+	credential Credential
+	returned   []byte
+}
+
+func (value *blockingProvider) Resolve(context.Context, string) (Credential, error) {
+	close(value.started)
+	<-value.release
+	credential := value.credential.Clone()
+	value.returned = credential.SecretBytes
+	return credential, nil
+}
 
 type testAudit struct {
 	mu      sync.Mutex

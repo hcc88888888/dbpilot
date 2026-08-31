@@ -15,6 +15,7 @@ import (
 
 type Config struct {
 	Authorizer  Authorizer
+	Renewals    RenewalAuthorizer
 	Provider    SecretProvider
 	Clock       DatabaseClock
 	Audit       AuditRecorder
@@ -25,6 +26,7 @@ type Config struct {
 
 type ApplicationService struct {
 	authorizer  Authorizer
+	renewals    RenewalAuthorizer
 	provider    SecretProvider
 	clock       DatabaseClock
 	audit       AuditRecorder
@@ -33,6 +35,8 @@ type ApplicationService struct {
 	random      io.Reader
 	mu          sync.Mutex
 	leases      map[string]*liveLease
+	issued      map[string]bool
+	closed      bool
 }
 
 type liveLease struct {
@@ -41,6 +45,8 @@ type liveLease struct {
 	lease       Lease
 	err         error
 	timer       *time.Timer
+	expired     bool
+	completed   bool
 }
 
 func NewService(config Config) (*ApplicationService, error) {
@@ -64,14 +70,24 @@ func NewService(config Config) (*ApplicationService, error) {
 	if maximum < 1 || maximum > DefaultMaximumLive {
 		return nil, ErrLeaseRejected
 	}
-	return &ApplicationService{authorizer: config.Authorizer, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease)}, nil
+	return &ApplicationService{authorizer: config.Authorizer, renewals: config.Renewals, provider: config.Provider, clock: config.Clock, audit: config.Audit, ttl: ttl, maximumLive: maximum, random: config.Random, leases: make(map[string]*liveLease), issued: make(map[string]bool)}, nil
 }
 
 func (service *ApplicationService) Lease(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest) (Lease, error) {
 	if ctx == nil || ctx.Err() != nil || service == nil || !validAgent(agent) || !validLeaseRequest(request) {
 		return Lease{}, ErrLeaseRejected
 	}
-	authorization, err := service.authorizer.Authorize(ctx, agent, request)
+	service.mu.Lock()
+	closed := service.closed
+	service.mu.Unlock()
+	if closed {
+		return Lease{}, ErrLeaseRejected
+	}
+	renewalKey := agent.SessionID + "\x00" + request.AssignmentID + "\x00" + request.InstanceID
+	service.mu.Lock()
+	isRenewal := service.issued[renewalKey]
+	service.mu.Unlock()
+	authorization, err := service.authorize(ctx, agent, request, isRenewal)
 	if err != nil || !validAuthorization(authorization, agent, request) || !strictSecretReference(authorization.CredentialRef) || authorization.TLSRef != "" && !strictSecretReference(authorization.TLSRef) {
 		service.recordRejected(ctx, authorization, agent, request, time.Time{})
 		return Lease{}, ErrLeaseRejected
@@ -87,13 +103,12 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 
 	service.mu.Lock()
 	service.pruneLocked(now)
+	if service.closed {
+		service.mu.Unlock()
+		return Lease{}, ErrLeaseRejected
+	}
 	if existing := service.leases[key]; existing != nil {
 		if existing.fingerprint != fingerprint {
-			if existing.timer != nil {
-				existing.timer.Stop()
-			}
-			existing.lease.Release()
-			delete(service.leases, key)
 			service.mu.Unlock()
 			service.recordRejected(ctx, authorization, agent, request, now)
 			return Lease{}, ErrLeaseRejected
@@ -103,7 +118,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		select {
 		case <-ready:
 			service.mu.Lock()
-			if existing.err != nil || !existing.lease.ExpiresAt.After(now) || service.leases[key] != existing {
+			if existing.err != nil || existing.expired || !existing.lease.ExpiresAt.After(now) || service.leases[key] != existing {
 				service.mu.Unlock()
 				return Lease{}, ErrLeaseRejected
 			}
@@ -130,6 +145,16 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
+	freshAuthorization, authorizeErr := service.authorize(ctx, agent, request, isRenewal)
+	finalNow, clockErr := service.clock.Now(ctx)
+	if authorizeErr != nil || clockErr != nil || finalNow.IsZero() || !validAuthorization(freshAuthorization, agent, request) || leaseFingerprint(agent, request, freshAuthorization) != fingerprint {
+		credential.Release()
+		service.failRecord(key, record)
+		service.recordRejected(ctx, freshAuthorization, agent, request, finalNow)
+		return Lease{}, ErrLeaseRejected
+	}
+	authorization = freshAuthorization
+	finalNow = finalNow.UTC()
 	leaseIDBytes := make([]byte, 16)
 	if _, err = io.ReadFull(service.random, leaseIDBytes); err != nil {
 		credential.Release()
@@ -137,28 +162,40 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
-	lease := Lease{ID: hex.EncodeToString(leaseIDBytes), InstanceID: request.InstanceID, AssignmentID: request.AssignmentID, DatabaseFamily: authorization.DatabaseFamily, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, CredentialRevision: credential.Revision, ExpiresAt: now.Add(service.ttl), Username: credential.Username, SecretBytes: append([]byte(nil), credential.SecretBytes...)}
+	lease := Lease{ID: hex.EncodeToString(leaseIDBytes), InstanceID: request.InstanceID, AssignmentID: request.AssignmentID, DatabaseFamily: authorization.DatabaseFamily, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, CredentialRevision: credential.Revision, ExpiresAt: finalNow.Add(service.ttl), Username: credential.Username, SecretBytes: append([]byte(nil), credential.SecretBytes...)}
 	credential.Release()
-	audit := auditFor(authorization, agent, request, now, AuditResultIssued, lease.CredentialRevision)
+	remaining := time.Until(lease.ExpiresAt)
+	if remaining <= 0 {
+		lease.Release()
+		service.failRecord(key, record)
+		service.recordRejected(ctx, authorization, agent, request, finalNow)
+		return Lease{}, ErrLeaseRejected
+	}
+	audit := auditFor(authorization, agent, request, finalNow, AuditResultIssued, lease.CredentialRevision, LeaseIDAuditHash(lease.ID))
 	if audit.Validate() != nil || service.audit.Record(ctx, audit) != nil {
 		lease.Release()
 		service.failRecord(key, record)
 		return Lease{}, ErrLeaseRejected
 	}
 	service.mu.Lock()
-	if service.leases[key] != record {
+	if service.closed || service.leases[key] != record || record.completed {
 		record.err = ErrLeaseRejected
-		close(record.ready)
+		if !record.completed {
+			record.completed = true
+			close(record.ready)
+		}
 		service.mu.Unlock()
 		lease.Release()
 		return Lease{}, ErrLeaseRejected
 	}
 	record.lease = lease.Clone()
-	record.timer = time.AfterFunc(service.ttl, func() {
+	service.issued[renewalKey] = true
+	record.completed = true
+	record.timer = time.AfterFunc(remaining, func() {
 		service.mu.Lock()
 		if service.leases[key] == record {
 			record.lease.Release()
-			delete(service.leases, key)
+			record.expired = true
 		}
 		service.mu.Unlock()
 	})
@@ -169,19 +206,20 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 
 func (service *ApplicationService) failRecord(key string, record *liveLease) {
 	service.mu.Lock()
+	defer service.mu.Unlock()
+	if record.completed {
+		return
+	}
 	record.err = ErrLeaseRejected
 	if record.timer != nil {
 		record.timer.Stop()
 	}
-	if service.leases[key] == record {
-		delete(service.leases, key)
-	}
+	record.completed = true
 	close(record.ready)
-	service.mu.Unlock()
 }
 
 func (service *ApplicationService) pruneLocked(now time.Time) {
-	for key, record := range service.leases {
+	for _, record := range service.leases {
 		select {
 		case <-record.ready:
 			if record.err != nil || !record.lease.ExpiresAt.After(now) {
@@ -189,11 +227,45 @@ func (service *ApplicationService) pruneLocked(now time.Time) {
 					record.timer.Stop()
 				}
 				record.lease.Release()
-				delete(service.leases, key)
+				record.expired = true
 			}
 		default:
 		}
 	}
+}
+
+func (service *ApplicationService) Close() {
+	if service == nil {
+		return
+	}
+	service.mu.Lock()
+	if service.closed {
+		service.mu.Unlock()
+		return
+	}
+	service.closed = true
+	for key, record := range service.leases {
+		if record.timer != nil {
+			record.timer.Stop()
+		}
+		record.lease.Release()
+		record.err = ErrLeaseRejected
+		record.expired = true
+		if !record.completed {
+			record.completed = true
+			close(record.ready)
+		}
+		delete(service.leases, key)
+	}
+	clear(service.issued)
+	service.mu.Unlock()
+}
+
+func (service *ApplicationService) authorize(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest, renewal bool) (Authorization, error) {
+	if renewal && service.renewals != nil {
+		return service.renewals.AuthorizeRenewal(ctx, agent, request)
+	}
+	return service.authorizer.Authorize(ctx, agent, request)
 }
 
 func (service *ApplicationService) recordRejected(ctx context.Context, authorization Authorization, agent AuthenticatedAgent, request LeaseRequest, now time.Time) {
@@ -204,14 +276,14 @@ func (service *ApplicationService) recordRejected(ctx context.Context, authoriza
 		}
 		now = clockNow.UTC()
 	}
-	record := auditFor(authorization, agent, request, now, AuditResultRejected, 0)
+	record := auditFor(authorization, agent, request, now, AuditResultRejected, 0, "")
 	if record.Validate() == nil {
 		_ = service.audit.Record(ctx, record)
 	}
 }
 
-func auditFor(authorization Authorization, agent AuthenticatedAgent, request LeaseRequest, now time.Time, result AuditResult, credentialRevision uint64) AuditRecord {
-	return AuditRecord{TenantID: authorization.Scope.TenantID, ProjectID: authorization.Scope.ProjectID, AgentID: agent.AgentID, HostID: authorization.HostID, AssignmentID: request.AssignmentID, InstanceID: request.InstanceID, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, InstanceRevision: authorization.InstanceRevision, CredentialRevision: credentialRevision, Result: result, ExpiryClass: ExpiryClassShort, OccurredAt: now.UTC()}
+func auditFor(authorization Authorization, agent AuthenticatedAgent, request LeaseRequest, now time.Time, result AuditResult, credentialRevision uint64, leaseIDHash string) AuditRecord {
+	return AuditRecord{TenantID: authorization.Scope.TenantID, ProjectID: authorization.Scope.ProjectID, AgentID: agent.AgentID, HostID: authorization.HostID, AssignmentID: request.AssignmentID, InstanceID: request.InstanceID, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, InstanceRevision: authorization.InstanceRevision, CredentialRevision: credentialRevision, LeaseIDHash: leaseIDHash, Result: result, ExpiryClass: ExpiryClassShort, OccurredAt: now.UTC()}
 }
 
 func validAgent(value AuthenticatedAgent) bool {
@@ -219,11 +291,11 @@ func validAgent(value AuthenticatedAgent) bool {
 }
 
 func validLeaseRequest(value LeaseRequest) bool {
-	return len(value.Nonce) == RequestNonceBytes && identifier.MatchString(value.InstanceID) && identifier.MatchString(value.AssignmentID) && value.ConfigurationRevision > 0
+	return len(value.Nonce) == RequestNonceBytes && identifier.MatchString(value.InstanceID) && identifier.MatchString(value.AssignmentID) && familyIdentifier.MatchString(value.DatabaseFamily) && value.ConfigurationRevision > 0 && value.OperationRevision > 0
 }
 
 func validAuthorization(value Authorization, agent AuthenticatedAgent, request LeaseRequest) bool {
-	return value.Scope.Validate() == nil && identifier.MatchString(value.HostID) && value.AgentID == agent.AgentID && value.AssignmentID == request.AssignmentID && familyIdentifier.MatchString(value.DatabaseFamily) && value.ConfigurationRevision == request.ConfigurationRevision && value.OperationRevision > 0 && value.InstanceID == request.InstanceID && value.InstanceRevision > 0 && value.ManagementStatus != "" && value.ManagementStatus != "retired" && !value.AuthorizedAt.IsZero()
+	return value.Scope.Validate() == nil && identifier.MatchString(value.HostID) && value.AgentID == agent.AgentID && value.AssignmentID == request.AssignmentID && value.DatabaseFamily == request.DatabaseFamily && value.ConfigurationRevision == request.ConfigurationRevision && value.OperationRevision == request.OperationRevision && value.InstanceID == request.InstanceID && value.InstanceRevision > 0 && value.ManagementStatus != "" && value.ManagementStatus != "retired" && !value.AuthorizedAt.IsZero()
 }
 
 func validCredential(value Credential) bool {
@@ -251,10 +323,10 @@ func leaseFingerprint(agent AuthenticatedAgent, request LeaseRequest, authorizat
 		binary.BigEndian.PutUint64(encoded[:], value)
 		_, _ = hash.Write(encoded[:])
 	}
-	for _, value := range []string{agent.AgentID, agent.SessionID, request.InstanceID, request.AssignmentID, authorization.Scope.TenantID, authorization.Scope.ProjectID, authorization.HostID, authorization.DatabaseFamily, authorization.CredentialRef, authorization.TLSRef, authorization.ManagementStatus} {
+	for _, value := range []string{agent.AgentID, agent.SessionID, request.InstanceID, request.AssignmentID, request.DatabaseFamily, authorization.Scope.TenantID, authorization.Scope.ProjectID, authorization.HostID, authorization.DatabaseFamily, authorization.CredentialRef, authorization.TLSRef, authorization.ManagementStatus} {
 		writeFingerprint(value)
 	}
-	for _, value := range []uint64{request.ConfigurationRevision, authorization.OperationRevision, authorization.InstanceRevision} {
+	for _, value := range []uint64{request.ConfigurationRevision, request.OperationRevision, authorization.OperationRevision, authorization.InstanceRevision} {
 		writeRevision(value)
 	}
 	var result [sha256.Size]byte

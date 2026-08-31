@@ -71,6 +71,7 @@ type entry struct {
 	ready chan struct{}
 	lease Lease
 	err   error
+	timer *time.Timer
 }
 
 type Cache struct {
@@ -121,7 +122,8 @@ func (cache *Cache) Get(ctx context.Context, key Key, loader Loader) (*Handle, e
 	loaded, err := loader(ctx)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if err != nil || !loaded.valid(now) || loaded.Key != key || cache.closed || cache.entries[key] != current {
+	freshNow := cache.now().UTC()
+	if err != nil || !loaded.valid(freshNow) || loaded.Key != key || cache.closed || cache.entries[key] != current {
 		loaded.zero()
 		current.err = ErrUnavailable
 		if cache.entries[key] == current {
@@ -131,6 +133,22 @@ func (cache *Cache) Get(ctx context.Context, key Key, loader Loader) (*Handle, e
 		return nil, ErrUnavailable
 	}
 	current.lease = loaded.clone()
+	remaining := time.Until(current.lease.ExpiresAt)
+	if remaining <= 0 {
+		current.lease.zero()
+		current.err = ErrUnavailable
+		delete(cache.entries, key)
+		close(current.ready)
+		return nil, ErrUnavailable
+	}
+	current.timer = time.AfterFunc(remaining, func() {
+		cache.mu.Lock()
+		if cache.entries[key] == current {
+			current.lease.zero()
+			delete(cache.entries, key)
+		}
+		cache.mu.Unlock()
+	})
 	loaded.zero()
 	close(current.ready)
 	return handle(current.lease), nil
@@ -154,6 +172,9 @@ func (cache *Cache) InvalidateAssignment(assignmentID string) {
 		if key.AssignmentID == assignmentID {
 			select {
 			case <-current.ready:
+				if current.timer != nil {
+					current.timer.Stop()
+				}
 				current.lease.zero()
 			default:
 				current.err = ErrUnavailable
@@ -173,6 +194,9 @@ func (cache *Cache) Close() {
 	for key, current := range cache.entries {
 		select {
 		case <-current.ready:
+			if current.timer != nil {
+				current.timer.Stop()
+			}
 			current.lease.zero()
 		default:
 			current.err = ErrUnavailable
@@ -189,6 +213,9 @@ func (cache *Cache) invalidateSupersededLocked(want Key) {
 		}
 		select {
 		case <-current.ready:
+			if current.timer != nil {
+				current.timer.Stop()
+			}
 			current.lease.zero()
 		default:
 			current.err = ErrUnavailable
@@ -202,6 +229,9 @@ func (cache *Cache) pruneLocked(now time.Time) {
 		select {
 		case <-current.ready:
 			if current.err != nil || !current.lease.ExpiresAt.After(now) {
+				if current.timer != nil {
+					current.timer.Stop()
+				}
 				current.lease.zero()
 				delete(cache.entries, key)
 			}

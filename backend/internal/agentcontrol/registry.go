@@ -120,6 +120,14 @@ func (r *Registry) unregister(agentID string, expected *session) {
 		return
 	}
 	delete(r.sessions, agentID)
+	for {
+		select {
+		case message := <-current.send:
+			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+		default:
+			return
+		}
+	}
 }
 
 func (r *Registry) liveSession(agentID string) (*session, bool) {

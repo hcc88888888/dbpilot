@@ -124,8 +124,15 @@ type PluginCatalogSettings struct {
 }
 
 type CredentialLeaseSettings struct {
-	Enabled bool          `yaml:"enabled"`
-	TTL     time.Duration `yaml:"ttl,omitempty"`
+	Enabled     bool                                         `yaml:"enabled"`
+	TTL         time.Duration                                `yaml:"ttl,omitempty"`
+	Environment map[string]CredentialLeaseEnvironmentBinding `yaml:"environment,omitempty"`
+}
+
+type CredentialLeaseEnvironmentBinding struct {
+	Username string `yaml:"username"`
+	Variable string `yaml:"variable"`
+	Revision uint64 `yaml:"revision"`
 }
 
 type DiscoveryRulePolicySettings struct {
@@ -243,6 +250,7 @@ type Server struct {
 	hostObservations        *agentcontrol.HostObservationDispatcher
 	discoveryObservations   *agentcontrol.DiscoveryDispatcher
 	pluginObservations      *agentcontrol.PluginObservationDispatcher
+	credentialLeases        *credentiallease.ApplicationService
 	inspectionWorker        *inspection.Worker
 	scheduleInspections     func(context.Context, time.Time) error
 	processInspections      func(context.Context, time.Time) error
@@ -352,7 +360,11 @@ func NewServer(config Config) (*Server, error) {
 		return nil, err
 	}
 	if config.CredentialLeases.Enabled && config.CredentialLeaseProvider == nil {
-		return nil, errors.New("credential lease provider is required when credential leasing is enabled")
+		provider, providerErr := credentialLeaseProviderForConfig(config)
+		if providerErr != nil {
+			return nil, errors.New("credential lease provider configuration failed")
+		}
+		config.CredentialLeaseProvider = provider
 	}
 	httpTLS := config.HTTPServerTLS
 	if httpTLS == nil {
@@ -659,11 +671,14 @@ func NewServer(config Config) (*Server, error) {
 	}
 	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepositoryWithProvisioner(database, acceptanceProvisioner))
 	var credentialLeaseIssuer agentcontrol.CredentialLeaseIssueService
+	var leaseService *credentiallease.ApplicationService
 	if config.CredentialLeases.Enabled {
 		if !config.PluginCatalog.Enabled {
 			return nil, errors.New("credential leasing requires plugin catalog")
 		}
-		leaseService, leaseErr := credentiallease.NewService(credentiallease.Config{Authorizer: credentiallease.PostgresAuthorizer{Database: database, Fences: agentRegistry}, Provider: config.CredentialLeaseProvider, Clock: credentiallease.PostgresClock{Database: database}, Audit: credentiallease.PostgresAuditRecorder{Database: database}, TTL: config.CredentialLeases.TTL, Random: rand.Reader})
+		var leaseErr error
+		postgresLeaseAuthorizer := credentiallease.PostgresAuthorizer{Database: database, Fences: agentRegistry}
+		leaseService, leaseErr = credentiallease.NewService(credentiallease.Config{Authorizer: postgresLeaseAuthorizer, Renewals: postgresLeaseAuthorizer, Provider: config.CredentialLeaseProvider, Clock: credentiallease.PostgresClock{Database: database}, Audit: credentiallease.PostgresAuditRecorder{Database: database}, TTL: config.CredentialLeases.TTL, Random: rand.Reader})
 		if leaseErr != nil {
 			return nil, errors.New("configure credential leases")
 		}
@@ -837,7 +852,7 @@ func NewServer(config Config) (*Server, error) {
 		commandObserver = commandLifecycle
 	}
 	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer)))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, dispatchCommands: func(ctx context.Context, at time.Time) error {
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
@@ -894,6 +909,33 @@ func NewServer(config Config) (*Server, error) {
 			return err
 		},
 	}, nil
+}
+
+func credentialLeaseProviderForConfig(config Config) (credentiallease.SecretProvider, error) {
+	if !config.CredentialLeases.Enabled || len(config.CredentialLeases.Environment) == 0 {
+		return nil, credentiallease.ErrLeaseRejected
+	}
+	bindings := make(map[string]credentiallease.EnvironmentBinding, len(config.CredentialLeases.Environment))
+	variables := make(map[string]struct{}, len(config.CredentialLeases.Environment))
+	for reference, binding := range config.CredentialLeases.Environment {
+		if _, duplicate := variables[binding.Variable]; duplicate {
+			return nil, credentiallease.ErrLeaseRejected
+		}
+		variables[binding.Variable] = struct{}{}
+		bindings[reference] = credentiallease.EnvironmentBinding{Username: binding.Username, Variable: binding.Variable, Revision: binding.Revision}
+	}
+	provider, err := credentiallease.NewEnvironmentProvider(bindings, os.LookupEnv)
+	if err != nil {
+		return nil, credentiallease.ErrLeaseRejected
+	}
+	for reference := range bindings {
+		credential, resolveErr := provider.Resolve(context.Background(), reference)
+		if resolveErr != nil {
+			return nil, credentiallease.ErrLeaseRejected
+		}
+		credential.Release()
+	}
+	return provider, nil
 }
 
 func publisherKeysForConfig(config Config) (*plugincatalog.StaticPublisherKeyStore, error) {
@@ -1390,6 +1432,10 @@ func (server *Server) closeDatabase() {
 }
 
 func (server *Server) closeResources() {
+	if server.credentialLeases != nil {
+		server.credentialLeases.Close()
+		server.credentialLeases = nil
+	}
 	if server.artifactBlobs != nil {
 		_ = server.artifactBlobs.Close()
 		server.artifactBlobs = nil

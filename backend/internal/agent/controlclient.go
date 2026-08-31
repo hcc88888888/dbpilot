@@ -234,8 +234,10 @@ type CredentialLeaseRequest = pluginsupervisor.CredentialLeaseRequest
 type CredentialLease = pluginsupervisor.CredentialLease
 
 type credentialLeaseWaiter struct {
-	request CredentialLeaseRequest
-	result  chan credentialLeaseResult
+	request   CredentialLeaseRequest
+	result    chan credentialLeaseResult
+	mu        sync.Mutex
+	cancelled bool
 }
 
 type credentialLeaseResult struct {
@@ -425,6 +427,9 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 			select {
 			case received <- receiveResult{message: message, err: receiveErr}:
 			case <-ctx.Done():
+				if message != nil {
+					clearWireCredential(message.GetCredentialLeaseResponse())
+				}
 				return
 			}
 			if receiveErr != nil {
@@ -435,6 +440,17 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	defer func() {
 		session.cancel()
 		_ = stream.CloseSend()
+		for {
+			select {
+			case pending := <-received:
+				if pending.message != nil {
+					clearWireCredential(pending.message.GetCredentialLeaseResponse())
+				}
+			default:
+				goto drainedReceived
+			}
+		}
+	drainedReceived:
 		c.clearSession(session)
 		session.wait.Wait()
 	}()
@@ -988,8 +1004,16 @@ func (c *ControlClient) LeaseCredential(ctx context.Context, request CredentialL
 			delete(c.credentialLeaseWaiters, key)
 		}
 		c.credentialLeaseMu.Unlock()
+		waiter.mu.Lock()
+		waiter.cancelled = true
+		select {
+		case pending := <-waiter.result:
+			pending.lease.Release()
+		default:
+		}
+		waiter.mu.Unlock()
 	}()
-	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CredentialLeaseRequest{CredentialLeaseRequest: &agentv1.CredentialLeaseRequest{RequestNonce: nonce[:], InstanceId: request.InstanceID, AssignmentId: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision}}}
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_CredentialLeaseRequest{CredentialLeaseRequest: &agentv1.CredentialLeaseRequest{RequestNonce: nonce[:], InstanceId: request.InstanceID, AssignmentId: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, DatabaseFamily: request.DatabaseFamily, OperationRevision: request.OperationRevision}}}
 	if err := c.sendAgentMessage(message); err != nil {
 		return CredentialLease{}, ErrCredentialLease
 	}
@@ -1021,13 +1045,31 @@ func (c *ControlClient) handleCredentialLeaseResponse(response *agentv1.Credenti
 	}
 	credential := response.GetCredential()
 	now := c.now()
-	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetInstanceId() == waiter.request.InstanceID && response.GetCredentialRevision() > 0 && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(now) && !response.GetExpiresAt().AsTime().After(now.Add(5*time.Minute)) && credential != nil && len(credential.GetUsername()) <= 256 && strings.TrimSpace(credential.GetUsername()) == credential.GetUsername() && !strings.ContainsAny(credential.GetUsername(), "\x00\r\n") && len(credential.GetSecretBytes()) > 0 && len(credential.GetSecretBytes()) <= 64<<10 && proto.Size(response) <= (68<<10)
+	valid := validArtifactLeaseResource(response.GetLeaseId()) && response.GetAssignmentId() == waiter.request.AssignmentID && response.GetInstanceId() == waiter.request.InstanceID && response.GetDatabaseFamily() == waiter.request.DatabaseFamily && response.GetConfigurationRevision() == waiter.request.ConfigurationRevision && response.GetOperationRevision() == waiter.request.OperationRevision && response.GetCredentialRevision() > 0 && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(now) && !response.GetExpiresAt().AsTime().After(now.Add(5*time.Minute)) && credential != nil && len(credential.GetUsername()) <= 256 && strings.TrimSpace(credential.GetUsername()) == credential.GetUsername() && !strings.ContainsAny(credential.GetUsername(), "\x00\r\n") && len(credential.GetSecretBytes()) > 0 && len(credential.GetSecretBytes()) <= 64<<10 && proto.Size(response) <= (68<<10)
 	if !valid {
-		waiter.result <- credentialLeaseResult{err: ErrCredentialLease}
+		waiter.deliver(credentialLeaseResult{err: ErrCredentialLease})
 		return nil
 	}
-	waiter.result <- credentialLeaseResult{lease: CredentialLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), DatabaseFamily: waiter.request.DatabaseFamily, CredentialRevision: response.GetCredentialRevision(), ConfigurationRevision: waiter.request.ConfigurationRevision, OperationRevision: waiter.request.OperationRevision, ExpiresAt: response.GetExpiresAt().AsTime().UTC(), Username: credential.GetUsername(), SecretBytes: append([]byte(nil), credential.GetSecretBytes()...)}}
+	waiter.deliver(credentialLeaseResult{lease: CredentialLease{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), DatabaseFamily: response.GetDatabaseFamily(), CredentialRevision: response.GetCredentialRevision(), ConfigurationRevision: response.GetConfigurationRevision(), OperationRevision: response.GetOperationRevision(), ExpiresAt: response.GetExpiresAt().AsTime().UTC(), Username: credential.GetUsername(), SecretBytes: append([]byte(nil), credential.GetSecretBytes()...)}})
 	return nil
+}
+
+func (waiter *credentialLeaseWaiter) deliver(result credentialLeaseResult) {
+	if waiter == nil {
+		result.lease.Release()
+		return
+	}
+	waiter.mu.Lock()
+	defer waiter.mu.Unlock()
+	if waiter.cancelled {
+		result.lease.Release()
+		return
+	}
+	select {
+	case waiter.result <- result:
+	default:
+		result.lease.Release()
+	}
 }
 
 func (c *ControlClient) failCredentialLeaseWaiters() {
@@ -1039,10 +1081,7 @@ func (c *ControlClient) failCredentialLeaseWaiters() {
 	}
 	c.credentialLeaseMu.Unlock()
 	for _, waiter := range waiters {
-		select {
-		case waiter.result <- credentialLeaseResult{err: ErrCredentialLease}:
-		default:
-		}
+		waiter.deliver(credentialLeaseResult{err: ErrCredentialLease})
 	}
 }
 

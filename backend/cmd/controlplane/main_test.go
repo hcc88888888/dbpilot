@@ -1105,6 +1105,25 @@ func TestNewServerFailsClosedWhenCredentialLeasingEnabledWithoutProvider(t *test
 	require.Contains(t, err.Error(), "credential lease provider")
 }
 
+func TestCredentialLeaseProviderForConfigUsesOnlyExplicitEnvironmentBindings(t *testing.T) {
+	t.Setenv("DBPILOT_DB_ONE", "operator-runtime-secret")
+	config := Config{CredentialLeases: CredentialLeaseSettings{Enabled: true, Environment: map[string]CredentialLeaseEnvironmentBinding{"secret://database/one": {Username: "monitor", Variable: "DBPILOT_DB_ONE", Revision: 4}}}}
+	provider, err := credentialLeaseProviderForConfig(config)
+	require.NoError(t, err)
+	credential, err := provider.Resolve(context.Background(), "secret://database/one")
+	require.NoError(t, err)
+	require.Equal(t, []byte("operator-runtime-secret"), credential.SecretBytes)
+	credential.Release()
+	_, err = provider.Resolve(context.Background(), "secret://database/other")
+	require.Error(t, err)
+
+	missing := config
+	missing.CredentialLeases.Environment["secret://database/one"] = CredentialLeaseEnvironmentBinding{Username: "monitor", Variable: "DBPILOT_MISSING", Revision: 4}
+	_, err = credentialLeaseProviderForConfig(missing)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "operator-runtime-secret")
+}
+
 func validServerConfig() Config {
 	return Config{
 		DatabaseURL:             "postgres://dbpilot:password@localhost/dbpilot?sslmode=require",

@@ -3,6 +3,8 @@ package pluginsupervisor
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,14 +20,30 @@ import (
 // private UDS client as all later plugin RPCs. It preserves Task9's exact
 // process, executable and inherited-nonce proof before accepting a process.
 type GatewayHealthChecker struct {
-	client      *plugingateway.Client
-	credentials CredentialLeaser
-	mu          sync.Mutex
-	sessions    map[int]*plugingateway.Session
-	streams     map[int]context.CancelFunc
-	expiries    map[int]context.CancelFunc
-	activation  map[int]gatewayActivation
-	cache       *credentialcache.Cache
+	client       *plugingateway.Client
+	credentials  CredentialLeaser
+	mu           sync.Mutex
+	sessions     map[int]*plugingateway.Session
+	streams      map[int]context.CancelFunc
+	expiries     map[int]context.CancelFunc
+	activation   map[int]gatewayActivation
+	cache        *credentialcache.Cache
+	leaseFlights map[string]*credentialFlight
+}
+
+type credentialFlight struct {
+	ready     chan struct{}
+	lease     CredentialLease
+	err       error
+	waiters   int
+	completed bool
+	timer     *time.Timer
+}
+
+type credentialLeaserFunc func(context.Context, CredentialLeaseRequest) (CredentialLease, error)
+
+func (function credentialLeaserFunc) LeaseCredential(ctx context.Context, request CredentialLeaseRequest) (CredentialLease, error) {
+	return function(ctx, request)
 }
 
 type gatewayActivation struct {
@@ -34,7 +52,7 @@ type gatewayActivation struct {
 }
 
 func NewGatewayHealthChecker(client *plugingateway.Client) *GatewayHealthChecker {
-	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now)}
+	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now), leaseFlights: make(map[string]*credentialFlight)}
 }
 
 func NewGatewayHealthCheckerWithCredentials(client *plugingateway.Client, credentials CredentialLeaser) *GatewayHealthChecker {
@@ -83,7 +101,7 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 			instances = instancesWithoutCredentials(request)
 		} else {
 			var leaseErr error
-			instances, releases, leaseErr = leaseInstancesWithCache(ctx, checker.credentials, checker.cache, request, time.Now().UTC())
+			instances, releases, leaseErr = leaseInstancesWithCache(ctx, credentialLeaserFunc(checker.leaseCredential), checker.cache, request, time.Now().UTC())
 			if leaseErr != nil {
 				checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_credentials")
 				return nil
@@ -97,7 +115,7 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		if err := session.ApplyConfiguration(ctx, configuration); err != nil {
 			return ErrHealthHandshake
 		}
-		checker.scheduleCredentialExpiry(process, session, request.AssignmentID, earliestCredentialExpiry(instances))
+		checker.scheduleCredentialRenewal(process, session, request, earliestCredentialExpiry(instances))
 		for _, instanceID := range request.InstanceIDs {
 			result, validateErr := session.ValidateInstance(ctx, instanceID)
 			if validateErr != nil || !result.Valid {
@@ -222,7 +240,7 @@ func earliestCredentialExpiry(instances []*pluginv1.PluginInstanceConfiguration)
 	return earliest
 }
 
-func (checker *GatewayHealthChecker) scheduleCredentialExpiry(process Process, session *plugingateway.Session, assignmentID string, expiresAt time.Time) {
+func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, session *plugingateway.Session, request HealthRequest, expiresAt time.Time) {
 	if checker == nil || process == nil || session == nil || expiresAt.IsZero() {
 		return
 	}
@@ -234,19 +252,163 @@ func (checker *GatewayHealthChecker) scheduleCredentialExpiry(process Process, s
 	checker.expiries[process.PID()] = cancel
 	checker.mu.Unlock()
 	go func() {
-		timer := time.NewTimer(time.Until(expiresAt))
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			clearContext, clearCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = session.RemoveCredentials(clearContext)
-			clearCancel()
-			checker.cache.InvalidateAssignment(assignmentID)
-			checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_credentials")
-			_ = process.Kill()
-		case <-ctx.Done():
+		backoff := time.Second
+		removed := false
+		for {
+			remaining := time.Until(expiresAt)
+			lead := remaining / 5
+			if lead < time.Second {
+				lead = time.Second
+			}
+			if lead > 30*time.Second {
+				lead = 30 * time.Second
+			}
+			wait := remaining - lead
+			jitter := time.Duration(process.PID()%251) * time.Millisecond
+			if wait > jitter {
+				wait -= jitter
+			}
+			if removed || wait < 0 {
+				wait = backoff
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			callContext, callCancel := context.WithTimeout(ctx, 15*time.Second)
+			checker.invalidateCredentialFlights(request.AssignmentID)
+			instances, releases, err := leaseInstancesWithCache(callContext, credentialLeaserFunc(checker.leaseCredential), checker.cache, request, time.Now().UTC())
+			if err == nil {
+				configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
+				err = session.ApplyConfiguration(callContext, configuration)
+				if err == nil {
+					for _, instanceID := range request.InstanceIDs {
+						result, validateErr := session.ValidateInstance(callContext, instanceID)
+						if validateErr != nil || !result.Valid {
+							err = errCredentialLease
+							break
+						}
+					}
+				}
+				configuration.Release()
+				for _, release := range releases {
+					release()
+				}
+				if err == nil {
+					expiresAt = earliestCredentialExpiry(instances)
+					removed = false
+					backoff = time.Second
+					checker.storeActivation(process.PID(), session, pluginstate.HealthHealthy, "")
+					callCancel()
+					continue
+				}
+			}
+			callCancel()
+			if !removed && !time.Now().Before(expiresAt) {
+				clearContext, clearCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				_ = session.RemoveCredentials(clearContext)
+				clearCancel()
+				checker.cache.InvalidateAssignment(request.AssignmentID)
+				checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_credentials")
+				removed = true
+			}
+			if backoff < 10*time.Second {
+				backoff *= 2
+			}
 		}
 	}()
+}
+
+func (checker *GatewayHealthChecker) leaseCredential(ctx context.Context, request CredentialLeaseRequest) (CredentialLease, error) {
+	if checker == nil || checker.credentials == nil || ctx == nil || ctx.Err() != nil {
+		return CredentialLease{}, errCredentialLease
+	}
+	key := request.AssignmentID + "\x00" + request.InstanceID + "\x00" + fmt.Sprint(request.ConfigurationRevision) + "\x00" + fmt.Sprint(request.OperationRevision)
+	checker.mu.Lock()
+	flight := checker.leaseFlights[key]
+	if flight != nil {
+		flight.waiters++
+		checker.mu.Unlock()
+		return checker.awaitCredentialFlight(ctx, key, flight)
+	}
+	flight = &credentialFlight{ready: make(chan struct{}), waiters: 1}
+	checker.leaseFlights[key] = flight
+	checker.mu.Unlock()
+	lease, err := checker.credentials.LeaseCredential(ctx, request)
+	checker.mu.Lock()
+	flight.completed = true
+	if err != nil {
+		flight.err = errCredentialLease
+		lease.Release()
+	} else {
+		flight.lease = lease.Clone()
+		lease.Release()
+	}
+	close(flight.ready)
+	if flight.err == nil {
+		remaining := time.Until(flight.lease.ExpiresAt)
+		if remaining > 0 {
+			flight.timer = time.AfterFunc(remaining, func() {
+				checker.mu.Lock()
+				if checker.leaseFlights[key] == flight {
+					flight.lease.Release()
+					delete(checker.leaseFlights, key)
+				}
+				checker.mu.Unlock()
+			})
+		}
+	}
+	if flight.waiters == 0 && flight.err != nil {
+		flight.lease.Release()
+		delete(checker.leaseFlights, key)
+	}
+	checker.mu.Unlock()
+	return checker.awaitCredentialFlight(ctx, key, flight)
+}
+
+func (checker *GatewayHealthChecker) awaitCredentialFlight(ctx context.Context, key string, flight *credentialFlight) (CredentialLease, error) {
+	select {
+	case <-ctx.Done():
+		checker.mu.Lock()
+		flight.waiters--
+		if flight.waiters == 0 && flight.completed && flight.err != nil {
+			flight.lease.Release()
+			delete(checker.leaseFlights, key)
+		}
+		checker.mu.Unlock()
+		return CredentialLease{}, errCredentialLease
+	case <-flight.ready:
+		checker.mu.Lock()
+		flight.waiters--
+		lease, err := flight.lease.Clone(), flight.err
+		if flight.waiters == 0 && flight.err != nil {
+			flight.lease.Release()
+			delete(checker.leaseFlights, key)
+		}
+		checker.mu.Unlock()
+		if err != nil {
+			lease.Release()
+			return CredentialLease{}, errCredentialLease
+		}
+		return lease, nil
+	}
+}
+
+func (checker *GatewayHealthChecker) invalidateCredentialFlights(assignmentID string) {
+	checker.mu.Lock()
+	for key, flight := range checker.leaseFlights {
+		if strings.HasPrefix(key, assignmentID+"\x00") && flight.completed {
+			if flight.timer != nil {
+				flight.timer.Stop()
+			}
+			flight.lease.Release()
+			delete(checker.leaseFlights, key)
+		}
+	}
+	checker.mu.Unlock()
 }
 
 func (checker *GatewayHealthChecker) storeActivation(pid int, session *plugingateway.Session, health pluginstate.HealthState, code string) {
@@ -293,6 +455,7 @@ func (checker *GatewayHealthChecker) Shutdown(ctx context.Context, process Proce
 	}
 	_ = session.RemoveCredentials(ctx)
 	checker.cache.InvalidateAssignment(session.AssignmentID())
+	checker.invalidateCredentialFlights(session.AssignmentID())
 	if session.Shutdown(ctx, timeout) != nil {
 		return ErrHealthHandshake
 	}

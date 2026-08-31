@@ -2,6 +2,8 @@ package credentiallease
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 )
 
@@ -25,6 +27,7 @@ type AuditRecord struct {
 	OperationRevision     uint64      `json:"operation_revision"`
 	InstanceRevision      uint64      `json:"instance_revision"`
 	CredentialRevision    uint64      `json:"credential_revision,omitempty"`
+	LeaseIDHash           string      `json:"lease_id_hash,omitempty"`
 	Result                AuditResult `json:"result"`
 	ExpiryClass           ExpiryClass `json:"expiry_class"`
 	OccurredAt            time.Time   `json:"occurred_at"`
@@ -34,10 +37,15 @@ func (value AuditRecord) Validate() error {
 	if !identifier.MatchString(value.TenantID) || !identifier.MatchString(value.ProjectID) || !identifier.MatchString(value.AgentID) || !identifier.MatchString(value.HostID) || !identifier.MatchString(value.AssignmentID) || !identifier.MatchString(value.InstanceID) || value.ConfigurationRevision == 0 || value.OperationRevision == 0 || value.InstanceRevision == 0 || value.Result != AuditResultIssued && value.Result != AuditResultRejected || value.ExpiryClass != ExpiryClassShort || value.OccurredAt.IsZero() || value.OccurredAt.Location() != time.UTC {
 		return ErrLeaseRejected
 	}
-	if value.Result == AuditResultIssued && value.CredentialRevision == 0 {
+	if value.Result == AuditResultIssued && (value.CredentialRevision == 0 || len(value.LeaseIDHash) != len("sha256:")+sha256.Size*2) {
 		return ErrLeaseRejected
 	}
 	return nil
+}
+
+func LeaseIDAuditHash(leaseID string) string {
+	digest := sha256.Sum256([]byte("dbpilot-credential-lease-audit-v1\x00" + leaseID))
+	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
 type AuditRecorder interface {

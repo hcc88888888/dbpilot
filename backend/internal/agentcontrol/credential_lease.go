@@ -14,12 +14,12 @@ func (issuer CredentialLeaseIssuer) Issue(ctx context.Context, agent credentiall
 	if issuer.Service == nil || request == nil {
 		return nil, credentiallease.ErrLeaseRejected
 	}
-	lease, err := issuer.Service.Lease(ctx, agent, credentiallease.LeaseRequest{Nonce: append([]byte(nil), request.GetRequestNonce()...), InstanceID: request.GetInstanceId(), AssignmentID: request.GetAssignmentId(), ConfigurationRevision: request.GetConfigurationRevision()})
+	lease, err := issuer.Service.Lease(ctx, agent, credentiallease.LeaseRequest{Nonce: append([]byte(nil), request.GetRequestNonce()...), InstanceID: request.GetInstanceId(), AssignmentID: request.GetAssignmentId(), DatabaseFamily: request.GetDatabaseFamily(), ConfigurationRevision: request.GetConfigurationRevision(), OperationRevision: request.GetOperationRevision()})
 	if err != nil {
 		return nil, credentiallease.ErrLeaseRejected
 	}
 	defer lease.Release()
-	return &agentv1.CredentialLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), LeaseId: lease.ID, InstanceId: lease.InstanceID, AssignmentId: lease.AssignmentID, CredentialRevision: lease.CredentialRevision, ExpiresAt: timestamppb.New(lease.ExpiresAt), Credential: &agentv1.CredentialMaterial{Username: lease.Username, SecretBytes: append([]byte(nil), lease.SecretBytes...)}}, nil
+	return &agentv1.CredentialLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), LeaseId: lease.ID, InstanceId: lease.InstanceID, AssignmentId: lease.AssignmentID, CredentialRevision: lease.CredentialRevision, ExpiresAt: timestamppb.New(lease.ExpiresAt), Credential: &agentv1.CredentialMaterial{Username: lease.Username, SecretBytes: append([]byte(nil), lease.SecretBytes...)}, DatabaseFamily: lease.DatabaseFamily, ConfigurationRevision: lease.ConfigurationRevision, OperationRevision: lease.OperationRevision}, nil
 }
 
 var _ CredentialLeaseIssueService = CredentialLeaseIssuer{}

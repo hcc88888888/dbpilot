@@ -78,6 +78,19 @@ func TestNewCacheIsEmptyAndNeverRestoresAPreviousLease(t *testing.T) {
 	require.Empty(t, New(time.Now).entries)
 }
 
+func TestCacheTimerZerosAndRemovesWithoutAnotherGet(t *testing.T) {
+	cache := New(time.Now)
+	key := validKey()
+	handle, err := cache.Get(context.Background(), key, func(context.Context) (Lease, error) {
+		return Lease{ID: "lease-timer", Key: key, ExpiresAt: time.Now().UTC().Add(50 * time.Millisecond), Username: "monitor", SecretBytes: []byte("timer-secret")}, nil
+	})
+	require.NoError(t, err)
+	handle.Release()
+	stored := cache.entries[key].lease.SecretBytes
+	require.Eventually(t, func() bool { cache.mu.Lock(); defer cache.mu.Unlock(); return cache.entries[key] == nil }, time.Second, 10*time.Millisecond)
+	require.Equal(t, make([]byte, len(stored)), stored)
+}
+
 func validKey() Key {
 	return Key{AssignmentID: "assignment-1", InstanceID: "instance-1", CredentialRevision: 9, ConfigurationRevision: 5, OperationRevision: 7}
 }

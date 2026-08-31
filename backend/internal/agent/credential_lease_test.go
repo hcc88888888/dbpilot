@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestControlClientCorrelatesCredentialLeaseAndClearsWireSecret(t *testing.T)
 		return false
 	}, time.Second, time.Millisecond)
 	secret := []byte("fixture-password")
-	response := &agentv1.CredentialLeaseResponse{RequestNonce: request.GetRequestNonce(), LeaseId: "lease-1", InstanceId: "instance-1", AssignmentId: "assignment-1", CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: secret}}
+	response := &agentv1.CredentialLeaseResponse{RequestNonce: request.GetRequestNonce(), LeaseId: "lease-1", InstanceId: "instance-1", AssignmentId: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7, CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: secret}}
 	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CredentialLeaseResponse{CredentialLeaseResponse: response}}
 
 	got := <-result
@@ -81,10 +82,43 @@ func TestControlClientRejectsMismatchedCredentialLeaseWithoutSecretInError(t *te
 		return false
 	}, time.Second, time.Millisecond)
 	secret := []byte("credential-must-not-appear")
-	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CredentialLeaseResponse{CredentialLeaseResponse: &agentv1.CredentialLeaseResponse{RequestNonce: request.GetRequestNonce(), LeaseId: "lease-1", InstanceId: "instance-other", AssignmentId: "assignment-1", CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: secret}}}}
+	stream.receive <- &agentv1.ServerMessage{Message: &agentv1.ServerMessage_CredentialLeaseResponse{CredentialLeaseResponse: &agentv1.CredentialLeaseResponse{RequestNonce: request.GetRequestNonce(), LeaseId: "lease-1", InstanceId: "instance-other", AssignmentId: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7, CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: secret}}}}
 	err := <-result
 	require.ErrorIs(t, err, ErrCredentialLease)
 	require.NotContains(t, err.Error(), "credential-must-not-appear")
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestCancelledCredentialWaiterImmediatelyZerosLateCopiedLease(t *testing.T) {
+	waiter := &credentialLeaseWaiter{result: make(chan credentialLeaseResult, 1), cancelled: true}
+	secret := []byte("late-copied-secret")
+	waiter.deliver(credentialLeaseResult{lease: CredentialLease{SecretBytes: secret}})
+	require.Equal(t, make([]byte, len(secret)), secret)
+	require.Empty(t, waiter.result)
+}
+
+func TestCredentialLeaseResponseRejectsEveryReturnedFenceAndZerosSecret(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*agentv1.CredentialLeaseResponse)
+	}{
+		{name: "family", mutate: func(value *agentv1.CredentialLeaseResponse) { value.DatabaseFamily = "postgres" }},
+		{name: "configuration", mutate: func(value *agentv1.CredentialLeaseResponse) { value.ConfigurationRevision++ }},
+		{name: "operation", mutate: func(value *agentv1.CredentialLeaseResponse) { value.OperationRevision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &ControlClient{now: time.Now, credentialLeaseWaiters: make(map[string]*credentialLeaseWaiter)}
+			nonce := bytes.Repeat([]byte{0x31}, 32)
+			waiter := &credentialLeaseWaiter{request: CredentialLeaseRequest{AssignmentID: "assignment-1", InstanceID: "instance-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7}, result: make(chan credentialLeaseResult, 1)}
+			client.credentialLeaseWaiters[string(nonce)] = waiter
+			secret := []byte("wrong-fence-secret")
+			response := &agentv1.CredentialLeaseResponse{RequestNonce: nonce, LeaseId: "lease-1", InstanceId: "instance-1", AssignmentId: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7, CredentialRevision: 9, ExpiresAt: timestamppb.New(time.Now().Add(time.Minute)), Credential: &agentv1.CredentialMaterial{Username: "monitor", SecretBytes: secret}}
+			test.mutate(response)
+			require.NoError(t, client.handleCredentialLeaseResponse(response))
+			result := <-waiter.result
+			require.ErrorIs(t, result.err, ErrCredentialLease)
+			require.Equal(t, make([]byte, len(secret)), secret)
+		})
+	}
 }

@@ -12,6 +12,7 @@ CREATE TABLE credential_lease_audits (
     operation_revision BIGINT NOT NULL CHECK (operation_revision >= 1),
     instance_revision BIGINT NOT NULL CHECK (instance_revision >= 1),
     credential_revision BIGINT NOT NULL CHECK (credential_revision >= 0),
+    lease_id_hash TEXT NOT NULL DEFAULT '' CHECK (lease_id_hash = '' OR lease_id_hash ~ '^sha256:[0-9a-f]{64}$'),
     result TEXT NOT NULL CHECK (result IN ('issued','rejected')),
     expiry_class TEXT NOT NULL CHECK (expiry_class IN ('short')),
     occurred_at TIMESTAMPTZ NOT NULL,

@@ -2,6 +2,8 @@ package pluginsupervisor
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,44 @@ func TestLeaseInstancesUsesExactFencesAndReleasesSecretBuffers(t *testing.T) {
 		release()
 	}
 	require.Equal(t, make([]byte, len(retained)), retained)
+}
+
+func TestGatewayCredentialRemoteRequestIsSingleflight(t *testing.T) {
+	now := time.Now().UTC()
+	leaser := &slowCredentialLeaser{release: make(chan struct{}), lease: CredentialLease{LeaseID: "lease-1", AssignmentID: "assignment-1", InstanceID: "instance-1", DatabaseFamily: "mysql", CredentialRevision: 9, ConfigurationRevision: 5, OperationRevision: 7, ExpiresAt: now.Add(time.Minute), Username: "monitor", SecretBytes: []byte("singleflight-secret")}}
+	checker := NewGatewayHealthCheckerWithCredentials(nil, leaser)
+	request := CredentialLeaseRequest{AssignmentID: "assignment-1", InstanceID: "instance-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7}
+	results := make(chan CredentialLease, 8)
+	var wait sync.WaitGroup
+	for index := 0; index < 8; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			lease, _ := checker.leaseCredential(context.Background(), request)
+			results <- lease
+		}()
+	}
+	require.Eventually(t, func() bool { return leaser.calls.Load() == 1 }, time.Second, time.Millisecond)
+	close(leaser.release)
+	wait.Wait()
+	close(results)
+	require.Equal(t, int32(1), leaser.calls.Load())
+	for lease := range results {
+		require.Equal(t, []byte("singleflight-secret"), lease.SecretBytes)
+		lease.Release()
+	}
+}
+
+type slowCredentialLeaser struct {
+	calls   atomic.Int32
+	release chan struct{}
+	lease   CredentialLease
+}
+
+func (value *slowCredentialLeaser) LeaseCredential(context.Context, CredentialLeaseRequest) (CredentialLease, error) {
+	value.calls.Add(1)
+	<-value.release
+	return value.lease.Clone(), nil
 }
 
 type recordingCredentialLeaser struct {

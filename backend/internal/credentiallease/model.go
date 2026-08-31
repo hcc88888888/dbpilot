@@ -36,7 +36,9 @@ type LeaseRequest struct {
 	Nonce                 []byte
 	InstanceID            string
 	AssignmentID          string
+	DatabaseFamily        string
 	ConfigurationRevision uint64
+	OperationRevision     uint64
 }
 
 type Authorization struct {
@@ -109,6 +111,10 @@ type SecretProvider interface {
 
 type Authorizer interface {
 	Authorize(context.Context, AuthenticatedAgent, LeaseRequest) (Authorization, error)
+}
+
+type RenewalAuthorizer interface {
+	AuthorizeRenewal(context.Context, AuthenticatedAgent, LeaseRequest) (Authorization, error)
 }
 
 type DatabaseClock interface {
