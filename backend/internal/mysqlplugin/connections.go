@@ -137,6 +137,14 @@ func NewRuntime(factory PoolFactory, options RuntimeOptions) *Runtime {
 }
 
 func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
+	return runtime.apply(ctx, configuration, nil)
+}
+
+func (runtime *Runtime) ApplyWithSwap(ctx context.Context, configuration Config, onSwap func()) error {
+	return runtime.apply(ctx, configuration, onSwap)
+}
+
+func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap func()) error {
 	defer configuration.Release()
 	if runtime == nil || runtime.factory == nil || ctx == nil || ctx.Err() != nil || configuration.AssignmentID == "" || configuration.Revision == 0 || len(configuration.Instances) == 0 || len(configuration.Instances) > MaxInstances {
 		return ErrConfigurationRejected
@@ -248,6 +256,9 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 	}
 	runtime.generation++
 	failed = false
+	if onSwap != nil {
+		onSwap()
+	}
 	runtime.mu.Unlock()
 	for index := range retiredConfigs {
 		retiredConfigs[index].Release()
@@ -292,6 +303,19 @@ func (runtime *Runtime) AssignmentID() string {
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
 	return runtime.config.AssignmentID
+}
+
+func (runtime *Runtime) withRevision(revision uint64, action func()) bool {
+	if runtime == nil || action == nil {
+		return false
+	}
+	runtime.mu.RLock()
+	defer runtime.mu.RUnlock()
+	if runtime.config.Revision != revision {
+		return false
+	}
+	action()
+	return true
 }
 
 func (runtime *Runtime) Close() {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,7 +255,7 @@ func TestPendingBacklogBoundsOversizeLegalShapeAndMultiBatchEnvelope(t *testing.
 	}
 }
 
-func TestOversizeCollectResponseRollsBackOnlyNewPendingBytes(t *testing.T) {
+func TestOversizeCollectResponseKeepsBoundedPendingForPairRecovery(t *testing.T) {
 	columns := make([]string, 0, 26)
 	valueMappings := make([]*pluginv1.MetricValueMapping, 0, 10)
 	labelMappings := make([]*pluginv1.MetricLabelMapping, 0, 16)
@@ -289,12 +290,143 @@ func TestOversizeCollectResponseRollsBackOnlyNewPendingBytes(t *testing.T) {
 	_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"custom-a", "custom-b"}})
 	require.Error(t, err)
 	server.mu.Lock()
-	defer server.mu.Unlock()
-	require.Empty(t, server.pending)
-	require.Zero(t, server.pendingBytes)
-	require.Zero(t, server.sequences[cursorKey("mysql-a", "custom-a")])
-	require.Zero(t, server.sequences[cursorKey("mysql-a", "custom-b")])
+	require.Len(t, server.pending, 2)
+	require.Greater(t, server.pendingBytes, 0)
+	require.LessOrEqual(t, server.pendingBytes, maxPendingBytes)
+	before := server.pendingBytes
+	server.mu.Unlock()
+	for _, templateID := range []string{"custom-a", "custom-b"} {
+		response, recoveryErr := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{templateID}})
+		require.NoError(t, recoveryErr)
+		require.Len(t, response.GetBatches(), 1)
+		server.mu.Lock()
+		require.True(t, proto.Equal(server.pending[cursorKey("mysql-a", templateID)], response.GetBatches()[0]))
+		server.mu.Unlock()
+	}
+	server.mu.Lock()
+	require.Equal(t, before, server.pendingBytes)
+	server.mu.Unlock()
 }
+
+func TestBlockedACollectionAndCredentialApplyDoNotBlockB(t *testing.T) {
+	rows := &blockingCustomRows{started: make(chan struct{}), release: make(chan struct{})}
+	instanceA := fixtureDecodedInstance("instance-a", "old-a")
+	instanceA.Templates = map[string]TemplateConfig{"custom-a": customTemplate(10)}
+	instanceB := fixtureDecodedInstance("instance-b", "old-b")
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"instance-a": {Config: instanceA, Pool: newGuardedPool(&blockingCustomPool{rows: rows}), fingerprint: instanceFingerprint(instanceA)}, "instance-b": {Config: instanceB, Pool: newGuardedPool(&statusPool{}), fingerprint: instanceFingerprint(instanceB)}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", Runtime: runtime})
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"custom-a"}})
+		aDone <- err
+	}()
+	<-rows.started
+	applyDone := make(chan error, 1)
+	go func() {
+		response, err := server.ApplyConfiguration(context.Background(), &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: "assignment-a", ConfigurationRevision: 2, Instances: []*pluginv1.PluginInstanceConfiguration{fixtureInstance("instance-a", "127.0.0.1:3306", "new-a", []byte("new-a"), time.Now().Add(time.Minute)), fixtureInstance("instance-b", "127.0.0.1:3307", "new-b", []byte("new-b"), time.Now().Add(time.Minute))}})
+		if err == nil && response.GetErrorCode() != "" {
+			err = errors.New(response.GetErrorCode())
+		}
+		applyDone <- err
+	}()
+	require.Eventually(t, func() bool { return runtime.Revision() == 2 }, time.Second, time.Millisecond)
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 2, InstanceIds: []string{"instance-b"}, TemplateIds: []string{"mysql.up"}})
+		bDone <- err
+	}()
+	select {
+	case err := <-bDone:
+		require.NoError(t, err)
+	case <-time.After(100 * time.Millisecond):
+		t.Error("blocked A collection/Apply blocked B collection")
+	}
+	close(rows.release)
+	require.Error(t, <-aDone, "old revision A result must be discarded")
+	require.NoError(t, <-applyDone)
+}
+
+func TestStreamSendsBDueBatchesWhileACustomQueryIsBlocked(t *testing.T) {
+	blocked := &blockingMixedPool{started: make(chan struct{}), release: make(chan struct{})}
+	instanceA := fixtureDecodedInstance("instance-a", "old-a")
+	instanceA.Templates = map[string]TemplateConfig{"custom-a": customTemplate(10)}
+	instanceB := fixtureDecodedInstance("instance-b", "old-b")
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"instance-a": {Config: instanceA, Pool: newGuardedPool(blocked)}, "instance-b": {Config: instanceB, Pool: newGuardedPool(&statusPool{})}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", ConfigurationRevision: 1, Runtime: runtime, StreamInterval: time.Millisecond})
+	cursors := make([]*pluginv1.PluginMetricCursor, 0, 11)
+	for _, instanceID := range []string{"instance-a", "instance-b"} {
+		for _, templateID := range SortedBuiltinTemplateIDs(BuiltinCatalog()) {
+			cursors = append(cursors, &pluginv1.PluginMetricCursor{InstanceId: instanceID, TemplateId: templateID})
+		}
+	}
+	cursors = append(cursors, &pluginv1.PluginMetricCursor{InstanceId: "instance-a", TemplateId: "custom-a"})
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := &captureMetricStream{ctx: ctx, cancel: cancel, want: 10}
+	stream.onSend = func(batch *pluginv1.PluginMetricBatch) {
+		if batch.GetInstanceId() != "instance-b" {
+			return
+		}
+		_, _ = server.AcknowledgeMetrics(context.Background(), &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, Cursors: []*pluginv1.PluginMetricCursor{{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()}}})
+		server.mu.Lock()
+		server.nextDue[cursorKey(batch.GetInstanceId(), batch.GetTemplateId())] = time.Time{}
+		server.mu.Unlock()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.StreamMetrics(&pluginv1.StreamPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, ResumeCursors: cursors}, stream)
+	}()
+	<-blocked.started
+	require.Eventually(t, func() bool { stream.mu.Lock(); defer stream.mu.Unlock(); return len(stream.batches) >= 10 }, 500*time.Millisecond, time.Millisecond)
+	stream.mu.Lock()
+	for _, batch := range stream.batches {
+		require.Equal(t, "instance-b", batch.GetInstanceId())
+	}
+	stream.mu.Unlock()
+	require.Equal(t, int32(1), blocked.calls.Load())
+	close(blocked.release)
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+type blockingMixedPool struct {
+	started, release chan struct{}
+	once             sync.Once
+	calls            atomic.Int32
+}
+
+func (*blockingMixedPool) PingContext(context.Context) error { return nil }
+func (pool *blockingMixedPool) QueryContext(_ context.Context, query string, _ ...any) (Rows, error) {
+	pool.calls.Add(1)
+	if query == builtinStatusQuery {
+		return &blockingStatusRows{owner: pool, rows: [][]string{{"Threads_connected", "1"}, {"Questions", "2"}, {"Threads_running", "1"}, {"Uptime", "10"}}}, nil
+	}
+	return &customRows{columns: []string{"value", "role_name"}, values: [][]any{{[]byte("1"), []byte("primary")}}}, nil
+}
+func (*blockingMixedPool) Close() error { return nil }
+
+type blockingStatusRows struct {
+	owner *blockingMixedPool
+	rows  [][]string
+	index int
+}
+
+func (rows *blockingStatusRows) Next() bool {
+	rows.owner.once.Do(func() { close(rows.owner.started); <-rows.owner.release })
+	return rows.index < len(rows.rows)
+}
+func (rows *blockingStatusRows) Scan(dest ...any) error {
+	current := rows.rows[rows.index]
+	rows.index++
+	*(dest[0].(*string)) = current[0]
+	*(dest[1].(*string)) = current[1]
+	return nil
+}
+func (*blockingStatusRows) Columns() ([]string, error) {
+	return []string{"VARIABLE_NAME", "VARIABLE_VALUE"}, nil
+}
+func (*blockingStatusRows) Err() error   { return nil }
+func (*blockingStatusRows) Close() error { return nil }
 
 func TestShutdownStopsActiveStreamsBeforeClosingRuntime(t *testing.T) {
 	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
@@ -400,6 +532,7 @@ type captureMetricStream struct {
 	mu      sync.Mutex
 	batches []*pluginv1.PluginMetricBatch
 	header  chan struct{}
+	onSend  func(*pluginv1.PluginMetricBatch)
 }
 
 func (stream *captureMetricStream) Context() context.Context { return stream.ctx }
@@ -416,6 +549,9 @@ func (stream *captureMetricStream) Send(batch *pluginv1.PluginMetricBatch) error
 	stream.batches = append(stream.batches, batch)
 	done := stream.want > 0 && len(stream.batches) >= stream.want
 	stream.mu.Unlock()
+	if stream.onSend != nil {
+		stream.onSend(batch)
+	}
 	if done && stream.cancel != nil {
 		stream.cancel()
 	}
