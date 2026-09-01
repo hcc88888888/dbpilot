@@ -36,11 +36,6 @@ AND pa.desired_state='running' AND di.management_status<>'retired'`
 	}
 	value.AuthorizedAt = value.AuthorizedAt.UTC()
 	if !authorizer.Fences.ExecutionLeaseActive(agent.AgentID, commandID, value.AuthorizedAt) {
-		var previouslyIssued bool
-		priorErr := authorizer.Database.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM credential_lease_audits WHERE tenant_id=$1 AND project_id=$2 AND agent_id=$3 AND assignment_id=$4 AND instance_id=$5 AND configuration_revision=$6 AND operation_revision=$7 AND result='issued')`, value.Scope.TenantID, value.Scope.ProjectID, agent.AgentID, request.AssignmentID, request.InstanceID, value.ConfigurationRevision, value.OperationRevision).Scan(&previouslyIssued)
-		if priorErr != nil || !previouslyIssued {
-			return Authorization{}, ErrLeaseRejected
-		}
 		return authorizer.AuthorizeRenewal(ctx, agent, request)
 	}
 	return value, nil
@@ -62,10 +57,18 @@ JOIN command_outbox co ON co.tenant_id=op.tenant_id AND co.project_id=op.project
 JOIN plugin_versions pv ON pv.tenant_id=pa.tenant_id AND pv.project_id=pa.project_id AND pv.version_id=pa.desired_version_id AND pv.status='available'
 JOIN plugin_observations po ON po.tenant_id=pa.tenant_id AND po.project_id=pa.project_id AND po.assignment_id=pa.assignment_id AND po.process_state='running' AND po.health='healthy' AND po.active_configuration_revision=pa.configuration_revision AND po.observed_operation_revision=pa.operation_revision
 WHERE pa.agent_id=$1 AND pa.assignment_id=$2 AND di.instance_id=$3 AND pa.configuration_revision=$4
-AND pa.desired_state='running' AND di.management_status<>'retired'`
+AND pa.desired_state='running' AND di.management_status<>'retired'
+AND EXISTS (
+SELECT 1 FROM credential_lease_audits cla
+WHERE cla.tenant_id=pa.tenant_id AND cla.project_id=pa.project_id AND cla.agent_id=pa.agent_id AND cla.host_id=pa.host_id
+AND cla.assignment_id=pa.assignment_id AND cla.instance_id=di.instance_id
+AND cla.configuration_revision=pa.configuration_revision AND cla.operation_revision=pa.operation_revision
+AND cla.instance_revision=di.revision
+AND cla.credential_ref_hash='sha256:' || encode(sha256(convert_to('dbpilot-credential-reference-audit-v1','UTF8') || decode('00','hex') || convert_to(di.credential_ref,'UTF8')),'hex')
+AND cla.result='issued')`
 	var value Authorization
 	err := authorizer.Database.QueryRowContext(ctx, query, agent.AgentID, request.AssignmentID, request.InstanceID, request.ConfigurationRevision).Scan(&value.Scope.TenantID, &value.Scope.ProjectID, &value.HostID, &value.AgentID, &value.AssignmentID, &value.DatabaseFamily, &value.ConfigurationRevision, &value.OperationRevision, &value.InstanceID, &value.InstanceRevision, &value.CredentialRef, &value.TLSRef, &value.ManagementStatus, &value.AuthorizedAt)
-	if err != nil || !validAuthorization(value, agent, request) {
+	if err != nil || !validAuthorization(value, agent, request) || !strictSecretReference(value.CredentialRef) {
 		return Authorization{}, ErrLeaseRejected
 	}
 	value.AuthorizedAt = value.AuthorizedAt.UTC()
@@ -92,9 +95,9 @@ func (recorder PostgresAuditRecorder) Record(ctx context.Context, record AuditRe
 		return ErrLeaseRejected
 	}
 	const statement = `INSERT INTO credential_lease_audits
-(tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_revision,lease_id_hash,result,expiry_class,occurred_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`
-	_, err := recorder.Database.ExecContext(ctx, statement, record.TenantID, record.ProjectID, record.AgentID, record.HostID, record.AssignmentID, record.InstanceID, record.ConfigurationRevision, record.OperationRevision, record.InstanceRevision, record.CredentialRevision, record.LeaseIDHash, record.Result, record.ExpiryClass, record.OccurredAt)
+(tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_ref_hash,credential_revision,lease_id_hash,result,expiry_class,occurred_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`
+	_, err := recorder.Database.ExecContext(ctx, statement, record.TenantID, record.ProjectID, record.AgentID, record.HostID, record.AssignmentID, record.InstanceID, record.ConfigurationRevision, record.OperationRevision, record.InstanceRevision, record.CredentialRefHash, record.CredentialRevision, record.LeaseIDHash, record.Result, record.ExpiryClass, record.OccurredAt)
 	if err != nil {
 		return ErrLeaseRejected
 	}

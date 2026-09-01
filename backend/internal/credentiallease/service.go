@@ -355,7 +355,7 @@ func (service *ApplicationService) recordRejected(ctx context.Context, authoriza
 }
 
 func auditFor(authorization Authorization, agent AuthenticatedAgent, request LeaseRequest, now time.Time, result AuditResult, credentialRevision uint64, leaseIDHash string) AuditRecord {
-	return AuditRecord{TenantID: authorization.Scope.TenantID, ProjectID: authorization.Scope.ProjectID, AgentID: agent.AgentID, HostID: authorization.HostID, AssignmentID: request.AssignmentID, InstanceID: request.InstanceID, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, InstanceRevision: authorization.InstanceRevision, CredentialRevision: credentialRevision, LeaseIDHash: leaseIDHash, Result: result, ExpiryClass: ExpiryClassShort, OccurredAt: now.UTC()}
+	return AuditRecord{TenantID: authorization.Scope.TenantID, ProjectID: authorization.Scope.ProjectID, AgentID: agent.AgentID, HostID: authorization.HostID, AssignmentID: request.AssignmentID, InstanceID: request.InstanceID, ConfigurationRevision: authorization.ConfigurationRevision, OperationRevision: authorization.OperationRevision, InstanceRevision: authorization.InstanceRevision, CredentialRefHash: CredentialRefAuditHash(authorization.CredentialRef), CredentialRevision: credentialRevision, LeaseIDHash: leaseIDHash, Result: result, ExpiryClass: ExpiryClassShort, OccurredAt: now.UTC()}
 }
 
 func validAgent(value AuthenticatedAgent) bool {

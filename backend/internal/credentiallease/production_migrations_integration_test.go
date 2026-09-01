@@ -8,11 +8,14 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"dbpilot.local/platform/internal/controlplanemigrations"
 	"dbpilot.local/platform/internal/credentiallease"
+	"dbpilot.local/platform/internal/databaseinstance"
+	"dbpilot.local/platform/internal/platformscope"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
@@ -30,15 +33,61 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	require.NoError(t, controlplanemigrations.Run(ctx, database, options), "the production migration composition must be restart-idempotent")
 
 	success := seedDurableRenewalFixture(t, database, "success", now)
-	lease, fence, service, err := requestDurableRenewal(ctx, database, success)
-	require.NoError(t, err, "a restarted service must renew from durable production-schema evidence")
-	require.Equal(t, success.commandID, fence.commandID)
-	require.GreaterOrEqual(t, fence.calls, 2, "initial and post-provider authorization must both observe the absent live fence")
-	require.Equal(t, success.secret, lease.SecretBytes)
-	require.Equal(t, success.username, lease.Username)
-	assertIssuedAuditIsHashOnly(t, database, success, lease)
-	lease.Release()
-	service.Close()
+	initialProvider := newRecordingProvider(map[string]credentiallease.Credential{
+		success.credentialRef: {Username: success.username, SecretBytes: success.secret, Revision: 11},
+	})
+	liveFence := &recordingFence{active: true}
+	initialService := newCredentialLeaseService(t, database, liveFence, initialProvider)
+	initialLease, err := requestCredentialLease(ctx, initialService, success, 0x21)
+	require.NoError(t, err, "a live CommandStart fence must authorize initial issuance")
+	require.Equal(t, uint64(11), initialLease.CredentialRevision)
+	assertIssuedAuditIsHashOnly(t, database, success, initialLease)
+	initialLease.Release()
+	initialService.Close()
+
+	rotatedRef := "secret://database/rotated-success"
+	restartProvider := newRecordingProvider(map[string]credentiallease.Credential{
+		success.credentialRef: {Username: success.username, SecretBytes: success.secret, Revision: 12},
+		rotatedRef:            {Username: "rotated_success", SecretBytes: []byte("task11-production-secret-rotated-success"), Revision: 13},
+	})
+	inactiveFence := &recordingFence{}
+	restartedService := newCredentialLeaseService(t, database, inactiveFence, restartProvider)
+	renewedLease, err := requestCredentialLease(ctx, restartedService, success, 0x22)
+	require.NoError(t, err, "a restarted service must renew the same credential reference from durable production-schema evidence")
+	require.Equal(t, uint64(12), renewedLease.CredentialRevision, "same-reference provider revision rotation remains authorized")
+	require.Equal(t, success.commandID, inactiveFence.commandID)
+	require.GreaterOrEqual(t, inactiveFence.calls, 2, "initial and post-provider authorization must both observe the absent live fence")
+	assertIssuedAuditIsHashOnly(t, database, success, renewedLease)
+	renewedLease.Release()
+
+	updated, err := databaseinstance.NewPostgresRepository(database).Update(ctx,
+		platformscope.Scope{TenantID: success.tenantID, ProjectID: success.projectID}, success.instanceID, 9,
+		databaseinstance.Update{CredentialRef: &rotatedRef, Audit: databaseinstance.MutationAudit{
+			Actor: "operator-1", OperationID: "updateDatabaseInstance", IdempotencyKey: "rotate-success",
+			RequestFingerprint: "sha256:" + strings.Repeat("c", 64), RequestID: "request-rotate-success",
+		}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), updated.Revision)
+	require.Equal(t, rotatedRef, updated.CredentialRef)
+	providerCallsBeforeDrift := restartProvider.Calls()
+	driftedLease, err := requestCredentialLease(ctx, restartedService, success, 0x23)
+	driftedLease.Release()
+	require.ErrorIs(t, err, credentiallease.ErrLeaseRejected)
+	require.Equal(t, providerCallsBeforeDrift, restartProvider.Calls(), "Task 6 credential reference/revision drift must reject before provider resolution")
+	restartedService.Close()
+
+	legacy := seedDurableRenewalFixture(t, database, "legacy-audit", now.Add(time.Second))
+	seedIssuedAudit(t, database, legacy, false, now.Add(time.Second))
+	legacyProvider := newRecordingProvider(map[string]credentiallease.Credential{
+		legacy.credentialRef: {Username: legacy.username, SecretBytes: legacy.secret, Revision: 12},
+	})
+	legacyService := newCredentialLeaseService(t, database, &recordingFence{}, legacyProvider)
+	legacyLease, err := requestCredentialLease(ctx, legacyService, legacy, 0x24)
+	legacyLease.Release()
+	legacyService.Close()
+	require.ErrorIs(t, err, credentiallease.ErrLeaseRejected, "pre-migration Audit rows without a credential reference hash must fail closed")
+	require.Zero(t, legacyProvider.Calls())
 
 	mutations := []struct {
 		name   string
@@ -54,10 +103,6 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 		}},
 		{name: "assignment membership", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
 			_, err := database.Exec(`DELETE FROM plugin_assignment_instances WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
-			require.NoError(t, err)
-		}},
-		{name: "credential reference", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
-			_, err := database.Exec(`UPDATE managed_database_instances SET credential_ref='secret://database/revoked' WHERE instance_id=$1`, value.instanceID)
 			require.NoError(t, err)
 		}},
 		{name: "instance status", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
@@ -92,11 +137,14 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	for index, test := range mutations {
 		t.Run(test.name, func(t *testing.T) {
 			value := seedDurableRenewalFixture(t, database, fmt.Sprintf("drift-%02d", index), now.Add(time.Duration(index+1)*time.Second))
+			seedIssuedAudit(t, database, value, true, now.Add(time.Duration(index+1)*time.Second))
 			test.mutate(t, database, value)
-			lease, _, service, err := requestDurableRenewal(ctx, database, value)
-			if service != nil {
-				service.Close()
-			}
+			provider := newRecordingProvider(map[string]credentiallease.Credential{
+				value.credentialRef: {Username: value.username, SecretBytes: value.secret, Revision: 12},
+			})
+			service := newCredentialLeaseService(t, database, &recordingFence{}, provider)
+			lease, err := requestCredentialLease(ctx, service, value, byte(0x30+index))
+			service.Close()
 			lease.Release()
 			require.ErrorIs(t, err, credentiallease.ErrLeaseRejected)
 		})
@@ -185,32 +233,67 @@ VALUES ($1,$2,$3,5,7,$4,$5,$6)`, value.tenantID, value.projectID, value.assignme
 	exec(`INSERT INTO plugin_observations
 (tenant_id,project_id,assignment_id,host_id,agent_id,plugin_id,database_family,installed_version,active_slot,process_state,process_id,started_at,health,restart_count,circuit_state,bound_instance_count,active_configuration_revision,observed_operation_revision,observation_revision,observation_digest,observed_at,received_at)
 VALUES ($1,$2,$3,$4,$5,$6,'mysql','1.0.0','a','running',123,$7,'healthy',0,'closed',1,5,7,1,$8,$7,$7)`, value.tenantID, value.projectID, value.assignmentID, value.hostID, value.agentID, pluginID, now, digest)
-	exec(`INSERT INTO credential_lease_audits
-(tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_revision,lease_id_hash,result,expiry_class,occurred_at)
-VALUES ($1,$2,$3,$4,$5,$6,5,7,9,11,$7,'issued','short',$8)`, value.tenantID, value.projectID, value.agentID, value.hostID, value.assignmentID, value.instanceID, "sha256:"+strings.Repeat("1", 64), now)
 	require.NoError(t, tx.Commit())
 	return value
 }
 
-type inactiveFence struct {
+func seedIssuedAudit(t *testing.T, database *sql.DB, value durableRenewalFixture, includeCredentialRefHash bool, now time.Time) {
+	t.Helper()
+	credentialRefHash := ""
+	if includeCredentialRefHash {
+		credentialRefHash = credentiallease.CredentialRefAuditHash(value.credentialRef)
+	}
+	_, err := database.Exec(`INSERT INTO credential_lease_audits
+(tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_ref_hash,credential_revision,lease_id_hash,result,expiry_class,occurred_at)
+VALUES ($1,$2,$3,$4,$5,$6,5,7,9,$7,11,$8,'issued','short',$9)`, value.tenantID, value.projectID, value.agentID, value.hostID, value.assignmentID, value.instanceID, credentialRefHash, "sha256:"+strings.Repeat("1", 64), now)
+	require.NoError(t, err)
+}
+
+type recordingFence struct {
 	calls     int
 	commandID string
+	active    bool
 }
 
-func (fence *inactiveFence) ExecutionLeaseActive(_ string, commandID string, _ time.Time) bool {
+func (fence *recordingFence) ExecutionLeaseActive(_ string, commandID string, _ time.Time) bool {
 	fence.calls++
 	fence.commandID = commandID
-	return false
+	return fence.active
 }
 
-func requestDurableRenewal(ctx context.Context, database *sql.DB, value durableRenewalFixture) (credentiallease.Lease, *inactiveFence, *credentiallease.ApplicationService, error) {
-	provider, err := credentiallease.NewMemoryProvider(map[string]credentiallease.Credential{
-		value.credentialRef: {Username: value.username, SecretBytes: value.secret, Revision: 12},
-	})
-	if err != nil {
-		return credentiallease.Lease{}, nil, nil, err
+type recordingProvider struct {
+	mu     sync.Mutex
+	values map[string]credentiallease.Credential
+	calls  int
+}
+
+func newRecordingProvider(values map[string]credentiallease.Credential) *recordingProvider {
+	cloned := make(map[string]credentiallease.Credential, len(values))
+	for reference, credential := range values {
+		cloned[reference] = credential.Clone()
 	}
-	fence := &inactiveFence{}
+	return &recordingProvider{values: cloned}
+}
+
+func (provider *recordingProvider) Resolve(_ context.Context, reference string) (credentiallease.Credential, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	provider.calls++
+	credential, ok := provider.values[reference]
+	if !ok {
+		return credentiallease.Credential{}, credentiallease.ErrLeaseRejected
+	}
+	return credential.Clone(), nil
+}
+
+func (provider *recordingProvider) Calls() int {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	return provider.calls
+}
+
+func newCredentialLeaseService(t *testing.T, database *sql.DB, fence *recordingFence, provider credentiallease.SecretProvider) *credentiallease.ApplicationService {
+	t.Helper()
 	authorizer := credentiallease.PostgresAuthorizer{Database: database, Fences: fence}
 	service, err := credentiallease.NewService(credentiallease.Config{
 		Authorizer: authorizer,
@@ -221,28 +304,29 @@ func requestDurableRenewal(ctx context.Context, database *sql.DB, value durableR
 		TTL:        30 * time.Second,
 		Random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 16)),
 	})
-	if err != nil {
-		return credentiallease.Lease{}, fence, nil, err
-	}
+	require.NoError(t, err)
+	return service
+}
+
+func requestCredentialLease(ctx context.Context, service *credentiallease.ApplicationService, value durableRenewalFixture, nonce byte) (credentiallease.Lease, error) {
 	request := credentiallease.LeaseRequest{
-		Nonce:                 bytes.Repeat([]byte{0x24}, credentiallease.RequestNonceBytes),
+		Nonce:                 bytes.Repeat([]byte{nonce}, credentiallease.RequestNonceBytes),
 		InstanceID:            value.instanceID,
 		AssignmentID:          value.assignmentID,
 		DatabaseFamily:        "mysql",
 		ConfigurationRevision: 5,
 		OperationRevision:     7,
 	}
-	lease, err := service.Lease(ctx, credentiallease.AuthenticatedAgent{AgentID: value.agentID, SessionID: "session-" + strings.TrimPrefix(value.agentID, "agent-")}, request)
-	return lease, fence, service, err
+	return service.Lease(ctx, credentiallease.AuthenticatedAgent{AgentID: value.agentID, SessionID: "session-" + strings.TrimPrefix(value.agentID, "agent-")}, request)
 }
 
 func assertIssuedAuditIsHashOnly(t *testing.T, database *sql.DB, value durableRenewalFixture, lease credentiallease.Lease) {
 	t.Helper()
-	var tenantID, projectID, agentID, hostID, assignmentID, instanceID, leaseIDHash, result, expiryClass string
+	var tenantID, projectID, agentID, hostID, assignmentID, instanceID, credentialRefHash, leaseIDHash, result, expiryClass string
 	var configurationRevision, operationRevision, instanceRevision, credentialRevision uint64
 	var occurredAt time.Time
-	err := database.QueryRow(`SELECT tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_revision,lease_id_hash,result,expiry_class,occurred_at
-FROM credential_lease_audits WHERE tenant_id=$1 AND project_id=$2 ORDER BY audit_id DESC LIMIT 1`, value.tenantID, value.projectID).Scan(&tenantID, &projectID, &agentID, &hostID, &assignmentID, &instanceID, &configurationRevision, &operationRevision, &instanceRevision, &credentialRevision, &leaseIDHash, &result, &expiryClass, &occurredAt)
+	err := database.QueryRow(`SELECT tenant_id,project_id,agent_id,host_id,assignment_id,instance_id,configuration_revision,operation_revision,instance_revision,credential_ref_hash,credential_revision,lease_id_hash,result,expiry_class,occurred_at
+FROM credential_lease_audits WHERE tenant_id=$1 AND project_id=$2 ORDER BY audit_id DESC LIMIT 1`, value.tenantID, value.projectID).Scan(&tenantID, &projectID, &agentID, &hostID, &assignmentID, &instanceID, &configurationRevision, &operationRevision, &instanceRevision, &credentialRefHash, &credentialRevision, &leaseIDHash, &result, &expiryClass, &occurredAt)
 	require.NoError(t, err)
 	require.Equal(t, value.tenantID, tenantID)
 	require.Equal(t, value.projectID, projectID)
@@ -253,7 +337,8 @@ FROM credential_lease_audits WHERE tenant_id=$1 AND project_id=$2 ORDER BY audit
 	require.Equal(t, uint64(5), configurationRevision)
 	require.Equal(t, uint64(7), operationRevision)
 	require.Equal(t, uint64(9), instanceRevision)
-	require.Equal(t, uint64(12), credentialRevision)
+	require.Equal(t, credentiallease.CredentialRefAuditHash(value.credentialRef), credentialRefHash)
+	require.Equal(t, lease.CredentialRevision, credentialRevision)
 	require.Equal(t, credentiallease.LeaseIDAuditHash(lease.ID), leaseIDHash)
 	require.NotEqual(t, lease.ID, leaseIDHash)
 	require.Equal(t, "issued", result)
@@ -265,6 +350,8 @@ FROM credential_lease_audits WHERE tenant_id=$1 AND project_id=$2 ORDER BY audit
 	require.NotContains(t, rowJSON, lease.ID)
 	require.NotContains(t, rowJSON, value.username)
 	require.NotContains(t, rowJSON, string(value.secret))
+	require.NotContains(t, rowJSON, value.credentialRef)
+	require.Contains(t, rowJSON, credentialRefHash)
 	require.Contains(t, rowJSON, leaseIDHash)
 }
 
