@@ -560,53 +560,6 @@ func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {
 	err = server.Run(context.Background())
 	require.ErrorIs(t, err, want)
 	require.Zero(t, listens)
-}
-
-func TestDefaultMigrationSequenceRunsHostBeforeInspectionAndStopsOnHostFailure(t *testing.T) {
-	var order []string
-	steps := defaultMigrationSteps{
-		alert:            func(context.Context) error { order = append(order, "alert"); return nil },
-		job:              func(context.Context) error { order = append(order, "job"); return nil },
-		platform:         func(context.Context) error { order = append(order, "platform"); return nil },
-		enrollment:       func(context.Context) error { order = append(order, "enrollment"); return nil },
-		host:             func(context.Context) error { order = append(order, "host"); return nil },
-		discovery:        func(context.Context) error { order = append(order, "discovery"); return nil },
-		databaseInstance: func(context.Context) error { order = append(order, "database-instance"); return nil },
-		inspection:       func(context.Context) error { order = append(order, "inspection"); return nil },
-	}
-	migrate := composeDefaultMigrations(steps)
-
-	require.NoError(t, migrate(context.Background()))
-	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "database-instance", "enrollment", "inspection"}, order)
-
-	want := errors.New("host migration failed")
-	order = nil
-	steps.host = func(context.Context) error { order = append(order, "host"); return want }
-	migrate = composeDefaultMigrations(steps)
-	require.ErrorIs(t, migrate(context.Background()), want)
-	require.Equal(t, []string{"alert", "job", "platform", "host"}, order)
-}
-
-func TestDefaultHostMigrationFailurePreventsListenersAndReadiness(t *testing.T) {
-	want := errors.New("host migration failed")
-	listens := 0
-	config := validServerConfig()
-	config.Ping = func(context.Context) error { return nil }
-	config.Migrate = composeDefaultMigrations(defaultMigrationSteps{
-		alert:      func(context.Context) error { return nil },
-		job:        func(context.Context) error { return nil },
-		platform:   func(context.Context) error { return nil },
-		enrollment: func(context.Context) error { return nil },
-		host:       func(context.Context) error { return want },
-		inspection: func(context.Context) error { t.Fatal("inspection migration ran after Host failure"); return nil },
-	})
-	config.Listen = func(string, string) (net.Listener, error) { listens++; return newBlockingListener(), nil }
-	server, err := NewServer(config)
-	require.NoError(t, err)
-
-	err = server.Run(context.Background())
-	require.ErrorIs(t, err, want)
-	require.Zero(t, listens)
 	require.False(t, server.ready.Load())
 }
 
@@ -632,23 +585,6 @@ func TestConfigRequiresValidatedInspectionTargetMetadata(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, server.inspectionService)
 	require.NotNil(t, server.inspectionWorker)
-}
-
-func TestInspectionCatalogSeedIsScopedAndIdempotent(t *testing.T) {
-	store := &memoryInspectionCatalog{items: map[string]inspection.Item{}}
-	now := time.Date(2026, 8, 29, 9, 0, 0, 0, time.UTC)
-	scopes := []alert.Scope{{TenantID: "tenant-a", ProjectID: "project-a"}, {TenantID: "tenant-b", ProjectID: "project-b"}}
-	require.NoError(t, seedInspectionCatalog(context.Background(), store, scopes, now))
-	require.Len(t, store.items, len(inspection.BuiltinHostItems())*2)
-	for _, item := range store.items {
-		require.NotEmpty(t, item.Scope.TenantID)
-		require.True(t, item.Enabled)
-		require.Equal(t, now, item.CreatedAt)
-		require.Equal(t, now, item.UpdatedAt)
-	}
-	created := store.creates
-	require.NoError(t, seedInspectionCatalog(context.Background(), store, scopes, now.Add(time.Hour)))
-	require.Equal(t, created, store.creates, "restart must not create a second catalog version")
 }
 
 func TestLiveInspectionTargetsReflectAuthenticatedAgentConnectivityAndCapabilities(t *testing.T) {
@@ -841,26 +777,6 @@ func (*inspectionWorkflowRepository) GetReport(context.Context, platformscope.Sc
 }
 func (*inspectionWorkflowRepository) ListReports(context.Context, platformscope.Scope, inspection.ReportFilter) (inspection.ReportPage, error) {
 	return inspection.ReportPage{}, nil
-}
-
-type memoryInspectionCatalog struct {
-	items   map[string]inspection.Item
-	creates int
-}
-
-func (store *memoryInspectionCatalog) CreateItem(_ context.Context, value inspection.Item) error {
-	store.creates++
-	store.items[value.Scope.Key()+"\x00"+value.ID] = value
-	return nil
-}
-func (store *memoryInspectionCatalog) ListItems(_ context.Context, scope platformscope.Scope, filter inspection.ItemFilter) (inspection.ItemPage, error) {
-	result := inspection.ItemPage{}
-	for _, requested := range filter.Versions {
-		if value, ok := store.items[scope.Key()+"\x00"+requested.ItemID]; ok && value.Version == requested.Version {
-			result.Items = append(result.Items, value)
-		}
-	}
-	return result, nil
 }
 
 func TestRunCanceledContextReturnsWithoutMigrationOrListeners(t *testing.T) {

@@ -38,6 +38,7 @@ import (
 	"dbpilot.local/platform/internal/capability"
 	"dbpilot.local/platform/internal/commandvalidation"
 	"dbpilot.local/platform/internal/controlplane"
+	"dbpilot.local/platform/internal/controlplanemigrations"
 	"dbpilot.local/platform/internal/credentiallease"
 	platformdatabase "dbpilot.local/platform/internal/database"
 	"dbpilot.local/platform/internal/databaseinstance"
@@ -49,7 +50,6 @@ import (
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/monitoring"
-	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
@@ -312,49 +312,6 @@ func loadConfig(path string) (Config, error) {
 	return config, nil
 }
 
-func composeMigrations(steps ...func(context.Context) error) func(context.Context) error {
-	return func(ctx context.Context) error {
-		for _, step := range steps {
-			if step == nil {
-				return errors.New("migration step is unavailable")
-			}
-			if err := step(ctx); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-type defaultMigrationSteps struct {
-	alert            func(context.Context) error
-	job              func(context.Context) error
-	platform         func(context.Context) error
-	enrollment       func(context.Context) error
-	host             func(context.Context) error
-	discovery        func(context.Context) error
-	databaseInstance func(context.Context) error
-	plugin           func(context.Context) error
-	assignment       func(context.Context) error
-	credentialLease  func(context.Context) error
-	inspection       func(context.Context) error
-}
-
-func composeDefaultMigrations(steps defaultMigrationSteps) func(context.Context) error {
-	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.databaseInstance, steps.enrollment}
-	if steps.plugin != nil {
-		pipeline = append(pipeline, steps.plugin)
-	}
-	if steps.assignment != nil {
-		pipeline = append(pipeline, steps.assignment)
-	}
-	if steps.credentialLease != nil {
-		pipeline = append(pipeline, steps.credentialLease)
-	}
-	pipeline = append(pipeline, steps.inspection)
-	return composeMigrations(pipeline...)
-}
-
 func NewServer(config Config) (*Server, error) {
 	if err := validateConfig(config); err != nil {
 		return nil, err
@@ -489,31 +446,13 @@ func NewServer(config Config) (*Server, error) {
 	}
 	migrate := config.Migrate
 	if migrate == nil {
-		steps := defaultMigrationSteps{
-			alert:    func(ctx context.Context) error { return alert.RunMigrations(ctx, database) },
-			job:      func(ctx context.Context) error { return job.RunMigrations(ctx, database) },
-			platform: func(ctx context.Context) error { return platformdb.RunMigrations(ctx, database) },
-			enrollment: func(ctx context.Context) error {
-				return enrollment.RunMigrations(ctx, database)
-			},
-			host:             func(ctx context.Context) error { return hostinventory.RunMigrations(ctx, database) },
-			discovery:        func(ctx context.Context) error { return discovery.RunMigrations(ctx, database) },
-			databaseInstance: func(ctx context.Context) error { return databaseinstance.RunMigrations(ctx, database) },
-			inspection: func(ctx context.Context) error {
-				if err := inspection.RunMigrations(ctx, database); err != nil {
-					return err
-				}
-				return seedInspectionCatalog(ctx, inspection.NewPostgresRepository(database, nil), configuredScopes(config), time.Now().UTC())
-			},
+		options := controlplanemigrations.Options{
+			PluginCatalogEnabled:    config.PluginCatalog.Enabled,
+			CredentialLeasesEnabled: config.CredentialLeases.Enabled,
+			InspectionScopes:        configuredScopes(config),
+			Now:                     time.Now,
 		}
-		if config.PluginCatalog.Enabled {
-			steps.plugin = func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) }
-			steps.assignment = func(ctx context.Context) error { return pluginassignment.RunMigrations(ctx, database) }
-		}
-		if config.CredentialLeases.Enabled {
-			steps.credentialLease = func(ctx context.Context) error { return credentiallease.RunMigrations(ctx, database) }
-		}
-		migrate = composeDefaultMigrations(steps)
+		migrate = func(ctx context.Context) error { return controlplanemigrations.Run(ctx, database, options) }
 	}
 	listen := config.Listen
 	if listen == nil {
@@ -1733,44 +1672,6 @@ func (resolver liveInspectionTargetResolver) withSessions(targets []inspection.H
 		}
 	}
 	return targets
-}
-
-type inspectionCatalogStore interface {
-	CreateItem(context.Context, inspection.Item) error
-	ListItems(context.Context, platformscope.Scope, inspection.ItemFilter) (inspection.ItemPage, error)
-}
-
-func seedInspectionCatalog(ctx context.Context, store inspectionCatalogStore, scopes []alert.Scope, now time.Time) error {
-	if ctx == nil || store == nil || now.IsZero() || now.Location() != time.UTC {
-		return errors.New("inspection catalog seed input is invalid")
-	}
-	for _, configured := range scopes {
-		scope := platformscope.Scope{TenantID: configured.TenantID, ProjectID: configured.ProjectID}
-		if scope.Validate() != nil {
-			return errors.New("inspection catalog scope is invalid")
-		}
-		for _, item := range inspection.BuiltinHostItems() {
-			filter := inspection.ItemFilter{CursorFilter: inspection.CursorFilter{Limit: 2}, Versions: []inspection.PolicyItem{{ItemID: item.ID, Version: item.Version}}}
-			page, err := store.ListItems(ctx, scope, filter)
-			if err != nil {
-				return fmt.Errorf("list inspection catalog item: %w", err)
-			}
-			if len(page.Items) == 1 && page.Items[0].ID == item.ID && page.Items[0].Version == item.Version && page.Items[0].Scope == scope {
-				continue
-			}
-			if len(page.Items) != 0 {
-				return errors.New("inspection catalog item is inconsistent")
-			}
-			item.Scope, item.Enabled, item.CreatedAt, item.UpdatedAt = scope, true, now, now
-			if err := store.CreateItem(ctx, item); err != nil {
-				page, readErr := store.ListItems(ctx, scope, filter)
-				if readErr != nil || len(page.Items) != 1 || page.Items[0].ID != item.ID || page.Items[0].Version != item.Version || page.Items[0].Scope != scope {
-					return fmt.Errorf("create inspection catalog item: %w", err)
-				}
-			}
-		}
-	}
-	return nil
 }
 
 func configuredScopes(config Config) []alert.Scope {
