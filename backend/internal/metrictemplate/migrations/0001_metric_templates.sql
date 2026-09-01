@@ -159,9 +159,17 @@ BEGIN
     FOR item IN SELECT jsonb_array_elements_text(NEW.template_revision_ids) LOOP
         IF NOT EXISTS (
             SELECT 1 FROM metric_template_revisions revision
-            JOIN metric_templates template ON template.tenant_id=revision.tenant_id AND template.project_id=revision.project_id AND template.template_id=revision.template_id
             WHERE revision.tenant_id=NEW.tenant_id AND revision.project_id=NEW.project_id
-              AND revision.revision_id=item AND revision.status='published' AND template.published_revision=revision.revision
+              AND revision.revision_id=item AND revision.status IN ('published','superseded')
+              AND (EXISTS (
+                  SELECT 1 FROM metric_template_publications publication
+                  WHERE publication.tenant_id=revision.tenant_id AND publication.project_id=revision.project_id
+                    AND publication.selected_revision_id=revision.revision_id
+              ) OR EXISTS (
+                  SELECT 1 FROM metric_templates template
+                  WHERE template.tenant_id=revision.tenant_id AND template.project_id=revision.project_id
+                    AND template.template_id=revision.template_id AND template.published_revision=revision.revision
+              ))
         ) THEN
             RAISE EXCEPTION 'unpublished metric template revision' USING ERRCODE='23514';
         END IF;

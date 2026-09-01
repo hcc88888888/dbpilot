@@ -72,7 +72,7 @@ func (repository *PostgresRepository) LoadPluginTemplateReferences(ctx context.C
 		}
 		return []*agentv1.MetricTemplateCommandReference{}, instances, nil
 	}
-	rows, err := repository.database.QueryContext(ctx, `SELECT binding.instance_id,revision.template_id,revision.revision_id,revision.query_digest,revision.timeout_seconds,revision.max_rows,revision.max_columns,revision.cardinality_limit FROM plugin_assignment_instances binding CROSS JOIN LATERAL jsonb_array_elements_text(binding.template_revision_ids) item(revision_id) JOIN metric_template_revisions revision ON revision.tenant_id=binding.tenant_id AND revision.project_id=binding.project_id AND revision.revision_id=item.revision_id JOIN metric_templates template ON template.tenant_id=revision.tenant_id AND template.project_id=revision.project_id AND template.template_id=revision.template_id WHERE binding.tenant_id=$1 AND binding.project_id=$2 AND binding.assignment_id=$3 AND binding.instance_id=ANY($4) AND revision.status='published' AND template.published_revision=revision.revision ORDER BY binding.instance_id,revision.template_id`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.ID, pq.Array(assignment.InstanceIDs))
+	rows, err := repository.database.QueryContext(ctx, `SELECT binding.instance_id,revision.template_id,revision.revision_id,revision.query_digest,revision.timeout_seconds,revision.max_rows,revision.max_columns,revision.cardinality_limit FROM plugin_assignment_instances binding CROSS JOIN LATERAL jsonb_array_elements_text(binding.template_revision_ids) item(revision_id) JOIN metric_template_revisions revision ON revision.tenant_id=binding.tenant_id AND revision.project_id=binding.project_id AND revision.revision_id=item.revision_id WHERE binding.tenant_id=$1 AND binding.project_id=$2 AND binding.assignment_id=$3 AND binding.instance_id=ANY($4) AND revision.status IN ('published','superseded') AND EXISTS (SELECT 1 FROM metric_template_publications publication WHERE publication.tenant_id=revision.tenant_id AND publication.project_id=revision.project_id AND publication.selected_revision_id=revision.revision_id) ORDER BY binding.instance_id,revision.template_id,revision.revision_id`, assignment.Scope.TenantID, assignment.Scope.ProjectID, assignment.ID, pq.Array(assignment.InstanceIDs))
 	if err != nil {
 		return nil, nil, mapPostgresError(err)
 	}
@@ -108,7 +108,12 @@ func (repository *PostgresRepository) LoadPluginTemplateReferences(ctx context.C
 	for _, revisionID := range assignment.TemplateRevisionIDs {
 		references = append(references, proto.Clone(byRevision[revisionID]).(*agentv1.MetricTemplateCommandReference))
 	}
-	sort.Slice(references, func(i, j int) bool { return references[i].GetTemplateId() < references[j].GetTemplateId() })
+	sort.Slice(references, func(i, j int) bool {
+		if references[i].GetTemplateId() == references[j].GetTemplateId() {
+			return references[i].GetRevisionId() < references[j].GetRevisionId()
+		}
+		return references[i].GetTemplateId() < references[j].GetTemplateId()
+	})
 	instances := make([]*agentv1.PluginInstanceTemplateReferences, 0, len(assignment.InstanceIDs))
 	for _, instanceID := range assignment.InstanceIDs {
 		values := byInstance[instanceID]
@@ -549,6 +554,31 @@ func (repository *PostgresRepository) RecordTrialResult(ctx context.Context, sco
 	return value, nil
 }
 
+func (repository *PostgresRepository) ClassifyTrialResult(ctx context.Context, scope platformscope.Scope, jobID string, result TrialResult) (TrialResult, error) {
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !idPattern.MatchString(jobID) || result.Validate() != nil {
+		return TrialResult{}, ErrInvalid
+	}
+	var revisionID, digest string
+	var cardinalityLimit, maxRows, maxColumns int
+	var valueMappingsJSON, labelMappingsJSON []byte
+	err := repository.database.QueryRowContext(ctx, `SELECT trial.revision_id,trial.query_digest,trial.cardinality_limit,trial.max_rows,trial.max_columns,revision.value_mappings,revision.label_mappings FROM metric_template_trials trial JOIN metric_template_revisions revision ON revision.tenant_id=trial.tenant_id AND revision.project_id=trial.project_id AND revision.revision_id=trial.revision_id WHERE trial.tenant_id=$1 AND trial.project_id=$2 AND trial.job_id=$3`, scope.TenantID, scope.ProjectID, jobID).Scan(&revisionID, &digest, &cardinalityLimit, &maxRows, &maxColumns, &valueMappingsJSON, &labelMappingsJSON)
+	if err != nil {
+		return TrialResult{}, mapPostgresError(err)
+	}
+	if revisionID != result.RevisionID || digest != result.QueryDigest {
+		return TrialResult{}, ErrConflict
+	}
+	var valueMappings []ValueMapping
+	var labelMappings []LabelMapping
+	if json.Unmarshal(valueMappingsJSON, &valueMappings) != nil || json.Unmarshal(labelMappingsJSON, &labelMappings) != nil {
+		return TrialResult{}, ErrInvalid
+	}
+	if failure := trialLimitFailure(result, cardinalityLimit, maxRows, maxColumns, valueMappings, labelMappings); failure != "" {
+		result = TrialResult{RevisionID: result.RevisionID, QueryDigest: result.QueryDigest, StatusCode: failure}
+	}
+	return result, nil
+}
+
 func (repository *PostgresRepository) FailTerminalTrials(ctx context.Context, limit int, at time.Time) (int, error) {
 	if repository == nil || repository.database == nil || ctx == nil || limit < 1 || limit > 128 || !validUTC(at) {
 		return 0, ErrInvalid
@@ -673,6 +703,9 @@ func (repository *PostgresRepository) Publish(ctx context.Context, scope platfor
 	if len(targets) > MaximumAssignments {
 		return Revision{}, ErrCapacity
 	}
+	if len(targets) == 0 {
+		return Revision{}, ErrNotFound
+	}
 	assignmentInstances := map[string][]string{}
 	for _, target := range targets {
 		if !compatiblePublicationTarget(current, target) {
@@ -710,21 +743,9 @@ func (repository *PostgresRepository) Publish(ctx context.Context, scope platfor
 		return Revision{}, mapPostgresError(err)
 	}
 	for assignmentID, instances := range assignmentInstances {
-		var existing []byte
 		var configuration, operation, resource uint64
-		if err := tx.QueryRowContext(ctx, `SELECT template_revision_ids,configuration_revision,operation_revision,revision FROM plugin_assignments WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 FOR UPDATE`, scope.TenantID, scope.ProjectID, assignmentID).Scan(&existing, &configuration, &operation, &resource); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT configuration_revision,operation_revision,revision FROM plugin_assignments WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 FOR UPDATE`, scope.TenantID, scope.ProjectID, assignmentID).Scan(&configuration, &operation, &resource); err != nil {
 			return Revision{}, mapPostgresError(err)
-		}
-		var aggregate []string
-		if json.Unmarshal(existing, &aggregate) != nil {
-			return Revision{}, ErrInvalid
-		}
-		aggregate, err = replaceTemplateRevisionTx(ctx, tx, scope, current.TemplateID, aggregate, revisionID)
-		if err != nil {
-			return Revision{}, err
-		}
-		if len(aggregate) > MaximumAssignments {
-			return Revision{}, ErrCapacity
 		}
 		for _, instanceID := range instances {
 			var encoded []byte
@@ -746,13 +767,20 @@ func (repository *PostgresRepository) Publish(ctx context.Context, scope platfor
 				return Revision{}, mapPostgresError(err)
 			}
 		}
+		aggregate, aggregateErr := assignmentTemplateRevisionUnionTx(ctx, tx, scope, assignmentID)
+		if aggregateErr != nil {
+			return Revision{}, aggregateErr
+		}
+		if len(aggregate) > MaximumAssignments {
+			return Revision{}, ErrCapacity
+		}
 		configuration++
 		operation++
 		resource++
 		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET template_revision_ids=$1,configuration_revision=$2,operation_revision=$3,reconcile_state='pending',blocked_reason='',revision=$4,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$5 AND project_id=$6 AND assignment_id=$7`, jsonValue(aggregate), configuration, operation, resource, scope.TenantID, scope.ProjectID, assignmentID); err != nil {
 			return Revision{}, mapPostgresError(err)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET plugin_assignment_revision=$1,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$2 AND project_id=$3 AND instance_id=ANY($4)`, configuration, scope.TenantID, scope.ProjectID, pq.Array(instances)); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE managed_database_instances instance SET plugin_assignment_revision=$1,revision=revision+1,updated_at=CURRENT_TIMESTAMP FROM plugin_assignment_instances binding WHERE binding.tenant_id=$2 AND binding.project_id=$3 AND binding.assignment_id=$4 AND instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.instance_id=binding.instance_id`, configuration, scope.TenantID, scope.ProjectID, assignmentID); err != nil {
 			return Revision{}, mapPostgresError(err)
 		}
 	}
@@ -771,13 +799,34 @@ func (repository *PostgresRepository) Publish(ctx context.Context, scope platfor
 	return next, nil
 }
 
+func assignmentTemplateRevisionUnionTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, assignmentID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT item.revision_id FROM plugin_assignment_instances binding CROSS JOIN LATERAL jsonb_array_elements_text(binding.template_revision_ids) item(revision_id) WHERE binding.tenant_id=$1 AND binding.project_id=$2 AND binding.assignment_id=$3 ORDER BY item.revision_id`, scope.TenantID, scope.ProjectID, assignmentID)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	var values []string
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
 type publicationTarget struct {
 	InstanceID, AssignmentID, SemanticVersion, DatabaseVariant, DatabaseVersion, Status string
 	SchemaVersion                                                                       uint32
 }
 
 func loadPublicationTargets(ctx context.Context, tx *sql.Tx, revision Revision, ids []string) ([]publicationTarget, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT instance.instance_id,binding.assignment_id,version.semantic_version,instance.database_variant,instance.version_hint,version.status,version.metric_template_schema_version FROM managed_database_instances instance JOIN plugin_assignment_instances binding ON binding.tenant_id=instance.tenant_id AND binding.project_id=instance.project_id AND binding.instance_id=instance.instance_id JOIN plugin_assignments assignment ON assignment.tenant_id=binding.tenant_id AND assignment.project_id=binding.project_id AND assignment.assignment_id=binding.assignment_id JOIN plugin_versions version ON version.tenant_id=assignment.tenant_id AND version.project_id=assignment.project_id AND version.version_id=assignment.desired_version_id WHERE instance.tenant_id=$1 AND instance.project_id=$2 AND instance.database_family=$3 AND instance.management_status<>'retired' AND (cardinality($4::text[])=0 OR instance.instance_id=ANY($4)) ORDER BY instance.instance_id FOR UPDATE OF instance,binding,assignment`, revision.Scope.TenantID, revision.Scope.ProjectID, revision.DatabaseFamily, pq.Array(ids))
+	selectedIDs := ids
+	if selectedIDs == nil {
+		selectedIDs = []string{}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT instance.instance_id,binding.assignment_id,version.semantic_version,instance.database_variant,instance.version_hint,version.status,version.metric_template_schema_version FROM managed_database_instances instance JOIN plugin_assignment_instances binding ON binding.tenant_id=instance.tenant_id AND binding.project_id=instance.project_id AND binding.instance_id=instance.instance_id JOIN plugin_assignments assignment ON assignment.tenant_id=binding.tenant_id AND assignment.project_id=binding.project_id AND assignment.assignment_id=binding.assignment_id JOIN plugin_versions version ON version.tenant_id=assignment.tenant_id AND version.project_id=assignment.project_id AND version.version_id=assignment.desired_version_id WHERE instance.tenant_id=$1 AND instance.project_id=$2 AND instance.database_family=$3 AND instance.management_status<>'retired' AND (cardinality($4::text[])=0 OR instance.instance_id=ANY($4)) ORDER BY instance.instance_id FOR UPDATE OF instance,binding,assignment`, revision.Scope.TenantID, revision.Scope.ProjectID, revision.DatabaseFamily, pq.Array(selectedIDs))
 	if err != nil {
 		return nil, mapPostgresError(err)
 	}

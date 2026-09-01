@@ -54,6 +54,16 @@ func TestExecutionFenceRequiresExactStartedCommandBoundary(t *testing.T) {
 	require.ErrorIs(t, fence.Validate(), ErrInvalidFence)
 }
 
+func TestReconcileRequestAllowsSameStableTemplateAtDifferentInstanceRevisions(t *testing.T) {
+	request := validReconcileRequest()
+	request.TemplateConfigurations = nil
+	request.TemplateLeaseCommandID = "command-a"
+	request.TemplateReferences = []TemplateReference{{TemplateID: "template-a", RevisionID: "revision-1", QueryDigest: bytesOf(1, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}, {TemplateID: "template-a", RevisionID: "revision-2", QueryDigest: bytesOf(2, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}}
+	request.TemplateIDs = []string{"template-a"}
+	request.InstanceTemplateRefs = []InstanceTemplateReferences{{InstanceID: "mysql-1", Templates: []TemplateReference{request.TemplateReferences[1]}}, {InstanceID: "mysql-2", Templates: []TemplateReference{request.TemplateReferences[0]}}}
+	require.NoError(t, request.Validate())
+}
+
 func validReconcileRequest() ReconcileRequest {
 	return ReconcileRequest{
 		AssignmentID: "assignment-1", PluginID: "mysql", DatabaseFamily: "mysql",

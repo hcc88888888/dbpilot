@@ -53,6 +53,19 @@ func TestConfigurationValidatesExactPerInstanceTemplateBindings(t *testing.T) {
 	require.Error(t, configuration.validate(expected))
 }
 
+func TestExpectedPerInstanceTemplatesAllowsDifferentRevisionsOfSameStableTemplate(t *testing.T) {
+	template1 := gatewayTestTemplateConfiguration("template-a")
+	template2 := proto.Clone(template1).(*pluginv1.MetricTemplateConfiguration)
+	template2.Revision = 2
+	template2.ReadOnlyStatement = "SELECT 2"
+	digest := sha256.Sum256([]byte(template2.ReadOnlyStatement))
+	template2.QueryDigest = digest[:]
+	session := &Session{expected: ExpectedPlugin{InstanceIDs: []string{"instance-a", "instance-b"}, TemplateIDs: []string{"template-a"}}}
+	require.NoError(t, session.SetExpectedInstanceTemplateConfigurations(map[string][]*pluginv1.MetricTemplateConfiguration{"instance-a": {template2}, "instance-b": {template1}}))
+	require.Nil(t, session.expected.TemplateConfigurations)
+	require.Equal(t, uint64(2), session.expected.InstanceTemplateConfigurations["instance-a"][0].GetRevision())
+}
+
 func TestConfigurationRejectsTemplateOutsideExpectedAllowlist(t *testing.T) {
 	expected := ExpectedPlugin{AssignmentID: "assignment-1", ConfigurationRevision: 4, InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}}
 	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{{TemplateId: "not-allowed", Revision: 1}}}}}

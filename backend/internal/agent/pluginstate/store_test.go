@@ -122,6 +122,17 @@ func TestFileStorePersistsExactPublicTemplateRefsWithoutSQL(t *testing.T) {
 	require.ErrorIs(t, tampered.Validate(), ErrInvalidState)
 }
 
+func TestFamilyStateAllowsSameStableTemplateAtDifferentInstanceRevisions(t *testing.T) {
+	state := validFamilyState()
+	ref1 := TemplateReference{TemplateID: "template-a", RevisionID: "revision-1", QueryDigest: strings.Repeat("b", 64), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	ref2 := TemplateReference{TemplateID: "template-a", RevisionID: "revision-2", QueryDigest: strings.Repeat("c", 64), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	state.ActiveTemplateIDs = []string{"template-a"}
+	state.ActiveTemplateLeaseCommandID = "command-a"
+	state.ActiveTemplateReferences = []TemplateReference{ref1, ref2}
+	state.ActiveInstanceTemplateRefs = []InstanceTemplateReferences{{InstanceID: "mysql-1", Templates: []TemplateReference{ref2}}, {InstanceID: "mysql-2", Templates: []TemplateReference{ref1}}}
+	require.NoError(t, state.Validate())
+}
+
 func validFamilyState() FamilyState {
 	return FamilyState{
 		AssignmentID:                 "assignment-1",

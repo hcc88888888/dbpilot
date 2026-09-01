@@ -989,6 +989,93 @@ func TestTooLateSuccessfulResultWinsOverCancellationRequest(t *testing.T) {
 	require.Equal(t, OutcomeComplete, fixture.persistence.currentJob().Outcome)
 }
 
+func TestInvalidMetricTrialIsClassifiedBeforeTerminalCAS(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-trial"}
+	fixture.lifecycle.typedResultRecorder = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	digest := bytes.Repeat([]byte{1}, sha256.Size)
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{AssignmentId: "assignment-a", ConfigurationRevision: 1, OperationRevision: 1, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"template-a"}, Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: digest, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1}}}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-trial", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	result := &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, ExecutionToken: token, LeaseRevision: 1, MetricTemplateTrialResult: &agentv1.MetricTemplateTrialResult{RevisionId: "revision-a", QueryDigest: digest, StatusCode: "succeeded", MetricCount: 1, CandidateMetrics: []*agentv1.MetricTemplateCandidateMetric{nil}}}
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", result)
+	require.NoError(t, err)
+	require.True(t, recorder.classifiedBeforeCAS)
+	require.Equal(t, CommandFailed, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
+}
+
+func TestCancelledMetricTrialKeepsCancelledTerminalState(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-trial-cancelled"}
+	fixture.lifecycle.typedResultRecorder = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	digest := bytes.Repeat([]byte{1}, sha256.Size)
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{AssignmentId: "assignment-a", ConfigurationRevision: 1, OperationRevision: 1, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"template-a"}, Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: digest, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1}}}}})
+	require.NoError(t, err)
+	message := fixture.message(t, recorder.commandID, "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now})
+	require.NoError(t, err)
+	current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusCancelling, Actor: "operator-1", At: fixture.now})
+	require.NoError(t, err)
+	fixture.persistence.jobs[fixture.value.ID] = current
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, ExecutionToken: token, LeaseRevision: 1})
+	require.NoError(t, err)
+	require.Equal(t, CommandCancelled, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, TargetCancelled, fixture.persistence.currentJob().TargetResults[0].Status)
+}
+
+func TestTimedOutMetricTrialKeepsTimedOutTerminalState(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-trial-timeout"}
+	fixture.lifecycle.typedResultRecorder = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	digest := bytes.Repeat([]byte{1}, sha256.Size)
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{AssignmentId: "assignment-a", ConfigurationRevision: 1, OperationRevision: 1, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"template-a"}, Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: digest, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1}}}}})
+	require.NoError(t, err)
+	message := fixture.message(t, recorder.commandID, "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+	current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now})
+	require.NoError(t, err)
+	fixture.persistence.jobs[fixture.value.ID] = current
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, ExecutionToken: token, LeaseRevision: 1})
+	require.NoError(t, err)
+	require.Equal(t, CommandTimedOut, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, TargetTimedOut, fixture.persistence.currentJob().TargetResults[0].Status)
+}
+
+type orderingTrialRecorder struct {
+	persistence         *memoryCommandPersistence
+	commandID           string
+	classifiedBeforeCAS bool
+}
+
+type allowTrialTarget struct{}
+
+func (allowTrialTarget) AuthorizeTarget(context.Context, string, string) error { return nil }
+
+func (recorder *orderingTrialRecorder) ClassifyMetricTemplateTrial(context.Context, platformscope.Scope, string, *agentv1.CollectDatabaseMetrics, *agentv1.CommandResult) (bool, error) {
+	recorder.persistence.mu.Lock()
+	recorder.classifiedBeforeCAS = !terminalCommandStatus(recorder.persistence.messages[recorder.commandID].CommandStatus)
+	recorder.persistence.mu.Unlock()
+	return false, nil
+}
+
+func (*orderingTrialRecorder) RecordMetricTemplateTrial(context.Context, platformscope.Scope, string, string, *agentv1.CollectDatabaseMetrics, *agentv1.CommandResult, time.Time) error {
+	return nil
+}
+
 func TestReconnectRenewsKnownActiveCommandsAndReplaysCancellation(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	message := fixture.message(t, "command-a", "agent-a")

@@ -108,6 +108,7 @@ type CommandLifecycleConfig struct {
 }
 
 type CommandTypedResultRecorder interface {
+	ClassifyMetricTemplateTrial(context.Context, platformscope.Scope, string, *agentv1.CollectDatabaseMetrics, *agentv1.CommandResult) (bool, error)
 	RecordMetricTemplateTrial(context.Context, platformscope.Scope, string, string, *agentv1.CollectDatabaseMetrics, *agentv1.CommandResult, time.Time) error
 }
 
@@ -1008,6 +1009,24 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	tokenHash := sha256.Sum256(result.GetExecutionToken())
 	target.TargetID = message.TargetID
 	at := lifecycle.currentTime()
+	trialCommand := envelope.GetCollectDatabaseMetrics()
+	if trialCommand != nil && trialCommand.GetTrial() {
+		if lifecycle.typedResultRecorder == nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
+		}
+		succeeded, classifyErr := lifecycle.typedResultRecorder.ClassifyMetricTemplateTrial(ctx, message.Scope, message.JobID, trialCommand, result)
+		if classifyErr != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, classifyErr
+		}
+		if result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && !succeeded {
+			commandStatus = CommandFailed
+			target.Status = TargetFailed
+			target.ErrorSummary = "metric_template_trial_invalid_result"
+			auditResult = "failure"
+		}
+	} else if result.GetMetricTemplateTrialResult() != nil {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
+	}
 	terminal, err := lifecycle.dispatchRepository.PersistTerminalResult(ctx, TerminalResultCAS{
 		Scope: message.Scope, CommandID: message.ID, TokenHash: tokenHash,
 		ExpectedExecutionRevision: result.GetLeaseRevision(), Status: commandStatus, ResultDigest: resultDigest,
@@ -1027,21 +1046,10 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
 	}
-	if command := envelope.GetCollectDatabaseMetrics(); command != nil && command.GetTrial() && result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && !validSuccessfulMetricTrial(command, result.GetMetricTemplateTrialResult()) {
-		commandStatus = CommandFailed
-		target.Status = TargetFailed
-		target.ErrorSummary = "metric_template_trial_invalid_result"
-		auditResult = "failure"
-	}
-	if command := envelope.GetCollectDatabaseMetrics(); command != nil && command.GetTrial() {
-		if lifecycle.typedResultRecorder == nil {
-			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
-		}
-		if err := lifecycle.typedResultRecorder.RecordMetricTemplateTrial(ctx, message.Scope, message.JobID, message.ID, command, result, at); err != nil {
+	if trialCommand != nil && trialCommand.GetTrial() {
+		if err := lifecycle.typedResultRecorder.RecordMetricTemplateTrial(ctx, message.Scope, message.JobID, message.ID, trialCommand, result, at); err != nil {
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 		}
-	} else if result.GetMetricTemplateTrialResult() != nil {
-		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
 	}
 	if terminal.Duplicate && terminal.Status == CommandTimedOut && result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED {
 		value, getErr := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)
@@ -1072,14 +1080,6 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
 	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
-}
-
-func validSuccessfulMetricTrial(command *agentv1.CollectDatabaseMetrics, result *agentv1.MetricTemplateTrialResult) bool {
-	if command == nil || result == nil || result.GetStatusCode() != "succeeded" || len(command.GetTemplateRevisions()) != 1 {
-		return false
-	}
-	reference := command.GetTemplateRevisions()[0]
-	return reference != nil && result.GetRevisionId() == reference.GetRevisionId() && len(result.GetQueryDigest()) == sha256.Size && subtle.ConstantTimeCompare(result.GetQueryDigest(), reference.GetQueryDigest()) == 1 && result.GetMetricCount() == uint32(len(result.GetCandidateMetrics())) && result.GetRowCount() <= reference.GetMaxRows() && result.GetColumnCount() <= reference.GetMaxColumns() && result.GetDurationMillis() <= reference.GetTimeoutSeconds()*1000
 }
 
 func matchingTerminalTarget(stored, incoming TargetResult) bool {

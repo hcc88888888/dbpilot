@@ -117,12 +117,23 @@ func validReconcileTemplateShape(value *agentv1.ReconcilePlugin) bool {
 	if len(value.GetTemplateRevisions()) == 0 && len(value.GetInstanceTemplateRevisions()) == 0 {
 		return true
 	}
-	if value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || !validMetricTemplateReferences(value.GetTemplateIds(), value.GetTemplateRevisions()) || len(value.GetInstanceTemplateRevisions()) != len(value.GetInstanceIds()) {
+	if value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || !validIdentifierList(value.GetTemplateIds(), true) || len(value.GetTemplateRevisions()) == 0 || len(value.GetTemplateRevisions()) > maximumListItems || len(value.GetInstanceTemplateRevisions()) != len(value.GetInstanceIds()) {
 		return false
 	}
 	byRevision := map[string]*agentv1.MetricTemplateCommandReference{}
+	stable := map[string]struct{}{}
 	for _, reference := range value.GetTemplateRevisions() {
+		if !validMetricTemplateReference(reference) || !containsString(value.GetTemplateIds(), reference.GetTemplateId()) {
+			return false
+		}
+		if _, duplicate := byRevision[reference.GetRevisionId()]; duplicate {
+			return false
+		}
 		byRevision[reference.GetRevisionId()] = reference
+		stable[reference.GetTemplateId()] = struct{}{}
+	}
+	if len(stable) != len(value.GetTemplateIds()) {
+		return false
 	}
 	seenInstances, used := map[string]struct{}{}, map[string]struct{}{}
 	for _, instance := range value.GetInstanceTemplateRevisions() {
@@ -162,11 +173,15 @@ func validMetricTemplateReferences(ids []string, values []*agentv1.MetricTemplat
 		return false
 	}
 	for index, value := range values {
-		if value == nil || value.GetTemplateId() != ids[index] || !validIdentifier(value.GetRevisionId()) || len(value.GetQueryDigest()) != sha256.Size || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || value.GetCardinalityLimit() == 0 || value.GetCardinalityLimit() > 10000 {
+		if value.GetTemplateId() != ids[index] || !validMetricTemplateReference(value) {
 			return false
 		}
 	}
 	return true
+}
+
+func validMetricTemplateReference(value *agentv1.MetricTemplateCommandReference) bool {
+	return value != nil && validIdentifier(value.GetTemplateId()) && validIdentifier(value.GetRevisionId()) && len(value.GetQueryDigest()) == sha256.Size && value.GetTimeoutSeconds() > 0 && value.GetTimeoutSeconds() <= 30 && value.GetMaxRows() > 0 && value.GetMaxRows() <= 100 && value.GetMaxColumns() > 0 && value.GetMaxColumns() <= 32 && value.GetCardinalityLimit() > 0 && value.GetCardinalityLimit() <= 10000
 }
 
 func validPluginDescriptorShape(value *agentv1.ReconcilePlugin) bool {

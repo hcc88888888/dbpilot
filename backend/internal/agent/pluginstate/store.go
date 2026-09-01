@@ -497,7 +497,7 @@ func validPublicTemplateReferences(templateIDs, instanceIDs []string, commandID 
 	if len(references) == 0 {
 		return commandID == "" && len(instances) == 0
 	}
-	if !resourcePattern.MatchString(commandID) || len(references) != len(templateIDs) || len(references) > 128 || len(instances) != len(instanceIDs) {
+	if !resourcePattern.MatchString(commandID) || len(references) > 128 || len(instances) != len(instanceIDs) {
 		return false
 	}
 	byRevision, byTemplate := map[string]TemplateReference{}, map[string]struct{}{}
@@ -508,10 +508,10 @@ func validPublicTemplateReferences(templateIDs, instanceIDs []string, commandID 
 		if _, duplicate := byRevision[reference.RevisionID]; duplicate {
 			return false
 		}
-		if _, duplicate := byTemplate[reference.TemplateID]; duplicate {
-			return false
-		}
 		byRevision[reference.RevisionID], byTemplate[reference.TemplateID] = reference, struct{}{}
+	}
+	if len(byTemplate) != len(templateIDs) {
+		return false
 	}
 	for _, templateID := range templateIDs {
 		if _, ok := byTemplate[templateID]; !ok {

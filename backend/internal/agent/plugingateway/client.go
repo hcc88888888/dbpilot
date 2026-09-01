@@ -289,6 +289,7 @@ func (session *Session) SetExpectedInstanceTemplateConfigurations(values map[str
 		return errGateway
 	}
 	aggregateByID := map[string]*pluginv1.MetricTemplateConfiguration{}
+	conflictingAggregate := false
 	cloned := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(values))
 	for _, instanceID := range session.expected.InstanceIDs {
 		templates, ok := values[instanceID]
@@ -305,19 +306,22 @@ func (session *Session) SetExpectedInstanceTemplateConfigurations(values map[str
 			}
 			seen[template.GetTemplateId()] = struct{}{}
 			if existing := aggregateByID[template.GetTemplateId()]; existing != nil && !proto.Equal(existing, template) {
-				return errGateway
+				conflictingAggregate = true
+			} else if existing == nil {
+				aggregateByID[template.GetTemplateId()] = template
 			}
-			aggregateByID[template.GetTemplateId()] = template
 		}
 		cloned[instanceID] = cloneTemplateConfigurations(templates)
 	}
-	aggregate := make([]*pluginv1.MetricTemplateConfiguration, 0, len(aggregateByID))
+	var aggregate []*pluginv1.MetricTemplateConfiguration
 	for _, templateID := range session.expected.TemplateIDs {
 		template := aggregateByID[templateID]
 		if template == nil {
 			return errGateway
 		}
-		aggregate = append(aggregate, proto.Clone(template).(*pluginv1.MetricTemplateConfiguration))
+		if !conflictingAggregate {
+			aggregate = append(aggregate, proto.Clone(template).(*pluginv1.MetricTemplateConfiguration))
+		}
 	}
 	session.mu.Lock()
 	session.expected.TemplateConfigurations = aggregate

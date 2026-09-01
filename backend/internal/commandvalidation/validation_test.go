@@ -124,6 +124,26 @@ func TestValidateCollectDatabaseMetricsRequiresBoundedInstancesAndTemplateRevisi
 	require.ErrorIs(t, Validate(context.Background(), invalid, allowAllAuthorizer{}), ErrInvalidCommand)
 }
 
+func TestValidateReconcileAllowsSameTemplateAtDifferentPerInstanceRevisions(t *testing.T) {
+	ref1 := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-1", QueryDigest: bytesOfValidation(1, sha256.Size), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	ref2 := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-2", QueryDigest: bytesOfValidation(2, sha256.Size), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	command := &agentv1.ReconcilePlugin{AssignmentId: "assignment-a", PluginId: "mysql", DatabaseFamily: "mysql", DesiredVersion: "1.0.0", DesiredState: agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING, ArtifactId: "artifact-a", ArtifactSha256: bytesOfValidation(3, sha256.Size), ManifestDigest: bytesOfValidation(4, sha256.Size), ConfigurationRevision: 7, OperationRevision: 9, InstanceIds: []string{"instance-a", "instance-b"}, TemplateIds: []string{"template-a"}, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{ref1, ref2}, InstanceTemplateRevisions: []*agentv1.PluginInstanceTemplateReferences{{InstanceId: "instance-a", Templates: []*agentv1.MetricTemplateCommandReference{ref2}}, {InstanceId: "instance-b", Templates: []*agentv1.MetricTemplateCommandReference{ref1}}}, InstanceDescriptors: []*agentv1.PluginInstanceDescriptor{{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}, {InstanceId: "instance-b", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3307"}}}
+	envelope := &agentv1.CommandEnvelope{AgentId: "agent-a", Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: command}}
+	require.NoError(t, Validate(context.Background(), envelope, allowAllAuthorizer{}))
+
+	invalid := proto.Clone(envelope).(*agentv1.CommandEnvelope)
+	invalid.GetReconcilePlugin().InstanceTemplateRevisions[0].Templates = append(invalid.GetReconcilePlugin().InstanceTemplateRevisions[0].Templates, ref1)
+	require.ErrorIs(t, Validate(context.Background(), invalid, allowAllAuthorizer{}), ErrInvalidCommand)
+}
+
+func bytesOfValidation(value byte, count int) []byte {
+	result := make([]byte, count)
+	for index := range result {
+		result[index] = value
+	}
+	return result
+}
+
 type recordingAuthorizer struct {
 	allowed map[string]bool
 	calls   []string

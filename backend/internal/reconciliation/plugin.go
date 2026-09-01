@@ -326,9 +326,11 @@ func buildPluginJobWithConfiguration(assignment pluginassignment.Assignment, des
 	}
 	templateIDs := append([]string(nil), assignment.TemplateRevisionIDs...)
 	if len(templateReferences) > 0 {
-		templateIDs = make([]string, len(templateReferences))
-		for index, reference := range templateReferences {
-			templateIDs[index] = reference.GetTemplateId()
+		templateIDs = nil
+		for _, reference := range templateReferences {
+			if !containsAssignmentID(templateIDs, reference.GetTemplateId()) {
+				templateIDs = append(templateIDs, reference.GetTemplateId())
+			}
 		}
 	}
 	command := &agentv1.CommandEnvelope{AgentId: assignment.AgentID, LeaseSeconds: PluginExecutionLeaseSeconds, Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: assignment.ID, PluginId: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, DesiredVersion: assignment.DesiredVersion, DesiredState: state, ArtifactId: assignment.ArtifactID, ArtifactSha256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: assignment.ConfigurationRevision, OperationRevision: assignment.OperationRevision, InstanceIds: append([]string(nil), assignment.InstanceIDs...), TemplateIds: templateIDs, TemplateRevisions: cloneTemplateReferences(templateReferences), InstanceTemplateRevisions: cloneInstanceTemplateReferences(instanceReferences), InstanceDescriptors: cloneDescriptors(descriptors)}}}
@@ -355,13 +357,10 @@ func validateTemplateReferences(assignment pluginassignment.Assignment, referenc
 		if !validTemplateReference(reference) {
 			return pluginassignment.ErrInvalid
 		}
-		if index > 0 && references[index-1].GetTemplateId() >= reference.GetTemplateId() {
+		if index > 0 && (references[index-1].GetTemplateId() > reference.GetTemplateId() || references[index-1].GetTemplateId() == reference.GetTemplateId() && references[index-1].GetRevisionId() >= reference.GetRevisionId()) {
 			return pluginassignment.ErrInvalid
 		}
 		if _, duplicate := revisionSet[reference.GetRevisionId()]; duplicate {
-			return pluginassignment.ErrInvalid
-		}
-		if _, duplicate := templateSet[reference.GetTemplateId()]; duplicate {
 			return pluginassignment.ErrInvalid
 		}
 		revisionSet[reference.GetRevisionId()] = struct{}{}

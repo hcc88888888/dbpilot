@@ -19,19 +19,39 @@ type metricTemplateLeaseService interface {
 type metricTemplateLeaseIssuer struct{ Service metricTemplateLeaseService }
 
 type metricTrialResultStore interface {
+	ClassifyTrialResult(context.Context, platformscope.Scope, string, metrictemplate.TrialResult) (metrictemplate.TrialResult, error)
 	RecordTrialResult(context.Context, platformscope.Scope, string, metrictemplate.TrialResult, time.Time) (metrictemplate.Revision, error)
 }
 
 type metricTrialResultRecorder struct{ Store metricTrialResultStore }
 
+func (recorder metricTrialResultRecorder) ClassifyMetricTemplateTrial(ctx context.Context, scope platformscope.Scope, jobID string, command *agentv1.CollectDatabaseMetrics, result *agentv1.CommandResult) (bool, error) {
+	value, err := normalizedMetricTrialResult(command, result)
+	if err != nil || recorder.Store == nil {
+		return false, metrictemplate.ErrInvalid
+	}
+	value, err = recorder.Store.ClassifyTrialResult(ctx, scope, jobID, value)
+	return err == nil && value.StatusCode == "succeeded", err
+}
+
 func (recorder metricTrialResultRecorder) RecordMetricTemplateTrial(ctx context.Context, scope platformscope.Scope, jobID, _ string, command *agentv1.CollectDatabaseMetrics, result *agentv1.CommandResult, at time.Time) error {
-	if recorder.Store == nil || command == nil || !command.GetTrial() || len(command.GetTemplateRevisions()) != 1 || result == nil {
+	value, err := normalizedMetricTrialResult(command, result)
+	if err != nil || recorder.Store == nil {
 		return metrictemplate.ErrInvalid
+	}
+	value, err = recorder.Store.ClassifyTrialResult(ctx, scope, jobID, value)
+	if err != nil {
+		return err
+	}
+	_, err = recorder.Store.RecordTrialResult(ctx, scope, jobID, value, at.UTC())
+	return err
+}
+
+func normalizedMetricTrialResult(command *agentv1.CollectDatabaseMetrics, result *agentv1.CommandResult) (metrictemplate.TrialResult, error) {
+	if command == nil || !command.GetTrial() || len(command.GetTemplateRevisions()) != 1 || result == nil || command.GetTemplateRevisions()[0] == nil {
+		return metrictemplate.TrialResult{}, metrictemplate.ErrInvalid
 	}
 	reference := command.GetTemplateRevisions()[0]
-	if reference == nil {
-		return metrictemplate.ErrInvalid
-	}
 	value := metrictemplate.TrialResult{RevisionID: reference.GetRevisionId(), QueryDigest: hex.EncodeToString(reference.GetQueryDigest()), StatusCode: fixedTrialStatus(result.GetState())}
 	if typed := result.GetMetricTemplateTrialResult(); result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && typed != nil && typed.GetRevisionId() == reference.GetRevisionId() && hex.EncodeToString(typed.GetQueryDigest()) == value.QueryDigest && typed.GetStatusCode() == "succeeded" {
 		value.StatusCode = fixedMetricTrialCode(typed.GetStatusCode())
@@ -61,8 +81,7 @@ func (recorder metricTrialResultRecorder) RecordMetricTemplateTrial(ctx context.
 	if value.Validate() != nil {
 		value = metrictemplate.TrialResult{RevisionID: reference.GetRevisionId(), QueryDigest: hex.EncodeToString(reference.GetQueryDigest()), StatusCode: "invalid_result"}
 	}
-	_, err := recorder.Store.RecordTrialResult(ctx, scope, jobID, value, at.UTC())
-	return err
+	return value, nil
 }
 
 func fixedTrialStatus(state agentv1.CommandResultState) string {

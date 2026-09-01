@@ -97,6 +97,32 @@ func TestMetricTemplatePostgres16TrialConcurrencyTimeoutAndBoundedMetrics(t *tes
 	require.NoError(t, err)
 	metricJob, err := service.StartTrial(ctx, scope, validated.ID, TrialRequest{InstanceID: "instance-task12", PluginVersionID: "version-task12", Actor: integrationActor("creator", "trialMetricTemplateRevision", "metrics-trial")})
 	require.NoError(t, err)
+	baseMetric := CandidateMetric{Name: "mysql.connections.current", MetricType: MetricGauge, Unit: "1", Value: 1}
+	classificationCases := []struct {
+		name   string
+		result TrialResult
+		status string
+	}{
+		{"mapping", TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: []CandidateMetric{{Name: "mysql.unknown", MetricType: MetricGauge, Unit: "1", Value: 1}}, RowCount: 1, ColumnCount: 1, MetricCount: 1}, "invalid_result"},
+		{"type", TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: []CandidateMetric{{Name: baseMetric.Name, MetricType: MetricCounter, Unit: "1", Value: 1}}, RowCount: 1, ColumnCount: 1, MetricCount: 1}, "invalid_result"},
+		{"unit", TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: []CandidateMetric{{Name: baseMetric.Name, MetricType: MetricGauge, Unit: "s", Value: 1}}, RowCount: 1, ColumnCount: 1, MetricCount: 1}, "invalid_result"},
+		{"label", TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: []CandidateMetric{{Name: baseMetric.Name, MetricType: MetricGauge, Unit: "1", Value: 1, Labels: map[string]string{"role": "primary"}}}, RowCount: 1, ColumnCount: 1, MetricCount: 1}, "invalid_result"},
+		{"bounds", TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: []CandidateMetric{baseMetric}, RowCount: 1, ColumnCount: 3, MetricCount: 1}, "bounds_exceeded"},
+	}
+	for _, test := range classificationCases {
+		t.Run("classify_"+test.name, func(t *testing.T) {
+			classified, classifyErr := repository.ClassifyTrialResult(ctx, scope, metricJob.ID, test.result)
+			require.NoError(t, classifyErr)
+			require.Equal(t, test.status, classified.StatusCode)
+		})
+	}
+	highMetrics := make([]CandidateMetric, 201)
+	for index := range highMetrics {
+		highMetrics[index] = baseMetric
+	}
+	classified, err := repository.ClassifyTrialResult(ctx, scope, metricJob.ID, TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "succeeded", Metrics: highMetrics, RowCount: 100, ColumnCount: 2, MetricCount: len(highMetrics)})
+	require.NoError(t, err)
+	require.Equal(t, "high_cardinality", classified.StatusCode)
 	metrics := make([]CandidateMetric, 101)
 	for index := range metrics {
 		name := "mysql.connections.current"
@@ -117,6 +143,7 @@ func TestMetricTemplatePostgres16WorkflowRevisionRaceRollbackAndRedaction(t *tes
 	repository := NewPostgresRepository(database, jobs)
 	dialect := DeterministicDialectValidator{Validate: func(context.Context, TemplateDefinition) error { return nil }}
 	service := NewService(repository, dialect, repository, time.Now)
+	seedMetricTemplateTrialTarget(t, database, scope, time.Now().UTC())
 	creator := integrationActor("creator", "createMetricTemplate", "template-create")
 	created, err := service.CreateTemplate(ctx, scope, TemplateDraft{ID: "mysql.custom_connections", DatabaseFamily: "mysql", Name: "Custom connections"}, creator)
 	require.NoError(t, err)
@@ -170,6 +197,85 @@ func TestMetricTemplatePostgres16WorkflowRevisionRaceRollbackAndRedaction(t *tes
 	}
 	_, err = repository.GetRevision(ctx, platformscope.Scope{TenantID: scope.TenantID, ProjectID: "other-project"}, rolledBack.ID)
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestMetricTemplatePostgres16PartialPublicationPreservesPerInstanceRevision(t *testing.T) {
+	database, scope := metricTemplatePostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	repository := NewPostgresRepository(database, jobs)
+	service := NewService(repository, DeterministicDialectValidator{Validate: func(context.Context, TemplateDefinition) error { return nil }}, repository, time.Now)
+	seedMetricTemplateTrialTarget(t, database, scope, time.Now().UTC())
+	seedSecondaryMetricTemplateAssignment(t, database, scope, time.Now().UTC())
+	assignmentRepository := pluginassignment.NewPostgresRepository(database, jobs)
+	_, err := service.CreateTemplate(ctx, scope, TemplateDraft{ID: "mysql.partial_publication", DatabaseFamily: "mysql", Name: "Partial publication"}, integrationActor("creator", "createMetricTemplate", "partial-template"))
+	require.NoError(t, err)
+
+	revision1 := createValidatedTrialPassedRevision(t, ctx, database, service, scope, "mysql.partial_publication", "creator", 1)
+	revision1, err = service.Approve(ctx, scope, revision1.ID, revision1.ResourceRevision, integrationActor("approver", "approveMetricTemplateRevision", "partial-approve-1"))
+	require.NoError(t, err)
+	_, err = service.Publish(ctx, scope, revision1.ID, revision1.ResourceRevision, PublishScope{InstanceIDs: []string{"instance-task12", "instance-task12-b", "instance-task12-c"}, Actor: integrationActor("approver", "publishMetricTemplateRevision", "partial-publish-1")})
+	require.NoError(t, err)
+	secondaryBefore, err := assignmentRepository.Get(ctx, scope, "assignment-task12-2")
+	require.NoError(t, err)
+	seedSucceededMetricTemplateReconcile(t, database, scope, secondaryBefore, "job-partial-reconcile-2", "command-partial-reconcile-2", time.Now().UTC())
+
+	revision2 := createValidatedTrialPassedRevision(t, ctx, database, service, scope, "mysql.partial_publication", "creator", 2)
+	revision2, err = service.Approve(ctx, scope, revision2.ID, revision2.ResourceRevision, integrationActor("approver", "approveMetricTemplateRevision", "partial-approve-2"))
+	require.NoError(t, err)
+	_, err = service.Publish(ctx, scope, revision2.ID, revision2.ResourceRevision, PublishScope{InstanceIDs: []string{"instance-task12"}, Actor: integrationActor("approver", "publishMetricTemplateRevision", "partial-publish-2")})
+	require.NoError(t, err)
+
+	assignment, err := assignmentRepository.Get(ctx, scope, "assignment-task12")
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{revision1.ID, revision2.ID}, assignment.TemplateRevisionIDs)
+	references, instances, err := repository.LoadPluginTemplateReferences(ctx, assignment)
+	require.NoError(t, err)
+	require.Len(t, references, 2)
+	require.Equal(t, "mysql.partial_publication", references[0].GetTemplateId())
+	require.Equal(t, "mysql.partial_publication", references[1].GetTemplateId())
+	require.Equal(t, revision2.ID, instances[0].GetTemplates()[0].GetRevisionId())
+	require.Equal(t, revision1.ID, instances[1].GetTemplates()[0].GetRevisionId())
+	secondaryAfter, err := assignmentRepository.Get(ctx, scope, "assignment-task12-2")
+	require.NoError(t, err)
+	require.Equal(t, secondaryBefore.ConfigurationRevision, secondaryAfter.ConfigurationRevision)
+	require.Equal(t, secondaryBefore.OperationRevision, secondaryAfter.OperationRevision)
+	require.Equal(t, []string{revision1.ID}, secondaryAfter.TemplateRevisionIDs)
+	seedSucceededMetricTemplateReconcile(t, database, scope, assignment, "job-partial-reconcile", "command-partial-reconcile", time.Now().UTC())
+	authorizer := PostgresLeaseAuthorizer{Database: database, Fences: inactiveMetricTemplateFence{}, Now: time.Now}
+	for _, leaseCase := range []struct {
+		agent, command string
+		assignment     pluginassignment.Assignment
+		instance       string
+		revision       Revision
+	}{{"agent-task12", "command-partial-reconcile", assignment, "instance-task12", revision2}, {"agent-task12", "command-partial-reconcile", assignment, "instance-task12-b", revision1}, {"agent-task12-2", "command-partial-reconcile-2", secondaryAfter, "instance-task12-c", revision1}} {
+		authorization, authorizeErr := authorizer.AuthorizeMetricTemplateLease(ctx, AuthenticatedAgent{AgentID: leaseCase.agent, SessionID: "restart-session"}, LeaseRequest{Nonce: make([]byte, 32), CommandID: leaseCase.command, AssignmentID: leaseCase.assignment.ID, InstanceID: leaseCase.instance, ConfigurationRevision: leaseCase.assignment.ConfigurationRevision, OperationRevision: leaseCase.assignment.OperationRevision, TemplateID: leaseCase.revision.TemplateID, RevisionID: leaseCase.revision.ID, QueryDigest: leaseCase.revision.QueryDigest})
+		require.NoError(t, authorizeErr)
+		require.Equal(t, leaseCase.revision.ID, authorization.RevisionID)
+		authorization.Definition.Release()
+	}
+
+	revision3 := createValidatedTrialPassedRevision(t, ctx, database, service, scope, "mysql.partial_publication", "creator", 3)
+	revision3, err = service.Approve(ctx, scope, revision3.ID, revision3.ResourceRevision, integrationActor("approver", "approveMetricTemplateRevision", "partial-approve-3"))
+	require.NoError(t, err)
+	beforeAssignment := assignment
+	_, err = service.Publish(ctx, scope, revision3.ID, revision3.ResourceRevision, PublishScope{InstanceIDs: []string{"instance-task12", "missing-instance"}, Actor: integrationActor("approver", "publishMetricTemplateRevision", "partial-invalid")})
+	require.ErrorIs(t, err, ErrNotFound)
+	afterInvalid, err := assignmentRepository.Get(ctx, scope, "assignment-task12")
+	require.NoError(t, err)
+	require.Equal(t, beforeAssignment.ConfigurationRevision, afterInvalid.ConfigurationRevision)
+	require.Equal(t, beforeAssignment.TemplateRevisionIDs, afterInvalid.TemplateRevisionIDs)
+	unchanged3, err := repository.GetRevision(ctx, scope, revision3.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusApproved, unchanged3.Status)
+
+	old, err := repository.GetRevision(ctx, scope, revision1.ID)
+	require.NoError(t, err)
+	_, err = service.Publish(ctx, scope, old.ID, old.ResourceRevision, PublishScope{InstanceIDs: []string{"instance-task12"}, Actor: integrationActor("approver", "publishMetricTemplateRevision", "partial-rollback")})
+	require.NoError(t, err)
+	assignment, err = assignmentRepository.Get(ctx, scope, "assignment-task12")
+	require.NoError(t, err)
+	require.Equal(t, []string{revision1.ID}, assignment.TemplateRevisionIDs)
 }
 
 func createValidatedTrialPassedRevision(t *testing.T, ctx context.Context, database *sql.DB, service *ApplicationService, scope platformscope.Scope, templateID, creator string, number int) Revision {
@@ -249,10 +355,17 @@ VALUES ($1,$2,'host-task12','agent-task12','Task12 host','task12.example','linux
 	exec(`INSERT INTO discovery_candidates
 (candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,normalized_endpoint,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at)
 VALUES ('candidate-task12',$1,$2,'host-task12','agent-task12','observation-task12','native','mysql','mysql','127.0.0.1:3306',1,'[]'::jsonb,decode($3,'hex'),1,1,$4,$4,'accepted',$4)`, scope.TenantID, scope.ProjectID, sourceFingerprint, now)
+	exec(`INSERT INTO discovery_candidates
+(candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,normalized_endpoint,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at)
+VALUES ('candidate-task12-b',$1,$2,'host-task12','agent-task12','observation-task12-b','native','mysql','mysql','127.0.0.1:3307',1,'[]'::jsonb,decode($3,'hex'),1,1,$4,$4,'accepted',$4)`, scope.TenantID, scope.ProjectID, strings.Repeat("c", 64), now)
 	exec(`INSERT INTO managed_database_instances
 (instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,credential_ref,capability_state,connection_test_status,plugin_assignment_revision,management_status,revision,created_at,updated_at,canonical_connection)
 VALUES ('instance-task12',$1,$2,'host-task12','agent-task12','candidate-task12','native',$3,'native:task12','mysql','mysql','Task12 MySQL','127.0.0.1:3306','secret://database/task12','plugin_not_installed','not_tested',5,'monitoring',1,$4,$4,'mysql://127.0.0.1:3306/task12')`, scope.TenantID, scope.ProjectID, sourceFingerprint, now)
+	exec(`INSERT INTO managed_database_instances
+(instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,credential_ref,capability_state,connection_test_status,plugin_assignment_revision,management_status,revision,created_at,updated_at,canonical_connection)
+VALUES ('instance-task12-b',$1,$2,'host-task12','agent-task12','candidate-task12-b','native',$3,'native:task12-b','mysql','mysql','Task12 MySQL B','127.0.0.1:3307','secret://database/task12-b','plugin_not_installed','not_tested',5,'monitoring',1,$4,$4,'mysql://127.0.0.1:3307/task12-b')`, scope.TenantID, scope.ProjectID, strings.Repeat("c", 64), now)
 	exec(`UPDATE discovery_candidates SET accepted_instance_id='instance-task12' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id='candidate-task12'`, scope.TenantID, scope.ProjectID)
+	exec(`UPDATE discovery_candidates SET accepted_instance_id='instance-task12-b' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id='candidate-task12-b'`, scope.TenantID, scope.ProjectID)
 	exec(`INSERT INTO artifacts
 (id,tenant_id,project_id,kind,content_type,size_bytes,checksum,created_at,storage_reference)
 VALUES ('artifact-task12',$1,$2,'plugin-package','application/octet-stream',1,$3,$4,'object://plugins/task12')`, scope.TenantID, scope.ProjectID, "sha256:"+digest, now)
@@ -264,12 +377,68 @@ VALUES ($1,$2,'plugin-task12','Task12 MySQL','mysql','v1','["mysql"]'::jsonb,'["
 VALUES ('version-task12',$1,$2,'plugin-task12','1.0.0','available','artifact-task12',$3,$3,'publisher-task12','key-task12','v1','v1','v1','["mysql"]'::jsonb,'*','["metrics.collect"]'::jsonb,1,'[{"os":"linux","arch":"amd64"}]'::jsonb,1,$4,$4)`, scope.TenantID, scope.ProjectID, digest, now)
 	exec(`INSERT INTO plugin_assignments
 (assignment_id,tenant_id,project_id,host_id,agent_id,plugin_id,database_family,desired_version_id,desired_version,artifact_id,artifact_sha256,manifest_digest,desired_state,configuration_revision,operation_revision,rollout_percentage,instance_ids,template_revision_ids,reconcile_state,revision,created_at,updated_at)
-VALUES ('assignment-task12',$1,$2,'host-task12','agent-task12','plugin-task12','mysql','version-task12','1.0.0','artifact-task12',$3,$3,'running',5,7,100,'["instance-task12"]'::jsonb,'[]'::jsonb,'converged',1,$4,$4)`, scope.TenantID, scope.ProjectID, digest, now)
+VALUES ('assignment-task12',$1,$2,'host-task12','agent-task12','plugin-task12','mysql','version-task12','1.0.0','artifact-task12',$3,$3,'running',5,7,100,'["instance-task12","instance-task12-b"]'::jsonb,'[]'::jsonb,'converged',1,$4,$4)`, scope.TenantID, scope.ProjectID, digest, now)
 	exec(`INSERT INTO plugin_assignment_instances
 (tenant_id,project_id,assignment_id,instance_id,created_at,updated_at)
 VALUES ($1,$2,'assignment-task12','instance-task12',$3,$3)`, scope.TenantID, scope.ProjectID, now)
+	exec(`INSERT INTO plugin_assignment_instances
+(tenant_id,project_id,assignment_id,instance_id,created_at,updated_at)
+VALUES ($1,$2,'assignment-task12','instance-task12-b',$3,$3)`, scope.TenantID, scope.ProjectID, now)
 	exec(`INSERT INTO plugin_observations
 (tenant_id,project_id,assignment_id,host_id,agent_id,plugin_id,database_family,installed_version,active_slot,process_state,process_id,started_at,health,restart_count,circuit_state,bound_instance_count,active_configuration_revision,observed_operation_revision,observation_revision,observation_digest,observed_at,received_at)
-VALUES ($1,$2,'assignment-task12','host-task12','agent-task12','plugin-task12','mysql','1.0.0','a','running',123,$3,'healthy',0,'closed',1,5,7,1,$4,$3,$3)`, scope.TenantID, scope.ProjectID, now, digest)
+VALUES ($1,$2,'assignment-task12','host-task12','agent-task12','plugin-task12','mysql','1.0.0','a','running',123,$3,'healthy',0,'closed',2,5,7,1,$4,$3,$3)`, scope.TenantID, scope.ProjectID, now, digest)
 	require.NoError(t, tx.Commit())
 }
+
+func seedSecondaryMetricTemplateAssignment(t *testing.T, database *sql.DB, scope platformscope.Scope, now time.Time) {
+	t.Helper()
+	digest := strings.Repeat("a", 64)
+	fingerprint := strings.Repeat("d", 64)
+	tx, err := database.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	exec := func(statement string, arguments ...any) {
+		t.Helper()
+		_, execErr := tx.Exec(statement, arguments...)
+		require.NoError(t, execErr)
+	}
+	exec(`INSERT INTO managed_hosts
+(tenant_id,project_id,host_id,agent_id,display_name,hostname,operating_system,architecture,observation_revision,enrolled_at,status,updated_at)
+VALUES ($1,$2,'host-task12-2','agent-task12-2','Task12 host 2','task12-2.example','linux','amd64',1,$3,'online',$3)`, scope.TenantID, scope.ProjectID, now)
+	exec(`INSERT INTO discovery_candidates
+(candidate_id,tenant_id,project_id,host_id,agent_id,observation_id,discovery_source,database_family,database_variant,normalized_endpoint,confidence,evidence_summary,fingerprint,rule_revision,observation_revision,first_seen_at,last_seen_at,status,updated_at)
+VALUES ('candidate-task12-c',$1,$2,'host-task12-2','agent-task12-2','observation-task12-c','native','mysql','mysql','127.0.0.1:3310',1,'[]'::jsonb,decode($3,'hex'),1,1,$4,$4,'accepted',$4)`, scope.TenantID, scope.ProjectID, fingerprint, now)
+	exec(`INSERT INTO managed_database_instances
+(instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,credential_ref,capability_state,connection_test_status,plugin_assignment_revision,management_status,revision,created_at,updated_at,canonical_connection)
+VALUES ('instance-task12-c',$1,$2,'host-task12-2','agent-task12-2','candidate-task12-c','native',$3,'native:task12-c','mysql','mysql','Task12 MySQL C','127.0.0.1:3310','secret://database/task12-c','plugin_not_installed','not_tested',5,'monitoring',1,$4,$4,'mysql://127.0.0.1:3310/task12-c')`, scope.TenantID, scope.ProjectID, fingerprint, now)
+	exec(`UPDATE discovery_candidates SET accepted_instance_id='instance-task12-c' WHERE tenant_id=$1 AND project_id=$2 AND candidate_id='candidate-task12-c'`, scope.TenantID, scope.ProjectID)
+	exec(`INSERT INTO plugin_assignments
+(assignment_id,tenant_id,project_id,host_id,agent_id,plugin_id,database_family,desired_version_id,desired_version,artifact_id,artifact_sha256,manifest_digest,desired_state,configuration_revision,operation_revision,rollout_percentage,instance_ids,template_revision_ids,reconcile_state,revision,created_at,updated_at)
+VALUES ('assignment-task12-2',$1,$2,'host-task12-2','agent-task12-2','plugin-task12','mysql','version-task12','1.0.0','artifact-task12',$3,$3,'running',5,7,100,'["instance-task12-c"]'::jsonb,'[]'::jsonb,'converged',1,$4,$4)`, scope.TenantID, scope.ProjectID, digest, now)
+	exec(`INSERT INTO plugin_assignment_instances
+(tenant_id,project_id,assignment_id,instance_id,created_at,updated_at)
+VALUES ($1,$2,'assignment-task12-2','instance-task12-c',$3,$3)`, scope.TenantID, scope.ProjectID, now)
+	exec(`INSERT INTO plugin_observations
+(tenant_id,project_id,assignment_id,host_id,agent_id,plugin_id,database_family,installed_version,active_slot,process_state,process_id,started_at,health,restart_count,circuit_state,bound_instance_count,active_configuration_revision,observed_operation_revision,observation_revision,observation_digest,observed_at,received_at)
+VALUES ($1,$2,'assignment-task12-2','host-task12-2','agent-task12-2','plugin-task12','mysql','1.0.0','a','running',124,$3,'healthy',0,'closed',1,5,7,1,$4,$3,$3)`, scope.TenantID, scope.ProjectID, now, digest)
+	require.NoError(t, tx.Commit())
+}
+
+func seedSucceededMetricTemplateReconcile(t *testing.T, database *sql.DB, scope platformscope.Scope, assignment pluginassignment.Assignment, jobID, commandID string, now time.Time) {
+	t.Helper()
+	_, err := database.Exec(`INSERT INTO jobs
+(id,tenant_id,project_id,job_type,status,outcome,source_resource_type,source_resource_id,idempotency_key,version,total_targets,completed_targets,created_at,finished_at,request_id,trace_id)
+VALUES ($1,$2,$3,'plugin.reconcile','succeeded','complete','plugin_assignment',$4,$5,1,1,1,$6,$6,$7,$8)`, jobID, scope.TenantID, scope.ProjectID, assignment.ID, "idem-"+jobID, now, "request-"+jobID, "trace-"+jobID)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO command_outbox
+(id,tenant_id,project_id,job_id,target_id,message_type,payload,available_at,created_at,published_at,command_status,command_phase,terminal_at)
+VALUES ($1,$2,$3,$4,$5,'agent.plugin.reconcile.v1',decode('00','hex'),$6,$6,$6,'succeeded','succeeded',$6)`, commandID, scope.TenantID, scope.ProjectID, jobID, assignment.AgentID, now)
+	require.NoError(t, err)
+	_, err = database.Exec(`INSERT INTO plugin_reconcile_operations
+(tenant_id,project_id,assignment_id,configuration_revision,operation_revision,job_id,command_id,created_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, scope.TenantID, scope.ProjectID, assignment.ID, assignment.ConfigurationRevision, assignment.OperationRevision, jobID, commandID, now)
+	require.NoError(t, err)
+}
+
+type inactiveMetricTemplateFence struct{}
+
+func (inactiveMetricTemplateFence) ExecutionLeaseActive(string, string, time.Time) bool { return false }

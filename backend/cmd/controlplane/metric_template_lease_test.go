@@ -22,9 +22,23 @@ func TestMetricTrialRecorderNeverPromotesFailedTopLevelTypedSuccess(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, "command_failed", store.result.StatusCode)
 	require.Empty(t, store.result.Metrics)
+	succeeded, err := recorder.ClassifyMetricTemplateTrial(context.Background(), scope, "job-a", command, &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, MetricTemplateTrialResult: typed})
+	require.NoError(t, err)
+	require.False(t, succeeded)
+
+	typed.CandidateMetrics = []*agentv1.MetricTemplateCandidateMetric{nil}
+	succeeded, err = recorder.ClassifyMetricTemplateTrial(context.Background(), scope, "job-a", command, &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, MetricTemplateTrialResult: typed})
+	require.NoError(t, err)
+	require.False(t, succeeded)
+	require.Equal(t, "invalid_result", store.result.StatusCode)
 }
 
 type recordingMetricTrialStore struct{ result metrictemplate.TrialResult }
+
+func (store *recordingMetricTrialStore) ClassifyTrialResult(_ context.Context, _ platformscope.Scope, _ string, result metrictemplate.TrialResult) (metrictemplate.TrialResult, error) {
+	store.result = result
+	return result, nil
+}
 
 func (store *recordingMetricTrialStore) RecordTrialResult(_ context.Context, _ platformscope.Scope, _ string, result metrictemplate.TrialResult, _ time.Time) (metrictemplate.Revision, error) {
 	store.result = result

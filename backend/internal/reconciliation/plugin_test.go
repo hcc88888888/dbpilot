@@ -73,6 +73,20 @@ func TestBuildPluginJobCarriesDifferentPublishedTemplateRefsPerInstanceWithoutSQ
 	require.NotContains(t, string(message.Payload), "SELECT")
 }
 
+func TestBuildPluginJobUsesStableUniqueTemplateUnionForDifferentRevisions(t *testing.T) {
+	now := time.Now().UTC()
+	assignment := reconcileAssignmentFixture(now)
+	assignment.TemplateRevisionIDs = []string{"revision-1", "revision-2"}
+	ref1 := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-1", QueryDigest: bytesOfReconcile(1, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	ref2 := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-2", QueryDigest: bytesOfReconcile(2, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	descriptors := []*agentv1.PluginInstanceDescriptor{{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}, {InstanceId: "instance-b", DatabaseVariant: "mysql", UnixSocket: "/run/mysql/mysql.sock"}}
+	_, message, err := buildPluginJobWithConfiguration(assignment, descriptors, []*agentv1.MetricTemplateCommandReference{ref1, ref2}, []*agentv1.PluginInstanceTemplateReferences{{InstanceId: "instance-a", Templates: []*agentv1.MetricTemplateCommandReference{ref2}}, {InstanceId: "instance-b", Templates: []*agentv1.MetricTemplateCommandReference{ref1}}}, now)
+	require.NoError(t, err)
+	envelope := new(agentv1.CommandEnvelope)
+	require.NoError(t, proto.Unmarshal(message.Payload, envelope))
+	require.Equal(t, []string{"template-a"}, envelope.GetReconcilePlugin().GetTemplateIds())
+}
+
 func TestTemplateRefsRequiredOnlyForRunningAndRejectUnusedAggregate(t *testing.T) {
 	now := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
 	for _, state := range []pluginassignment.DesiredState{pluginassignment.DesiredInstalled, pluginassignment.DesiredStopped, pluginassignment.DesiredAbsent} {
