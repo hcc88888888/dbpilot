@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/plugincontract"
 	"dbpilot.local/platform/internal/spool"
 	"google.golang.org/protobuf/proto"
 )
@@ -98,6 +99,7 @@ type Capabilities struct {
 	DatabaseVersionRange        string
 	Capabilities                []string
 	MetricTemplateSchemaVersion uint32
+	BuiltinTemplateIDs          []string
 }
 
 type PluginConfiguration struct {
@@ -179,6 +181,7 @@ type Session struct {
 	handshaken            bool
 	configurationRevision uint64
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
+	builtinTemplates      map[string]*pluginv1.BuiltinMetricTemplateDescriptor
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -206,6 +209,7 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 		return Capabilities{}, errGateway
 	}
 	var result Capabilities
+	var builtinTemplates map[string]*pluginv1.BuiltinMetricTemplateDescriptor
 	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		challenge := make([]byte, sha256.Size)
 		if _, err := rand.Read(challenge); err != nil {
@@ -219,7 +223,14 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 		if len(response.GetSupportedVariants()) > 0 && variants == nil || len(response.GetCapabilities()) > 0 && capabilities == nil || response.GetDatabaseVersionRange() != "" && versionRange == "" {
 			return errGateway
 		}
-		result = Capabilities{SupportedVariants: variants, DatabaseVersionRange: versionRange, Capabilities: capabilities, MetricTemplateSchemaVersion: response.GetMetricTemplateSchemaVersion()}
+		var valid bool
+		builtinTemplates, valid = plugincontract.ValidateBuiltinDescriptors(response.GetBuiltinTemplates(), session.expected.TemplateIDs)
+		if !valid {
+			return errGateway
+		}
+		builtinIDs := mapKeysBuiltin(builtinTemplates)
+		sort.Strings(builtinIDs)
+		result = Capabilities{SupportedVariants: variants, DatabaseVersionRange: versionRange, Capabilities: capabilities, MetricTemplateSchemaVersion: response.GetMetricTemplateSchemaVersion(), BuiltinTemplateIDs: builtinIDs}
 		return nil
 	})
 	if err != nil {
@@ -227,6 +238,7 @@ func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) 
 	}
 	session.mu.Lock()
 	session.handshaken = true
+	session.builtinTemplates = builtinTemplates
 	session.mu.Unlock()
 	return result, nil
 }
@@ -262,6 +274,19 @@ func (session *Session) AssignmentID() string {
 		return ""
 	}
 	return session.expected.AssignmentID
+}
+
+func (session *Session) ConfiguredTemplateIDs(instanceID string) ([]string, error) {
+	if session == nil || !session.isConfigured() {
+		return nil, errGateway
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	instance := session.instances[instanceID]
+	if instance == nil {
+		return nil, errGateway
+	}
+	return session.configuredTemplateIDs(instance), nil
 }
 
 func (session *Session) SetExpectedTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) error {
@@ -632,10 +657,7 @@ func (session *Session) resumeCursors(ctx context.Context, sink MetricSink) ([]*
 		if configured == nil {
 			return nil, errGateway
 		}
-		templateIDs := make([]string, 0, len(configured.GetTemplates()))
-		for _, template := range configured.GetTemplates() {
-			templateIDs = append(templateIDs, template.GetTemplateId())
-		}
+		templateIDs := session.configuredTemplateIDs(configured)
 		sort.Strings(templateIDs)
 		for _, templateID := range templateIDs {
 			key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), TemplateID: templateID, InstanceID: instanceID}
@@ -789,7 +811,7 @@ func (session *Session) validateBatchInLane(batch *pluginv1.PluginMetricBatch) e
 }
 
 func (session *Session) batchLane(batch *pluginv1.PluginMetricBatch) (*sync.Mutex, error) {
-	if session == nil || batch == nil || batch.GetConfigurationRevision() != session.expected.ConfigurationRevision || !contains(session.expected.InstanceIDs, batch.GetInstanceId()) || !contains(session.expected.TemplateIDs, batch.GetTemplateId()) {
+	if session == nil || batch == nil || batch.GetConfigurationRevision() != session.expected.ConfigurationRevision || !contains(session.expected.InstanceIDs, batch.GetInstanceId()) || !session.hasTemplate(batch.GetTemplateId()) {
 		return nil, errGateway
 	}
 	key := cursorKey{AssignmentID: session.expected.AssignmentID, ConfigurationRevision: batch.GetConfigurationRevision(), TemplateID: batch.GetTemplateId(), InstanceID: batch.GetInstanceId()}
@@ -832,7 +854,7 @@ func (session *Session) appendBatchInLane(ctx context.Context, batch *pluginv1.P
 }
 
 func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) bool {
-	if batch == nil || batch.GetPluginId() != session.expected.PluginID || batch.GetPluginVersion() != session.expected.Version || batch.GetDatabaseFamily() != session.expected.DatabaseFamily || batch.GetConfigurationRevision() != session.configurationRevision || !contains(session.expected.TemplateIDs, batch.GetTemplateId()) {
+	if batch == nil || batch.GetPluginId() != session.expected.PluginID || batch.GetPluginVersion() != session.expected.Version || batch.GetDatabaseFamily() != session.expected.DatabaseFamily || batch.GetConfigurationRevision() != session.configurationRevision || !session.hasTemplate(batch.GetTemplateId()) {
 		return false
 	}
 	configured := session.instances[batch.GetInstanceId()]
@@ -844,6 +866,9 @@ func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) boo
 			return validateBatchAgainstTemplate(batch, template)
 		}
 	}
+	if builtin := session.builtinTemplates[batch.GetTemplateId()]; builtin != nil && builtin.GetRevision() == batch.GetTemplateRevision() {
+		return validateBatchAgainstBuiltin(batch, builtin)
+	}
 	return false
 }
 
@@ -851,7 +876,7 @@ func (session *Session) metricScope(batch *pluginv1.PluginMetricBatch) MetricSco
 	scope := session.client.config.Scope
 	scope.AssignmentID = session.expected.AssignmentID
 	scope.InstanceIDs = append([]string(nil), session.expected.InstanceIDs...)
-	scope.TemplateIDs = append([]string(nil), session.expected.TemplateIDs...)
+	scope.TemplateIDs = session.allTemplateIDs()
 	scope.DatabaseFamily = session.expected.DatabaseFamily
 	scope.PluginID = session.expected.PluginID
 	scope.PluginVersion = session.expected.Version
@@ -889,10 +914,7 @@ func (session *Session) readyForCollect(instances, templates []string) bool {
 		if instance == nil {
 			return false
 		}
-		configured := make([]string, len(instance.GetTemplates()))
-		for index, template := range instance.GetTemplates() {
-			configured[index] = template.GetTemplateId()
-		}
+		configured := session.configuredTemplateIDs(instance)
 		if !sameSet(templates, configured) {
 			return false
 		}
@@ -1034,10 +1056,64 @@ func canonicalDatabaseText(value string) bool {
 }
 
 func validTemplateConfiguration(value *pluginv1.MetricTemplateConfiguration) bool {
-	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || !validTemplateMappings(value.GetValueMappings(), value.GetLabelMappings()) {
+	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 32<<10 || value.GetCollectionIntervalSeconds() < 10 || value.GetCollectionIntervalSeconds() > 86400 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || value.GetCardinalityLimit() == 0 || value.GetCardinalityLimit() > 10000 || !validTemplateMappings(value.GetValueMappings(), value.GetLabelMappings()) {
 		return false
 	}
 	return true
+}
+
+func mapKeysBuiltin(values map[string]*pluginv1.BuiltinMetricTemplateDescriptor) []string {
+	result := make([]string, 0, len(values))
+	for id := range values {
+		result = append(result, id)
+	}
+	return result
+}
+func (session *Session) allTemplateIDs() []string {
+	result := append([]string(nil), session.expected.TemplateIDs...)
+	for id := range session.builtinTemplates {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result
+}
+func (session *Session) configuredTemplateIDs(instance *pluginv1.PluginInstanceConfiguration) []string {
+	result := make([]string, 0, len(instance.GetTemplates())+len(session.builtinTemplates))
+	for _, template := range instance.GetTemplates() {
+		if template != nil {
+			result = append(result, template.GetTemplateId())
+		}
+	}
+	for id := range session.builtinTemplates {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result
+}
+func (session *Session) hasTemplate(id string) bool {
+	return contains(session.expected.TemplateIDs, id) || session.builtinTemplates[id] != nil
+}
+
+func validateBatchAgainstBuiltin(batch *pluginv1.PluginMetricBatch, descriptor *pluginv1.BuiltinMetricTemplateDescriptor) bool {
+	if batch == nil || descriptor == nil || batch.GetTemplateId() != descriptor.GetTemplateId() || batch.GetTemplateRevision() != descriptor.GetRevision() || len(batch.GetSamples()) > len(descriptor.GetMetrics()) {
+		return false
+	}
+	allowed := make(map[string]*pluginv1.BuiltinMetricDescriptor, len(descriptor.GetMetrics()))
+	for _, metric := range descriptor.GetMetrics() {
+		allowed[metric.GetMetricName()] = metric
+	}
+	seen := map[string]struct{}{}
+	for _, sample := range batch.GetSamples() {
+		metric := allowed[sample.GetMetricName()]
+		if sample == nil || metric == nil || sample.GetMetricType() != metric.GetMetricType() || sample.GetUnit() != metric.GetUnit() || len(sample.GetLabels()) != 0 {
+			return false
+		}
+		if _, duplicate := seen[sample.GetMetricName()]; duplicate {
+			return false
+		}
+		seen[sample.GetMetricName()] = struct{}{}
+	}
+	return batch.GetCollectionStatus() != pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED || len(seen) == len(allowed)
 }
 
 func validTemplateMappings(valueMappings []*pluginv1.MetricValueMapping, labelMappings []*pluginv1.MetricLabelMapping) bool {

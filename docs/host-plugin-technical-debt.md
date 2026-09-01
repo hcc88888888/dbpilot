@@ -21,3 +21,19 @@
 - Functional impact: none observed. Contract lint, breaking checks, zero-drift generation and all contract tests pass. `npm ci --ignore-scripts` reports 16 moderate and 1 high advisory in the existing dependency graph.
 - Severity: medium for the development/CI environment, non-blocking for Task 9 runtime functionality.
 - Recommended remediation stage: consolidated dependency maintenance before production release qualification. Upgrade pinned generators/CLI dependencies in a dedicated change and rerun generated-client drift and breaking-contract gates; do not apply `npm audit fix --force` inside a feature branch.
+
+## TD-MYSQL-001: Driver retains active credential strings until pool close
+
+- Affected module: MySQL plugin connection factory (`go-sql-driver/mysql`).
+- Trigger conditions: an instance has an active connection pool or a credential rotation closes and replaces that pool.
+- Functional impact: none for connection, rotation or cleanup behavior. DBPilot clears lease byte buffers and closes retired pools, but the Go driver must retain an immutable password string internally while a pool can reconnect, so byte-for-byte zeroization cannot be guaranteed by application code.
+- Severity: medium hardening limitation; it becomes high only if an attacker already has same-process memory-read capability.
+- Recommended remediation stage: production hardening review. Prefer short lease TTLs and process isolation now; evaluate a connector/driver design with replaceable zeroizable credential material before admitting less-trusted plugin publishers.
+
+## TD-TEST-001: MySQL verifier image reference and Windows race gate
+
+- Affected module: Task 13 MySQL/Kylin acceptance tooling.
+- Trigger conditions: `mysql:8.4` is republished upstream, or a developer attempts the Go race detector with the repository's default `CGO_ENABLED=0` Windows toolchain.
+- Functional impact: none observed in current unit, full Go, Linux amd64/arm64, Kylin V10 and real MySQL 8.4 verification. The mutable image tag weakens long-term reproducibility, and the local Windows race gate is unavailable without an approved C toolchain.
+- Severity: low for feature delivery; medium for release-evidence reproducibility.
+- Recommended remediation stage: release qualification. Pin the approved MySQL 8 image digest and run `go test -race` for the plugin packages in a dedicated Linux CI runner with CGO enabled.

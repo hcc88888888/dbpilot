@@ -47,6 +47,7 @@ message MetricTemplateConfiguration {
   uint32 max_columns = 9;
   repeated MetricValueMapping value_mappings = 10;
   repeated MetricLabelMapping label_mappings = 11;
+  uint32 cardinality_limit = 12;
 }
 
 message MetricValueMapping {

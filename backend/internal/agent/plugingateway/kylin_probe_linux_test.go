@@ -232,7 +232,7 @@ func (fixture *gatewayFixture) StreamMetrics(request *pluginv1.StreamPluginMetri
 }
 
 func probeTemplate(id string) *pluginv1.MetricTemplateConfiguration {
-	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: make([]byte, sha256.Size), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}}
+	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: make([]byte, sha256.Size), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}}
 }
 func (fixture *gatewayFixture) AcknowledgeMetrics(_ context.Context, request *pluginv1.AcknowledgePluginMetricsRequest) (*pluginv1.AcknowledgePluginMetricsResponse, error) {
 	fixture.acks += len(request.GetCursors())

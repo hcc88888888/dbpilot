@@ -39,4 +39,21 @@ message PluginHandshakeResponse {
   uint32 metric_template_schema_version = 8;
   bytes executable_digest = 9;
   bytes launch_nonce_proof = 10;
+  repeated BuiltinMetricTemplateDescriptor builtin_templates = 11;
+}
+
+// BuiltinMetricTemplateDescriptor exposes only the signed runtime's stable
+// metric contract. It never carries SQL or database credentials.
+message BuiltinMetricTemplateDescriptor {
+  string template_id = 1;
+  uint64 revision = 2;
+  bytes definition_digest = 3;
+  uint32 collection_interval_seconds = 4;
+  repeated BuiltinMetricDescriptor metrics = 5;
+}
+
+message BuiltinMetricDescriptor {
+  string metric_name = 1;
+  PluginMetricType metric_type = 2;
+  string unit = 3;
 }

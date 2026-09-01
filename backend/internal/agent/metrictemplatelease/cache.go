@@ -147,7 +147,7 @@ func (cache *Cache) PluginConfiguration(assignmentID string, configurationRevisi
 		}
 		return plugingateway.PluginConfiguration{}, ErrUnavailable
 	}
-	template := &pluginv1.MetricTemplateConfiguration{TemplateId: value.TemplateID, Revision: value.Revision, QueryDigest: decodeDigest(value.QueryDigest), QueryKind: "sql", ReadOnlyStatement: string(value.StatementBytes), CollectionIntervalSeconds: uint32(value.CollectionIntervalSeconds), TimeoutSeconds: uint32(value.TimeoutSeconds), MaxRows: uint32(value.MaxRows), MaxColumns: uint32(value.MaxColumns)}
+	template := &pluginv1.MetricTemplateConfiguration{TemplateId: value.TemplateID, Revision: value.Revision, QueryDigest: decodeDigest(value.QueryDigest), QueryKind: "sql", ReadOnlyStatement: string(value.StatementBytes), CollectionIntervalSeconds: uint32(value.CollectionIntervalSeconds), TimeoutSeconds: uint32(value.TimeoutSeconds), MaxRows: uint32(value.MaxRows), MaxColumns: uint32(value.MaxColumns), CardinalityLimit: uint32(value.CardinalityLimit)}
 	for _, mapping := range value.ValueMappings {
 		template.ValueMappings = append(template.ValueMappings, &pluginv1.MetricValueMapping{SourceColumn: mapping.SourceColumn, MetricName: mapping.MetricName, MetricType: string(mapping.MetricType), Unit: mapping.Unit})
 	}

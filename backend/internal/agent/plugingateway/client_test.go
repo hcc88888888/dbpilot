@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/plugincontract"
 	"dbpilot.local/platform/internal/spool"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -76,7 +77,7 @@ func TestConfigurationRequiresCompleteImmutableTemplateCoverage(t *testing.T) {
 	expected := ExpectedPlugin{AssignmentID: "assignment-1", ConfigurationRevision: 4, InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}}
 	instance := &pluginv1.PluginInstanceConfiguration{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}
 	require.Error(t, PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{instance}}.validate(expected))
-	instance.Templates = []*pluginv1.MetricTemplateConfiguration{{TemplateId: "builtin", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}}
+	instance.Templates = []*pluginv1.MetricTemplateConfiguration{{TemplateId: "builtin", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}}
 	expected.TemplateConfigurations = cloneTemplateConfigurations(instance.Templates)
 	require.NoError(t, PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{instance}}.validate(expected))
 	instance.Templates[0].QueryDigest[0] ^= 0xff
@@ -92,6 +93,33 @@ func TestSignedManifestProjectionMustExactlyMatchHandshake(t *testing.T) {
 	response.Capabilities = []string{"metrics.collect"}
 	response.SupportedVariants = []string{"postgres"}
 	require.False(t, matchesSignedManifest(response, expected))
+}
+
+func TestVerifiedRuntimeBuiltinsJoinCustomConfiguredPairsWithoutEnteringApplyPayload(t *testing.T) {
+	builtin := &pluginv1.BuiltinMetricTemplateDescriptor{TemplateId: "mysql.up", Revision: 1, CollectionIntervalSeconds: 10, Metrics: []*pluginv1.BuiltinMetricDescriptor{{MetricName: "mysql.up", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Unit: "1"}}}
+	builtin.DefinitionDigest = plugincontract.BuiltinDescriptorDigest(builtin)
+	validated, ok := plugincontract.ValidateBuiltinDescriptors([]*pluginv1.BuiltinMetricTemplateDescriptor{builtin}, []string{"custom-a"})
+	require.True(t, ok)
+	custom := gatewayTestTemplateConfiguration("custom-a")
+	session := &Session{client: &Client{}, handshaken: true, expected: ExpectedPlugin{AssignmentID: "assignment-1", PluginID: "mysql", Version: "1.0.0", DatabaseFamily: "mysql", ConfigurationRevision: 4, InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"custom-a"}}, configurationRevision: 4, instances: map[string]*pluginv1.PluginInstanceConfiguration{"mysql-1": {InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{custom}}}}
+	session.builtinTemplates = validated
+	require.True(t, session.readyForCollect([]string{"mysql-1"}, []string{"mysql.up", "custom-a"}))
+	require.Len(t, session.instances["mysql-1"].GetTemplates(), 1, "runtime builtins never enter ApplyConfiguration")
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "mysql.up", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.up", Value: 1, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
+	require.True(t, session.isBatchConfigured(batch))
+	scope := session.metricScope(batch)
+	require.ElementsMatch(t, []string{"custom-a", "mysql.up"}, scope.TemplateIDs)
+
+	tampered := proto.Clone(builtin).(*pluginv1.BuiltinMetricTemplateDescriptor)
+	tampered.Metrics[0].Unit = "s"
+	_, ok = plugincontract.ValidateBuiltinDescriptors([]*pluginv1.BuiltinMetricTemplateDescriptor{tampered}, []string{"custom-a"})
+	require.False(t, ok)
+	collision := proto.Clone(builtin).(*pluginv1.BuiltinMetricTemplateDescriptor)
+	collision.TemplateId = "custom-a"
+	collision.DefinitionDigest = plugincontract.BuiltinDescriptorDigest(collision)
+	_, ok = plugincontract.ValidateBuiltinDescriptors([]*pluginv1.BuiltinMetricTemplateDescriptor{collision}, []string{"custom-a"})
+	require.False(t, ok)
 }
 
 func TestValidationResultRequiresCanonicalSecretSafeTextAndExactInvariants(t *testing.T) {
@@ -490,7 +518,7 @@ func (allCursorSink) MarkCursorAcknowledged(context.Context, string, uint64) err
 func canonicalPairFixture(instanceCount, templateCount int) (map[string]*pluginv1.PluginInstanceConfiguration, []*pluginv1.MetricTemplateConfiguration) {
 	templates := make([]*pluginv1.MetricTemplateConfiguration, templateCount)
 	for index := range templates {
-		templates[index] = &pluginv1.MetricTemplateConfiguration{TemplateId: fmt.Sprintf("template-%03d", index), Revision: 1, QueryDigest: bytes.Repeat([]byte{byte(index + 1)}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: fmt.Sprintf("mysql.metric_%03d", index), MetricType: "gauge", Unit: "1"}}}
+		templates[index] = &pluginv1.MetricTemplateConfiguration{TemplateId: fmt.Sprintf("template-%03d", index), Revision: 1, QueryDigest: bytes.Repeat([]byte{byte(index + 1)}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: fmt.Sprintf("mysql.metric_%03d", index), MetricType: "gauge", Unit: "1"}}}
 	}
 	instances := make(map[string]*pluginv1.PluginInstanceConfiguration, instanceCount)
 	for index := 0; index < instanceCount; index++ {
@@ -669,14 +697,14 @@ func TestTrialMetricTemplateRejectsDigestMappingAndCandidateViolations(t *testin
 }
 
 func configuredTestSession(client *Client) *Session {
-	template := &pluginv1.MetricTemplateConfiguration{TemplateId: "builtin", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}
+	template := &pluginv1.MetricTemplateConfiguration{TemplateId: "builtin", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}
 	return &Session{client: client, expected: ExpectedPlugin{AssignmentID: "assignment-1", PluginID: "mysql", Version: "1.0.0", DatabaseFamily: "mysql", ConfigurationRevision: 4, InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}}, configurationRevision: 4, instances: map[string]*pluginv1.PluginInstanceConfiguration{"mysql-1": {InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{template}}}}
 }
 
 func gatewayTestTemplateConfiguration(id string) *pluginv1.MetricTemplateConfiguration {
 	statement := "SELECT value"
 	digest := sha256.Sum256([]byte(statement))
-	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}
+	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}
 }
 
 func testBatch(now time.Time, sequence uint64, value float64) *pluginv1.PluginMetricBatch {

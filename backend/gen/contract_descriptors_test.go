@@ -242,3 +242,39 @@ func TestPluginAndDockerDescriptorsExposeExactServices(t *testing.T) {
 		t.Fatal("DockerDiscovery RPC descriptors are incorrect")
 	}
 }
+
+func TestPluginDescriptorsExposeBuiltinMetricsAndPublishedCardinality(t *testing.T) {
+	plugin := pluginv1.File_plugin_v1_plugin_proto
+	handshake := plugin.Messages().ByName("PluginHandshakeResponse")
+	if handshake == nil || handshake.Fields().ByName("builtin_templates") == nil || handshake.Fields().ByName("builtin_templates").Number() != 11 {
+		t.Fatal("PluginHandshakeResponse.builtin_templates is absent")
+	}
+	template := plugin.Messages().ByName("BuiltinMetricTemplateDescriptor")
+	metric := plugin.Messages().ByName("BuiltinMetricDescriptor")
+	if template == nil || metric == nil {
+		t.Fatal("builtin metric descriptor messages are absent")
+	}
+	assertFields := func(message protoreflect.MessageDescriptor, want map[protoreflect.Name]protoreflect.FieldNumber) {
+		t.Helper()
+		if message.Fields().Len() != len(want) {
+			t.Fatalf("%s field count=%d", message.Name(), message.Fields().Len())
+		}
+		for name, number := range want {
+			field := message.Fields().ByName(name)
+			if field == nil || field.Number() != number {
+				t.Fatalf("%s.%s descriptor mismatch", message.Name(), name)
+			}
+		}
+	}
+	assertFields(template, map[protoreflect.Name]protoreflect.FieldNumber{"template_id": 1, "revision": 2, "definition_digest": 3, "collection_interval_seconds": 4, "metrics": 5})
+	assertFields(metric, map[protoreflect.Name]protoreflect.FieldNumber{"metric_name": 1, "metric_type": 2, "unit": 3})
+	for _, sensitive := range []protoreflect.Name{"statement", "read_only_statement", "query", "query_digest", "credential", "secret_bytes"} {
+		if template.Fields().ByName(sensitive) != nil || metric.Fields().ByName(sensitive) != nil {
+			t.Fatalf("builtin descriptor exposes sensitive field %s", sensitive)
+		}
+	}
+	instance := pluginv1.File_plugin_v1_instance_proto.Messages().ByName("MetricTemplateConfiguration")
+	if instance == nil || instance.Fields().ByName("cardinality_limit") == nil || instance.Fields().ByName("cardinality_limit").Number() != 12 {
+		t.Fatal("MetricTemplateConfiguration.cardinality_limit is absent")
+	}
+}

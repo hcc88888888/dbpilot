@@ -67,6 +67,8 @@ func TestLeaseMetricTemplatesKeepsDifferentPerInstanceBindingsAndReleasesQueries
 	require.NoError(t, err)
 	require.Equal(t, "template-a", configurations["instance-a"][0].GetTemplateId())
 	require.Equal(t, "template-b", configurations["instance-b"][0].GetTemplateId())
+	require.Equal(t, uint32(10), configurations["instance-a"][0].GetCardinalityLimit())
+	require.Equal(t, uint32(10), configurations["instance-b"][0].GetCardinalityLimit())
 	retained := append([][]byte(nil), leaser.returned...)
 	for _, release := range releases {
 		release()

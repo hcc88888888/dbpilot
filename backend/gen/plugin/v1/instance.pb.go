@@ -315,6 +315,7 @@ type MetricTemplateConfiguration struct {
 	MaxColumns                uint32                 `protobuf:"varint,9,opt,name=max_columns,json=maxColumns,proto3" json:"max_columns,omitempty"`
 	ValueMappings             []*MetricValueMapping  `protobuf:"bytes,10,rep,name=value_mappings,json=valueMappings,proto3" json:"value_mappings,omitempty"`
 	LabelMappings             []*MetricLabelMapping  `protobuf:"bytes,11,rep,name=label_mappings,json=labelMappings,proto3" json:"label_mappings,omitempty"`
+	CardinalityLimit          uint32                 `protobuf:"varint,12,opt,name=cardinality_limit,json=cardinalityLimit,proto3" json:"cardinality_limit,omitempty"`
 	unknownFields             protoimpl.UnknownFields
 	sizeCache                 protoimpl.SizeCache
 }
@@ -424,6 +425,13 @@ func (x *MetricTemplateConfiguration) GetLabelMappings() []*MetricLabelMapping {
 		return x.LabelMappings
 	}
 	return nil
+}
+
+func (x *MetricTemplateConfiguration) GetCardinalityLimit() uint32 {
+	if x != nil {
+		return x.CardinalityLimit
+	}
+	return 0
 }
 
 type MetricValueMapping struct {
@@ -779,7 +787,7 @@ const file_plugin_v1_instance_proto_rawDesc = "" +
 	"\busername\x18\x03 \x01(\tR\busername\x12!\n" +
 	"\fsecret_bytes\x18\x04 \x01(\fR\vsecretBytes\x129\n" +
 	"\n" +
-	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\x8d\x04\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"\xba\x04\n" +
 	"\x1bMetricTemplateConfiguration\x12\x1f\n" +
 	"\vtemplate_id\x18\x01 \x01(\tR\n" +
 	"templateId\x12\x1a\n" +
@@ -795,7 +803,8 @@ const file_plugin_v1_instance_proto_rawDesc = "" +
 	"maxColumns\x12L\n" +
 	"\x0evalue_mappings\x18\n" +
 	" \x03(\v2%.dbpilot.plugin.v1.MetricValueMappingR\rvalueMappings\x12L\n" +
-	"\x0elabel_mappings\x18\v \x03(\v2%.dbpilot.plugin.v1.MetricLabelMappingR\rlabelMappings\"\x8f\x01\n" +
+	"\x0elabel_mappings\x18\v \x03(\v2%.dbpilot.plugin.v1.MetricLabelMappingR\rlabelMappings\x12+\n" +
+	"\x11cardinality_limit\x18\f \x01(\rR\x10cardinalityLimit\"\x8f\x01\n" +
 	"\x12MetricValueMapping\x12#\n" +
 	"\rsource_column\x18\x01 \x01(\tR\fsourceColumn\x12\x1f\n" +
 	"\vmetric_name\x18\x02 \x01(\tR\n" +

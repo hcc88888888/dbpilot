@@ -96,14 +96,15 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 	if err != nil {
 		return ErrHealthHandshake
 	}
-	if _, err = session.Handshake(ctx, expected); err != nil {
+	capabilities, handshakeErr := session.Handshake(ctx, expected)
+	if handshakeErr != nil {
 		return ErrHealthHandshake
 	}
 	if len(request.SupportedVariants) == 0 || len(request.SignedCapabilities) == 0 || request.MetricTemplateSchemaVersion == 0 || len(request.InstanceDescriptors) == 0 {
 		checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "plugin_reconcile_unavailable")
 		return nil
 	}
-	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
+	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 && len(capabilities.BuiltinTemplateIDs) == 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
 		checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_templates")
 		return nil
 	}
@@ -166,9 +167,9 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		}
 		if sink := checker.client.MetricSink(); sink != nil {
 			for _, instance := range instances {
-				templateIDs := make([]string, len(instance.GetTemplates()))
-				for index, template := range instance.GetTemplates() {
-					templateIDs[index] = template.GetTemplateId()
+				templateIDs, configuredErr := session.ConfiguredTemplateIDs(instance.GetInstanceId())
+				if configuredErr != nil {
+					return ErrHealthHandshake
 				}
 				if len(templateIDs) > 0 {
 					if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, templateIDs); err != nil {
@@ -269,7 +270,7 @@ func leaseMetricTemplates(ctx context.Context, leaser MetricTemplateLeaser, requ
 			}
 			retained := &material
 			releases = append(releases, retained.Release)
-			configuration := &pluginv1.MetricTemplateConfiguration{TemplateId: material.TemplateID, Revision: material.Revision, QueryDigest: append([]byte(nil), reference.QueryDigest...), QueryKind: "sql", ReadOnlyStatement: string(material.StatementBytes), CollectionIntervalSeconds: uint32(material.CollectionIntervalSeconds), TimeoutSeconds: uint32(material.TimeoutSeconds), MaxRows: uint32(material.MaxRows), MaxColumns: uint32(material.MaxColumns)}
+			configuration := &pluginv1.MetricTemplateConfiguration{TemplateId: material.TemplateID, Revision: material.Revision, QueryDigest: append([]byte(nil), reference.QueryDigest...), QueryKind: "sql", ReadOnlyStatement: string(material.StatementBytes), CollectionIntervalSeconds: uint32(material.CollectionIntervalSeconds), TimeoutSeconds: uint32(material.TimeoutSeconds), MaxRows: uint32(material.MaxRows), MaxColumns: uint32(material.MaxColumns), CardinalityLimit: uint32(material.CardinalityLimit)}
 			for _, mapping := range material.ValueMappings {
 				configuration.ValueMappings = append(configuration.ValueMappings, &pluginv1.MetricValueMapping{SourceColumn: mapping.SourceColumn, MetricName: mapping.MetricName, MetricType: mapping.MetricType, Unit: mapping.Unit})
 			}

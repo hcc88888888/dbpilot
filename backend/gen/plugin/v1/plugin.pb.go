@@ -98,17 +98,18 @@ func (x *PluginHandshakeRequest) GetLaunchNonceChallenge() []byte {
 }
 
 type PluginHandshakeResponse struct {
-	state                       protoimpl.MessageState `protogen:"open.v1"`
-	PluginId                    string                 `protobuf:"bytes,1,opt,name=plugin_id,json=pluginId,proto3" json:"plugin_id,omitempty"`
-	DatabaseFamily              string                 `protobuf:"bytes,2,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
-	Version                     string                 `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
-	ProtocolVersion             string                 `protobuf:"bytes,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	SupportedVariants           []string               `protobuf:"bytes,5,rep,name=supported_variants,json=supportedVariants,proto3" json:"supported_variants,omitempty"`
-	DatabaseVersionRange        string                 `protobuf:"bytes,6,opt,name=database_version_range,json=databaseVersionRange,proto3" json:"database_version_range,omitempty"`
-	Capabilities                []string               `protobuf:"bytes,7,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
-	MetricTemplateSchemaVersion uint32                 `protobuf:"varint,8,opt,name=metric_template_schema_version,json=metricTemplateSchemaVersion,proto3" json:"metric_template_schema_version,omitempty"`
-	ExecutableDigest            []byte                 `protobuf:"bytes,9,opt,name=executable_digest,json=executableDigest,proto3" json:"executable_digest,omitempty"`
-	LaunchNonceProof            []byte                 `protobuf:"bytes,10,opt,name=launch_nonce_proof,json=launchNonceProof,proto3" json:"launch_nonce_proof,omitempty"`
+	state                       protoimpl.MessageState             `protogen:"open.v1"`
+	PluginId                    string                             `protobuf:"bytes,1,opt,name=plugin_id,json=pluginId,proto3" json:"plugin_id,omitempty"`
+	DatabaseFamily              string                             `protobuf:"bytes,2,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	Version                     string                             `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
+	ProtocolVersion             string                             `protobuf:"bytes,4,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	SupportedVariants           []string                           `protobuf:"bytes,5,rep,name=supported_variants,json=supportedVariants,proto3" json:"supported_variants,omitempty"`
+	DatabaseVersionRange        string                             `protobuf:"bytes,6,opt,name=database_version_range,json=databaseVersionRange,proto3" json:"database_version_range,omitempty"`
+	Capabilities                []string                           `protobuf:"bytes,7,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
+	MetricTemplateSchemaVersion uint32                             `protobuf:"varint,8,opt,name=metric_template_schema_version,json=metricTemplateSchemaVersion,proto3" json:"metric_template_schema_version,omitempty"`
+	ExecutableDigest            []byte                             `protobuf:"bytes,9,opt,name=executable_digest,json=executableDigest,proto3" json:"executable_digest,omitempty"`
+	LaunchNonceProof            []byte                             `protobuf:"bytes,10,opt,name=launch_nonce_proof,json=launchNonceProof,proto3" json:"launch_nonce_proof,omitempty"`
+	BuiltinTemplates            []*BuiltinMetricTemplateDescriptor `protobuf:"bytes,11,rep,name=builtin_templates,json=builtinTemplates,proto3" json:"builtin_templates,omitempty"`
 	unknownFields               protoimpl.UnknownFields
 	sizeCache                   protoimpl.SizeCache
 }
@@ -213,6 +214,151 @@ func (x *PluginHandshakeResponse) GetLaunchNonceProof() []byte {
 	return nil
 }
 
+func (x *PluginHandshakeResponse) GetBuiltinTemplates() []*BuiltinMetricTemplateDescriptor {
+	if x != nil {
+		return x.BuiltinTemplates
+	}
+	return nil
+}
+
+// BuiltinMetricTemplateDescriptor exposes only the signed runtime's stable
+// metric contract. It never carries SQL or database credentials.
+type BuiltinMetricTemplateDescriptor struct {
+	state                     protoimpl.MessageState     `protogen:"open.v1"`
+	TemplateId                string                     `protobuf:"bytes,1,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	Revision                  uint64                     `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	DefinitionDigest          []byte                     `protobuf:"bytes,3,opt,name=definition_digest,json=definitionDigest,proto3" json:"definition_digest,omitempty"`
+	CollectionIntervalSeconds uint32                     `protobuf:"varint,4,opt,name=collection_interval_seconds,json=collectionIntervalSeconds,proto3" json:"collection_interval_seconds,omitempty"`
+	Metrics                   []*BuiltinMetricDescriptor `protobuf:"bytes,5,rep,name=metrics,proto3" json:"metrics,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
+}
+
+func (x *BuiltinMetricTemplateDescriptor) Reset() {
+	*x = BuiltinMetricTemplateDescriptor{}
+	mi := &file_plugin_v1_plugin_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BuiltinMetricTemplateDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BuiltinMetricTemplateDescriptor) ProtoMessage() {}
+
+func (x *BuiltinMetricTemplateDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_v1_plugin_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BuiltinMetricTemplateDescriptor.ProtoReflect.Descriptor instead.
+func (*BuiltinMetricTemplateDescriptor) Descriptor() ([]byte, []int) {
+	return file_plugin_v1_plugin_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *BuiltinMetricTemplateDescriptor) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+func (x *BuiltinMetricTemplateDescriptor) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
+}
+
+func (x *BuiltinMetricTemplateDescriptor) GetDefinitionDigest() []byte {
+	if x != nil {
+		return x.DefinitionDigest
+	}
+	return nil
+}
+
+func (x *BuiltinMetricTemplateDescriptor) GetCollectionIntervalSeconds() uint32 {
+	if x != nil {
+		return x.CollectionIntervalSeconds
+	}
+	return 0
+}
+
+func (x *BuiltinMetricTemplateDescriptor) GetMetrics() []*BuiltinMetricDescriptor {
+	if x != nil {
+		return x.Metrics
+	}
+	return nil
+}
+
+type BuiltinMetricDescriptor struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MetricName    string                 `protobuf:"bytes,1,opt,name=metric_name,json=metricName,proto3" json:"metric_name,omitempty"`
+	MetricType    PluginMetricType       `protobuf:"varint,2,opt,name=metric_type,json=metricType,proto3,enum=dbpilot.plugin.v1.PluginMetricType" json:"metric_type,omitempty"`
+	Unit          string                 `protobuf:"bytes,3,opt,name=unit,proto3" json:"unit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BuiltinMetricDescriptor) Reset() {
+	*x = BuiltinMetricDescriptor{}
+	mi := &file_plugin_v1_plugin_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BuiltinMetricDescriptor) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BuiltinMetricDescriptor) ProtoMessage() {}
+
+func (x *BuiltinMetricDescriptor) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_v1_plugin_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BuiltinMetricDescriptor.ProtoReflect.Descriptor instead.
+func (*BuiltinMetricDescriptor) Descriptor() ([]byte, []int) {
+	return file_plugin_v1_plugin_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *BuiltinMetricDescriptor) GetMetricName() string {
+	if x != nil {
+		return x.MetricName
+	}
+	return ""
+}
+
+func (x *BuiltinMetricDescriptor) GetMetricType() PluginMetricType {
+	if x != nil {
+		return x.MetricType
+	}
+	return PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED
+}
+
+func (x *BuiltinMetricDescriptor) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
 var File_plugin_v1_plugin_proto protoreflect.FileDescriptor
 
 const file_plugin_v1_plugin_proto_rawDesc = "" +
@@ -223,7 +369,7 @@ const file_plugin_v1_plugin_proto_rawDesc = "" +
 	"\x18expected_database_family\x18\x02 \x01(\tR\x16expectedDatabaseFamily\x12)\n" +
 	"\x10expected_version\x18\x03 \x01(\tR\x0fexpectedVersion\x12:\n" +
 	"\x19expected_protocol_version\x18\x04 \x01(\tR\x17expectedProtocolVersion\x124\n" +
-	"\x16launch_nonce_challenge\x18\x05 \x01(\fR\x14launchNonceChallenge\"\xcd\x03\n" +
+	"\x16launch_nonce_challenge\x18\x05 \x01(\fR\x14launchNonceChallenge\"\xae\x04\n" +
 	"\x17PluginHandshakeResponse\x12\x1b\n" +
 	"\tplugin_id\x18\x01 \x01(\tR\bpluginId\x12'\n" +
 	"\x0fdatabase_family\x18\x02 \x01(\tR\x0edatabaseFamily\x12\x18\n" +
@@ -235,7 +381,21 @@ const file_plugin_v1_plugin_proto_rawDesc = "" +
 	"\x1emetric_template_schema_version\x18\b \x01(\rR\x1bmetricTemplateSchemaVersion\x12+\n" +
 	"\x11executable_digest\x18\t \x01(\fR\x10executableDigest\x12,\n" +
 	"\x12launch_nonce_proof\x18\n" +
-	" \x01(\fR\x10launchNonceProof2\xf1\a\n" +
+	" \x01(\fR\x10launchNonceProof\x12_\n" +
+	"\x11builtin_templates\x18\v \x03(\v22.dbpilot.plugin.v1.BuiltinMetricTemplateDescriptorR\x10builtinTemplates\"\x91\x02\n" +
+	"\x1fBuiltinMetricTemplateDescriptor\x12\x1f\n" +
+	"\vtemplate_id\x18\x01 \x01(\tR\n" +
+	"templateId\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\x12+\n" +
+	"\x11definition_digest\x18\x03 \x01(\fR\x10definitionDigest\x12>\n" +
+	"\x1bcollection_interval_seconds\x18\x04 \x01(\rR\x19collectionIntervalSeconds\x12D\n" +
+	"\ametrics\x18\x05 \x03(\v2*.dbpilot.plugin.v1.BuiltinMetricDescriptorR\ametrics\"\x94\x01\n" +
+	"\x17BuiltinMetricDescriptor\x12\x1f\n" +
+	"\vmetric_name\x18\x01 \x01(\tR\n" +
+	"metricName\x12D\n" +
+	"\vmetric_type\x18\x02 \x01(\x0e2#.dbpilot.plugin.v1.PluginMetricTypeR\n" +
+	"metricType\x12\x12\n" +
+	"\x04unit\x18\x03 \x01(\tR\x04unit2\xf1\a\n" +
 	"\rPluginRuntime\x12b\n" +
 	"\tHandshake\x12).dbpilot.plugin.v1.PluginHandshakeRequest\x1a*.dbpilot.plugin.v1.PluginHandshakeResponse\x12}\n" +
 	"\x12ApplyConfiguration\x122.dbpilot.plugin.v1.ApplyPluginConfigurationRequest\x1a3.dbpilot.plugin.v1.ApplyPluginConfigurationResponse\x12w\n" +
@@ -260,51 +420,57 @@ func file_plugin_v1_plugin_proto_rawDescGZIP() []byte {
 	return file_plugin_v1_plugin_proto_rawDescData
 }
 
-var file_plugin_v1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_plugin_v1_plugin_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_plugin_v1_plugin_proto_goTypes = []any{
 	(*PluginHandshakeRequest)(nil),           // 0: dbpilot.plugin.v1.PluginHandshakeRequest
 	(*PluginHandshakeResponse)(nil),          // 1: dbpilot.plugin.v1.PluginHandshakeResponse
-	(*ApplyPluginConfigurationRequest)(nil),  // 2: dbpilot.plugin.v1.ApplyPluginConfigurationRequest
-	(*ValidatePluginInstanceRequest)(nil),    // 3: dbpilot.plugin.v1.ValidatePluginInstanceRequest
-	(*CollectPluginMetricsRequest)(nil),      // 4: dbpilot.plugin.v1.CollectPluginMetricsRequest
-	(*TrialMetricTemplateRequest)(nil),       // 5: dbpilot.plugin.v1.TrialMetricTemplateRequest
-	(*StreamPluginMetricsRequest)(nil),       // 6: dbpilot.plugin.v1.StreamPluginMetricsRequest
-	(*AcknowledgePluginMetricsRequest)(nil),  // 7: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
-	(*GetPluginHealthRequest)(nil),           // 8: dbpilot.plugin.v1.GetPluginHealthRequest
-	(*ShutdownPluginRequest)(nil),            // 9: dbpilot.plugin.v1.ShutdownPluginRequest
-	(*ApplyPluginConfigurationResponse)(nil), // 10: dbpilot.plugin.v1.ApplyPluginConfigurationResponse
-	(*ValidatePluginInstanceResponse)(nil),   // 11: dbpilot.plugin.v1.ValidatePluginInstanceResponse
-	(*CollectPluginMetricsResponse)(nil),     // 12: dbpilot.plugin.v1.CollectPluginMetricsResponse
-	(*TrialMetricTemplateResponse)(nil),      // 13: dbpilot.plugin.v1.TrialMetricTemplateResponse
-	(*PluginMetricBatch)(nil),                // 14: dbpilot.plugin.v1.PluginMetricBatch
-	(*AcknowledgePluginMetricsResponse)(nil), // 15: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
-	(*PluginHealth)(nil),                     // 16: dbpilot.plugin.v1.PluginHealth
-	(*ShutdownPluginResponse)(nil),           // 17: dbpilot.plugin.v1.ShutdownPluginResponse
+	(*BuiltinMetricTemplateDescriptor)(nil),  // 2: dbpilot.plugin.v1.BuiltinMetricTemplateDescriptor
+	(*BuiltinMetricDescriptor)(nil),          // 3: dbpilot.plugin.v1.BuiltinMetricDescriptor
+	(PluginMetricType)(0),                    // 4: dbpilot.plugin.v1.PluginMetricType
+	(*ApplyPluginConfigurationRequest)(nil),  // 5: dbpilot.plugin.v1.ApplyPluginConfigurationRequest
+	(*ValidatePluginInstanceRequest)(nil),    // 6: dbpilot.plugin.v1.ValidatePluginInstanceRequest
+	(*CollectPluginMetricsRequest)(nil),      // 7: dbpilot.plugin.v1.CollectPluginMetricsRequest
+	(*TrialMetricTemplateRequest)(nil),       // 8: dbpilot.plugin.v1.TrialMetricTemplateRequest
+	(*StreamPluginMetricsRequest)(nil),       // 9: dbpilot.plugin.v1.StreamPluginMetricsRequest
+	(*AcknowledgePluginMetricsRequest)(nil),  // 10: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
+	(*GetPluginHealthRequest)(nil),           // 11: dbpilot.plugin.v1.GetPluginHealthRequest
+	(*ShutdownPluginRequest)(nil),            // 12: dbpilot.plugin.v1.ShutdownPluginRequest
+	(*ApplyPluginConfigurationResponse)(nil), // 13: dbpilot.plugin.v1.ApplyPluginConfigurationResponse
+	(*ValidatePluginInstanceResponse)(nil),   // 14: dbpilot.plugin.v1.ValidatePluginInstanceResponse
+	(*CollectPluginMetricsResponse)(nil),     // 15: dbpilot.plugin.v1.CollectPluginMetricsResponse
+	(*TrialMetricTemplateResponse)(nil),      // 16: dbpilot.plugin.v1.TrialMetricTemplateResponse
+	(*PluginMetricBatch)(nil),                // 17: dbpilot.plugin.v1.PluginMetricBatch
+	(*AcknowledgePluginMetricsResponse)(nil), // 18: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
+	(*PluginHealth)(nil),                     // 19: dbpilot.plugin.v1.PluginHealth
+	(*ShutdownPluginResponse)(nil),           // 20: dbpilot.plugin.v1.ShutdownPluginResponse
 }
 var file_plugin_v1_plugin_proto_depIdxs = []int32{
-	0,  // 0: dbpilot.plugin.v1.PluginRuntime.Handshake:input_type -> dbpilot.plugin.v1.PluginHandshakeRequest
-	2,  // 1: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:input_type -> dbpilot.plugin.v1.ApplyPluginConfigurationRequest
-	3,  // 2: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:input_type -> dbpilot.plugin.v1.ValidatePluginInstanceRequest
-	4,  // 3: dbpilot.plugin.v1.PluginRuntime.CollectNow:input_type -> dbpilot.plugin.v1.CollectPluginMetricsRequest
-	5,  // 4: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:input_type -> dbpilot.plugin.v1.TrialMetricTemplateRequest
-	6,  // 5: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:input_type -> dbpilot.plugin.v1.StreamPluginMetricsRequest
-	7,  // 6: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:input_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
-	8,  // 7: dbpilot.plugin.v1.PluginRuntime.GetHealth:input_type -> dbpilot.plugin.v1.GetPluginHealthRequest
-	9,  // 8: dbpilot.plugin.v1.PluginRuntime.Shutdown:input_type -> dbpilot.plugin.v1.ShutdownPluginRequest
-	1,  // 9: dbpilot.plugin.v1.PluginRuntime.Handshake:output_type -> dbpilot.plugin.v1.PluginHandshakeResponse
-	10, // 10: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:output_type -> dbpilot.plugin.v1.ApplyPluginConfigurationResponse
-	11, // 11: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:output_type -> dbpilot.plugin.v1.ValidatePluginInstanceResponse
-	12, // 12: dbpilot.plugin.v1.PluginRuntime.CollectNow:output_type -> dbpilot.plugin.v1.CollectPluginMetricsResponse
-	13, // 13: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:output_type -> dbpilot.plugin.v1.TrialMetricTemplateResponse
-	14, // 14: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:output_type -> dbpilot.plugin.v1.PluginMetricBatch
-	15, // 15: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:output_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
-	16, // 16: dbpilot.plugin.v1.PluginRuntime.GetHealth:output_type -> dbpilot.plugin.v1.PluginHealth
-	17, // 17: dbpilot.plugin.v1.PluginRuntime.Shutdown:output_type -> dbpilot.plugin.v1.ShutdownPluginResponse
-	9,  // [9:18] is the sub-list for method output_type
-	0,  // [0:9] is the sub-list for method input_type
-	0,  // [0:0] is the sub-list for extension type_name
-	0,  // [0:0] is the sub-list for extension extendee
-	0,  // [0:0] is the sub-list for field type_name
+	2,  // 0: dbpilot.plugin.v1.PluginHandshakeResponse.builtin_templates:type_name -> dbpilot.plugin.v1.BuiltinMetricTemplateDescriptor
+	3,  // 1: dbpilot.plugin.v1.BuiltinMetricTemplateDescriptor.metrics:type_name -> dbpilot.plugin.v1.BuiltinMetricDescriptor
+	4,  // 2: dbpilot.plugin.v1.BuiltinMetricDescriptor.metric_type:type_name -> dbpilot.plugin.v1.PluginMetricType
+	0,  // 3: dbpilot.plugin.v1.PluginRuntime.Handshake:input_type -> dbpilot.plugin.v1.PluginHandshakeRequest
+	5,  // 4: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:input_type -> dbpilot.plugin.v1.ApplyPluginConfigurationRequest
+	6,  // 5: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:input_type -> dbpilot.plugin.v1.ValidatePluginInstanceRequest
+	7,  // 6: dbpilot.plugin.v1.PluginRuntime.CollectNow:input_type -> dbpilot.plugin.v1.CollectPluginMetricsRequest
+	8,  // 7: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:input_type -> dbpilot.plugin.v1.TrialMetricTemplateRequest
+	9,  // 8: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:input_type -> dbpilot.plugin.v1.StreamPluginMetricsRequest
+	10, // 9: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:input_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
+	11, // 10: dbpilot.plugin.v1.PluginRuntime.GetHealth:input_type -> dbpilot.plugin.v1.GetPluginHealthRequest
+	12, // 11: dbpilot.plugin.v1.PluginRuntime.Shutdown:input_type -> dbpilot.plugin.v1.ShutdownPluginRequest
+	1,  // 12: dbpilot.plugin.v1.PluginRuntime.Handshake:output_type -> dbpilot.plugin.v1.PluginHandshakeResponse
+	13, // 13: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:output_type -> dbpilot.plugin.v1.ApplyPluginConfigurationResponse
+	14, // 14: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:output_type -> dbpilot.plugin.v1.ValidatePluginInstanceResponse
+	15, // 15: dbpilot.plugin.v1.PluginRuntime.CollectNow:output_type -> dbpilot.plugin.v1.CollectPluginMetricsResponse
+	16, // 16: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:output_type -> dbpilot.plugin.v1.TrialMetricTemplateResponse
+	17, // 17: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:output_type -> dbpilot.plugin.v1.PluginMetricBatch
+	18, // 18: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:output_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
+	19, // 19: dbpilot.plugin.v1.PluginRuntime.GetHealth:output_type -> dbpilot.plugin.v1.PluginHealth
+	20, // 20: dbpilot.plugin.v1.PluginRuntime.Shutdown:output_type -> dbpilot.plugin.v1.ShutdownPluginResponse
+	12, // [12:21] is the sub-list for method output_type
+	3,  // [3:12] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_plugin_v1_plugin_proto_init() }
@@ -321,7 +487,7 @@ func file_plugin_v1_plugin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_plugin_v1_plugin_proto_rawDesc), len(file_plugin_v1_plugin_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   2,
+			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
