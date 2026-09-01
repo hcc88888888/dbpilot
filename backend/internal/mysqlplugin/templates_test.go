@@ -13,6 +13,7 @@ func TestBuiltinCatalogIsCanonicalAndImmutableByCopy(t *testing.T) {
 	require.Equal(t, pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, catalog["mysql.connections.current"].MetricType)
 	require.Equal(t, pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER, catalog["mysql.queries.total"].MetricType)
 	require.Equal(t, "{query}", catalog["mysql.queries.total"].Unit)
+	require.Equal(t, "Questions", catalog["mysql.queries.total"].SourceName)
 	require.Equal(t, "s", catalog["mysql.uptime.seconds"].Unit)
 	delete(catalog, "mysql.up")
 	require.Contains(t, BuiltinCatalog(), "mysql.up")
@@ -27,6 +28,13 @@ func TestMySQLStatementParserAcceptsSingleReadOnlyQueryAndRejectsDangerousForms(
 		"SELECT 1; SELECT 2",
 		"DELETE FROM orders",
 		"SELECT * FROM orders FOR UPDATE",
+		"SELECT * FROM orders FOR SHARE",
+		"SELECT * FROM orders FOR UPDATE NOWAIT",
+		"SELECT * FROM orders FOR UPDATE SKIP LOCKED",
+		"SELECT value INTO @captured FROM orders",
+		"SELECT @captured := value FROM orders",
+		"SELECT 1 UNION SELECT value INTO @captured FROM orders",
+		"WITH locked AS (SELECT * FROM orders FOR UPDATE) SELECT * FROM locked",
 		"SELECT * INTO OUTFILE '/tmp/leak' FROM orders",
 		"SELECT SLEEP(1)",
 		"SELECT evil_side_effect_udf()",

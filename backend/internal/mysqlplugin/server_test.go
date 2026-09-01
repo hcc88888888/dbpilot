@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"dbpilot.local/platform/internal/plugincontract"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestServerApplyValidateHealthAndCredentialRemovalRecovery(t *testing.T) {
@@ -102,7 +104,7 @@ func TestStreamTreatsResumeAsAuthoritativeAndAckIsAtomicForBoundPairs(t *testing
 	}
 	lagging := make([]*pluginv1.PluginMetricCursor, 0, len(cursors))
 	for _, cursor := range cursors {
-		lagging = append(lagging, &pluginv1.PluginMetricCursor{InstanceId: cursor.GetInstanceId(), TemplateId: cursor.GetTemplateId(), Sequence: 41})
+		lagging = append(lagging, &pluginv1.PluginMetricCursor{InstanceId: cursor.GetInstanceId(), TemplateId: cursor.GetTemplateId(), Sequence: 40})
 	}
 	err = server.StreamMetrics(&pluginv1.StreamPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, ResumeCursors: lagging}, &captureMetricStream{ctx: context.Background()})
 	require.EqualError(t, err, "stream_rejected")
@@ -112,11 +114,80 @@ func TestStreamTreatsResumeAsAuthoritativeAndAckIsAtomicForBoundPairs(t *testing
 	response, err := server.AcknowledgeMetrics(context.Background(), &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, Cursors: []*pluginv1.PluginMetricCursor{valid, invalid}})
 	require.NoError(t, err)
 	require.Equal(t, "cursor_rejected", response.GetErrorCode())
-	require.Zero(t, server.acknowledged[cursorKey("mysql-a", "mysql.up")])
+	require.Equal(t, uint64(41), server.acknowledged[cursorKey("mysql-a", "mysql.up")])
 	response, err = server.AcknowledgeMetrics(context.Background(), &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, Cursors: []*pluginv1.PluginMetricCursor{valid}})
 	require.NoError(t, err)
 	require.Empty(t, response.GetErrorCode())
 	require.Equal(t, uint64(42), server.acknowledged[cursorKey("mysql-a", "mysql.up")])
+}
+
+func TestCollectNowRejectsUnboundAndDuplicatePairsWithoutGrowingPending(t *testing.T) {
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"mysql-a": {Config: fixtureDecodedInstance("mysql-a", "monitor"), Pool: &statusPool{}}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", Runtime: runtime})
+	for index := 0; index < 100; index++ {
+		_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{fmt.Sprintf("unknown-%d", index)}})
+		require.Error(t, err)
+	}
+	_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a", "mysql-a"}, TemplateIds: []string{"mysql.up"}})
+	require.Error(t, err)
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	require.Empty(t, server.pending)
+	require.Empty(t, server.sequences)
+}
+
+func TestPerPairPendingBacklogReplaysExactPayloadAcrossLostAppendAndResume(t *testing.T) {
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 4}, map[string]InstanceRuntime{"mysql-a": {Config: fixtureDecodedInstance("mysql-a", "monitor"), Pool: &statusPool{}}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", ConfigurationRevision: 4, Runtime: runtime})
+	request := &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up"}}
+	first, err := server.CollectNow(context.Background(), request)
+	require.NoError(t, err)
+	require.Len(t, first.GetBatches(), 1)
+	retry, err := server.CollectNow(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(first.GetBatches()[0], retry.GetBatches()[0]), "Append-before-ACK retry must replay exact payload")
+	resume := make([]*pluginv1.PluginMetricCursor, 0, 5)
+	for _, id := range SortedBuiltinTemplateIDs(BuiltinCatalog()) {
+		sequence := uint64(0)
+		if id == "mysql.up" {
+			sequence = first.GetBatches()[0].GetSequence() - 1
+		}
+		resume = append(resume, &pluginv1.PluginMetricCursor{InstanceId: "mysql-a", TemplateId: id, Sequence: sequence})
+	}
+	replay, err := server.prepareResume(resume)
+	require.NoError(t, err)
+	require.Len(t, replay, 1)
+	require.True(t, proto.Equal(first.GetBatches()[0], replay[0]))
+	durable := proto.Clone(resume[3]).(*pluginv1.PluginMetricCursor)
+	for _, cursor := range resume {
+		if cursor.GetTemplateId() == "mysql.up" {
+			cursor.Sequence = first.GetBatches()[0].GetSequence()
+		}
+	}
+	replay, err = server.prepareResume(resume)
+	require.NoError(t, err)
+	require.Empty(t, replay)
+	_, err = server.prepareResume(append([]*pluginv1.PluginMetricCursor(nil), durable))
+	require.Error(t, err)
+	ack := &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, Cursors: []*pluginv1.PluginMetricCursor{{InstanceId: "mysql-a", TemplateId: "mysql.up", Sequence: first.GetBatches()[0].GetSequence()}}}
+	response, err := server.AcknowledgeMetrics(context.Background(), ack)
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode())
+	response, err = server.AcknowledgeMetrics(context.Background(), ack)
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode(), "lost ACK response retry must be idempotent")
+	next, err := server.CollectNow(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, first.GetBatches()[0].GetSequence()+1, next.GetBatches()[0].GetSequence())
+	apply := &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: "assignment-a", ConfigurationRevision: 5, Instances: []*pluginv1.PluginInstanceConfiguration{fixtureInstance("mysql-a", "127.0.0.1:3306", "monitor", []byte("rotated"), time.Now().Add(time.Minute))}}
+	applied, err := server.ApplyConfiguration(context.Background(), apply)
+	require.NoError(t, err)
+	require.Empty(t, applied.GetErrorCode())
+	server.mu.Lock()
+	require.Empty(t, server.pending, "configuration revision change must prune old backlog")
+	server.mu.Unlock()
 }
 
 func TestShutdownStopsActiveStreamsBeforeClosingRuntime(t *testing.T) {

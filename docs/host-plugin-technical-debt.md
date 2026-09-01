@@ -37,3 +37,19 @@
 - Functional impact: none observed in current unit, full Go, Linux amd64/arm64, Kylin V10 and real MySQL 8.4 verification. The mutable image tag weakens long-term reproducibility, and the local Windows race gate is unavailable without an approved C toolchain.
 - Severity: low for feature delivery; medium for release-evidence reproducibility.
 - Recommended remediation stage: release qualification. Pin the approved MySQL 8 image digest and run `go test -race` for the plugin packages in a dedicated Linux CI runner with CGO enabled.
+
+## TD-MYSQL-002: Shutdown does not count unrelated in-flight unary RPCs
+
+- Affected module: MySQL PluginRuntime shutdown coordination.
+- Trigger conditions: shutdown overlaps a direct local unary `CollectNow`, `ValidateInstance` or template trial that was not launched through the managed stream lifecycle.
+- Functional impact: normal Supervisor shutdown remains ordered: it cancels and waits for metric streams, then guarded pool close waits for active database rows. The shutdown response does not separately count every non-stream unary handler before returning `drained=true`.
+- Severity: low in the current single-Agent private-UDS workflow; an uncoordinated local client can make the drain response precede completion of its own unary RPC.
+- Recommended remediation stage: consolidated runtime hardening before production rollout. Add an admission gate plus unary wait group shared by all PluginRuntime handlers, reject new calls after drain begins, and prove the drain timeout covers every accepted handler.
+
+## TD-TEST-002: Exporter retry timing test is scheduler-sensitive
+
+- Affected module: existing exporter unit test `TestSendPendingRetriesUntypedResourceExhaustion`.
+- Trigger conditions: the complete Go suite runs many packages concurrently on the Windows development host and the test's short timing window observes only its first attempt.
+- Functional impact: none observed in Task 13 or exporter behavior. One full-suite run reported one attempt instead of the expected two; the focused test passed 10/10 repetitions immediately afterward, and a fresh complete-suite rerun passed.
+- Severity: low test-reliability issue; it does not affect the MySQL plugin runtime path.
+- Recommended remediation stage: consolidated test-harness maintenance. Replace wall-clock retry assertions with an injected clock or synchronization barrier, then retain a separate integration test for real backoff timing.

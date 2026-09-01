@@ -13,7 +13,7 @@ import (
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 )
 
-const builtinStatusQuery = "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Threads_connected','Queries','Threads_running','Uptime')"
+const builtinStatusQuery = "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Threads_connected','Questions','Threads_running','Uptime')"
 
 type CollectorOptions struct {
 	Now              func() time.Time
@@ -37,6 +37,10 @@ const (
 )
 
 type collectionHealth struct{ code string }
+type counterState struct {
+	value, uptime float64
+	start         time.Time
+}
 
 type Collector struct {
 	runtime   *Runtime
@@ -44,7 +48,7 @@ type Collector struct {
 	semaphore chan struct{}
 	mu        sync.Mutex
 	circuits  map[string]circuitState
-	queries   map[string]float64
+	queries   map[string]counterState
 	health    map[string]collectionHealth
 }
 
@@ -64,13 +68,19 @@ func NewCollector(runtime *Runtime, options CollectorOptions) *Collector {
 	if options.CircuitOpenFor <= 0 {
 		options.CircuitOpenFor = 30 * time.Second
 	}
-	return &Collector{runtime: runtime, options: options, semaphore: make(chan struct{}, options.MaxConcurrent), circuits: map[string]circuitState{}, queries: map[string]float64{}, health: map[string]collectionHealth{}}
+	return &Collector{runtime: runtime, options: options, semaphore: make(chan struct{}, options.MaxConcurrent), circuits: map[string]circuitState{}, queries: map[string]counterState{}, health: map[string]collectionHealth{}}
 }
 
 func (collector *Collector) Collect(ctx context.Context, instanceID string, templateIDs []string) Batch {
 	now := collector.options.Now().UTC()
 	result := Batch{InstanceID: instanceID, CollectedAt: now, Status: CollectionFailed}
-	defer func(){if result.Status==CollectionSucceeded{collector.succeeded(instanceID)}else if result.ErrorCode!=""{collector.observe(instanceID,result.ErrorCode)}}()
+	defer func() {
+		if result.Status == CollectionSucceeded {
+			collector.succeeded(instanceID)
+		} else if result.ErrorCode != "" {
+			collector.observe(instanceID, result.ErrorCode)
+		}
+	}()
 	if len(templateIDs) == 0 {
 		result.ErrorCode = "template_unavailable"
 		return result
@@ -183,7 +193,18 @@ func (collector *Collector) Collect(ctx context.Context, instanceID string, temp
 		}
 		sample := Sample{Name: id, Value: value, Unit: definition.Unit, MetricType: definition.MetricType, Labels: map[string]string{}, SampledAt: now}
 		if id == "mysql.queries.total" {
-			sample.CounterReset = collector.counterReset(instanceID, value)
+			uptime, valid := values["uptime"]
+			if !valid || uptime < 0 {
+				result.ErrorCode = "result_rejected"
+				result.Status = CollectionPartial
+				continue
+			}
+			sample.CounterReset, sample.StartTime = collector.counterReset(instanceID, value, uptime, now)
+			if sample.StartTime.IsZero() {
+				result.ErrorCode = "result_rejected"
+				result.Status = CollectionPartial
+				continue
+			}
 		}
 		result.Samples = append(result.Samples, sample)
 	}
@@ -201,7 +222,13 @@ func (collector *Collector) Collect(ctx context.Context, instanceID string, temp
 func (collector *Collector) CollectTemplate(ctx context.Context, instanceID string, template TemplateConfig) Batch {
 	now := collector.options.Now().UTC()
 	result := Batch{InstanceID: instanceID, TemplateID: template.ID, TemplateRevision: template.Revision, CollectedAt: now, Status: CollectionFailed}
-	defer func(){if result.Status==CollectionSucceeded{collector.succeeded(instanceID)}else if result.ErrorCode!=""{collector.observe(instanceID,result.ErrorCode)}}()
+	defer func() {
+		if result.Status == CollectionSucceeded {
+			collector.succeeded(instanceID)
+		} else if result.ErrorCode != "" {
+			collector.observe(instanceID, result.ErrorCode)
+		}
+	}()
 	instance, ok := collector.runtime.Instance(instanceID)
 	if !ok || instance.Pool == nil {
 		result.ErrorCode = "waiting_credentials"
@@ -374,7 +401,11 @@ func (collector *Collector) succeeded(id string) {
 	collector.health[id] = collectionHealth{}
 	collector.mu.Unlock()
 }
-func(collector *Collector)observe(id,code string){collector.mu.Lock();collector.health[id]=collectionHealth{code:code};collector.mu.Unlock()}
+func (collector *Collector) observe(id, code string) {
+	collector.mu.Lock()
+	collector.health[id] = collectionHealth{code: code}
+	collector.mu.Unlock()
+}
 func (collector *Collector) Health(id string, now time.Time) (HealthStatus, string) {
 	if collector == nil {
 		return HealthDegraded, "collector_unavailable"
@@ -389,12 +420,23 @@ func (collector *Collector) Health(id string, now time.Time) (HealthStatus, stri
 	}
 	return HealthHealthy, ""
 }
-func (collector *Collector) counterReset(id string, value float64) bool {
+func (collector *Collector) counterReset(id string, value, uptime float64, now time.Time) (bool, time.Time) {
 	collector.mu.Lock()
 	defer collector.mu.Unlock()
+	if uptime > float64((time.Duration(1<<63-1))/time.Second) {
+		return false, time.Time{}
+	}
+	boot := now.Add(-time.Duration(uptime * float64(time.Second)))
 	previous, ok := collector.queries[id]
-	collector.queries[id] = value
-	return ok && value < previous
+	reset := ok && value < previous.value
+	start := boot
+	if ok && !reset {
+		start = previous.start
+	} else if reset && uptime >= previous.uptime {
+		start = now
+	}
+	collector.queries[id] = counterState{value: value, uptime: uptime, start: start}
+	return reset, start
 }
 func containsTemplate(values []string, want string) bool {
 	for _, value := range values {

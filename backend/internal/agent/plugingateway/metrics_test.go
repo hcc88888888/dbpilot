@@ -7,6 +7,7 @@ import (
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -22,6 +23,41 @@ func TestNormalizeBatchInjectsAuthoritativeScope(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, payload)
 	require.Contains(t, id, "plugin-metrics-v1-")
+}
+
+func TestNormalizeBatchWritesCounterStartTimestampAndRejectsFutureEpoch(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	start := now.Add(-time.Hour)
+	batch := testBatch(now, 1, 7)
+	batch.Samples[0].MetricName = "mysql.queries.total"
+	batch.Samples[0].Unit = "{query}"
+	batch.Samples[0].MetricType = pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER
+	batch.Samples[0].StartTime = timestamppb.New(start)
+	scope := MetricScope{AgentID: "agent-1", HostID: "host-1", AssignmentID: "assignment-1", InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}, DatabaseFamily: "mysql", PluginID: "mysql", PluginVersion: "1.0.0", ConfigurationRevision: 4, DatabaseVariant: "mysql", TemplateRevision: 1}
+	payload, _, err := normalizeBatch(batch, scope, now)
+	require.NoError(t, err)
+	metrics, err := (&pmetric.ProtoUnmarshaler{}).UnmarshalMetrics(payload)
+	require.NoError(t, err)
+	var found bool
+	resourceMetrics := metrics.ResourceMetrics()
+	for i := 0; i < resourceMetrics.Len(); i++ {
+		scopes := resourceMetrics.At(i).ScopeMetrics()
+		for j := 0; j < scopes.Len(); j++ {
+			values := scopes.At(j).Metrics()
+			for k := 0; k < values.Len(); k++ {
+				metric := values.At(k)
+				if metric.Name() == "mysql.queries.total" {
+					point := metric.Sum().DataPoints().At(0)
+					require.Equal(t, start, point.StartTimestamp().AsTime())
+					found = true
+				}
+			}
+		}
+	}
+	require.True(t, found)
+	batch.Samples[0].StartTime = timestamppb.New(now.Add(time.Second))
+	_, _, err = normalizeBatch(batch, scope, now)
+	require.Error(t, err)
 }
 
 func TestNormalizeBatchRejectsPluginScopeAndInvalidValues(t *testing.T) {

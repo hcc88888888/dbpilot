@@ -11,6 +11,7 @@ import (
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -44,6 +45,7 @@ type Server struct {
 	shutdownOnce sync.Once
 	streams      sync.WaitGroup
 	nextDue      map[string]time.Time
+	pending      map[string]*pluginv1.PluginMetricBatch
 }
 
 func NewServer(config ServerConfig) *Server {
@@ -69,7 +71,7 @@ func NewServer(config ServerConfig) *Server {
 	if config.StreamInterval <= 0 {
 		config.StreamInterval = time.Second
 	}
-	return &Server{config: config, runtime: config.Runtime, collector: config.Collector, parser: config.Parser, sequences: map[string]uint64{}, acknowledged: map[string]uint64{}, shutdown: make(chan struct{}), nextDue: map[string]time.Time{}}
+	return &Server{config: config, runtime: config.Runtime, collector: config.Collector, parser: config.Parser, sequences: map[string]uint64{}, acknowledged: map[string]uint64{}, shutdown: make(chan struct{}), nextDue: map[string]time.Time{}, pending: map[string]*pluginv1.PluginMetricBatch{}}
 }
 
 func (server *Server) Handshake(_ context.Context, request *pluginv1.PluginHandshakeRequest) (*pluginv1.PluginHandshakeResponse, error) {
@@ -92,7 +94,7 @@ func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.
 	if err != nil {
 		return &pluginv1.ApplyPluginConfigurationResponse{ErrorCode: "configuration_rejected"}, nil
 	}
-	previousRevision:=server.runtime.Revision()
+	previousRevision := server.runtime.Revision()
 	if err = server.runtime.Apply(ctx, configuration); err != nil {
 		code := "connection_rejected"
 		if errors.Is(err, ErrConfigurationRejected) {
@@ -100,7 +102,12 @@ func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.
 		}
 		return &pluginv1.ApplyPluginConfigurationResponse{ErrorCode: code}, nil
 	}
-	if previousRevision!=0&&previousRevision!=request.GetConfigurationRevision(){server.mu.Lock();server.nextDue=map[string]time.Time{};server.mu.Unlock()}
+	if previousRevision != 0 && previousRevision != request.GetConfigurationRevision() {
+		server.mu.Lock()
+		server.nextDue = map[string]time.Time{}
+		server.pending = map[string]*pluginv1.PluginMetricBatch{}
+		server.mu.Unlock()
+	}
 	server.pruneCursors()
 	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(request.GetInstances()))
 	for _, instance := range request.GetInstances() {
@@ -142,14 +149,36 @@ func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectP
 	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || len(request.GetInstanceIds()) == 0 || len(request.GetInstanceIds()) > MaxInstances || len(request.GetTemplateIds()) == 0 || len(request.GetTemplateIds()) > MaxTemplates {
 		return nil, errors.New("collection_rejected")
 	}
+	if !uniqueStrings(request.GetInstanceIds()) || !uniqueStrings(request.GetTemplateIds()) {
+		return nil, errors.New("collection_rejected")
+	}
+	for _, instanceID := range request.GetInstanceIds() {
+		instance, exists := server.runtime.Instance(instanceID)
+		if !exists {
+			return nil, errors.New("collection_rejected")
+		}
+		for _, templateID := range request.GetTemplateIds() {
+			if _, builtin := builtinCatalog[templateID]; builtin {
+				continue
+			}
+			if _, custom := instance.Config.Templates[templateID]; !custom {
+				return nil, errors.New("collection_rejected")
+			}
+		}
+	}
 	batches := make([]*pluginv1.PluginMetricBatch, 0, len(request.GetInstanceIds())*len(request.GetTemplateIds()))
 	for _, instanceID := range request.GetInstanceIds() {
 		instance, exists := server.runtime.Instance(instanceID)
 		if !exists {
 			return nil, errors.New("collection_rejected")
 		}
+		pending := make(map[string]*pluginv1.PluginMetricBatch, len(request.GetTemplateIds()))
 		builtins := make([]string, 0)
 		for _, templateID := range request.GetTemplateIds() {
+			if batch := server.pendingBatch(instanceID, templateID); batch != nil {
+				pending[templateID] = batch
+				continue
+			}
 			if _, ok := builtinCatalog[templateID]; ok {
 				builtins = append(builtins, templateID)
 			}
@@ -159,6 +188,10 @@ func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectP
 			builtin = server.collector.Collect(ctx, instanceID, builtins)
 		}
 		for _, templateID := range request.GetTemplateIds() {
+			if batch := pending[templateID]; batch != nil {
+				batches = append(batches, batch)
+				continue
+			}
 			if _, builtinTemplate := builtinCatalog[templateID]; builtinTemplate {
 				filtered := filterSample(builtin, templateID)
 				status, errorCode := builtin.Status, builtin.ErrorCode
@@ -217,33 +250,10 @@ func (server *Server) StreamMetrics(request *pluginv1.StreamPluginMetricsRequest
 	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() {
 		return errors.New("stream_rejected")
 	}
-	bound := server.boundPairs()
-	if len(request.GetResumeCursors()) != len(bound) || len(bound) == 0 || len(bound) > MaxInstances*MaxTemplates {
-		return errors.New("stream_rejected")
+	replays, err := server.prepareResume(request.GetResumeCursors())
+	if err != nil {
+		return err
 	}
-	resume := make(map[string]uint64, len(bound))
-	for _, cursor := range request.GetResumeCursors() {
-		key := cursorKey(cursor.GetInstanceId(), cursor.GetTemplateId())
-		if _, ok := bound[key]; !ok {
-			return errors.New("stream_rejected")
-		}
-		if _, duplicate := resume[key]; duplicate {
-			return errors.New("stream_rejected")
-		}
-		resume[key] = cursor.GetSequence()
-	}
-	server.mu.Lock()
-	for key, sequence := range resume {
-		current := server.sequences[key]
-		if sequence < server.acknowledged[key] || current != 0 && sequence != current {
-			server.mu.Unlock()
-			return errors.New("stream_rejected")
-		}
-	}
-	for key, sequence := range resume {
-		server.sequences[key] = sequence
-	}
-	server.mu.Unlock()
 	server.mu.Lock()
 	if server.shuttingDown {
 		server.mu.Unlock()
@@ -254,6 +264,11 @@ func (server *Server) StreamMetrics(request *pluginv1.StreamPluginMetricsRequest
 	defer server.streams.Done()
 	if err := stream.SendHeader(nil); err != nil {
 		return err
+	}
+	for _, batch := range replays {
+		if err := stream.Send(batch); err != nil {
+			return err
+		}
 	}
 	streamContext, cancel := context.WithCancel(stream.Context())
 	defer cancel()
@@ -315,7 +330,9 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 		if _, duplicate := proposed[key]; duplicate {
 			return &pluginv1.AcknowledgePluginMetricsResponse{ErrorCode: "cursor_rejected"}, nil
 		}
-		if cursor.GetSequence() < server.acknowledged[key] || cursor.GetSequence() > server.sequences[key] {
+		sequence := cursor.GetSequence()
+		pending := server.pending[key]
+		if sequence == 0 || sequence != server.acknowledged[key] && (pending == nil || pending.GetSequence() != sequence || server.sequences[key] != sequence) {
 			return &pluginv1.AcknowledgePluginMetricsResponse{ErrorCode: "cursor_rejected"}, nil
 		}
 		proposed[key] = cursor.GetSequence()
@@ -323,6 +340,9 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 	}
 	for key, sequence := range proposed {
 		server.acknowledged[key] = sequence
+		if pending := server.pending[key]; pending != nil && pending.GetSequence() == sequence {
+			delete(server.pending, key)
+		}
 	}
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: accepted}, nil
 }
@@ -393,20 +413,90 @@ func (server *Server) isShuttingDown() bool {
 
 func (server *Server) wireBatch(instance InstanceRuntime, templateID string, revision uint64, batch Batch, status CollectionStatus, errorCode string) *pluginv1.PluginMetricBatch {
 	key := cursorKey(instance.Config.ID, templateID)
-	server.mu.Lock()
-	server.sequences[key]++
-	sequence := server.sequences[key]
-	server.mu.Unlock()
 	collectedAt := batch.CollectedAt
 	if collectedAt.IsZero() {
 		collectedAt = server.config.Now().UTC()
 	}
-	server.markScheduled(instance.Config, []string{templateID}, collectedAt)
-	result := &pluginv1.PluginMetricBatch{PluginId: server.config.PluginID, PluginVersion: server.config.Version, DatabaseFamily: DatabaseFamily, DatabaseVariant: instance.Config.Variant, InstanceId: instance.Config.ID, ConfigurationRevision: server.runtime.Revision(), TemplateId: templateID, TemplateRevision: revision, CollectedAt: timestamppb.New(collectedAt), Sequence: sequence, CollectionStatus: wireStatus(status), ErrorCode: errorCode}
+	result := &pluginv1.PluginMetricBatch{PluginId: server.config.PluginID, PluginVersion: server.config.Version, DatabaseFamily: DatabaseFamily, DatabaseVariant: instance.Config.Variant, InstanceId: instance.Config.ID, ConfigurationRevision: server.runtime.Revision(), TemplateId: templateID, TemplateRevision: revision, CollectedAt: timestamppb.New(collectedAt), CollectionStatus: wireStatus(status), ErrorCode: errorCode}
 	for _, sample := range batch.Samples {
 		result.Samples = append(result.Samples, wireSample(sample))
 	}
+	server.mu.Lock()
+	if existing := server.pending[key]; existing != nil {
+		cloned := proto.Clone(existing).(*pluginv1.PluginMetricBatch)
+		server.mu.Unlock()
+		return cloned
+	}
+	server.sequences[key]++
+	result.Sequence = server.sequences[key]
+	server.pending[key] = proto.Clone(result).(*pluginv1.PluginMetricBatch)
+	server.mu.Unlock()
+	server.markScheduled(instance.Config, []string{templateID}, collectedAt)
 	return result
+}
+
+func (server *Server) pendingBatch(instanceID, templateID string) *pluginv1.PluginMetricBatch {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if batch := server.pending[cursorKey(instanceID, templateID)]; batch != nil {
+		return proto.Clone(batch).(*pluginv1.PluginMetricBatch)
+	}
+	return nil
+}
+
+func (server *Server) prepareResume(cursors []*pluginv1.PluginMetricCursor) ([]*pluginv1.PluginMetricBatch, error) {
+	bound := server.boundPairs()
+	if len(cursors) != len(bound) || len(bound) == 0 || len(bound) > MaxInstances*MaxTemplates {
+		return nil, errors.New("stream_rejected")
+	}
+	resume := make(map[string]uint64, len(bound))
+	for _, cursor := range cursors {
+		key := cursorKey(cursor.GetInstanceId(), cursor.GetTemplateId())
+		if _, ok := bound[key]; !ok {
+			return nil, errors.New("stream_rejected")
+		}
+		if _, duplicate := resume[key]; duplicate {
+			return nil, errors.New("stream_rejected")
+		}
+		resume[key] = cursor.GetSequence()
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	replayKeys := make([]string, 0)
+	for key, sequence := range resume {
+		current, acknowledged, pending := server.sequences[key], server.acknowledged[key], server.pending[key]
+		if current == 0 {
+			continue
+		}
+		if sequence < acknowledged {
+			return nil, errors.New("stream_rejected")
+		}
+		if sequence == current {
+			continue
+		}
+		if pending != nil && pending.GetSequence() == current && sequence+1 == current {
+			replayKeys = append(replayKeys, key)
+			continue
+		}
+		return nil, errors.New("stream_rejected")
+	}
+	for key, sequence := range resume {
+		current := server.sequences[key]
+		if current == 0 {
+			server.sequences[key] = sequence
+			server.acknowledged[key] = sequence
+			delete(server.pending, key)
+		} else if sequence == current {
+			server.acknowledged[key] = sequence
+			delete(server.pending, key)
+		}
+	}
+	sort.Strings(replayKeys)
+	result := make([]*pluginv1.PluginMetricBatch, 0, len(replayKeys))
+	for _, key := range replayKeys {
+		result = append(result, proto.Clone(server.pending[key]).(*pluginv1.PluginMetricBatch))
+	}
+	return result, nil
 }
 func filterSample(batch Batch, name string) Batch {
 	result := batch
@@ -419,7 +509,11 @@ func filterSample(batch Batch, name string) Batch {
 	return result
 }
 func wireSample(sample Sample) *pluginv1.PluginMetricSample {
-	return &pluginv1.PluginMetricSample{MetricName: sample.Name, Value: sample.Value, Unit: sample.Unit, MetricType: sample.MetricType, Labels: cloneLabels(sample.Labels), SampledAt: timestamppb.New(sample.SampledAt)}
+	result := &pluginv1.PluginMetricSample{MetricName: sample.Name, Value: sample.Value, Unit: sample.Unit, MetricType: sample.MetricType, Labels: cloneLabels(sample.Labels), SampledAt: timestamppb.New(sample.SampledAt)}
+	if !sample.StartTime.IsZero() {
+		result.StartTime = timestamppb.New(sample.StartTime)
+	}
+	return result
 }
 func wireStatus(value CollectionStatus) pluginv1.PluginCollectionStatus {
 	switch value {
@@ -432,6 +526,19 @@ func wireStatus(value CollectionStatus) pluginv1.PluginCollectionStatus {
 	}
 }
 func cursorKey(instanceID, templateID string) string { return instanceID + "\x00" + templateID }
+func uniqueStrings(values []string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == "" {
+			return false
+		}
+		if _, duplicate := seen[value]; duplicate {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	return true
+}
 func boundedText(value string, limit int) string {
 	if len(value) <= limit {
 		return value
@@ -468,6 +575,7 @@ func (server *Server) pruneCursors() {
 			delete(server.sequences, key)
 			delete(server.acknowledged, key)
 			delete(server.nextDue, key)
+			delete(server.pending, key)
 		}
 	}
 }
@@ -482,6 +590,9 @@ func (server *Server) dueTemplateIDs(instance InstanceConfig, now time.Time) []s
 	defer server.mu.Unlock()
 	result := make([]string, 0, len(ids))
 	for _, id := range ids {
+		if server.pending[cursorKey(instance.ID, id)] != nil {
+			continue
+		}
 		due := server.nextDue[cursorKey(instance.ID, id)]
 		if due.IsZero() || !now.Before(due) {
 			result = append(result, id)

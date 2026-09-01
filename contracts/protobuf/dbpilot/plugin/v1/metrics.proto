@@ -97,6 +97,7 @@ message PluginMetricSample {
   PluginMetricType metric_type = 4;
   map<string, string> labels = 5;
   google.protobuf.Timestamp sampled_at = 6;
+  google.protobuf.Timestamp start_time = 7;
 }
 
 enum PluginMetricType {

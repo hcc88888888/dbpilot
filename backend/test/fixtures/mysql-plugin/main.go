@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -167,6 +168,13 @@ func run() error {
 	if len(seen) != 10 {
 		return fmt.Errorf("metric coverage rejected")
 	}
+	if err = ackBatches(ctx, client, collected); err != nil {
+		return fmt.Errorf("metric ack rejected")
+	}
+	questionsSample, questionsSampleOK := metricSample(collected, "mysql-a", "mysql.queries.total")
+	if !questionsSampleOK || questionsSample.GetStartTime() == nil || questionsSample.GetStartTime().AsTime().After(questionsSample.GetSampledAt().AsTime()) {
+		return fmt.Errorf("questions epoch rejected")
+	}
 	beforeA, beforeAOK := metricValue(collected, "mysql-a", "mysql.connections.current")
 	_, beforeBOK := metricValue(collected, "mysql-b", "mysql.connections.current")
 	if !beforeAOK || !beforeBOK {
@@ -188,6 +196,44 @@ func run() error {
 	if err = directDatabase.PingContext(ctx); err != nil {
 		return err
 	}
+	for _, statement := range []string{"CREATE DATABASE IF NOT EXISTS dbpilot_task13", "DROP PROCEDURE IF EXISTS dbpilot_task13.bump_queries", "CREATE PROCEDURE dbpilot_task13.bump_queries() BEGIN SET @dbpilot_a=1; SET @dbpilot_b=2; END", "CALL dbpilot_task13.bump_queries()"} {
+		if _, execErr := directDatabase.ExecContext(ctx, statement); execErr != nil {
+			return fmt.Errorf("questions fixture rejected")
+		}
+	}
+	semantic, err := client.CollectNow(ctx, &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.queries.total"}})
+	if err != nil {
+		return fmt.Errorf("questions collection rejected")
+	}
+	semanticValue, semanticOK := metricValue(semantic, "mysql-a", "mysql.queries.total")
+	if !semanticOK {
+		return fmt.Errorf("questions sample rejected")
+	}
+	if err = ackBatches(ctx, client, semantic); err != nil {
+		return fmt.Errorf("questions ack rejected")
+	}
+	statusRows, err := directDatabase.QueryContext(ctx, "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Questions','Queries')")
+	if err != nil {
+		return fmt.Errorf("questions evidence rejected")
+	}
+	status := map[string]float64{}
+	for statusRows.Next() {
+		var name, raw string
+		if statusRows.Scan(&name, &raw) != nil {
+			_ = statusRows.Close()
+			return fmt.Errorf("questions evidence rejected")
+		}
+		value, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr != nil {
+			_ = statusRows.Close()
+			return fmt.Errorf("questions evidence rejected")
+		}
+		status[name] = value
+	}
+	_ = statusRows.Close()
+	if status["Queries"] <= status["Questions"] || semanticValue > status["Questions"] || status["Questions"]-semanticValue > 2 {
+		return fmt.Errorf("questions semantics rejected")
+	}
 	changed, err := client.CollectNow(ctx, &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a", "mysql-b"}, TemplateIds: []string{"mysql.connections.current"}})
 	if err != nil {
 		return err
@@ -196,6 +242,9 @@ func run() error {
 	afterB, afterBOK := metricValue(changed, "mysql-b", "mysql.connections.current")
 	if !afterAOK || !afterBOK || afterA < beforeA+1 || afterA <= afterB {
 		return fmt.Errorf("connection count did not change")
+	}
+	if err = ackBatches(ctx, client, changed); err != nil {
+		return fmt.Errorf("connection ack rejected")
 	}
 	failed, err := apply(2, password+"-invalid")
 	if err != nil || failed.GetErrorCode() != "connection_rejected" {
@@ -209,6 +258,9 @@ func run() error {
 		if batch.GetCollectionStatus() != pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED {
 			return fmt.Errorf("old configuration damaged")
 		}
+	}
+	if err = ackBatches(ctx, client, isolated); err != nil {
+		return fmt.Errorf("isolation ack rejected")
 	}
 	if err = checker.Shutdown(ctx, process, 5*time.Second); err != nil {
 		return fmt.Errorf("agent gateway shutdown rejected")
@@ -238,6 +290,25 @@ func metricValue(response *pluginv1.CollectPluginMetricsResponse, instanceID, te
 		}
 	}
 	return 0, false
+}
+func metricSample(response *pluginv1.CollectPluginMetricsResponse, instanceID, templateID string) (*pluginv1.PluginMetricSample, bool) {
+	for _, batch := range response.GetBatches() {
+		if batch.GetInstanceId() == instanceID && batch.GetTemplateId() == templateID && len(batch.GetSamples()) == 1 {
+			return batch.GetSamples()[0], true
+		}
+	}
+	return nil, false
+}
+func ackBatches(ctx context.Context, client pluginv1.PluginRuntimeClient, response *pluginv1.CollectPluginMetricsResponse) error {
+	cursors := make([]*pluginv1.PluginMetricCursor, 0, len(response.GetBatches()))
+	for _, batch := range response.GetBatches() {
+		cursors = append(cursors, &pluginv1.PluginMetricCursor{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()})
+	}
+	ack, err := client.AcknowledgeMetrics(ctx, &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, Cursors: cursors})
+	if err != nil || ack.GetErrorCode() != "" || len(ack.GetAcceptedCursors()) != len(cursors) {
+		return fmt.Errorf("ack rejected")
+	}
+	return nil
 }
 
 type fixtureCredentialLeaser struct{ password string }

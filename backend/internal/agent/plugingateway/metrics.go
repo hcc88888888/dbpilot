@@ -195,6 +195,9 @@ func normalizeBatch(batch *pluginv1.PluginMetricBatch, scope MetricScope, now ti
 			}
 			timestamp := sample.GetSampledAt().AsTime().UTC()
 			point.SetTimestamp(pcommon.NewTimestampFromTime(timestamp))
+			if start := sample.GetStartTime(); start != nil {
+				point.SetStartTimestamp(pcommon.NewTimestampFromTime(start.AsTime().UTC()))
+			}
 			point.SetDoubleValue(sample.GetValue())
 			labelKeys := make([]string, 0, len(sample.GetLabels()))
 			for label := range sample.GetLabels() {
@@ -234,6 +237,11 @@ func validateSample(sample *pluginv1.PluginMetricSample, collected, now time.Tim
 	observed := timestamp.AsTime().UTC()
 	if observed.After(now.Add(maxMetricFutureSkew)) || observed.Before(now.Add(-maxMetricAge)) || observed.After(collected.Add(maxMetricFutureSkew)) || observed.Before(collected.Add(-maxMetricAge)) {
 		return errInvalidMetric
+	}
+	if start := sample.GetStartTime(); start != nil {
+		if !start.IsValid() || start.AsTime().UTC().After(observed) {
+			return errInvalidMetric
+		}
 	}
 	for key, value := range sample.GetLabels() {
 		if !pluginLabelName.MatchString(key) || len(value) == 0 || len(value) > maxPluginLabelBytes || strings.TrimSpace(value) != value || strings.ContainsAny(value, "\x00\r\n") {

@@ -924,6 +924,7 @@ type PluginMetricSample struct {
 	MetricType    PluginMetricType       `protobuf:"varint,4,opt,name=metric_type,json=metricType,proto3,enum=dbpilot.plugin.v1.PluginMetricType" json:"metric_type,omitempty"`
 	Labels        map[string]string      `protobuf:"bytes,5,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	SampledAt     *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"`
+	StartTime     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=start_time,json=startTime,proto3" json:"start_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -996,6 +997,13 @@ func (x *PluginMetricSample) GetLabels() map[string]string {
 func (x *PluginMetricSample) GetSampledAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.SampledAt
+	}
+	return nil
+}
+
+func (x *PluginMetricSample) GetStartTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartTime
 	}
 	return nil
 }
@@ -1080,7 +1088,7 @@ const file_plugin_v1_metrics_proto_rawDesc = "" +
 	"\asamples\x18\v \x03(\v2%.dbpilot.plugin.v1.PluginMetricSampleR\asamples\x12V\n" +
 	"\x11collection_status\x18\f \x01(\x0e2).dbpilot.plugin.v1.PluginCollectionStatusR\x10collectionStatus\x12\x1d\n" +
 	"\n" +
-	"error_code\x18\r \x01(\tR\terrorCode\"\xe6\x02\n" +
+	"error_code\x18\r \x01(\tR\terrorCode\"\xa1\x03\n" +
 	"\x12PluginMetricSample\x12\x1f\n" +
 	"\vmetric_name\x18\x01 \x01(\tR\n" +
 	"metricName\x12\x14\n" +
@@ -1090,7 +1098,9 @@ const file_plugin_v1_metrics_proto_rawDesc = "" +
 	"metricType\x12I\n" +
 	"\x06labels\x18\x05 \x03(\v21.dbpilot.plugin.v1.PluginMetricSample.LabelsEntryR\x06labels\x129\n" +
 	"\n" +
-	"sampled_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tsampledAt\x1a9\n" +
+	"sampled_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tsampledAt\x129\n" +
+	"\n" +
+	"start_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tstartTime\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01*\xc6\x01\n" +
@@ -1155,11 +1165,12 @@ var file_plugin_v1_metrics_proto_depIdxs = []int32{
 	0,  // 11: dbpilot.plugin.v1.PluginMetricSample.metric_type:type_name -> dbpilot.plugin.v1.PluginMetricType
 	13, // 12: dbpilot.plugin.v1.PluginMetricSample.labels:type_name -> dbpilot.plugin.v1.PluginMetricSample.LabelsEntry
 	16, // 13: dbpilot.plugin.v1.PluginMetricSample.sampled_at:type_name -> google.protobuf.Timestamp
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	16, // 14: dbpilot.plugin.v1.PluginMetricSample.start_time:type_name -> google.protobuf.Timestamp
+	15, // [15:15] is the sub-list for method output_type
+	15, // [15:15] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_plugin_v1_metrics_proto_init() }

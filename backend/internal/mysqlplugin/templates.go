@@ -22,7 +22,7 @@ type BuiltinDefinition struct {
 var builtinCatalog = map[string]BuiltinDefinition{
 	"mysql.up":                  {TemplateID: "mysql.up", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Unit: "1"},
 	"mysql.connections.current": {TemplateID: "mysql.connections.current", SourceName: "Threads_connected", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Unit: "1"},
-	"mysql.queries.total":       {TemplateID: "mysql.queries.total", SourceName: "Queries", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER, Unit: "{query}"},
+	"mysql.queries.total":       {TemplateID: "mysql.queries.total", SourceName: "Questions", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER, Unit: "{query}"},
 	"mysql.threads.running":     {TemplateID: "mysql.threads.running", SourceName: "Threads_running", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Unit: "1"},
 	"mysql.uptime.seconds":      {TemplateID: "mysql.uptime.seconds", SourceName: "Uptime", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_GAUGE, Unit: "s"},
 }
@@ -93,6 +93,18 @@ func (parser MySQLStatementParser) Validate(statement string) error {
 		return ErrStatementRejected
 	}
 	if err := sqlparser.Walk(func(node sqlparser.SQLNode) (bool, error) {
+		switch typed := node.(type) {
+		case *sqlparser.Select:
+			if typed.Lock != sqlparser.NoLock || typed.Into != nil {
+				return false, ErrStatementRejected
+			}
+		case *sqlparser.Union:
+			if typed.Lock != sqlparser.NoLock || typed.Into != nil {
+				return false, ErrStatementRejected
+			}
+		case *sqlparser.AssignmentExpr:
+			return false, ErrStatementRejected
+		}
 		function, ok := node.(*sqlparser.FuncExpr)
 		if !ok {
 			return true, nil

@@ -18,7 +18,7 @@ func TestCollectorEmitsFiveCanonicalMetricsWithTypesUnitsAndTimestamp(t *testing
 	defer cleanup()
 	mock.ExpectPing()
 	mock.ExpectQuery("SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status").WillReturnRows(sqlmock.NewRows([]string{"VARIABLE_NAME", "VARIABLE_VALUE"}).AddRows(
-		[]driver.Value{"Threads_connected", "12"}, []driver.Value{"Queries", "999"}, []driver.Value{"Threads_running", "3"}, []driver.Value{"Uptime", "3600"},
+		[]driver.Value{"Threads_connected", "12"}, []driver.Value{"Questions", "999"}, []driver.Value{"Threads_running", "3"}, []driver.Value{"Uptime", "3600"},
 	))
 	collector := NewCollector(runtime, CollectorOptions{Now: func() time.Time { return now }, MaxConcurrent: 4})
 
@@ -30,6 +30,7 @@ func TestCollectorEmitsFiveCanonicalMetricsWithTypesUnitsAndTimestamp(t *testing
 	require.Equal(t, "1", byName["mysql.connections.current"].Unit)
 	require.Equal(t, "{query}", byName["mysql.queries.total"].Unit)
 	require.Equal(t, "s", byName["mysql.uptime.seconds"].Unit)
+	require.Equal(t, now.Add(-time.Hour), byName["mysql.queries.total"].StartTime)
 	for _, sample := range batch.Samples {
 		require.Equal(t, now, sample.SampledAt)
 	}
@@ -39,16 +40,20 @@ func TestCollectorEmitsFiveCanonicalMetricsWithTypesUnitsAndTimestamp(t *testing
 func TestCollectorDetectsCounterResetWithoutProducingNegativeDelta(t *testing.T) {
 	runtime, mock, cleanup := runtimeWithSQLMock(t, "mysql-a")
 	defer cleanup()
+	current := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 	for _, queries := range []string{"100", "3"} {
 		mock.ExpectPing()
-		mock.ExpectQuery("SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status").WillReturnRows(sqlmock.NewRows([]string{"VARIABLE_NAME", "VARIABLE_VALUE"}).AddRow("Threads_connected", "1").AddRow("Queries", queries).AddRow("Threads_running", "1").AddRow("Uptime", "5"))
+		mock.ExpectQuery("SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status").WillReturnRows(sqlmock.NewRows([]string{"VARIABLE_NAME", "VARIABLE_VALUE"}).AddRow("Threads_connected", "1").AddRow("Questions", queries).AddRow("Threads_running", "1").AddRow("Uptime", "5"))
 	}
-	collector := NewCollector(runtime, CollectorOptions{MaxConcurrent: 1})
+	collector := NewCollector(runtime, CollectorOptions{MaxConcurrent: 1, Now: func() time.Time { return current }})
 	first := collector.Collect(context.Background(), "mysql-a", []string{"mysql.queries.total"})
+	current = current.Add(time.Second)
 	second := collector.Collect(context.Background(), "mysql-a", []string{"mysql.queries.total"})
 	require.False(t, first.Samples[0].CounterReset)
+	require.Equal(t, current.Add(-6*time.Second), first.Samples[0].StartTime)
 	require.True(t, second.Samples[0].CounterReset)
 	require.Equal(t, float64(3), second.Samples[0].Value)
+	require.Equal(t, current, second.Samples[0].StartTime)
 }
 
 func TestCollectorFailureAndCircuitAreIsolatedPerInstance(t *testing.T) {
@@ -180,7 +185,7 @@ type statusPool struct{}
 
 func (*statusPool) PingContext(context.Context) error { return nil }
 func (*statusPool) QueryContext(context.Context, string, ...any) (Rows, error) {
-	return &staticRows{rows: [][]string{{"Threads_connected", "1"}, {"Queries", "1"}, {"Threads_running", "1"}, {"Uptime", "1"}}}, nil
+	return &staticRows{rows: [][]string{{"Threads_connected", "1"}, {"Questions", "1"}, {"Threads_running", "1"}, {"Uptime", "1"}}}, nil
 }
 func (*statusPool) Close() error { return nil }
 

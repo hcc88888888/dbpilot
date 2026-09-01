@@ -8,7 +8,9 @@ import (
 	"sync"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"github.com/go-sql-driver/mysql"
+	"google.golang.org/protobuf/proto"
 )
 
 type PoolFactory interface {
@@ -127,6 +129,7 @@ type Runtime struct {
 	config              Config
 	values              map[string]InstanceRuntime
 	credentialRevisions map[string]uint64
+	generation          uint64
 }
 
 func NewRuntime(factory PoolFactory, options RuntimeOptions) *Runtime {
@@ -138,29 +141,6 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 	if runtime == nil || runtime.factory == nil || ctx == nil || ctx.Err() != nil || configuration.AssignmentID == "" || configuration.Revision == 0 || len(configuration.Instances) == 0 || len(configuration.Instances) > MaxInstances {
 		return ErrConfigurationRejected
 	}
-	runtime.mu.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			runtime.mu.Unlock()
-		}
-	}()
-	if runtime.config.AssignmentID != "" && runtime.config.AssignmentID != configuration.AssignmentID {
-		return ErrConfigurationRejected
-	}
-	if configuration.Revision < runtime.config.Revision {
-		return ErrConfigurationRejected
-	}
-	candidates := make(map[string]InstanceRuntime, len(configuration.Instances))
-	newPools := make([]Pool, 0)
-	failed := true
-	defer func() {
-		if failed {
-			for _, pool := range newPools {
-				_ = pool.Close()
-			}
-		}
-	}()
 	seen := map[string]struct{}{}
 	for _, source := range configuration.Instances {
 		if source.ID == "" {
@@ -170,11 +150,47 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 			return ErrConfigurationRejected
 		}
 		seen[source.ID] = struct{}{}
-		if source.Credential.Revision > 0 && source.Credential.Revision < runtime.credentialRevisions[source.ID] {
+	}
+	runtime.mu.RLock()
+	if runtime.config.AssignmentID != "" && runtime.config.AssignmentID != configuration.AssignmentID {
+		runtime.mu.RUnlock()
+		return ErrConfigurationRejected
+	}
+	if configuration.Revision < runtime.config.Revision {
+		runtime.mu.RUnlock()
+		return ErrConfigurationRejected
+	}
+	snapshotGeneration := runtime.generation
+	snapshotAssignment, snapshotRevision := runtime.config.AssignmentID, runtime.config.Revision
+	snapshotValues := make(map[string]InstanceRuntime, len(runtime.values))
+	for id, value := range runtime.values {
+		snapshotValues[id] = value
+	}
+	snapshotCredentialRevisions := make(map[string]uint64, len(runtime.credentialRevisions))
+	for id, revision := range runtime.credentialRevisions {
+		snapshotCredentialRevisions[id] = revision
+	}
+	runtime.mu.RUnlock()
+	candidates := make(map[string]InstanceRuntime, len(configuration.Instances))
+	newPools := make([]Pool, 0)
+	failed := true
+	defer func() {
+		if failed {
+			for _, pool := range newPools {
+				_ = pool.Close()
+			}
+			for id, candidate := range candidates {
+				candidate.Config.Release()
+				candidates[id] = candidate
+			}
+		}
+	}()
+	for _, source := range configuration.Instances {
+		if source.Credential.Revision > 0 && source.Credential.Revision < snapshotCredentialRevisions[source.ID] {
 			return ErrConfigurationRejected
 		}
 		fingerprint := instanceFingerprint(source)
-		if old, exists := runtime.values[source.ID]; exists && old.fingerprint == fingerprint {
+		if old, exists := snapshotValues[source.ID]; exists && old.fingerprint == fingerprint {
 			candidates[source.ID] = InstanceRuntime{Config: cloneInstanceWithoutSecret(source), Pool: old.Pool, fingerprint: old.fingerprint}
 			continue
 		}
@@ -201,7 +217,19 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 		}
 		candidates[source.ID] = candidate
 	}
+	runtime.mu.Lock()
+	if runtime.generation != snapshotGeneration || runtime.config.AssignmentID != snapshotAssignment || runtime.config.Revision != snapshotRevision || runtime.config.AssignmentID != "" && runtime.config.AssignmentID != configuration.AssignmentID || configuration.Revision < runtime.config.Revision {
+		runtime.mu.Unlock()
+		return ErrConfigurationRejected
+	}
+	for _, source := range configuration.Instances {
+		if source.Credential.Revision > 0 && source.Credential.Revision < runtime.credentialRevisions[source.ID] {
+			runtime.mu.Unlock()
+			return ErrConfigurationRejected
+		}
+	}
 	retired := make([]Pool, 0)
+	retiredConfigs := make([]InstanceConfig, 0, len(runtime.values))
 	for id, old := range runtime.values {
 		candidate, retained := candidates[id]
 		if !retained || candidate.Pool != old.Pool {
@@ -209,7 +237,7 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 				retired = append(retired, old.Pool)
 			}
 		}
-		old.Config.Release()
+		retiredConfigs = append(retiredConfigs, old.Config)
 	}
 	runtime.config = Config{AssignmentID: configuration.AssignmentID, Revision: configuration.Revision}
 	runtime.values = candidates
@@ -218,9 +246,12 @@ func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
 			runtime.credentialRevisions[source.ID] = source.Credential.Revision
 		}
 	}
+	runtime.generation++
 	failed = false
 	runtime.mu.Unlock()
-	locked = false
+	for index := range retiredConfigs {
+		retiredConfigs[index].Release()
+	}
 	for _, pool := range retired {
 		_ = pool.Close()
 	}
@@ -234,7 +265,11 @@ func (runtime *Runtime) Instance(id string) (InstanceRuntime, bool) {
 	runtime.mu.RLock()
 	defer runtime.mu.RUnlock()
 	value, ok := runtime.values[id]
-	return value, ok
+	if !ok {
+		return InstanceRuntime{}, false
+	}
+	value.Config = cloneInstanceWithoutSecret(value.Config)
+	return value, true
 }
 
 func (runtime *Runtime) Instances() []InstanceRuntime {
@@ -242,6 +277,7 @@ func (runtime *Runtime) Instances() []InstanceRuntime {
 	defer runtime.mu.RUnlock()
 	result := make([]InstanceRuntime, 0, len(runtime.values))
 	for _, value := range runtime.values {
+		value.Config = cloneInstanceWithoutSecret(value.Config)
 		result = append(result, value)
 	}
 	return result
@@ -277,6 +313,7 @@ func (runtime *Runtime) replaceForTest(configuration Config, values map[string]I
 	runtime.mu.Lock()
 	runtime.config = configuration
 	runtime.values = values
+	runtime.generation++
 	runtime.mu.Unlock()
 }
 
@@ -305,6 +342,18 @@ func cloneInstanceWithoutSecret(source InstanceConfig) InstanceConfig {
 	for key, template := range source.Templates {
 		copied := template
 		copied.Digest = append([]byte(nil), template.Digest...)
+		copied.ValueMappings = make([]*pluginv1.MetricValueMapping, len(template.ValueMappings))
+		for index, mapping := range template.ValueMappings {
+			if mapping != nil {
+				copied.ValueMappings[index] = proto.Clone(mapping).(*pluginv1.MetricValueMapping)
+			}
+		}
+		copied.LabelMappings = make([]*pluginv1.MetricLabelMapping, len(template.LabelMappings))
+		for index, mapping := range template.LabelMappings {
+			if mapping != nil {
+				copied.LabelMappings[index] = proto.Clone(mapping).(*pluginv1.MetricLabelMapping)
+			}
+		}
 		result.Templates[key] = copied
 	}
 	return result

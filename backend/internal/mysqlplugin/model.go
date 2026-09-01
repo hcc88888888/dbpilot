@@ -121,6 +121,7 @@ type Sample struct {
 	MetricType   pluginv1.PluginMetricType
 	Labels       map[string]string
 	SampledAt    time.Time
+	StartTime    time.Time
 	CounterReset bool
 }
 

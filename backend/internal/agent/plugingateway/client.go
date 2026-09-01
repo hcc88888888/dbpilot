@@ -1105,7 +1105,7 @@ func validateBatchAgainstBuiltin(batch *pluginv1.PluginMetricBatch, descriptor *
 	seen := map[string]struct{}{}
 	for _, sample := range batch.GetSamples() {
 		metric := allowed[sample.GetMetricName()]
-		if sample == nil || metric == nil || sample.GetMetricType() != metric.GetMetricType() || sample.GetUnit() != metric.GetUnit() || len(sample.GetLabels()) != 0 {
+		if sample == nil || metric == nil || sample.GetMetricType() != metric.GetMetricType() || sample.GetUnit() != metric.GetUnit() || len(sample.GetLabels()) != 0 || metric.GetMetricType() == pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER && sample.GetStartTime() == nil {
 			return false
 		}
 		if _, duplicate := seen[sample.GetMetricName()]; duplicate {

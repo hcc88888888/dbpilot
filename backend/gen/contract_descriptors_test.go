@@ -278,3 +278,14 @@ func TestPluginDescriptorsExposeBuiltinMetricsAndPublishedCardinality(t *testing
 		t.Fatal("MetricTemplateConfiguration.cardinality_limit is absent")
 	}
 }
+
+func TestPluginMetricSampleCarriesStandardCounterStartTime(t *testing.T) {
+	sample := pluginv1.File_plugin_v1_metrics_proto.Messages().ByName("PluginMetricSample")
+	if sample == nil {
+		t.Fatal("PluginMetricSample absent")
+	}
+	field := sample.Fields().ByName("start_time")
+	if field == nil || field.Number() != 7 || field.Message() == nil || field.Message().FullName() != "google.protobuf.Timestamp" {
+		t.Fatal("PluginMetricSample.start_time descriptor mismatch")
+	}
+}
