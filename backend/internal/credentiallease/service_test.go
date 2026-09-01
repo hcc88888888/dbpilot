@@ -213,6 +213,47 @@ func TestTombstoneEvictionNeverDeletesNewGenerationOrConsumesLiveCapacity(t *tes
 	lease.Release()
 }
 
+func TestAdmissionReservesFutureFenceForEveryActiveNonce(t *testing.T) {
+	now := time.Now().UTC()
+	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("reserved-fence-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, MaximumLive: 2, Random: bytes.NewReader(bytes.Repeat([]byte{0x7b}, 128))})
+	require.NoError(t, err)
+	service.mu.Lock()
+	for index := 0; index < service.totalFenceCapacity()-2; index++ {
+		require.True(t, service.addTombstoneLocked(fmt.Sprintf("old-%d", index), now.Add(10*time.Minute), now))
+	}
+	service.mu.Unlock()
+	agent := AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}
+	firstRequest := validRequest()
+	secondRequest := validRequest()
+	secondRequest.Nonce = bytes.Repeat([]byte{0x7c}, 32)
+	first, err := service.Lease(context.Background(), agent, firstRequest)
+	require.NoError(t, err)
+	second, err := service.Lease(context.Background(), agent, secondRequest)
+	require.NoError(t, err)
+	third := validRequest()
+	third.Nonce = bytes.Repeat([]byte{0x7d}, 32)
+	_, err = service.Lease(context.Background(), agent, third)
+	require.ErrorIs(t, err, ErrLeaseRejected)
+	service.mu.Lock()
+	service.pruneLocked(now.Add(2 * time.Minute))
+	active, tombstones := len(service.leases), len(service.tombstones)
+	service.mu.Unlock()
+	require.Zero(t, active)
+	require.Equal(t, service.totalFenceCapacity(), tombstones)
+	_, err = service.Lease(context.Background(), agent, firstRequest)
+	require.ErrorIs(t, err, ErrLeaseRejected)
+	conflict := firstRequest
+	conflict.InstanceID = "instance-2"
+	_, err = service.Lease(context.Background(), agent, conflict)
+	require.ErrorIs(t, err, ErrLeaseRejected)
+	first.Release()
+	second.Release()
+	service.mu.Lock()
+	service.pruneLocked(now.Add(20 * time.Minute))
+	require.Empty(t, service.tombstones)
+	service.mu.Unlock()
+}
+
 func validRequest() LeaseRequest {
 	return LeaseRequest{Nonce: bytes.Repeat([]byte{0x01}, 32), InstanceID: "instance-1", AssignmentID: "assignment-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7}
 }

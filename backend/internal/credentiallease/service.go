@@ -147,7 +147,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
-	if len(service.tombstones) >= service.maximumLive*4 {
+	if len(service.leases)+len(service.tombstones) >= service.totalFenceCapacity() {
 		service.mu.Unlock()
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
@@ -220,8 +220,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		if service.leases[key] == record {
 			record.lease.Release()
 			record.expired = true
-			delete(service.leases, key)
-			service.addTombstoneLocked(key, finalNow.Add(service.ttl*3), lease.ExpiresAt)
+			service.transitionToFenceLocked(key, record, finalNow.Add(service.ttl*3), lease.ExpiresAt)
 		}
 		service.mu.Unlock()
 	})
@@ -243,8 +242,7 @@ func (service *ApplicationService) failRecord(key string, record *liveLease) {
 	record.completed = true
 	close(record.ready)
 	if service.leases[key] == record {
-		delete(service.leases, key)
-		service.addTombstoneLocked(key, record.tombstoneUntil, record.tombstoneUntil.Add(-service.ttl*3))
+		service.transitionToFenceLocked(key, record, record.tombstoneUntil, record.tombstoneUntil.Add(-service.ttl*3))
 	}
 }
 
@@ -263,8 +261,7 @@ func (service *ApplicationService) pruneLocked(now time.Time) {
 				}
 				record.lease.Release()
 				record.expired = true
-				delete(service.leases, key)
-				service.addTombstoneLocked(key, now.Add(service.ttl*3), now)
+				service.transitionToFenceLocked(key, record, now.Add(service.ttl*3), now)
 			}
 		default:
 		}
@@ -306,7 +303,7 @@ func (service *ApplicationService) addTombstoneLocked(key string, until, now tim
 			delete(service.tombstones, existingKey)
 		}
 	}
-	if _, exists := service.tombstones[key]; !exists && len(service.tombstones) >= service.maximumLive*4 {
+	if _, exists := service.tombstones[key]; !exists && len(service.tombstones) >= service.totalFenceCapacity() {
 		return false
 	}
 	service.tombstoneGeneration++
@@ -321,6 +318,19 @@ func (service *ApplicationService) addTombstoneLocked(key string, until, now tim
 	}
 	service.tombstoneOrder = kept
 	return true
+}
+
+func (service *ApplicationService) totalFenceCapacity() int { return service.maximumLive * 4 }
+
+func (service *ApplicationService) transitionToFenceLocked(key string, record *liveLease, until, now time.Time) {
+	delete(service.leases, key)
+	if !service.addTombstoneLocked(key, until, now) {
+		// Capacity was reserved at admission. Preserve the zeroed record as a
+		// replay fence if an invariant violation is ever observed.
+		record.expired = true
+		record.err = ErrLeaseRejected
+		service.leases[key] = record
+	}
 }
 
 func (service *ApplicationService) authorize(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest, renewal bool) (Authorization, error) {
