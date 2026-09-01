@@ -56,6 +56,23 @@ func TestCollectorDetectsCounterResetWithoutProducingNegativeDelta(t *testing.T)
 	require.Equal(t, current, second.Samples[0].StartTime)
 }
 
+func TestCollectorTreatsUptimeDropAsResetEvenWhenQuestionsIncreases(t *testing.T) {
+	runtime, mock, cleanup := runtimeWithSQLMock(t, "mysql-a")
+	defer cleanup()
+	for _, row := range []struct{ questions, uptime string }{{"100", "100"}, {"1000", "2"}} {
+		mock.ExpectPing()
+		mock.ExpectQuery("SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status").WillReturnRows(sqlmock.NewRows([]string{"VARIABLE_NAME", "VARIABLE_VALUE"}).AddRow("Questions", row.questions).AddRow("Uptime", row.uptime))
+	}
+	current := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	collector := NewCollector(runtime, CollectorOptions{Now: func() time.Time { return current }})
+	first := collector.Collect(context.Background(), "mysql-a", []string{"mysql.queries.total"})
+	current = current.Add(time.Second)
+	second := collector.Collect(context.Background(), "mysql-a", []string{"mysql.queries.total"})
+	require.False(t, first.Samples[0].CounterReset)
+	require.True(t, second.Samples[0].CounterReset)
+	require.Equal(t, current.Add(-2*time.Second), second.Samples[0].StartTime)
+}
+
 func TestCollectorFailureAndCircuitAreIsolatedPerInstance(t *testing.T) {
 	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
 	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{

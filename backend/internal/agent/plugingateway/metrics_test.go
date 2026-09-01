@@ -159,5 +159,6 @@ func TestNormalizeBatchPreservesPartialAndStaleStatusMetrics(t *testing.T) {
 
 func TestFixedPluginCodeNeverLeaksPluginVocabulary(t *testing.T) {
 	require.Equal(t, "waiting_templates", fixedPluginCode("waiting_templates"))
+	require.Equal(t, "result_limit_exceeded", fixedPluginCode("result_limit_exceeded"))
 	require.Equal(t, "plugin_failed", fixedPluginCode("plugin says: secret=do-not-log"))
 }

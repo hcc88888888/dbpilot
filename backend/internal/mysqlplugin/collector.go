@@ -428,7 +428,7 @@ func (collector *Collector) counterReset(id string, value, uptime float64, now t
 	}
 	boot := now.Add(-time.Duration(uptime * float64(time.Second)))
 	previous, ok := collector.queries[id]
-	reset := ok && value < previous.value
+	reset := ok && (uptime < previous.uptime || value < previous.value)
 	start := boot
 	if ok && !reset {
 		start = previous.start

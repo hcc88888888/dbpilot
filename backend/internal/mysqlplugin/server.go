@@ -15,6 +15,13 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const (
+	maxPluginRPCMessageBytes   = 4 << 20
+	maxPluginBatchBytes        = 3 << 20
+	maxPendingBytes            = 64 << 20
+	pendingFailureReserveBytes = 1 << 10
+)
+
 type ServerConfig struct {
 	AssignmentID          string
 	OperationRevision     uint64
@@ -38,6 +45,7 @@ type Server struct {
 	collector    *Collector
 	parser       StatementParser
 	mu           sync.Mutex
+	collectMu    sync.Mutex
 	sequences    map[string]uint64
 	acknowledged map[string]uint64
 	shuttingDown bool
@@ -46,6 +54,7 @@ type Server struct {
 	streams      sync.WaitGroup
 	nextDue      map[string]time.Time
 	pending      map[string]*pluginv1.PluginMetricBatch
+	pendingBytes int
 }
 
 func NewServer(config ServerConfig) *Server {
@@ -86,6 +95,8 @@ func (server *Server) Handshake(_ context.Context, request *pluginv1.PluginHands
 }
 
 func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
+	server.collectMu.Lock()
+	defer server.collectMu.Unlock()
 	defer clearApplyRequest(request)
 	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || server.isShuttingDown() {
 		return nil, errors.New("configuration_rejected")
@@ -106,6 +117,7 @@ func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.
 		server.mu.Lock()
 		server.nextDue = map[string]time.Time{}
 		server.pending = map[string]*pluginv1.PluginMetricBatch{}
+		server.pendingBytes = 0
 		server.mu.Unlock()
 	}
 	server.pruneCursors()
@@ -146,6 +158,8 @@ func (server *Server) ValidateInstance(ctx context.Context, request *pluginv1.Va
 }
 
 func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectPluginMetricsRequest) (*pluginv1.CollectPluginMetricsResponse, error) {
+	server.collectMu.Lock()
+	defer server.collectMu.Unlock()
 	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || len(request.GetInstanceIds()) == 0 || len(request.GetInstanceIds()) > MaxInstances || len(request.GetTemplateIds()) == 0 || len(request.GetTemplateIds()) > MaxTemplates {
 		return nil, errors.New("collection_rejected")
 	}
@@ -166,6 +180,12 @@ func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectP
 			}
 		}
 	}
+	server.mu.Lock()
+	baseline := make(map[string]struct{}, len(server.pending))
+	for key := range server.pending {
+		baseline[key] = struct{}{}
+	}
+	server.mu.Unlock()
 	batches := make([]*pluginv1.PluginMetricBatch, 0, len(request.GetInstanceIds())*len(request.GetTemplateIds()))
 	for _, instanceID := range request.GetInstanceIds() {
 		instance, exists := server.runtime.Instance(instanceID)
@@ -211,7 +231,12 @@ func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectP
 			batches = append(batches, server.wireBatch(instance, templateID, template.Revision, collected, collected.Status, collected.ErrorCode))
 		}
 	}
-	return &pluginv1.CollectPluginMetricsResponse{Batches: batches}, nil
+	response := &pluginv1.CollectPluginMetricsResponse{Batches: batches}
+	if proto.Size(response) > maxPluginRPCMessageBytes {
+		server.rollbackNewPending(baseline)
+		return nil, errors.New("collection_response_too_large")
+	}
+	return response, nil
 }
 
 func (server *Server) TrialMetricTemplate(ctx context.Context, request *pluginv1.TrialMetricTemplateRequest) (*pluginv1.TrialMetricTemplateResponse, error) {
@@ -341,7 +366,7 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 	for key, sequence := range proposed {
 		server.acknowledged[key] = sequence
 		if pending := server.pending[key]; pending != nil && pending.GetSequence() == sequence {
-			delete(server.pending, key)
+			server.removePendingLocked(key)
 		}
 	}
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: accepted}, nil
@@ -413,6 +438,7 @@ func (server *Server) isShuttingDown() bool {
 
 func (server *Server) wireBatch(instance InstanceRuntime, templateID string, revision uint64, batch Batch, status CollectionStatus, errorCode string) *pluginv1.PluginMetricBatch {
 	key := cursorKey(instance.Config.ID, templateID)
+	boundCount := len(server.boundPairs())
 	collectedAt := batch.CollectedAt
 	if collectedAt.IsZero() {
 		collectedAt = server.config.Now().UTC()
@@ -429,10 +455,58 @@ func (server *Server) wireBatch(instance InstanceRuntime, templateID string, rev
 	}
 	server.sequences[key]++
 	result.Sequence = server.sequences[key]
+	if proto.Size(result) >= maxPluginBatchBytes {
+		result = smallFailureBatch(result)
+	}
+	size := proto.Size(result)
+	unoccupied := boundCount - (len(server.pending) + 1)
+	if unoccupied < 0 {
+		unoccupied = 0
+	}
+	budget := maxPendingBytes - unoccupied*pendingFailureReserveBytes
+	if server.pendingBytes+size > budget {
+		result = smallFailureBatch(result)
+		size = proto.Size(result)
+	}
+	if size >= maxPluginBatchBytes || server.pendingBytes+size > maxPendingBytes {
+		server.sequences[key]--
+		server.mu.Unlock()
+		return smallFailureBatch(result)
+	}
 	server.pending[key] = proto.Clone(result).(*pluginv1.PluginMetricBatch)
+	server.pendingBytes += size
 	server.mu.Unlock()
 	server.markScheduled(instance.Config, []string{templateID}, collectedAt)
 	return result
+}
+
+func smallFailureBatch(source *pluginv1.PluginMetricBatch) *pluginv1.PluginMetricBatch {
+	return &pluginv1.PluginMetricBatch{PluginId: source.GetPluginId(), PluginVersion: source.GetPluginVersion(), DatabaseFamily: source.GetDatabaseFamily(), DatabaseVariant: source.GetDatabaseVariant(), InstanceId: source.GetInstanceId(), ConfigurationRevision: source.GetConfigurationRevision(), TemplateId: source.GetTemplateId(), TemplateRevision: source.GetTemplateRevision(), CollectedAt: source.GetCollectedAt(), Sequence: source.GetSequence(), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_FAILED, ErrorCode: "result_limit_exceeded"}
+}
+
+func (server *Server) removePendingLocked(key string) {
+	if pending := server.pending[key]; pending != nil {
+		server.pendingBytes -= proto.Size(pending)
+		if server.pendingBytes < 0 {
+			server.pendingBytes = 0
+		}
+		delete(server.pending, key)
+	}
+}
+
+func (server *Server) rollbackNewPending(baseline map[string]struct{}) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	for key, pending := range server.pending {
+		if _, existed := baseline[key]; existed {
+			continue
+		}
+		sequence := pending.GetSequence()
+		server.removePendingLocked(key)
+		if server.sequences[key] == sequence && sequence > 0 {
+			server.sequences[key]--
+		}
+	}
 }
 
 func (server *Server) pendingBatch(instanceID, templateID string) *pluginv1.PluginMetricBatch {
@@ -474,7 +548,7 @@ func (server *Server) prepareResume(cursors []*pluginv1.PluginMetricCursor) ([]*
 		if sequence == current {
 			continue
 		}
-		if pending != nil && pending.GetSequence() == current && sequence+1 == current {
+		if pending != nil && pending.GetSequence() == current && sequence == current-1 {
 			replayKeys = append(replayKeys, key)
 			continue
 		}
@@ -485,10 +559,10 @@ func (server *Server) prepareResume(cursors []*pluginv1.PluginMetricCursor) ([]*
 		if current == 0 {
 			server.sequences[key] = sequence
 			server.acknowledged[key] = sequence
-			delete(server.pending, key)
+			server.removePendingLocked(key)
 		} else if sequence == current {
 			server.acknowledged[key] = sequence
-			delete(server.pending, key)
+			server.removePendingLocked(key)
 		}
 	}
 	sort.Strings(replayKeys)
@@ -575,7 +649,7 @@ func (server *Server) pruneCursors() {
 			delete(server.sequences, key)
 			delete(server.acknowledged, key)
 			delete(server.nextDue, key)
-			delete(server.pending, key)
+			server.removePendingLocked(key)
 		}
 	}
 }

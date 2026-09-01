@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func TestServerApplyValidateHealthAndCredentialRemovalRecovery(t *testing.T) {
@@ -188,6 +191,109 @@ func TestPerPairPendingBacklogReplaysExactPayloadAcrossLostAppendAndResume(t *te
 	server.mu.Lock()
 	require.Empty(t, server.pending, "configuration revision change must prune old backlog")
 	server.mu.Unlock()
+}
+
+func TestPendingBacklogBoundsOversizeLegalShapeAndMultiBatchEnvelope(t *testing.T) {
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	instance := fixtureDecodedInstance("mysql-a", "monitor")
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"mysql-a": {Config: instance, Pool: &statusPool{}}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", Runtime: runtime})
+	labels := map[string]string{}
+	for index := 0; index < 16; index++ {
+		labels[fmt.Sprintf("label_%02d", index)] = strings.Repeat("x", 128)
+	}
+	samples := make([]Sample, 0, 100*32)
+	for row := 0; row < 100; row++ {
+		for mapping := 0; mapping < 32; mapping++ {
+			samples = append(samples, Sample{Name: fmt.Sprintf("mysql.custom.metric_%02d", mapping), Value: float64(row), Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: labels, SampledAt: time.Now().UTC()})
+		}
+	}
+	oversize := server.wireBatch(runtime.values["mysql-a"], "mysql.up", 1, Batch{InstanceID: "mysql-a", Samples: samples, Status: CollectionSucceeded, CollectedAt: time.Now().UTC()}, CollectionSucceeded, "")
+	require.Less(t, proto.Size(oversize), maxPluginBatchBytes)
+	require.Empty(t, oversize.GetSamples())
+	require.Equal(t, pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_FAILED, oversize.GetCollectionStatus())
+	require.Equal(t, "result_limit_exceeded", oversize.GetErrorCode())
+	require.LessOrEqual(t, server.pendingBytes, maxPendingBytes)
+	retry := server.pendingBatch("mysql-a", "mysql.up")
+	require.True(t, proto.Equal(oversize, retry))
+	server.mu.Lock()
+	server.pending = map[string]*pluginv1.PluginMetricBatch{}
+	server.pendingBytes = 0
+	server.sequences = map[string]uint64{}
+	server.mu.Unlock()
+	large := func(template string) *pluginv1.PluginMetricBatch {
+		batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-a", ConfigurationRevision: 1, TemplateId: template, TemplateRevision: 1, CollectedAt: timestamppb.Now(), Sequence: 1, CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED}
+		for proto.Size(batch) < (5<<20)/2 {
+			for index := 0; index < 1024; index++ {
+				batch.Samples = append(batch.Samples, &pluginv1.PluginMetricSample{MetricName: "mysql.up", Value: 1, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: map[string]string{"payload": strings.Repeat("x", 128)}, SampledAt: timestamppb.Now()})
+			}
+		}
+		require.Less(t, proto.Size(batch), maxPluginBatchBytes)
+		return batch
+	}
+	first, second := large("mysql.up"), large("mysql.connections.current")
+	server.mu.Lock()
+	server.pending[cursorKey("mysql-a", "mysql.up")] = first
+	server.pending[cursorKey("mysql-a", "mysql.connections.current")] = second
+	server.sequences[cursorKey("mysql-a", "mysql.up")] = 1
+	server.sequences[cursorKey("mysql-a", "mysql.connections.current")] = 1
+	server.pendingBytes = proto.Size(first) + proto.Size(second)
+	before := server.pendingBytes
+	server.mu.Unlock()
+	_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up", "mysql.connections.current"}})
+	require.Error(t, err)
+	server.mu.Lock()
+	require.Equal(t, before, server.pendingBytes)
+	require.Len(t, server.pending, 2)
+	server.mu.Unlock()
+	for _, template := range []string{"mysql.up", "mysql.connections.current"} {
+		response, collectErr := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{template}})
+		require.NoError(t, collectErr)
+		require.Len(t, response.GetBatches(), 1)
+		require.Less(t, proto.Size(response), maxPluginRPCMessageBytes)
+	}
+}
+
+func TestOversizeCollectResponseRollsBackOnlyNewPendingBytes(t *testing.T) {
+	columns := make([]string, 0, 26)
+	valueMappings := make([]*pluginv1.MetricValueMapping, 0, 10)
+	labelMappings := make([]*pluginv1.MetricLabelMapping, 0, 16)
+	for index := 0; index < 10; index++ {
+		name := fmt.Sprintf("value_%02d", index)
+		columns = append(columns, name)
+		valueMappings = append(valueMappings, &pluginv1.MetricValueMapping{SourceColumn: name, MetricName: fmt.Sprintf("mysql.custom.metric_%02d", index), MetricType: "gauge", Unit: "1"})
+	}
+	for index := 0; index < 16; index++ {
+		name := fmt.Sprintf("label_%02d", index)
+		columns = append(columns, name)
+		labelMappings = append(labelMappings, &pluginv1.MetricLabelMapping{SourceColumn: name, Label: name})
+	}
+	values := make([][]any, 100)
+	for row := range values {
+		values[row] = make([]any, len(columns))
+		for index := 0; index < 10; index++ {
+			values[row][index] = []byte(strconv.Itoa(row + index + 1))
+		}
+		for index := 10; index < len(columns); index++ {
+			values[row][index] = []byte(strings.Repeat("x", 128))
+		}
+	}
+	template := func(id string) TemplateConfig {
+		return TemplateConfig{ID: id, Revision: 1, Statement: "SELECT bounded", Timeout: time.Second, MaxRows: 100, MaxColumns: 32, Cardinality: 10000, ValueMappings: valueMappings, LabelMappings: labelMappings}
+	}
+	instance := fixtureDecodedInstance("mysql-a", "monitor")
+	instance.Templates = map[string]TemplateConfig{"custom-a": template("custom-a"), "custom-b": template("custom-b")}
+	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+	runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"mysql-a": {Config: instance, Pool: &customRowsPool{columns: columns, values: values}}})
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", Runtime: runtime})
+	_, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 1, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"custom-a", "custom-b"}})
+	require.Error(t, err)
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	require.Empty(t, server.pending)
+	require.Zero(t, server.pendingBytes)
+	require.Zero(t, server.sequences[cursorKey("mysql-a", "custom-a")])
+	require.Zero(t, server.sequences[cursorKey("mysql-a", "custom-b")])
 }
 
 func TestShutdownStopsActiveStreamsBeforeClosingRuntime(t *testing.T) {

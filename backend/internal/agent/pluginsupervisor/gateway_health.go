@@ -171,8 +171,8 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 				if configuredErr != nil {
 					return ErrHealthHandshake
 				}
-				if len(templateIDs) > 0 {
-					if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, templateIDs); err != nil {
+				for _, templateID := range templateIDs {
+					if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, []string{templateID}); err != nil {
 						return ErrHealthHandshake
 					}
 				}

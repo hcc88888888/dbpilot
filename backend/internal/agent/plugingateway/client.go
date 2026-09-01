@@ -915,8 +915,10 @@ func (session *Session) readyForCollect(instances, templates []string) bool {
 			return false
 		}
 		configured := session.configuredTemplateIDs(instance)
-		if !sameSet(templates, configured) {
-			return false
+		for _, templateID := range templates {
+			if !contains(configured, templateID) {
+				return false
+			}
 		}
 	}
 	return true
