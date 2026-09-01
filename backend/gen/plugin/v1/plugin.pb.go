@@ -235,13 +235,14 @@ const file_plugin_v1_plugin_proto_rawDesc = "" +
 	"\x1emetric_template_schema_version\x18\b \x01(\rR\x1bmetricTemplateSchemaVersion\x12+\n" +
 	"\x11executable_digest\x18\t \x01(\fR\x10executableDigest\x12,\n" +
 	"\x12launch_nonce_proof\x18\n" +
-	" \x01(\fR\x10launchNonceProof2\xfb\x06\n" +
+	" \x01(\fR\x10launchNonceProof2\xf1\a\n" +
 	"\rPluginRuntime\x12b\n" +
 	"\tHandshake\x12).dbpilot.plugin.v1.PluginHandshakeRequest\x1a*.dbpilot.plugin.v1.PluginHandshakeResponse\x12}\n" +
 	"\x12ApplyConfiguration\x122.dbpilot.plugin.v1.ApplyPluginConfigurationRequest\x1a3.dbpilot.plugin.v1.ApplyPluginConfigurationResponse\x12w\n" +
 	"\x10ValidateInstance\x120.dbpilot.plugin.v1.ValidatePluginInstanceRequest\x1a1.dbpilot.plugin.v1.ValidatePluginInstanceResponse\x12m\n" +
 	"\n" +
-	"CollectNow\x12..dbpilot.plugin.v1.CollectPluginMetricsRequest\x1a/.dbpilot.plugin.v1.CollectPluginMetricsResponse\x12f\n" +
+	"CollectNow\x12..dbpilot.plugin.v1.CollectPluginMetricsRequest\x1a/.dbpilot.plugin.v1.CollectPluginMetricsResponse\x12t\n" +
+	"\x13TrialMetricTemplate\x12-.dbpilot.plugin.v1.TrialMetricTemplateRequest\x1a..dbpilot.plugin.v1.TrialMetricTemplateResponse\x12f\n" +
 	"\rStreamMetrics\x12-.dbpilot.plugin.v1.StreamPluginMetricsRequest\x1a$.dbpilot.plugin.v1.PluginMetricBatch0\x01\x12}\n" +
 	"\x12AcknowledgeMetrics\x122.dbpilot.plugin.v1.AcknowledgePluginMetricsRequest\x1a3.dbpilot.plugin.v1.AcknowledgePluginMetricsResponse\x12W\n" +
 	"\tGetHealth\x12).dbpilot.plugin.v1.GetPluginHealthRequest\x1a\x1f.dbpilot.plugin.v1.PluginHealth\x12_\n" +
@@ -266,37 +267,41 @@ var file_plugin_v1_plugin_proto_goTypes = []any{
 	(*ApplyPluginConfigurationRequest)(nil),  // 2: dbpilot.plugin.v1.ApplyPluginConfigurationRequest
 	(*ValidatePluginInstanceRequest)(nil),    // 3: dbpilot.plugin.v1.ValidatePluginInstanceRequest
 	(*CollectPluginMetricsRequest)(nil),      // 4: dbpilot.plugin.v1.CollectPluginMetricsRequest
-	(*StreamPluginMetricsRequest)(nil),       // 5: dbpilot.plugin.v1.StreamPluginMetricsRequest
-	(*AcknowledgePluginMetricsRequest)(nil),  // 6: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
-	(*GetPluginHealthRequest)(nil),           // 7: dbpilot.plugin.v1.GetPluginHealthRequest
-	(*ShutdownPluginRequest)(nil),            // 8: dbpilot.plugin.v1.ShutdownPluginRequest
-	(*ApplyPluginConfigurationResponse)(nil), // 9: dbpilot.plugin.v1.ApplyPluginConfigurationResponse
-	(*ValidatePluginInstanceResponse)(nil),   // 10: dbpilot.plugin.v1.ValidatePluginInstanceResponse
-	(*CollectPluginMetricsResponse)(nil),     // 11: dbpilot.plugin.v1.CollectPluginMetricsResponse
-	(*PluginMetricBatch)(nil),                // 12: dbpilot.plugin.v1.PluginMetricBatch
-	(*AcknowledgePluginMetricsResponse)(nil), // 13: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
-	(*PluginHealth)(nil),                     // 14: dbpilot.plugin.v1.PluginHealth
-	(*ShutdownPluginResponse)(nil),           // 15: dbpilot.plugin.v1.ShutdownPluginResponse
+	(*TrialMetricTemplateRequest)(nil),       // 5: dbpilot.plugin.v1.TrialMetricTemplateRequest
+	(*StreamPluginMetricsRequest)(nil),       // 6: dbpilot.plugin.v1.StreamPluginMetricsRequest
+	(*AcknowledgePluginMetricsRequest)(nil),  // 7: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
+	(*GetPluginHealthRequest)(nil),           // 8: dbpilot.plugin.v1.GetPluginHealthRequest
+	(*ShutdownPluginRequest)(nil),            // 9: dbpilot.plugin.v1.ShutdownPluginRequest
+	(*ApplyPluginConfigurationResponse)(nil), // 10: dbpilot.plugin.v1.ApplyPluginConfigurationResponse
+	(*ValidatePluginInstanceResponse)(nil),   // 11: dbpilot.plugin.v1.ValidatePluginInstanceResponse
+	(*CollectPluginMetricsResponse)(nil),     // 12: dbpilot.plugin.v1.CollectPluginMetricsResponse
+	(*TrialMetricTemplateResponse)(nil),      // 13: dbpilot.plugin.v1.TrialMetricTemplateResponse
+	(*PluginMetricBatch)(nil),                // 14: dbpilot.plugin.v1.PluginMetricBatch
+	(*AcknowledgePluginMetricsResponse)(nil), // 15: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
+	(*PluginHealth)(nil),                     // 16: dbpilot.plugin.v1.PluginHealth
+	(*ShutdownPluginResponse)(nil),           // 17: dbpilot.plugin.v1.ShutdownPluginResponse
 }
 var file_plugin_v1_plugin_proto_depIdxs = []int32{
 	0,  // 0: dbpilot.plugin.v1.PluginRuntime.Handshake:input_type -> dbpilot.plugin.v1.PluginHandshakeRequest
 	2,  // 1: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:input_type -> dbpilot.plugin.v1.ApplyPluginConfigurationRequest
 	3,  // 2: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:input_type -> dbpilot.plugin.v1.ValidatePluginInstanceRequest
 	4,  // 3: dbpilot.plugin.v1.PluginRuntime.CollectNow:input_type -> dbpilot.plugin.v1.CollectPluginMetricsRequest
-	5,  // 4: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:input_type -> dbpilot.plugin.v1.StreamPluginMetricsRequest
-	6,  // 5: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:input_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
-	7,  // 6: dbpilot.plugin.v1.PluginRuntime.GetHealth:input_type -> dbpilot.plugin.v1.GetPluginHealthRequest
-	8,  // 7: dbpilot.plugin.v1.PluginRuntime.Shutdown:input_type -> dbpilot.plugin.v1.ShutdownPluginRequest
-	1,  // 8: dbpilot.plugin.v1.PluginRuntime.Handshake:output_type -> dbpilot.plugin.v1.PluginHandshakeResponse
-	9,  // 9: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:output_type -> dbpilot.plugin.v1.ApplyPluginConfigurationResponse
-	10, // 10: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:output_type -> dbpilot.plugin.v1.ValidatePluginInstanceResponse
-	11, // 11: dbpilot.plugin.v1.PluginRuntime.CollectNow:output_type -> dbpilot.plugin.v1.CollectPluginMetricsResponse
-	12, // 12: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:output_type -> dbpilot.plugin.v1.PluginMetricBatch
-	13, // 13: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:output_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
-	14, // 14: dbpilot.plugin.v1.PluginRuntime.GetHealth:output_type -> dbpilot.plugin.v1.PluginHealth
-	15, // 15: dbpilot.plugin.v1.PluginRuntime.Shutdown:output_type -> dbpilot.plugin.v1.ShutdownPluginResponse
-	8,  // [8:16] is the sub-list for method output_type
-	0,  // [0:8] is the sub-list for method input_type
+	5,  // 4: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:input_type -> dbpilot.plugin.v1.TrialMetricTemplateRequest
+	6,  // 5: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:input_type -> dbpilot.plugin.v1.StreamPluginMetricsRequest
+	7,  // 6: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:input_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
+	8,  // 7: dbpilot.plugin.v1.PluginRuntime.GetHealth:input_type -> dbpilot.plugin.v1.GetPluginHealthRequest
+	9,  // 8: dbpilot.plugin.v1.PluginRuntime.Shutdown:input_type -> dbpilot.plugin.v1.ShutdownPluginRequest
+	1,  // 9: dbpilot.plugin.v1.PluginRuntime.Handshake:output_type -> dbpilot.plugin.v1.PluginHandshakeResponse
+	10, // 10: dbpilot.plugin.v1.PluginRuntime.ApplyConfiguration:output_type -> dbpilot.plugin.v1.ApplyPluginConfigurationResponse
+	11, // 11: dbpilot.plugin.v1.PluginRuntime.ValidateInstance:output_type -> dbpilot.plugin.v1.ValidatePluginInstanceResponse
+	12, // 12: dbpilot.plugin.v1.PluginRuntime.CollectNow:output_type -> dbpilot.plugin.v1.CollectPluginMetricsResponse
+	13, // 13: dbpilot.plugin.v1.PluginRuntime.TrialMetricTemplate:output_type -> dbpilot.plugin.v1.TrialMetricTemplateResponse
+	14, // 14: dbpilot.plugin.v1.PluginRuntime.StreamMetrics:output_type -> dbpilot.plugin.v1.PluginMetricBatch
+	15, // 15: dbpilot.plugin.v1.PluginRuntime.AcknowledgeMetrics:output_type -> dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
+	16, // 16: dbpilot.plugin.v1.PluginRuntime.GetHealth:output_type -> dbpilot.plugin.v1.PluginHealth
+	17, // 17: dbpilot.plugin.v1.PluginRuntime.Shutdown:output_type -> dbpilot.plugin.v1.ShutdownPluginResponse
+	9,  // [9:18] is the sub-list for method output_type
+	0,  // [0:9] is the sub-list for method input_type
 	0,  // [0:0] is the sub-list for extension type_name
 	0,  // [0:0] is the sub-list for extension extendee
 	0,  // [0:0] is the sub-list for field type_name

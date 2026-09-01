@@ -35,7 +35,31 @@ func (executor *ReconcilePluginExecutor) Execute(ctx context.Context, envelope *
 		}
 		descriptors = append(descriptors, pluginsupervisor.InstanceDescriptor{InstanceID: descriptor.GetInstanceId(), DatabaseVariant: descriptor.GetDatabaseVariant(), Endpoint: descriptor.GetEndpoint(), UnixSocket: descriptor.GetUnixSocket()})
 	}
-	request := pluginsupervisor.ReconcileRequest{AssignmentID: command.GetAssignmentId(), PluginID: command.GetPluginId(), DatabaseFamily: command.GetDatabaseFamily(), DesiredVersion: command.GetDesiredVersion(), DesiredState: desiredPluginState(command.GetDesiredState()), ArtifactID: command.GetArtifactId(), ArtifactSHA256: append([]byte(nil), command.GetArtifactSha256()...), ManifestDigest: append([]byte(nil), command.GetManifestDigest()...), ConfigurationRevision: command.GetConfigurationRevision(), OperationRevision: command.GetOperationRevision(), InstanceIDs: append([]string(nil), command.GetInstanceIds()...), InstanceDescriptors: descriptors, TemplateIDs: append([]string(nil), command.GetTemplateIds()...)}
+	templateReferences := make([]pluginsupervisor.TemplateReference, len(command.GetTemplateRevisions()))
+	for index, reference := range command.GetTemplateRevisions() {
+		if reference == nil {
+			return nil, pluginsupervisor.ErrInvalidRequest
+		}
+		templateReferences[index] = pluginsupervisor.TemplateReference{TemplateID: reference.GetTemplateId(), RevisionID: reference.GetRevisionId(), QueryDigest: append([]byte(nil), reference.GetQueryDigest()...), TimeoutSeconds: reference.GetTimeoutSeconds(), MaxRows: reference.GetMaxRows(), MaxColumns: reference.GetMaxColumns(), CardinalityLimit: reference.GetCardinalityLimit()}
+	}
+	instanceReferences := make([]pluginsupervisor.InstanceTemplateReferences, len(command.GetInstanceTemplateRevisions()))
+	for index, instance := range command.GetInstanceTemplateRevisions() {
+		if instance == nil {
+			return nil, pluginsupervisor.ErrInvalidRequest
+		}
+		instanceReferences[index].InstanceID = instance.GetInstanceId()
+		for _, reference := range instance.GetTemplates() {
+			if reference == nil {
+				return nil, pluginsupervisor.ErrInvalidRequest
+			}
+			instanceReferences[index].Templates = append(instanceReferences[index].Templates, pluginsupervisor.TemplateReference{TemplateID: reference.GetTemplateId(), RevisionID: reference.GetRevisionId(), QueryDigest: append([]byte(nil), reference.GetQueryDigest()...), TimeoutSeconds: reference.GetTimeoutSeconds(), MaxRows: reference.GetMaxRows(), MaxColumns: reference.GetMaxColumns(), CardinalityLimit: reference.GetCardinalityLimit()})
+		}
+	}
+	leaseCommandID := ""
+	if len(templateReferences) > 0 {
+		leaseCommandID = envelope.GetCommandId()
+	}
+	request := pluginsupervisor.ReconcileRequest{AssignmentID: command.GetAssignmentId(), PluginID: command.GetPluginId(), DatabaseFamily: command.GetDatabaseFamily(), DesiredVersion: command.GetDesiredVersion(), DesiredState: desiredPluginState(command.GetDesiredState()), ArtifactID: command.GetArtifactId(), ArtifactSHA256: append([]byte(nil), command.GetArtifactSha256()...), ManifestDigest: append([]byte(nil), command.GetManifestDigest()...), ConfigurationRevision: command.GetConfigurationRevision(), OperationRevision: command.GetOperationRevision(), InstanceIDs: append([]string(nil), command.GetInstanceIds()...), InstanceDescriptors: descriptors, TemplateIDs: append([]string(nil), command.GetTemplateIds()...), TemplateLeaseCommandID: leaseCommandID, TemplateReferences: templateReferences, InstanceTemplateRefs: instanceReferences}
 	prepared, err := executor.supervisor.Prepare(ctx, request)
 	if err != nil {
 		return nil, err

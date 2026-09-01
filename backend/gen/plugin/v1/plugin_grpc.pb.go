@@ -19,14 +19,15 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	PluginRuntime_Handshake_FullMethodName          = "/dbpilot.plugin.v1.PluginRuntime/Handshake"
-	PluginRuntime_ApplyConfiguration_FullMethodName = "/dbpilot.plugin.v1.PluginRuntime/ApplyConfiguration"
-	PluginRuntime_ValidateInstance_FullMethodName   = "/dbpilot.plugin.v1.PluginRuntime/ValidateInstance"
-	PluginRuntime_CollectNow_FullMethodName         = "/dbpilot.plugin.v1.PluginRuntime/CollectNow"
-	PluginRuntime_StreamMetrics_FullMethodName      = "/dbpilot.plugin.v1.PluginRuntime/StreamMetrics"
-	PluginRuntime_AcknowledgeMetrics_FullMethodName = "/dbpilot.plugin.v1.PluginRuntime/AcknowledgeMetrics"
-	PluginRuntime_GetHealth_FullMethodName          = "/dbpilot.plugin.v1.PluginRuntime/GetHealth"
-	PluginRuntime_Shutdown_FullMethodName           = "/dbpilot.plugin.v1.PluginRuntime/Shutdown"
+	PluginRuntime_Handshake_FullMethodName           = "/dbpilot.plugin.v1.PluginRuntime/Handshake"
+	PluginRuntime_ApplyConfiguration_FullMethodName  = "/dbpilot.plugin.v1.PluginRuntime/ApplyConfiguration"
+	PluginRuntime_ValidateInstance_FullMethodName    = "/dbpilot.plugin.v1.PluginRuntime/ValidateInstance"
+	PluginRuntime_CollectNow_FullMethodName          = "/dbpilot.plugin.v1.PluginRuntime/CollectNow"
+	PluginRuntime_TrialMetricTemplate_FullMethodName = "/dbpilot.plugin.v1.PluginRuntime/TrialMetricTemplate"
+	PluginRuntime_StreamMetrics_FullMethodName       = "/dbpilot.plugin.v1.PluginRuntime/StreamMetrics"
+	PluginRuntime_AcknowledgeMetrics_FullMethodName  = "/dbpilot.plugin.v1.PluginRuntime/AcknowledgeMetrics"
+	PluginRuntime_GetHealth_FullMethodName           = "/dbpilot.plugin.v1.PluginRuntime/GetHealth"
+	PluginRuntime_Shutdown_FullMethodName            = "/dbpilot.plugin.v1.PluginRuntime/Shutdown"
 )
 
 // PluginRuntimeClient is the client API for PluginRuntime service.
@@ -37,6 +38,7 @@ type PluginRuntimeClient interface {
 	ApplyConfiguration(ctx context.Context, in *ApplyPluginConfigurationRequest, opts ...grpc.CallOption) (*ApplyPluginConfigurationResponse, error)
 	ValidateInstance(ctx context.Context, in *ValidatePluginInstanceRequest, opts ...grpc.CallOption) (*ValidatePluginInstanceResponse, error)
 	CollectNow(ctx context.Context, in *CollectPluginMetricsRequest, opts ...grpc.CallOption) (*CollectPluginMetricsResponse, error)
+	TrialMetricTemplate(ctx context.Context, in *TrialMetricTemplateRequest, opts ...grpc.CallOption) (*TrialMetricTemplateResponse, error)
 	StreamMetrics(ctx context.Context, in *StreamPluginMetricsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PluginMetricBatch], error)
 	AcknowledgeMetrics(ctx context.Context, in *AcknowledgePluginMetricsRequest, opts ...grpc.CallOption) (*AcknowledgePluginMetricsResponse, error)
 	GetHealth(ctx context.Context, in *GetPluginHealthRequest, opts ...grpc.CallOption) (*PluginHealth, error)
@@ -85,6 +87,16 @@ func (c *pluginRuntimeClient) CollectNow(ctx context.Context, in *CollectPluginM
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CollectPluginMetricsResponse)
 	err := c.cc.Invoke(ctx, PluginRuntime_CollectNow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pluginRuntimeClient) TrialMetricTemplate(ctx context.Context, in *TrialMetricTemplateRequest, opts ...grpc.CallOption) (*TrialMetricTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TrialMetricTemplateResponse)
+	err := c.cc.Invoke(ctx, PluginRuntime_TrialMetricTemplate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +160,7 @@ type PluginRuntimeServer interface {
 	ApplyConfiguration(context.Context, *ApplyPluginConfigurationRequest) (*ApplyPluginConfigurationResponse, error)
 	ValidateInstance(context.Context, *ValidatePluginInstanceRequest) (*ValidatePluginInstanceResponse, error)
 	CollectNow(context.Context, *CollectPluginMetricsRequest) (*CollectPluginMetricsResponse, error)
+	TrialMetricTemplate(context.Context, *TrialMetricTemplateRequest) (*TrialMetricTemplateResponse, error)
 	StreamMetrics(*StreamPluginMetricsRequest, grpc.ServerStreamingServer[PluginMetricBatch]) error
 	AcknowledgeMetrics(context.Context, *AcknowledgePluginMetricsRequest) (*AcknowledgePluginMetricsResponse, error)
 	GetHealth(context.Context, *GetPluginHealthRequest) (*PluginHealth, error)
@@ -173,6 +186,9 @@ func (UnimplementedPluginRuntimeServer) ValidateInstance(context.Context, *Valid
 }
 func (UnimplementedPluginRuntimeServer) CollectNow(context.Context, *CollectPluginMetricsRequest) (*CollectPluginMetricsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CollectNow not implemented")
+}
+func (UnimplementedPluginRuntimeServer) TrialMetricTemplate(context.Context, *TrialMetricTemplateRequest) (*TrialMetricTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TrialMetricTemplate not implemented")
 }
 func (UnimplementedPluginRuntimeServer) StreamMetrics(*StreamPluginMetricsRequest, grpc.ServerStreamingServer[PluginMetricBatch]) error {
 	return status.Error(codes.Unimplemented, "method StreamMetrics not implemented")
@@ -279,6 +295,24 @@ func _PluginRuntime_CollectNow_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PluginRuntime_TrialMetricTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TrialMetricTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PluginRuntimeServer).TrialMetricTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PluginRuntime_TrialMetricTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PluginRuntimeServer).TrialMetricTemplate(ctx, req.(*TrialMetricTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _PluginRuntime_StreamMetrics_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(StreamPluginMetricsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -366,6 +400,10 @@ var PluginRuntime_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CollectNow",
 			Handler:    _PluginRuntime_CollectNow_Handler,
+		},
+		{
+			MethodName: "TrialMetricTemplate",
+			Handler:    _PluginRuntime_TrialMetricTemplate_Handler,
 		},
 		{
 			MethodName: "AcknowledgeMetrics",

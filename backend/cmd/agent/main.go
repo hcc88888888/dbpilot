@@ -27,6 +27,7 @@ import (
 	"dbpilot.local/platform/internal/agent"
 	"dbpilot.local/platform/internal/agent/commandjournal"
 	agentdiscovery "dbpilot.local/platform/internal/agent/discovery"
+	"dbpilot.local/platform/internal/agent/metrictemplatelease"
 	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
@@ -420,6 +421,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 	}
 	var pluginSupervisor *pluginsupervisor.PluginSupervisor
 	var pluginLeases *deferredPluginLeaseClient
+	var pluginGatewayHealth *pluginsupervisor.GatewayHealthChecker
 	if settings.Plugin.Enabled {
 		currentUID, currentGID, nonRoot := pluginsupervisor.CurrentProcessIdentity()
 		if !nonRoot || currentUID != settings.Plugin.UserID || currentGID != settings.Plugin.GroupID {
@@ -478,7 +480,8 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return errors.New("configure plugin gateway")
 		}
-		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginsupervisor.NewGatewayHealthCheckerWithCredentials(pluginGateway, pluginLeases), UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
+		pluginGatewayHealth = pluginsupervisor.NewGatewayHealthCheckerWithCredentials(pluginGateway, pluginLeases)
+		pluginSupervisor, err = pluginsupervisor.NewPluginSupervisor(pluginsupervisor.PluginSupervisorConfig{AgentID: settings.AgentID, HostID: settings.HostID, RuntimeRoot: pluginRuntimeRoot, Store: stateStore, Installer: installer, Leases: pluginLeases, Downloader: downloader, Processes: pluginsupervisor.NewOSProcessRunner(pluginsupervisor.OSProcessRunnerConfig{}), Health: pluginGatewayHealth, UserID: settings.Plugin.UserID, GroupID: settings.Plugin.GroupID, DrainTimeout: 30 * time.Second, FailureWindow: 10 * time.Minute, FailureThreshold: 5})
 		if err != nil {
 			_ = store.Close()
 			return errors.New("configure plugin supervisor")
@@ -491,6 +494,15 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		if registerErr := executors.Register(agent.CommandKindReconcilePlugin, pluginExecutor); registerErr != nil {
 			_ = store.Close()
 			return errors.New("register plugin reconcile executor")
+		}
+		trialExecutor, trialErr := agent.NewMetricTemplateTrialExecutor(pluginLeases, pluginGatewayHealth)
+		if trialErr != nil {
+			_ = store.Close()
+			return errors.New("configure metric template trial executor")
+		}
+		if registerErr := executors.Register(agent.CommandKindCollectDatabaseMetrics, trialExecutor); registerErr != nil {
+			_ = store.Close()
+			return errors.New("register metric template trial executor")
 		}
 	}
 	commandVerifier, err := agent.NewCommandVerifier(settings.AgentID, controlPublicKey, executors.Capabilities())
@@ -582,8 +594,19 @@ func (client *deferredPluginLeaseClient) LeaseCredential(ctx context.Context, re
 	return control.LeaseCredential(ctx, request)
 }
 
+func (client *deferredPluginLeaseClient) LeaseMetricTemplate(ctx context.Context, request metrictemplatelease.Request) (metrictemplatelease.Material, error) {
+	client.mu.RLock()
+	control := client.client
+	client.mu.RUnlock()
+	if control == nil {
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	return control.LeaseMetricTemplate(ctx, request)
+}
+
 var _ pluginsupervisor.LeaseClient = (*deferredPluginLeaseClient)(nil)
 var _ pluginsupervisor.CredentialLeaser = (*deferredPluginLeaseClient)(nil)
+var _ agent.MetricTemplateLeaser = (*deferredPluginLeaseClient)(nil)
 
 func runProcHelper(arguments []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("proc-helper", flag.ContinueOnError)

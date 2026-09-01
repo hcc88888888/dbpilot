@@ -49,6 +49,7 @@ import (
 	"dbpilot.local/platform/internal/ingest"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/metrictemplate"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
@@ -251,12 +252,14 @@ type Server struct {
 	discoveryObservations   *agentcontrol.DiscoveryDispatcher
 	pluginObservations      *agentcontrol.PluginObservationDispatcher
 	credentialLeases        *credentiallease.ApplicationService
+	metricTemplateLeases    *metrictemplate.LeaseService
 	inspectionWorker        *inspection.Worker
 	scheduleInspections     func(context.Context, time.Time) error
 	processInspections      func(context.Context, time.Time) error
 	reconcilePluginCatalog  func(context.Context, time.Time) error
 	reconcilePlugins        func(context.Context, time.Time) error
 	repairPluginAssignments func(context.Context, time.Time) error
+	failMetricTrials        func(context.Context, time.Time) error
 	workers                 sync.WaitGroup
 }
 
@@ -575,13 +578,28 @@ func NewServer(config Config) (*Server, error) {
 	var assignmentRepository *pluginassignment.PostgresRepository
 	var assignmentService *pluginassignment.ApplicationService
 	var pluginReconciler *reconciliation.PluginReconciler
+	var metricRepository *metrictemplate.PostgresRepository
+	var metricTemplateService *metrictemplate.ApplicationService
+	var metricTemplateLeases *metrictemplate.LeaseService
+	var metricTemplateLeaseWire agentcontrol.MetricTemplateLeaseIssueService
 	var acceptanceProvisioner databaseinstance.AcceptanceProvisioner = databaseinstance.AcceptanceProvisionerFunc(func(context.Context, *sql.Tx, databaseinstance.Instance, databaseinstance.MutationAudit) (databaseinstance.AssignmentBinding, error) {
 		return databaseinstance.AssignmentBinding{}, databaseinstance.ErrPluginMissing
 	})
 	if config.PluginCatalog.Enabled {
 		assignmentRepository = pluginassignment.NewPostgresRepository(database, jobRepository)
 		assignmentService = pluginassignment.NewService(assignmentRepository)
-		pluginReconciler = reconciliation.NewPluginReconciler(assignmentRepository, agentRegistry)
+		metricRepository = metrictemplate.NewPostgresRepository(database, jobRepository)
+		pluginReconciler = reconciliation.NewPluginReconcilerWithTemplateLoader(assignmentRepository, metricRepository, agentRegistry)
+		// Task12 fixture keeps the authoritative dialect boundary explicit. The
+		// Task13 MySQL plugin replaces this deterministic acceptance adapter with
+		// its AST parser before custom templates can be enabled in production.
+		metricDialect := metrictemplate.DeterministicDialectValidator{Validate: func(context.Context, metrictemplate.TemplateDefinition) error { return nil }}
+		metricTemplateService = metrictemplate.NewService(metricRepository, metricDialect, metricRepository, time.Now)
+		metricTemplateLeases, err = metrictemplate.NewLeaseService(metrictemplate.LeaseConfig{Authorizer: metrictemplate.PostgresLeaseAuthorizer{Database: database, Fences: agentRegistry, Now: time.Now}, Audit: metrictemplate.PostgresLeaseAuditRecorder{Database: database}, Now: time.Now})
+		if err != nil {
+			return nil, errors.New("configure metric template leases")
+		}
+		metricTemplateLeaseWire = metricTemplateLeaseIssuer{Service: metricTemplateLeases}
 		acceptanceProvisioner = assignmentRepository
 	}
 	var pluginArtifactLeaseIssuer *agentcontrol.PluginArtifactLeaseIssuer
@@ -741,6 +759,7 @@ func NewServer(config Config) (*Server, error) {
 		PluginCatalog:              pluginCatalogService,
 		PluginAssignments:          assignmentService,
 		PluginReconciler:           pluginReconciler,
+		MetricTemplates:            metricTemplateService,
 		PluginUploadCleanupFailure: func(error) { log.Printf("plugin upload temporary cleanup failed") },
 		Ready: func(ctx context.Context) error {
 			if !ready.Load() {
@@ -760,6 +779,9 @@ func NewServer(config Config) (*Server, error) {
 				if err := assignmentRepository.Ready(ctx); err != nil {
 					return err
 				}
+				if metricRepository == nil || metricRepository.Ready(ctx) != nil {
+					return errors.New("metric templates are not ready")
+				}
 			}
 			return nil
 		},
@@ -775,7 +797,8 @@ func NewServer(config Config) (*Server, error) {
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
 		TargetAuthorizer: targetAuthorizer, TokenProtector: commandTokenProtector,
-		OnError: func(err error) { log.Printf("command lifecycle event failed: %v", err) },
+		TypedResultRecorder: metricTrialResultRecorder{Store: metricRepository},
+		OnError:             func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
 		if artifactBlobs != nil {
@@ -790,8 +813,14 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer)))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, dispatchCommands: func(ctx context.Context, at time.Time) error {
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer), agentcontrol.WithMetricTemplateLeaseIssuer(metricTemplateLeaseWire)))
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, metricTemplateLeases: metricTemplateLeases, failMetricTrials: func(ctx context.Context, at time.Time) error {
+		if metricRepository == nil {
+			return nil
+		}
+		_, err := metricRepository.FailTerminalTrials(ctx, 128, at.UTC())
+		return err
+	}, dispatchCommands: func(ctx context.Context, at time.Time) error {
 		_, err := commandLifecycle.DispatchPending(ctx, at)
 		return err
 	}, idempotency: idempotencyService, artifactBlobs: artifactBlobs,
@@ -1371,6 +1400,10 @@ func (server *Server) closeDatabase() {
 }
 
 func (server *Server) closeResources() {
+	if server.metricTemplateLeases != nil {
+		server.metricTemplateLeases.Close()
+		server.metricTemplateLeases = nil
+	}
 	if server.credentialLeases != nil {
 		server.credentialLeases.Close()
 		server.credentialLeases = nil
@@ -1391,7 +1424,7 @@ func (server *Server) startLoops(ctx context.Context) {
 	if retryEvery <= 0 {
 		retryEvery = time.Minute
 	}
-	server.workers.Add(8)
+	server.workers.Add(9)
 	go func() {
 		defer server.workers.Done()
 		periodic(ctx, evaluationEvery, func(at time.Time) { _ = server.evaluateAndDispatch(ctx, at) })
@@ -1441,6 +1474,16 @@ func (server *Server) startLoops(ctx context.Context) {
 		periodic(ctx, 5*time.Second, func(at time.Time) {
 			if err := server.repairPluginAssignments(ctx, at); err != nil && ctx.Err() == nil {
 				log.Printf("plugin assignment repair pass failed: %v", err)
+			}
+		})
+	}()
+	go func() {
+		defer server.workers.Done()
+		periodic(ctx, 5*time.Second, func(at time.Time) {
+			if server.failMetricTrials != nil {
+				if err := server.failMetricTrials(ctx, at); err != nil && ctx.Err() == nil {
+					log.Printf("metric template trial terminal reconciliation failed: %v", err)
+				}
 			}
 		})
 	}()

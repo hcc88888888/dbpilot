@@ -2,6 +2,8 @@ package pluginsupervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/credentialcache"
+	"dbpilot.local/platform/internal/agent/metrictemplatelease"
 	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"google.golang.org/protobuf/proto"
@@ -22,6 +25,7 @@ import (
 type GatewayHealthChecker struct {
 	client            *plugingateway.Client
 	credentials       CredentialLeaser
+	templates         MetricTemplateLeaser
 	mu                sync.Mutex
 	sessions          map[int]*plugingateway.Session
 	streams           map[int]context.CancelFunc
@@ -68,6 +72,9 @@ func NewGatewayHealthChecker(client *plugingateway.Client) *GatewayHealthChecker
 func NewGatewayHealthCheckerWithCredentials(client *plugingateway.Client, credentials CredentialLeaser) *GatewayHealthChecker {
 	checker := NewGatewayHealthChecker(client)
 	checker.credentials = credentials
+	if templates, ok := credentials.(MetricTemplateLeaser); ok {
+		checker.templates = templates
+	}
 	return checker
 }
 
@@ -96,7 +103,7 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "plugin_reconcile_unavailable")
 		return nil
 	}
-	if len(request.TemplateConfigurations) == 0 || !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) {
+	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
 		checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_templates")
 		return nil
 	}
@@ -121,6 +128,26 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 		for _, release := range releases {
 			defer release()
 		}
+		if len(request.TemplateReferences) > 0 {
+			if checker.templates == nil {
+				checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_templates")
+				return nil
+			}
+			perInstance, templateReleases, _, leaseErr := leaseMetricTemplates(ctx, checker.templates, request, time.Now().UTC())
+			if leaseErr != nil {
+				checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "waiting_templates")
+				return nil
+			}
+			for _, release := range templateReleases {
+				defer release()
+			}
+			for _, instance := range instances {
+				instance.Templates = cloneTemplateConfigurations(perInstance[instance.GetInstanceId()])
+			}
+			if session.SetExpectedInstanceTemplateConfigurations(perInstance) != nil {
+				return ErrHealthHandshake
+			}
+		}
 		configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
 		defer configuration.Release()
 		if err := session.ApplyConfiguration(ctx, configuration); err != nil {
@@ -138,8 +165,16 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 			return ErrHealthHandshake
 		}
 		if sink := checker.client.MetricSink(); sink != nil {
-			if err := session.CollectNow(ctx, request.InstanceIDs, request.TemplateIDs); err != nil {
-				return ErrHealthHandshake
+			for _, instance := range instances {
+				templateIDs := make([]string, len(instance.GetTemplates()))
+				for index, template := range instance.GetTemplates() {
+					templateIDs[index] = template.GetTemplateId()
+				}
+				if len(templateIDs) > 0 {
+					if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, templateIDs); err != nil {
+						return ErrHealthHandshake
+					}
+				}
 			}
 			streamContext, cancel := context.WithCancel(context.Background())
 			ready := make(chan error, 1)
@@ -207,6 +242,69 @@ var errCredentialLease = errors.New("credential lease unavailable")
 
 func leaseInstances(ctx context.Context, leaser CredentialLeaser, request HealthRequest, now time.Time) ([]*pluginv1.PluginInstanceConfiguration, []func(), time.Duration, error) {
 	return leaseInstancesWithCache(ctx, leaser, nil, request, now)
+}
+
+func leaseMetricTemplates(ctx context.Context, leaser MetricTemplateLeaser, request HealthRequest, now time.Time) (map[string][]*pluginv1.MetricTemplateConfiguration, []func(), time.Duration, error) {
+	if ctx == nil || leaser == nil || request.TemplateLeaseCommandID == "" || !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
+		return nil, nil, 0, ErrHealthHandshake
+	}
+	result := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(request.InstanceIDs))
+	releases := make([]func(), 0)
+	validFor := time.Duration(0)
+	failed := true
+	defer func() {
+		if failed {
+			for _, release := range releases {
+				release()
+			}
+			clearTemplateConfigurationMap(result)
+		}
+	}()
+	for _, instance := range request.InstanceTemplateRefs {
+		for _, reference := range instance.Templates {
+			material, err := leaser.LeaseMetricTemplate(ctx, metrictemplatelease.Request{CommandID: request.TemplateLeaseCommandID, AssignmentID: request.AssignmentID, InstanceID: instance.InstanceID, ConfigurationRevision: request.ConfigurationRevision, OperationRevision: request.OperationRevision, TemplateID: reference.TemplateID, RevisionID: reference.RevisionID, QueryDigest: append([]byte(nil), reference.QueryDigest...)})
+			if err != nil || !materialMatchesReference(material, request, instance.InstanceID, reference, now) {
+				material.Release()
+				return nil, nil, 0, ErrHealthHandshake
+			}
+			retained := &material
+			releases = append(releases, retained.Release)
+			configuration := &pluginv1.MetricTemplateConfiguration{TemplateId: material.TemplateID, Revision: material.Revision, QueryDigest: append([]byte(nil), reference.QueryDigest...), QueryKind: "sql", ReadOnlyStatement: string(material.StatementBytes), CollectionIntervalSeconds: uint32(material.CollectionIntervalSeconds), TimeoutSeconds: uint32(material.TimeoutSeconds), MaxRows: uint32(material.MaxRows), MaxColumns: uint32(material.MaxColumns)}
+			for _, mapping := range material.ValueMappings {
+				configuration.ValueMappings = append(configuration.ValueMappings, &pluginv1.MetricValueMapping{SourceColumn: mapping.SourceColumn, MetricName: mapping.MetricName, MetricType: mapping.MetricType, Unit: mapping.Unit})
+			}
+			for _, mapping := range material.LabelMappings {
+				configuration.LabelMappings = append(configuration.LabelMappings, &pluginv1.MetricLabelMapping{SourceColumn: mapping.SourceColumn, Label: mapping.Label})
+			}
+			result[instance.InstanceID] = append(result[instance.InstanceID], configuration)
+			remaining := material.ExpiresAt.Sub(now)
+			if validFor == 0 || remaining < validFor {
+				validFor = remaining
+			}
+		}
+	}
+	failed = false
+	return result, releases, validFor, nil
+}
+
+func clearTemplateConfigurationMap(values map[string][]*pluginv1.MetricTemplateConfiguration) {
+	for _, templates := range values {
+		for _, template := range templates {
+			if template != nil {
+				template.ReadOnlyStatement = ""
+				template.ValueMappings = nil
+				template.LabelMappings = nil
+			}
+		}
+	}
+}
+
+func materialMatchesReference(material metrictemplatelease.Material, request HealthRequest, instanceID string, reference TemplateReference, now time.Time) bool {
+	if material.AssignmentID != request.AssignmentID || material.InstanceID != instanceID || material.ConfigurationRevision != request.ConfigurationRevision || material.OperationRevision != request.OperationRevision || material.TemplateID != reference.TemplateID || material.RevisionID != reference.RevisionID || material.QueryDigest != hex.EncodeToString(reference.QueryDigest) || material.TimeoutSeconds != int(reference.TimeoutSeconds) || material.MaxRows != int(reference.MaxRows) || material.MaxColumns != int(reference.MaxColumns) || material.CardinalityLimit != int(reference.CardinalityLimit) || !material.ExpiresAt.After(now) || len(material.StatementBytes) == 0 {
+		return false
+	}
+	digest := sha256.Sum256(material.StatementBytes)
+	return hex.EncodeToString(digest[:]) == material.QueryDigest
 }
 
 func leaseInstancesWithCache(ctx context.Context, leaser CredentialLeaser, cache *credentialcache.Cache, request HealthRequest, now time.Time) ([]*pluginv1.PluginInstanceConfiguration, []func(), time.Duration, error) {
@@ -315,8 +413,13 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 			checker.invalidateCredentialFlights(request.AssignmentID)
 			instances, releases, renewedFor, err := leaseInstancesWithCache(callContext, credentialLeaserFunc(checker.leaseCredential), checker.cache, request, time.Now().UTC())
 			if err == nil {
+				if !checker.copyActiveTemplates(process.PID(), instances) {
+					err = errCredentialLease
+				}
 				configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
-				err = session.ApplyConfiguration(callContext, configuration)
+				if err == nil {
+					err = session.ApplyConfiguration(callContext, configuration)
+				}
 				applied := err == nil
 				if err == nil {
 					for _, instanceID := range request.InstanceIDs {
@@ -373,6 +476,28 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 			}
 		}
 	}()
+}
+
+func (checker *GatewayHealthChecker) copyActiveTemplates(pid int, instances []*pluginv1.PluginInstanceConfiguration) bool {
+	checker.mu.Lock()
+	active := clonePluginConfiguration(checker.activeCredentials[pid].configuration)
+	checker.mu.Unlock()
+	defer active.Release()
+	if len(active.Instances) != len(instances) {
+		return false
+	}
+	byID := map[string]*pluginv1.PluginInstanceConfiguration{}
+	for _, instance := range active.Instances {
+		byID[instance.GetInstanceId()] = instance
+	}
+	for _, instance := range instances {
+		stored := byID[instance.GetInstanceId()]
+		if stored == nil {
+			return false
+		}
+		instance.Templates = cloneTemplateConfigurations(stored.GetTemplates())
+	}
+	return true
 }
 
 func (checker *GatewayHealthChecker) rollbackCredentialConfiguration(ctx context.Context, pid int, session *plugingateway.Session, instanceIDs []string) bool {
@@ -532,6 +657,28 @@ func (checker *GatewayHealthChecker) ActivationState(process Process) (pluginsta
 		return pluginstate.HealthUnhealthy, "plugin_reconcile_unavailable"
 	}
 	return value.health, value.code
+}
+
+func (checker *GatewayHealthChecker) TrialMetricTemplate(ctx context.Context, assignmentID string, configurationRevision, operationRevision uint64, instanceID string, definition *pluginv1.TrialMetricTemplateDefinition) (plugingateway.TrialResult, error) {
+	if checker == nil || ctx == nil || ctx.Err() != nil || assignmentID == "" || configurationRevision == 0 || operationRevision == 0 || instanceID == "" || definition == nil {
+		return plugingateway.TrialResult{}, ErrHealthHandshake
+	}
+	checker.mu.Lock()
+	var session *plugingateway.Session
+	for _, candidate := range checker.sessions {
+		if candidate != nil && candidate.AssignmentID() == assignmentID && candidate.ConfigurationRevision() == configurationRevision && candidate.OperationRevision() == operationRevision {
+			if session != nil {
+				checker.mu.Unlock()
+				return plugingateway.TrialResult{}, ErrHealthHandshake
+			}
+			session = candidate
+		}
+	}
+	checker.mu.Unlock()
+	if session == nil {
+		return plugingateway.TrialResult{}, ErrHealthHandshake
+	}
+	return session.TrialMetricTemplate(ctx, configurationRevision, operationRevision, instanceID, definition)
 }
 
 // Shutdown drains through the verified gateway before the Supervisor signals

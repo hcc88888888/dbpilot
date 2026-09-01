@@ -496,7 +496,10 @@ func (s *testConnectStream) nextSent(t *testing.T) *agentv1.ServerMessage {
 		return nil
 	}
 }
-func (s *testConnectStream) Send(message *agentv1.ServerMessage) error { s.sent <- message; return nil }
+func (s *testConnectStream) Send(message *agentv1.ServerMessage) error {
+	s.sent <- proto.Clone(message).(*agentv1.ServerMessage)
+	return nil
+}
 func (s *testConnectStream) Recv() (*agentv1.AgentMessage, error) {
 	message, ok := <-s.receive
 	if !ok {

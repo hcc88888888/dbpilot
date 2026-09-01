@@ -15,6 +15,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/metrictemplatelease"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"google.golang.org/protobuf/proto"
 )
@@ -72,6 +73,9 @@ type ReconcileRequest struct {
 	InstanceDescriptors    []InstanceDescriptor
 	TemplateIDs            []string
 	TemplateConfigurations []*pluginv1.MetricTemplateConfiguration
+	TemplateLeaseCommandID string
+	TemplateReferences     []TemplateReference
+	InstanceTemplateRefs   []InstanceTemplateReferences
 	CredentialsComplete    bool
 }
 
@@ -84,10 +88,25 @@ type InstanceDescriptor struct {
 	UnixSocket      string
 }
 
+type TemplateReference struct {
+	TemplateID       string
+	RevisionID       string
+	QueryDigest      []byte
+	TimeoutSeconds   uint32
+	MaxRows          uint32
+	MaxColumns       uint32
+	CardinalityLimit uint32
+}
+
+type InstanceTemplateReferences struct {
+	InstanceID string
+	Templates  []TemplateReference
+}
+
 func (request ReconcileRequest) Validate() error {
 	if !resourceIdentifier.MatchString(request.AssignmentID) || !familyIdentifier.MatchString(request.PluginID) || !familyIdentifier.MatchString(request.DatabaseFamily) ||
 		request.ConfigurationRevision == 0 || request.OperationRevision == 0 || len(request.InstanceIDs) > MaxAssignedInstances || len(request.TemplateIDs) > MaxAssignedTemplates ||
-		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) || !validInstanceDescriptors(request.InstanceIDs, request.InstanceDescriptors) || !validTemplateConfigurations(request.TemplateIDs, request.TemplateConfigurations) || request.CredentialsComplete && len(request.TemplateConfigurations) == 0 {
+		!uniqueResources(request.InstanceIDs) || !uniqueResources(request.TemplateIDs) || !validInstanceDescriptors(request.InstanceIDs, request.InstanceDescriptors) || !validTemplateConfigurations(request.TemplateIDs, request.TemplateConfigurations) || !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) || len(request.TemplateReferences) > 0 && len(request.TemplateConfigurations) > 0 {
 		return ErrInvalidRequest
 	}
 	switch request.DesiredState {
@@ -140,6 +159,16 @@ func (request ReconcileRequest) Fingerprint() string {
 	for _, configuration := range configurations {
 		encoded, _ := proto.MarshalOptions{Deterministic: true}.Marshal(configuration)
 		values = append(values, hex.EncodeToString(encoded))
+	}
+	values = append(values, "template_lease_command", request.TemplateLeaseCommandID, "template_references", strconv.Itoa(len(request.TemplateReferences)))
+	for _, reference := range request.TemplateReferences {
+		values = append(values, reference.TemplateID, reference.RevisionID, hex.EncodeToString(reference.QueryDigest), strconv.FormatUint(uint64(reference.TimeoutSeconds), 10), strconv.FormatUint(uint64(reference.MaxRows), 10), strconv.FormatUint(uint64(reference.MaxColumns), 10), strconv.FormatUint(uint64(reference.CardinalityLimit), 10))
+	}
+	for _, instance := range request.InstanceTemplateRefs {
+		values = append(values, "instance_templates", instance.InstanceID)
+		for _, reference := range instance.Templates {
+			values = append(values, reference.RevisionID)
+		}
 	}
 	hash := sha256.New()
 	for _, value := range values {
@@ -247,6 +276,10 @@ type CredentialLeaser interface {
 	LeaseCredential(context.Context, CredentialLeaseRequest) (CredentialLease, error)
 }
 
+type MetricTemplateLeaser interface {
+	LeaseMetricTemplate(context.Context, metrictemplatelease.Request) (metrictemplatelease.Material, error)
+}
+
 type DownloadedArtifact struct {
 	Body io.ReadCloser
 	Size int64
@@ -350,6 +383,9 @@ type HealthRequest struct {
 	SignedCapabilities          []string
 	MetricTemplateSchemaVersion uint32
 	TemplateConfigurations      []*pluginv1.MetricTemplateConfiguration
+	TemplateLeaseCommandID      string
+	TemplateReferences          []TemplateReference
+	InstanceTemplateRefs        []InstanceTemplateReferences
 	CredentialsComplete         bool
 	RuntimeDirectory            string
 	LaunchNonce                 []byte
@@ -426,6 +462,66 @@ func validInstanceDescriptors(instanceIDs []string, descriptors []InstanceDescri
 		seen[descriptor.InstanceID] = struct{}{}
 	}
 	return true
+}
+
+func validTemplateReferences(templateIDs, instanceIDs []string, commandID string, references []TemplateReference, instances []InstanceTemplateReferences) bool {
+	if len(references) == 0 {
+		return commandID == "" && len(instances) == 0
+	}
+	if !resourceIdentifier.MatchString(commandID) || len(references) != len(templateIDs) || len(references) > MaxAssignedTemplates || len(instances) != len(instanceIDs) {
+		return false
+	}
+	byRevision := map[string]TemplateReference{}
+	byTemplate := map[string]struct{}{}
+	for _, reference := range references {
+		if !validTemplateReference(reference) {
+			return false
+		}
+		if _, duplicate := byRevision[reference.RevisionID]; duplicate {
+			return false
+		}
+		if _, duplicate := byTemplate[reference.TemplateID]; duplicate {
+			return false
+		}
+		byRevision[reference.RevisionID], byTemplate[reference.TemplateID] = reference, struct{}{}
+	}
+	for _, id := range templateIDs {
+		if _, ok := byTemplate[id]; !ok {
+			return false
+		}
+	}
+	allowedInstances, seenInstances, used := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
+	for _, id := range instanceIDs {
+		allowedInstances[id] = struct{}{}
+	}
+	for _, instance := range instances {
+		if _, ok := allowedInstances[instance.InstanceID]; !ok {
+			return false
+		}
+		if _, duplicate := seenInstances[instance.InstanceID]; duplicate {
+			return false
+		}
+		seenInstances[instance.InstanceID] = struct{}{}
+		seenTemplates := map[string]struct{}{}
+		for _, reference := range instance.Templates {
+			authoritative, ok := byRevision[reference.RevisionID]
+			if !ok || !sameTemplateReference(authoritative, reference) {
+				return false
+			}
+			if _, duplicate := seenTemplates[reference.TemplateID]; duplicate {
+				return false
+			}
+			seenTemplates[reference.TemplateID], used[reference.RevisionID] = struct{}{}, struct{}{}
+		}
+	}
+	return len(used) == len(byRevision)
+}
+
+func validTemplateReference(value TemplateReference) bool {
+	return resourceIdentifier.MatchString(value.TemplateID) && resourceIdentifier.MatchString(value.RevisionID) && len(value.QueryDigest) == sha256.Size && value.TimeoutSeconds > 0 && value.TimeoutSeconds <= 30 && value.MaxRows > 0 && value.MaxRows <= 100 && value.MaxColumns > 0 && value.MaxColumns <= 32 && value.CardinalityLimit > 0 && value.CardinalityLimit <= 10000
+}
+func sameTemplateReference(left, right TemplateReference) bool {
+	return left.TemplateID == right.TemplateID && left.RevisionID == right.RevisionID && hmac.Equal(left.QueryDigest, right.QueryDigest) && left.TimeoutSeconds == right.TimeoutSeconds && left.MaxRows == right.MaxRows && left.MaxColumns == right.MaxColumns && left.CardinalityLimit == right.CardinalityLimit
 }
 
 func validTemplateConfigurations(templateIDs []string, values []*pluginv1.MetricTemplateConfiguration) bool {

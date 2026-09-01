@@ -102,6 +102,21 @@ type InstanceDescriptor struct {
 	UnixSocket      string `json:"unix_socket,omitempty"`
 }
 
+type TemplateReference struct {
+	TemplateID       string `json:"template_id"`
+	RevisionID       string `json:"revision_id"`
+	QueryDigest      string `json:"query_digest"`
+	TimeoutSeconds   uint32 `json:"timeout_seconds"`
+	MaxRows          uint32 `json:"max_rows"`
+	MaxColumns       uint32 `json:"max_columns"`
+	CardinalityLimit uint32 `json:"cardinality_limit"`
+}
+
+type InstanceTemplateReferences struct {
+	InstanceID string              `json:"instance_id"`
+	Templates  []TemplateReference `json:"templates"`
+}
+
 // FamilyState contains only durable, non-secret reconciliation facts. Lease
 // URLs, request headers, credentials, command tokens and plugin output never
 // cross this persistence boundary.
@@ -118,6 +133,9 @@ type FamilyState struct {
 	ActiveInstanceDescriptors     []InstanceDescriptor                    `json:"active_instance_descriptors,omitempty"`
 	ActiveTemplateIDs             []string                                `json:"active_template_ids,omitempty"`
 	ActiveTemplateConfigurations  []*pluginv1.MetricTemplateConfiguration `json:"active_template_configurations,omitempty"`
+	ActiveTemplateLeaseCommandID  string                                  `json:"active_template_lease_command_id,omitempty"`
+	ActiveTemplateReferences      []TemplateReference                     `json:"active_template_references,omitempty"`
+	ActiveInstanceTemplateRefs    []InstanceTemplateReferences            `json:"active_instance_template_refs,omitempty"`
 	ActiveCredentialsComplete     bool                                    `json:"active_credentials_complete,omitempty"`
 	DesiredVersion                string                                  `json:"desired_version,omitempty"`
 	DesiredArtifactID             string                                  `json:"desired_artifact_id,omitempty"`
@@ -128,6 +146,9 @@ type FamilyState struct {
 	DesiredInstanceDescriptors    []InstanceDescriptor                    `json:"desired_instance_descriptors,omitempty"`
 	DesiredTemplateIDs            []string                                `json:"desired_template_ids,omitempty"`
 	DesiredTemplateConfigurations []*pluginv1.MetricTemplateConfiguration `json:"desired_template_configurations,omitempty"`
+	DesiredTemplateLeaseCommandID string                                  `json:"desired_template_lease_command_id,omitempty"`
+	DesiredTemplateReferences     []TemplateReference                     `json:"desired_template_references,omitempty"`
+	DesiredInstanceTemplateRefs   []InstanceTemplateReferences            `json:"desired_instance_template_refs,omitempty"`
 	DesiredCredentialsComplete    bool                                    `json:"desired_credentials_complete,omitempty"`
 	RequestFingerprint            string                                  `json:"request_fingerprint"`
 	ActiveSlot                    Slot                                    `json:"active_slot"`
@@ -165,7 +186,7 @@ func (state FamilyState) Validate() error {
 	if state.InstalledVersion != "" && !boundedText(state.InstalledVersion, 64) || state.DesiredVersion != "" && !boundedText(state.DesiredVersion, 64) || state.LastErrorCode != "" && !identifierPattern.MatchString(state.LastErrorCode) || int(state.BoundInstanceCount) != len(state.ActiveInstanceIDs) {
 		return ErrInvalidState
 	}
-	if !validOptionalArtifact(state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest) || !validOptionalArtifact(state.DesiredArtifactID, state.DesiredArtifactSHA256, state.DesiredManifestDigest) || !validIDs(state.ActiveInstanceIDs) || !validIDs(state.ActiveTemplateIDs) || !validIDs(state.DesiredInstanceIDs) || !validIDs(state.DesiredTemplateIDs) || !validDescriptors(state.ActiveInstanceIDs, state.ActiveInstanceDescriptors) || !validDescriptors(state.DesiredInstanceIDs, state.DesiredInstanceDescriptors) || !validTemplateProjection(state.ActiveTemplateIDs, state.ActiveTemplateConfigurations) || !validTemplateProjection(state.DesiredTemplateIDs, state.DesiredTemplateConfigurations) {
+	if !validOptionalArtifact(state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest) || !validOptionalArtifact(state.DesiredArtifactID, state.DesiredArtifactSHA256, state.DesiredManifestDigest) || !validIDs(state.ActiveInstanceIDs) || !validIDs(state.ActiveTemplateIDs) || !validIDs(state.DesiredInstanceIDs) || !validIDs(state.DesiredTemplateIDs) || !validDescriptors(state.ActiveInstanceIDs, state.ActiveInstanceDescriptors) || !validDescriptors(state.DesiredInstanceIDs, state.DesiredInstanceDescriptors) || !validTemplateProjection(state.ActiveTemplateIDs, state.ActiveTemplateConfigurations) || !validTemplateProjection(state.DesiredTemplateIDs, state.DesiredTemplateConfigurations) || !validPublicTemplateReferences(state.ActiveTemplateIDs, state.ActiveInstanceIDs, state.ActiveTemplateLeaseCommandID, state.ActiveTemplateReferences, state.ActiveInstanceTemplateRefs) || !validPublicTemplateReferences(state.DesiredTemplateIDs, state.DesiredInstanceIDs, state.DesiredTemplateLeaseCommandID, state.DesiredTemplateReferences, state.DesiredInstanceTemplateRefs) || len(state.ActiveTemplateReferences) > 0 && len(state.ActiveTemplateConfigurations) > 0 || len(state.DesiredTemplateReferences) > 0 && len(state.DesiredTemplateConfigurations) > 0 {
 		return ErrInvalidState
 	}
 	for slot, value := range state.Slots {
@@ -398,10 +419,14 @@ func cloneFamily(state FamilyState) FamilyState {
 	state.ActiveInstanceDescriptors = append([]InstanceDescriptor(nil), state.ActiveInstanceDescriptors...)
 	state.ActiveTemplateIDs = append([]string(nil), state.ActiveTemplateIDs...)
 	state.ActiveTemplateConfigurations = cloneTemplates(state.ActiveTemplateConfigurations)
+	state.ActiveTemplateReferences = append([]TemplateReference(nil), state.ActiveTemplateReferences...)
+	state.ActiveInstanceTemplateRefs = cloneInstanceTemplateRefs(state.ActiveInstanceTemplateRefs)
 	state.DesiredInstanceIDs = append([]string(nil), state.DesiredInstanceIDs...)
 	state.DesiredInstanceDescriptors = append([]InstanceDescriptor(nil), state.DesiredInstanceDescriptors...)
 	state.DesiredTemplateIDs = append([]string(nil), state.DesiredTemplateIDs...)
 	state.DesiredTemplateConfigurations = cloneTemplates(state.DesiredTemplateConfigurations)
+	state.DesiredTemplateReferences = append([]TemplateReference(nil), state.DesiredTemplateReferences...)
+	state.DesiredInstanceTemplateRefs = cloneInstanceTemplateRefs(state.DesiredInstanceTemplateRefs)
 	if state.Slots != nil {
 		state.Slots = make(map[Slot]SlotState, len(state.Slots))
 		for slot, value := range state.Slots {
@@ -466,6 +491,71 @@ func validDescriptors(instanceIDs []string, values []InstanceDescriptor) bool {
 		seen[value.InstanceID] = struct{}{}
 	}
 	return true
+}
+
+func validPublicTemplateReferences(templateIDs, instanceIDs []string, commandID string, references []TemplateReference, instances []InstanceTemplateReferences) bool {
+	if len(references) == 0 {
+		return commandID == "" && len(instances) == 0
+	}
+	if !resourcePattern.MatchString(commandID) || len(references) != len(templateIDs) || len(references) > 128 || len(instances) != len(instanceIDs) {
+		return false
+	}
+	byRevision, byTemplate := map[string]TemplateReference{}, map[string]struct{}{}
+	for _, reference := range references {
+		if !resourcePattern.MatchString(reference.TemplateID) || !resourcePattern.MatchString(reference.RevisionID) || !hexDigest(reference.QueryDigest) || reference.TimeoutSeconds == 0 || reference.TimeoutSeconds > 30 || reference.MaxRows == 0 || reference.MaxRows > 100 || reference.MaxColumns == 0 || reference.MaxColumns > 32 || reference.CardinalityLimit == 0 || reference.CardinalityLimit > 10000 {
+			return false
+		}
+		if _, duplicate := byRevision[reference.RevisionID]; duplicate {
+			return false
+		}
+		if _, duplicate := byTemplate[reference.TemplateID]; duplicate {
+			return false
+		}
+		byRevision[reference.RevisionID], byTemplate[reference.TemplateID] = reference, struct{}{}
+	}
+	for _, templateID := range templateIDs {
+		if _, ok := byTemplate[templateID]; !ok {
+			return false
+		}
+	}
+	allowedInstances, seenInstances, used := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
+	for _, instanceID := range instanceIDs {
+		allowedInstances[instanceID] = struct{}{}
+	}
+	for _, instance := range instances {
+		if _, ok := allowedInstances[instance.InstanceID]; !ok {
+			return false
+		}
+		if _, duplicate := seenInstances[instance.InstanceID]; duplicate {
+			return false
+		}
+		seenInstances[instance.InstanceID] = struct{}{}
+		seenTemplates := map[string]struct{}{}
+		for _, reference := range instance.Templates {
+			authoritative, ok := byRevision[reference.RevisionID]
+			if !ok || !samePublicTemplateReference(authoritative, reference) {
+				return false
+			}
+			if _, duplicate := seenTemplates[reference.TemplateID]; duplicate {
+				return false
+			}
+			seenTemplates[reference.TemplateID], used[reference.RevisionID] = struct{}{}, struct{}{}
+		}
+	}
+	return len(used) == len(byRevision)
+}
+
+func samePublicTemplateReference(left, right TemplateReference) bool {
+	return left.TemplateID == right.TemplateID && left.RevisionID == right.RevisionID && left.QueryDigest == right.QueryDigest && left.TimeoutSeconds == right.TimeoutSeconds && left.MaxRows == right.MaxRows && left.MaxColumns == right.MaxColumns && left.CardinalityLimit == right.CardinalityLimit
+}
+
+func cloneInstanceTemplateRefs(values []InstanceTemplateReferences) []InstanceTemplateReferences {
+	result := make([]InstanceTemplateReferences, len(values))
+	for index, value := range values {
+		result[index] = value
+		result[index].Templates = append([]TemplateReference(nil), value.Templates...)
+	}
+	return result
 }
 
 func validTemplateProjection(templateIDs []string, values []*pluginv1.MetricTemplateConfiguration) bool {

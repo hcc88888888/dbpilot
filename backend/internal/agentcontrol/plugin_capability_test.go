@@ -8,6 +8,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -53,4 +54,20 @@ func TestRegistryDispatchesDescriptorFreeSafetyCommandsToOldAgent(t *testing.T) 
 			require.Len(t, session.send, 1)
 		})
 	}
+}
+
+func TestMetricTemplateLeaseCapabilityIsConditionalOnExactReferences(t *testing.T) {
+	ref := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: make([]byte, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1}
+	running := &agentv1.CommandEnvelope{Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{DesiredState: agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{ref}}}}
+	require.Equal(t, []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1", "metric_template_lease.v1"}, commandCapabilities(running))
+	installed := proto.Clone(running).(*agentv1.CommandEnvelope)
+	installed.GetReconcilePlugin().DesiredState = agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_INSTALLED
+	installed.GetReconcilePlugin().TemplateRevisions = nil
+	require.NotContains(t, commandCapabilities(installed), "metric_template_lease.v1")
+	for _, desired := range []agentv1.PluginDesiredState{agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_STOPPED, agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT} {
+		safety := &agentv1.CommandEnvelope{Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{DesiredState: desired}}}
+		require.Equal(t, []string{"plugin.reconcile.v1"}, commandCapabilities(safety))
+	}
+	collect := &agentv1.CommandEnvelope{Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{TemplateRevisions: []*agentv1.MetricTemplateCommandReference{ref}}}}
+	require.Equal(t, []string{"plugin.metrics.collect.v1", "metric_template_lease.v1"}, commandCapabilities(collect))
 }

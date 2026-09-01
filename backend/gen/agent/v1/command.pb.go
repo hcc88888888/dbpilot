@@ -318,6 +318,7 @@ type AgentMessage struct {
 	//	*AgentMessage_PluginObservation
 	//	*AgentMessage_CredentialLeaseRequest
 	//	*AgentMessage_PluginArtifactLeaseRequest
+	//	*AgentMessage_MetricTemplateLeaseRequest
 	Message       isAgentMessage_Message `protobuf_oneof:"message"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -482,6 +483,15 @@ func (x *AgentMessage) GetPluginArtifactLeaseRequest() *PluginArtifactLeaseReque
 	return nil
 }
 
+func (x *AgentMessage) GetMetricTemplateLeaseRequest() *MetricTemplateLeaseRequest {
+	if x != nil {
+		if x, ok := x.Message.(*AgentMessage_MetricTemplateLeaseRequest); ok {
+			return x.MetricTemplateLeaseRequest
+		}
+	}
+	return nil
+}
+
 type isAgentMessage_Message interface {
 	isAgentMessage_Message()
 }
@@ -534,6 +544,10 @@ type AgentMessage_PluginArtifactLeaseRequest struct {
 	PluginArtifactLeaseRequest *PluginArtifactLeaseRequest `protobuf:"bytes,31,opt,name=plugin_artifact_lease_request,json=pluginArtifactLeaseRequest,proto3,oneof"`
 }
 
+type AgentMessage_MetricTemplateLeaseRequest struct {
+	MetricTemplateLeaseRequest *MetricTemplateLeaseRequest `protobuf:"bytes,32,opt,name=metric_template_lease_request,json=metricTemplateLeaseRequest,proto3,oneof"`
+}
+
 func (*AgentMessage_Hello) isAgentMessage_Message() {}
 
 func (*AgentMessage_Heartbeat) isAgentMessage_Message() {}
@@ -558,6 +572,8 @@ func (*AgentMessage_CredentialLeaseRequest) isAgentMessage_Message() {}
 
 func (*AgentMessage_PluginArtifactLeaseRequest) isAgentMessage_Message() {}
 
+func (*AgentMessage_MetricTemplateLeaseRequest) isAgentMessage_Message() {}
+
 type ServerMessage struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	MessageId string                 `protobuf:"bytes,1,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`
@@ -573,6 +589,7 @@ type ServerMessage struct {
 	//	*ServerMessage_CommandStart
 	//	*ServerMessage_CredentialLeaseResponse
 	//	*ServerMessage_PluginArtifactLeaseResponse
+	//	*ServerMessage_MetricTemplateLeaseResponse
 	//	*ServerMessage_DiscoveryReportAcknowledgement
 	Message       isServerMessage_Message `protobuf_oneof:"message"`
 	unknownFields protoimpl.UnknownFields
@@ -711,6 +728,15 @@ func (x *ServerMessage) GetPluginArtifactLeaseResponse() *PluginArtifactLeaseRes
 	return nil
 }
 
+func (x *ServerMessage) GetMetricTemplateLeaseResponse() *MetricTemplateLeaseResponse {
+	if x != nil {
+		if x, ok := x.Message.(*ServerMessage_MetricTemplateLeaseResponse); ok {
+			return x.MetricTemplateLeaseResponse
+		}
+	}
+	return nil
+}
+
 func (x *ServerMessage) GetDiscoveryReportAcknowledgement() *DiscoveryReportAcknowledgement {
 	if x != nil {
 		if x, ok := x.Message.(*ServerMessage_DiscoveryReportAcknowledgement); ok {
@@ -760,6 +786,10 @@ type ServerMessage_PluginArtifactLeaseResponse struct {
 	PluginArtifactLeaseResponse *PluginArtifactLeaseResponse `protobuf:"bytes,28,opt,name=plugin_artifact_lease_response,json=pluginArtifactLeaseResponse,proto3,oneof"`
 }
 
+type ServerMessage_MetricTemplateLeaseResponse struct {
+	MetricTemplateLeaseResponse *MetricTemplateLeaseResponse `protobuf:"bytes,29,opt,name=metric_template_lease_response,json=metricTemplateLeaseResponse,proto3,oneof"`
+}
+
 type ServerMessage_DiscoveryReportAcknowledgement struct {
 	DiscoveryReportAcknowledgement *DiscoveryReportAcknowledgement `protobuf:"bytes,50,opt,name=discovery_report_acknowledgement,json=discoveryReportAcknowledgement,proto3,oneof"`
 }
@@ -781,6 +811,8 @@ func (*ServerMessage_CommandStart) isServerMessage_Message() {}
 func (*ServerMessage_CredentialLeaseResponse) isServerMessage_Message() {}
 
 func (*ServerMessage_PluginArtifactLeaseResponse) isServerMessage_Message() {}
+
+func (*ServerMessage_MetricTemplateLeaseResponse) isServerMessage_Message() {}
 
 func (*ServerMessage_DiscoveryReportAcknowledgement) isServerMessage_Message() {}
 
@@ -1900,22 +1932,24 @@ func (x *DiscoverDatabases) GetIncludeDocker() bool {
 }
 
 type ReconcilePlugin struct {
-	state                 protoimpl.MessageState      `protogen:"open.v1"`
-	AssignmentId          string                      `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
-	PluginId              string                      `protobuf:"bytes,2,opt,name=plugin_id,json=pluginId,proto3" json:"plugin_id,omitempty"`
-	DatabaseFamily        string                      `protobuf:"bytes,3,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
-	DesiredVersion        string                      `protobuf:"bytes,4,opt,name=desired_version,json=desiredVersion,proto3" json:"desired_version,omitempty"`
-	DesiredState          PluginDesiredState          `protobuf:"varint,5,opt,name=desired_state,json=desiredState,proto3,enum=dbpilot.agent.v1.PluginDesiredState" json:"desired_state,omitempty"`
-	ArtifactId            string                      `protobuf:"bytes,6,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
-	ArtifactSha256        []byte                      `protobuf:"bytes,7,opt,name=artifact_sha256,json=artifactSha256,proto3" json:"artifact_sha256,omitempty"`
-	ManifestDigest        []byte                      `protobuf:"bytes,8,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
-	ConfigurationRevision uint64                      `protobuf:"varint,9,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
-	OperationRevision     uint64                      `protobuf:"varint,10,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
-	InstanceIds           []string                    `protobuf:"bytes,11,rep,name=instance_ids,json=instanceIds,proto3" json:"instance_ids,omitempty"`
-	TemplateIds           []string                    `protobuf:"bytes,12,rep,name=template_ids,json=templateIds,proto3" json:"template_ids,omitempty"`
-	InstanceDescriptors   []*PluginInstanceDescriptor `protobuf:"bytes,20,rep,name=instance_descriptors,json=instanceDescriptors,proto3" json:"instance_descriptors,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	state                     protoimpl.MessageState              `protogen:"open.v1"`
+	AssignmentId              string                              `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	PluginId                  string                              `protobuf:"bytes,2,opt,name=plugin_id,json=pluginId,proto3" json:"plugin_id,omitempty"`
+	DatabaseFamily            string                              `protobuf:"bytes,3,opt,name=database_family,json=databaseFamily,proto3" json:"database_family,omitempty"`
+	DesiredVersion            string                              `protobuf:"bytes,4,opt,name=desired_version,json=desiredVersion,proto3" json:"desired_version,omitempty"`
+	DesiredState              PluginDesiredState                  `protobuf:"varint,5,opt,name=desired_state,json=desiredState,proto3,enum=dbpilot.agent.v1.PluginDesiredState" json:"desired_state,omitempty"`
+	ArtifactId                string                              `protobuf:"bytes,6,opt,name=artifact_id,json=artifactId,proto3" json:"artifact_id,omitempty"`
+	ArtifactSha256            []byte                              `protobuf:"bytes,7,opt,name=artifact_sha256,json=artifactSha256,proto3" json:"artifact_sha256,omitempty"`
+	ManifestDigest            []byte                              `protobuf:"bytes,8,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
+	ConfigurationRevision     uint64                              `protobuf:"varint,9,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	OperationRevision         uint64                              `protobuf:"varint,10,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	InstanceIds               []string                            `protobuf:"bytes,11,rep,name=instance_ids,json=instanceIds,proto3" json:"instance_ids,omitempty"`
+	TemplateIds               []string                            `protobuf:"bytes,12,rep,name=template_ids,json=templateIds,proto3" json:"template_ids,omitempty"`
+	TemplateRevisions         []*MetricTemplateCommandReference   `protobuf:"bytes,13,rep,name=template_revisions,json=templateRevisions,proto3" json:"template_revisions,omitempty"`
+	InstanceTemplateRevisions []*PluginInstanceTemplateReferences `protobuf:"bytes,14,rep,name=instance_template_revisions,json=instanceTemplateRevisions,proto3" json:"instance_template_revisions,omitempty"`
+	InstanceDescriptors       []*PluginInstanceDescriptor         `protobuf:"bytes,20,rep,name=instance_descriptors,json=instanceDescriptors,proto3" json:"instance_descriptors,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ReconcilePlugin) Reset() {
@@ -2032,9 +2066,75 @@ func (x *ReconcilePlugin) GetTemplateIds() []string {
 	return nil
 }
 
+func (x *ReconcilePlugin) GetTemplateRevisions() []*MetricTemplateCommandReference {
+	if x != nil {
+		return x.TemplateRevisions
+	}
+	return nil
+}
+
+func (x *ReconcilePlugin) GetInstanceTemplateRevisions() []*PluginInstanceTemplateReferences {
+	if x != nil {
+		return x.InstanceTemplateRevisions
+	}
+	return nil
+}
+
 func (x *ReconcilePlugin) GetInstanceDescriptors() []*PluginInstanceDescriptor {
 	if x != nil {
 		return x.InstanceDescriptors
+	}
+	return nil
+}
+
+type PluginInstanceTemplateReferences struct {
+	state         protoimpl.MessageState            `protogen:"open.v1"`
+	InstanceId    string                            `protobuf:"bytes,1,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	Templates     []*MetricTemplateCommandReference `protobuf:"bytes,2,rep,name=templates,proto3" json:"templates,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PluginInstanceTemplateReferences) Reset() {
+	*x = PluginInstanceTemplateReferences{}
+	mi := &file_agent_v1_command_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PluginInstanceTemplateReferences) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PluginInstanceTemplateReferences) ProtoMessage() {}
+
+func (x *PluginInstanceTemplateReferences) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PluginInstanceTemplateReferences.ProtoReflect.Descriptor instead.
+func (*PluginInstanceTemplateReferences) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PluginInstanceTemplateReferences) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *PluginInstanceTemplateReferences) GetTemplates() []*MetricTemplateCommandReference {
+	if x != nil {
+		return x.Templates
 	}
 	return nil
 }
@@ -2054,7 +2154,7 @@ type PluginInstanceDescriptor struct {
 
 func (x *PluginInstanceDescriptor) Reset() {
 	*x = PluginInstanceDescriptor{}
-	mi := &file_agent_v1_command_proto_msgTypes[16]
+	mi := &file_agent_v1_command_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2066,7 +2166,7 @@ func (x *PluginInstanceDescriptor) String() string {
 func (*PluginInstanceDescriptor) ProtoMessage() {}
 
 func (x *PluginInstanceDescriptor) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[16]
+	mi := &file_agent_v1_command_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2079,7 +2179,7 @@ func (x *PluginInstanceDescriptor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginInstanceDescriptor.ProtoReflect.Descriptor instead.
 func (*PluginInstanceDescriptor) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{16}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PluginInstanceDescriptor) GetInstanceId() string {
@@ -2121,7 +2221,7 @@ type ApplyPluginConfiguration struct {
 
 func (x *ApplyPluginConfiguration) Reset() {
 	*x = ApplyPluginConfiguration{}
-	mi := &file_agent_v1_command_proto_msgTypes[17]
+	mi := &file_agent_v1_command_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2133,7 +2233,7 @@ func (x *ApplyPluginConfiguration) String() string {
 func (*ApplyPluginConfiguration) ProtoMessage() {}
 
 func (x *ApplyPluginConfiguration) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[17]
+	mi := &file_agent_v1_command_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2146,7 +2246,7 @@ func (x *ApplyPluginConfiguration) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyPluginConfiguration.ProtoReflect.Descriptor instead.
 func (*ApplyPluginConfiguration) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{17}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ApplyPluginConfiguration) GetAssignmentId() string {
@@ -2184,7 +2284,7 @@ type PluginInstanceConfiguration struct {
 
 func (x *PluginInstanceConfiguration) Reset() {
 	*x = PluginInstanceConfiguration{}
-	mi := &file_agent_v1_command_proto_msgTypes[18]
+	mi := &file_agent_v1_command_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2196,7 +2296,7 @@ func (x *PluginInstanceConfiguration) String() string {
 func (*PluginInstanceConfiguration) ProtoMessage() {}
 
 func (x *PluginInstanceConfiguration) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[18]
+	mi := &file_agent_v1_command_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2209,7 +2309,7 @@ func (x *PluginInstanceConfiguration) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginInstanceConfiguration.ProtoReflect.Descriptor instead.
 func (*PluginInstanceConfiguration) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{18}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PluginInstanceConfiguration) GetInstanceId() string {
@@ -2265,7 +2365,7 @@ type PluginTemplateRevision struct {
 
 func (x *PluginTemplateRevision) Reset() {
 	*x = PluginTemplateRevision{}
-	mi := &file_agent_v1_command_proto_msgTypes[19]
+	mi := &file_agent_v1_command_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2277,7 +2377,7 @@ func (x *PluginTemplateRevision) String() string {
 func (*PluginTemplateRevision) ProtoMessage() {}
 
 func (x *PluginTemplateRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[19]
+	mi := &file_agent_v1_command_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2290,7 +2390,7 @@ func (x *PluginTemplateRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginTemplateRevision.ProtoReflect.Descriptor instead.
 func (*PluginTemplateRevision) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{19}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *PluginTemplateRevision) GetTemplateId() string {
@@ -2325,7 +2425,7 @@ type ValidateDatabaseInstance struct {
 
 func (x *ValidateDatabaseInstance) Reset() {
 	*x = ValidateDatabaseInstance{}
-	mi := &file_agent_v1_command_proto_msgTypes[20]
+	mi := &file_agent_v1_command_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2337,7 +2437,7 @@ func (x *ValidateDatabaseInstance) String() string {
 func (*ValidateDatabaseInstance) ProtoMessage() {}
 
 func (x *ValidateDatabaseInstance) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[20]
+	mi := &file_agent_v1_command_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2350,7 +2450,7 @@ func (x *ValidateDatabaseInstance) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ValidateDatabaseInstance.ProtoReflect.Descriptor instead.
 func (*ValidateDatabaseInstance) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{20}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ValidateDatabaseInstance) GetAssignmentId() string {
@@ -2385,7 +2485,7 @@ type DrainPlugin struct {
 
 func (x *DrainPlugin) Reset() {
 	*x = DrainPlugin{}
-	mi := &file_agent_v1_command_proto_msgTypes[21]
+	mi := &file_agent_v1_command_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2397,7 +2497,7 @@ func (x *DrainPlugin) String() string {
 func (*DrainPlugin) ProtoMessage() {}
 
 func (x *DrainPlugin) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[21]
+	mi := &file_agent_v1_command_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2410,7 +2510,7 @@ func (x *DrainPlugin) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrainPlugin.ProtoReflect.Descriptor instead.
 func (*DrainPlugin) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{21}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *DrainPlugin) GetAssignmentId() string {
@@ -2435,18 +2535,21 @@ func (x *DrainPlugin) GetTimeoutSeconds() uint32 {
 }
 
 type CollectDatabaseMetrics struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	AssignmentId          string                 `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
-	ConfigurationRevision uint64                 `protobuf:"varint,2,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
-	InstanceIds           []string               `protobuf:"bytes,3,rep,name=instance_ids,json=instanceIds,proto3" json:"instance_ids,omitempty"`
-	TemplateIds           []string               `protobuf:"bytes,4,rep,name=template_ids,json=templateIds,proto3" json:"template_ids,omitempty"`
+	state                 protoimpl.MessageState            `protogen:"open.v1"`
+	AssignmentId          string                            `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	ConfigurationRevision uint64                            `protobuf:"varint,2,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	InstanceIds           []string                          `protobuf:"bytes,3,rep,name=instance_ids,json=instanceIds,proto3" json:"instance_ids,omitempty"`
+	TemplateIds           []string                          `protobuf:"bytes,4,rep,name=template_ids,json=templateIds,proto3" json:"template_ids,omitempty"`
+	OperationRevision     uint64                            `protobuf:"varint,5,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	TemplateRevisions     []*MetricTemplateCommandReference `protobuf:"bytes,6,rep,name=template_revisions,json=templateRevisions,proto3" json:"template_revisions,omitempty"`
+	Trial                 bool                              `protobuf:"varint,7,opt,name=trial,proto3" json:"trial,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
 
 func (x *CollectDatabaseMetrics) Reset() {
 	*x = CollectDatabaseMetrics{}
-	mi := &file_agent_v1_command_proto_msgTypes[22]
+	mi := &file_agent_v1_command_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2458,7 +2561,7 @@ func (x *CollectDatabaseMetrics) String() string {
 func (*CollectDatabaseMetrics) ProtoMessage() {}
 
 func (x *CollectDatabaseMetrics) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[22]
+	mi := &file_agent_v1_command_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2471,7 +2574,7 @@ func (x *CollectDatabaseMetrics) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectDatabaseMetrics.ProtoReflect.Descriptor instead.
 func (*CollectDatabaseMetrics) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{22}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *CollectDatabaseMetrics) GetAssignmentId() string {
@@ -2502,6 +2605,121 @@ func (x *CollectDatabaseMetrics) GetTemplateIds() []string {
 	return nil
 }
 
+func (x *CollectDatabaseMetrics) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
+}
+
+func (x *CollectDatabaseMetrics) GetTemplateRevisions() []*MetricTemplateCommandReference {
+	if x != nil {
+		return x.TemplateRevisions
+	}
+	return nil
+}
+
+func (x *CollectDatabaseMetrics) GetTrial() bool {
+	if x != nil {
+		return x.Trial
+	}
+	return false
+}
+
+// Persisted commands contain only immutable identity, digest, and execution
+// bounds. Query text is fetched over the live AgentControl lease flow.
+type MetricTemplateCommandReference struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	TemplateId       string                 `protobuf:"bytes,1,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	RevisionId       string                 `protobuf:"bytes,2,opt,name=revision_id,json=revisionId,proto3" json:"revision_id,omitempty"`
+	QueryDigest      []byte                 `protobuf:"bytes,3,opt,name=query_digest,json=queryDigest,proto3" json:"query_digest,omitempty"`
+	TimeoutSeconds   uint32                 `protobuf:"varint,4,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	MaxRows          uint32                 `protobuf:"varint,5,opt,name=max_rows,json=maxRows,proto3" json:"max_rows,omitempty"`
+	MaxColumns       uint32                 `protobuf:"varint,6,opt,name=max_columns,json=maxColumns,proto3" json:"max_columns,omitempty"`
+	CardinalityLimit uint32                 `protobuf:"varint,7,opt,name=cardinality_limit,json=cardinalityLimit,proto3" json:"cardinality_limit,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *MetricTemplateCommandReference) Reset() {
+	*x = MetricTemplateCommandReference{}
+	mi := &file_agent_v1_command_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateCommandReference) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateCommandReference) ProtoMessage() {}
+
+func (x *MetricTemplateCommandReference) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateCommandReference.ProtoReflect.Descriptor instead.
+func (*MetricTemplateCommandReference) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *MetricTemplateCommandReference) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+func (x *MetricTemplateCommandReference) GetRevisionId() string {
+	if x != nil {
+		return x.RevisionId
+	}
+	return ""
+}
+
+func (x *MetricTemplateCommandReference) GetQueryDigest() []byte {
+	if x != nil {
+		return x.QueryDigest
+	}
+	return nil
+}
+
+func (x *MetricTemplateCommandReference) GetTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
+}
+
+func (x *MetricTemplateCommandReference) GetMaxRows() uint32 {
+	if x != nil {
+		return x.MaxRows
+	}
+	return 0
+}
+
+func (x *MetricTemplateCommandReference) GetMaxColumns() uint32 {
+	if x != nil {
+		return x.MaxColumns
+	}
+	return 0
+}
+
+func (x *MetricTemplateCommandReference) GetCardinalityLimit() uint32 {
+	if x != nil {
+		return x.CardinalityLimit
+	}
+	return 0
+}
+
 // Credential lease requests and responses exist only on the live AgentControl
 // stream. They are never embedded in CommandEnvelope, Job, Outbox or Result.
 type CredentialLeaseRequest struct {
@@ -2518,7 +2736,7 @@ type CredentialLeaseRequest struct {
 
 func (x *CredentialLeaseRequest) Reset() {
 	*x = CredentialLeaseRequest{}
-	mi := &file_agent_v1_command_proto_msgTypes[23]
+	mi := &file_agent_v1_command_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2530,7 +2748,7 @@ func (x *CredentialLeaseRequest) String() string {
 func (*CredentialLeaseRequest) ProtoMessage() {}
 
 func (x *CredentialLeaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[23]
+	mi := &file_agent_v1_command_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2543,7 +2761,7 @@ func (x *CredentialLeaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialLeaseRequest.ProtoReflect.Descriptor instead.
 func (*CredentialLeaseRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{23}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *CredentialLeaseRequest) GetRequestNonce() []byte {
@@ -2607,7 +2825,7 @@ type CredentialLeaseResponse struct {
 
 func (x *CredentialLeaseResponse) Reset() {
 	*x = CredentialLeaseResponse{}
-	mi := &file_agent_v1_command_proto_msgTypes[24]
+	mi := &file_agent_v1_command_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2619,7 +2837,7 @@ func (x *CredentialLeaseResponse) String() string {
 func (*CredentialLeaseResponse) ProtoMessage() {}
 
 func (x *CredentialLeaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[24]
+	mi := &file_agent_v1_command_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2632,7 +2850,7 @@ func (x *CredentialLeaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialLeaseResponse.ProtoReflect.Descriptor instead.
 func (*CredentialLeaseResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{24}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *CredentialLeaseResponse) GetRequestNonce() []byte {
@@ -2722,7 +2940,7 @@ type CredentialMaterial struct {
 
 func (x *CredentialMaterial) Reset() {
 	*x = CredentialMaterial{}
-	mi := &file_agent_v1_command_proto_msgTypes[25]
+	mi := &file_agent_v1_command_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2734,7 +2952,7 @@ func (x *CredentialMaterial) String() string {
 func (*CredentialMaterial) ProtoMessage() {}
 
 func (x *CredentialMaterial) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[25]
+	mi := &file_agent_v1_command_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2747,7 +2965,7 @@ func (x *CredentialMaterial) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialMaterial.ProtoReflect.Descriptor instead.
 func (*CredentialMaterial) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{25}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *CredentialMaterial) GetUsername() string {
@@ -2778,7 +2996,7 @@ type PluginArtifactLeaseRequest struct {
 
 func (x *PluginArtifactLeaseRequest) Reset() {
 	*x = PluginArtifactLeaseRequest{}
-	mi := &file_agent_v1_command_proto_msgTypes[26]
+	mi := &file_agent_v1_command_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2790,7 +3008,7 @@ func (x *PluginArtifactLeaseRequest) String() string {
 func (*PluginArtifactLeaseRequest) ProtoMessage() {}
 
 func (x *PluginArtifactLeaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[26]
+	mi := &file_agent_v1_command_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2803,7 +3021,7 @@ func (x *PluginArtifactLeaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginArtifactLeaseRequest.ProtoReflect.Descriptor instead.
 func (*PluginArtifactLeaseRequest) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{26}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *PluginArtifactLeaseRequest) GetRequestNonce() []byte {
@@ -2850,7 +3068,7 @@ type PluginArtifactLeaseResponse struct {
 
 func (x *PluginArtifactLeaseResponse) Reset() {
 	*x = PluginArtifactLeaseResponse{}
-	mi := &file_agent_v1_command_proto_msgTypes[27]
+	mi := &file_agent_v1_command_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2862,7 +3080,7 @@ func (x *PluginArtifactLeaseResponse) String() string {
 func (*PluginArtifactLeaseResponse) ProtoMessage() {}
 
 func (x *PluginArtifactLeaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[27]
+	mi := &file_agent_v1_command_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2875,7 +3093,7 @@ func (x *PluginArtifactLeaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginArtifactLeaseResponse.ProtoReflect.Descriptor instead.
 func (*PluginArtifactLeaseResponse) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{27}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *PluginArtifactLeaseResponse) GetRequestNonce() []byte {
@@ -2934,6 +3152,492 @@ func (x *PluginArtifactLeaseResponse) GetRequestHeaders() map[string]string {
 	return nil
 }
 
+// Template query text is delivered only over the authenticated live stream.
+// Agents keep it in bounded memory and never journal the response.
+type MetricTemplateLeaseRequest struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	RequestNonce          []byte                 `protobuf:"bytes,1,opt,name=request_nonce,json=requestNonce,proto3" json:"request_nonce,omitempty"`
+	CommandId             string                 `protobuf:"bytes,2,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	AssignmentId          string                 `protobuf:"bytes,3,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	InstanceId            string                 `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	ConfigurationRevision uint64                 `protobuf:"varint,5,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	OperationRevision     uint64                 `protobuf:"varint,6,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	RevisionId            string                 `protobuf:"bytes,7,opt,name=revision_id,json=revisionId,proto3" json:"revision_id,omitempty"`
+	QueryDigest           []byte                 `protobuf:"bytes,8,opt,name=query_digest,json=queryDigest,proto3" json:"query_digest,omitempty"`
+	TemplateId            string                 `protobuf:"bytes,9,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *MetricTemplateLeaseRequest) Reset() {
+	*x = MetricTemplateLeaseRequest{}
+	mi := &file_agent_v1_command_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateLeaseRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateLeaseRequest) ProtoMessage() {}
+
+func (x *MetricTemplateLeaseRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateLeaseRequest.ProtoReflect.Descriptor instead.
+func (*MetricTemplateLeaseRequest) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *MetricTemplateLeaseRequest) GetRequestNonce() []byte {
+	if x != nil {
+		return x.RequestNonce
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseRequest) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseRequest) GetAssignmentId() string {
+	if x != nil {
+		return x.AssignmentId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseRequest) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseRequest) GetConfigurationRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationRevision
+	}
+	return 0
+}
+
+func (x *MetricTemplateLeaseRequest) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
+}
+
+func (x *MetricTemplateLeaseRequest) GetRevisionId() string {
+	if x != nil {
+		return x.RevisionId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseRequest) GetQueryDigest() []byte {
+	if x != nil {
+		return x.QueryDigest
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseRequest) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+type MetricTemplateLeaseResponse struct {
+	state                 protoimpl.MessageState    `protogen:"open.v1"`
+	RequestNonce          []byte                    `protobuf:"bytes,1,opt,name=request_nonce,json=requestNonce,proto3" json:"request_nonce,omitempty"`
+	LeaseId               string                    `protobuf:"bytes,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	CommandId             string                    `protobuf:"bytes,3,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	AssignmentId          string                    `protobuf:"bytes,4,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	InstanceId            string                    `protobuf:"bytes,5,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	ConfigurationRevision uint64                    `protobuf:"varint,6,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	OperationRevision     uint64                    `protobuf:"varint,7,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	RevisionId            string                    `protobuf:"bytes,8,opt,name=revision_id,json=revisionId,proto3" json:"revision_id,omitempty"`
+	QueryDigest           []byte                    `protobuf:"bytes,9,opt,name=query_digest,json=queryDigest,proto3" json:"query_digest,omitempty"`
+	ExpiresAt             *timestamppb.Timestamp    `protobuf:"bytes,10,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	Definition            *MetricTemplateDefinition `protobuf:"bytes,11,opt,name=definition,proto3" json:"definition,omitempty"`
+	ValidForSeconds       uint32                    `protobuf:"varint,12,opt,name=valid_for_seconds,json=validForSeconds,proto3" json:"valid_for_seconds,omitempty"`
+	TemplateId            string                    `protobuf:"bytes,13,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *MetricTemplateLeaseResponse) Reset() {
+	*x = MetricTemplateLeaseResponse{}
+	mi := &file_agent_v1_command_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateLeaseResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateLeaseResponse) ProtoMessage() {}
+
+func (x *MetricTemplateLeaseResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateLeaseResponse.ProtoReflect.Descriptor instead.
+func (*MetricTemplateLeaseResponse) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *MetricTemplateLeaseResponse) GetRequestNonce() []byte {
+	if x != nil {
+		return x.RequestNonce
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseResponse) GetLeaseId() string {
+	if x != nil {
+		return x.LeaseId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseResponse) GetCommandId() string {
+	if x != nil {
+		return x.CommandId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseResponse) GetAssignmentId() string {
+	if x != nil {
+		return x.AssignmentId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseResponse) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseResponse) GetConfigurationRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationRevision
+	}
+	return 0
+}
+
+func (x *MetricTemplateLeaseResponse) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
+}
+
+func (x *MetricTemplateLeaseResponse) GetRevisionId() string {
+	if x != nil {
+		return x.RevisionId
+	}
+	return ""
+}
+
+func (x *MetricTemplateLeaseResponse) GetQueryDigest() []byte {
+	if x != nil {
+		return x.QueryDigest
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseResponse) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseResponse) GetDefinition() *MetricTemplateDefinition {
+	if x != nil {
+		return x.Definition
+	}
+	return nil
+}
+
+func (x *MetricTemplateLeaseResponse) GetValidForSeconds() uint32 {
+	if x != nil {
+		return x.ValidForSeconds
+	}
+	return 0
+}
+
+func (x *MetricTemplateLeaseResponse) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+type MetricTemplateDefinition struct {
+	state                     protoimpl.MessageState        `protogen:"open.v1"`
+	Revision                  uint64                        `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	QueryKind                 string                        `protobuf:"bytes,2,opt,name=query_kind,json=queryKind,proto3" json:"query_kind,omitempty"`
+	ReadOnlyStatement         []byte                        `protobuf:"bytes,3,opt,name=read_only_statement,json=readOnlyStatement,proto3" json:"read_only_statement,omitempty"`
+	CollectionIntervalSeconds uint32                        `protobuf:"varint,4,opt,name=collection_interval_seconds,json=collectionIntervalSeconds,proto3" json:"collection_interval_seconds,omitempty"`
+	TimeoutSeconds            uint32                        `protobuf:"varint,5,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	MaxRows                   uint32                        `protobuf:"varint,6,opt,name=max_rows,json=maxRows,proto3" json:"max_rows,omitempty"`
+	MaxColumns                uint32                        `protobuf:"varint,7,opt,name=max_columns,json=maxColumns,proto3" json:"max_columns,omitempty"`
+	CardinalityLimit          uint32                        `protobuf:"varint,8,opt,name=cardinality_limit,json=cardinalityLimit,proto3" json:"cardinality_limit,omitempty"`
+	ValueMappings             []*MetricTemplateValueMapping `protobuf:"bytes,9,rep,name=value_mappings,json=valueMappings,proto3" json:"value_mappings,omitempty"`
+	LabelMappings             []*MetricTemplateLabelMapping `protobuf:"bytes,10,rep,name=label_mappings,json=labelMappings,proto3" json:"label_mappings,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
+}
+
+func (x *MetricTemplateDefinition) Reset() {
+	*x = MetricTemplateDefinition{}
+	mi := &file_agent_v1_command_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateDefinition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateDefinition) ProtoMessage() {}
+
+func (x *MetricTemplateDefinition) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateDefinition.ProtoReflect.Descriptor instead.
+func (*MetricTemplateDefinition) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *MetricTemplateDefinition) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetQueryKind() string {
+	if x != nil {
+		return x.QueryKind
+	}
+	return ""
+}
+
+func (x *MetricTemplateDefinition) GetReadOnlyStatement() []byte {
+	if x != nil {
+		return x.ReadOnlyStatement
+	}
+	return nil
+}
+
+func (x *MetricTemplateDefinition) GetCollectionIntervalSeconds() uint32 {
+	if x != nil {
+		return x.CollectionIntervalSeconds
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetMaxRows() uint32 {
+	if x != nil {
+		return x.MaxRows
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetMaxColumns() uint32 {
+	if x != nil {
+		return x.MaxColumns
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetCardinalityLimit() uint32 {
+	if x != nil {
+		return x.CardinalityLimit
+	}
+	return 0
+}
+
+func (x *MetricTemplateDefinition) GetValueMappings() []*MetricTemplateValueMapping {
+	if x != nil {
+		return x.ValueMappings
+	}
+	return nil
+}
+
+func (x *MetricTemplateDefinition) GetLabelMappings() []*MetricTemplateLabelMapping {
+	if x != nil {
+		return x.LabelMappings
+	}
+	return nil
+}
+
+type MetricTemplateValueMapping struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SourceColumn  string                 `protobuf:"bytes,1,opt,name=source_column,json=sourceColumn,proto3" json:"source_column,omitempty"`
+	MetricName    string                 `protobuf:"bytes,2,opt,name=metric_name,json=metricName,proto3" json:"metric_name,omitempty"`
+	MetricType    string                 `protobuf:"bytes,3,opt,name=metric_type,json=metricType,proto3" json:"metric_type,omitempty"`
+	Unit          string                 `protobuf:"bytes,4,opt,name=unit,proto3" json:"unit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MetricTemplateValueMapping) Reset() {
+	*x = MetricTemplateValueMapping{}
+	mi := &file_agent_v1_command_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateValueMapping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateValueMapping) ProtoMessage() {}
+
+func (x *MetricTemplateValueMapping) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateValueMapping.ProtoReflect.Descriptor instead.
+func (*MetricTemplateValueMapping) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *MetricTemplateValueMapping) GetSourceColumn() string {
+	if x != nil {
+		return x.SourceColumn
+	}
+	return ""
+}
+
+func (x *MetricTemplateValueMapping) GetMetricName() string {
+	if x != nil {
+		return x.MetricName
+	}
+	return ""
+}
+
+func (x *MetricTemplateValueMapping) GetMetricType() string {
+	if x != nil {
+		return x.MetricType
+	}
+	return ""
+}
+
+func (x *MetricTemplateValueMapping) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+type MetricTemplateLabelMapping struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SourceColumn  string                 `protobuf:"bytes,1,opt,name=source_column,json=sourceColumn,proto3" json:"source_column,omitempty"`
+	Label         string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MetricTemplateLabelMapping) Reset() {
+	*x = MetricTemplateLabelMapping{}
+	mi := &file_agent_v1_command_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateLabelMapping) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateLabelMapping) ProtoMessage() {}
+
+func (x *MetricTemplateLabelMapping) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateLabelMapping.ProtoReflect.Descriptor instead.
+func (*MetricTemplateLabelMapping) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *MetricTemplateLabelMapping) GetSourceColumn() string {
+	if x != nil {
+		return x.SourceColumn
+	}
+	return ""
+}
+
+func (x *MetricTemplateLabelMapping) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
 type CommandAcknowledgement struct {
 	state         protoimpl.MessageState      `protogen:"open.v1"`
 	CommandId     string                      `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
@@ -2945,7 +3649,7 @@ type CommandAcknowledgement struct {
 
 func (x *CommandAcknowledgement) Reset() {
 	*x = CommandAcknowledgement{}
-	mi := &file_agent_v1_command_proto_msgTypes[28]
+	mi := &file_agent_v1_command_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2957,7 +3661,7 @@ func (x *CommandAcknowledgement) String() string {
 func (*CommandAcknowledgement) ProtoMessage() {}
 
 func (x *CommandAcknowledgement) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[28]
+	mi := &file_agent_v1_command_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2970,7 +3674,7 @@ func (x *CommandAcknowledgement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandAcknowledgement.ProtoReflect.Descriptor instead.
 func (*CommandAcknowledgement) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{28}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *CommandAcknowledgement) GetCommandId() string {
@@ -3004,7 +3708,7 @@ type CommandPrepared struct {
 
 func (x *CommandPrepared) Reset() {
 	*x = CommandPrepared{}
-	mi := &file_agent_v1_command_proto_msgTypes[29]
+	mi := &file_agent_v1_command_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3016,7 +3720,7 @@ func (x *CommandPrepared) String() string {
 func (*CommandPrepared) ProtoMessage() {}
 
 func (x *CommandPrepared) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[29]
+	mi := &file_agent_v1_command_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3029,7 +3733,7 @@ func (x *CommandPrepared) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandPrepared.ProtoReflect.Descriptor instead.
 func (*CommandPrepared) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{29}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *CommandPrepared) GetCommandId() string {
@@ -3060,7 +3764,7 @@ type CommandProgress struct {
 
 func (x *CommandProgress) Reset() {
 	*x = CommandProgress{}
-	mi := &file_agent_v1_command_proto_msgTypes[30]
+	mi := &file_agent_v1_command_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3072,7 +3776,7 @@ func (x *CommandProgress) String() string {
 func (*CommandProgress) ProtoMessage() {}
 
 func (x *CommandProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[30]
+	mi := &file_agent_v1_command_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3085,7 +3789,7 @@ func (x *CommandProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandProgress.ProtoReflect.Descriptor instead.
 func (*CommandProgress) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{30}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *CommandProgress) GetCommandId() string {
@@ -3131,21 +3835,22 @@ func (x *CommandProgress) GetLeaseRevision() uint64 {
 }
 
 type CommandResult struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
-	State          CommandResultState     `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandResultState" json:"state,omitempty"`
-	Summary        string                 `protobuf:"bytes,3,opt,name=summary,proto3" json:"summary,omitempty"`
-	Artifacts      []*ArtifactReference   `protobuf:"bytes,4,rep,name=artifacts,proto3" json:"artifacts,omitempty"`
-	ErrorCode      string                 `protobuf:"bytes,5,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
-	ExecutionToken []byte                 `protobuf:"bytes,6,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
-	LeaseRevision  uint64                 `protobuf:"varint,7,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state                     protoimpl.MessageState     `protogen:"open.v1"`
+	CommandId                 string                     `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
+	State                     CommandResultState         `protobuf:"varint,2,opt,name=state,proto3,enum=dbpilot.agent.v1.CommandResultState" json:"state,omitempty"`
+	Summary                   string                     `protobuf:"bytes,3,opt,name=summary,proto3" json:"summary,omitempty"`
+	Artifacts                 []*ArtifactReference       `protobuf:"bytes,4,rep,name=artifacts,proto3" json:"artifacts,omitempty"`
+	ErrorCode                 string                     `protobuf:"bytes,5,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	ExecutionToken            []byte                     `protobuf:"bytes,6,opt,name=execution_token,json=executionToken,proto3" json:"execution_token,omitempty"`
+	LeaseRevision             uint64                     `protobuf:"varint,7,opt,name=lease_revision,json=leaseRevision,proto3" json:"lease_revision,omitempty"`
+	MetricTemplateTrialResult *MetricTemplateTrialResult `protobuf:"bytes,8,opt,name=metric_template_trial_result,json=metricTemplateTrialResult,proto3" json:"metric_template_trial_result,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *CommandResult) Reset() {
 	*x = CommandResult{}
-	mi := &file_agent_v1_command_proto_msgTypes[31]
+	mi := &file_agent_v1_command_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3157,7 +3862,7 @@ func (x *CommandResult) String() string {
 func (*CommandResult) ProtoMessage() {}
 
 func (x *CommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[31]
+	mi := &file_agent_v1_command_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3170,7 +3875,7 @@ func (x *CommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResult.ProtoReflect.Descriptor instead.
 func (*CommandResult) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{31}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *CommandResult) GetCommandId() string {
@@ -3222,6 +3927,189 @@ func (x *CommandResult) GetLeaseRevision() uint64 {
 	return 0
 }
 
+func (x *CommandResult) GetMetricTemplateTrialResult() *MetricTemplateTrialResult {
+	if x != nil {
+		return x.MetricTemplateTrialResult
+	}
+	return nil
+}
+
+type MetricTemplateTrialResult struct {
+	state            protoimpl.MessageState           `protogen:"open.v1"`
+	RevisionId       string                           `protobuf:"bytes,1,opt,name=revision_id,json=revisionId,proto3" json:"revision_id,omitempty"`
+	QueryDigest      []byte                           `protobuf:"bytes,2,opt,name=query_digest,json=queryDigest,proto3" json:"query_digest,omitempty"`
+	StatusCode       string                           `protobuf:"bytes,3,opt,name=status_code,json=statusCode,proto3" json:"status_code,omitempty"`
+	CandidateMetrics []*MetricTemplateCandidateMetric `protobuf:"bytes,4,rep,name=candidate_metrics,json=candidateMetrics,proto3" json:"candidate_metrics,omitempty"`
+	RowCount         uint32                           `protobuf:"varint,5,opt,name=row_count,json=rowCount,proto3" json:"row_count,omitempty"`
+	ColumnCount      uint32                           `protobuf:"varint,6,opt,name=column_count,json=columnCount,proto3" json:"column_count,omitempty"`
+	MetricCount      uint32                           `protobuf:"varint,7,opt,name=metric_count,json=metricCount,proto3" json:"metric_count,omitempty"`
+	DurationMillis   uint32                           `protobuf:"varint,8,opt,name=duration_millis,json=durationMillis,proto3" json:"duration_millis,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *MetricTemplateTrialResult) Reset() {
+	*x = MetricTemplateTrialResult{}
+	mi := &file_agent_v1_command_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateTrialResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateTrialResult) ProtoMessage() {}
+
+func (x *MetricTemplateTrialResult) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateTrialResult.ProtoReflect.Descriptor instead.
+func (*MetricTemplateTrialResult) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *MetricTemplateTrialResult) GetRevisionId() string {
+	if x != nil {
+		return x.RevisionId
+	}
+	return ""
+}
+
+func (x *MetricTemplateTrialResult) GetQueryDigest() []byte {
+	if x != nil {
+		return x.QueryDigest
+	}
+	return nil
+}
+
+func (x *MetricTemplateTrialResult) GetStatusCode() string {
+	if x != nil {
+		return x.StatusCode
+	}
+	return ""
+}
+
+func (x *MetricTemplateTrialResult) GetCandidateMetrics() []*MetricTemplateCandidateMetric {
+	if x != nil {
+		return x.CandidateMetrics
+	}
+	return nil
+}
+
+func (x *MetricTemplateTrialResult) GetRowCount() uint32 {
+	if x != nil {
+		return x.RowCount
+	}
+	return 0
+}
+
+func (x *MetricTemplateTrialResult) GetColumnCount() uint32 {
+	if x != nil {
+		return x.ColumnCount
+	}
+	return 0
+}
+
+func (x *MetricTemplateTrialResult) GetMetricCount() uint32 {
+	if x != nil {
+		return x.MetricCount
+	}
+	return 0
+}
+
+func (x *MetricTemplateTrialResult) GetDurationMillis() uint32 {
+	if x != nil {
+		return x.DurationMillis
+	}
+	return 0
+}
+
+type MetricTemplateCandidateMetric struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MetricName    string                 `protobuf:"bytes,1,opt,name=metric_name,json=metricName,proto3" json:"metric_name,omitempty"`
+	Value         float64                `protobuf:"fixed64,2,opt,name=value,proto3" json:"value,omitempty"`
+	Unit          string                 `protobuf:"bytes,3,opt,name=unit,proto3" json:"unit,omitempty"`
+	Labels        map[string]string      `protobuf:"bytes,4,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	MetricType    string                 `protobuf:"bytes,5,opt,name=metric_type,json=metricType,proto3" json:"metric_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MetricTemplateCandidateMetric) Reset() {
+	*x = MetricTemplateCandidateMetric{}
+	mi := &file_agent_v1_command_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetricTemplateCandidateMetric) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetricTemplateCandidateMetric) ProtoMessage() {}
+
+func (x *MetricTemplateCandidateMetric) ProtoReflect() protoreflect.Message {
+	mi := &file_agent_v1_command_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetricTemplateCandidateMetric.ProtoReflect.Descriptor instead.
+func (*MetricTemplateCandidateMetric) Descriptor() ([]byte, []int) {
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *MetricTemplateCandidateMetric) GetMetricName() string {
+	if x != nil {
+		return x.MetricName
+	}
+	return ""
+}
+
+func (x *MetricTemplateCandidateMetric) GetValue() float64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
+func (x *MetricTemplateCandidateMetric) GetUnit() string {
+	if x != nil {
+		return x.Unit
+	}
+	return ""
+}
+
+func (x *MetricTemplateCandidateMetric) GetLabels() map[string]string {
+	if x != nil {
+		return x.Labels
+	}
+	return nil
+}
+
+func (x *MetricTemplateCandidateMetric) GetMetricType() string {
+	if x != nil {
+		return x.MetricType
+	}
+	return ""
+}
+
 type CommandStart struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	CommandId      string                 `protobuf:"bytes,1,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
@@ -3235,7 +4123,7 @@ type CommandStart struct {
 
 func (x *CommandStart) Reset() {
 	*x = CommandStart{}
-	mi := &file_agent_v1_command_proto_msgTypes[32]
+	mi := &file_agent_v1_command_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3247,7 +4135,7 @@ func (x *CommandStart) String() string {
 func (*CommandStart) ProtoMessage() {}
 
 func (x *CommandStart) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[32]
+	mi := &file_agent_v1_command_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3260,7 +4148,7 @@ func (x *CommandStart) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandStart.ProtoReflect.Descriptor instead.
 func (*CommandStart) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{32}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *CommandStart) GetCommandId() string {
@@ -3313,7 +4201,7 @@ type CommandResultAcknowledgement struct {
 
 func (x *CommandResultAcknowledgement) Reset() {
 	*x = CommandResultAcknowledgement{}
-	mi := &file_agent_v1_command_proto_msgTypes[33]
+	mi := &file_agent_v1_command_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3325,7 +4213,7 @@ func (x *CommandResultAcknowledgement) String() string {
 func (*CommandResultAcknowledgement) ProtoMessage() {}
 
 func (x *CommandResultAcknowledgement) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[33]
+	mi := &file_agent_v1_command_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3338,7 +4226,7 @@ func (x *CommandResultAcknowledgement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandResultAcknowledgement.ProtoReflect.Descriptor instead.
 func (*CommandResultAcknowledgement) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{33}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *CommandResultAcknowledgement) GetCommandId() string {
@@ -3389,7 +4277,7 @@ type ArtifactReference struct {
 
 func (x *ArtifactReference) Reset() {
 	*x = ArtifactReference{}
-	mi := &file_agent_v1_command_proto_msgTypes[34]
+	mi := &file_agent_v1_command_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3401,7 +4289,7 @@ func (x *ArtifactReference) String() string {
 func (*ArtifactReference) ProtoMessage() {}
 
 func (x *ArtifactReference) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[34]
+	mi := &file_agent_v1_command_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3414,7 +4302,7 @@ func (x *ArtifactReference) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactReference.ProtoReflect.Descriptor instead.
 func (*ArtifactReference) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{34}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *ArtifactReference) GetArtifactId() string {
@@ -3464,7 +4352,7 @@ type CommandCancellation struct {
 
 func (x *CommandCancellation) Reset() {
 	*x = CommandCancellation{}
-	mi := &file_agent_v1_command_proto_msgTypes[35]
+	mi := &file_agent_v1_command_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3476,7 +4364,7 @@ func (x *CommandCancellation) String() string {
 func (*CommandCancellation) ProtoMessage() {}
 
 func (x *CommandCancellation) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[35]
+	mi := &file_agent_v1_command_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3489,7 +4377,7 @@ func (x *CommandCancellation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommandCancellation.ProtoReflect.Descriptor instead.
 func (*CommandCancellation) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{35}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *CommandCancellation) GetCommandId() string {
@@ -3531,7 +4419,7 @@ type FlowControlInstruction struct {
 
 func (x *FlowControlInstruction) Reset() {
 	*x = FlowControlInstruction{}
-	mi := &file_agent_v1_command_proto_msgTypes[36]
+	mi := &file_agent_v1_command_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3543,7 +4431,7 @@ func (x *FlowControlInstruction) String() string {
 func (*FlowControlInstruction) ProtoMessage() {}
 
 func (x *FlowControlInstruction) ProtoReflect() protoreflect.Message {
-	mi := &file_agent_v1_command_proto_msgTypes[36]
+	mi := &file_agent_v1_command_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3556,7 +4444,7 @@ func (x *FlowControlInstruction) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlowControlInstruction.ProtoReflect.Descriptor instead.
 func (*FlowControlInstruction) Descriptor() ([]byte, []int) {
-	return file_agent_v1_command_proto_rawDescGZIP(), []int{36}
+	return file_agent_v1_command_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *FlowControlInstruction) GetMaxInFlightCommands() uint32 {
@@ -3584,7 +4472,7 @@ var File_agent_v1_command_proto protoreflect.FileDescriptor
 
 const file_agent_v1_command_proto_rawDesc = "" +
 	"\n" +
-	"\x16agent/v1/command.proto\x12\x10dbpilot.agent.v1\x1a\x18agent/v1/inventory.proto\x1a\x15agent/v1/policy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc2\b\n" +
+	"\x16agent/v1/command.proto\x12\x10dbpilot.agent.v1\x1a\x18agent/v1/inventory.proto\x1a\x15agent/v1/policy.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xb5\t\n" +
 	"\fAgentMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x123\n" +
@@ -3600,8 +4488,9 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x10discovery_report\x18\x1c \x01(\v2!.dbpilot.agent.v1.DiscoveryReportH\x00R\x0fdiscoveryReport\x12T\n" +
 	"\x12plugin_observation\x18\x1d \x01(\v2#.dbpilot.agent.v1.PluginObservationH\x00R\x11pluginObservation\x12d\n" +
 	"\x18credential_lease_request\x18\x1e \x01(\v2(.dbpilot.agent.v1.CredentialLeaseRequestH\x00R\x16credentialLeaseRequest\x12q\n" +
-	"\x1dplugin_artifact_lease_request\x18\x1f \x01(\v2,.dbpilot.agent.v1.PluginArtifactLeaseRequestH\x00R\x1apluginArtifactLeaseRequestB\t\n" +
-	"\amessageJ\x04\b\x03\x10\x14J\x04\b \x102\"\x99\b\n" +
+	"\x1dplugin_artifact_lease_request\x18\x1f \x01(\v2,.dbpilot.agent.v1.PluginArtifactLeaseRequestH\x00R\x1apluginArtifactLeaseRequest\x12q\n" +
+	"\x1dmetric_template_lease_request\x18  \x01(\v2,.dbpilot.agent.v1.MetricTemplateLeaseRequestH\x00R\x1ametricTemplateLeaseRequestB\t\n" +
+	"\amessageJ\x04\b\x03\x10\x14J\x04\b!\x102\"\x8f\t\n" +
 	"\rServerMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x123\n" +
@@ -3614,9 +4503,10 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x1ecommand_result_acknowledgement\x18\x19 \x01(\v2..dbpilot.agent.v1.CommandResultAcknowledgementH\x00R\x1ccommandResultAcknowledgement\x12E\n" +
 	"\rcommand_start\x18\x1a \x01(\v2\x1e.dbpilot.agent.v1.CommandStartH\x00R\fcommandStart\x12g\n" +
 	"\x19credential_lease_response\x18\x1b \x01(\v2).dbpilot.agent.v1.CredentialLeaseResponseH\x00R\x17credentialLeaseResponse\x12t\n" +
-	"\x1eplugin_artifact_lease_response\x18\x1c \x01(\v2-.dbpilot.agent.v1.PluginArtifactLeaseResponseH\x00R\x1bpluginArtifactLeaseResponse\x12|\n" +
+	"\x1eplugin_artifact_lease_response\x18\x1c \x01(\v2-.dbpilot.agent.v1.PluginArtifactLeaseResponseH\x00R\x1bpluginArtifactLeaseResponse\x12t\n" +
+	"\x1emetric_template_lease_response\x18\x1d \x01(\v2-.dbpilot.agent.v1.MetricTemplateLeaseResponseH\x00R\x1bmetricTemplateLeaseResponse\x12|\n" +
 	" discovery_report_acknowledgement\x182 \x01(\v20.dbpilot.agent.v1.DiscoveryReportAcknowledgementH\x00R\x1ediscoveryReportAcknowledgementB\t\n" +
-	"\amessageJ\x04\b\x03\x10\x14J\x04\b\x1d\x102\"\x89\x02\n" +
+	"\amessageJ\x04\b\x03\x10\x14J\x04\b\x1e\x102\"\x89\x02\n" +
 	"\x1eDiscoveryReportAcknowledgement\x12\x17\n" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x121\n" +
@@ -3719,7 +4609,7 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\ahost_id\x18\x01 \x01(\tR\x06hostId\x12#\n" +
 	"\rrule_revision\x18\x02 \x01(\x04R\fruleRevision\x12%\n" +
 	"\x0einclude_native\x18\x03 \x01(\bR\rincludeNative\x12%\n" +
-	"\x0einclude_docker\x18\x04 \x01(\bR\rincludeDocker\"\xf4\x04\n" +
+	"\x0einclude_docker\x18\x04 \x01(\bR\rincludeDocker\"\xc9\x06\n" +
 	"\x0fReconcilePlugin\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x12\x1b\n" +
 	"\tplugin_id\x18\x02 \x01(\tR\bpluginId\x12'\n" +
@@ -3734,8 +4624,14 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x12operation_revision\x18\n" +
 	" \x01(\x04R\x11operationRevision\x12!\n" +
 	"\finstance_ids\x18\v \x03(\tR\vinstanceIds\x12!\n" +
-	"\ftemplate_ids\x18\f \x03(\tR\vtemplateIds\x12]\n" +
-	"\x14instance_descriptors\x18\x14 \x03(\v2*.dbpilot.agent.v1.PluginInstanceDescriptorR\x13instanceDescriptorsJ\x04\b\r\x10\x14\"\xa3\x01\n" +
+	"\ftemplate_ids\x18\f \x03(\tR\vtemplateIds\x12_\n" +
+	"\x12template_revisions\x18\r \x03(\v20.dbpilot.agent.v1.MetricTemplateCommandReferenceR\x11templateRevisions\x12r\n" +
+	"\x1binstance_template_revisions\x18\x0e \x03(\v22.dbpilot.agent.v1.PluginInstanceTemplateReferencesR\x19instanceTemplateRevisions\x12]\n" +
+	"\x14instance_descriptors\x18\x14 \x03(\v2*.dbpilot.agent.v1.PluginInstanceDescriptorR\x13instanceDescriptorsJ\x04\b\x0f\x10\x14\"\x93\x01\n" +
+	" PluginInstanceTemplateReferences\x12\x1f\n" +
+	"\vinstance_id\x18\x01 \x01(\tR\n" +
+	"instanceId\x12N\n" +
+	"\ttemplates\x18\x02 \x03(\v20.dbpilot.agent.v1.MetricTemplateCommandReferenceR\ttemplates\"\xa3\x01\n" +
 	"\x18PluginInstanceDescriptor\x12\x1f\n" +
 	"\vinstance_id\x18\x01 \x01(\tR\n" +
 	"instanceId\x12)\n" +
@@ -3769,12 +4665,26 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\vDrainPlugin\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x12-\n" +
 	"\x12operation_revision\x18\x02 \x01(\x04R\x11operationRevision\x12'\n" +
-	"\x0ftimeout_seconds\x18\x03 \x01(\rR\x0etimeoutSeconds\"\xba\x01\n" +
+	"\x0ftimeout_seconds\x18\x03 \x01(\rR\x0etimeoutSeconds\"\xe0\x02\n" +
 	"\x16CollectDatabaseMetrics\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12!\n" +
 	"\finstance_ids\x18\x03 \x03(\tR\vinstanceIds\x12!\n" +
-	"\ftemplate_ids\x18\x04 \x03(\tR\vtemplateIds\"\x92\x02\n" +
+	"\ftemplate_ids\x18\x04 \x03(\tR\vtemplateIds\x12-\n" +
+	"\x12operation_revision\x18\x05 \x01(\x04R\x11operationRevision\x12_\n" +
+	"\x12template_revisions\x18\x06 \x03(\v20.dbpilot.agent.v1.MetricTemplateCommandReferenceR\x11templateRevisions\x12\x14\n" +
+	"\x05trial\x18\a \x01(\bR\x05trial\"\x97\x02\n" +
+	"\x1eMetricTemplateCommandReference\x12\x1f\n" +
+	"\vtemplate_id\x18\x01 \x01(\tR\n" +
+	"templateId\x12\x1f\n" +
+	"\vrevision_id\x18\x02 \x01(\tR\n" +
+	"revisionId\x12!\n" +
+	"\fquery_digest\x18\x03 \x01(\fR\vqueryDigest\x12'\n" +
+	"\x0ftimeout_seconds\x18\x04 \x01(\rR\x0etimeoutSeconds\x12\x19\n" +
+	"\bmax_rows\x18\x05 \x01(\rR\amaxRows\x12\x1f\n" +
+	"\vmax_columns\x18\x06 \x01(\rR\n" +
+	"maxColumns\x12+\n" +
+	"\x11cardinality_limit\x18\a \x01(\rR\x10cardinalityLimit\"\x92\x02\n" +
 	"\x16CredentialLeaseRequest\x12#\n" +
 	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x1f\n" +
 	"\vinstance_id\x18\x02 \x01(\tR\n" +
@@ -3822,7 +4732,67 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x0frequest_headers\x18\b \x03(\v2A.dbpilot.agent.v1.PluginArtifactLeaseResponse.RequestHeadersEntryR\x0erequestHeaders\x1aA\n" +
 	"\x13RequestHeadersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9d\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf1\x02\n" +
+	"\x1aMetricTemplateLeaseRequest\x12#\n" +
+	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x02 \x01(\tR\tcommandId\x12#\n" +
+	"\rassignment_id\x18\x03 \x01(\tR\fassignmentId\x12\x1f\n" +
+	"\vinstance_id\x18\x04 \x01(\tR\n" +
+	"instanceId\x125\n" +
+	"\x16configuration_revision\x18\x05 \x01(\x04R\x15configurationRevision\x12-\n" +
+	"\x12operation_revision\x18\x06 \x01(\x04R\x11operationRevision\x12\x1f\n" +
+	"\vrevision_id\x18\a \x01(\tR\n" +
+	"revisionId\x12!\n" +
+	"\fquery_digest\x18\b \x01(\fR\vqueryDigest\x12\x1f\n" +
+	"\vtemplate_id\x18\t \x01(\tR\n" +
+	"templateId\"\xc0\x04\n" +
+	"\x1bMetricTemplateLeaseResponse\x12#\n" +
+	"\rrequest_nonce\x18\x01 \x01(\fR\frequestNonce\x12\x19\n" +
+	"\blease_id\x18\x02 \x01(\tR\aleaseId\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x03 \x01(\tR\tcommandId\x12#\n" +
+	"\rassignment_id\x18\x04 \x01(\tR\fassignmentId\x12\x1f\n" +
+	"\vinstance_id\x18\x05 \x01(\tR\n" +
+	"instanceId\x125\n" +
+	"\x16configuration_revision\x18\x06 \x01(\x04R\x15configurationRevision\x12-\n" +
+	"\x12operation_revision\x18\a \x01(\x04R\x11operationRevision\x12\x1f\n" +
+	"\vrevision_id\x18\b \x01(\tR\n" +
+	"revisionId\x12!\n" +
+	"\fquery_digest\x18\t \x01(\fR\vqueryDigest\x129\n" +
+	"\n" +
+	"expires_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12J\n" +
+	"\n" +
+	"definition\x18\v \x01(\v2*.dbpilot.agent.v1.MetricTemplateDefinitionR\n" +
+	"definition\x12*\n" +
+	"\x11valid_for_seconds\x18\f \x01(\rR\x0fvalidForSeconds\x12\x1f\n" +
+	"\vtemplate_id\x18\r \x01(\tR\n" +
+	"templateId\"\x81\x04\n" +
+	"\x18MetricTemplateDefinition\x12\x1a\n" +
+	"\brevision\x18\x01 \x01(\x04R\brevision\x12\x1d\n" +
+	"\n" +
+	"query_kind\x18\x02 \x01(\tR\tqueryKind\x12.\n" +
+	"\x13read_only_statement\x18\x03 \x01(\fR\x11readOnlyStatement\x12>\n" +
+	"\x1bcollection_interval_seconds\x18\x04 \x01(\rR\x19collectionIntervalSeconds\x12'\n" +
+	"\x0ftimeout_seconds\x18\x05 \x01(\rR\x0etimeoutSeconds\x12\x19\n" +
+	"\bmax_rows\x18\x06 \x01(\rR\amaxRows\x12\x1f\n" +
+	"\vmax_columns\x18\a \x01(\rR\n" +
+	"maxColumns\x12+\n" +
+	"\x11cardinality_limit\x18\b \x01(\rR\x10cardinalityLimit\x12S\n" +
+	"\x0evalue_mappings\x18\t \x03(\v2,.dbpilot.agent.v1.MetricTemplateValueMappingR\rvalueMappings\x12S\n" +
+	"\x0elabel_mappings\x18\n" +
+	" \x03(\v2,.dbpilot.agent.v1.MetricTemplateLabelMappingR\rlabelMappings\"\x97\x01\n" +
+	"\x1aMetricTemplateValueMapping\x12#\n" +
+	"\rsource_column\x18\x01 \x01(\tR\fsourceColumn\x12\x1f\n" +
+	"\vmetric_name\x18\x02 \x01(\tR\n" +
+	"metricName\x12\x1f\n" +
+	"\vmetric_type\x18\x03 \x01(\tR\n" +
+	"metricType\x12\x12\n" +
+	"\x04unit\x18\x04 \x01(\tR\x04unit\"W\n" +
+	"\x1aMetricTemplateLabelMapping\x12#\n" +
+	"\rsource_column\x18\x01 \x01(\tR\fsourceColumn\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\"\x9d\x01\n" +
 	"\x16CommandAcknowledgement\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12C\n" +
@@ -3840,7 +4810,7 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\x05stage\x18\x03 \x01(\tR\x05stage\x12\x18\n" +
 	"\amessage\x18\x04 \x01(\tR\amessage\x12'\n" +
 	"\x0fexecution_token\x18\x05 \x01(\fR\x0eexecutionToken\x12%\n" +
-	"\x0elease_revision\x18\x06 \x01(\x04R\rleaseRevision\"\xb6\x02\n" +
+	"\x0elease_revision\x18\x06 \x01(\x04R\rleaseRevision\"\xa4\x03\n" +
 	"\rCommandResult\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12:\n" +
@@ -3850,7 +4820,30 @@ const file_agent_v1_command_proto_rawDesc = "" +
 	"\n" +
 	"error_code\x18\x05 \x01(\tR\terrorCode\x12'\n" +
 	"\x0fexecution_token\x18\x06 \x01(\fR\x0eexecutionToken\x12%\n" +
-	"\x0elease_revision\x18\a \x01(\x04R\rleaseRevision\"\xe5\x01\n" +
+	"\x0elease_revision\x18\a \x01(\x04R\rleaseRevision\x12l\n" +
+	"\x1cmetric_template_trial_result\x18\b \x01(\v2+.dbpilot.agent.v1.MetricTemplateTrialResultR\x19metricTemplateTrialResult\"\xea\x02\n" +
+	"\x19MetricTemplateTrialResult\x12\x1f\n" +
+	"\vrevision_id\x18\x01 \x01(\tR\n" +
+	"revisionId\x12!\n" +
+	"\fquery_digest\x18\x02 \x01(\fR\vqueryDigest\x12\x1f\n" +
+	"\vstatus_code\x18\x03 \x01(\tR\n" +
+	"statusCode\x12\\\n" +
+	"\x11candidate_metrics\x18\x04 \x03(\v2/.dbpilot.agent.v1.MetricTemplateCandidateMetricR\x10candidateMetrics\x12\x1b\n" +
+	"\trow_count\x18\x05 \x01(\rR\browCount\x12!\n" +
+	"\fcolumn_count\x18\x06 \x01(\rR\vcolumnCount\x12!\n" +
+	"\fmetric_count\x18\a \x01(\rR\vmetricCount\x12'\n" +
+	"\x0fduration_millis\x18\b \x01(\rR\x0edurationMillis\"\x9b\x02\n" +
+	"\x1dMetricTemplateCandidateMetric\x12\x1f\n" +
+	"\vmetric_name\x18\x01 \x01(\tR\n" +
+	"metricName\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x01R\x05value\x12\x12\n" +
+	"\x04unit\x18\x03 \x01(\tR\x04unit\x12S\n" +
+	"\x06labels\x18\x04 \x03(\v2;.dbpilot.agent.v1.MetricTemplateCandidateMetric.LabelsEntryR\x06labels\x12\x1f\n" +
+	"\vmetric_type\x18\x05 \x01(\tR\n" +
+	"metricType\x1a9\n" +
+	"\vLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe5\x01\n" +
 	"\fCommandStart\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12'\n" +
@@ -3931,122 +4924,145 @@ func file_agent_v1_command_proto_rawDescGZIP() []byte {
 }
 
 var file_agent_v1_command_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_agent_v1_command_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_agent_v1_command_proto_msgTypes = make([]protoimpl.MessageInfo, 49)
 var file_agent_v1_command_proto_goTypes = []any{
-	(CommandExecutionState)(0),             // 0: dbpilot.agent.v1.CommandExecutionState
-	(TransactionPolicy)(0),                 // 1: dbpilot.agent.v1.TransactionPolicy
-	(PluginDesiredState)(0),                // 2: dbpilot.agent.v1.PluginDesiredState
-	(CommandAcknowledgementState)(0),       // 3: dbpilot.agent.v1.CommandAcknowledgementState
-	(CommandResultState)(0),                // 4: dbpilot.agent.v1.CommandResultState
-	(*AgentMessage)(nil),                   // 5: dbpilot.agent.v1.AgentMessage
-	(*ServerMessage)(nil),                  // 6: dbpilot.agent.v1.ServerMessage
-	(*DiscoveryReportAcknowledgement)(nil), // 7: dbpilot.agent.v1.DiscoveryReportAcknowledgement
-	(*Hello)(nil),                          // 8: dbpilot.agent.v1.Hello
-	(*HelloAck)(nil),                       // 9: dbpilot.agent.v1.HelloAck
-	(*Heartbeat)(nil),                      // 10: dbpilot.agent.v1.Heartbeat
-	(*ActiveCommand)(nil),                  // 11: dbpilot.agent.v1.ActiveCommand
-	(*CommandEnvelope)(nil),                // 12: dbpilot.agent.v1.CommandEnvelope
-	(*CollectNow)(nil),                     // 13: dbpilot.agent.v1.CollectNow
-	(*InspectInstance)(nil),                // 14: dbpilot.agent.v1.InspectInstance
-	(*ExecuteSQL)(nil),                     // 15: dbpilot.agent.v1.ExecuteSQL
-	(*CommandRecoveryState)(nil),           // 16: dbpilot.agent.v1.CommandRecoveryState
-	(*ExecuteRegisteredProcess)(nil),       // 17: dbpilot.agent.v1.ExecuteRegisteredProcess
-	(*CollectDiagnostic)(nil),              // 18: dbpilot.agent.v1.CollectDiagnostic
-	(*DiscoverDatabases)(nil),              // 19: dbpilot.agent.v1.DiscoverDatabases
-	(*ReconcilePlugin)(nil),                // 20: dbpilot.agent.v1.ReconcilePlugin
-	(*PluginInstanceDescriptor)(nil),       // 21: dbpilot.agent.v1.PluginInstanceDescriptor
-	(*ApplyPluginConfiguration)(nil),       // 22: dbpilot.agent.v1.ApplyPluginConfiguration
-	(*PluginInstanceConfiguration)(nil),    // 23: dbpilot.agent.v1.PluginInstanceConfiguration
-	(*PluginTemplateRevision)(nil),         // 24: dbpilot.agent.v1.PluginTemplateRevision
-	(*ValidateDatabaseInstance)(nil),       // 25: dbpilot.agent.v1.ValidateDatabaseInstance
-	(*DrainPlugin)(nil),                    // 26: dbpilot.agent.v1.DrainPlugin
-	(*CollectDatabaseMetrics)(nil),         // 27: dbpilot.agent.v1.CollectDatabaseMetrics
-	(*CredentialLeaseRequest)(nil),         // 28: dbpilot.agent.v1.CredentialLeaseRequest
-	(*CredentialLeaseResponse)(nil),        // 29: dbpilot.agent.v1.CredentialLeaseResponse
-	(*CredentialMaterial)(nil),             // 30: dbpilot.agent.v1.CredentialMaterial
-	(*PluginArtifactLeaseRequest)(nil),     // 31: dbpilot.agent.v1.PluginArtifactLeaseRequest
-	(*PluginArtifactLeaseResponse)(nil),    // 32: dbpilot.agent.v1.PluginArtifactLeaseResponse
-	(*CommandAcknowledgement)(nil),         // 33: dbpilot.agent.v1.CommandAcknowledgement
-	(*CommandPrepared)(nil),                // 34: dbpilot.agent.v1.CommandPrepared
-	(*CommandProgress)(nil),                // 35: dbpilot.agent.v1.CommandProgress
-	(*CommandResult)(nil),                  // 36: dbpilot.agent.v1.CommandResult
-	(*CommandStart)(nil),                   // 37: dbpilot.agent.v1.CommandStart
-	(*CommandResultAcknowledgement)(nil),   // 38: dbpilot.agent.v1.CommandResultAcknowledgement
-	(*ArtifactReference)(nil),              // 39: dbpilot.agent.v1.ArtifactReference
-	(*CommandCancellation)(nil),            // 40: dbpilot.agent.v1.CommandCancellation
-	(*FlowControlInstruction)(nil),         // 41: dbpilot.agent.v1.FlowControlInstruction
-	nil,                                    // 42: dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
-	nil,                                    // 43: dbpilot.agent.v1.PluginArtifactLeaseResponse.RequestHeadersEntry
-	(*timestamppb.Timestamp)(nil),          // 44: google.protobuf.Timestamp
-	(*Inventory)(nil),                      // 45: dbpilot.agent.v1.Inventory
-	(*HostObservation)(nil),                // 46: dbpilot.agent.v1.HostObservation
-	(*DiscoveryReport)(nil),                // 47: dbpilot.agent.v1.DiscoveryReport
-	(*PluginObservation)(nil),              // 48: dbpilot.agent.v1.PluginObservation
-	(*PolicyUpdate)(nil),                   // 49: dbpilot.agent.v1.PolicyUpdate
+	(CommandExecutionState)(0),               // 0: dbpilot.agent.v1.CommandExecutionState
+	(TransactionPolicy)(0),                   // 1: dbpilot.agent.v1.TransactionPolicy
+	(PluginDesiredState)(0),                  // 2: dbpilot.agent.v1.PluginDesiredState
+	(CommandAcknowledgementState)(0),         // 3: dbpilot.agent.v1.CommandAcknowledgementState
+	(CommandResultState)(0),                  // 4: dbpilot.agent.v1.CommandResultState
+	(*AgentMessage)(nil),                     // 5: dbpilot.agent.v1.AgentMessage
+	(*ServerMessage)(nil),                    // 6: dbpilot.agent.v1.ServerMessage
+	(*DiscoveryReportAcknowledgement)(nil),   // 7: dbpilot.agent.v1.DiscoveryReportAcknowledgement
+	(*Hello)(nil),                            // 8: dbpilot.agent.v1.Hello
+	(*HelloAck)(nil),                         // 9: dbpilot.agent.v1.HelloAck
+	(*Heartbeat)(nil),                        // 10: dbpilot.agent.v1.Heartbeat
+	(*ActiveCommand)(nil),                    // 11: dbpilot.agent.v1.ActiveCommand
+	(*CommandEnvelope)(nil),                  // 12: dbpilot.agent.v1.CommandEnvelope
+	(*CollectNow)(nil),                       // 13: dbpilot.agent.v1.CollectNow
+	(*InspectInstance)(nil),                  // 14: dbpilot.agent.v1.InspectInstance
+	(*ExecuteSQL)(nil),                       // 15: dbpilot.agent.v1.ExecuteSQL
+	(*CommandRecoveryState)(nil),             // 16: dbpilot.agent.v1.CommandRecoveryState
+	(*ExecuteRegisteredProcess)(nil),         // 17: dbpilot.agent.v1.ExecuteRegisteredProcess
+	(*CollectDiagnostic)(nil),                // 18: dbpilot.agent.v1.CollectDiagnostic
+	(*DiscoverDatabases)(nil),                // 19: dbpilot.agent.v1.DiscoverDatabases
+	(*ReconcilePlugin)(nil),                  // 20: dbpilot.agent.v1.ReconcilePlugin
+	(*PluginInstanceTemplateReferences)(nil), // 21: dbpilot.agent.v1.PluginInstanceTemplateReferences
+	(*PluginInstanceDescriptor)(nil),         // 22: dbpilot.agent.v1.PluginInstanceDescriptor
+	(*ApplyPluginConfiguration)(nil),         // 23: dbpilot.agent.v1.ApplyPluginConfiguration
+	(*PluginInstanceConfiguration)(nil),      // 24: dbpilot.agent.v1.PluginInstanceConfiguration
+	(*PluginTemplateRevision)(nil),           // 25: dbpilot.agent.v1.PluginTemplateRevision
+	(*ValidateDatabaseInstance)(nil),         // 26: dbpilot.agent.v1.ValidateDatabaseInstance
+	(*DrainPlugin)(nil),                      // 27: dbpilot.agent.v1.DrainPlugin
+	(*CollectDatabaseMetrics)(nil),           // 28: dbpilot.agent.v1.CollectDatabaseMetrics
+	(*MetricTemplateCommandReference)(nil),   // 29: dbpilot.agent.v1.MetricTemplateCommandReference
+	(*CredentialLeaseRequest)(nil),           // 30: dbpilot.agent.v1.CredentialLeaseRequest
+	(*CredentialLeaseResponse)(nil),          // 31: dbpilot.agent.v1.CredentialLeaseResponse
+	(*CredentialMaterial)(nil),               // 32: dbpilot.agent.v1.CredentialMaterial
+	(*PluginArtifactLeaseRequest)(nil),       // 33: dbpilot.agent.v1.PluginArtifactLeaseRequest
+	(*PluginArtifactLeaseResponse)(nil),      // 34: dbpilot.agent.v1.PluginArtifactLeaseResponse
+	(*MetricTemplateLeaseRequest)(nil),       // 35: dbpilot.agent.v1.MetricTemplateLeaseRequest
+	(*MetricTemplateLeaseResponse)(nil),      // 36: dbpilot.agent.v1.MetricTemplateLeaseResponse
+	(*MetricTemplateDefinition)(nil),         // 37: dbpilot.agent.v1.MetricTemplateDefinition
+	(*MetricTemplateValueMapping)(nil),       // 38: dbpilot.agent.v1.MetricTemplateValueMapping
+	(*MetricTemplateLabelMapping)(nil),       // 39: dbpilot.agent.v1.MetricTemplateLabelMapping
+	(*CommandAcknowledgement)(nil),           // 40: dbpilot.agent.v1.CommandAcknowledgement
+	(*CommandPrepared)(nil),                  // 41: dbpilot.agent.v1.CommandPrepared
+	(*CommandProgress)(nil),                  // 42: dbpilot.agent.v1.CommandProgress
+	(*CommandResult)(nil),                    // 43: dbpilot.agent.v1.CommandResult
+	(*MetricTemplateTrialResult)(nil),        // 44: dbpilot.agent.v1.MetricTemplateTrialResult
+	(*MetricTemplateCandidateMetric)(nil),    // 45: dbpilot.agent.v1.MetricTemplateCandidateMetric
+	(*CommandStart)(nil),                     // 46: dbpilot.agent.v1.CommandStart
+	(*CommandResultAcknowledgement)(nil),     // 47: dbpilot.agent.v1.CommandResultAcknowledgement
+	(*ArtifactReference)(nil),                // 48: dbpilot.agent.v1.ArtifactReference
+	(*CommandCancellation)(nil),              // 49: dbpilot.agent.v1.CommandCancellation
+	(*FlowControlInstruction)(nil),           // 50: dbpilot.agent.v1.FlowControlInstruction
+	nil,                                      // 51: dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
+	nil,                                      // 52: dbpilot.agent.v1.PluginArtifactLeaseResponse.RequestHeadersEntry
+	nil,                                      // 53: dbpilot.agent.v1.MetricTemplateCandidateMetric.LabelsEntry
+	(*timestamppb.Timestamp)(nil),            // 54: google.protobuf.Timestamp
+	(*Inventory)(nil),                        // 55: dbpilot.agent.v1.Inventory
+	(*HostObservation)(nil),                  // 56: dbpilot.agent.v1.HostObservation
+	(*DiscoveryReport)(nil),                  // 57: dbpilot.agent.v1.DiscoveryReport
+	(*PluginObservation)(nil),                // 58: dbpilot.agent.v1.PluginObservation
+	(*PolicyUpdate)(nil),                     // 59: dbpilot.agent.v1.PolicyUpdate
 }
 var file_agent_v1_command_proto_depIdxs = []int32{
-	44, // 0: dbpilot.agent.v1.AgentMessage.sent_at:type_name -> google.protobuf.Timestamp
+	54, // 0: dbpilot.agent.v1.AgentMessage.sent_at:type_name -> google.protobuf.Timestamp
 	8,  // 1: dbpilot.agent.v1.AgentMessage.hello:type_name -> dbpilot.agent.v1.Hello
 	10, // 2: dbpilot.agent.v1.AgentMessage.heartbeat:type_name -> dbpilot.agent.v1.Heartbeat
-	45, // 3: dbpilot.agent.v1.AgentMessage.inventory:type_name -> dbpilot.agent.v1.Inventory
-	33, // 4: dbpilot.agent.v1.AgentMessage.command_acknowledgement:type_name -> dbpilot.agent.v1.CommandAcknowledgement
-	35, // 5: dbpilot.agent.v1.AgentMessage.command_progress:type_name -> dbpilot.agent.v1.CommandProgress
-	36, // 6: dbpilot.agent.v1.AgentMessage.command_result:type_name -> dbpilot.agent.v1.CommandResult
-	34, // 7: dbpilot.agent.v1.AgentMessage.command_prepared:type_name -> dbpilot.agent.v1.CommandPrepared
-	46, // 8: dbpilot.agent.v1.AgentMessage.host_observation:type_name -> dbpilot.agent.v1.HostObservation
-	47, // 9: dbpilot.agent.v1.AgentMessage.discovery_report:type_name -> dbpilot.agent.v1.DiscoveryReport
-	48, // 10: dbpilot.agent.v1.AgentMessage.plugin_observation:type_name -> dbpilot.agent.v1.PluginObservation
-	28, // 11: dbpilot.agent.v1.AgentMessage.credential_lease_request:type_name -> dbpilot.agent.v1.CredentialLeaseRequest
-	31, // 12: dbpilot.agent.v1.AgentMessage.plugin_artifact_lease_request:type_name -> dbpilot.agent.v1.PluginArtifactLeaseRequest
-	44, // 13: dbpilot.agent.v1.ServerMessage.sent_at:type_name -> google.protobuf.Timestamp
-	9,  // 14: dbpilot.agent.v1.ServerMessage.hello_ack:type_name -> dbpilot.agent.v1.HelloAck
-	49, // 15: dbpilot.agent.v1.ServerMessage.policy_update:type_name -> dbpilot.agent.v1.PolicyUpdate
-	12, // 16: dbpilot.agent.v1.ServerMessage.command:type_name -> dbpilot.agent.v1.CommandEnvelope
-	40, // 17: dbpilot.agent.v1.ServerMessage.command_cancellation:type_name -> dbpilot.agent.v1.CommandCancellation
-	41, // 18: dbpilot.agent.v1.ServerMessage.flow_control_instruction:type_name -> dbpilot.agent.v1.FlowControlInstruction
-	38, // 19: dbpilot.agent.v1.ServerMessage.command_result_acknowledgement:type_name -> dbpilot.agent.v1.CommandResultAcknowledgement
-	37, // 20: dbpilot.agent.v1.ServerMessage.command_start:type_name -> dbpilot.agent.v1.CommandStart
-	29, // 21: dbpilot.agent.v1.ServerMessage.credential_lease_response:type_name -> dbpilot.agent.v1.CredentialLeaseResponse
-	32, // 22: dbpilot.agent.v1.ServerMessage.plugin_artifact_lease_response:type_name -> dbpilot.agent.v1.PluginArtifactLeaseResponse
-	7,  // 23: dbpilot.agent.v1.ServerMessage.discovery_report_acknowledgement:type_name -> dbpilot.agent.v1.DiscoveryReportAcknowledgement
-	16, // 24: dbpilot.agent.v1.Hello.active_commands:type_name -> dbpilot.agent.v1.CommandRecoveryState
-	44, // 25: dbpilot.agent.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
-	11, // 26: dbpilot.agent.v1.Heartbeat.active_commands:type_name -> dbpilot.agent.v1.ActiveCommand
-	44, // 27: dbpilot.agent.v1.CommandEnvelope.issued_at:type_name -> google.protobuf.Timestamp
-	44, // 28: dbpilot.agent.v1.CommandEnvelope.expires_at:type_name -> google.protobuf.Timestamp
-	13, // 29: dbpilot.agent.v1.CommandEnvelope.collect_now:type_name -> dbpilot.agent.v1.CollectNow
-	14, // 30: dbpilot.agent.v1.CommandEnvelope.inspect_instance:type_name -> dbpilot.agent.v1.InspectInstance
-	15, // 31: dbpilot.agent.v1.CommandEnvelope.execute_sql:type_name -> dbpilot.agent.v1.ExecuteSQL
-	17, // 32: dbpilot.agent.v1.CommandEnvelope.execute_registered_process:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess
-	18, // 33: dbpilot.agent.v1.CommandEnvelope.collect_diagnostic:type_name -> dbpilot.agent.v1.CollectDiagnostic
-	19, // 34: dbpilot.agent.v1.CommandEnvelope.discover_databases:type_name -> dbpilot.agent.v1.DiscoverDatabases
-	20, // 35: dbpilot.agent.v1.CommandEnvelope.reconcile_plugin:type_name -> dbpilot.agent.v1.ReconcilePlugin
-	22, // 36: dbpilot.agent.v1.CommandEnvelope.apply_plugin_configuration:type_name -> dbpilot.agent.v1.ApplyPluginConfiguration
-	25, // 37: dbpilot.agent.v1.CommandEnvelope.validate_database_instance:type_name -> dbpilot.agent.v1.ValidateDatabaseInstance
-	26, // 38: dbpilot.agent.v1.CommandEnvelope.drain_plugin:type_name -> dbpilot.agent.v1.DrainPlugin
-	27, // 39: dbpilot.agent.v1.CommandEnvelope.collect_database_metrics:type_name -> dbpilot.agent.v1.CollectDatabaseMetrics
-	1,  // 40: dbpilot.agent.v1.ExecuteSQL.transaction_policy:type_name -> dbpilot.agent.v1.TransactionPolicy
-	0,  // 41: dbpilot.agent.v1.CommandRecoveryState.state:type_name -> dbpilot.agent.v1.CommandExecutionState
-	42, // 42: dbpilot.agent.v1.ExecuteRegisteredProcess.parameters:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
-	2,  // 43: dbpilot.agent.v1.ReconcilePlugin.desired_state:type_name -> dbpilot.agent.v1.PluginDesiredState
-	21, // 44: dbpilot.agent.v1.ReconcilePlugin.instance_descriptors:type_name -> dbpilot.agent.v1.PluginInstanceDescriptor
-	23, // 45: dbpilot.agent.v1.ApplyPluginConfiguration.instances:type_name -> dbpilot.agent.v1.PluginInstanceConfiguration
-	24, // 46: dbpilot.agent.v1.PluginInstanceConfiguration.templates:type_name -> dbpilot.agent.v1.PluginTemplateRevision
-	44, // 47: dbpilot.agent.v1.CredentialLeaseResponse.expires_at:type_name -> google.protobuf.Timestamp
-	30, // 48: dbpilot.agent.v1.CredentialLeaseResponse.credential:type_name -> dbpilot.agent.v1.CredentialMaterial
-	44, // 49: dbpilot.agent.v1.PluginArtifactLeaseResponse.expires_at:type_name -> google.protobuf.Timestamp
-	43, // 50: dbpilot.agent.v1.PluginArtifactLeaseResponse.request_headers:type_name -> dbpilot.agent.v1.PluginArtifactLeaseResponse.RequestHeadersEntry
-	3,  // 51: dbpilot.agent.v1.CommandAcknowledgement.state:type_name -> dbpilot.agent.v1.CommandAcknowledgementState
-	4,  // 52: dbpilot.agent.v1.CommandResult.state:type_name -> dbpilot.agent.v1.CommandResultState
-	39, // 53: dbpilot.agent.v1.CommandResult.artifacts:type_name -> dbpilot.agent.v1.ArtifactReference
-	44, // 54: dbpilot.agent.v1.CommandStart.start_deadline:type_name -> google.protobuf.Timestamp
-	5,  // 55: dbpilot.agent.v1.AgentControl.Connect:input_type -> dbpilot.agent.v1.AgentMessage
-	6,  // 56: dbpilot.agent.v1.AgentControl.Connect:output_type -> dbpilot.agent.v1.ServerMessage
-	56, // [56:57] is the sub-list for method output_type
-	55, // [55:56] is the sub-list for method input_type
-	55, // [55:55] is the sub-list for extension type_name
-	55, // [55:55] is the sub-list for extension extendee
-	0,  // [0:55] is the sub-list for field type_name
+	55, // 3: dbpilot.agent.v1.AgentMessage.inventory:type_name -> dbpilot.agent.v1.Inventory
+	40, // 4: dbpilot.agent.v1.AgentMessage.command_acknowledgement:type_name -> dbpilot.agent.v1.CommandAcknowledgement
+	42, // 5: dbpilot.agent.v1.AgentMessage.command_progress:type_name -> dbpilot.agent.v1.CommandProgress
+	43, // 6: dbpilot.agent.v1.AgentMessage.command_result:type_name -> dbpilot.agent.v1.CommandResult
+	41, // 7: dbpilot.agent.v1.AgentMessage.command_prepared:type_name -> dbpilot.agent.v1.CommandPrepared
+	56, // 8: dbpilot.agent.v1.AgentMessage.host_observation:type_name -> dbpilot.agent.v1.HostObservation
+	57, // 9: dbpilot.agent.v1.AgentMessage.discovery_report:type_name -> dbpilot.agent.v1.DiscoveryReport
+	58, // 10: dbpilot.agent.v1.AgentMessage.plugin_observation:type_name -> dbpilot.agent.v1.PluginObservation
+	30, // 11: dbpilot.agent.v1.AgentMessage.credential_lease_request:type_name -> dbpilot.agent.v1.CredentialLeaseRequest
+	33, // 12: dbpilot.agent.v1.AgentMessage.plugin_artifact_lease_request:type_name -> dbpilot.agent.v1.PluginArtifactLeaseRequest
+	35, // 13: dbpilot.agent.v1.AgentMessage.metric_template_lease_request:type_name -> dbpilot.agent.v1.MetricTemplateLeaseRequest
+	54, // 14: dbpilot.agent.v1.ServerMessage.sent_at:type_name -> google.protobuf.Timestamp
+	9,  // 15: dbpilot.agent.v1.ServerMessage.hello_ack:type_name -> dbpilot.agent.v1.HelloAck
+	59, // 16: dbpilot.agent.v1.ServerMessage.policy_update:type_name -> dbpilot.agent.v1.PolicyUpdate
+	12, // 17: dbpilot.agent.v1.ServerMessage.command:type_name -> dbpilot.agent.v1.CommandEnvelope
+	49, // 18: dbpilot.agent.v1.ServerMessage.command_cancellation:type_name -> dbpilot.agent.v1.CommandCancellation
+	50, // 19: dbpilot.agent.v1.ServerMessage.flow_control_instruction:type_name -> dbpilot.agent.v1.FlowControlInstruction
+	47, // 20: dbpilot.agent.v1.ServerMessage.command_result_acknowledgement:type_name -> dbpilot.agent.v1.CommandResultAcknowledgement
+	46, // 21: dbpilot.agent.v1.ServerMessage.command_start:type_name -> dbpilot.agent.v1.CommandStart
+	31, // 22: dbpilot.agent.v1.ServerMessage.credential_lease_response:type_name -> dbpilot.agent.v1.CredentialLeaseResponse
+	34, // 23: dbpilot.agent.v1.ServerMessage.plugin_artifact_lease_response:type_name -> dbpilot.agent.v1.PluginArtifactLeaseResponse
+	36, // 24: dbpilot.agent.v1.ServerMessage.metric_template_lease_response:type_name -> dbpilot.agent.v1.MetricTemplateLeaseResponse
+	7,  // 25: dbpilot.agent.v1.ServerMessage.discovery_report_acknowledgement:type_name -> dbpilot.agent.v1.DiscoveryReportAcknowledgement
+	16, // 26: dbpilot.agent.v1.Hello.active_commands:type_name -> dbpilot.agent.v1.CommandRecoveryState
+	54, // 27: dbpilot.agent.v1.HelloAck.server_time:type_name -> google.protobuf.Timestamp
+	11, // 28: dbpilot.agent.v1.Heartbeat.active_commands:type_name -> dbpilot.agent.v1.ActiveCommand
+	54, // 29: dbpilot.agent.v1.CommandEnvelope.issued_at:type_name -> google.protobuf.Timestamp
+	54, // 30: dbpilot.agent.v1.CommandEnvelope.expires_at:type_name -> google.protobuf.Timestamp
+	13, // 31: dbpilot.agent.v1.CommandEnvelope.collect_now:type_name -> dbpilot.agent.v1.CollectNow
+	14, // 32: dbpilot.agent.v1.CommandEnvelope.inspect_instance:type_name -> dbpilot.agent.v1.InspectInstance
+	15, // 33: dbpilot.agent.v1.CommandEnvelope.execute_sql:type_name -> dbpilot.agent.v1.ExecuteSQL
+	17, // 34: dbpilot.agent.v1.CommandEnvelope.execute_registered_process:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess
+	18, // 35: dbpilot.agent.v1.CommandEnvelope.collect_diagnostic:type_name -> dbpilot.agent.v1.CollectDiagnostic
+	19, // 36: dbpilot.agent.v1.CommandEnvelope.discover_databases:type_name -> dbpilot.agent.v1.DiscoverDatabases
+	20, // 37: dbpilot.agent.v1.CommandEnvelope.reconcile_plugin:type_name -> dbpilot.agent.v1.ReconcilePlugin
+	23, // 38: dbpilot.agent.v1.CommandEnvelope.apply_plugin_configuration:type_name -> dbpilot.agent.v1.ApplyPluginConfiguration
+	26, // 39: dbpilot.agent.v1.CommandEnvelope.validate_database_instance:type_name -> dbpilot.agent.v1.ValidateDatabaseInstance
+	27, // 40: dbpilot.agent.v1.CommandEnvelope.drain_plugin:type_name -> dbpilot.agent.v1.DrainPlugin
+	28, // 41: dbpilot.agent.v1.CommandEnvelope.collect_database_metrics:type_name -> dbpilot.agent.v1.CollectDatabaseMetrics
+	1,  // 42: dbpilot.agent.v1.ExecuteSQL.transaction_policy:type_name -> dbpilot.agent.v1.TransactionPolicy
+	0,  // 43: dbpilot.agent.v1.CommandRecoveryState.state:type_name -> dbpilot.agent.v1.CommandExecutionState
+	51, // 44: dbpilot.agent.v1.ExecuteRegisteredProcess.parameters:type_name -> dbpilot.agent.v1.ExecuteRegisteredProcess.ParametersEntry
+	2,  // 45: dbpilot.agent.v1.ReconcilePlugin.desired_state:type_name -> dbpilot.agent.v1.PluginDesiredState
+	29, // 46: dbpilot.agent.v1.ReconcilePlugin.template_revisions:type_name -> dbpilot.agent.v1.MetricTemplateCommandReference
+	21, // 47: dbpilot.agent.v1.ReconcilePlugin.instance_template_revisions:type_name -> dbpilot.agent.v1.PluginInstanceTemplateReferences
+	22, // 48: dbpilot.agent.v1.ReconcilePlugin.instance_descriptors:type_name -> dbpilot.agent.v1.PluginInstanceDescriptor
+	29, // 49: dbpilot.agent.v1.PluginInstanceTemplateReferences.templates:type_name -> dbpilot.agent.v1.MetricTemplateCommandReference
+	24, // 50: dbpilot.agent.v1.ApplyPluginConfiguration.instances:type_name -> dbpilot.agent.v1.PluginInstanceConfiguration
+	25, // 51: dbpilot.agent.v1.PluginInstanceConfiguration.templates:type_name -> dbpilot.agent.v1.PluginTemplateRevision
+	29, // 52: dbpilot.agent.v1.CollectDatabaseMetrics.template_revisions:type_name -> dbpilot.agent.v1.MetricTemplateCommandReference
+	54, // 53: dbpilot.agent.v1.CredentialLeaseResponse.expires_at:type_name -> google.protobuf.Timestamp
+	32, // 54: dbpilot.agent.v1.CredentialLeaseResponse.credential:type_name -> dbpilot.agent.v1.CredentialMaterial
+	54, // 55: dbpilot.agent.v1.PluginArtifactLeaseResponse.expires_at:type_name -> google.protobuf.Timestamp
+	52, // 56: dbpilot.agent.v1.PluginArtifactLeaseResponse.request_headers:type_name -> dbpilot.agent.v1.PluginArtifactLeaseResponse.RequestHeadersEntry
+	54, // 57: dbpilot.agent.v1.MetricTemplateLeaseResponse.expires_at:type_name -> google.protobuf.Timestamp
+	37, // 58: dbpilot.agent.v1.MetricTemplateLeaseResponse.definition:type_name -> dbpilot.agent.v1.MetricTemplateDefinition
+	38, // 59: dbpilot.agent.v1.MetricTemplateDefinition.value_mappings:type_name -> dbpilot.agent.v1.MetricTemplateValueMapping
+	39, // 60: dbpilot.agent.v1.MetricTemplateDefinition.label_mappings:type_name -> dbpilot.agent.v1.MetricTemplateLabelMapping
+	3,  // 61: dbpilot.agent.v1.CommandAcknowledgement.state:type_name -> dbpilot.agent.v1.CommandAcknowledgementState
+	4,  // 62: dbpilot.agent.v1.CommandResult.state:type_name -> dbpilot.agent.v1.CommandResultState
+	48, // 63: dbpilot.agent.v1.CommandResult.artifacts:type_name -> dbpilot.agent.v1.ArtifactReference
+	44, // 64: dbpilot.agent.v1.CommandResult.metric_template_trial_result:type_name -> dbpilot.agent.v1.MetricTemplateTrialResult
+	45, // 65: dbpilot.agent.v1.MetricTemplateTrialResult.candidate_metrics:type_name -> dbpilot.agent.v1.MetricTemplateCandidateMetric
+	53, // 66: dbpilot.agent.v1.MetricTemplateCandidateMetric.labels:type_name -> dbpilot.agent.v1.MetricTemplateCandidateMetric.LabelsEntry
+	54, // 67: dbpilot.agent.v1.CommandStart.start_deadline:type_name -> google.protobuf.Timestamp
+	5,  // 68: dbpilot.agent.v1.AgentControl.Connect:input_type -> dbpilot.agent.v1.AgentMessage
+	6,  // 69: dbpilot.agent.v1.AgentControl.Connect:output_type -> dbpilot.agent.v1.ServerMessage
+	69, // [69:70] is the sub-list for method output_type
+	68, // [68:69] is the sub-list for method input_type
+	68, // [68:68] is the sub-list for extension type_name
+	68, // [68:68] is the sub-list for extension extendee
+	0,  // [0:68] is the sub-list for field type_name
 }
 
 func init() { file_agent_v1_command_proto_init() }
@@ -4069,6 +5085,7 @@ func file_agent_v1_command_proto_init() {
 		(*AgentMessage_PluginObservation)(nil),
 		(*AgentMessage_CredentialLeaseRequest)(nil),
 		(*AgentMessage_PluginArtifactLeaseRequest)(nil),
+		(*AgentMessage_MetricTemplateLeaseRequest)(nil),
 	}
 	file_agent_v1_command_proto_msgTypes[1].OneofWrappers = []any{
 		(*ServerMessage_HelloAck)(nil),
@@ -4080,6 +5097,7 @@ func file_agent_v1_command_proto_init() {
 		(*ServerMessage_CommandStart)(nil),
 		(*ServerMessage_CredentialLeaseResponse)(nil),
 		(*ServerMessage_PluginArtifactLeaseResponse)(nil),
+		(*ServerMessage_MetricTemplateLeaseResponse)(nil),
 		(*ServerMessage_DiscoveryReportAcknowledgement)(nil),
 	}
 	file_agent_v1_command_proto_msgTypes[7].OneofWrappers = []any{
@@ -4101,7 +5119,7 @@ func file_agent_v1_command_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agent_v1_command_proto_rawDesc), len(file_agent_v1_command_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   39,
+			NumMessages:   49,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

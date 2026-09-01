@@ -244,6 +244,306 @@ func (x *CollectPluginMetricsResponse) GetBatches() []*PluginMetricBatch {
 	return nil
 }
 
+type TrialMetricTemplateRequest struct {
+	state                 protoimpl.MessageState         `protogen:"open.v1"`
+	AssignmentId          string                         `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
+	ConfigurationRevision uint64                         `protobuf:"varint,2,opt,name=configuration_revision,json=configurationRevision,proto3" json:"configuration_revision,omitempty"`
+	OperationRevision     uint64                         `protobuf:"varint,3,opt,name=operation_revision,json=operationRevision,proto3" json:"operation_revision,omitempty"`
+	InstanceId            string                         `protobuf:"bytes,4,opt,name=instance_id,json=instanceId,proto3" json:"instance_id,omitempty"`
+	Template              *TrialMetricTemplateDefinition `protobuf:"bytes,5,opt,name=template,proto3" json:"template,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *TrialMetricTemplateRequest) Reset() {
+	*x = TrialMetricTemplateRequest{}
+	mi := &file_plugin_v1_metrics_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TrialMetricTemplateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TrialMetricTemplateRequest) ProtoMessage() {}
+
+func (x *TrialMetricTemplateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_v1_metrics_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TrialMetricTemplateRequest.ProtoReflect.Descriptor instead.
+func (*TrialMetricTemplateRequest) Descriptor() ([]byte, []int) {
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *TrialMetricTemplateRequest) GetAssignmentId() string {
+	if x != nil {
+		return x.AssignmentId
+	}
+	return ""
+}
+
+func (x *TrialMetricTemplateRequest) GetConfigurationRevision() uint64 {
+	if x != nil {
+		return x.ConfigurationRevision
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateRequest) GetOperationRevision() uint64 {
+	if x != nil {
+		return x.OperationRevision
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateRequest) GetInstanceId() string {
+	if x != nil {
+		return x.InstanceId
+	}
+	return ""
+}
+
+func (x *TrialMetricTemplateRequest) GetTemplate() *TrialMetricTemplateDefinition {
+	if x != nil {
+		return x.Template
+	}
+	return nil
+}
+
+type TrialMetricTemplateDefinition struct {
+	state                     protoimpl.MessageState `protogen:"open.v1"`
+	TemplateId                string                 `protobuf:"bytes,1,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
+	Revision                  uint64                 `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	QueryDigest               []byte                 `protobuf:"bytes,3,opt,name=query_digest,json=queryDigest,proto3" json:"query_digest,omitempty"`
+	QueryKind                 string                 `protobuf:"bytes,4,opt,name=query_kind,json=queryKind,proto3" json:"query_kind,omitempty"`
+	ReadOnlyStatement         []byte                 `protobuf:"bytes,5,opt,name=read_only_statement,json=readOnlyStatement,proto3" json:"read_only_statement,omitempty"`
+	CollectionIntervalSeconds uint32                 `protobuf:"varint,6,opt,name=collection_interval_seconds,json=collectionIntervalSeconds,proto3" json:"collection_interval_seconds,omitempty"`
+	TimeoutSeconds            uint32                 `protobuf:"varint,7,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
+	MaxRows                   uint32                 `protobuf:"varint,8,opt,name=max_rows,json=maxRows,proto3" json:"max_rows,omitempty"`
+	MaxColumns                uint32                 `protobuf:"varint,9,opt,name=max_columns,json=maxColumns,proto3" json:"max_columns,omitempty"`
+	ValueMappings             []*MetricValueMapping  `protobuf:"bytes,10,rep,name=value_mappings,json=valueMappings,proto3" json:"value_mappings,omitempty"`
+	LabelMappings             []*MetricLabelMapping  `protobuf:"bytes,11,rep,name=label_mappings,json=labelMappings,proto3" json:"label_mappings,omitempty"`
+	CardinalityLimit          uint32                 `protobuf:"varint,12,opt,name=cardinality_limit,json=cardinalityLimit,proto3" json:"cardinality_limit,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
+}
+
+func (x *TrialMetricTemplateDefinition) Reset() {
+	*x = TrialMetricTemplateDefinition{}
+	mi := &file_plugin_v1_metrics_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TrialMetricTemplateDefinition) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TrialMetricTemplateDefinition) ProtoMessage() {}
+
+func (x *TrialMetricTemplateDefinition) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_v1_metrics_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TrialMetricTemplateDefinition.ProtoReflect.Descriptor instead.
+func (*TrialMetricTemplateDefinition) Descriptor() ([]byte, []int) {
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *TrialMetricTemplateDefinition) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
+func (x *TrialMetricTemplateDefinition) GetRevision() uint64 {
+	if x != nil {
+		return x.Revision
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateDefinition) GetQueryDigest() []byte {
+	if x != nil {
+		return x.QueryDigest
+	}
+	return nil
+}
+
+func (x *TrialMetricTemplateDefinition) GetQueryKind() string {
+	if x != nil {
+		return x.QueryKind
+	}
+	return ""
+}
+
+func (x *TrialMetricTemplateDefinition) GetReadOnlyStatement() []byte {
+	if x != nil {
+		return x.ReadOnlyStatement
+	}
+	return nil
+}
+
+func (x *TrialMetricTemplateDefinition) GetCollectionIntervalSeconds() uint32 {
+	if x != nil {
+		return x.CollectionIntervalSeconds
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateDefinition) GetTimeoutSeconds() uint32 {
+	if x != nil {
+		return x.TimeoutSeconds
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateDefinition) GetMaxRows() uint32 {
+	if x != nil {
+		return x.MaxRows
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateDefinition) GetMaxColumns() uint32 {
+	if x != nil {
+		return x.MaxColumns
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateDefinition) GetValueMappings() []*MetricValueMapping {
+	if x != nil {
+		return x.ValueMappings
+	}
+	return nil
+}
+
+func (x *TrialMetricTemplateDefinition) GetLabelMappings() []*MetricLabelMapping {
+	if x != nil {
+		return x.LabelMappings
+	}
+	return nil
+}
+
+func (x *TrialMetricTemplateDefinition) GetCardinalityLimit() uint32 {
+	if x != nil {
+		return x.CardinalityLimit
+	}
+	return 0
+}
+
+type TrialMetricTemplateResponse struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Succeeded        bool                   `protobuf:"varint,1,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
+	CandidateMetrics []*PluginMetricSample  `protobuf:"bytes,2,rep,name=candidate_metrics,json=candidateMetrics,proto3" json:"candidate_metrics,omitempty"`
+	RowCount         uint32                 `protobuf:"varint,3,opt,name=row_count,json=rowCount,proto3" json:"row_count,omitempty"`
+	ColumnCount      uint32                 `protobuf:"varint,4,opt,name=column_count,json=columnCount,proto3" json:"column_count,omitempty"`
+	MetricCount      uint32                 `protobuf:"varint,5,opt,name=metric_count,json=metricCount,proto3" json:"metric_count,omitempty"`
+	DurationMillis   uint32                 `protobuf:"varint,6,opt,name=duration_millis,json=durationMillis,proto3" json:"duration_millis,omitempty"`
+	ErrorCode        string                 `protobuf:"bytes,7,opt,name=error_code,json=errorCode,proto3" json:"error_code,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *TrialMetricTemplateResponse) Reset() {
+	*x = TrialMetricTemplateResponse{}
+	mi := &file_plugin_v1_metrics_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TrialMetricTemplateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TrialMetricTemplateResponse) ProtoMessage() {}
+
+func (x *TrialMetricTemplateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_plugin_v1_metrics_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TrialMetricTemplateResponse.ProtoReflect.Descriptor instead.
+func (*TrialMetricTemplateResponse) Descriptor() ([]byte, []int) {
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *TrialMetricTemplateResponse) GetSucceeded() bool {
+	if x != nil {
+		return x.Succeeded
+	}
+	return false
+}
+
+func (x *TrialMetricTemplateResponse) GetCandidateMetrics() []*PluginMetricSample {
+	if x != nil {
+		return x.CandidateMetrics
+	}
+	return nil
+}
+
+func (x *TrialMetricTemplateResponse) GetRowCount() uint32 {
+	if x != nil {
+		return x.RowCount
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateResponse) GetColumnCount() uint32 {
+	if x != nil {
+		return x.ColumnCount
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateResponse) GetMetricCount() uint32 {
+	if x != nil {
+		return x.MetricCount
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateResponse) GetDurationMillis() uint32 {
+	if x != nil {
+		return x.DurationMillis
+	}
+	return 0
+}
+
+func (x *TrialMetricTemplateResponse) GetErrorCode() string {
+	if x != nil {
+		return x.ErrorCode
+	}
+	return ""
+}
+
 type StreamPluginMetricsRequest struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	AssignmentId          string                 `protobuf:"bytes,1,opt,name=assignment_id,json=assignmentId,proto3" json:"assignment_id,omitempty"`
@@ -255,7 +555,7 @@ type StreamPluginMetricsRequest struct {
 
 func (x *StreamPluginMetricsRequest) Reset() {
 	*x = StreamPluginMetricsRequest{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[2]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -267,7 +567,7 @@ func (x *StreamPluginMetricsRequest) String() string {
 func (*StreamPluginMetricsRequest) ProtoMessage() {}
 
 func (x *StreamPluginMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[2]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -280,7 +580,7 @@ func (x *StreamPluginMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamPluginMetricsRequest.ProtoReflect.Descriptor instead.
 func (*StreamPluginMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{2}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *StreamPluginMetricsRequest) GetAssignmentId() string {
@@ -315,7 +615,7 @@ type PluginMetricCursor struct {
 
 func (x *PluginMetricCursor) Reset() {
 	*x = PluginMetricCursor{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[3]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -327,7 +627,7 @@ func (x *PluginMetricCursor) String() string {
 func (*PluginMetricCursor) ProtoMessage() {}
 
 func (x *PluginMetricCursor) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[3]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -340,7 +640,7 @@ func (x *PluginMetricCursor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginMetricCursor.ProtoReflect.Descriptor instead.
 func (*PluginMetricCursor) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{3}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PluginMetricCursor) GetInstanceId() string {
@@ -375,7 +675,7 @@ type AcknowledgePluginMetricsRequest struct {
 
 func (x *AcknowledgePluginMetricsRequest) Reset() {
 	*x = AcknowledgePluginMetricsRequest{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[4]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -387,7 +687,7 @@ func (x *AcknowledgePluginMetricsRequest) String() string {
 func (*AcknowledgePluginMetricsRequest) ProtoMessage() {}
 
 func (x *AcknowledgePluginMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[4]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -400,7 +700,7 @@ func (x *AcknowledgePluginMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgePluginMetricsRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgePluginMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{4}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *AcknowledgePluginMetricsRequest) GetAssignmentId() string {
@@ -434,7 +734,7 @@ type AcknowledgePluginMetricsResponse struct {
 
 func (x *AcknowledgePluginMetricsResponse) Reset() {
 	*x = AcknowledgePluginMetricsResponse{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[5]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -446,7 +746,7 @@ func (x *AcknowledgePluginMetricsResponse) String() string {
 func (*AcknowledgePluginMetricsResponse) ProtoMessage() {}
 
 func (x *AcknowledgePluginMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[5]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -459,7 +759,7 @@ func (x *AcknowledgePluginMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgePluginMetricsResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgePluginMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{5}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AcknowledgePluginMetricsResponse) GetAcceptedCursors() []*PluginMetricCursor {
@@ -497,7 +797,7 @@ type PluginMetricBatch struct {
 
 func (x *PluginMetricBatch) Reset() {
 	*x = PluginMetricBatch{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[6]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -509,7 +809,7 @@ func (x *PluginMetricBatch) String() string {
 func (*PluginMetricBatch) ProtoMessage() {}
 
 func (x *PluginMetricBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[6]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -522,7 +822,7 @@ func (x *PluginMetricBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginMetricBatch.ProtoReflect.Descriptor instead.
 func (*PluginMetricBatch) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{6}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PluginMetricBatch) GetPluginId() string {
@@ -630,7 +930,7 @@ type PluginMetricSample struct {
 
 func (x *PluginMetricSample) Reset() {
 	*x = PluginMetricSample{}
-	mi := &file_plugin_v1_metrics_proto_msgTypes[7]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -642,7 +942,7 @@ func (x *PluginMetricSample) String() string {
 func (*PluginMetricSample) ProtoMessage() {}
 
 func (x *PluginMetricSample) ProtoReflect() protoreflect.Message {
-	mi := &file_plugin_v1_metrics_proto_msgTypes[7]
+	mi := &file_plugin_v1_metrics_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -655,7 +955,7 @@ func (x *PluginMetricSample) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PluginMetricSample.ProtoReflect.Descriptor instead.
 func (*PluginMetricSample) Descriptor() ([]byte, []int) {
-	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{7}
+	return file_plugin_v1_metrics_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PluginMetricSample) GetMetricName() string {
@@ -704,14 +1004,47 @@ var File_plugin_v1_metrics_proto protoreflect.FileDescriptor
 
 const file_plugin_v1_metrics_proto_rawDesc = "" +
 	"\n" +
-	"\x17plugin/v1/metrics.proto\x12\x11dbpilot.plugin.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xbf\x01\n" +
+	"\x17plugin/v1/metrics.proto\x12\x11dbpilot.plugin.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x18plugin/v1/instance.proto\"\xbf\x01\n" +
 	"\x1bCollectPluginMetricsRequest\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12!\n" +
 	"\finstance_ids\x18\x03 \x03(\tR\vinstanceIds\x12!\n" +
 	"\ftemplate_ids\x18\x04 \x03(\tR\vtemplateIds\"^\n" +
 	"\x1cCollectPluginMetricsResponse\x12>\n" +
-	"\abatches\x18\x01 \x03(\v2$.dbpilot.plugin.v1.PluginMetricBatchR\abatches\"\xc6\x01\n" +
+	"\abatches\x18\x01 \x03(\v2$.dbpilot.plugin.v1.PluginMetricBatchR\abatches\"\x96\x02\n" +
+	"\x1aTrialMetricTemplateRequest\x12#\n" +
+	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
+	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12-\n" +
+	"\x12operation_revision\x18\x03 \x01(\x04R\x11operationRevision\x12\x1f\n" +
+	"\vinstance_id\x18\x04 \x01(\tR\n" +
+	"instanceId\x12L\n" +
+	"\btemplate\x18\x05 \x01(\v20.dbpilot.plugin.v1.TrialMetricTemplateDefinitionR\btemplate\"\xbc\x04\n" +
+	"\x1dTrialMetricTemplateDefinition\x12\x1f\n" +
+	"\vtemplate_id\x18\x01 \x01(\tR\n" +
+	"templateId\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\x12!\n" +
+	"\fquery_digest\x18\x03 \x01(\fR\vqueryDigest\x12\x1d\n" +
+	"\n" +
+	"query_kind\x18\x04 \x01(\tR\tqueryKind\x12.\n" +
+	"\x13read_only_statement\x18\x05 \x01(\fR\x11readOnlyStatement\x12>\n" +
+	"\x1bcollection_interval_seconds\x18\x06 \x01(\rR\x19collectionIntervalSeconds\x12'\n" +
+	"\x0ftimeout_seconds\x18\a \x01(\rR\x0etimeoutSeconds\x12\x19\n" +
+	"\bmax_rows\x18\b \x01(\rR\amaxRows\x12\x1f\n" +
+	"\vmax_columns\x18\t \x01(\rR\n" +
+	"maxColumns\x12L\n" +
+	"\x0evalue_mappings\x18\n" +
+	" \x03(\v2%.dbpilot.plugin.v1.MetricValueMappingR\rvalueMappings\x12L\n" +
+	"\x0elabel_mappings\x18\v \x03(\v2%.dbpilot.plugin.v1.MetricLabelMappingR\rlabelMappings\x12+\n" +
+	"\x11cardinality_limit\x18\f \x01(\rR\x10cardinalityLimit\"\xba\x02\n" +
+	"\x1bTrialMetricTemplateResponse\x12\x1c\n" +
+	"\tsucceeded\x18\x01 \x01(\bR\tsucceeded\x12R\n" +
+	"\x11candidate_metrics\x18\x02 \x03(\v2%.dbpilot.plugin.v1.PluginMetricSampleR\x10candidateMetrics\x12\x1b\n" +
+	"\trow_count\x18\x03 \x01(\rR\browCount\x12!\n" +
+	"\fcolumn_count\x18\x04 \x01(\rR\vcolumnCount\x12!\n" +
+	"\fmetric_count\x18\x05 \x01(\rR\vmetricCount\x12'\n" +
+	"\x0fduration_millis\x18\x06 \x01(\rR\x0edurationMillis\x12\x1d\n" +
+	"\n" +
+	"error_code\x18\a \x01(\tR\terrorCode\"\xc6\x01\n" +
 	"\x1aStreamPluginMetricsRequest\x12#\n" +
 	"\rassignment_id\x18\x01 \x01(\tR\fassignmentId\x125\n" +
 	"\x16configuration_revision\x18\x02 \x01(\x04R\x15configurationRevision\x12L\n" +
@@ -787,37 +1120,46 @@ func file_plugin_v1_metrics_proto_rawDescGZIP() []byte {
 }
 
 var file_plugin_v1_metrics_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_plugin_v1_metrics_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_plugin_v1_metrics_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_plugin_v1_metrics_proto_goTypes = []any{
 	(PluginMetricType)(0),                    // 0: dbpilot.plugin.v1.PluginMetricType
 	(PluginCollectionStatus)(0),              // 1: dbpilot.plugin.v1.PluginCollectionStatus
 	(*CollectPluginMetricsRequest)(nil),      // 2: dbpilot.plugin.v1.CollectPluginMetricsRequest
 	(*CollectPluginMetricsResponse)(nil),     // 3: dbpilot.plugin.v1.CollectPluginMetricsResponse
-	(*StreamPluginMetricsRequest)(nil),       // 4: dbpilot.plugin.v1.StreamPluginMetricsRequest
-	(*PluginMetricCursor)(nil),               // 5: dbpilot.plugin.v1.PluginMetricCursor
-	(*AcknowledgePluginMetricsRequest)(nil),  // 6: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
-	(*AcknowledgePluginMetricsResponse)(nil), // 7: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
-	(*PluginMetricBatch)(nil),                // 8: dbpilot.plugin.v1.PluginMetricBatch
-	(*PluginMetricSample)(nil),               // 9: dbpilot.plugin.v1.PluginMetricSample
-	nil,                                      // 10: dbpilot.plugin.v1.PluginMetricSample.LabelsEntry
-	(*timestamppb.Timestamp)(nil),            // 11: google.protobuf.Timestamp
+	(*TrialMetricTemplateRequest)(nil),       // 4: dbpilot.plugin.v1.TrialMetricTemplateRequest
+	(*TrialMetricTemplateDefinition)(nil),    // 5: dbpilot.plugin.v1.TrialMetricTemplateDefinition
+	(*TrialMetricTemplateResponse)(nil),      // 6: dbpilot.plugin.v1.TrialMetricTemplateResponse
+	(*StreamPluginMetricsRequest)(nil),       // 7: dbpilot.plugin.v1.StreamPluginMetricsRequest
+	(*PluginMetricCursor)(nil),               // 8: dbpilot.plugin.v1.PluginMetricCursor
+	(*AcknowledgePluginMetricsRequest)(nil),  // 9: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest
+	(*AcknowledgePluginMetricsResponse)(nil), // 10: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse
+	(*PluginMetricBatch)(nil),                // 11: dbpilot.plugin.v1.PluginMetricBatch
+	(*PluginMetricSample)(nil),               // 12: dbpilot.plugin.v1.PluginMetricSample
+	nil,                                      // 13: dbpilot.plugin.v1.PluginMetricSample.LabelsEntry
+	(*MetricValueMapping)(nil),               // 14: dbpilot.plugin.v1.MetricValueMapping
+	(*MetricLabelMapping)(nil),               // 15: dbpilot.plugin.v1.MetricLabelMapping
+	(*timestamppb.Timestamp)(nil),            // 16: google.protobuf.Timestamp
 }
 var file_plugin_v1_metrics_proto_depIdxs = []int32{
-	8,  // 0: dbpilot.plugin.v1.CollectPluginMetricsResponse.batches:type_name -> dbpilot.plugin.v1.PluginMetricBatch
-	5,  // 1: dbpilot.plugin.v1.StreamPluginMetricsRequest.resume_cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
-	5,  // 2: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest.cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
-	5,  // 3: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse.accepted_cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
-	11, // 4: dbpilot.plugin.v1.PluginMetricBatch.collected_at:type_name -> google.protobuf.Timestamp
-	9,  // 5: dbpilot.plugin.v1.PluginMetricBatch.samples:type_name -> dbpilot.plugin.v1.PluginMetricSample
-	1,  // 6: dbpilot.plugin.v1.PluginMetricBatch.collection_status:type_name -> dbpilot.plugin.v1.PluginCollectionStatus
-	0,  // 7: dbpilot.plugin.v1.PluginMetricSample.metric_type:type_name -> dbpilot.plugin.v1.PluginMetricType
-	10, // 8: dbpilot.plugin.v1.PluginMetricSample.labels:type_name -> dbpilot.plugin.v1.PluginMetricSample.LabelsEntry
-	11, // 9: dbpilot.plugin.v1.PluginMetricSample.sampled_at:type_name -> google.protobuf.Timestamp
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	11, // 0: dbpilot.plugin.v1.CollectPluginMetricsResponse.batches:type_name -> dbpilot.plugin.v1.PluginMetricBatch
+	5,  // 1: dbpilot.plugin.v1.TrialMetricTemplateRequest.template:type_name -> dbpilot.plugin.v1.TrialMetricTemplateDefinition
+	14, // 2: dbpilot.plugin.v1.TrialMetricTemplateDefinition.value_mappings:type_name -> dbpilot.plugin.v1.MetricValueMapping
+	15, // 3: dbpilot.plugin.v1.TrialMetricTemplateDefinition.label_mappings:type_name -> dbpilot.plugin.v1.MetricLabelMapping
+	12, // 4: dbpilot.plugin.v1.TrialMetricTemplateResponse.candidate_metrics:type_name -> dbpilot.plugin.v1.PluginMetricSample
+	8,  // 5: dbpilot.plugin.v1.StreamPluginMetricsRequest.resume_cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
+	8,  // 6: dbpilot.plugin.v1.AcknowledgePluginMetricsRequest.cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
+	8,  // 7: dbpilot.plugin.v1.AcknowledgePluginMetricsResponse.accepted_cursors:type_name -> dbpilot.plugin.v1.PluginMetricCursor
+	16, // 8: dbpilot.plugin.v1.PluginMetricBatch.collected_at:type_name -> google.protobuf.Timestamp
+	12, // 9: dbpilot.plugin.v1.PluginMetricBatch.samples:type_name -> dbpilot.plugin.v1.PluginMetricSample
+	1,  // 10: dbpilot.plugin.v1.PluginMetricBatch.collection_status:type_name -> dbpilot.plugin.v1.PluginCollectionStatus
+	0,  // 11: dbpilot.plugin.v1.PluginMetricSample.metric_type:type_name -> dbpilot.plugin.v1.PluginMetricType
+	13, // 12: dbpilot.plugin.v1.PluginMetricSample.labels:type_name -> dbpilot.plugin.v1.PluginMetricSample.LabelsEntry
+	16, // 13: dbpilot.plugin.v1.PluginMetricSample.sampled_at:type_name -> google.protobuf.Timestamp
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_plugin_v1_metrics_proto_init() }
@@ -825,13 +1167,14 @@ func file_plugin_v1_metrics_proto_init() {
 	if File_plugin_v1_metrics_proto != nil {
 		return
 	}
+	file_plugin_v1_instance_proto_init()
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_plugin_v1_metrics_proto_rawDesc), len(file_plugin_v1_metrics_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

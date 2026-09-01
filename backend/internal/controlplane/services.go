@@ -16,6 +16,7 @@ import (
 	"dbpilot.local/platform/internal/idempotency"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/metrictemplate"
 	"dbpilot.local/platform/internal/monitoring"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
@@ -118,6 +119,7 @@ type Services struct {
 	DatabaseInstances          databaseinstance.Service
 	PluginCatalog              plugincatalog.CatalogService
 	PluginAssignments          pluginassignment.Service
+	MetricTemplates            metrictemplate.Service
 	PluginReconciler           PluginAssignmentReconciler
 	PluginUploadRemove         func(string) error
 	PluginUploadCleanupFailure func(error)

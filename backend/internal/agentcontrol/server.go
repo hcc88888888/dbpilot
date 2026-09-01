@@ -66,6 +66,7 @@ type Server struct {
 	plugins         PluginObserver
 	pluginArtifacts PluginArtifactLeaseIssueService
 	credentials     CredentialLeaseIssueService
+	metricTemplates MetricTemplateLeaseIssueService
 	now             func() time.Time
 }
 
@@ -77,6 +78,10 @@ type CredentialLeaseIssueService interface {
 	Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.CredentialLeaseRequest) (*agentv1.CredentialLeaseResponse, error)
 }
 
+type MetricTemplateLeaseIssueService interface {
+	Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.MetricTemplateLeaseRequest) (*agentv1.MetricTemplateLeaseResponse, error)
+}
+
 type noopCredentialLeaseIssuer struct{}
 
 func (noopCredentialLeaseIssuer) Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.CredentialLeaseRequest) (*agentv1.CredentialLeaseResponse, error) {
@@ -84,6 +89,12 @@ func (noopCredentialLeaseIssuer) Issue(context.Context, credentiallease.Authenti
 }
 
 type noopPluginArtifactLeaseIssuer struct{}
+
+type noopMetricTemplateLeaseIssuer struct{}
+
+func (noopMetricTemplateLeaseIssuer) Issue(context.Context, credentiallease.AuthenticatedAgent, *agentv1.MetricTemplateLeaseRequest) (*agentv1.MetricTemplateLeaseResponse, error) {
+	return nil, errors.New("metric template lease is unavailable")
+}
 
 func (noopPluginArtifactLeaseIssuer) Issue(context.Context, string, *agentv1.PluginArtifactLeaseRequest) (*agentv1.PluginArtifactLeaseResponse, error) {
 	return nil, ErrPluginArtifactLeaseRejected
@@ -138,6 +149,14 @@ func WithCredentialLeaseIssuer(issuer CredentialLeaseIssueService) ServerOption 
 	}
 }
 
+func WithMetricTemplateLeaseIssuer(issuer MetricTemplateLeaseIssueService) ServerOption {
+	return func(server *Server) {
+		if issuer != nil {
+			server.metricTemplates = issuer
+		}
+	}
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -145,7 +164,7 @@ func NewServer(registry *Registry, observer Observer, options ...ServerOption) *
 	if observer == nil {
 		observer = NoopObserver{}
 	}
-	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, pluginArtifacts: noopPluginArtifactLeaseIssuer{}, credentials: noopCredentialLeaseIssuer{}, now: time.Now}
+	server := &Server{registry: registry, observer: observer, hosts: noopHostObserver{}, discovery: noopDiscoveryObserver{}, plugins: noopPluginObserver{}, pluginArtifacts: noopPluginArtifactLeaseIssuer{}, credentials: noopCredentialLeaseIssuer{}, metricTemplates: noopMetricTemplateLeaseIssuer{}, now: time.Now}
 	for _, option := range options {
 		if option != nil {
 			option(server)
@@ -240,9 +259,11 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 			message.SentAt = timestamppb.New(s.now())
 			if err := stream.Send(message); err != nil {
 				clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+				clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
 				return err
 			}
 			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+			clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
 		case item := <-received:
 			if errors.Is(item.err, io.EOF) {
 				return nil
@@ -406,6 +427,24 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 			clearCredentialLeaseResponse(response)
 			return status.Error(codes.Unavailable, "credential lease delivery is unavailable")
 		}
+	case *agentv1.AgentMessage_MetricTemplateLeaseRequest:
+		request := typed.MetricTemplateLeaseRequest
+		if request == nil || len(request.GetRequestNonce()) != sha256.Size || len(request.GetQueryDigest()) != sha256.Size || request.GetCommandId() == "" || request.GetAssignmentId() == "" || request.GetInstanceId() == "" || request.GetConfigurationRevision() == 0 || request.GetOperationRevision() == 0 || request.GetTemplateId() == "" || request.GetRevisionId() == "" || !s.registry.Supports(agentID, "metric_template_lease.v1") {
+			return status.Error(codes.InvalidArgument, "metric template lease request is invalid")
+		}
+		session, ok := s.registry.Session(agentID)
+		if !ok || session.SessionID == "" {
+			return status.Error(codes.Unauthenticated, "Agent session is unavailable")
+		}
+		response, issueErr := s.metricTemplates.Issue(ctx, credentiallease.AuthenticatedAgent{AgentID: agentID, SessionID: session.SessionID}, request)
+		if issueErr != nil || !validMetricTemplateLeaseResponse(response, request, s.now()) {
+			clearMetricTemplateLeaseResponse(response)
+			response = &agentv1.MetricTemplateLeaseResponse{RequestNonce: append([]byte(nil), request.GetRequestNonce()...), CommandId: request.GetCommandId(), AssignmentId: request.GetAssignmentId(), InstanceId: request.GetInstanceId(), TemplateId: request.GetTemplateId(), RevisionId: request.GetRevisionId(), QueryDigest: append([]byte(nil), request.GetQueryDigest()...)}
+		}
+		if err := s.registry.enqueue(agentID, &agentv1.ServerMessage{MessageId: "metric-template-lease", Message: &agentv1.ServerMessage_MetricTemplateLeaseResponse{MetricTemplateLeaseResponse: response}}); err != nil {
+			clearMetricTemplateLeaseResponse(response)
+			return status.Error(codes.Unavailable, "metric template lease delivery is unavailable")
+		}
 	default:
 		return status.Error(codes.InvalidArgument, "unsupported Agent message for an established session")
 	}
@@ -428,6 +467,27 @@ func clearCredentialLeaseResponse(response *agentv1.CredentialLeaseResponse) {
 	}
 	response.Credential.SecretBytes = nil
 	response.Credential.Username = ""
+}
+
+func validMetricTemplateLeaseResponse(response *agentv1.MetricTemplateLeaseResponse, request *agentv1.MetricTemplateLeaseRequest, now time.Time) bool {
+	if response == nil || request == nil || len(response.GetRequestNonce()) != sha256.Size || subtle.ConstantTimeCompare(response.GetRequestNonce(), request.GetRequestNonce()) != 1 || response.GetLeaseId() == "" || len(response.GetLeaseId()) > 128 || response.GetCommandId() != request.GetCommandId() || response.GetAssignmentId() != request.GetAssignmentId() || response.GetInstanceId() != request.GetInstanceId() || response.GetConfigurationRevision() != request.GetConfigurationRevision() || response.GetOperationRevision() != request.GetOperationRevision() || response.GetTemplateId() != request.GetTemplateId() || response.GetRevisionId() != request.GetRevisionId() || subtle.ConstantTimeCompare(response.GetQueryDigest(), request.GetQueryDigest()) != 1 || response.GetValidForSeconds() < 5 || response.GetValidForSeconds() > 60 || response.GetExpiresAt() == nil || !response.GetExpiresAt().IsValid() || !response.GetExpiresAt().AsTime().After(now.UTC()) || response.GetExpiresAt().AsTime().After(now.UTC().Add(time.Duration(response.GetValidForSeconds())*time.Second+2*time.Second)) || !validMetricTemplateDefinition(response.GetDefinition()) || proto.Size(response) > 40<<10 {
+		return false
+	}
+	return true
+}
+
+func validMetricTemplateDefinition(value *agentv1.MetricTemplateDefinition) bool {
+	return value != nil && value.GetRevision() > 0 && value.GetQueryKind() == "sql" && len(value.GetReadOnlyStatement()) > 0 && len(value.GetReadOnlyStatement()) <= 32768 && value.GetCollectionIntervalSeconds() >= 10 && value.GetCollectionIntervalSeconds() <= 86400 && value.GetTimeoutSeconds() > 0 && value.GetTimeoutSeconds() <= 30 && value.GetMaxRows() > 0 && value.GetMaxRows() <= 100 && value.GetMaxColumns() > 0 && value.GetMaxColumns() <= 32 && value.GetCardinalityLimit() > 0 && value.GetCardinalityLimit() <= 10000 && len(value.GetValueMappings()) > 0 && len(value.GetValueMappings()) <= 32 && len(value.GetLabelMappings()) <= 16
+}
+
+func clearMetricTemplateLeaseResponse(response *agentv1.MetricTemplateLeaseResponse) {
+	if response == nil || response.Definition == nil {
+		return
+	}
+	for index := range response.Definition.ReadOnlyStatement {
+		response.Definition.ReadOnlyStatement[index] = 0
+	}
+	response.Definition.ReadOnlyStatement = nil
 }
 
 func (s *Server) rejectDiscoveryReport(agentID string, report *agentv1.DiscoveryReport, reason string) {

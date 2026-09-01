@@ -119,9 +119,6 @@ func (server *runtimeServer) ApplyConfiguration(_ context.Context, request *plug
 	}
 	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(server.instances))
 	for _, instance := range request.GetInstances() {
-		if len(instance.GetTemplates()) != len(server.templates) {
-			return nil, errors.New("template coverage mismatch")
-		}
 		results = append(results, &pluginv1.PluginInstanceConfigurationResult{InstanceId: instance.GetInstanceId(), Applied: true})
 	}
 	server.mu.Lock()
@@ -129,6 +126,36 @@ func (server *runtimeServer) ApplyConfiguration(_ context.Context, request *plug
 	server.mu.Unlock()
 	server.record("apply")
 	return &pluginv1.ApplyPluginConfigurationResponse{ActiveConfigurationRevision: server.configurationRevision, Results: results}, nil
+}
+
+func (server *runtimeServer) TrialMetricTemplate(_ context.Context, request *pluginv1.TrialMetricTemplateRequest) (*pluginv1.TrialMetricTemplateResponse, error) {
+	template := request.GetTemplate()
+	if request.GetAssignmentId() != server.assignmentID || request.GetConfigurationRevision() != server.configurationRevision || request.GetOperationRevision() != server.operationRevision || !contains(server.instances, request.GetInstanceId()) || template == nil || len(template.GetReadOnlyStatement()) == 0 || len(template.GetValueMappings()) == 0 {
+		return nil, errors.New("trial mismatch")
+	}
+	digest := sha256.Sum256(template.GetReadOnlyStatement())
+	if string(digest[:]) != string(template.GetQueryDigest()) {
+		return &pluginv1.TrialMetricTemplateResponse{Succeeded: false, ErrorCode: "unsupported"}, nil
+	}
+	mapping := template.GetValueMappings()[0]
+	sample := &pluginv1.PluginMetricSample{MetricName: mapping.GetMetricName(), Value: 1, Unit: mapping.GetUnit(), MetricType: fixtureMetricType(mapping.GetMetricType()), Labels: map[string]string{}, SampledAt: timestamppb.Now()}
+	server.record("trial:" + template.GetTemplateId())
+	return &pluginv1.TrialMetricTemplateResponse{Succeeded: true, CandidateMetrics: []*pluginv1.PluginMetricSample{sample}, RowCount: 1, ColumnCount: 1, MetricCount: 1, DurationMillis: 1}, nil
+}
+
+func fixtureMetricType(value string) pluginv1.PluginMetricType {
+	switch value {
+	case "gauge":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE
+	case "monotonic_gauge":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_GAUGE
+	case "counter":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_COUNTER
+	case "monotonic_counter":
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER
+	default:
+		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED
+	}
 }
 
 func (server *runtimeServer) ValidateInstance(_ context.Context, request *pluginv1.ValidatePluginInstanceRequest) (*pluginv1.ValidatePluginInstanceResponse, error) {

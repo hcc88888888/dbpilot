@@ -98,12 +98,6 @@ export interface MetricTemplateRevision {
     queryKind: MetricQueryKind;
     /**
      *
-     * @type {string}
-     * @memberof MetricTemplateRevision
-     */
-    readOnlyStatement: string;
-    /**
-     *
      * @type {number}
      * @memberof MetricTemplateRevision
      */
@@ -207,7 +201,6 @@ export function instanceOfMetricTemplateRevision(value: object): value is Metric
     if (!('variants' in value) || value['variants'] === undefined) return false;
     if (!('name' in value) || value['name'] === undefined) return false;
     if (!('queryKind' in value) || value['queryKind'] === undefined) return false;
-    if (!('readOnlyStatement' in value) || value['readOnlyStatement'] === undefined) return false;
     if (!('collectionIntervalSeconds' in value) || value['collectionIntervalSeconds'] === undefined) return false;
     if (!('timeoutSeconds' in value) || value['timeoutSeconds'] === undefined) return false;
     if (!('maxRows' in value) || value['maxRows'] === undefined) return false;
@@ -240,7 +233,6 @@ export function MetricTemplateRevisionFromJSONTyped(json: any, ignoreDiscriminat
         'name': json['name'],
         'description': json['description'] == null ? undefined : json['description'],
         'queryKind': MetricQueryKindFromJSON(json['query_kind']),
-        'readOnlyStatement': json['read_only_statement'],
         'collectionIntervalSeconds': json['collection_interval_seconds'],
         'timeoutSeconds': json['timeout_seconds'],
         'maxRows': json['max_rows'],
@@ -277,7 +269,6 @@ export function MetricTemplateRevisionToJSONTyped(value?: MetricTemplateRevision
         'name': value['name'],
         'description': value['description'],
         'query_kind': MetricQueryKindToJSON(value['queryKind']),
-        'read_only_statement': value['readOnlyStatement'],
         'collection_interval_seconds': value['collectionIntervalSeconds'],
         'timeout_seconds': value['timeoutSeconds'],
         'max_rows': value['maxRows'],

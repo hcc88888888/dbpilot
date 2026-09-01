@@ -110,12 +110,14 @@ func TestAgentDescriptorsKeepCommandsAndLeasesInTypedOneofs(t *testing.T) {
 	agentMessage := requireMessage(t, file, "AgentMessage")
 	requireOneofField(t, agentMessage, "credential_lease_request", "message")
 	requireOneofField(t, agentMessage, "plugin_artifact_lease_request", "message")
-	requireReserved(t, agentMessage, 32, 49)
+	requireOneofField(t, agentMessage, "metric_template_lease_request", "message")
+	requireReserved(t, agentMessage, 33, 49)
 	serverMessage := requireMessage(t, file, "ServerMessage")
 	requireOneofField(t, serverMessage, "credential_lease_response", "message")
 	requireOneofField(t, serverMessage, "plugin_artifact_lease_response", "message")
 	requireOneofField(t, serverMessage, "discovery_report_acknowledgement", "message")
-	requireReserved(t, serverMessage, 29, 49)
+	requireOneofField(t, serverMessage, "metric_template_lease_response", "message")
+	requireReserved(t, serverMessage, 30, 49)
 
 	service := file.Services().ByName("AgentControl")
 	if service == nil || service.Methods().ByName("Connect") == nil {
@@ -212,14 +214,15 @@ func TestPluginAndDockerDescriptorsExposeExactServices(t *testing.T) {
 		t.Fatal("PluginRuntime service is absent")
 	}
 	expected := map[protoreflect.Name][3]string{
-		"Handshake":          {"dbpilot.plugin.v1.PluginHandshakeRequest", "dbpilot.plugin.v1.PluginHandshakeResponse", "false"},
-		"ApplyConfiguration": {"dbpilot.plugin.v1.ApplyPluginConfigurationRequest", "dbpilot.plugin.v1.ApplyPluginConfigurationResponse", "false"},
-		"ValidateInstance":   {"dbpilot.plugin.v1.ValidatePluginInstanceRequest", "dbpilot.plugin.v1.ValidatePluginInstanceResponse", "false"},
-		"CollectNow":         {"dbpilot.plugin.v1.CollectPluginMetricsRequest", "dbpilot.plugin.v1.CollectPluginMetricsResponse", "false"},
-		"StreamMetrics":      {"dbpilot.plugin.v1.StreamPluginMetricsRequest", "dbpilot.plugin.v1.PluginMetricBatch", "true"},
-		"AcknowledgeMetrics": {"dbpilot.plugin.v1.AcknowledgePluginMetricsRequest", "dbpilot.plugin.v1.AcknowledgePluginMetricsResponse", "false"},
-		"GetHealth":          {"dbpilot.plugin.v1.GetPluginHealthRequest", "dbpilot.plugin.v1.PluginHealth", "false"},
-		"Shutdown":           {"dbpilot.plugin.v1.ShutdownPluginRequest", "dbpilot.plugin.v1.ShutdownPluginResponse", "false"},
+		"Handshake":           {"dbpilot.plugin.v1.PluginHandshakeRequest", "dbpilot.plugin.v1.PluginHandshakeResponse", "false"},
+		"ApplyConfiguration":  {"dbpilot.plugin.v1.ApplyPluginConfigurationRequest", "dbpilot.plugin.v1.ApplyPluginConfigurationResponse", "false"},
+		"ValidateInstance":    {"dbpilot.plugin.v1.ValidatePluginInstanceRequest", "dbpilot.plugin.v1.ValidatePluginInstanceResponse", "false"},
+		"CollectNow":          {"dbpilot.plugin.v1.CollectPluginMetricsRequest", "dbpilot.plugin.v1.CollectPluginMetricsResponse", "false"},
+		"TrialMetricTemplate": {"dbpilot.plugin.v1.TrialMetricTemplateRequest", "dbpilot.plugin.v1.TrialMetricTemplateResponse", "false"},
+		"StreamMetrics":       {"dbpilot.plugin.v1.StreamPluginMetricsRequest", "dbpilot.plugin.v1.PluginMetricBatch", "true"},
+		"AcknowledgeMetrics":  {"dbpilot.plugin.v1.AcknowledgePluginMetricsRequest", "dbpilot.plugin.v1.AcknowledgePluginMetricsResponse", "false"},
+		"GetHealth":           {"dbpilot.plugin.v1.GetPluginHealthRequest", "dbpilot.plugin.v1.PluginHealth", "false"},
+		"Shutdown":            {"dbpilot.plugin.v1.ShutdownPluginRequest", "dbpilot.plugin.v1.ShutdownPluginResponse", "false"},
 	}
 	if service.Methods().Len() != len(expected) {
 		t.Fatalf("PluginRuntime method count = %d, want %d", service.Methods().Len(), len(expected))

@@ -31,7 +31,7 @@ MetricTemplate:
     latest_revision:
       type: integer
       format: int64
-      minimum: 1
+      minimum: 0
     published_revision:
       type: [integer, 'null']
       format: int64
@@ -87,7 +87,7 @@ MetricLabelMapping:
 MetricTemplateRevision:
   type: object
   additionalProperties: false
-  required: [revision_id, template_id, revision, database_family, variants, name, query_kind, read_only_statement, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit, query_digest, status, created_by, created_at, etag]
+  required: [revision_id, template_id, revision, database_family, variants, name, query_kind, collection_interval_seconds, timeout_seconds, max_rows, max_columns, value_mappings, label_mappings, cardinality_limit, query_digest, status, created_by, created_at, etag]
   properties:
     revision_id:
       type: string
@@ -119,10 +119,6 @@ MetricTemplateRevision:
       maxLength: 1000
     query_kind:
       $ref: '#/MetricQueryKind'
-    read_only_statement:
-      type: string
-      minLength: 1
-      maxLength: 32768
     collection_interval_seconds:
       type: integer
       minimum: 10

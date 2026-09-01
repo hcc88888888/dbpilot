@@ -30,9 +30,10 @@ message AgentMessage {
     PluginObservation plugin_observation = 29;
     CredentialLeaseRequest credential_lease_request = 30;
     PluginArtifactLeaseRequest plugin_artifact_lease_request = 31;
+    MetricTemplateLeaseRequest metric_template_lease_request = 32;
   }
 
-  reserved 32 to 49;
+  reserved 33 to 49;
 }
 
 message ServerMessage {
@@ -50,10 +51,11 @@ message ServerMessage {
     CommandStart command_start = 26;
     CredentialLeaseResponse credential_lease_response = 27;
     PluginArtifactLeaseResponse plugin_artifact_lease_response = 28;
+    MetricTemplateLeaseResponse metric_template_lease_response = 29;
     DiscoveryReportAcknowledgement discovery_report_acknowledgement = 50;
   }
 
-  reserved 29 to 49;
+  reserved 30 to 49;
 }
 
 message DiscoveryReportAcknowledgement {
@@ -200,8 +202,15 @@ message ReconcilePlugin {
   uint64 operation_revision = 10;
   repeated string instance_ids = 11;
   repeated string template_ids = 12;
-  reserved 13 to 19;
+  repeated MetricTemplateCommandReference template_revisions = 13;
+  repeated PluginInstanceTemplateReferences instance_template_revisions = 14;
+  reserved 15 to 19;
   repeated PluginInstanceDescriptor instance_descriptors = 20;
+}
+
+message PluginInstanceTemplateReferences {
+  string instance_id = 1;
+  repeated MetricTemplateCommandReference templates = 2;
 }
 
 // Non-secret routing facts for the current assignment membership. Credential
@@ -260,6 +269,21 @@ message CollectDatabaseMetrics {
   uint64 configuration_revision = 2;
   repeated string instance_ids = 3;
   repeated string template_ids = 4;
+  uint64 operation_revision = 5;
+  repeated MetricTemplateCommandReference template_revisions = 6;
+  bool trial = 7;
+}
+
+// Persisted commands contain only immutable identity, digest, and execution
+// bounds. Query text is fetched over the live AgentControl lease flow.
+message MetricTemplateCommandReference {
+  string template_id = 1;
+  string revision_id = 2;
+  bytes query_digest = 3;
+  uint32 timeout_seconds = 4;
+  uint32 max_rows = 5;
+  uint32 max_columns = 6;
+  uint32 cardinality_limit = 7;
 }
 
 // Credential lease requests and responses exist only on the live AgentControl
@@ -312,6 +336,61 @@ message PluginArtifactLeaseResponse {
   map<string, string> request_headers = 8;
 }
 
+// Template query text is delivered only over the authenticated live stream.
+// Agents keep it in bounded memory and never journal the response.
+message MetricTemplateLeaseRequest {
+  bytes request_nonce = 1;
+  string command_id = 2;
+  string assignment_id = 3;
+  string instance_id = 4;
+  uint64 configuration_revision = 5;
+  uint64 operation_revision = 6;
+  string revision_id = 7;
+  bytes query_digest = 8;
+  string template_id = 9;
+}
+
+message MetricTemplateLeaseResponse {
+  bytes request_nonce = 1;
+  string lease_id = 2;
+  string command_id = 3;
+  string assignment_id = 4;
+  string instance_id = 5;
+  uint64 configuration_revision = 6;
+  uint64 operation_revision = 7;
+  string revision_id = 8;
+  bytes query_digest = 9;
+  google.protobuf.Timestamp expires_at = 10;
+  MetricTemplateDefinition definition = 11;
+  uint32 valid_for_seconds = 12;
+  string template_id = 13;
+}
+
+message MetricTemplateDefinition {
+  uint64 revision = 1;
+  string query_kind = 2;
+  bytes read_only_statement = 3;
+  uint32 collection_interval_seconds = 4;
+  uint32 timeout_seconds = 5;
+  uint32 max_rows = 6;
+  uint32 max_columns = 7;
+  uint32 cardinality_limit = 8;
+  repeated MetricTemplateValueMapping value_mappings = 9;
+  repeated MetricTemplateLabelMapping label_mappings = 10;
+}
+
+message MetricTemplateValueMapping {
+  string source_column = 1;
+  string metric_name = 2;
+  string metric_type = 3;
+  string unit = 4;
+}
+
+message MetricTemplateLabelMapping {
+  string source_column = 1;
+  string label = 2;
+}
+
 message CommandAcknowledgement {
   string command_id = 1;
   CommandAcknowledgementState state = 2;
@@ -347,6 +426,26 @@ message CommandResult {
   string error_code = 5;
   bytes execution_token = 6;
   uint64 lease_revision = 7;
+  MetricTemplateTrialResult metric_template_trial_result = 8;
+}
+
+message MetricTemplateTrialResult {
+  string revision_id = 1;
+  bytes query_digest = 2;
+  string status_code = 3;
+  repeated MetricTemplateCandidateMetric candidate_metrics = 4;
+  uint32 row_count = 5;
+  uint32 column_count = 6;
+  uint32 metric_count = 7;
+  uint32 duration_millis = 8;
+}
+
+message MetricTemplateCandidateMetric {
+  string metric_name = 1;
+  double value = 2;
+  string unit = 3;
+  map<string, string> labels = 4;
+  string metric_type = 5;
 }
 
 message CommandStart {

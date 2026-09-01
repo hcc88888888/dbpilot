@@ -60,6 +60,21 @@ func TestReconcilePluginExecutorAcceptsTask8AbsentCommandWithArtifactMetadata(t 
 	require.NoError(t, supervisor.request.Validate())
 }
 
+func TestReconcilePluginExecutorPassesPublicPerInstanceTemplateRefsWithoutSQL(t *testing.T) {
+	supervisor := &recordingPluginSupervisor{}
+	executor, err := NewReconcilePluginExecutor(supervisor)
+	require.NoError(t, err)
+	reporter := fencedProgressReporter{fence: pluginsupervisor.ExecutionFence{CommandID: "command-custom", ExecutionToken: bytesOfAgent(1, 32), LeaseRevision: 1, StartedAt: time.Now().UTC()}}
+	ref := &agentv1.MetricTemplateCommandReference{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: bytesOfAgent(2, 32), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1}
+	envelope := &agentv1.CommandEnvelope{CommandId: "command-custom", Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: "assignment-1", PluginId: "mysql", DatabaseFamily: "mysql", DesiredVersion: "1.0.0", DesiredState: agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING, ArtifactId: "artifact-1", ArtifactSha256: bytesOfAgent(3, 32), ManifestDigest: bytesOfAgent(4, 32), ConfigurationRevision: 5, OperationRevision: 7, InstanceIds: []string{"instance-a"}, InstanceDescriptors: []*agentv1.PluginInstanceDescriptor{{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306"}}, TemplateIds: []string{"template-a"}, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{ref}, InstanceTemplateRevisions: []*agentv1.PluginInstanceTemplateReferences{{InstanceId: "instance-a", Templates: []*agentv1.MetricTemplateCommandReference{ref}}}}}}
+	_, err = executor.Execute(context.Background(), envelope, &reporter)
+	require.NoError(t, err)
+	require.Equal(t, "command-custom", supervisor.request.TemplateLeaseCommandID)
+	require.Equal(t, "template-a", supervisor.request.InstanceTemplateRefs[0].Templates[0].TemplateID)
+	require.Empty(t, supervisor.request.TemplateConfigurations)
+	require.NoError(t, supervisor.request.Validate())
+}
+
 type recordingPluginSupervisor struct {
 	prepareCalls int
 	startCalls   int

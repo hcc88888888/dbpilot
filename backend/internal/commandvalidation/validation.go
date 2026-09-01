@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"path"
 	"regexp"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/discovery"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -79,7 +81,13 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		value := command.ReconcilePlugin
-		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) || !validPluginDescriptorShape(value) {
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetPluginId()) || !validIdentifier(value.GetDatabaseFamily()) || !validVersion(value.GetDesiredVersion()) || !validPluginDesiredState(value.GetDesiredState()) || !validIdentifier(value.GetArtifactId()) || len(value.GetArtifactSha256()) != sha256.Size || len(value.GetManifestDigest()) != sha256.Size || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_ABSENT) || !validIdentifierList(value.GetTemplateIds(), false) || !validPluginDescriptorShape(value) || !validReconcileTemplateShape(value) {
+			return ErrInvalidCommand
+		}
+		targets = value.GetInstanceIds()
+	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
+		value := command.CollectDatabaseMetrics
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), true) || !validIdentifierList(value.GetTemplateIds(), true) || !validMetricTemplateReferences(value.GetTemplateIds(), value.GetTemplateRevisions()) || value.GetTrial() && (len(value.GetInstanceIds()) != 1 || len(value.GetTemplateRevisions()) != 1) {
 			return ErrInvalidCommand
 		}
 		targets = value.GetInstanceIds()
@@ -103,6 +111,62 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	}
 	return nil
+}
+
+func validReconcileTemplateShape(value *agentv1.ReconcilePlugin) bool {
+	if len(value.GetTemplateRevisions()) == 0 && len(value.GetInstanceTemplateRevisions()) == 0 {
+		return true
+	}
+	if value.GetDesiredState() != agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || !validMetricTemplateReferences(value.GetTemplateIds(), value.GetTemplateRevisions()) || len(value.GetInstanceTemplateRevisions()) != len(value.GetInstanceIds()) {
+		return false
+	}
+	byRevision := map[string]*agentv1.MetricTemplateCommandReference{}
+	for _, reference := range value.GetTemplateRevisions() {
+		byRevision[reference.GetRevisionId()] = reference
+	}
+	seenInstances, used := map[string]struct{}{}, map[string]struct{}{}
+	for _, instance := range value.GetInstanceTemplateRevisions() {
+		if instance == nil || !containsString(value.GetInstanceIds(), instance.GetInstanceId()) {
+			return false
+		}
+		if _, duplicate := seenInstances[instance.GetInstanceId()]; duplicate {
+			return false
+		}
+		seenInstances[instance.GetInstanceId()] = struct{}{}
+		seenTemplates := map[string]struct{}{}
+		for _, reference := range instance.GetTemplates() {
+			authoritative := byRevision[reference.GetRevisionId()]
+			if authoritative == nil || !proto.Equal(authoritative, reference) {
+				return false
+			}
+			if _, duplicate := seenTemplates[reference.GetTemplateId()]; duplicate {
+				return false
+			}
+			seenTemplates[reference.GetTemplateId()], used[reference.GetRevisionId()] = struct{}{}, struct{}{}
+		}
+	}
+	return len(used) == len(byRevision)
+}
+
+func containsString(values []string, candidate string) bool {
+	for _, value := range values {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func validMetricTemplateReferences(ids []string, values []*agentv1.MetricTemplateCommandReference) bool {
+	if len(values) != len(ids) || len(values) == 0 || len(values) > maximumListItems {
+		return false
+	}
+	for index, value := range values {
+		if value == nil || value.GetTemplateId() != ids[index] || !validIdentifier(value.GetRevisionId()) || len(value.GetQueryDigest()) != sha256.Size || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || value.GetCardinalityLimit() == 0 || value.GetCardinalityLimit() > 10000 {
+			return false
+		}
+	}
+	return true
 }
 
 func validPluginDescriptorShape(value *agentv1.ReconcilePlugin) bool {
@@ -150,6 +214,9 @@ func ValidateResult(result *agentv1.CommandResult) error {
 	if result == nil || !validExecutionFence(result.GetCommandId(), result.GetExecutionToken(), result.GetLeaseRevision()) {
 		return ErrInvalidCommand
 	}
+	if result.GetMetricTemplateTrialResult() != nil && !validMetricTemplateTrialResult(result.GetMetricTemplateTrialResult()) {
+		return ErrInvalidCommand
+	}
 	switch result.GetState() {
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED,
 		agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED,
@@ -160,6 +227,23 @@ func ValidateResult(result *agentv1.CommandResult) error {
 	default:
 		return ErrInvalidCommand
 	}
+}
+
+func validMetricTemplateTrialResult(value *agentv1.MetricTemplateTrialResult) bool {
+	if value == nil || !validIdentifier(value.GetRevisionId()) || len(value.GetQueryDigest()) != sha256.Size || !validIdentifier(value.GetStatusCode()) || value.GetMetricCount() != uint32(len(value.GetCandidateMetrics())) || value.GetRowCount() > 100 || value.GetColumnCount() > 32 || value.GetMetricCount() > 3200 || value.GetDurationMillis() > 30000 {
+		return false
+	}
+	for _, metric := range value.GetCandidateMetrics() {
+		if metric == nil || !validIdentifier(metric.GetMetricName()) || metric.GetUnit() == "" || len(metric.GetUnit()) > 32 || math.IsNaN(metric.GetValue()) || math.IsInf(metric.GetValue(), 0) || len(metric.GetLabels()) > 16 {
+			return false
+		}
+		for name, label := range metric.GetLabels() {
+			if !validIdentifier(name) || !utf8.ValidString(label) || len([]byte(label)) > 128 || strings.ContainsAny(label, "\x00\r\n") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func ValidateCancellation(cancellation *agentv1.CommandCancellation) error {

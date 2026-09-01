@@ -124,6 +124,7 @@ func (r *Registry) unregister(agentID string, expected *session) {
 		select {
 		case message := <-current.send:
 			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+			clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
 		default:
 			return
 		}
@@ -436,6 +437,15 @@ func commandCapabilities(envelope *agentv1.CommandEnvelope) []string {
 		capabilities := []string{"plugin.reconcile.v1"}
 		if len(command.GetInstanceDescriptors()) > 0 || command.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING || command.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_INSTALLED {
 			capabilities = append(capabilities, "plugin_reconcile.instance_descriptors.v1")
+		}
+		if command.GetDesiredState() == agentv1.PluginDesiredState_PLUGIN_DESIRED_STATE_RUNNING && (len(command.GetTemplateRevisions()) > 0 || len(command.GetInstanceTemplateRevisions()) > 0) {
+			capabilities = append(capabilities, "metric_template_lease.v1")
+		}
+		return capabilities
+	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
+		capabilities := []string{"plugin.metrics.collect.v1"}
+		if len(envelope.GetCollectDatabaseMetrics().GetTemplateRevisions()) > 0 {
+			capabilities = append(capabilities, "metric_template_lease.v1")
 		}
 		return capabilities
 	default:

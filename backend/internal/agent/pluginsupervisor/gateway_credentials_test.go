@@ -2,12 +2,15 @@ package pluginsupervisor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/metrictemplatelease"
 	"dbpilot.local/platform/internal/agent/plugingateway"
 	"github.com/stretchr/testify/require"
 )
@@ -52,6 +55,36 @@ func TestGatewayCredentialRemoteRequestIsSingleflight(t *testing.T) {
 		require.Equal(t, []byte("singleflight-secret"), lease.SecretBytes)
 		lease.Release()
 	}
+}
+
+func TestLeaseMetricTemplatesKeepsDifferentPerInstanceBindingsAndReleasesQueries(t *testing.T) {
+	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	refA := templateReferenceFor("template-a", "revision-a", "SELECT a")
+	refB := templateReferenceFor("template-b", "revision-b", "SELECT b")
+	leaser := &recordingTemplateLeaser{materials: map[string]metrictemplatelease.Material{"revision-a": templateMaterial(now, refA, "instance-a", "SELECT a"), "revision-b": templateMaterial(now, refB, "instance-b", "SELECT b")}}
+	request := HealthRequest{AssignmentID: "assignment-a", ConfigurationRevision: 5, OperationRevision: 7, TemplateLeaseCommandID: "command-a", TemplateIDs: []string{"template-a", "template-b"}, TemplateReferences: []TemplateReference{refA, refB}, InstanceIDs: []string{"instance-a", "instance-b"}, InstanceTemplateRefs: []InstanceTemplateReferences{{InstanceID: "instance-a", Templates: []TemplateReference{refA}}, {InstanceID: "instance-b", Templates: []TemplateReference{refB}}}}
+	configurations, releases, _, err := leaseMetricTemplates(context.Background(), leaser, request, now)
+	require.NoError(t, err)
+	require.Equal(t, "template-a", configurations["instance-a"][0].GetTemplateId())
+	require.Equal(t, "template-b", configurations["instance-b"][0].GetTemplateId())
+	retained := append([][]byte(nil), leaser.returned...)
+	for _, release := range releases {
+		release()
+	}
+	for _, query := range retained {
+		require.Equal(t, make([]byte, len(query)), query)
+	}
+}
+
+func TestCredentialRenewalReusesActivePerInstanceTemplates(t *testing.T) {
+	checker := NewGatewayHealthChecker(nil)
+	templateA := testTemplateConfiguration("template-a")
+	templateB := testTemplateConfiguration("template-b")
+	checker.activeCredentials[42] = activeCredentialConfiguration{configuration: plugingateway.PluginConfiguration{AssignmentID: "assignment-a", ConfigurationRevision: 5, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "instance-a", Templates: []*pluginv1.MetricTemplateConfiguration{templateA}}, {InstanceId: "instance-b", Templates: []*pluginv1.MetricTemplateConfiguration{templateB}}}}}
+	renewed := []*pluginv1.PluginInstanceConfiguration{{InstanceId: "instance-a"}, {InstanceId: "instance-b"}}
+	require.True(t, checker.copyActiveTemplates(42, renewed))
+	require.Equal(t, "template-a", renewed[0].Templates[0].GetTemplateId())
+	require.Equal(t, "template-b", renewed[1].Templates[0].GetTemplateId())
 }
 
 func TestGatewayUnexpectedExitZerosActiveCredentialsAndCancelsLifetimes(t *testing.T) {
@@ -110,6 +143,27 @@ type recordingCredentialLeaser struct {
 	request  CredentialLeaseRequest
 	lease    CredentialLease
 	returned *CredentialLease
+}
+
+type recordingTemplateLeaser struct {
+	materials map[string]metrictemplatelease.Material
+	returned  [][]byte
+}
+
+func (leaser *recordingTemplateLeaser) LeaseMetricTemplate(_ context.Context, request metrictemplatelease.Request) (metrictemplatelease.Material, error) {
+	material := leaser.materials[request.RevisionID]
+	material.StatementBytes = append([]byte(nil), material.StatementBytes...)
+	leaser.returned = append(leaser.returned, material.StatementBytes)
+	return material, nil
+}
+
+func templateReferenceFor(templateID, revisionID, statement string) TemplateReference {
+	digest := sha256.Sum256([]byte(statement))
+	return TemplateReference{TemplateID: templateID, RevisionID: revisionID, QueryDigest: digest[:], TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+}
+
+func templateMaterial(now time.Time, reference TemplateReference, instanceID, statement string) metrictemplatelease.Material {
+	return metrictemplatelease.Material{LeaseID: "lease-" + reference.RevisionID, AssignmentID: "assignment-a", InstanceID: instanceID, TemplateID: reference.TemplateID, RevisionID: reference.RevisionID, Revision: 1, ConfigurationRevision: 5, OperationRevision: 7, QueryDigest: hex.EncodeToString(reference.QueryDigest), ExpiresAt: now.Add(time.Minute), StatementBytes: []byte(statement), CollectionIntervalSeconds: 60, TimeoutSeconds: int(reference.TimeoutSeconds), MaxRows: int(reference.MaxRows), MaxColumns: int(reference.MaxColumns), CardinalityLimit: int(reference.CardinalityLimit), ValueMappings: []metrictemplatelease.ValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}
 }
 
 func (value *recordingCredentialLeaser) LeaseCredential(_ context.Context, request CredentialLeaseRequest) (CredentialLease, error) {

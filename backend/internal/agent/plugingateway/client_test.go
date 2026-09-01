@@ -3,8 +3,10 @@ package plugingateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -35,6 +37,20 @@ func TestConfigurationRequiresTheCompleteAssignedInstanceSet(t *testing.T) {
 	require.Error(t, PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{valid("mysql-1")}}.validate(expected))
 	require.Error(t, PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{valid("mysql-1"), valid("mysql-1")}}.validate(expected))
 	require.NoError(t, PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{valid("mysql-1"), valid("mysql-2")}}.validate(expected))
+}
+
+func TestConfigurationValidatesExactPerInstanceTemplateBindings(t *testing.T) {
+	templateA := gatewayTestTemplateConfiguration("template-a")
+	templateB := gatewayTestTemplateConfiguration("template-b")
+	expected := ExpectedPlugin{AssignmentID: "assignment-1", ConfigurationRevision: 4, InstanceIDs: []string{"instance-a", "instance-b"}, TemplateIDs: []string{"template-a", "template-b"}, TemplateConfigurations: []*pluginv1.MetricTemplateConfiguration{templateA, templateB}, InstanceTemplateConfigurations: map[string][]*pluginv1.MetricTemplateConfiguration{"instance-a": {templateA}, "instance-b": {templateB}}}
+	configuration := PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 4, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "instance-a", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{templateA}}, {InstanceId: "instance-b", DatabaseVariant: "mysql", UnixSocket: "/run/mysql.sock", Templates: []*pluginv1.MetricTemplateConfiguration{templateB}}}}
+	require.NoError(t, configuration.validate(expected))
+	session := &Session{handshaken: true, configurationRevision: 4, expected: expected, instances: map[string]*pluginv1.PluginInstanceConfiguration{"instance-a": configuration.Instances[0], "instance-b": configuration.Instances[1]}}
+	require.True(t, session.readyForCollect([]string{"instance-a"}, []string{"template-a"}))
+	require.True(t, session.readyForCollect([]string{"instance-b"}, []string{"template-b"}))
+	require.False(t, session.readyForCollect([]string{"instance-a"}, []string{"template-b"}))
+	configuration.Instances[0].Templates = []*pluginv1.MetricTemplateConfiguration{templateB}
+	require.Error(t, configuration.validate(expected))
 }
 
 func TestConfigurationRejectsTemplateOutsideExpectedAllowlist(t *testing.T) {
@@ -370,6 +386,9 @@ func (*orderedACKClient) ValidateInstance(context.Context, *pluginv1.ValidatePlu
 func (*orderedACKClient) CollectNow(context.Context, *pluginv1.CollectPluginMetricsRequest, ...grpc.CallOption) (*pluginv1.CollectPluginMetricsResponse, error) {
 	return nil, errors.New("unused")
 }
+func (*orderedACKClient) TrialMetricTemplate(context.Context, *pluginv1.TrialMetricTemplateRequest, ...grpc.CallOption) (*pluginv1.TrialMetricTemplateResponse, error) {
+	return nil, errors.New("unused")
+}
 func (*orderedACKClient) StreamMetrics(context.Context, *pluginv1.StreamPluginMetricsRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pluginv1.PluginMetricBatch], error) {
 	return nil, errors.New("unused")
 }
@@ -581,9 +600,70 @@ func TestAppendBatchRejectsForgedPluginDimensions(t *testing.T) {
 	require.Error(t, session.appendBatch(context.Background(), forged, &recordingMetricSink{}))
 }
 
+func TestClearConfigurationSecretsDropsCredentialAndTemplateQueryBuffers(t *testing.T) {
+	request := &pluginv1.ApplyPluginConfigurationRequest{Instances: []*pluginv1.PluginInstanceConfiguration{{CredentialLease: &pluginv1.CredentialLease{SecretBytes: []byte("password")}, Templates: []*pluginv1.MetricTemplateConfiguration{{TemplateId: "revision-a", ReadOnlyStatement: "SELECT value FROM metrics"}}}}}
+	clearConfigurationSecrets(request)
+	require.Empty(t, request.Instances[0].CredentialLease.SecretBytes)
+	require.Empty(t, request.Instances[0].Templates[0].ReadOnlyStatement)
+}
+
+func TestTrialMetricTemplateUsesDedicatedBoundedRPCAndZerosQuery(t *testing.T) {
+	client := &recordingTrialClient{response: &pluginv1.TrialMetricTemplateResponse{Succeeded: true, CandidateMetrics: []*pluginv1.PluginMetricSample{{MetricName: "mysql.custom.value", Value: 3, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: map[string]string{"role": "primary"}, SampledAt: timestamppb.Now()}}, RowCount: 1, ColumnCount: 2, MetricCount: 1, DurationMillis: 4}}
+	statement := []byte("SELECT value FROM metrics")
+	digest := sha256.Sum256(statement)
+	request := &pluginv1.TrialMetricTemplateRequest{AssignmentId: "assignment-1", ConfigurationRevision: 4, OperationRevision: 9, InstanceId: "mysql-1", Template: &pluginv1.TrialMetricTemplateDefinition{TemplateId: "template-a", Revision: 3, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}}
+	result, err := trialMetricTemplateWithClient(context.Background(), client, request)
+	require.NoError(t, err)
+	require.True(t, result.Succeeded)
+	require.Len(t, result.Metrics, 1)
+	require.Empty(t, client.request.GetTemplate().GetReadOnlyStatement(), "Agent query bytes are cleared after unary RPC")
+}
+
+func TestTrialMetricTemplateRejectsStaleConfigurationAndOperation(t *testing.T) {
+	session := configuredTestSession(nil)
+	session.expected.OperationRevision = 9
+	definition := &pluginv1.TrialMetricTemplateDefinition{TemplateId: "template-a", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: []byte("SELECT 1"), CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, CardinalityLimit: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}
+	_, err := session.TrialMetricTemplate(context.Background(), 3, 9, "mysql-1", definition)
+	require.Error(t, err)
+	_, err = session.TrialMetricTemplate(context.Background(), 4, 8, "mysql-1", definition)
+	require.Error(t, err)
+}
+
+func TestTrialMetricTemplateRejectsDigestMappingAndCandidateViolations(t *testing.T) {
+	definition := &pluginv1.TrialMetricTemplateDefinition{TemplateId: "template-a", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: []byte("SELECT value"), CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 2, MaxColumns: 2, CardinalityLimit: 4, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}
+	require.False(t, validTrialTemplateDefinition(definition), "digest must match statement")
+	digest := sha256.Sum256(definition.ReadOnlyStatement)
+	definition.QueryDigest = digest[:]
+	require.True(t, validTrialTemplateDefinition(definition))
+	duplicate := proto.Clone(definition).(*pluginv1.TrialMetricTemplateDefinition)
+	duplicate.ValueMappings = append(duplicate.ValueMappings, proto.Clone(duplicate.ValueMappings[0]).(*pluginv1.MetricValueMapping))
+	require.False(t, validTrialTemplateDefinition(duplicate))
+	baseMetric := &pluginv1.PluginMetricSample{MetricName: "mysql.custom.value", Value: 1, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, Labels: map[string]string{"role": "primary"}, SampledAt: timestamppb.Now()}
+	response := &pluginv1.TrialMetricTemplateResponse{Succeeded: true, CandidateMetrics: []*pluginv1.PluginMetricSample{baseMetric}, RowCount: 1, ColumnCount: 2, MetricCount: 1, DurationMillis: 1}
+	require.True(t, validTrialMetricTemplateResponse(response, definition))
+	wrongType := proto.Clone(response).(*pluginv1.TrialMetricTemplateResponse)
+	wrongType.CandidateMetrics[0].MetricType = pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_COUNTER
+	require.False(t, validTrialMetricTemplateResponse(wrongType, definition))
+	nonFinite := proto.Clone(response).(*pluginv1.TrialMetricTemplateResponse)
+	nonFinite.CandidateMetrics[0].Value = math.NaN()
+	require.False(t, validTrialMetricTemplateResponse(nonFinite, definition))
+	unknownLabel := proto.Clone(response).(*pluginv1.TrialMetricTemplateResponse)
+	unknownLabel.CandidateMetrics[0].Labels = map[string]string{"tenant_id": "x"}
+	require.False(t, validTrialMetricTemplateResponse(unknownLabel, definition))
+	controlLabel := proto.Clone(response).(*pluginv1.TrialMetricTemplateResponse)
+	controlLabel.CandidateMetrics[0].Labels = map[string]string{"role": "bad\nvalue"}
+	require.False(t, validTrialMetricTemplateResponse(controlLabel, definition))
+}
+
 func configuredTestSession(client *Client) *Session {
 	template := &pluginv1.MetricTemplateConfiguration{TemplateId: "builtin", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.connections.current", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}
 	return &Session{client: client, expected: ExpectedPlugin{AssignmentID: "assignment-1", PluginID: "mysql", Version: "1.0.0", DatabaseFamily: "mysql", ConfigurationRevision: 4, InstanceIDs: []string{"mysql-1"}, TemplateIDs: []string{"builtin"}}, configurationRevision: 4, instances: map[string]*pluginv1.PluginInstanceConfiguration{"mysql-1": {InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", Templates: []*pluginv1.MetricTemplateConfiguration{template}}}}
+}
+
+func gatewayTestTemplateConfiguration(id string) *pluginv1.MetricTemplateConfiguration {
+	statement := "SELECT value"
+	digest := sha256.Sum256([]byte(statement))
+	return &pluginv1.MetricTemplateConfiguration{TemplateId: id, Revision: 1, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}
 }
 
 func testBatch(now time.Time, sequence uint64, value float64) *pluginv1.PluginMetricBatch {
@@ -602,4 +682,15 @@ func (sink *recordingMetricSink) Cursor(context.Context, string) (spool.CursorRe
 }
 func (sink *recordingMetricSink) MarkCursorAcknowledged(context.Context, string, uint64) error {
 	return nil
+}
+
+type recordingTrialClient struct {
+	orderedACKClient
+	request  *pluginv1.TrialMetricTemplateRequest
+	response *pluginv1.TrialMetricTemplateResponse
+}
+
+func (client *recordingTrialClient) TrialMetricTemplate(_ context.Context, request *pluginv1.TrialMetricTemplateRequest, _ ...grpc.CallOption) (*pluginv1.TrialMetricTemplateResponse, error) {
+	client.request = request
+	return client.response, nil
 }

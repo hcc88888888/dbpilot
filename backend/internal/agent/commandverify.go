@@ -35,6 +35,7 @@ const (
 	CommandKindCollectDiagnostic        CommandKind = "collect_diagnostic"
 	CommandKindDiscoverDatabases        CommandKind = "discover_databases"
 	CommandKindReconcilePlugin          CommandKind = "plugin.reconcile.v1"
+	CommandKindCollectDatabaseMetrics   CommandKind = "plugin.metrics.collect.v1"
 )
 
 type nonceRecord struct {
@@ -193,6 +194,8 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 		return CommandKindDiscoverDatabases, true
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		return CommandKindReconcilePlugin, true
+	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
+		return CommandKindCollectDatabaseMetrics, true
 	default:
 		return "", false
 	}
@@ -200,7 +203,7 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 
 func knownCommandKind(kind CommandKind) bool {
 	switch kind {
-	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic, CommandKindDiscoverDatabases, CommandKindReconcilePlugin:
+	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic, CommandKindDiscoverDatabases, CommandKindReconcilePlugin, CommandKindCollectDatabaseMetrics:
 		return true
 	default:
 		return false

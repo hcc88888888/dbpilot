@@ -30,6 +30,7 @@ func TestRunMigrationStepsPreservesProductionOrderAndOptions(t *testing.T) {
 		enrollment:       step("enrollment"),
 		pluginCatalog:    step("plugin-catalog"),
 		pluginAssignment: step("plugin-assignment"),
+		metricTemplate:   step("metric-template"),
 		credentialLease:  step("credential-lease"),
 		inspection:       step("inspection"),
 	}
@@ -39,7 +40,7 @@ func TestRunMigrationStepsPreservesProductionOrderAndOptions(t *testing.T) {
 
 	order = nil
 	require.NoError(t, runMigrationSteps(context.Background(), Options{PluginCatalogEnabled: true, CredentialLeasesEnabled: true}, steps))
-	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "database-instance", "enrollment", "plugin-catalog", "plugin-assignment", "credential-lease", "inspection"}, order)
+	require.Equal(t, []string{"alert", "job", "platform", "host", "discovery", "database-instance", "enrollment", "plugin-catalog", "plugin-assignment", "metric-template", "credential-lease", "inspection"}, order)
 }
 
 func TestRunMigrationStepsStopsAtFirstFailure(t *testing.T) {
@@ -62,6 +63,7 @@ func TestRunMigrationStepsStopsAtFirstFailure(t *testing.T) {
 		enrollment:       step("enrollment", nil),
 		pluginCatalog:    step("plugin-catalog", nil),
 		pluginAssignment: step("plugin-assignment", nil),
+		metricTemplate:   step("metric-template", nil),
 		credentialLease:  step("credential-lease", nil),
 		inspection:       step("inspection", nil),
 	})
@@ -82,6 +84,7 @@ func TestRunMigrationStepsFailsClosedWhenEnabledStepIsUnavailable(t *testing.T) 
 		enrollment:       noop,
 		pluginCatalog:    noop,
 		pluginAssignment: noop,
+		metricTemplate:   noop,
 		credentialLease:  noop,
 		inspection:       noop,
 	}

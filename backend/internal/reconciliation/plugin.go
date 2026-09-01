@@ -17,12 +17,14 @@ import (
 )
 
 const (
-	DefaultClaimLease                          = 45 * time.Second
-	PluginExecutionLeaseSeconds         uint32 = 900
-	PluginJobTimeout                           = 20 * time.Minute
-	PluginReconcileCapability                  = "plugin.reconcile.v1"
-	PluginInstanceDescriptorsCapability        = "plugin_reconcile.instance_descriptors.v1"
-	PluginCapabilityWaitingReason              = "instance_descriptors_capability_unavailable"
+	DefaultClaimLease                            = 45 * time.Second
+	PluginExecutionLeaseSeconds           uint32 = 900
+	PluginJobTimeout                             = 20 * time.Minute
+	PluginReconcileCapability                    = "plugin.reconcile.v1"
+	PluginInstanceDescriptorsCapability          = "plugin_reconcile.instance_descriptors.v1"
+	MetricTemplateLeaseCapability                = "metric_template_lease.v1"
+	PluginCapabilityWaitingReason                = "instance_descriptors_capability_unavailable"
+	MetricTemplateCapabilityWaitingReason        = "metric_template_lease_capability_unavailable"
 )
 
 type AssignmentRepository interface {
@@ -39,6 +41,10 @@ type AssignmentRepository interface {
 // facts at scheduling time; Assignment deliberately stores only membership.
 type InstanceDescriptorLoader interface {
 	LoadPluginInstanceDescriptors(context.Context, pluginassignment.Assignment) ([]*agentv1.PluginInstanceDescriptor, error)
+}
+
+type TemplateReferenceLoader interface {
+	LoadPluginTemplateReferences(context.Context, pluginassignment.Assignment) ([]*agentv1.MetricTemplateCommandReference, []*agentv1.PluginInstanceTemplateReferences, error)
 }
 
 func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, assignment pluginassignment.Assignment, at time.Time) (job.Job, error) {
@@ -78,6 +84,12 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 		}
 		return job.Job{}, pluginassignment.ErrConflict
 	}
+	if reconciler.templates != nil && requiresTemplateReferences(claim.Assignment) && !reconciler.supportsTemplateReconcile(claim.Assignment.AgentID) {
+		if err := reconciler.repository.MarkWaiting(ctx, claim, MetricTemplateCapabilityWaitingReason); err != nil {
+			return job.Job{}, err
+		}
+		return job.Job{}, pluginassignment.ErrConflict
+	}
 	var descriptors []*agentv1.PluginInstanceDescriptor
 	if requiresPluginDescriptors(claim.Assignment.DesiredState) {
 		descriptors, err = reconciler.loadDescriptors(ctx, claim.Assignment)
@@ -85,7 +97,15 @@ func (reconciler *PluginReconciler) ReconcileAssignment(ctx context.Context, ass
 			return job.Job{}, err
 		}
 	}
-	value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
+	var references []*agentv1.MetricTemplateCommandReference
+	var instanceReferences []*agentv1.PluginInstanceTemplateReferences
+	if reconciler.templates != nil && requiresTemplateReferences(claim.Assignment) {
+		references, instanceReferences, err = reconciler.loadTemplateReferences(ctx, claim.Assignment)
+		if err != nil {
+			return job.Job{}, err
+		}
+	}
+	value, message, err := buildPluginJobWithConfiguration(claim.Assignment, descriptors, references, instanceReferences, at.UTC())
 	if err != nil {
 		return job.Job{}, err
 	}
@@ -105,6 +125,7 @@ type Reconciler interface {
 type PluginReconciler struct {
 	repository   AssignmentRepository
 	descriptors  InstanceDescriptorLoader
+	templates    TemplateReferenceLoader
 	capabilities AgentCapabilitySource
 }
 
@@ -113,12 +134,16 @@ type AgentCapabilitySource interface {
 }
 
 func NewPluginReconciler(repository AssignmentRepository, sources ...AgentCapabilitySource) *PluginReconciler {
+	return NewPluginReconcilerWithTemplateLoader(repository, nil, sources...)
+}
+
+func NewPluginReconcilerWithTemplateLoader(repository AssignmentRepository, templates TemplateReferenceLoader, sources ...AgentCapabilitySource) *PluginReconciler {
 	loader, _ := repository.(InstanceDescriptorLoader)
 	var source AgentCapabilitySource
 	if len(sources) > 0 {
 		source = sources[0]
 	}
-	return &PluginReconciler{repository: repository, descriptors: loader, capabilities: source}
+	return &PluginReconciler{repository: repository, descriptors: loader, templates: templates, capabilities: source}
 }
 
 func (reconciler *PluginReconciler) FindScheduledJob(ctx context.Context, assignment pluginassignment.Assignment) (job.Job, bool, error) {
@@ -173,6 +198,14 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 			}
 			continue
 		}
+		if reconciler.templates != nil && requiresTemplateReferences(claim.Assignment) && !reconciler.supportsTemplateReconcile(claim.Assignment.AgentID) {
+			if err := reconciler.repository.MarkWaiting(ctx, claim, MetricTemplateCapabilityWaitingReason); err != nil {
+				failures = append(failures, err)
+			} else {
+				result.Waiting++
+			}
+			continue
+		}
 		var descriptors []*agentv1.PluginInstanceDescriptor
 		if requiresPluginDescriptors(claim.Assignment.DesiredState) {
 			descriptors, err = reconciler.loadDescriptors(ctx, claim.Assignment)
@@ -181,7 +214,16 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 				continue
 			}
 		}
-		value, message, err := buildPluginJobWithDescriptors(claim.Assignment, descriptors, at.UTC())
+		var references []*agentv1.MetricTemplateCommandReference
+		var instanceReferences []*agentv1.PluginInstanceTemplateReferences
+		if reconciler.templates != nil && requiresTemplateReferences(claim.Assignment) {
+			references, instanceReferences, err = reconciler.loadTemplateReferences(ctx, claim.Assignment)
+			if err != nil {
+				failures = append(failures, err)
+				continue
+			}
+		}
+		value, message, err := buildPluginJobWithConfiguration(claim.Assignment, descriptors, references, instanceReferences, at.UTC())
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -204,6 +246,25 @@ func (reconciler *PluginReconciler) Reconcile(ctx context.Context, at time.Time,
 
 func (reconciler *PluginReconciler) supportsDescriptorReconcile(agentID string) bool {
 	return reconciler.capabilities == nil || reconciler.capabilities.Supports(agentID, PluginReconcileCapability, PluginInstanceDescriptorsCapability)
+}
+
+func (reconciler *PluginReconciler) supportsTemplateReconcile(agentID string) bool {
+	return reconciler.capabilities == nil || reconciler.capabilities.Supports(agentID, PluginReconcileCapability, PluginInstanceDescriptorsCapability, MetricTemplateLeaseCapability)
+}
+
+func requiresTemplateReferences(value pluginassignment.Assignment) bool {
+	return value.DesiredState == pluginassignment.DesiredRunning && len(value.TemplateRevisionIDs) > 0
+}
+
+func (reconciler *PluginReconciler) loadTemplateReferences(ctx context.Context, assignment pluginassignment.Assignment) ([]*agentv1.MetricTemplateCommandReference, []*agentv1.PluginInstanceTemplateReferences, error) {
+	if reconciler == nil || reconciler.templates == nil {
+		return nil, nil, pluginassignment.ErrInvalid
+	}
+	references, instances, err := reconciler.templates.LoadPluginTemplateReferences(ctx, assignment)
+	if err != nil || validateTemplateReferences(assignment, references, instances) != nil {
+		return nil, nil, pluginassignment.ErrInvalid
+	}
+	return references, instances, nil
 }
 
 func requiresPluginDescriptors(state pluginassignment.DesiredState) bool {
@@ -236,11 +297,20 @@ func (reconciler *PluginReconciler) loadDescriptors(ctx context.Context, assignm
 }
 
 func buildPluginJobWithDescriptors(assignment pluginassignment.Assignment, descriptors []*agentv1.PluginInstanceDescriptor, at time.Time) (job.Job, job.OutboxMessage, error) {
+	return buildPluginJobWithConfiguration(assignment, descriptors, nil, nil, at)
+}
+
+func buildPluginJobWithConfiguration(assignment pluginassignment.Assignment, descriptors []*agentv1.PluginInstanceDescriptor, templateReferences []*agentv1.MetricTemplateCommandReference, instanceReferences []*agentv1.PluginInstanceTemplateReferences, at time.Time) (job.Job, job.OutboxMessage, error) {
 	if assignment.Validate() != nil || at.IsZero() || !assignment.NeedsReconcile() {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
 	if requiresPluginDescriptors(assignment.DesiredState) && validateDescriptors(assignment, descriptors) != nil || !requiresPluginDescriptors(assignment.DesiredState) && len(descriptors) != 0 {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
+	}
+	if len(templateReferences) > 0 || len(instanceReferences) > 0 {
+		if !requiresPluginDescriptors(assignment.DesiredState) || validateTemplateReferences(assignment, templateReferences, instanceReferences) != nil {
+			return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
+		}
 	}
 	artifactDigest, err := hex.DecodeString(assignment.ArtifactSHA256)
 	if err != nil || len(artifactDigest) != 32 {
@@ -254,7 +324,14 @@ func buildPluginJobWithDescriptors(assignment pluginassignment.Assignment, descr
 	if !ok {
 		return job.Job{}, job.OutboxMessage{}, pluginassignment.ErrInvalid
 	}
-	command := &agentv1.CommandEnvelope{AgentId: assignment.AgentID, LeaseSeconds: PluginExecutionLeaseSeconds, Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: assignment.ID, PluginId: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, DesiredVersion: assignment.DesiredVersion, DesiredState: state, ArtifactId: assignment.ArtifactID, ArtifactSha256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: assignment.ConfigurationRevision, OperationRevision: assignment.OperationRevision, InstanceIds: append([]string(nil), assignment.InstanceIDs...), TemplateIds: append([]string(nil), assignment.TemplateRevisionIDs...), InstanceDescriptors: cloneDescriptors(descriptors)}}}
+	templateIDs := append([]string(nil), assignment.TemplateRevisionIDs...)
+	if len(templateReferences) > 0 {
+		templateIDs = make([]string, len(templateReferences))
+		for index, reference := range templateReferences {
+			templateIDs[index] = reference.GetTemplateId()
+		}
+	}
+	command := &agentv1.CommandEnvelope{AgentId: assignment.AgentID, LeaseSeconds: PluginExecutionLeaseSeconds, Command: &agentv1.CommandEnvelope_ReconcilePlugin{ReconcilePlugin: &agentv1.ReconcilePlugin{AssignmentId: assignment.ID, PluginId: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, DesiredVersion: assignment.DesiredVersion, DesiredState: state, ArtifactId: assignment.ArtifactID, ArtifactSha256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: assignment.ConfigurationRevision, OperationRevision: assignment.OperationRevision, InstanceIds: append([]string(nil), assignment.InstanceIDs...), TemplateIds: templateIDs, TemplateRevisions: cloneTemplateReferences(templateReferences), InstanceTemplateRevisions: cloneInstanceTemplateReferences(instanceReferences), InstanceDescriptors: cloneDescriptors(descriptors)}}}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(command)
 	if err != nil {
 		return job.Job{}, job.OutboxMessage{}, fmt.Errorf("marshal ReconcilePlugin: %w", err)
@@ -266,6 +343,90 @@ func buildPluginJobWithDescriptors(assignment pluginassignment.Assignment, descr
 	value := job.Job{ID: jobID, Type: "plugin.reconcile", Scope: assignment.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{assignment.AgentID}, InitiatedBy: "plugin-reconciler", SourceResource: job.ResourceReference{ResourceType: "plugin_assignment", ResourceID: assignment.ID}, IdempotencyKey: "plugin-reconcile:" + identity, Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at.UTC(), TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: PluginJobTimeout - time.Minute, RequestID: "plugin-reconcile-" + assignment.ID, TraceID: pluginassignment.DeterministicID("trace-", assignment.Scope.Key(), identity)}
 	message := job.OutboxMessage{ID: commandID, Scope: assignment.Scope, JobID: jobID, TargetID: assignment.AgentID, Type: "agent.command", Payload: payload, AvailableAt: at.UTC(), CreatedAt: at.UTC()}
 	return value, message, nil
+}
+
+func validateTemplateReferences(assignment pluginassignment.Assignment, references []*agentv1.MetricTemplateCommandReference, instances []*agentv1.PluginInstanceTemplateReferences) error {
+	if len(references) == 0 || len(references) > 128 || len(instances) != len(assignment.InstanceIDs) {
+		return pluginassignment.ErrInvalid
+	}
+	revisionSet := make(map[string]struct{}, len(references))
+	templateSet := make(map[string]struct{}, len(references))
+	for index, reference := range references {
+		if !validTemplateReference(reference) {
+			return pluginassignment.ErrInvalid
+		}
+		if index > 0 && references[index-1].GetTemplateId() >= reference.GetTemplateId() {
+			return pluginassignment.ErrInvalid
+		}
+		if _, duplicate := revisionSet[reference.GetRevisionId()]; duplicate {
+			return pluginassignment.ErrInvalid
+		}
+		if _, duplicate := templateSet[reference.GetTemplateId()]; duplicate {
+			return pluginassignment.ErrInvalid
+		}
+		revisionSet[reference.GetRevisionId()] = struct{}{}
+		templateSet[reference.GetTemplateId()] = struct{}{}
+	}
+	if len(revisionSet) != len(assignment.TemplateRevisionIDs) {
+		return pluginassignment.ErrInvalid
+	}
+	for _, id := range assignment.TemplateRevisionIDs {
+		if _, ok := revisionSet[id]; !ok {
+			return pluginassignment.ErrInvalid
+		}
+	}
+	seenInstances := make(map[string]struct{}, len(instances))
+	usedRevisions := make(map[string]struct{}, len(references))
+	for _, instance := range instances {
+		if instance == nil || !containsAssignmentID(assignment.InstanceIDs, instance.GetInstanceId()) {
+			return pluginassignment.ErrInvalid
+		}
+		if _, duplicate := seenInstances[instance.GetInstanceId()]; duplicate {
+			return pluginassignment.ErrInvalid
+		}
+		seenInstances[instance.GetInstanceId()] = struct{}{}
+		seenTemplates := map[string]struct{}{}
+		for index, reference := range instance.GetTemplates() {
+			if !validTemplateReference(reference) {
+				return pluginassignment.ErrInvalid
+			}
+			if index > 0 && instance.GetTemplates()[index-1].GetTemplateId() >= reference.GetTemplateId() {
+				return pluginassignment.ErrInvalid
+			}
+			if _, ok := revisionSet[reference.GetRevisionId()]; !ok {
+				return pluginassignment.ErrInvalid
+			}
+			if _, duplicate := seenTemplates[reference.GetTemplateId()]; duplicate {
+				return pluginassignment.ErrInvalid
+			}
+			seenTemplates[reference.GetTemplateId()] = struct{}{}
+			usedRevisions[reference.GetRevisionId()] = struct{}{}
+		}
+	}
+	if len(usedRevisions) != len(revisionSet) {
+		return pluginassignment.ErrInvalid
+	}
+	return nil
+}
+
+func validTemplateReference(value *agentv1.MetricTemplateCommandReference) bool {
+	return value != nil && value.GetTemplateId() != "" && len(value.GetTemplateId()) <= 128 && value.GetRevisionId() != "" && len(value.GetRevisionId()) <= 128 && len(value.GetQueryDigest()) == 32 && value.GetTimeoutSeconds() > 0 && value.GetTimeoutSeconds() <= 30 && value.GetMaxRows() > 0 && value.GetMaxRows() <= 100 && value.GetMaxColumns() > 0 && value.GetMaxColumns() <= 32 && value.GetCardinalityLimit() > 0 && value.GetCardinalityLimit() <= 10000
+}
+
+func cloneTemplateReferences(values []*agentv1.MetricTemplateCommandReference) []*agentv1.MetricTemplateCommandReference {
+	result := make([]*agentv1.MetricTemplateCommandReference, len(values))
+	for index, value := range values {
+		result[index] = proto.Clone(value).(*agentv1.MetricTemplateCommandReference)
+	}
+	return result
+}
+
+func cloneInstanceTemplateReferences(values []*agentv1.PluginInstanceTemplateReferences) []*agentv1.PluginInstanceTemplateReferences {
+	result := make([]*agentv1.PluginInstanceTemplateReferences, len(values))
+	for index, value := range values {
+		result[index] = proto.Clone(value).(*agentv1.PluginInstanceTemplateReferences)
+	}
+	return result
 }
 
 func validateDescriptors(assignment pluginassignment.Assignment, values []*agentv1.PluginInstanceDescriptor) error {

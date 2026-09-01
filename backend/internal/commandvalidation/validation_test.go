@@ -108,6 +108,22 @@ func TestValidateTypedCommandsRejectsUnsafeOrEmptyStructuredInput(t *testing.T) 
 	require.NoError(t, Validate(context.Background(), valid, nil), "foundation CollectNow without instance targets remains allowed")
 }
 
+func TestValidateCollectDatabaseMetricsRequiresBoundedInstancesAndTemplateRevisions(t *testing.T) {
+	valid := &agentv1.CommandEnvelope{AgentId: "agent-a", Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{AssignmentId: "assignment-a", ConfigurationRevision: 7, OperationRevision: 9, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"template-a"}, Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: make([]byte, sha256.Size), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}}}}}
+	authorizer := &recordingAuthorizer{allowed: map[string]bool{"agent-a/instance-a": true}}
+	require.NoError(t, Validate(context.Background(), valid, authorizer))
+
+	invalid := proto.Clone(valid).(*agentv1.CommandEnvelope)
+	invalid.GetCollectDatabaseMetrics().InstanceIds = append(invalid.GetCollectDatabaseMetrics().InstanceIds, "instance-a")
+	require.ErrorIs(t, Validate(context.Background(), invalid, allowAllAuthorizer{}), ErrInvalidCommand)
+	invalid = proto.Clone(valid).(*agentv1.CommandEnvelope)
+	invalid.GetCollectDatabaseMetrics().TemplateIds = nil
+	require.ErrorIs(t, Validate(context.Background(), invalid, allowAllAuthorizer{}), ErrInvalidCommand)
+	invalid = proto.Clone(valid).(*agentv1.CommandEnvelope)
+	invalid.GetCollectDatabaseMetrics().TemplateRevisions[0].QueryDigest = []byte("short")
+	require.ErrorIs(t, Validate(context.Background(), invalid, allowAllAuthorizer{}), ErrInvalidCommand)
+}
+
 type recordingAuthorizer struct {
 	allowed map[string]bool
 	calls   []string

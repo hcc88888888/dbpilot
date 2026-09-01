@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/spool"
@@ -69,26 +70,27 @@ func (client *Client) MetricSink() MetricSink {
 // ExpectedPlugin comes only from the Supervisor's launch result, never from a
 // plugin response or control-plane supplied socket address.
 type ExpectedPlugin struct {
-	PID                         int
-	ExpectedUserID              uint32
-	ExpectedGroupID             uint32
-	RuntimeDirectory            string
-	AssignmentID                string
-	PluginID                    string
-	DatabaseFamily              string
-	Version                     string
-	ProtocolVersion             string
-	ExecutablePath              string
-	ExecutableSHA256            []byte
-	LaunchNonce                 []byte
-	ConfigurationRevision       uint64
-	OperationRevision           uint64
-	InstanceIDs                 []string
-	TemplateIDs                 []string
-	SupportedVariants           []string
-	SignedCapabilities          []string
-	MetricTemplateSchemaVersion uint32
-	TemplateConfigurations      []*pluginv1.MetricTemplateConfiguration
+	PID                            int
+	ExpectedUserID                 uint32
+	ExpectedGroupID                uint32
+	RuntimeDirectory               string
+	AssignmentID                   string
+	PluginID                       string
+	DatabaseFamily                 string
+	Version                        string
+	ProtocolVersion                string
+	ExecutablePath                 string
+	ExecutableSHA256               []byte
+	LaunchNonce                    []byte
+	ConfigurationRevision          uint64
+	OperationRevision              uint64
+	InstanceIDs                    []string
+	TemplateIDs                    []string
+	SupportedVariants              []string
+	SignedCapabilities             []string
+	MetricTemplateSchemaVersion    uint32
+	TemplateConfigurations         []*pluginv1.MetricTemplateConfiguration
+	InstanceTemplateConfigurations map[string][]*pluginv1.MetricTemplateConfiguration
 }
 
 type Capabilities struct {
@@ -110,6 +112,13 @@ func (configuration *PluginConfiguration) Release() {
 	}
 	for _, instance := range configuration.Instances {
 		clearInstanceCredential(instance)
+		for _, template := range instance.GetTemplates() {
+			if template != nil {
+				template.ReadOnlyStatement = ""
+				template.ValueMappings = nil
+				template.LabelMappings = nil
+			}
+		}
 	}
 }
 
@@ -120,6 +129,24 @@ type ValidationResult struct {
 	DatabaseEdition string
 	Capabilities    []string
 	ErrorCode       string
+}
+
+type TrialMetric struct {
+	Name       string
+	Value      float64
+	Unit       string
+	MetricType string
+	Labels     map[string]string
+}
+
+type TrialResult struct {
+	Succeeded      bool
+	Metrics        []TrialMetric
+	RowCount       uint32
+	ColumnCount    uint32
+	MetricCount    uint32
+	DurationMillis uint32
+	ErrorCode      string
 }
 
 type MetricSink interface {
@@ -237,6 +264,68 @@ func (session *Session) AssignmentID() string {
 	return session.expected.AssignmentID
 }
 
+func (session *Session) SetExpectedTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) error {
+	if session == nil || len(values) == 0 {
+		return errGateway
+	}
+	ids := make([]string, 0, len(values))
+	for _, value := range values {
+		if !validTemplateConfiguration(value) {
+			return errGateway
+		}
+		ids = append(ids, value.GetTemplateId())
+	}
+	if !sameSet(ids, session.expected.TemplateIDs) {
+		return errGateway
+	}
+	session.mu.Lock()
+	session.expected.TemplateConfigurations = cloneTemplateConfigurations(values)
+	session.mu.Unlock()
+	return nil
+}
+
+func (session *Session) SetExpectedInstanceTemplateConfigurations(values map[string][]*pluginv1.MetricTemplateConfiguration) error {
+	if session == nil || len(values) != len(session.expected.InstanceIDs) {
+		return errGateway
+	}
+	aggregateByID := map[string]*pluginv1.MetricTemplateConfiguration{}
+	cloned := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(values))
+	for _, instanceID := range session.expected.InstanceIDs {
+		templates, ok := values[instanceID]
+		if !ok {
+			return errGateway
+		}
+		seen := map[string]struct{}{}
+		for _, template := range templates {
+			if !validTemplateConfiguration(template) {
+				return errGateway
+			}
+			if _, duplicate := seen[template.GetTemplateId()]; duplicate {
+				return errGateway
+			}
+			seen[template.GetTemplateId()] = struct{}{}
+			if existing := aggregateByID[template.GetTemplateId()]; existing != nil && !proto.Equal(existing, template) {
+				return errGateway
+			}
+			aggregateByID[template.GetTemplateId()] = template
+		}
+		cloned[instanceID] = cloneTemplateConfigurations(templates)
+	}
+	aggregate := make([]*pluginv1.MetricTemplateConfiguration, 0, len(aggregateByID))
+	for _, templateID := range session.expected.TemplateIDs {
+		template := aggregateByID[templateID]
+		if template == nil {
+			return errGateway
+		}
+		aggregate = append(aggregate, proto.Clone(template).(*pluginv1.MetricTemplateConfiguration))
+	}
+	session.mu.Lock()
+	session.expected.TemplateConfigurations = aggregate
+	session.expected.InstanceTemplateConfigurations = cloned
+	session.mu.Unlock()
+	return nil
+}
+
 // RemoveCredentials applies the current routing and templates without a lease,
 // requiring the plugin to close its database pools before shutdown or expiry.
 func (session *Session) RemoveCredentials(ctx context.Context) error {
@@ -294,6 +383,118 @@ func (session *Session) ValidateInstance(ctx context.Context, instanceID string)
 		return nil
 	})
 	return result, err
+}
+
+func (session *Session) TrialMetricTemplate(ctx context.Context, configurationRevision, operationRevision uint64, instanceID string, template *pluginv1.TrialMetricTemplateDefinition) (TrialResult, error) {
+	if session == nil || ctx == nil || ctx.Err() != nil || configurationRevision == 0 || operationRevision == 0 || configurationRevision != session.currentRevision() || operationRevision != session.expected.OperationRevision || !session.readyForInstance(instanceID) || !validTrialTemplateDefinition(template) {
+		return TrialResult{}, errGateway
+	}
+	request := &pluginv1.TrialMetricTemplateRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), OperationRevision: operationRevision, InstanceId: instanceID, Template: proto.Clone(template).(*pluginv1.TrialMetricTemplateDefinition)}
+	var result TrialResult
+	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
+		var trialErr error
+		result, trialErr = trialMetricTemplateWithClient(callContext, client, request)
+		return trialErr
+	})
+	return result, err
+}
+
+func (session *Session) ConfigurationRevision() uint64 {
+	if session == nil {
+		return 0
+	}
+	return session.currentRevision()
+}
+func (session *Session) OperationRevision() uint64 {
+	if session == nil {
+		return 0
+	}
+	return session.expected.OperationRevision
+}
+
+func trialMetricTemplateWithClient(ctx context.Context, client pluginv1.PluginRuntimeClient, request *pluginv1.TrialMetricTemplateRequest) (TrialResult, error) {
+	if ctx == nil || client == nil || request == nil || request.GetTemplate() == nil || !validTrialTemplateDefinition(request.GetTemplate()) {
+		return TrialResult{}, errGateway
+	}
+	defer clearTrialMetricTemplateRequest(request)
+	response, err := client.TrialMetricTemplate(ctx, request)
+	if err != nil || !validTrialMetricTemplateResponse(response, request.GetTemplate()) {
+		return TrialResult{}, errGateway
+	}
+	result := TrialResult{Succeeded: response.GetSucceeded(), RowCount: response.GetRowCount(), ColumnCount: response.GetColumnCount(), MetricCount: response.GetMetricCount(), DurationMillis: response.GetDurationMillis(), ErrorCode: fixedPluginCode(response.GetErrorCode()), Metrics: make([]TrialMetric, len(response.GetCandidateMetrics()))}
+	for index, metric := range response.GetCandidateMetrics() {
+		labels := make(map[string]string, len(metric.GetLabels()))
+		for name, value := range metric.GetLabels() {
+			labels[name] = value
+		}
+		result.Metrics[index] = TrialMetric{Name: metric.GetMetricName(), Value: metric.GetValue(), Unit: metric.GetUnit(), MetricType: metricTypeName(metric.GetMetricType()), Labels: labels}
+	}
+	return result, nil
+}
+
+func validTrialTemplateDefinition(value *pluginv1.TrialMetricTemplateDefinition) bool {
+	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || len(value.GetReadOnlyStatement()) == 0 || len(value.GetReadOnlyStatement()) > 32768 || value.GetCollectionIntervalSeconds() < 10 || value.GetCollectionIntervalSeconds() > 86400 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || value.GetCardinalityLimit() == 0 || value.GetCardinalityLimit() > 10000 || !validTemplateMappings(value.GetValueMappings(), value.GetLabelMappings()) {
+		return false
+	}
+	digest := sha256.Sum256(value.GetReadOnlyStatement())
+	return subtle.ConstantTimeCompare(digest[:], value.GetQueryDigest()) == 1
+}
+
+func validTrialMetricTemplateResponse(value *pluginv1.TrialMetricTemplateResponse, definition *pluginv1.TrialMetricTemplateDefinition) bool {
+	maximumMetrics := uint64(definition.GetMaxRows()) * uint64(len(definition.GetValueMappings()))
+	if maximumMetrics > uint64(definition.GetCardinalityLimit()) {
+		maximumMetrics = uint64(definition.GetCardinalityLimit())
+	}
+	if value == nil || definition == nil || value.GetMetricCount() != uint32(len(value.GetCandidateMetrics())) || value.GetRowCount() > definition.GetMaxRows() || value.GetColumnCount() > definition.GetMaxColumns() || uint64(value.GetMetricCount()) > maximumMetrics || value.GetDurationMillis() > definition.GetTimeoutSeconds()*1000 || value.GetSucceeded() == (value.GetErrorCode() != "") || fixedPluginCode(value.GetErrorCode()) != value.GetErrorCode() {
+		return false
+	}
+	type metricIdentity struct {
+		unit       string
+		metricType pluginv1.PluginMetricType
+	}
+	allowed := make(map[string]metricIdentity, len(definition.GetValueMappings()))
+	for _, mapping := range definition.GetValueMappings() {
+		if mapping == nil {
+			return false
+		}
+		allowed[mapping.GetMetricName()] = metricIdentity{unit: mapping.GetUnit(), metricType: metricTypeFromName(mapping.GetMetricType())}
+	}
+	allowedLabels := make(map[string]struct{}, len(definition.GetLabelMappings()))
+	for _, mapping := range definition.GetLabelMappings() {
+		allowedLabels[mapping.GetLabel()] = struct{}{}
+	}
+	series := make(map[string]struct{}, len(value.GetCandidateMetrics()))
+	for _, metric := range value.GetCandidateMetrics() {
+		identity, exists := allowed[metric.GetMetricName()]
+		if metric == nil || !exists || identity.unit != metric.GetUnit() || identity.metricType != metric.GetMetricType() || !finite(metric.GetValue()) || len(metric.GetLabels()) > 16 {
+			return false
+		}
+		key := metric.GetMetricName()
+		names := make([]string, 0, len(metric.GetLabels()))
+		for name := range metric.GetLabels() {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			label := metric.GetLabels()[name]
+			if _, ok := allowedLabels[name]; !ok || !pluginLabelName.MatchString(name) || !utf8.ValidString(label) || len([]byte(label)) > 128 || strings.ContainsAny(label, "\x00\r\n") {
+				return false
+			}
+			key += "\x00" + name + "=" + label
+		}
+		series[key] = struct{}{}
+	}
+	return len(series) <= int(definition.GetCardinalityLimit())
+}
+
+func clearTrialMetricTemplateRequest(request *pluginv1.TrialMetricTemplateRequest) {
+	if request == nil || request.Template == nil {
+		return
+	}
+	for index := range request.Template.ReadOnlyStatement {
+		request.Template.ReadOnlyStatement[index] = 0
+	}
+	request.Template.ReadOnlyStatement = nil
 }
 
 func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs []string) error {
@@ -674,7 +875,25 @@ func (session *Session) readyForInstance(id string) bool {
 	return session.isConfigured() && contains(session.expected.InstanceIDs, id)
 }
 func (session *Session) readyForCollect(instances, templates []string) bool {
-	return session.isConfigured() && sameSet(instances, session.expected.InstanceIDs) && sameSet(templates, session.expected.TemplateIDs)
+	if !session.isConfigured() || len(instances) == 0 || len(templates) == 0 || !unique(instances) || !unique(templates) {
+		return false
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	for _, instanceID := range instances {
+		instance := session.instances[instanceID]
+		if instance == nil {
+			return false
+		}
+		configured := make([]string, len(instance.GetTemplates()))
+		for index, template := range instance.GetTemplates() {
+			configured[index] = template.GetTemplateId()
+		}
+		if !sameSet(templates, configured) {
+			return false
+		}
+	}
+	return true
 }
 
 func (session *Session) invoke(ctx context.Context, invoke func(pluginv1.PluginRuntimeClient, context.Context) error) error {
@@ -705,8 +924,17 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 			return errGateway
 		}
 		templates := map[string]struct{}{}
+		expectedTemplates := expected.TemplateConfigurations
+		expectedIDs := expected.TemplateIDs
+		if expected.InstanceTemplateConfigurations != nil {
+			expectedTemplates = expected.InstanceTemplateConfigurations[instance.GetInstanceId()]
+			expectedIDs = make([]string, len(expectedTemplates))
+			for index, template := range expectedTemplates {
+				expectedIDs[index] = template.GetTemplateId()
+			}
+		}
 		for _, template := range instance.GetTemplates() {
-			if template == nil || !contains(expected.TemplateIDs, template.GetTemplateId()) || !validTemplateConfiguration(template) || !matchesExpectedTemplate(template, expected.TemplateConfigurations) {
+			if template == nil || !contains(expectedIDs, template.GetTemplateId()) || !validTemplateConfiguration(template) || !matchesExpectedTemplate(template, expectedTemplates) {
 				return errGateway
 			}
 			if _, duplicate := templates[template.GetTemplateId()]; duplicate {
@@ -722,7 +950,7 @@ func (configuration PluginConfiguration) validate(expected ExpectedPlugin) error
 		if pairs > maxConfiguredPairs {
 			return errGateway
 		}
-		if !sameSet(mapKeys(templates), expected.TemplateIDs) {
+		if !sameSet(mapKeys(templates), expectedIDs) {
 			return errGateway
 		}
 	}
@@ -802,24 +1030,38 @@ func canonicalDatabaseText(value string) bool {
 }
 
 func validTemplateConfiguration(value *pluginv1.MetricTemplateConfiguration) bool {
-	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || len(value.GetValueMappings()) == 0 || len(value.GetValueMappings()) > 32 || len(value.GetLabelMappings()) > 16 {
+	if value == nil || !identifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size || value.GetQueryKind() != "sql" || value.GetReadOnlyStatement() == "" || len(value.GetReadOnlyStatement()) > 64<<10 || value.GetCollectionIntervalSeconds() < 10 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 30 || value.GetMaxRows() == 0 || value.GetMaxRows() > 100 || value.GetMaxColumns() == 0 || value.GetMaxColumns() > 32 || !validTemplateMappings(value.GetValueMappings(), value.GetLabelMappings()) {
+		return false
+	}
+	return true
+}
+
+func validTemplateMappings(valueMappings []*pluginv1.MetricValueMapping, labelMappings []*pluginv1.MetricLabelMapping) bool {
+	if len(valueMappings) == 0 || len(valueMappings) > 32 || len(labelMappings) > 16 {
 		return false
 	}
 	metrics, labels := map[string]struct{}{}, map[string]struct{}{}
-	for _, mapping := range value.GetValueMappings() {
+	sources := map[string]struct{}{}
+	for _, mapping := range valueMappings {
 		if mapping == nil || !identifier(mapping.GetSourceColumn()) || !pluginMetricName.MatchString(mapping.GetMetricName()) || !pluginUnit.MatchString(mapping.GetUnit()) || metricTypeFromName(mapping.GetMetricType()) == pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED {
 			return false
 		}
-		key := mapping.GetMetricName() + "\x00" + mapping.GetMetricType() + "\x00" + mapping.GetUnit()
-		if _, duplicate := metrics[key]; duplicate {
+		if _, duplicate := metrics[mapping.GetMetricName()]; duplicate {
 			return false
 		}
-		metrics[key] = struct{}{}
+		if _, duplicate := sources[mapping.GetSourceColumn()]; duplicate {
+			return false
+		}
+		metrics[mapping.GetMetricName()] = struct{}{}
+		sources[mapping.GetSourceColumn()] = struct{}{}
 	}
-	for _, mapping := range value.GetLabelMappings() {
+	for _, mapping := range labelMappings {
+		if mapping == nil {
+			return false
+		}
 		normalized := normalizeMetricLabelKey(mapping.GetLabel())
 		_, reserved := reservedNormalizedLabels[normalized]
-		if mapping == nil || !identifier(mapping.GetSourceColumn()) || !pluginLabelName.MatchString(mapping.GetLabel()) || normalized == "" || reserved || strings.HasSuffix(normalized, "_tenant_id") || strings.HasSuffix(normalized, "_project_id") || strings.HasSuffix(normalized, "_agent_id") || strings.HasPrefix(normalized, "dbpilot_") {
+		if !identifier(mapping.GetSourceColumn()) || !pluginLabelName.MatchString(mapping.GetLabel()) || normalized == "" || reserved || strings.HasSuffix(normalized, "_tenant_id") || strings.HasSuffix(normalized, "_project_id") || strings.HasSuffix(normalized, "_agent_id") || strings.HasPrefix(normalized, "dbpilot_") {
 			return false
 		}
 		if _, duplicate := labels[mapping.GetLabel()]; duplicate {
@@ -868,6 +1110,21 @@ func metricTypeFromName(value string) pluginv1.PluginMetricType {
 		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER
 	default:
 		return pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_UNSPECIFIED
+	}
+}
+
+func metricTypeName(value pluginv1.PluginMetricType) string {
+	switch value {
+	case pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE:
+		return "gauge"
+	case pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_GAUGE:
+		return "monotonic_gauge"
+	case pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_COUNTER:
+		return "counter"
+	case pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_MONOTONIC_COUNTER:
+		return "monotonic_counter"
+	default:
+		return ""
 	}
 }
 
@@ -932,10 +1189,33 @@ func cloneExpected(value ExpectedPlugin) ExpectedPlugin {
 	value.SupportedVariants = append([]string(nil), value.SupportedVariants...)
 	value.SignedCapabilities = append([]string(nil), value.SignedCapabilities...)
 	value.TemplateConfigurations = cloneTemplateConfigurations(value.TemplateConfigurations)
+	value.InstanceTemplateConfigurations = cloneInstanceTemplateConfigurationMap(value.InstanceTemplateConfigurations)
 	return value
 }
 func sameExpected(left, right ExpectedPlugin) bool {
-	return left.PID == right.PID && left.ExpectedUserID == right.ExpectedUserID && left.ExpectedGroupID == right.ExpectedGroupID && left.RuntimeDirectory == right.RuntimeDirectory && left.AssignmentID == right.AssignmentID && left.PluginID == right.PluginID && left.DatabaseFamily == right.DatabaseFamily && left.Version == right.Version && left.ProtocolVersion == right.ProtocolVersion && left.ExecutablePath == right.ExecutablePath && bytes.Equal(left.ExecutableSHA256, right.ExecutableSHA256) && bytes.Equal(left.LaunchNonce, right.LaunchNonce) && left.ConfigurationRevision == right.ConfigurationRevision && left.OperationRevision == right.OperationRevision && sameSet(left.InstanceIDs, right.InstanceIDs) && sameSet(left.TemplateIDs, right.TemplateIDs) && sameSet(left.SupportedVariants, right.SupportedVariants) && sameSet(left.SignedCapabilities, right.SignedCapabilities) && left.MetricTemplateSchemaVersion == right.MetricTemplateSchemaVersion && sameTemplateConfigurations(left.TemplateConfigurations, right.TemplateConfigurations)
+	return left.PID == right.PID && left.ExpectedUserID == right.ExpectedUserID && left.ExpectedGroupID == right.ExpectedGroupID && left.RuntimeDirectory == right.RuntimeDirectory && left.AssignmentID == right.AssignmentID && left.PluginID == right.PluginID && left.DatabaseFamily == right.DatabaseFamily && left.Version == right.Version && left.ProtocolVersion == right.ProtocolVersion && left.ExecutablePath == right.ExecutablePath && bytes.Equal(left.ExecutableSHA256, right.ExecutableSHA256) && bytes.Equal(left.LaunchNonce, right.LaunchNonce) && left.ConfigurationRevision == right.ConfigurationRevision && left.OperationRevision == right.OperationRevision && sameSet(left.InstanceIDs, right.InstanceIDs) && sameSet(left.TemplateIDs, right.TemplateIDs) && sameSet(left.SupportedVariants, right.SupportedVariants) && sameSet(left.SignedCapabilities, right.SignedCapabilities) && left.MetricTemplateSchemaVersion == right.MetricTemplateSchemaVersion && sameTemplateConfigurations(left.TemplateConfigurations, right.TemplateConfigurations) && sameInstanceTemplateConfigurationMap(left.InstanceTemplateConfigurations, right.InstanceTemplateConfigurations)
+}
+
+func cloneInstanceTemplateConfigurationMap(values map[string][]*pluginv1.MetricTemplateConfiguration) map[string][]*pluginv1.MetricTemplateConfiguration {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(values))
+	for id, templates := range values {
+		result[id] = cloneTemplateConfigurations(templates)
+	}
+	return result
+}
+func sameInstanceTemplateConfigurationMap(left, right map[string][]*pluginv1.MetricTemplateConfiguration) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for id, templates := range left {
+		if !sameTemplateConfigurations(templates, right[id]) {
+			return false
+		}
+	}
+	return true
 }
 
 func cloneTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) []*pluginv1.MetricTemplateConfiguration {
@@ -997,6 +1277,11 @@ func clearConfigurationSecrets(request *pluginv1.ApplyPluginConfigurationRequest
 	}
 	for _, instance := range request.Instances {
 		clearInstanceCredential(instance)
+		for _, template := range instance.GetTemplates() {
+			if template != nil {
+				template.ReadOnlyStatement = ""
+			}
+		}
 	}
 }
 

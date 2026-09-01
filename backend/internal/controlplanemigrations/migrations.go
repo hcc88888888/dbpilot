@@ -17,6 +17,7 @@ import (
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/metrictemplate"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
@@ -40,6 +41,7 @@ type migrationSteps struct {
 	enrollment       func(context.Context) error
 	pluginCatalog    func(context.Context) error
 	pluginAssignment func(context.Context) error
+	metricTemplate   func(context.Context) error
 	credentialLease  func(context.Context) error
 	inspection       func(context.Context) error
 }
@@ -59,6 +61,7 @@ func Run(ctx context.Context, database *sql.DB, options Options) error {
 		enrollment:       func(ctx context.Context) error { return enrollment.RunMigrations(ctx, database) },
 		pluginCatalog:    func(ctx context.Context) error { return plugincatalog.RunMigrations(ctx, database) },
 		pluginAssignment: func(ctx context.Context) error { return pluginassignment.RunMigrations(ctx, database) },
+		metricTemplate:   func(ctx context.Context) error { return metrictemplate.RunMigrations(ctx, database) },
 		credentialLease:  func(ctx context.Context) error { return credentiallease.RunMigrations(ctx, database) },
 		inspection: func(ctx context.Context) error {
 			if err := inspection.RunMigrations(ctx, database); err != nil {
@@ -73,7 +76,7 @@ func Run(ctx context.Context, database *sql.DB, options Options) error {
 func runMigrationSteps(ctx context.Context, options Options, steps migrationSteps) error {
 	pipeline := []func(context.Context) error{steps.alert, steps.job, steps.platform, steps.host, steps.discovery, steps.databaseInstance, steps.enrollment}
 	if options.PluginCatalogEnabled {
-		pipeline = append(pipeline, steps.pluginCatalog, steps.pluginAssignment)
+		pipeline = append(pipeline, steps.pluginCatalog, steps.pluginAssignment, steps.metricTemplate)
 	}
 	if options.CredentialLeasesEnabled {
 		pipeline = append(pipeline, steps.credentialLease)

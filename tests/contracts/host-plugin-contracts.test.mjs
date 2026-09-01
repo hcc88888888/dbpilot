@@ -260,11 +260,11 @@ test('host database plugin and metric template DTOs are closed and bounded', asy
   assert.equal(resolvedSchema(document, schemas.MetricTemplateRevision.properties.label_mappings.items).properties.label.maxLength, 128);
 
   assert.deepEqual(schemas.MetricQueryKind.enum, ['sql']);
-  for (const name of ['MetricTemplateRevision', 'CreateMetricTemplateRevisionRequest']) {
-    assert.ok(schemas[name].required.includes('query_kind'), `${name} requires query_kind`);
-    assert.ok(schemas[name].required.includes('read_only_statement'), `${name} requires read_only_statement`);
-    assert.equal(schemas[name].properties.structured_query, undefined, `${name} has no unbounded structured query`);
-  }
+  assert.ok(schemas.MetricTemplateRevision.required.includes('query_kind'));
+  assert.equal(schemas.MetricTemplateRevision.properties.read_only_statement, undefined, 'public revision DTO never returns query text');
+  assert.ok(schemas.CreateMetricTemplateRevisionRequest.required.includes('query_kind'));
+  assert.ok(schemas.CreateMetricTemplateRevisionRequest.required.includes('read_only_statement'));
+  assert.equal(schemas.CreateMetricTemplateRevisionRequest.properties.structured_query, undefined, 'request has no unbounded structured query');
 
   const roots = [
     'ManagedHost', 'DiscoveryCandidate', 'AcceptDiscoveryCandidateRequest', 'ManagedDatabaseInstance',
@@ -304,11 +304,14 @@ test('agent commands and leases are typed without arbitrary execution or persist
   for (const lease of [
     'CredentialLeaseRequest credential_lease_request', 'CredentialLeaseResponse credential_lease_response',
     'PluginArtifactLeaseRequest plugin_artifact_lease_request', 'PluginArtifactLeaseResponse plugin_artifact_lease_response',
+    'MetricTemplateLeaseRequest metric_template_lease_request', 'MetricTemplateLeaseResponse metric_template_lease_response',
   ]) assert.match(command, new RegExp(lease));
   assert.match(command, /message CredentialLeaseRequest \{[\s\S]*?bytes request_nonce = 1;[\s\S]*?uint64 configuration_revision = 4;/);
   assert.match(command, /message CredentialLeaseResponse \{[\s\S]*?google\.protobuf\.Timestamp expires_at = 6;/);
   assert.match(command, /message PluginArtifactLeaseRequest \{[\s\S]*?bytes request_nonce = 1;[\s\S]*?uint64 operation_revision = 4;/);
   assert.match(command, /message PluginArtifactLeaseResponse \{[\s\S]*?google\.protobuf\.Timestamp expires_at = 6;/);
+  assert.match(command, /message MetricTemplateLeaseRequest \{[\s\S]*?string command_id = 2;[\s\S]*?bytes query_digest = 8;/);
+  assert.match(command, /message MetricTemplateLeaseResponse \{[\s\S]*?MetricTemplateDefinition definition = 11;/);
   assert.doesNotMatch(command.match(/message CommandEnvelope \{[\s\S]*?\n\}/)?.[0] ?? '', /lease_request|lease_response|download_url|http_url|url =/);
   assert.doesNotMatch(command, /shell_command|executable_path|script_body|string_command|install_hook|post_install/);
   for (const message of ['HostObservation', 'DiscoveryReport', 'PluginObservation']) {
@@ -332,6 +335,7 @@ test('plugin and Docker discovery protobuf services expose only bounded domain o
     'rpc ApplyConfiguration(ApplyPluginConfigurationRequest) returns (ApplyPluginConfigurationResponse);',
     'rpc ValidateInstance(ValidatePluginInstanceRequest) returns (ValidatePluginInstanceResponse);',
     'rpc CollectNow(CollectPluginMetricsRequest) returns (CollectPluginMetricsResponse);',
+    'rpc TrialMetricTemplate(TrialMetricTemplateRequest) returns (TrialMetricTemplateResponse);',
     'rpc StreamMetrics(StreamPluginMetricsRequest) returns (stream PluginMetricBatch);',
     'rpc AcknowledgeMetrics(AcknowledgePluginMetricsRequest) returns (AcknowledgePluginMetricsResponse);',
     'rpc GetHealth(GetPluginHealthRequest) returns (PluginHealth);',
@@ -341,5 +345,9 @@ test('plugin and Docker discovery protobuf services expose only bounded domain o
   ]) assert.match(source, new RegExp(rpc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(source, /message StreamPluginMetricsRequest \{[\s\S]*?repeated PluginMetricCursor resume_cursors = 3;/);
   assert.match(source, /message AcknowledgePluginMetricsRequest \{[\s\S]*?repeated PluginMetricCursor cursors = 3;/);
+  assert.match(source, /message TrialMetricTemplateRequest \{[\s\S]*?TrialMetricTemplateDefinition template = 5;/);
+  assert.match(source, /message TrialMetricTemplateDefinition \{[\s\S]*?bytes read_only_statement = 5;[\s\S]*?uint32 cardinality_limit = 12;/);
+  assert.match(source, /message TrialMetricTemplateResponse \{[\s\S]*?repeated PluginMetricSample candidate_metrics = 2;[\s\S]*?string error_code = 7;/);
+  assert.doesNotMatch(source, /raw_rows|raw_result|driver_error|driver_message/);
   assert.doesNotMatch(source, /tenant_id|project_id|docker_socket|container_exec|shell_command|executable_path|script_body/);
 });

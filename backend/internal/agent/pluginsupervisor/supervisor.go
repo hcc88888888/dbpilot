@@ -187,6 +187,9 @@ func (supervisor *PluginSupervisor) Start(ctx context.Context, prepared Prepared
 	current.DesiredInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
 	current.DesiredTemplateIDs = append([]string(nil), request.TemplateIDs...)
 	current.DesiredTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	current.DesiredTemplateLeaseCommandID = request.TemplateLeaseCommandID
+	current.DesiredTemplateReferences = stateTemplateReferences(request.TemplateReferences)
+	current.DesiredInstanceTemplateRefs = stateInstanceTemplateReferences(request.InstanceTemplateRefs)
 	current.DesiredCredentialsComplete = request.CredentialsComplete
 	sort.Strings(current.DesiredInstanceIDs)
 	sort.Strings(current.DesiredTemplateIDs)
@@ -245,6 +248,7 @@ func (supervisor *PluginSupervisor) makeAbsent(ctx context.Context, request Reco
 	state.ProcessState, state.ActiveSlot, state.InstalledVersion, state.Slots = pluginstate.ProcessAbsent, pluginstate.SlotNone, "", nil
 	state.ActiveArtifactID, state.ActiveArtifactSHA256, state.ActiveManifestDigest = "", "", ""
 	state.ActiveInstanceIDs, state.ActiveInstanceDescriptors, state.ActiveTemplateIDs, state.ActiveTemplateConfigurations, state.BoundInstanceCount = nil, nil, nil, nil, 0
+	state.ActiveTemplateLeaseCommandID, state.ActiveTemplateReferences, state.ActiveInstanceTemplateRefs = "", nil, nil
 	state.ActiveCredentialsComplete = false
 	state.ProcessID, state.ProcessStartTicks, state.RestartCount = 0, 0, 0
 	state.StartedAt, state.Failures, state.LastErrorCode = time.Time{}, nil, ""
@@ -426,6 +430,9 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 	old.DesiredInstanceIDs, old.DesiredTemplateIDs = append([]string(nil), request.InstanceIDs...), append([]string(nil), request.TemplateIDs...)
 	old.DesiredInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
 	old.DesiredTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	old.DesiredTemplateLeaseCommandID = request.TemplateLeaseCommandID
+	old.DesiredTemplateReferences = stateTemplateReferences(request.TemplateReferences)
+	old.DesiredInstanceTemplateRefs = stateInstanceTemplateReferences(request.InstanceTemplateRefs)
 	old.DesiredCredentialsComplete = request.CredentialsComplete
 	sort.Strings(old.DesiredInstanceIDs)
 	sort.Strings(old.DesiredTemplateIDs)
@@ -719,7 +726,7 @@ func assignmentObservation(state pluginstate.FamilyState, at time.Time) *agentv1
 }
 
 func baseState(request ReconcileRequest) pluginstate.FamilyState {
-	state := pluginstate.FamilyState{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, ActiveSlot: pluginstate.SlotNone, DesiredState: stateForDesired(request.DesiredState), DesiredVersion: request.DesiredVersion, DesiredArtifactID: request.ArtifactID, DesiredArtifactSHA256: hex.EncodeToString(request.ArtifactSHA256), DesiredManifestDigest: hex.EncodeToString(request.ManifestDigest), DesiredConfigurationRevision: request.ConfigurationRevision, DesiredInstanceIDs: append([]string(nil), request.InstanceIDs...), DesiredInstanceDescriptors: stateDescriptors(request.InstanceDescriptors), DesiredTemplateIDs: append([]string(nil), request.TemplateIDs...), DesiredTemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), DesiredCredentialsComplete: request.CredentialsComplete, RequestFingerprint: request.Fingerprint(), ProcessState: pluginstate.ProcessAbsent, HealthState: pluginstate.HealthUnknown, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: request.ConfigurationRevision, ObservedOperationRevision: request.OperationRevision}
+	state := pluginstate.FamilyState{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, ActiveSlot: pluginstate.SlotNone, DesiredState: stateForDesired(request.DesiredState), DesiredVersion: request.DesiredVersion, DesiredArtifactID: request.ArtifactID, DesiredArtifactSHA256: hex.EncodeToString(request.ArtifactSHA256), DesiredManifestDigest: hex.EncodeToString(request.ManifestDigest), DesiredConfigurationRevision: request.ConfigurationRevision, DesiredInstanceIDs: append([]string(nil), request.InstanceIDs...), DesiredInstanceDescriptors: stateDescriptors(request.InstanceDescriptors), DesiredTemplateIDs: append([]string(nil), request.TemplateIDs...), DesiredTemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), DesiredTemplateLeaseCommandID: request.TemplateLeaseCommandID, DesiredTemplateReferences: stateTemplateReferences(request.TemplateReferences), DesiredInstanceTemplateRefs: stateInstanceTemplateReferences(request.InstanceTemplateRefs), DesiredCredentialsComplete: request.CredentialsComplete, RequestFingerprint: request.Fingerprint(), ProcessState: pluginstate.ProcessAbsent, HealthState: pluginstate.HealthUnknown, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: request.ConfigurationRevision, ObservedOperationRevision: request.OperationRevision}
 	sort.Strings(state.DesiredInstanceIDs)
 	sort.Strings(state.DesiredTemplateIDs)
 	return state
@@ -732,6 +739,9 @@ func applyActiveConfiguration(state *pluginstate.FamilyState, request ReconcileR
 	state.ActiveInstanceDescriptors = stateDescriptors(request.InstanceDescriptors)
 	state.ActiveTemplateIDs = append([]string(nil), request.TemplateIDs...)
 	state.ActiveTemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	state.ActiveTemplateLeaseCommandID = request.TemplateLeaseCommandID
+	state.ActiveTemplateReferences = stateTemplateReferences(request.TemplateReferences)
+	state.ActiveInstanceTemplateRefs = stateInstanceTemplateReferences(request.InstanceTemplateRefs)
 	state.ActiveCredentialsComplete = request.CredentialsComplete
 	sort.Strings(state.ActiveInstanceIDs)
 	sort.Strings(state.ActiveTemplateIDs)
@@ -741,13 +751,61 @@ func applyActiveConfiguration(state *pluginstate.FamilyState, request ReconcileR
 func requestFromActiveState(state pluginstate.FamilyState) ReconcileRequest {
 	artifactDigest, _ := hex.DecodeString(state.ActiveArtifactSHA256)
 	manifestDigest, _ := hex.DecodeString(state.ActiveManifestDigest)
-	return ReconcileRequest{AssignmentID: state.AssignmentID, PluginID: state.PluginID, DatabaseFamily: state.DatabaseFamily, DesiredVersion: state.InstalledVersion, DesiredState: DesiredRunning, ArtifactID: state.ActiveArtifactID, ArtifactSHA256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: state.ActiveConfigurationRevision, OperationRevision: state.ObservedOperationRevision, InstanceIDs: append([]string(nil), state.ActiveInstanceIDs...), InstanceDescriptors: supervisorDescriptors(state.ActiveInstanceDescriptors), TemplateIDs: append([]string(nil), state.ActiveTemplateIDs...), TemplateConfigurations: cloneTemplateConfigurations(state.ActiveTemplateConfigurations), CredentialsComplete: state.ActiveCredentialsComplete}
+	return ReconcileRequest{AssignmentID: state.AssignmentID, PluginID: state.PluginID, DatabaseFamily: state.DatabaseFamily, DesiredVersion: state.InstalledVersion, DesiredState: DesiredRunning, ArtifactID: state.ActiveArtifactID, ArtifactSHA256: artifactDigest, ManifestDigest: manifestDigest, ConfigurationRevision: state.ActiveConfigurationRevision, OperationRevision: state.ObservedOperationRevision, InstanceIDs: append([]string(nil), state.ActiveInstanceIDs...), InstanceDescriptors: supervisorDescriptors(state.ActiveInstanceDescriptors), TemplateIDs: append([]string(nil), state.ActiveTemplateIDs...), TemplateConfigurations: cloneTemplateConfigurations(state.ActiveTemplateConfigurations), TemplateLeaseCommandID: state.ActiveTemplateLeaseCommandID, TemplateReferences: supervisorTemplateReferences(state.ActiveTemplateReferences), InstanceTemplateRefs: supervisorInstanceTemplateReferences(state.ActiveInstanceTemplateRefs), CredentialsComplete: state.ActiveCredentialsComplete}
 }
 
 func stateDescriptors(values []InstanceDescriptor) []pluginstate.InstanceDescriptor {
 	result := make([]pluginstate.InstanceDescriptor, len(values))
 	for index, value := range values {
 		result[index] = pluginstate.InstanceDescriptor{InstanceID: value.InstanceID, DatabaseVariant: value.DatabaseVariant, Endpoint: value.Endpoint, UnixSocket: value.UnixSocket}
+	}
+	return result
+}
+
+func stateTemplateReferences(values []TemplateReference) []pluginstate.TemplateReference {
+	result := make([]pluginstate.TemplateReference, len(values))
+	for index, value := range values {
+		result[index] = pluginstate.TemplateReference{TemplateID: value.TemplateID, RevisionID: value.RevisionID, QueryDigest: hex.EncodeToString(value.QueryDigest), TimeoutSeconds: value.TimeoutSeconds, MaxRows: value.MaxRows, MaxColumns: value.MaxColumns, CardinalityLimit: value.CardinalityLimit}
+	}
+	return result
+}
+func stateInstanceTemplateReferences(values []InstanceTemplateReferences) []pluginstate.InstanceTemplateReferences {
+	result := make([]pluginstate.InstanceTemplateReferences, len(values))
+	for index, value := range values {
+		result[index].InstanceID = value.InstanceID
+		result[index].Templates = stateTemplateReferences(value.Templates)
+	}
+	return result
+}
+func supervisorTemplateReferences(values []pluginstate.TemplateReference) []TemplateReference {
+	result := make([]TemplateReference, len(values))
+	for index, value := range values {
+		digest, _ := hex.DecodeString(value.QueryDigest)
+		result[index] = TemplateReference{TemplateID: value.TemplateID, RevisionID: value.RevisionID, QueryDigest: digest, TimeoutSeconds: value.TimeoutSeconds, MaxRows: value.MaxRows, MaxColumns: value.MaxColumns, CardinalityLimit: value.CardinalityLimit}
+	}
+	return result
+}
+func supervisorInstanceTemplateReferences(values []pluginstate.InstanceTemplateReferences) []InstanceTemplateReferences {
+	result := make([]InstanceTemplateReferences, len(values))
+	for index, value := range values {
+		result[index].InstanceID = value.InstanceID
+		result[index].Templates = supervisorTemplateReferences(value.Templates)
+	}
+	return result
+}
+func cloneTemplateReferences(values []TemplateReference) []TemplateReference {
+	result := make([]TemplateReference, len(values))
+	for index, value := range values {
+		result[index] = value
+		result[index].QueryDigest = append([]byte(nil), value.QueryDigest...)
+	}
+	return result
+}
+func cloneInstanceTemplateReferences(values []InstanceTemplateReferences) []InstanceTemplateReferences {
+	result := make([]InstanceTemplateReferences, len(values))
+	for index, value := range values {
+		result[index].InstanceID = value.InstanceID
+		result[index].Templates = cloneTemplateReferences(value.Templates)
 	}
 	return result
 }
@@ -775,12 +833,14 @@ func cloneRequest(request ReconcileRequest) ReconcileRequest {
 	request.InstanceDescriptors = append([]InstanceDescriptor(nil), request.InstanceDescriptors...)
 	request.TemplateIDs = append([]string(nil), request.TemplateIDs...)
 	request.TemplateConfigurations = cloneTemplateConfigurations(request.TemplateConfigurations)
+	request.TemplateReferences = cloneTemplateReferences(request.TemplateReferences)
+	request.InstanceTemplateRefs = cloneInstanceTemplateReferences(request.InstanceTemplateRefs)
 	return request
 }
 
 func healthRequest(request ReconcileRequest, installed InstalledSlot, configurationRevision uint64, runtimeDirectory string, nonce []byte, uid, gid uint32) HealthRequest {
 	digest, _ := hex.DecodeString(installed.ExecutableSHA256)
-	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), SupportedVariants: append([]string(nil), installed.SupportedVariants...), SignedCapabilities: append([]string(nil), installed.Capabilities...), MetricTemplateSchemaVersion: installed.MetricTemplateSchemaVersion, TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), CredentialsComplete: request.CredentialsComplete, RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
+	return HealthRequest{AssignmentID: request.AssignmentID, PluginID: request.PluginID, DatabaseFamily: request.DatabaseFamily, Version: installed.Version, ProtocolVersion: "v1", ExecutableSHA256: digest, ExecutablePath: installed.ExecutablePath, ConfigurationRevision: configurationRevision, OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), InstanceDescriptors: append([]InstanceDescriptor(nil), request.InstanceDescriptors...), TemplateIDs: append([]string(nil), request.TemplateIDs...), SupportedVariants: append([]string(nil), installed.SupportedVariants...), SignedCapabilities: append([]string(nil), installed.Capabilities...), MetricTemplateSchemaVersion: installed.MetricTemplateSchemaVersion, TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), TemplateLeaseCommandID: request.TemplateLeaseCommandID, TemplateReferences: cloneTemplateReferences(request.TemplateReferences), InstanceTemplateRefs: cloneInstanceTemplateReferences(request.InstanceTemplateRefs), CredentialsComplete: request.CredentialsComplete, RuntimeDirectory: runtimeDirectory, LaunchNonce: append([]byte(nil), nonce...), ExpectedUserID: uid, ExpectedGroupID: gid}
 }
 
 func cloneTemplateConfigurations(values []*pluginv1.MetricTemplateConfiguration) []*pluginv1.MetricTemplateConfiguration {

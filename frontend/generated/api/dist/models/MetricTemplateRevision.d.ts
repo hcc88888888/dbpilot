@@ -69,12 +69,6 @@ export interface MetricTemplateRevision {
     queryKind: MetricQueryKind;
     /**
      *
-     * @type {string}
-     * @memberof MetricTemplateRevision
-     */
-    readOnlyStatement: string;
-    /**
-     *
      * @type {number}
      * @memberof MetricTemplateRevision
      */

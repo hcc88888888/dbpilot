@@ -15,15 +15,7 @@ import (
 )
 
 var task1UnimplementedOperationNames = []string{
-	"ApproveMetricTemplateRevision",
-	"CreateMetricTemplate",
-	"CreateMetricTemplateRevision",
-	"ListMetricTemplateRevisions",
-	"ListMetricTemplates",
-	"PublishMetricTemplateRevision",
 	"RediscoverHost",
-	"TrialMetricTemplateRevision",
-	"ValidateMetricTemplateRevision",
 }
 
 func TestTask1UnimplementedPlatformAPIInventory(t *testing.T) {

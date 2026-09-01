@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,6 +91,35 @@ func TestFileStoreRejectsUnsafeRootAndInvalidState(t *testing.T) {
 	invalid.DatabaseFamily = "../mysql"
 	_, err = store.Put(context.Background(), invalid)
 	require.ErrorIs(t, err, ErrInvalidState)
+}
+
+func TestFileStorePersistsExactPublicTemplateRefsWithoutSQL(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewFileStore(root)
+	require.NoError(t, err)
+	state := validFamilyState()
+	reference := TemplateReference{TemplateID: "template-a", RevisionID: "revision-a", QueryDigest: strings.Repeat("b", 64), TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10}
+	state.ActiveTemplateIDs = []string{"template-a"}
+	state.ActiveTemplateLeaseCommandID = "command-a"
+	state.ActiveTemplateReferences = []TemplateReference{reference}
+	state.ActiveInstanceTemplateRefs = []InstanceTemplateReferences{{InstanceID: "mysql-1", Templates: []TemplateReference{reference}}, {InstanceID: "mysql-2", Templates: []TemplateReference{}}}
+	_, err = store.Put(context.Background(), state)
+	require.NoError(t, err)
+	for _, suffix := range []string{".a", ".b"} {
+		body, readErr := os.ReadFile(filepath.Join(root, stateFileName+suffix))
+		if readErr != nil {
+			continue
+		}
+		require.NotContains(t, string(body), "SELECT")
+		require.NotContains(t, string(body), "read_only_statement")
+	}
+	tampered := state
+	tampered.ActiveInstanceTemplateRefs = cloneInstanceTemplateRefs(state.ActiveInstanceTemplateRefs)
+	tampered.ActiveInstanceTemplateRefs[0].Templates[0].QueryDigest = strings.Repeat("c", 64)
+	require.ErrorIs(t, tampered.Validate(), ErrInvalidState)
+	tampered = state
+	tampered.ActiveTemplateConfigurations = []*pluginv1.MetricTemplateConfiguration{{TemplateId: "template-a", Revision: 1, QueryDigest: make([]byte, 32), QueryKind: "sql", ReadOnlyStatement: "SELECT 1", CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}}}
+	require.ErrorIs(t, tampered.Validate(), ErrInvalidState)
 }
 
 func validFamilyState() FamilyState {

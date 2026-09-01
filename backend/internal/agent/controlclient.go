@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/agent/commandjournal"
+	"dbpilot.local/platform/internal/agent/metrictemplatelease"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"dbpilot.local/platform/internal/commandvalidation"
 	discoverydomain "dbpilot.local/platform/internal/discovery"
@@ -228,6 +230,8 @@ type ControlClient struct {
 	artifactLeaseWaiters       map[string]*artifactLeaseWaiter
 	credentialLeaseMu          sync.Mutex
 	credentialLeaseWaiters     map[string]*credentialLeaseWaiter
+	metricTemplateLeaseMu      sync.Mutex
+	metricTemplateLeaseWaiters map[string]*metricTemplateLeaseWaiter
 }
 
 type CredentialLeaseRequest = pluginsupervisor.CredentialLeaseRequest
@@ -243,6 +247,18 @@ type credentialLeaseWaiter struct {
 type credentialLeaseResult struct {
 	lease CredentialLease
 	err   error
+}
+
+type metricTemplateLeaseWaiter struct {
+	request   metrictemplatelease.Request
+	result    chan metricTemplateLeaseResult
+	mu        sync.Mutex
+	cancelled bool
+}
+
+type metricTemplateLeaseResult struct {
+	material metrictemplatelease.Material
+	err      error
 }
 
 type artifactLeaseWaiter struct {
@@ -313,10 +329,11 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		reconnectBackoff:   boundedDuration(config.ReconnectBackoff, time.Second, 10*time.Millisecond, time.Minute),
 		resultRetryBackoff: boundedDuration(config.ResultRetryBackoff, 100*time.Millisecond, 10*time.Millisecond, 5*time.Second),
 		now:                config.Now, running: make(map[string]runningCommand),
-		executionErrors:        make(chan error, 1),
-		discoveryWaiters:       make(map[uint64]*discoveryAckWaiter),
-		artifactLeaseWaiters:   make(map[string]*artifactLeaseWaiter),
-		credentialLeaseWaiters: make(map[string]*credentialLeaseWaiter),
+		executionErrors:            make(chan error, 1),
+		discoveryWaiters:           make(map[uint64]*discoveryAckWaiter),
+		artifactLeaseWaiters:       make(map[string]*artifactLeaseWaiter),
+		credentialLeaseWaiters:     make(map[string]*credentialLeaseWaiter),
+		metricTemplateLeaseWaiters: make(map[string]*metricTemplateLeaseWaiter),
 	}, nil
 }
 
@@ -602,6 +619,8 @@ func (c *ControlClient) handleServerMessage(ctx, executionParent context.Context
 		return c.handlePluginArtifactLeaseResponse(typed.PluginArtifactLeaseResponse)
 	case *agentv1.ServerMessage_CredentialLeaseResponse:
 		return c.handleCredentialLeaseResponse(typed.CredentialLeaseResponse)
+	case *agentv1.ServerMessage_MetricTemplateLeaseResponse:
+		return c.handleMetricTemplateLeaseResponse(typed.MetricTemplateLeaseResponse)
 	default:
 		return errors.New("unsupported control-plane message")
 	}
@@ -976,6 +995,7 @@ func (c *ControlClient) clearSession(expected *controlSession) {
 	c.sessionMu.Unlock()
 	c.failPluginArtifactLeaseWaiters()
 	c.failCredentialLeaseWaiters()
+	c.failMetricTemplateLeaseWaiters()
 }
 
 // LeaseCredential requests database credentials only on the authenticated
@@ -1094,6 +1114,143 @@ func clearWireCredential(response *agentv1.CredentialLeaseResponse) {
 	}
 	response.Credential.SecretBytes = nil
 	response.Credential.Username = ""
+}
+
+// LeaseMetricTemplate requests one operation-bound template definition over
+// the authenticated live stream. The query remains in caller-owned memory and
+// is never written to the command journal or Agent state store.
+func (c *ControlClient) LeaseMetricTemplate(ctx context.Context, request metrictemplatelease.Request) (metrictemplatelease.Material, error) {
+	if c == nil || ctx == nil || ctx.Err() != nil || !validArtifactLeaseResource(request.CommandID) || !validArtifactLeaseResource(request.AssignmentID) || !validArtifactLeaseResource(request.InstanceID) || !validArtifactLeaseResource(request.TemplateID) || !validArtifactLeaseResource(request.RevisionID) || request.ConfigurationRevision == 0 || request.OperationRevision == 0 || len(request.QueryDigest) != sha256.Size {
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	var nonce [sha256.Size]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	waiter := &metricTemplateLeaseWaiter{request: request, result: make(chan metricTemplateLeaseResult, 1)}
+	key := string(nonce[:])
+	c.metricTemplateLeaseMu.Lock()
+	if _, duplicate := c.metricTemplateLeaseWaiters[key]; duplicate {
+		c.metricTemplateLeaseMu.Unlock()
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	c.metricTemplateLeaseWaiters[key] = waiter
+	c.metricTemplateLeaseMu.Unlock()
+	defer func() {
+		c.metricTemplateLeaseMu.Lock()
+		if c.metricTemplateLeaseWaiters[key] == waiter {
+			delete(c.metricTemplateLeaseWaiters, key)
+		}
+		c.metricTemplateLeaseMu.Unlock()
+		waiter.mu.Lock()
+		waiter.cancelled = true
+		select {
+		case pending := <-waiter.result:
+			pending.material.Release()
+		default:
+		}
+		waiter.mu.Unlock()
+	}()
+	message := &agentv1.AgentMessage{Message: &agentv1.AgentMessage_MetricTemplateLeaseRequest{MetricTemplateLeaseRequest: &agentv1.MetricTemplateLeaseRequest{RequestNonce: nonce[:], CommandId: request.CommandID, AssignmentId: request.AssignmentID, InstanceId: request.InstanceID, ConfigurationRevision: request.ConfigurationRevision, OperationRevision: request.OperationRevision, TemplateId: request.TemplateID, RevisionId: request.RevisionID, QueryDigest: append([]byte(nil), request.QueryDigest...)}}}
+	if err := c.sendAgentMessage(message); err != nil {
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	select {
+	case <-ctx.Done():
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	case result := <-waiter.result:
+		return result.material, result.err
+	}
+}
+
+func (c *ControlClient) handleMetricTemplateLeaseResponse(response *agentv1.MetricTemplateLeaseResponse) error {
+	if response == nil {
+		return nil
+	}
+	defer clearWireMetricTemplateLease(response)
+	if len(response.GetRequestNonce()) != sha256.Size {
+		return nil
+	}
+	key := string(response.GetRequestNonce())
+	c.metricTemplateLeaseMu.Lock()
+	waiter := c.metricTemplateLeaseWaiters[key]
+	if waiter != nil {
+		delete(c.metricTemplateLeaseWaiters, key)
+	}
+	c.metricTemplateLeaseMu.Unlock()
+	if waiter == nil {
+		return nil
+	}
+	definition := response.GetDefinition()
+	receivedAt := c.now().UTC()
+	validFor := time.Duration(response.GetValidForSeconds()) * time.Second
+	if !validMetricTemplateLeaseWire(response, waiter.request, receivedAt, validFor) {
+		waiter.deliver(metricTemplateLeaseResult{err: metrictemplatelease.ErrUnavailable})
+		return nil
+	}
+	expiresAt := response.GetExpiresAt().AsTime().UTC()
+	boundedExpiry := receivedAt.Add(validFor)
+	if expiresAt.After(boundedExpiry) {
+		expiresAt = boundedExpiry
+	}
+	values := make([]metrictemplatelease.ValueMapping, len(definition.GetValueMappings()))
+	for index, mapping := range definition.GetValueMappings() {
+		values[index] = metrictemplatelease.ValueMapping{SourceColumn: mapping.GetSourceColumn(), MetricName: mapping.GetMetricName(), MetricType: mapping.GetMetricType(), Unit: mapping.GetUnit()}
+	}
+	labels := make([]metrictemplatelease.LabelMapping, len(definition.GetLabelMappings()))
+	for index, mapping := range definition.GetLabelMappings() {
+		labels[index] = metrictemplatelease.LabelMapping{SourceColumn: mapping.GetSourceColumn(), Label: mapping.GetLabel()}
+	}
+	waiter.deliver(metricTemplateLeaseResult{material: metrictemplatelease.Material{LeaseID: response.GetLeaseId(), AssignmentID: response.GetAssignmentId(), InstanceID: response.GetInstanceId(), TemplateID: response.GetTemplateId(), RevisionID: response.GetRevisionId(), Revision: definition.GetRevision(), ConfigurationRevision: response.GetConfigurationRevision(), OperationRevision: response.GetOperationRevision(), QueryDigest: hex.EncodeToString(response.GetQueryDigest()), ExpiresAt: expiresAt, StatementBytes: append([]byte(nil), definition.GetReadOnlyStatement()...), CollectionIntervalSeconds: int(definition.GetCollectionIntervalSeconds()), TimeoutSeconds: int(definition.GetTimeoutSeconds()), MaxRows: int(definition.GetMaxRows()), MaxColumns: int(definition.GetMaxColumns()), CardinalityLimit: int(definition.GetCardinalityLimit()), ValueMappings: values, LabelMappings: labels}})
+	return nil
+}
+
+func validMetricTemplateLeaseWire(response *agentv1.MetricTemplateLeaseResponse, request metrictemplatelease.Request, now time.Time, validFor time.Duration) bool {
+	definition := response.GetDefinition()
+	return response.GetLeaseId() != "" && len(response.GetLeaseId()) <= 128 && response.GetCommandId() == request.CommandID && response.GetAssignmentId() == request.AssignmentID && response.GetInstanceId() == request.InstanceID && response.GetConfigurationRevision() == request.ConfigurationRevision && response.GetOperationRevision() == request.OperationRevision && response.GetTemplateId() == request.TemplateID && response.GetRevisionId() == request.RevisionID && len(response.GetQueryDigest()) == sha256.Size && subtle.ConstantTimeCompare(response.GetQueryDigest(), request.QueryDigest) == 1 && validFor >= 5*time.Second && validFor <= time.Minute && response.GetExpiresAt() != nil && response.GetExpiresAt().IsValid() && response.GetExpiresAt().AsTime().After(now) && definition != nil && definition.GetRevision() > 0 && definition.GetQueryKind() == "sql" && len(definition.GetReadOnlyStatement()) > 0 && len(definition.GetReadOnlyStatement()) <= 32768 && definition.GetCollectionIntervalSeconds() >= 10 && definition.GetCollectionIntervalSeconds() <= 86400 && definition.GetTimeoutSeconds() > 0 && definition.GetTimeoutSeconds() <= 30 && definition.GetMaxRows() > 0 && definition.GetMaxRows() <= 100 && definition.GetMaxColumns() > 0 && definition.GetMaxColumns() <= 32 && definition.GetCardinalityLimit() > 0 && definition.GetCardinalityLimit() <= 10000 && len(definition.GetValueMappings()) > 0 && len(definition.GetValueMappings()) <= 32 && len(definition.GetLabelMappings()) <= 16 && proto.Size(response) <= 40<<10
+}
+
+func (waiter *metricTemplateLeaseWaiter) deliver(result metricTemplateLeaseResult) {
+	if waiter == nil {
+		result.material.Release()
+		return
+	}
+	waiter.mu.Lock()
+	defer waiter.mu.Unlock()
+	if waiter.cancelled {
+		result.material.Release()
+		return
+	}
+	select {
+	case waiter.result <- result:
+	default:
+		result.material.Release()
+	}
+}
+
+func (c *ControlClient) failMetricTemplateLeaseWaiters() {
+	c.metricTemplateLeaseMu.Lock()
+	waiters := make([]*metricTemplateLeaseWaiter, 0, len(c.metricTemplateLeaseWaiters))
+	for key, waiter := range c.metricTemplateLeaseWaiters {
+		delete(c.metricTemplateLeaseWaiters, key)
+		waiters = append(waiters, waiter)
+	}
+	c.metricTemplateLeaseMu.Unlock()
+	for _, waiter := range waiters {
+		waiter.deliver(metricTemplateLeaseResult{err: metrictemplatelease.ErrUnavailable})
+	}
+}
+
+func clearWireMetricTemplateLease(response *agentv1.MetricTemplateLeaseResponse) {
+	if response == nil || response.Definition == nil {
+		return
+	}
+	for index := range response.Definition.ReadOnlyStatement {
+		response.Definition.ReadOnlyStatement[index] = 0
+	}
+	response.Definition.ReadOnlyStatement = nil
+	response.Definition.ValueMappings = nil
+	response.Definition.LabelMappings = nil
 }
 
 func validDatabaseFamily(value string) bool {

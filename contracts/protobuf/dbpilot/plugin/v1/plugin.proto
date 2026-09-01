@@ -13,6 +13,7 @@ service PluginRuntime {
   rpc ApplyConfiguration(ApplyPluginConfigurationRequest) returns (ApplyPluginConfigurationResponse);
   rpc ValidateInstance(ValidatePluginInstanceRequest) returns (ValidatePluginInstanceResponse);
   rpc CollectNow(CollectPluginMetricsRequest) returns (CollectPluginMetricsResponse);
+  rpc TrialMetricTemplate(TrialMetricTemplateRequest) returns (TrialMetricTemplateResponse);
   rpc StreamMetrics(StreamPluginMetricsRequest) returns (stream PluginMetricBatch);
   rpc AcknowledgeMetrics(AcknowledgePluginMetricsRequest) returns (AcknowledgePluginMetricsResponse);
   rpc GetHealth(GetPluginHealthRequest) returns (PluginHealth);
