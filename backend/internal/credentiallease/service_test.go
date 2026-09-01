@@ -184,23 +184,32 @@ func TestTombstoneEvictionNeverDeletesNewGenerationOrConsumesLiveCapacity(t *tes
 	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("capacity-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, MaximumLive: 1, Random: bytes.NewReader(bytes.Repeat([]byte{0x7a}, 64))})
 	require.NoError(t, err)
 	service.mu.Lock()
-	service.addTombstoneLocked("nonce-reused", now.Add(time.Minute))
+	service.addTombstoneLocked("nonce-reused", now.Add(time.Minute), now)
 	first := service.tombstones["nonce-reused"].generation
-	service.addTombstoneLocked("nonce-reused", now.Add(2*time.Minute))
+	service.addTombstoneLocked("nonce-reused", now.Add(2*time.Minute), now)
 	second := service.tombstones["nonce-reused"].generation
 	for index := 0; index < 3; index++ {
-		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute))
+		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute), now)
 	}
 	current, exists := service.tombstones["nonce-reused"]
 	for index := 3; index < 20; index++ {
-		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute))
+		service.addTombstoneLocked(fmt.Sprintf("nonce-%d", index), now.Add(time.Minute), now)
 	}
 	service.mu.Unlock()
 	require.NotEqual(t, first, second)
 	require.True(t, exists)
 	require.Equal(t, second, current.generation)
+	_, err = service.Lease(context.Background(), AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}, validRequest())
+	require.ErrorIs(t, err, ErrLeaseRejected, "full live tombstone capacity must reject without eviction")
+	service.mu.Lock()
+	for key, tombstone := range service.tombstones {
+		tombstone.until = now.Add(-time.Second)
+		service.tombstones[key] = tombstone
+	}
+	service.pruneLocked(now)
+	service.mu.Unlock()
 	lease, err := service.Lease(context.Background(), AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}, validRequest())
-	require.NoError(t, err, "bounded tombstones must not consume active lease capacity")
+	require.NoError(t, err, "expired tombstones must prune and release capacity")
 	lease.Release()
 }
 

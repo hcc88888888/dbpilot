@@ -72,16 +72,38 @@ func TestGatewayUnexpectedExitZerosActiveCredentialsAndCancelsLifetimes(t *testi
 	require.Empty(t, checker.expiries)
 }
 
+func TestGatewayUnexpectedExitFencesBlockedLateLeaseSuccess(t *testing.T) {
+	now := time.Now().UTC()
+	leaser := &slowCredentialLeaser{release: make(chan struct{}), lease: CredentialLease{LeaseID: "lease-late", AssignmentID: "assignment-1", InstanceID: "instance-1", DatabaseFamily: "mysql", CredentialRevision: 9, ConfigurationRevision: 5, OperationRevision: 7, ExpiresAt: now.Add(time.Minute), ValidFor: time.Minute, Username: "monitor", SecretBytes: []byte("late-provider-secret")}}
+	checker := NewGatewayHealthCheckerWithCredentials(nil, leaser)
+	process := &fakeProcess{pid: 4343}
+	checker.activeCredentials[process.pid] = activeCredentialConfiguration{configuration: plugingateway.PluginConfiguration{AssignmentID: "assignment-1"}, deadline: time.Now().Add(time.Minute)}
+	done := make(chan error, 1)
+	go func() {
+		_, err := checker.leaseCredential(context.Background(), CredentialLeaseRequest{AssignmentID: "assignment-1", InstanceID: "instance-1", DatabaseFamily: "mysql", ConfigurationRevision: 5, OperationRevision: 7})
+		done <- err
+	}()
+	require.Eventually(t, func() bool { return leaser.calls.Load() == 1 }, time.Second, time.Millisecond)
+	checker.CleanupUnexpectedExit(process)
+	close(leaser.release)
+	require.Error(t, <-done)
+	require.Equal(t, make([]byte, len(leaser.returned)), leaser.returned)
+	require.Empty(t, checker.leaseFlights)
+}
+
 type slowCredentialLeaser struct {
-	calls   atomic.Int32
-	release chan struct{}
-	lease   CredentialLease
+	calls    atomic.Int32
+	release  chan struct{}
+	lease    CredentialLease
+	returned []byte
 }
 
 func (value *slowCredentialLeaser) LeaseCredential(context.Context, CredentialLeaseRequest) (CredentialLease, error) {
 	value.calls.Add(1)
 	<-value.release
-	return value.lease.Clone(), nil
+	lease := value.lease.Clone()
+	value.returned = lease.SecretBytes
+	return lease, nil
 }
 
 type recordingCredentialLeaser struct {

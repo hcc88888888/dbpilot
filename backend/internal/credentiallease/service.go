@@ -147,6 +147,11 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 		service.recordRejected(ctx, authorization, agent, request, now)
 		return Lease{}, ErrLeaseRejected
 	}
+	if len(service.tombstones) >= service.maximumLive*4 {
+		service.mu.Unlock()
+		service.recordRejected(ctx, authorization, agent, request, now)
+		return Lease{}, ErrLeaseRejected
+	}
 	if len(service.leases) >= service.maximumLive {
 		service.mu.Unlock()
 		service.recordRejected(ctx, authorization, agent, request, now)
@@ -216,7 +221,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 			record.lease.Release()
 			record.expired = true
 			delete(service.leases, key)
-			service.addTombstoneLocked(key, finalNow.Add(service.ttl*3))
+			service.addTombstoneLocked(key, finalNow.Add(service.ttl*3), lease.ExpiresAt)
 		}
 		service.mu.Unlock()
 	})
@@ -239,7 +244,7 @@ func (service *ApplicationService) failRecord(key string, record *liveLease) {
 	close(record.ready)
 	if service.leases[key] == record {
 		delete(service.leases, key)
-		service.addTombstoneLocked(key, record.tombstoneUntil)
+		service.addTombstoneLocked(key, record.tombstoneUntil, record.tombstoneUntil.Add(-service.ttl*3))
 	}
 }
 
@@ -259,7 +264,7 @@ func (service *ApplicationService) pruneLocked(now time.Time) {
 				record.lease.Release()
 				record.expired = true
 				delete(service.leases, key)
-				service.addTombstoneLocked(key, now.Add(service.ttl*3))
+				service.addTombstoneLocked(key, now.Add(service.ttl*3), now)
 			}
 		default:
 		}
@@ -295,18 +300,27 @@ func (service *ApplicationService) Close() {
 	service.mu.Unlock()
 }
 
-func (service *ApplicationService) addTombstoneLocked(key string, until time.Time) {
+func (service *ApplicationService) addTombstoneLocked(key string, until, now time.Time) bool {
+	for existingKey, tombstone := range service.tombstones {
+		if !tombstone.until.After(now) {
+			delete(service.tombstones, existingKey)
+		}
+	}
+	if _, exists := service.tombstones[key]; !exists && len(service.tombstones) >= service.maximumLive*4 {
+		return false
+	}
 	service.tombstoneGeneration++
 	generation := service.tombstoneGeneration
 	service.tombstones[key] = nonceTombstone{until: until, generation: generation}
 	service.tombstoneOrder = append(service.tombstoneOrder, tombstoneOrderEntry{key: key, generation: generation})
-	for len(service.tombstoneOrder) > service.maximumLive*4 {
-		oldest := service.tombstoneOrder[0]
-		service.tombstoneOrder = service.tombstoneOrder[1:]
-		if current, exists := service.tombstones[oldest.key]; exists && current.generation == oldest.generation {
-			delete(service.tombstones, oldest.key)
+	kept := service.tombstoneOrder[:0]
+	for _, entry := range service.tombstoneOrder {
+		if current, exists := service.tombstones[entry.key]; exists && current.generation == entry.generation {
+			kept = append(kept, entry)
 		}
 	}
+	service.tombstoneOrder = kept
+	return true
 }
 
 func (service *ApplicationService) authorize(ctx context.Context, agent AuthenticatedAgent, request LeaseRequest, renewal bool) (Authorization, error) {

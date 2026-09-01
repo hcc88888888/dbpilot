@@ -30,6 +30,7 @@ type GatewayHealthChecker struct {
 	cache             *credentialcache.Cache
 	leaseFlights      map[string]*credentialFlight
 	activeCredentials map[int]activeCredentialConfiguration
+	leaseEpochs       map[string]uint64
 }
 
 type activeCredentialConfiguration struct {
@@ -38,12 +39,15 @@ type activeCredentialConfiguration struct {
 }
 
 type credentialFlight struct {
-	ready     chan struct{}
-	lease     CredentialLease
-	err       error
-	waiters   int
-	completed bool
-	timer     *time.Timer
+	ready        chan struct{}
+	lease        CredentialLease
+	err          error
+	waiters      int
+	completed    bool
+	timer        *time.Timer
+	assignmentID string
+	epoch        uint64
+	cancel       context.CancelFunc
 }
 
 type credentialLeaserFunc func(context.Context, CredentialLeaseRequest) (CredentialLease, error)
@@ -58,7 +62,7 @@ type gatewayActivation struct {
 }
 
 func NewGatewayHealthChecker(client *plugingateway.Client) *GatewayHealthChecker {
-	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now), leaseFlights: make(map[string]*credentialFlight), activeCredentials: make(map[int]activeCredentialConfiguration)}
+	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now), leaseFlights: make(map[string]*credentialFlight), activeCredentials: make(map[int]activeCredentialConfiguration), leaseEpochs: make(map[string]uint64)}
 }
 
 func NewGatewayHealthCheckerWithCredentials(client *plugingateway.Client, credentials CredentialLeaser) *GatewayHealthChecker {
@@ -418,11 +422,17 @@ func (checker *GatewayHealthChecker) leaseCredential(ctx context.Context, reques
 		checker.mu.Unlock()
 		return checker.awaitCredentialFlight(ctx, key, flight)
 	}
-	flight = &credentialFlight{ready: make(chan struct{}), waiters: 1}
+	flightCtx, flightCancel := context.WithCancel(ctx)
+	flight = &credentialFlight{ready: make(chan struct{}), waiters: 1, assignmentID: request.AssignmentID, epoch: checker.leaseEpochs[request.AssignmentID], cancel: flightCancel}
 	checker.leaseFlights[key] = flight
 	checker.mu.Unlock()
-	lease, err := checker.credentials.LeaseCredential(ctx, request)
+	lease, err := checker.credentials.LeaseCredential(flightCtx, request)
 	checker.mu.Lock()
+	if flight.completed || checker.leaseEpochs[request.AssignmentID] != flight.epoch || checker.leaseFlights[key] != flight {
+		lease.Release()
+		checker.mu.Unlock()
+		return CredentialLease{}, errCredentialLease
+	}
 	flight.completed = true
 	if err != nil {
 		flight.err = errCredentialLease
@@ -483,12 +493,21 @@ func (checker *GatewayHealthChecker) awaitCredentialFlight(ctx context.Context, 
 
 func (checker *GatewayHealthChecker) invalidateCredentialFlights(assignmentID string) {
 	checker.mu.Lock()
+	checker.leaseEpochs[assignmentID]++
 	for key, flight := range checker.leaseFlights {
-		if strings.HasPrefix(key, assignmentID+"\x00") && flight.completed {
+		if strings.HasPrefix(key, assignmentID+"\x00") {
+			if flight.cancel != nil {
+				flight.cancel()
+			}
 			if flight.timer != nil {
 				flight.timer.Stop()
 			}
 			flight.lease.Release()
+			if !flight.completed {
+				flight.completed = true
+				flight.err = errCredentialLease
+				close(flight.ready)
+			}
 			delete(checker.leaseFlights, key)
 		}
 	}
@@ -570,8 +589,11 @@ func (checker *GatewayHealthChecker) CleanupUnexpectedExit(process Process) {
 	delete(checker.activeCredentials, pid)
 	checker.mu.Unlock()
 	active.configuration.Release()
+	assignmentID := active.configuration.AssignmentID
 	if session != nil {
-		assignmentID := session.AssignmentID()
+		assignmentID = session.AssignmentID()
+	}
+	if assignmentID != "" {
 		checker.cache.InvalidateAssignment(assignmentID)
 		checker.invalidateCredentialFlights(assignmentID)
 	}
