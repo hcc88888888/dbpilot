@@ -8,6 +8,7 @@ const navigation = [
   { to: '/discovery', label: '数据库发现' },
   { to: '/instances', label: '数据库实例' },
   { to: '/plugins', label: '插件' },
+  { to: '/plugin-assignments', label: '插件分配' },
   { to: '/metric-templates', label: '指标模板' },
 ] as const;
 
