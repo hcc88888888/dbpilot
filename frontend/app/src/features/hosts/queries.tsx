@@ -1,6 +1,7 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import type { DefaultApi } from '../../../../generated/api/dist/index.js';
 import type { ApiProjectScope } from '../../api/client';
+import { retryScopedRequest } from '../../api/client';
 import type { HostFilters } from './types';
 
 const scopeKey = (scope: ApiProjectScope) => [scope.tenantId, scope.projectId] as const;
@@ -18,6 +19,7 @@ export function useHostList(api: DefaultApi, scope: ApiProjectScope, filters: Ho
     initialPageParam: undefined as string | undefined,
     queryFn: ({ signal, pageParam }) => api.listHosts({ ...filters, cursor: pageParam, limit: 100 }, { signal }),
     getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
+    retry: retryScopedRequest,
     enabled,
   });
 }
@@ -26,6 +28,7 @@ export function useHost(api: DefaultApi, scope: ApiProjectScope, hostId: string,
   return useQuery({
     queryKey: hostKeys.detail(scope, hostId),
     queryFn: ({ signal }) => api.getHost({ hostId }, { signal }),
+    retry: retryScopedRequest,
     enabled: enabled && Boolean(hostId),
   });
 }
@@ -36,6 +39,7 @@ export function useHostInstances(api: DefaultApi, scope: ApiProjectScope, hostId
     initialPageParam: undefined as string | undefined,
     queryFn: ({ signal, pageParam }) => api.listDatabaseInstances({ hostId, cursor: pageParam, limit: 100 }, { signal }),
     getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
+    retry: retryScopedRequest,
     enabled: enabled && Boolean(hostId),
   });
 }

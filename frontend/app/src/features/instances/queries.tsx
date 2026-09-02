@@ -2,7 +2,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import React from 'react';
 import type { DefaultApi, JobStatus } from '../../../../generated/api/dist/index.js';
 import type { ApiProjectScope } from '../../api/client';
-import { retryScopedMutation, useScopedRequest } from '../../api/client';
+import { retryScopedRequest, useScopedRequest } from '../../api/client';
 import type { InstanceFilters } from './types';
 
 const scopeKey = (scope: ApiProjectScope) => [scope.tenantId, scope.projectId] as const;
@@ -20,6 +20,7 @@ export function useInstanceList(api: DefaultApi, scope: ApiProjectScope, filters
     initialPageParam: undefined as string | undefined,
     queryFn: ({ signal, pageParam }) => api.listDatabaseInstances({ ...filters, cursor: pageParam, limit: 100 }, { signal }),
     getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
+    retry: retryScopedRequest,
     enabled,
   });
 }
@@ -28,6 +29,7 @@ export function useInstance(api: DefaultApi, scope: ApiProjectScope, instanceId:
   return useQuery({
     queryKey: instanceKeys.detail(scope, instanceId),
     queryFn: ({ signal }) => api.getDatabaseInstance({ instanceId }, { signal }),
+    retry: retryScopedRequest,
     enabled: enabled && Boolean(instanceId),
   });
 }
@@ -36,7 +38,7 @@ export function useConnectionTest(api: DefaultApi, scope: ApiProjectScope, insta
   const queryClient = useQueryClient();
   const request = useScopedRequest(scope);
   return useMutation({
-    retry: retryScopedMutation,
+    retry: retryScopedRequest,
     mutationFn: (idempotencyKey: string) => request((signal) => api.testDatabaseInstanceConnection({ instanceId, idempotencyKey }, { signal })),
     onSuccess: (job) => {
       queryClient.setQueryData(instanceKeys.connectionJob(scope, instanceId, job.id), job);
@@ -52,6 +54,7 @@ export function useConnectionJob(api: DefaultApi, scope: ApiProjectScope, instan
   const query = useQuery({
     queryKey: instanceKeys.connectionJob(scope, instanceId, jobId ?? ''),
     queryFn: ({ signal }) => api.getJob({ jobId: jobId! }, { signal }),
+    retry: retryScopedRequest,
     enabled: enabled && Boolean(jobId),
     refetchInterval: (current) => {
       if (current.state.error) return false;

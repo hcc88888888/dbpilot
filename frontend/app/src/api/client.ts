@@ -52,7 +52,7 @@ export function useScopedRequest(scope: ApiProjectScope) {
   }, [scope.projectId, scope.tenantId]);
 }
 
-export function retryScopedMutation(failureCount: number, error: unknown): boolean {
+export function retryScopedRequest(failureCount: number, error: unknown): boolean {
   if (failureCount >= 1 || typeof error !== 'object' || error === null) return false;
   const named = error as { name?: unknown; response?: unknown };
   if (named.name === 'AbortError' || named.name === 'RequiredError') return false;

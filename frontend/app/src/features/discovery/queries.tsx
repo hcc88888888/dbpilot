@@ -1,7 +1,7 @@
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import type { AcceptDiscoveryCandidateRequest, DefaultApi, DiscoveryCandidate } from '../../../../generated/api/dist/index.js';
 import type { ApiProjectScope } from '../../api/client';
-import { retryScopedMutation, useScopedRequest } from '../../api/client';
+import { retryScopedRequest, useScopedRequest } from '../../api/client';
 import { hostKeys } from '../hosts/queries';
 import { instanceKeys } from '../instances/queries';
 import type { DiscoveryFilters } from './types';
@@ -19,6 +19,7 @@ export function useCandidateList(api: DefaultApi, scope: ApiProjectScope, filter
     initialPageParam: undefined as string | undefined,
     queryFn: ({ signal, pageParam }) => api.listDiscoveryCandidates({ ...filters, cursor: pageParam, limit: 100 }, { signal }),
     getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
+    retry: retryScopedRequest,
     enabled,
   });
 }
@@ -27,7 +28,7 @@ export function useIgnoreCandidate(api: DefaultApi, scope: ApiProjectScope) {
   const queryClient = useQueryClient();
   const request = useScopedRequest(scope);
   return useMutation({
-    retry: retryScopedMutation,
+    retry: retryScopedRequest,
     mutationFn: ({ candidate, idempotencyKey }: { candidate: DiscoveryCandidate; idempotencyKey: string }) => request((signal) => api.ignoreDiscoveryCandidate({
       candidateId: candidate.candidateId, idempotencyKey, ignoreDiscoveryCandidateRequest: { reasonCode: 'operator_ignored' },
     }, { signal })),
@@ -42,7 +43,7 @@ export function useAcceptCandidate(api: DefaultApi, scope: ApiProjectScope) {
   const queryClient = useQueryClient();
   const scopedRequest = useScopedRequest(scope);
   return useMutation({
-    retry: retryScopedMutation,
+    retry: retryScopedRequest,
     mutationFn: ({ candidate, request, idempotencyKey }: { candidate: DiscoveryCandidate; request: AcceptDiscoveryCandidateRequest; idempotencyKey: string }) => scopedRequest((signal) => api.acceptDiscoveryCandidate({
       candidateId: candidate.candidateId,
       idempotencyKey,

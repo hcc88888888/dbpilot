@@ -82,8 +82,10 @@ describe('Database instance management pages', () => {
     renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test', 'platform.jobs.read']);
     await userEvent.click(await screen.findByRole('button', { name: '测试连接' }));
 
-    expect((await screen.findByRole('alert')).textContent).toContain(expectedMessage);
+    expect((await screen.findByRole('alert', undefined, { timeout: 2_500 })).textContent).toContain(expectedMessage);
     const calls = vi.mocked(client.getJob).mock.calls.length;
+    if (_kind === '403') expect(calls).toBe(1);
+    else expect(calls).toBe(2);
     await new Promise((resolve) => setTimeout(resolve, 2_100));
     expect(client.getJob).toHaveBeenCalledTimes(calls);
     expect(document.body.textContent).not.toMatch(/demo/i);
@@ -102,8 +104,10 @@ describe('Database instance management pages', () => {
   });
 
   it('shows 403 as a permission error with no demo fallback', async () => {
-    renderFeature(<InstanceListPage api={api(403)} />, ['database-instances:view']);
+    const client = api(403);
+    renderFeature(<InstanceListPage api={client} />, ['database-instances:view']);
     expect((await screen.findByRole('alert')).textContent).toContain('没有执行此操作的权限');
+    expect(client.listDatabaseInstances).toHaveBeenCalledTimes(1);
     expect(document.body.textContent).not.toMatch(/demo/i);
   });
 });

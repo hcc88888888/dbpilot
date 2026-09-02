@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { retryScopedMutation } from '../api/client';
+import { retryScopedRequest } from '../api/client';
 import { discoveryKeys } from './discovery/queries';
 import { hostKeys } from './hosts/queries';
 import { instanceKeys } from './instances/queries';
@@ -18,9 +18,9 @@ describe('project-scoped management query keys', () => {
   });
 
   it('retries only transport, throttling, timeout and server failures', () => {
-    expect(retryScopedMutation(0, Object.assign(new Error('forbidden'), { response: new Response(null, { status: 403 }) }))).toBe(false);
-    expect(retryScopedMutation(0, Object.assign(new Error('busy'), { response: new Response(null, { status: 503 }) }))).toBe(true);
-    expect(retryScopedMutation(0, new TypeError('network failed'))).toBe(true);
-    expect(retryScopedMutation(1, new TypeError('network failed'))).toBe(false);
+    expect(retryScopedRequest(0, Object.assign(new Error('forbidden'), { response: new Response(null, { status: 403 }) }))).toBe(false);
+    expect(retryScopedRequest(0, Object.assign(new Error('busy'), { response: new Response(null, { status: 503 }) }))).toBe(true);
+    expect(retryScopedRequest(0, new TypeError('network failed'))).toBe(true);
+    expect(retryScopedRequest(1, new TypeError('network failed'))).toBe(false);
   });
 });
