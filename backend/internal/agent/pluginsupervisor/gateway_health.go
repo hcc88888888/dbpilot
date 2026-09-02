@@ -218,6 +218,74 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 	return nil
 }
 
+func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, process Process, request HealthRequest) error {
+	if checker == nil || checker.client == nil || process == nil || ctx == nil || ctx.Err() != nil {
+		return ErrHealthHandshake
+	}
+	checker.mu.Lock()
+	session := checker.sessions[process.PID()]
+	checker.mu.Unlock()
+	if session == nil || session.AssignmentID() != request.AssignmentID || len(request.SupportedVariants) == 0 || len(request.SignedCapabilities) == 0 || request.MetricTemplateSchemaVersion == 0 || len(request.InstanceDescriptors) == 0 {
+		return ErrHealthHandshake
+	}
+	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 && len(request.TemplateIDs) > 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
+		return ErrHealthHandshake
+	}
+	var instances []*pluginv1.PluginInstanceConfiguration
+	var releases []func()
+	var configurationValidFor time.Duration
+	if checker.credentials == nil {
+		if !request.CredentialsComplete {
+			return ErrHealthHandshake
+		}
+		instances = instancesWithoutCredentials(request)
+	} else {
+		var leaseErr error
+		instances, releases, configurationValidFor, leaseErr = leaseInstancesWithCache(ctx, credentialLeaserFunc(checker.leaseCredential), checker.cache, request, time.Now().UTC())
+		if leaseErr != nil {
+			return ErrHealthHandshake
+		}
+	}
+	for _, release := range releases {
+		defer release()
+	}
+	expected := plugingateway.ExpectedPlugin{
+		PID: process.PID(), ExpectedUserID: request.ExpectedUserID, ExpectedGroupID: request.ExpectedGroupID,
+		RuntimeDirectory: request.RuntimeDirectory, AssignmentID: request.AssignmentID, PluginID: request.PluginID,
+		DatabaseFamily: request.DatabaseFamily, Version: request.Version, ProtocolVersion: request.ProtocolVersion,
+		ExecutablePath: request.ExecutablePath, ExecutableSHA256: append([]byte(nil), request.ExecutableSHA256...),
+		LaunchNonce: append([]byte(nil), request.LaunchNonce...), ConfigurationRevision: request.ConfigurationRevision,
+		OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), TemplateIDs: append([]string(nil), request.TemplateIDs...),
+		SupportedVariants: append([]string(nil), request.SupportedVariants...), SignedCapabilities: append([]string(nil), request.SignedCapabilities...), MetricTemplateSchemaVersion: request.MetricTemplateSchemaVersion,
+		TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations),
+	}
+	if len(request.TemplateReferences) > 0 {
+		if checker.templates == nil {
+			return ErrHealthHandshake
+		}
+		perInstance, templateReleases, _, leaseErr := leaseMetricTemplates(ctx, checker.templates, request, time.Now().UTC())
+		if leaseErr != nil {
+			return ErrHealthHandshake
+		}
+		for _, release := range templateReleases {
+			defer release()
+		}
+		for _, instance := range instances {
+			instance.Templates = cloneTemplateConfigurations(perInstance[instance.GetInstanceId()])
+		}
+		expected.InstanceTemplateConfigurations = perInstance
+	}
+	configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
+	defer configuration.Release()
+	if err := session.ApplyConfigurationUpdate(ctx, expected, configuration); err != nil {
+		return healthHandshakeFailure("apply_configuration_update")
+	}
+	checker.storeActiveCredentialConfiguration(process.PID(), configuration, configurationValidFor)
+	checker.scheduleCredentialRenewal(process, session, request, configurationValidFor)
+	checker.storeActivation(process.PID(), session, pluginstate.HealthHealthy, "")
+	return nil
+}
+
 func healthHandshakeFailure(stage string) error {
 	log.Printf("database plugin health handshake failed: stage=%s", stage)
 	return ErrHealthHandshake

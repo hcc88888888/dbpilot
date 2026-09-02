@@ -82,22 +82,28 @@ func (executor *MetricTemplateTrialExecutor) Execute(ctx context.Context, envelo
 	base.StatusCode = trial.ErrorCode
 	if trial.Succeeded {
 		base.StatusCode = "succeeded"
+	} else {
+		base.MetricCount = 0
 	}
-	for _, metric := range trial.Metrics {
-		labels := make(map[string]string, len(metric.Labels))
-		for name, value := range metric.Labels {
-			labels[name] = value
+	if trial.Succeeded {
+		for _, metric := range trial.Metrics {
+			labels := make(map[string]string, len(metric.Labels))
+			for name, value := range metric.Labels {
+				labels[name] = value
+			}
+			base.CandidateMetrics = append(base.CandidateMetrics, &agentv1.MetricTemplateCandidateMetric{MetricName: metric.Name, Value: metric.Value, Unit: metric.Unit, MetricType: metric.MetricType, Labels: labels})
 		}
-		base.CandidateMetrics = append(base.CandidateMetrics, &agentv1.MetricTemplateCandidateMetric{MetricName: metric.Name, Value: metric.Value, Unit: metric.Unit, MetricType: metric.MetricType, Labels: labels})
 	}
 	state := agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
+	errorCode := ""
 	if !trial.Succeeded {
 		state = agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED
+		errorCode = "METRIC_TEMPLATE_TRIAL_FAILED"
 	}
 	if err := reporter.Report(&agentv1.CommandProgress{CommandId: envelope.GetCommandId(), Percent: 100, Stage: "template_trial_complete", Message: "metric template trial completed"}); err != nil {
 		return nil, err
 	}
-	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: state, Summary: "metric template trial completed", MetricTemplateTrialResult: base}, nil
+	return &agentv1.CommandResult{CommandId: envelope.GetCommandId(), State: state, ErrorCode: errorCode, Summary: "metric template trial completed", MetricTemplateTrialResult: base}, nil
 }
 
 func trialDefinitionFromMaterial(value metrictemplatelease.Material) *pluginv1.TrialMetricTemplateDefinition {

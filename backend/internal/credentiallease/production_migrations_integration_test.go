@@ -59,6 +59,33 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	require.GreaterOrEqual(t, inactiveFence.calls, 2, "initial and post-provider authorization must both observe the absent live fence")
 	assertIssuedAuditIsHashOnly(t, database, success, renewedLease)
 	renewedLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET process_state='stopped',process_id=0,started_at=NULL,health='unknown',last_error_code='agent_restart_reconciled',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(500*time.Millisecond))
+	require.NoError(t, err)
+	recoveredLease, err := requestCredentialLease(ctx, restartedService, success, 0x25)
+	require.NoError(t, err, "an authenticated Agent may recover the exact previously-issued credential fence after its local restart")
+	recoveredLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET health='unhealthy',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(600*time.Millisecond))
+	require.NoError(t, err)
+	stoppingLease, err := requestCredentialLease(ctx, restartedService, success, 0x28)
+	require.NoError(t, err, "the Server's stopped-process health normalization must preserve the exact Agent restart recovery fence")
+	stoppingLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET process_state='restarting',process_id=0,started_at=NULL,health='unhealthy',last_error_code='plugin_restart_failed',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(750*time.Millisecond))
+	require.NoError(t, err)
+	retryLease, err := requestCredentialLease(ctx, restartedService, success, 0x26)
+	require.NoError(t, err, "the exact persisted fence remains available after a transient local plugin handshake retry")
+	retryLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET process_state='running',process_id=123,started_at=$4,health='degraded',last_error_code='waiting_credentials',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(900*time.Millisecond))
+	require.NoError(t, err)
+	degradedLease, err := requestCredentialLease(ctx, restartedService, success, 0x27)
+	require.NoError(t, err, "the exact audited fence may leave the bounded waiting-credentials recovery state")
+	degradedLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET active_configuration_revision=4,observed_operation_revision=6,health='healthy',last_error_code='plugin_upgrade_rolled_back',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(950*time.Millisecond))
+	require.NoError(t, err)
+	rollbackLease, err := requestCredentialLease(ctx, restartedService, success, 0x29)
+	require.NoError(t, err, "the exact current audit and terminal operation fence a restored binary while its last rollback observation is stale")
+	rollbackLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET process_state='running',process_id=123,started_at=$4,health='healthy',last_error_code='',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(time.Second))
+	require.NoError(t, err)
 
 	updated, err := databaseinstance.NewPostgresRepository(database).Update(ctx,
 		platformscope.Scope{TenantID: success.tenantID, ProjectID: success.projectID}, success.instanceID, 9,
@@ -302,7 +329,7 @@ func newCredentialLeaseService(t *testing.T, database *sql.DB, fence *recordingF
 		Clock:      credentiallease.PostgresClock{Database: database},
 		Audit:      credentiallease.PostgresAuditRecorder{Database: database},
 		TTL:        30 * time.Second,
-		Random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 16)),
+		Random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 96)),
 	})
 	require.NoError(t, err)
 	return service

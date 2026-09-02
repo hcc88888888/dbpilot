@@ -215,6 +215,7 @@ type ControlClient struct {
 
 	sessionMu                  sync.RWMutex
 	session                    *controlSession
+	sessionChanged             chan struct{}
 	sendMu                     sync.Mutex
 	runningMu                  sync.Mutex
 	running                    map[string]runningCommand
@@ -334,6 +335,7 @@ func NewControlClient(config ControlClientConfig) (*ControlClient, error) {
 		artifactLeaseWaiters:       make(map[string]*artifactLeaseWaiter),
 		credentialLeaseWaiters:     make(map[string]*credentialLeaseWaiter),
 		metricTemplateLeaseWaiters: make(map[string]*metricTemplateLeaseWaiter),
+		sessionChanged:             make(chan struct{}),
 	}, nil
 }
 
@@ -499,6 +501,11 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
+	if refresher, ok := c.pluginObservations.(interface{ RefreshObservation(context.Context) error }); ok {
+		if err := refresher.RefreshObservation(session.ctx); err != nil {
+			return fmt.Errorf("refresh plugin observation after control reconnect: %w", err)
+		}
+	}
 	if err := c.sendHeartbeat(session); err != nil {
 		return err
 	}
@@ -984,6 +991,7 @@ func (c *ControlClient) cancelAll() {
 func (c *ControlClient) setSession(session *controlSession) {
 	c.sessionMu.Lock()
 	c.session = session
+	c.notifySessionChangedLocked()
 	c.sessionMu.Unlock()
 }
 
@@ -991,11 +999,46 @@ func (c *ControlClient) clearSession(expected *controlSession) {
 	c.sessionMu.Lock()
 	if c.session == expected {
 		c.session = nil
+		c.notifySessionChangedLocked()
 	}
 	c.sessionMu.Unlock()
 	c.failPluginArtifactLeaseWaiters()
 	c.failCredentialLeaseWaiters()
 	c.failMetricTemplateLeaseWaiters()
+}
+
+// WaitConnected bounds startup consumers on the authenticated control-session
+// lifecycle instead of treating the constructed client pointer as readiness.
+func (c *ControlClient) WaitConnected(ctx context.Context) error {
+	if c == nil || ctx == nil {
+		return ErrControlStreamDisconnected
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return ErrControlStreamDisconnected
+		}
+		c.sessionMu.Lock()
+		if c.sessionChanged == nil {
+			c.sessionChanged = make(chan struct{})
+		}
+		session, changed := c.session, c.sessionChanged
+		c.sessionMu.Unlock()
+		if session != nil && session.ctx != nil && session.ctx.Err() == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ErrControlStreamDisconnected
+		case <-changed:
+		}
+	}
+}
+
+func (c *ControlClient) notifySessionChangedLocked() {
+	if c.sessionChanged != nil {
+		close(c.sessionChanged)
+	}
+	c.sessionChanged = make(chan struct{})
 }
 
 // LeaseCredential requests database credentials only on the authenticated

@@ -524,7 +524,10 @@ func (repository *PostgresRepository) RecordTrialResult(ctx context.Context, sco
 		value, err := scanRevision(tx.QueryRowContext(ctx, `SELECT `+revisionColumns+` FROM metric_template_revisions WHERE tenant_id=$1 AND project_id=$2 AND revision_id=$3`, scope.TenantID, scope.ProjectID, revisionID))
 		return value, mapPostgresError(err)
 	}
-	metrics, _ := json.Marshal(result.Metrics)
+	metrics := []byte("[]")
+	if len(result.Metrics) > 0 {
+		metrics, _ = json.Marshal(result.Metrics)
+	}
 	var valueMappings []ValueMapping
 	var labelMappings []LabelMapping
 	if json.Unmarshal(valueMappingsJSON, &valueMappings) != nil || json.Unmarshal(labelMappingsJSON, &labelMappings) != nil {

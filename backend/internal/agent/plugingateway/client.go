@@ -581,6 +581,50 @@ func (session *Session) RunMetricStreamReady(ctx context.Context, sink MetricSin
 	return session.runMetricStream(ctx, sink, ready)
 }
 
+// ApplyConfigurationUpdate changes only the configuration projection of an
+// already verified live session. Neither the session's verified binary
+// identity nor its retained configuration changes unless the plugin accepts
+// the complete atomic request.
+func (session *Session) ApplyConfigurationUpdate(ctx context.Context, expected ExpectedPlugin, configuration PluginConfiguration) error {
+	if session == nil || ctx == nil || ctx.Err() != nil || validateExpected(filepath.Dir(expected.RuntimeDirectory), expected) != nil || configuration.validate(expected) != nil {
+		return errGateway
+	}
+	session.mu.Lock()
+	current := cloneExpected(session.expected)
+	handshaken := session.handshaken
+	session.mu.Unlock()
+	if !handshaken || !sameVerifiedRuntime(current, expected) || expected.ConfigurationRevision <= current.ConfigurationRevision || expected.OperationRevision <= current.OperationRevision {
+		return errGateway
+	}
+	request := canonicalApplyRequest(configuration)
+	defer clearConfigurationSecrets(request)
+	if err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
+		response, err := client.ApplyConfiguration(callContext, request)
+		if err != nil || !validApplyResponse(response, configuration) {
+			return errGateway
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !session.handshaken || !sameExpected(session.expected, current) {
+		return errGateway
+	}
+	session.expected = cloneExpected(expected)
+	session.configurationRevision = configuration.ConfigurationRevision
+	session.instances = make(map[string]*pluginv1.PluginInstanceConfiguration, len(configuration.Instances))
+	for _, instance := range configuration.Instances {
+		session.instances[instance.GetInstanceId()] = cloneInstanceWithoutCredential(instance)
+	}
+	return nil
+}
+
+func sameVerifiedRuntime(left, right ExpectedPlugin) bool {
+	return left.PID == right.PID && left.ExpectedUserID == right.ExpectedUserID && left.ExpectedGroupID == right.ExpectedGroupID && left.RuntimeDirectory == right.RuntimeDirectory && left.AssignmentID == right.AssignmentID && left.PluginID == right.PluginID && left.DatabaseFamily == right.DatabaseFamily && left.Version == right.Version && left.ProtocolVersion == right.ProtocolVersion && left.ExecutablePath == right.ExecutablePath && bytes.Equal(left.ExecutableSHA256, right.ExecutableSHA256) && bytes.Equal(left.LaunchNonce, right.LaunchNonce) && sameSet(left.SupportedVariants, right.SupportedVariants) && sameSet(left.SignedCapabilities, right.SignedCapabilities) && left.MetricTemplateSchemaVersion == right.MetricTemplateSchemaVersion
+}
+
 // HasResumeCursors reports whether the exact assignment/configuration has
 // durable metric receipts. A fresh process with receipts must resume its
 // stream before producing another sequence; a first deployment may perform

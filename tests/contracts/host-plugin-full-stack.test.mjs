@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
@@ -11,6 +12,8 @@ const composeFile = join(repoRoot, 'backend', 'docker', 'host-plugin-full-stack'
 const nginxFile = join(repoRoot, 'backend', 'docker', 'host-plugin-full-stack', 'nginx.conf');
 const runnerFile = join(repoRoot, 'backend', 'docker', 'host-plugin-full-stack', 'runner.Dockerfile');
 const verifierFile = join(repoRoot, 'backend', 'scripts', 'verify-host-plugin-full-stack.ps1');
+const boundedProcessFile = join(repoRoot, 'backend', 'scripts', 'bounded-process.ps1');
+const containerSafetyFile = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const e2eRoot = join(repoRoot, 'backend', 'test', 'e2e', 'host-plugin-full-stack');
 const approvedKylinImage = 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1';
 
@@ -34,17 +37,24 @@ const serviceNames = [
 const volumeNames = [
   'acceptance-agent-data',
   'acceptance-artifacts',
+  'acceptance-assertion-secrets',
   'acceptance-bin',
   'acceptance-config',
+  'acceptance-controlplane-secrets',
   'acceptance-frontend-assets',
+  'acceptance-frontend-tls',
   'acceptance-helper-runtime',
   'acceptance-mysql-primary-data',
   'acceptance-mysql-secondary-data',
+  'acceptance-mysql-secrets',
+  'acceptance-oidc-secrets',
   'acceptance-plugin-runtime',
   'acceptance-postgres-data',
+  'acceptance-postgres-secrets',
   'acceptance-proc-runtime',
   'acceptance-runner-artifacts',
-  'acceptance-secrets',
+  'acceptance-runner-secrets',
+  'acceptance-runner-trust',
   'acceptance-state',
 ];
 
@@ -110,6 +120,8 @@ test('host plugin Compose resolves the exact labelled production topology', () =
     }
   }
   assert.equal(config.services['acceptance-runner'].build.dockerfile, 'backend/docker/host-plugin-full-stack/runner.Dockerfile');
+  assert.equal(config.services['acceptance-runner'].build.labels['dbpilot.verifier'], 'host-plugin-full-stack');
+  assert.equal(config.services['acceptance-runner'].build.labels['dbpilot.run'], 'contract000000000000000000000000');
 
   for (const [name, service] of Object.entries(config.services)) {
     assert.equal(service.labels['dbpilot.verifier'], 'host-plugin-full-stack', `${name} has verifier ownership`);
@@ -189,22 +201,43 @@ test('one MySQL plugin process is configured for both MySQL instances', () => {
   assert.equal((command.match(/pgrep -fc '\/dbpilot-plugin-mysql '/g) ?? []).length, 1);
   assert.doesNotMatch(command, /\/acceptance\/bin\/dbpilot-plugin-mysql/);
   const agentCommand = commandText(services.agent);
+  assert.match(agentCommand, /if test ! -s \/acceptance\/agent-data\/enrollment\/agent\.crt; then\s+test -s \/acceptance\/agent-data\/enrollment-token/);
   assert.match(agentCommand, /controlled acceptance file-log source/);
   assert.match(agentCommand, /\/acceptance\/agent-data\/native\/mysqld-dbp/);
   assert.doesNotMatch(agentCommand, /\/tmp\/mysqld-dbp/);
 });
 
-test('runtime services consume artifacts configuration and secrets read-only with exact writable volumes', () => {
+test('runtime services receive only least-privilege secret and trust volumes', () => {
   const services = loadCompose().services;
-  for (const name of ['controlplane', 'agent', 'docker-discovery', 'mysql-plugin', 'frontend', 'acceptance-runner', 'assertions']) {
-    for (const target of ['/acceptance/artifacts', '/acceptance/config', '/acceptance/secrets']) {
-      const mount = mountAt(services[name], target);
-      assert.ok(mount, `${name} mounts ${target}`);
-      assert.equal(mount.read_only, true, `${name} cannot mutate ${target}`);
-    }
+  const secretSources = {
+    postgres: 'acceptance-postgres-secrets',
+    oidc: 'acceptance-oidc-secrets',
+    controlplane: 'acceptance-controlplane-secrets',
+    'mysql-primary': 'acceptance-mysql-secrets',
+    'mysql-secondary': 'acceptance-mysql-secrets',
+    frontend: 'acceptance-frontend-tls',
+    'acceptance-runner': 'acceptance-runner-secrets',
+    assertions: 'acceptance-assertion-secrets',
+  };
+  for (const [name, source] of Object.entries(secretSources)) {
+    const mount = mountAt(services[name], '/acceptance/secrets');
+    assert.ok(mount, `${name} receives its dedicated secret volume`);
+    assert.equal(mount.source, source);
+    assert.equal(mount.read_only, true);
   }
+  for (const name of ['agent', 'docker-discovery', 'mysql-plugin', 'proc-helper']) {
+    assert.equal(mountAt(services[name], '/acceptance/secrets'), undefined, `${name} cannot read bootstrap secrets`);
+  }
+  assert.equal(mountAt(services.frontend, '/acceptance/config').source, 'acceptance-frontend-tls');
+  assert.equal(mountAt(services.frontend, '/etc/ssl/certs').source, 'acceptance-frontend-tls');
+  assert.equal(mountAt(services['acceptance-runner'], '/acceptance/config').source, 'acceptance-runner-trust');
+  const agentCommand = commandText(services.agent);
+  const tokenRemoval = agentCommand.indexOf('rm -f /acceptance/agent-data/enrollment-token');
+  assert.ok(tokenRemoval > agentCommand.indexOf('--output-dir /acceptance/agent-data/enrollment'));
+  assert.ok(tokenRemoval < agentCommand.indexOf('exec /acceptance/bin/dbpilot-agent --config'),
+    'the one-time enrollment token is removed before the long-running Agent starts');
   assert.deepEqual(writableTargets(services['asset-builder']), ['/acceptance/bin', '/acceptance/frontend']);
-  assert.deepEqual(writableTargets(services.bootstrap), ['/volumes/agent-data', '/volumes/artifacts', '/volumes/config', '/volumes/helper-runtime', '/volumes/plugin-runtime', '/volumes/proc-runtime', '/volumes/runner-artifacts', '/volumes/secrets', '/volumes/state']);
+  assert.deepEqual(writableTargets(services.bootstrap), ['/volumes/agent-data', '/volumes/artifacts', '/volumes/assertion-secrets', '/volumes/config', '/volumes/controlplane-secrets', '/volumes/frontend-tls', '/volumes/helper-runtime', '/volumes/mysql-secrets', '/volumes/oidc-secrets', '/volumes/plugin-runtime', '/volumes/postgres-secrets', '/volumes/proc-runtime', '/volumes/runner-artifacts', '/volumes/runner-secrets', '/volumes/runner-trust', '/volumes/state']);
   assert.deepEqual(writableTargets(services.postgres), ['/var/lib/postgresql/data']);
   assert.deepEqual(writableTargets(services.oidc), []);
   assert.deepEqual(writableTargets(services.controlplane), ['/acceptance/state']);
@@ -232,6 +265,7 @@ test('production frontend serves Vite assets through query-safe same-origin Ngin
   assert.match(nginx, /access_log\s+\/dev\/stdout\s+query_safe/);
   const frontend = loadCompose().services.frontend;
   assert.equal(mountAt(frontend, '/etc/ssl/certs').read_only, true, 'frontend health probe trusts only generated acceptance CA bundle');
+  assert.match(commandText(loadCompose().services.bootstrap), /cp \/acceptance\/config\/ca\.pem \/volumes\/frontend-tls\/ca-certificates\.crt/);
 });
 
 test('Playwright runner is exactly locked and invokes only its package-owned suite', async () => {
@@ -242,11 +276,38 @@ test('Playwright runner is exactly locked and invokes only its package-owned sui
   const lock = JSON.parse(await readFile(join(e2eRoot, 'package-lock.json'), 'utf8'));
   const playwrightConfig = await readFile(join(e2eRoot, 'playwright.config.mjs'), 'utf8');
   const acceptanceSpec = await readFile(join(e2eRoot, 'acceptance.spec.mjs'), 'utf8');
+  const verifier = await readFile(verifierFile, 'utf8');
+  const runner = await readFile(runnerFile, 'utf8');
   assert.deepEqual(metadata.devDependencies, { '@playwright/test': '1.62.0' });
   assert.equal(lock.packages['node_modules/@playwright/test'].version, '1.62.0');
   assert.equal(metadata.scripts.test, 'playwright test --config playwright.config.mjs');
+  assert.match(runner, /plugin-package\.mjs/);
+  assert.doesNotMatch(acceptanceSpec, /\bbuildPackage\(/);
   assert.match(playwrightConfig, /outputDir:\s*'\/acceptance\/playwright\/results'/);
   assert.match(acceptanceSpec, /data:\s*options\.body\s*\?\?\s*options\.data/);
+  assert.match(acceptanceSpec, /PLUGIN_ARM64_BINARY_FILE/);
+  assert.match(acceptanceSpec, /plugin_signature_rejected/);
+  assert.match(acceptanceSpec, /plugin_platform_mismatch/);
+  assert.match(acceptanceSpec, /high_cardinality/);
+  assert.match(acceptanceSpec, /first_instance_pid/);
+  for (const boundary of ['capture-agent-restart', 'capture-agent-stopped', 'convergence-agent', 'capture-server-restart', 'capture-server-stopped', 'convergence-server']) {
+    assert.ok(acceptanceSpec.includes(boundary), `restart evidence contains ${boundary}`);
+  }
+  assert.match(acceptanceSpec, /RESTART_BOUNDARY_UTC/);
+  assert.match(verifier, /capture-agent-stopped[\s\S]*RESTART_BOUNDARY_UTC/);
+  assert.match(verifier, /capture-server-stopped[\s\S]*RESTART_BOUNDARY_UTC/);
+  assert.match(acceptanceSpec, /observed_at[\s\S]*sample_at/);
+  assert.match(acceptanceSpec, /page\.on\('request'/);
+  assert.match(acceptanceSpec, /rotatedToken/);
+  assert.match(acceptanceSpec, /page\.exposeFunction\('__DBPilotAcceptanceReadToken'/);
+  assert.doesNotMatch(acceptanceSpec, /__DBPilotAcceptanceCurrentToken/);
+  assert.doesNotMatch(acceptanceSpec, /route\.continue\(\{\s*headers/);
+  assert.match(acceptanceSpec, /failure-canary/);
+  assert.match(acceptanceSpec, /diagnostic_stage/);
+  assert.match(verifier, /Get-AcceptanceFailureStage/);
+  assert.match(verifier, /Assert-FailureCanariesAbsent/);
+  assert.doesNotMatch(verifier, /\.png/);
+  assert.doesNotMatch(verifier, /playwright\/\./);
 });
 
 test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerShell and pwsh', async () => {
@@ -258,6 +319,9 @@ test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerS
   assert.match(verifier, /Remove-DBPilotRecordedNetwork/);
   assert.match(verifier, /Remove-DBPilotRecordedVolume/);
   assert.match(verifier, /Assert-ZeroResidualResources/);
+  assert.match(verifier, /ownedImageIDs/);
+  assert.match(verifier, /Remove-OwnedRunnerImage/);
+  assert.match(verifier, /image', 'ls'[\s\S]*label=dbpilot\.verifier/);
   assert.doesNotMatch(verifier, /Get-ComposeArguments @\('pull'/, 'release verification must use exact local image identities without registry drift');
   for (const image of ['golang:1.27.0-bookworm', 'postgres:16-alpine', 'nginx:1.29.1-alpine', 'mysql:8.4']) {
     assert.match(verifier, new RegExp(image.replace(/[.:]/g, '\\$&')));
@@ -277,6 +341,51 @@ test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerS
       '$errors=$null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:DBPILOT_PARSE_FILE,[ref]$null,[ref]$errors); if($errors.Count){$errors | ForEach-Object { Write-Error $_ }; exit 1}'],
     { cwd: repoRoot, encoding: 'utf8', env: { ...process.env, DBPILOT_PARSE_FILE: verifierFile } });
     assert.equal(result.status, 0, `${executable} parses verifier: ${result.stderr}`);
+  }
+});
+
+test('PowerShell 5.1 and 7 bound output pipes held by a child after its parent exits', { skip: process.platform !== 'win32' }, async () => {
+  assert.equal(existsSync(boundedProcessFile), true, 'the production bounded-process helper exists');
+  const root = await mkdtemp(join(tmpdir(), 'dbpilot-pipe-'));
+  const child = join(root, 'child.ps1');
+  const parent = join(root, 'parent.ps1');
+  const pidFile = join(root, 'child.pid');
+  await writeFile(child, "[Console]::Out.WriteLine('pipe-held'); Start-Sleep -Seconds 30\n", 'utf8');
+  await writeFile(parent, [
+    "$arguments = '-NoProfile -File \"' + $env:DBPILOT_PIPE_CHILD + '\"'",
+    '$child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $arguments -NoNewWindow -PassThru',
+    '[IO.File]::WriteAllText($env:DBPILOT_PIPE_PID, [string]$child.Id)',
+    'Start-Sleep -Milliseconds 750',
+    'exit 0',
+    '',
+  ].join('\n'), 'utf8');
+  try {
+    for (const executable of [
+      'pwsh',
+      join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ]) {
+      if (executable !== 'pwsh' && !existsSync(executable)) continue;
+      const command = [
+        `. '${containerSafetyFile.replaceAll("'", "''")}'`,
+        `. '${boundedProcessFile.replaceAll("'", "''")}'`,
+        "try { Invoke-BoundedProcess -Command (Get-Process -Id $PID).Path -Arguments @('-NoProfile','-File',$env:DBPILOT_PIPE_PARENT) -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 } }; exit 0",
+      ].join('; ');
+      const started = Date.now();
+      const result = spawnSync(executable, ['-NoProfile', '-Command', command], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 12_000,
+        env: { ...process.env, DBPILOT_PIPE_CHILD: child, DBPILOT_PIPE_PARENT: parent, DBPILOT_PIPE_PID: pidFile },
+      });
+      assert.equal(result.status, 0, `${executable} did not bound the inherited output pipe: ${result.stderr || result.stdout}`);
+      assert.ok(Date.now() - started < 8_000, `${executable} exceeded the bounded output deadline`);
+      const childPID = Number((await readFile(pidFile, 'utf8')).trim());
+      const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${childPID} -ErrorAction SilentlyContinue) { exit 1 }`]);
+      assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive`);
+      await rm(pidFile, { force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

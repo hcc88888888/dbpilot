@@ -203,6 +203,9 @@ func normalizeInternalEndpoints(containerState string, exposed map[string]struct
 }, networks map[string]struct {
 	IPAddress string `json:"IPAddress"`
 }) ([]InternalEndpoint, error) {
+	if containerState != "running" {
+		return nil, nil
+	}
 	ports := make(map[string]struct{}, len(exposed)+len(mapped))
 	for value := range exposed {
 		ports[value] = struct{}{}
@@ -243,11 +246,8 @@ func normalizeInternalEndpoints(containerState string, exposed map[string]struct
 		if !networkNamePattern.MatchString(name) {
 			return nil, errors.New("invalid Docker internal endpoint")
 		}
-		if address == "" && containerState != "running" {
-			continue
-		}
 		parsedAddress := net.ParseIP(address)
-		if parsedAddress == nil {
+		if !IsSafeInternalIP(parsedAddress) {
 			return nil, errors.New("invalid Docker internal endpoint")
 		}
 		for _, port := range parsedPorts {

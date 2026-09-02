@@ -129,11 +129,17 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.Equal(t, authoritative, retried)
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	var monitoringInstanceID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT instance_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 ORDER BY instance_id LIMIT 1`, scope.TenantID, scope.ProjectID).Scan(&monitoringInstanceID))
+	_, err = database.ExecContext(ctx, `UPDATE managed_database_instances SET management_status='monitoring' WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, monitoringInstanceID)
+	require.NoError(t, err)
 	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 2, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 5, ObservedAt: now}
 	require.NoError(t, service.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 5, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
-	var managedInstances int
+	var managedInstances, monitoringInstances int
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='managed'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&managedInstances))
-	require.Equal(t, 2, managedInstances, "a healthy matching plugin observation proves ValidateInstance and promotes all bound instances")
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='monitoring'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&monitoringInstances))
+	require.Equal(t, 1, managedInstances, "a healthy matching plugin observation promotes newly bound instances")
+	require.Equal(t, 1, monitoringInstances, "a healthy matching plugin observation must not downgrade an already monitored instance")
 	matching, err := reconciler.Reconcile(ctx, time.Now().UTC(), 10)
 	require.NoError(t, err)
 	require.Zero(t, matching.Enqueued)
@@ -165,6 +171,23 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.NoError(t, err)
 	_, err = reconciler.ReconcileAssignment(ctx, stopping, time.Now().UTC())
 	require.NoError(t, err, "revoked running plugins must still accept a safe stop command")
+}
+
+func TestPluginAssignmentLegacyKylinAndCentOSHostsSelectLinuxPackage(t *testing.T) {
+	for _, legacyOS := range []string{"kylin", "centos"} {
+		t.Run(legacyOS, func(t *testing.T) {
+			database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+			_, err := database.Exec(`UPDATE managed_hosts SET operating_system=$1 WHERE tenant_id=$2 AND project_id=$3 AND host_id=$4`, legacyOS, scope.TenantID, scope.ProjectID, hostID)
+			require.NoError(t, err)
+			assignments := pluginassignment.NewPostgresRepository(database, job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database}))
+			instances := databaseinstance.NewPostgresRepositoryWithProvisioner(database, assignments)
+			candidateID, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "candidate-"+legacyOS, "127.0.0.1:3320", 31)
+			accepted, err := instances.AcceptCandidate(context.Background(), scope, candidateID, request)
+			require.NoError(t, err)
+			require.Equal(t, "dbpilot.mysql", accepted.PluginID)
+			require.Equal(t, "1.2.3", accepted.DesiredPluginVersion)
+		})
+	}
 }
 
 func TestPluginAssignmentFailureRollsBackCandidateAndInstance(t *testing.T) {

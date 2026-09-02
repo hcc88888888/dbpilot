@@ -290,7 +290,7 @@ func (server *Server) instanceLane(instanceID string) *sync.Mutex {
 func (server *Server) TrialMetricTemplate(ctx context.Context, request *pluginv1.TrialMetricTemplateRequest) (*pluginv1.TrialMetricTemplateResponse, error) {
 	started := server.config.Now().UTC()
 	defer clearTrialRequest(request)
-	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || request.GetOperationRevision() != server.config.OperationRevision || request.GetTemplate() == nil {
+	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || request.GetOperationRevision() == 0 || request.GetTemplate() == nil {
 		return nil, errors.New("trial_rejected")
 	}
 	definition := request.GetTemplate()
@@ -312,7 +312,11 @@ func (server *Server) TrialMetricTemplate(ctx context.Context, request *pluginv1
 	if millis > int64(^uint32(0)) {
 		millis = int64(^uint32(0))
 	}
-	response := &pluginv1.TrialMetricTemplateResponse{Succeeded: result.Status == CollectionSucceeded, RowCount: result.RowCount, ColumnCount: result.ColumnCount, MetricCount: uint32(len(result.Samples)), DurationMillis: uint32(millis), ErrorCode: result.ErrorCode}
+	errorCode := result.ErrorCode
+	if errorCode == "cardinality_limit_exceeded" {
+		errorCode = "high_cardinality"
+	}
+	response := &pluginv1.TrialMetricTemplateResponse{Succeeded: result.Status == CollectionSucceeded, RowCount: result.RowCount, ColumnCount: result.ColumnCount, MetricCount: uint32(len(result.Samples)), DurationMillis: uint32(millis), ErrorCode: errorCode}
 	for _, sample := range result.Samples {
 		response.CandidateMetrics = append(response.CandidateMetrics, wireSample(sample))
 	}

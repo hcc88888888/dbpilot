@@ -67,6 +67,32 @@ func TestDockerDetectorRejectsInternalEndpointOutsideSignedNetworkRule(t *testin
 	require.Error(t, err)
 }
 
+func TestDockerDetectorSignedNetworkDoesNotFallBackToPublishedPort(t *testing.T) {
+	client := &fakeDockerRPCClient{snapshot: &discoveryv1.DockerSnapshotResponse{Containers: []*discoveryv1.DockerContainerObservation{{
+		ContainerId: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Name: "mysql-a", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING,
+		Labels: map[string]string{"dbpilot.discovery.family": "mysql"}, Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}},
+	}}}}
+	detector, err := NewDockerDetector(DockerDetectorConfig{Client: client, RuleRevision: 7, AllowedLabelKeys: []string{"dbpilot.discovery.family"}, AllowedNetworkNames: []string{"dbpilot_acceptance"}})
+	require.NoError(t, err)
+	rules := []domain.Rule{{ID: "mysql-docker", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", DockerImagePatterns: []string{`^mysql:8\.4$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DockerNetworkNames: []string{"dbpilot_acceptance"}, DefaultPorts: []uint16{3306}}}
+
+	candidates, err := detector.Discover(context.Background(), rules)
+	require.NoError(t, err)
+	require.Empty(t, candidates, "a signed internal-network rule must never fall back to a published host port")
+}
+
+func TestAgentRejectsUnsafeDockerInternalAddresses(t *testing.T) {
+	for _, address := range []string{"0.0.0.0", "::", "127.0.0.1", "::1", "169.254.10.20", "fe80::1", "224.0.0.1", "ff02::1"} {
+		t.Run(address, func(t *testing.T) {
+			container := &discoveryv1.DockerContainerObservation{
+				ContainerId: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Name: "mysql-a", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING,
+				InternalEndpoints: []*discoveryv1.DockerInternalEndpoint{{NetworkName: "dbpilot_acceptance", Address: address, Port: 3306, Protocol: "tcp"}},
+			}
+			require.Error(t, validateDockerObservation(container, nil, []string{"dbpilot_acceptance"}))
+		})
+	}
+}
+
 func TestDockerDetectorUsesStableIdentityLabelAndKeepsContainerIDAsEvidence(t *testing.T) {
 	const ephemeralID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	client := &fakeDockerRPCClient{snapshot: &discoveryv1.DockerSnapshotResponse{Containers: []*discoveryv1.DockerContainerObservation{{ContainerId: ephemeralID, Name: "generated-name", Image: "mysql:8.4", Status: discoveryv1.DockerContainerStatus_DOCKER_CONTAINER_STATUS_RUNNING, Labels: map[string]string{"dbpilot.discovery.family": "mysql", "dbpilot.instance_id": "orders-db"}, Ports: []*discoveryv1.DockerPortMapping{{HostAddress: "127.0.0.1", HostPort: 49161, ContainerPort: 3306, Protocol: "tcp"}}}}}}

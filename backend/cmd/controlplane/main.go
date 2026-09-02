@@ -285,6 +285,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", "", "control-plane YAML configuration")
 	showVersion := flags.Bool("version", false, "print version and exit")
+	checkConfig := flags.Bool("check-config", false, "validate configuration without opening the database or listeners")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -300,6 +301,14 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
+	}
+	if *checkConfig {
+		if err := validateConfig(config); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		fmt.Fprintln(stdout, "configuration valid")
+		return 0
 	}
 	server, err := NewServer(config)
 	if err != nil {
@@ -1595,6 +1604,12 @@ func (resolver configuredAgentResolver) ScopeForAgent(_ context.Context, id stri
 	}
 	return scope, nil
 }
+func (resolver configuredAgentResolver) HostForAgent(_ context.Context, id string) (string, error) {
+	if _, ok := resolver[id]; !ok {
+		return "", errors.New("agent assignment not found")
+	}
+	return id, nil
+}
 func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configuredAgentResolver {
 	result := make(configuredAgentResolver, len(assignments))
 	for id, a := range assignments {
@@ -1605,6 +1620,10 @@ func configuredAgentResolverFrom(assignments map[string]AgentAssignment) configu
 
 type enrolledAgentScopeResolver interface {
 	ScopeForAgent(context.Context, string) (platformscope.Scope, error)
+}
+
+type enrolledAgentHostResolver interface {
+	HostForAgent(context.Context, string) (string, error)
 }
 
 // runtimeAgentResolver trusts persisted enrollment first and keeps static
@@ -1630,6 +1649,19 @@ func (resolver runtimeAgentResolver) ScopeForAgent(ctx context.Context, agentID 
 		}
 	}
 	return resolver.configured.ScopeForAgent(ctx, agentID)
+}
+
+func (resolver runtimeAgentResolver) HostForAgent(ctx context.Context, agentID string) (string, error) {
+	if enrolled, ok := resolver.enrolled.(enrolledAgentHostResolver); ok {
+		hostID, err := enrolled.HostForAgent(ctx, agentID)
+		if err == nil {
+			return hostID, nil
+		}
+		if !errors.Is(err, hostinventory.ErrNotFound) {
+			return "", err
+		}
+	}
+	return resolver.configured.HostForAgent(ctx, agentID)
 }
 
 type persistedHostObservationSink struct {
@@ -1875,6 +1907,7 @@ func (dedup postgresLogBatchDeduplicator) AcceptBatchOnce(ctx context.Context, a
 
 var _ ingest.AgentIdentityResolver = runtimeAgentResolver{}
 var _ controlplane.AgentScopeResolver = runtimeAgentResolver{}
+var _ controlplane.AgentHostResolver = runtimeAgentResolver{}
 var _ ingest.DurableBatchDeduplicator = postgresLogBatchDeduplicator{}
 
 // Small constructor aliases keep the configuration-to-runtime mapping explicit.

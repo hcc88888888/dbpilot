@@ -53,8 +53,10 @@ func normalizedMetricTrialResult(command *agentv1.CollectDatabaseMetrics, result
 	}
 	reference := command.GetTemplateRevisions()[0]
 	value := metrictemplate.TrialResult{RevisionID: reference.GetRevisionId(), QueryDigest: hex.EncodeToString(reference.GetQueryDigest()), StatusCode: fixedTrialStatus(result.GetState())}
-	if typed := result.GetMetricTemplateTrialResult(); result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && typed != nil && typed.GetRevisionId() == reference.GetRevisionId() && hex.EncodeToString(typed.GetQueryDigest()) == value.QueryDigest && typed.GetStatusCode() == "succeeded" {
-		value.StatusCode = fixedMetricTrialCode(typed.GetStatusCode())
+	typed := result.GetMetricTemplateTrialResult()
+	typedMatches := typed != nil && typed.GetRevisionId() == reference.GetRevisionId() && hex.EncodeToString(typed.GetQueryDigest()) == value.QueryDigest
+	if result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && typedMatches && typed.GetStatusCode() == "succeeded" {
+		value.StatusCode = "succeeded"
 		value.RowCount = int(typed.GetRowCount())
 		value.ColumnCount = int(typed.GetColumnCount())
 		value.MetricCount = int(typed.GetMetricCount())
@@ -76,7 +78,13 @@ func normalizedMetricTrialResult(command *agentv1.CollectDatabaseMetrics, result
 	if result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && value.StatusCode != "succeeded" {
 		value = metrictemplate.TrialResult{RevisionID: value.RevisionID, QueryDigest: value.QueryDigest, StatusCode: "invalid_result"}
 	} else if result.GetState() != agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED {
-		value = metrictemplate.TrialResult{RevisionID: value.RevisionID, QueryDigest: value.QueryDigest, StatusCode: fixedTrialStatus(result.GetState())}
+		statusCode := fixedTrialStatus(result.GetState())
+		rowCount, columnCount, durationMillis := 0, 0, int64(0)
+		if typedMatches && (typed.GetStatusCode() == "high_cardinality" || typed.GetStatusCode() == "bounds_exceeded") {
+			statusCode = typed.GetStatusCode()
+			rowCount, columnCount, durationMillis = int(typed.GetRowCount()), int(typed.GetColumnCount()), int64(typed.GetDurationMillis())
+		}
+		value = metrictemplate.TrialResult{RevisionID: value.RevisionID, QueryDigest: value.QueryDigest, StatusCode: statusCode, RowCount: rowCount, ColumnCount: columnCount, DurationMillis: durationMillis}
 	}
 	if value.Validate() != nil {
 		value = metrictemplate.TrialResult{RevisionID: reference.GetRevisionId(), QueryDigest: hex.EncodeToString(reference.GetQueryDigest()), StatusCode: "invalid_result"}

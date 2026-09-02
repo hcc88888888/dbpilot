@@ -24,6 +24,26 @@ func TestProcHelperRequiresExplicitNonzeroPeerIdentity(t *testing.T) {
 	require.Contains(t, stderr.String(), "--allowed-uid and --allowed-gid")
 }
 
+func TestDeferredPluginLeaseWaitsForControlClientDuringPersistedRecovery(t *testing.T) {
+	leases := &deferredPluginLeaseClient{}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan *agent.ControlClient, 1)
+	go func() { result <- leases.awaitControl(ctx) }()
+	select {
+	case <-result:
+		t.Fatal("persisted plugin recovery must not observe a transient unavailable lease client")
+	case <-time.After(20 * time.Millisecond):
+	}
+	control := &agent.ControlClient{}
+	leases.Set(control)
+	require.Same(t, control, <-result)
+
+	cancelled, stop := context.WithCancel(context.Background())
+	stop()
+	require.Nil(t, (&deferredPluginLeaseClient{}).awaitControl(cancelled))
+}
+
 func TestProcHelperRequiresLocalDatabaseProcessAllowlist(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	require.Equal(t, 2, run([]string{"proc-helper", "--allowed-uid", "19001", "--allowed-gid", "19001"}, &stdout, &stderr))

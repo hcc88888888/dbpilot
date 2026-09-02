@@ -271,6 +271,18 @@ func (repository *PostgresRepository) ScopeForAgent(ctx context.Context, agentID
 	return scope, nil
 }
 
+func (repository *PostgresRepository) HostForAgent(ctx context.Context, agentID string) (string, error) {
+	scope, err := repository.ScopeForAgent(ctx, agentID)
+	if err != nil {
+		return "", err
+	}
+	host, err := repository.getByAgent(ctx, scope, agentID)
+	if err != nil {
+		return "", err
+	}
+	return host.ID, nil
+}
+
 func (repository *PostgresRepository) RecordHello(ctx context.Context, scope platformscope.Scope, agentID string, at time.Time) (Host, error) {
 	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(agentID) || !validUTC(at) {
 		return Host{}, ErrInvalid

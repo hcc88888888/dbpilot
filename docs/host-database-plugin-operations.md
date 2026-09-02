@@ -73,6 +73,24 @@ origin reachable by Agents with their client certificate, not a browser TLS
 terminator. Configure the same origin as the Agent plugin
 `artifact_origin`. Short-lived lease URLs and headers remain memory-only.
 
+Before upgrading a deployment that already has `plugin_catalog.enabled: true`,
+add `artifact.plugin_lease_origin` and run the offline preflight before stopping
+the old Server:
+
+```bash
+dbpilot-controlplane --config /etc/dbpilot/controlplane.yaml --check-config
+```
+
+The command parses known fields and validates the complete configuration but
+does not open PostgreSQL, load runtime secrets, or bind listeners. A missing or
+non-HTTPS Agent-reachable origin fails with a fixed configuration error; do not
+derive it from a browser URL or wildcard listener. After preflight succeeds,
+restart the Server and confirm the Agent's `plugin.artifact_origin` names the
+same direct mTLS origin. Existing enrolled rows whose historical
+`operating_system` is `kylin` or `centos` are compatibility-mapped to the
+canonical execution OS `linux` for package selection; their displayed distro
+and version fields remain unchanged.
+
 ## Credentials
 
 Database instances store only an opaque `secret://` credential reference and,

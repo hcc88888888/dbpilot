@@ -676,6 +676,10 @@ func TestTrialMetricTemplateRejectsStaleConfigurationAndOperation(t *testing.T) 
 	require.Error(t, err)
 }
 
+func TestTrialGatewayAcceptsFixedHighCardinalityCode(t *testing.T) {
+	require.Equal(t, "high_cardinality", fixedPluginCode("high_cardinality"))
+}
+
 func TestTrialMetricTemplateRejectsDigestMappingAndCandidateViolations(t *testing.T) {
 	definition := &pluginv1.TrialMetricTemplateDefinition{TemplateId: "template-a", Revision: 1, QueryDigest: bytes.Repeat([]byte{1}, 32), QueryKind: "sql", ReadOnlyStatement: []byte("SELECT value"), CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 2, MaxColumns: 2, CardinalityLimit: 4, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role", Label: "role"}}}
 	require.False(t, validTrialTemplateDefinition(definition), "digest must match statement")

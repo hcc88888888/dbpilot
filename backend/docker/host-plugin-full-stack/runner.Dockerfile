@@ -9,7 +9,7 @@ WORKDIR /work
 
 COPY --chown=pwuser:pwuser backend/test/e2e/host-plugin-full-stack/package.json backend/test/e2e/host-plugin-full-stack/package-lock.json ./
 RUN npm ci --ignore-scripts
-COPY --chown=pwuser:pwuser backend/test/e2e/host-plugin-full-stack/playwright.config.mjs backend/test/e2e/host-plugin-full-stack/acceptance.spec.mjs ./
+COPY --chown=pwuser:pwuser backend/test/e2e/host-plugin-full-stack/playwright.config.mjs backend/test/e2e/host-plugin-full-stack/acceptance.spec.mjs backend/test/e2e/host-plugin-full-stack/plugin-package.mjs ./
 
 USER pwuser
 ENTRYPOINT ["npx", "playwright", "test", "--config", "playwright.config.mjs"]

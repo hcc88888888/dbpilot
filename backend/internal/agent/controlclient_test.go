@@ -132,6 +132,29 @@ func TestResultAckOnlyMarksMatchingDigestReported(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestWaitConnectedBlocksUntilAuthenticatedSessionAndObservesDisconnect(t *testing.T) {
+	client := &ControlClient{}
+	waitContext, cancelWait := context.WithTimeout(context.Background(), time.Second)
+	defer cancelWait()
+	connected := make(chan error, 1)
+	go func() { connected <- client.WaitConnected(waitContext) }()
+	select {
+	case <-connected:
+		t.Fatal("control readiness must wait for a live authenticated session")
+	case <-time.After(20 * time.Millisecond):
+	}
+	sessionContext, cancelSession := context.WithCancel(context.Background())
+	session := &controlSession{ctx: sessionContext}
+	client.setSession(session)
+	require.NoError(t, <-connected)
+
+	client.clearSession(session)
+	cancelSession()
+	disconnectedContext, cancelDisconnected := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelDisconnected()
+	require.ErrorIs(t, client.WaitConnected(disconnectedContext), ErrControlStreamDisconnected)
+}
+
 func TestStartDeadlineCrossingAfterJournalSyncDoesNotLaunchExecutor(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)

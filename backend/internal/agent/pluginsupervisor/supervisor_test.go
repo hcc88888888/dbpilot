@@ -74,24 +74,60 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	require.Equal(t, first.InstanceDescriptors, fixture.runner.configurations[2].InstanceDescriptors)
 	require.True(t, proto.Equal(first.TemplateConfigurations[0], fixture.health.requests[2].TemplateConfigurations[0]))
 	require.Equal(t, []string{"template-1"}, fixture.runner.configurations[2].TemplateIDs)
+	require.Equal(t, upgrade.OperationRevision, fixture.runner.configurations[2].OperationRevision, "the restored binary must run under the current rollback operation fence")
+	require.Equal(t, upgrade.OperationRevision, fixture.health.requests[2].OperationRevision)
+	require.Equal(t, upgrade.ConfigurationRevision, fixture.runner.configurations[2].ConfigurationRevision, "the restored binary must lease credentials under the current configuration fence")
+	require.Equal(t, upgrade.ConfigurationRevision, observed.State.ActiveConfigurationRevision)
 }
 
-func TestSupervisorHigherConfigurationRevisionRestartsSameVersion(t *testing.T) {
+func TestSupervisorHigherConfigurationRevisionAppliesAtomicallyToSameProcess(t *testing.T) {
 	fixture := newSupervisorFixture(t)
 	request := validReconcileRequest()
 	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
 	require.NoError(t, err)
-	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	first, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
 	require.NoError(t, err)
 
 	request.OperationRevision = 2
 	request.ConfigurationRevision = 2
+	request.InstanceIDs = append(request.InstanceIDs, "mysql-3")
+	request.InstanceDescriptors = append(request.InstanceDescriptors, InstanceDescriptor{InstanceID: "mysql-3", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3308"})
 	prepared, err = fixture.supervisor.Prepare(context.Background(), request)
 	require.NoError(t, err)
 	observed, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
 	require.NoError(t, err)
-	require.Equal(t, 2, fixture.runner.startCount())
+	require.Equal(t, 1, fixture.runner.startCount())
+	require.Equal(t, first.State.ProcessID, observed.State.ProcessID)
+	require.Len(t, fixture.health.applied, 1)
+	require.Equal(t, []string{"mysql-1", "mysql-2", "mysql-3"}, fixture.health.applied[0].InstanceIDs)
 	require.Equal(t, uint64(2), observed.State.ActiveConfigurationRevision)
+	require.Equal(t, uint32(3), observed.State.BoundInstanceCount)
+}
+
+func TestSupervisorFailedSameVersionConfigurationKeepsOldProcessAndConfiguration(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	first, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+
+	fixture.health.applyErr = ErrHealthHandshake
+	request.OperationRevision = 2
+	request.ConfigurationRevision = 2
+	request.InstanceIDs = append(request.InstanceIDs, "mysql-3")
+	request.InstanceDescriptors = append(request.InstanceDescriptors, InstanceDescriptor{InstanceID: "mysql-3", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3308"})
+	prepared, err = fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	observed, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.ErrorIs(t, err, ErrHealthHandshake)
+	require.Equal(t, 1, fixture.runner.startCount())
+	require.Equal(t, first.State.ProcessID, observed.State.ProcessID)
+	require.Equal(t, pluginstate.ProcessRunning, observed.State.ProcessState)
+	require.Equal(t, uint64(1), observed.State.ActiveConfigurationRevision)
+	require.Equal(t, uint32(2), observed.State.BoundInstanceCount)
+	require.Equal(t, "plugin_configuration_apply_failed", observed.State.LastErrorCode)
+	require.NotEqual(t, "plugin_upgrade_rolled_back", observed.State.LastErrorCode)
 }
 
 func TestSupervisorOpensCircuitAfterFiveFailuresAndOnlyHigherOperationResets(t *testing.T) {
@@ -290,6 +326,19 @@ func TestSupervisorPluginObservationRevisionAdvancesWhenAnotherFamilyChanges(t *
 	require.NoError(t, err)
 	second := fixture.supervisor.Observation()
 	require.Greater(t, second.GetObservationRevision(), first.GetObservationRevision())
+}
+
+func TestSupervisorRefreshesEquivalentObservationAfterControlReconnect(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	state := pluginstate.FamilyState{AssignmentID: "assignment-mysql", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredRunning, RequestFingerprint: strings.Repeat("a", 64), ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, DesiredConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 5, BoundInstanceCount: 1, ActiveInstanceIDs: []string{"mysql-1"}}
+	stored, err := fixture.store.Put(context.Background(), state)
+	require.NoError(t, err)
+	before := fixture.supervisor.Observation()
+	require.NoError(t, fixture.supervisor.RefreshObservation(context.Background()))
+	after := fixture.supervisor.Observation()
+	require.Greater(t, after.GetObservationRevision(), before.GetObservationRevision())
+	require.True(t, after.GetObservedAt().AsTime().After(before.GetObservedAt().AsTime()))
+	require.Equal(t, stored.ProcessID, fixture.store.families["mysql"].ProcessID)
 }
 
 func TestNewSupervisorRecoversPersistedFamilySlotsBeforeAcceptingCommands(t *testing.T) {
@@ -500,6 +549,13 @@ type fakeHealthChecker struct {
 	activationHealth pluginstate.HealthState
 	activationCode   string
 	requests         []HealthRequest
+	applied          []HealthRequest
+	applyErr         error
+}
+
+func (checker *fakeHealthChecker) ApplyConfiguration(_ context.Context, _ Process, request HealthRequest) error {
+	checker.applied = append(checker.applied, request)
+	return checker.applyErr
 }
 
 func (checker *fakeHealthChecker) ActivationState(Process) (pluginstate.HealthState, string) {

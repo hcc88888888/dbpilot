@@ -104,6 +104,8 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusPreconditionFailed, "state_revision_conflict", "Resource revision conflicts with the request"
 	case errors.Is(err, pluginassignment.ErrVersionUnavailable):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_version_unavailable", "Plugin version is unavailable"
+	case errors.Is(err, pluginassignment.ErrPlatformMismatch):
+		status, code, title = http.StatusUnprocessableEntity, "plugin_platform_mismatch", "Plugin platform is unsupported"
 	case errors.Is(err, pluginassignment.ErrVersionRevoked):
 		status, code, title = http.StatusConflict, "plugin_version_revoked", "Plugin version is revoked"
 	case errors.Is(err, pluginassignment.ErrCapacity):

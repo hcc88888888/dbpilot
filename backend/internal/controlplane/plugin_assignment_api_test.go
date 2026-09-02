@@ -459,7 +459,7 @@ func TestPluginAssignmentProblemsAreStableAndRedacted(t *testing.T) {
 		err    error
 		status int
 		code   string
-	}{{pluginassignment.ErrInvalid, http.StatusBadRequest, "invalid_request"}, {pluginassignment.ErrNotFound, http.StatusNotFound, "not_found"}, {pluginassignment.ErrConflict, http.StatusConflict, "conflict"}, {pluginassignment.ErrPrecondition, http.StatusPreconditionFailed, "state_revision_conflict"}, {pluginassignment.ErrVersionUnavailable, http.StatusUnprocessableEntity, "plugin_version_unavailable"}, {pluginassignment.ErrVersionRevoked, http.StatusConflict, "plugin_version_revoked"}}
+	}{{pluginassignment.ErrInvalid, http.StatusBadRequest, "invalid_request"}, {pluginassignment.ErrNotFound, http.StatusNotFound, "not_found"}, {pluginassignment.ErrConflict, http.StatusConflict, "conflict"}, {pluginassignment.ErrPrecondition, http.StatusPreconditionFailed, "state_revision_conflict"}, {pluginassignment.ErrVersionUnavailable, http.StatusUnprocessableEntity, "plugin_version_unavailable"}, {pluginassignment.ErrPlatformMismatch, http.StatusUnprocessableEntity, "plugin_platform_mismatch"}, {pluginassignment.ErrVersionRevoked, http.StatusConflict, "plugin_version_revoked"}}
 	for _, test := range tests {
 		problem := problemForError(test.err, "request-a", "/plugin-assignments/assignment-a")
 		require.Equal(t, test.status, problem.Status)

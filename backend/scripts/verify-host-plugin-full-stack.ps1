@@ -31,6 +31,7 @@ $backendRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $repoRoot = (Resolve-Path (Join-Path $backendRoot '..')).Path
 $composeFile = Join-Path $backendRoot 'docker\host-plugin-full-stack\docker-compose.yml'
 $null = . (Join-Path $PSScriptRoot 'container-safety.ps1')
+$null = . (Join-Path $PSScriptRoot 'bounded-process.ps1')
 
 function Resolve-RequiredExecutable {
     param([string]$Value, [string]$CommandName, [string[]]$Candidates, [string]$Failure)
@@ -75,9 +76,11 @@ $containerIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ord
 $runnerContainerIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $networkIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $volumeNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$imageIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $ownedContainerIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $ownedNetworkIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $ownedVolumeNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$ownedImageIDs = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $primaryFailure = $null
 $cleanupFailures = [Collections.Generic.List[object]]::new()
 $temporaryCreated = $false
@@ -93,95 +96,6 @@ $env:DBPILOT_KYLIN_IMAGE = $KylinImage
 
 function Get-UTCInstant {
     return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [Globalization.CultureInfo]::InvariantCulture)
-}
-
-function Set-BoundedProcessArguments {
-    param([Diagnostics.ProcessStartInfo]$StartInfo, [string[]]$Arguments)
-    if ($null -ne $StartInfo.PSObject.Properties['ArgumentList']) {
-        foreach ($argument in $Arguments) { $null = $StartInfo.ArgumentList.Add([string]$argument) }
-        return
-    }
-    $StartInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-DBPilotNativeArgument ([string]$_) }) -join ' ')
-}
-
-function Stop-BoundedProcessTree {
-    param([Diagnostics.Process]$Process)
-    try { if ($Process.HasExited) { return } } catch { return }
-    if ($env:OS -eq 'Windows_NT') {
-        $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-        if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
-            $taskkillInfo = [Diagnostics.ProcessStartInfo]::new()
-            $taskkillInfo.FileName = $taskkill
-            $taskkillInfo.UseShellExecute = $false
-            $taskkillInfo.CreateNoWindow = $true
-            $taskkillInfo.RedirectStandardOutput = $true
-            $taskkillInfo.RedirectStandardError = $true
-            Set-BoundedProcessArguments $taskkillInfo @('/PID', [string]$Process.Id, '/T', '/F')
-            $killer = [Diagnostics.Process]::new()
-            $killer.StartInfo = $taskkillInfo
-            try {
-                if ($killer.Start()) {
-                    $stdoutTask = $killer.StandardOutput.ReadToEndAsync()
-                    $stderrTask = $killer.StandardError.ReadToEndAsync()
-                    if (-not $killer.WaitForExit(10000)) { try { $killer.Kill() } catch { } }
-                    $null = $killer.WaitForExit(2000)
-                    $null = $stdoutTask.GetAwaiter().GetResult()
-                    $null = $stderrTask.GetAwaiter().GetResult()
-                }
-            } catch { } finally { $killer.Dispose() }
-        }
-    }
-    try { if ($Process.HasExited) { return } } catch { return }
-    try {
-        $treeKill = $Process.GetType().GetMethod('Kill', [type[]]@([bool]))
-        if ($null -ne $treeKill) { $null = $treeKill.Invoke($Process, @($true)) } else { $Process.Kill() }
-    } catch { try { $Process.Kill() } catch { } }
-}
-
-function Invoke-BoundedProcess {
-    param(
-        [Parameter(Mandatory = $true)][string]$Command,
-        [string[]]$Arguments = @(),
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
-        [Parameter(Mandatory = $true)][string]$StartFailure,
-        [Parameter(Mandatory = $true)][string]$TimeoutFailure
-    )
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $commandArguments = @($Arguments)
-    if ([IO.Path]::GetExtension($Command) -ieq '.ps1') {
-        $startInfo.FileName = (Get-Process -Id $PID).Path
-        $commandArguments = @('-NoProfile', '-File', $Command) + $commandArguments
-    } else {
-        $startInfo.FileName = $Command
-    }
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    foreach ($key in [Environment]::GetEnvironmentVariables().Keys) {
-        $startInfo.EnvironmentVariables[[string]$key] = [string][Environment]::GetEnvironmentVariable([string]$key)
-    }
-    Set-BoundedProcessArguments $startInfo $commandArguments
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        try { if (-not $process.Start()) { throw $StartFailure } } catch { throw $StartFailure }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            Stop-BoundedProcessTree $process
-            $null = $process.WaitForExit(5000)
-            throw $TimeoutFailure
-        }
-        $process.WaitForExit()
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($stdout.Length -gt 1000000) { $stdout = $stdout.Substring($stdout.Length - 1000000) }
-        if ($stderr.Length -gt 1000000) { $stderr = $stderr.Substring($stderr.Length - 1000000) }
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout.Trim(); Stderr = $stderr.Trim() }
-    } finally {
-        $process.Dispose()
-    }
 }
 
 function Invoke-DockerProcess {
@@ -269,9 +183,11 @@ function Write-ResourceLedger {
         container_ids = @($containerIDs | Sort-Object)
         network_ids = @($networkIDs | Sort-Object)
         volume_ids = @($volumeNames | Sort-Object)
+        image_ids = @($imageIDs | Sort-Object)
         owned_container_ids = @($ownedContainerIDs | Sort-Object)
         owned_network_ids = @($ownedNetworkIDs | Sort-Object)
         owned_volume_ids = @($ownedVolumeNames | Sort-Object)
+        owned_image_ids = @($ownedImageIDs | Sort-Object)
     }
     [IO.File]::WriteAllText($ledgerPath, (($ledger | ConvertTo-Json -Depth 4) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
 }
@@ -305,6 +221,26 @@ function Register-OwnedResources {
     Write-ResourceLedger
 }
 
+function Register-OwnedRunnerImage {
+    $imageMatches = @(ConvertTo-OutputLines (Invoke-DockerCapture @('image', 'ls', '--no-trunc', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to resolve the acceptance-runner image ID.'))
+    if ($imageMatches.Count -ne 1) { throw 'The acceptance-runner image ownership query was not unique.' }
+    $id = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{.Id}}', $imageMatches[0]) 'Unable to canonicalize the acceptance-runner image ID.').Trim()
+    if ($id -notmatch '^sha256:[0-9a-f]{64}$') { throw 'The acceptance-runner image ID is invalid.' }
+    $labels = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{ index .Config.Labels "dbpilot.verifier" }}|{{ index .Config.Labels "dbpilot.run" }}', $id) 'Unable to inspect acceptance-runner image ownership.').Trim()
+    if ($labels -cne "$verifierLabel|$RunId") { throw 'The acceptance-runner image ownership labels do not match.' }
+    $null = $imageIDs.Add($id)
+    $null = $ownedImageIDs.Add($id)
+    Write-ResourceLedger
+}
+
+function Remove-OwnedRunnerImage {
+    param([string]$ImageID)
+    if (-not $ownedImageIDs.Contains($ImageID) -or $ImageID -notmatch '^sha256:[0-9a-f]{64}$') { throw 'Refusing unrecorded acceptance-runner image cleanup.' }
+    $labels = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{ index .Config.Labels "dbpilot.verifier" }}|{{ index .Config.Labels "dbpilot.run" }}', $ImageID) 'Unable to revalidate acceptance-runner image ownership.').Trim()
+    if ($labels -cne "$verifierLabel|$RunId") { throw 'Refusing mismatched acceptance-runner image cleanup.' }
+    Invoke-DockerChecked @('image', 'rm', $ImageID) -Failure 'Unable to remove the exact acceptance-runner image.'
+}
+
 function Assert-NoRunOwnershipCollision {
     $queries = @(
         @('ps', '-a', '--no-trunc', '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}'),
@@ -312,7 +248,8 @@ function Assert-NoRunOwnershipCollision {
         @('network', 'ls', '--no-trunc', '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}'),
         @('network', 'ls', '--no-trunc', '--filter', "label=com.docker.compose.project=$projectName", '--format', '{{.ID}}'),
         @('volume', 'ls', '--filter', "label=dbpilot.run=$RunId", '--format', '{{.Name}}'),
-        @('volume', 'ls', '--filter', "label=com.docker.compose.project=$projectName", '--format', '{{.Name}}')
+        @('volume', 'ls', '--filter', "label=com.docker.compose.project=$projectName", '--format', '{{.Name}}'),
+        @('image', 'ls', '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}')
     )
     foreach ($arguments in $queries) {
         $matches = ConvertTo-OutputLines (Invoke-DockerCapture $arguments 'Unable to audit host-plugin full-stack run ownership before creation.')
@@ -379,6 +316,42 @@ function Save-BoundedContainerLog {
     [IO.File]::WriteAllText($Path, (Redact-Text $body), [Text.UTF8Encoding]::new($false))
 }
 
+function Get-AcceptanceFailureStage {
+    param([string]$ContainerID)
+    $stagePath = Join-Path $temporaryRoot "$ContainerID-stage.json"
+    try {
+        Invoke-DockerChecked @('cp', "${ContainerID}:/acceptance/state/host-plugin-phase.json", $stagePath) -Failure 'Unable to copy bounded acceptance failure state.'
+        if (-not (Test-Path -LiteralPath $stagePath -PathType Leaf) -or (Get-Item -LiteralPath $stagePath).Length -gt 65536) { return 'unknown' }
+        try { $state = [IO.File]::ReadAllText($stagePath) | ConvertFrom-Json } catch { return 'unknown' }
+        if ($state.diagnostic_stage -is [string] -and $state.diagnostic_stage -match '^[a-z][a-z0-9-]{0,63}$') { return $state.diagnostic_stage }
+        return 'unknown'
+    } catch {
+        return 'unknown'
+    } finally {
+        Remove-Item -LiteralPath $stagePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-AssertionFailureStage {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'unknown' }
+    $body = [IO.File]::ReadAllText($Path)
+    $stateMatch = [regex]::Match($body, 'host plugin phase state invalid: (enrollment|version|assignment|assignment-pid|instances|template|high-cardinality|high-cardinality-job|restart-boundaries)')
+    if ($stateMatch.Success) { return ('state-' + $stateMatch.Groups[1].Value) }
+    $fixed = [ordered]@{
+        'host plugin assertion arguments are invalid' = 'arguments'
+        'host plugin database credential is unavailable' = 'database-credential'
+        'host plugin phase state is unavailable or invalid' = 'state'
+        'host plugin assertion connection failed' = 'database-connection'
+        'Agent command journal diagnostic is unavailable' = 'journal-open'
+        'Agent spool retains pending metric batches' = 'spool-pending'
+    }
+    foreach ($message in $fixed.Keys) {
+        if ($body.Contains($message)) { return $fixed[$message] }
+    }
+    return 'assertion'
+}
+
 function Invoke-ComposeJob {
     param([string]$Service, [string[]]$Command = @(), [hashtable]$Environment = @{}, [switch]$ExpectedFailure)
     $arguments = @('run', '-d', '--no-deps')
@@ -397,19 +370,47 @@ function Invoke-ComposeJob {
     $code = Wait-ContainerExit $id $Service
     $logPath = Join-Path $temporaryRoot "$id.log"
     Save-BoundedContainerLog $id $logPath
-    if (-not $ExpectedFailure -and $code -ne 0) { throw "The '$Service' phase failed with exit code $code." }
+    if (-not $ExpectedFailure -and $code -ne 0) {
+        $stage = if ($Service -ceq 'acceptance-runner') { Get-AcceptanceFailureStage $id } elseif ($Service -ceq 'assertions') { Get-AssertionFailureStage $logPath } else { 'unknown' }
+        throw "The '$Service' phase failed with exit code $code at stage '$stage'."
+    }
     if ($ExpectedFailure -and $code -eq 0) { throw "The '$Service' negative phase unexpectedly succeeded." }
     return [pscustomobject]@{ ContainerID = $id; ExitCode = $code; TimedOut = ($code -eq 124); LogPath = $logPath }
 }
 
 function Invoke-AssertionPhase {
-    param([ValidateSet('host-plugin')][string]$Phase)
+    param([ValidateSet('host-plugin', 'trial-diagnostic')][string]$Phase)
     return Invoke-ComposeJob -Service 'assertions' -Environment @{ DBPILOT_ASSERTION_PHASE = $Phase }
 }
 
+function Write-TrialFailureDiagnostic {
+    param([Parameter(Mandatory = $true)]$Result)
+    if ([string]::IsNullOrWhiteSpace($Result.LogPath) -or -not (Test-Path -LiteralPath $Result.LogPath -PathType Leaf)) { return }
+    $body = [IO.File]::ReadAllText($Result.LogPath).Trim()
+    if ($body.Length -eq 0 -or $body.Length -gt 2048) { return }
+    try { $value = $body | ConvertFrom-Json } catch { return }
+    $allowed = @('job_status', 'command_status', 'command_phase', 'journal_state', 'result_state', 'trial_code', 'reported')
+    $actual = @($value.PSObject.Properties.Name)
+    if ($actual.Count -ne $allowed.Count -or @($actual | Where-Object { $_ -cnotin $allowed }).Count -ne 0) { return }
+    foreach ($name in @('job_status', 'command_status', 'command_phase', 'journal_state', 'result_state', 'trial_code')) {
+        if ($value.$name -isnot [string] -or $value.$name -notmatch '^[a-z_]+$') { return }
+    }
+    if ($value.reported -isnot [bool]) { return }
+    Write-Host ('Host-plugin bounded trial diagnostic: ' + ($value | ConvertTo-Json -Compress))
+}
+
 function Invoke-AcceptancePhase {
-    param([ValidateSet('enrollment', 'platform', 'template', 'stop', 'restart', 'rollback', 'convergence', 'browser')][string]$Phase)
-    return Invoke-ComposeJob -Service 'acceptance-runner' -Environment @{ DBPILOT_ACCEPTANCE_PHASE = $Phase }
+    param(
+        [ValidateSet('enrollment', 'platform', 'template', 'stop', 'restart', 'rollback', 'capture-agent-restart', 'capture-agent-stopped', 'convergence-agent', 'capture-server-restart', 'capture-server-stopped', 'convergence-server', 'browser', 'failure-canary')][string]$Phase,
+        [string]$RestartBoundaryUTC,
+        [switch]$ExpectedFailure
+    )
+    $environment = @{ DBPILOT_ACCEPTANCE_PHASE = $Phase }
+    if (-not [string]::IsNullOrWhiteSpace($RestartBoundaryUTC)) {
+        if ($RestartBoundaryUTC -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$') { throw 'The restart boundary is invalid.' }
+        $environment.RESTART_BOUNDARY_UTC = $RestartBoundaryUTC
+    }
+    return Invoke-ComposeJob -Service 'acceptance-runner' -Environment $environment -ExpectedFailure:$ExpectedFailure
 }
 
 function Write-SuccessSummary {
@@ -505,23 +506,52 @@ function Collect-FailureArtifacts {
     $destination = Join-Path $FailureArtifactRoot "dbpilot-host-plugin-failure-$RunId"
     if (Test-Path -LiteralPath $destination) { throw 'The failure artifact directory already exists.' }
     New-Item -ItemType Directory -Path $destination | Out-Null
+    $diagnostic = [ordered]@{
+        version = 1
+        run_id = $RunId
+        failure_code = 'host_plugin_acceptance_failed'
+        recorded_container_count = $containerIDs.Count
+        recorded_network_count = $networkIDs.Count
+        recorded_volume_count = $volumeNames.Count
+    }
+    [IO.File]::WriteAllText((Join-Path $destination 'diagnostic.json'), ($diagnostic | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    return $destination
+}
+
+function Assert-FailureCanariesAbsent {
+    param([string]$ArtifactPath)
+    $canaries = @(
+        'DBPILOT_CANARY_SQL_7f30e2',
+        'DBPILOT_CANARY_PACKAGE_BYTES_7f30e2',
+        'DBPILOT_CANARY_TRIAL_ROW_7f30e2',
+        'DBPILOT_CANARY_RAW_INSPECT_7f30e2',
+        'DBPILOT_CANARY_NON_PEM_PRIVATE_KEY_7f30e2'
+    )
     foreach ($id in $ownedContainerIDs) {
-        try { Save-BoundedContainerLog $id (Join-Path $destination "$id.log") } catch { }
-    }
-    if (Test-Path -LiteralPath $ledgerPath -PathType Leaf) { Copy-Item -LiteralPath $ledgerPath -Destination (Join-Path $destination 'resource-ledger.json') }
-    foreach ($id in $runnerContainerIDs) {
-        $playwright = Join-Path $destination "playwright-$id"
-        New-Item -ItemType Directory -Path $playwright | Out-Null
-        try { Invoke-DockerChecked @('cp', "${id}:/acceptance/artifacts/playwright/.", $playwright) } catch { Remove-Item -LiteralPath $playwright -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-    foreach ($file in Get-ChildItem -LiteralPath $destination -Recurse -File -ErrorAction SilentlyContinue) {
-        if ($file.Extension -notin @('.log', '.txt', '.html', '.json', '.png')) { Remove-Item -LiteralPath $file.FullName -Force; continue }
-        if ($file.Extension -ne '.png') {
-            $body = [IO.File]::ReadAllText($file.FullName)
-            [IO.File]::WriteAllText($file.FullName, (Redact-Text $body), [Text.UTF8Encoding]::new($false))
+        $result = Invoke-DockerProcess @('logs', '--tail', '500', $id)
+        if ($result.ExitCode -ne 0) { continue }
+        $body = @($result.Stdout, $result.Stderr) -join [Environment]::NewLine
+        foreach ($canary in $canaries) {
+            if ($body.Contains($canary)) { throw 'A prohibited failure canary entered a container log.' }
         }
     }
-    return $destination
+    $files = @(Get-ChildItem -LiteralPath $ArtifactPath -Recurse -File -ErrorAction Stop)
+    if ($files.Count -ne 1 -or $files[0].Extension -cne '.json' -or $files[0].Length -gt 65536) {
+        throw 'Failure artifacts contain a non-auditable file.'
+    }
+    $retained = [IO.File]::ReadAllText($files[0].FullName)
+    foreach ($canary in $canaries) {
+        if ($retained.Contains($canary)) { throw 'A prohibited failure canary entered a retained artifact.' }
+    }
+}
+
+function Remove-SafeFailureArtifactDirectory {
+    param([string]$Path)
+    $expected = [IO.Path]::GetFullPath((Join-Path $FailureArtifactRoot "dbpilot-host-plugin-failure-$RunId"))
+    if ([IO.Path]::GetFullPath($Path) -cne $expected -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw 'Refusing unsafe failure artifact cleanup.'
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
 function Assert-ZeroResidualResources {
@@ -538,9 +568,14 @@ function Assert-ZeroResidualResources {
         $remainingVolumes = ConvertTo-OutputLines (Invoke-DockerCapture @('volume', 'ls', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.Name}}') 'Unable to audit host-plugin full-stack volumes by ownership label.')
         if ($remainingVolumes.Count -ne 0) { $auditFailures.Add('Host-plugin host-plugin full-stack cleanup left an owned volume behind.') }
     } catch { $auditFailures.Add('Unable to audit host-plugin full-stack volumes by ownership label.') }
+    try {
+        $remainingImages = ConvertTo-OutputLines (Invoke-DockerCapture @('image', 'ls', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to audit host-plugin full-stack images by ownership label.')
+        if ($remainingImages.Count -ne 0) { $auditFailures.Add('Host-plugin host-plugin full-stack cleanup left an owned image behind.') }
+    } catch { $auditFailures.Add('Unable to audit host-plugin full-stack images by ownership label.') }
     foreach ($id in $containerIDs) { try { $result = Invoke-DockerProcess @('inspect', $id); if ($result.ExitCode -eq 0) { $auditFailures.Add("Recorded container '$id' remains after cleanup.") } } catch { $auditFailures.Add("Unable to audit recorded container '$id'.") } }
     foreach ($id in $networkIDs) { try { $result = Invoke-DockerProcess @('network', 'inspect', $id); if ($result.ExitCode -eq 0) { $auditFailures.Add("Recorded network '$id' remains after cleanup.") } } catch { $auditFailures.Add("Unable to audit recorded network '$id'.") } }
     foreach ($name in $volumeNames) { try { $result = Invoke-DockerProcess @('volume', 'inspect', $name); if ($result.ExitCode -eq 0) { $auditFailures.Add("Recorded volume '$name' remains after cleanup.") } } catch { $auditFailures.Add("Unable to audit recorded volume '$name'.") } }
+    foreach ($id in $imageIDs) { try { $result = Invoke-DockerProcess @('image', 'inspect', $id); if ($result.ExitCode -eq 0) { $auditFailures.Add("Recorded image '$id' remains after cleanup.") } } catch { $auditFailures.Add("Unable to audit recorded image '$id'.") } }
     if ($auditFailures.Count -ne 0) { throw ($auditFailures -join ' ') }
 }
 
@@ -595,6 +630,11 @@ try {
             $build = Invoke-BoundedProcess -Command $GoBinary -Arguments @('-C', $backendRoot, 'build', '-trimpath', '-o', $output, $target.Package) -TimeoutSeconds $BuildTimeoutSeconds -StartFailure "The $($target.Name) static build could not start." -TimeoutFailure "The $($target.Name) static build timed out."
             if ($build.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $output -PathType Leaf)) { throw "The $($target.Name) static build failed." }
         }
+        [Environment]::SetEnvironmentVariable('GOARCH', 'arm64')
+        [Environment]::SetEnvironmentVariable('GOAMD64', $null)
+        $arm64Output = Join-Path $binaryRoot 'dbpilot-plugin-mysql-arm64'
+        $arm64Build = Invoke-BoundedProcess -Command $GoBinary -Arguments @('-C', $backendRoot, 'build', '-trimpath', '-o', $arm64Output, './cmd/dbpilot-plugin-mysql') -TimeoutSeconds $BuildTimeoutSeconds -StartFailure 'The dbpilot-plugin-mysql arm64 static build could not start.' -TimeoutFailure 'The dbpilot-plugin-mysql arm64 static build timed out.'
+        if ($arm64Build.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $arm64Output -PathType Leaf)) { throw 'The dbpilot-plugin-mysql arm64 static build failed.' }
     } finally {
         foreach ($name in $savedBuildEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedBuildEnvironment[$name]) }
     }
@@ -602,6 +642,7 @@ try {
     Invoke-ComposeChecked @('--profile', '*', 'config', '--quiet')
     Invoke-PublicImageMaterialization
     Invoke-ComposeChecked -Arguments @('build', 'acceptance-runner') -TimeoutSeconds $BuildTimeoutSeconds -Failure 'The acceptance-runner image build failed.' -TimeoutFailure 'The acceptance-runner image build timed out.'
+    Register-OwnedRunnerImage
     Register-OwnedResources
 
     Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'asset-builder')
@@ -662,18 +703,28 @@ try {
     $null = Invoke-AcceptancePhase 'restart'
     $null = Invoke-AcceptancePhase 'rollback'
 
+    $null = Invoke-AcceptancePhase 'capture-agent-restart'
     Invoke-DockerChecked @('stop', '--time', '20', $procHelperID)
     Invoke-DockerChecked @('stop', '--time', '20', $agentID)
+    $agentStoppedAt = Get-UTCInstant
     Invoke-DockerChecked @('start', $agentID)
     Invoke-DockerChecked @('start', $procHelperID)
     Wait-Healthy $procHelperID 'proc-helper'
-    $null = Invoke-AcceptancePhase 'convergence'
+    $null = Invoke-AcceptancePhase 'capture-agent-stopped' -RestartBoundaryUTC $agentStoppedAt
+    $null = Invoke-AcceptancePhase 'convergence-agent'
 
+    $null = Invoke-AcceptancePhase 'capture-server-restart'
     Invoke-DockerChecked @('stop', '--time', '20', $controlplaneID)
+    $serverStoppedAt = Get-UTCInstant
     Invoke-DockerChecked @('start', $controlplaneID)
     Wait-Healthy $controlplaneID 'controlplane'
-    $null = Invoke-AcceptancePhase 'convergence'
+    $null = Invoke-AcceptancePhase 'capture-server-stopped' -RestartBoundaryUTC $serverStoppedAt
+    $null = Invoke-AcceptancePhase 'convergence-server'
     $null = Invoke-AcceptancePhase 'browser'
+    $null = Invoke-AcceptancePhase 'failure-canary' -ExpectedFailure
+    $canaryArtifacts = Collect-FailureArtifacts
+    Assert-FailureCanariesAbsent $canaryArtifacts
+    Remove-SafeFailureArtifactDirectory $canaryArtifacts
     Invoke-DockerChecked @('stop', '--time', '20', $procHelperID)
     Invoke-DockerChecked @('stop', '--time', '20', $agentID)
     $null = Invoke-AssertionPhase 'host-plugin'
@@ -682,6 +733,13 @@ try {
 }
 catch {
     $primaryFailure = $_
+	if ($primaryFailure.Exception.Message -match "stage 'job-status-running'" -and -not [string]::IsNullOrWhiteSpace($agentID) -and -not [string]::IsNullOrWhiteSpace($procHelperID)) {
+		try {
+			Invoke-DockerChecked @('stop', '--time', '20', $procHelperID)
+			Invoke-DockerChecked @('stop', '--time', '20', $agentID)
+			Write-TrialFailureDiagnostic (Invoke-AssertionPhase 'trial-diagnostic')
+		} catch { Write-Warning 'The bounded trial diagnostic could not be collected.' }
+	}
 }
 finally {
     if ($ownershipStarted) {
@@ -690,12 +748,16 @@ finally {
     if ($null -ne $primaryFailure -and $ownershipStarted) {
         try {
             $failureArtifactPath = Collect-FailureArtifacts
+            Assert-FailureCanariesAbsent $failureArtifactPath
             Write-Host "Host-plugin host-plugin full-stack failure artifacts: $failureArtifactPath"
         } catch { $cleanupFailures.Add($_) }
     }
     if ($ownershipStarted) {
         foreach ($id in @($ownedContainerIDs) | Sort-Object -Descending) {
             try { Remove-DBPilotRecordedContainer -DockerBinary $DockerBinary -ContainerID $id -Verifier $verifierLabel -RunLabel $RunId -InvokeDocker $boundedDockerInvoker } catch { $cleanupFailures.Add($_) }
+        }
+        foreach ($id in @($ownedImageIDs) | Sort-Object -Descending) {
+            try { Remove-OwnedRunnerImage $id } catch { $cleanupFailures.Add($_) }
         }
         foreach ($id in @($ownedNetworkIDs) | Sort-Object -Descending) {
             try { Remove-DBPilotRecordedNetwork -DockerBinary $DockerBinary -NetworkID $id -Verifier $verifierLabel -RunLabel $RunId -InvokeDocker $boundedDockerInvoker } catch { $cleanupFailures.Add($_) }
@@ -718,7 +780,7 @@ finally {
     }
 
     if ($cleanupFailures.Count -eq 0 -and $ownershipStarted) {
-        Write-Host "Host-plugin host-plugin full-stack cleanup audit passed: containers=$($containerIDs.Count) networks=$($networkIDs.Count) volumes=$($volumeNames.Count) temporary_directory=removed."
+        Write-Host "Host-plugin host-plugin full-stack cleanup audit passed: containers=$($containerIDs.Count) networks=$($networkIDs.Count) volumes=$($volumeNames.Count) images=$($imageIDs.Count) temporary_directory=removed."
     } else {
         foreach ($failure in $cleanupFailures) { Write-Error (Redact-Text $failure.Exception.Message) -ErrorAction Continue }
     }

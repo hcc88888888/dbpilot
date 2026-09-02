@@ -79,6 +79,18 @@ func TestDockerServerRejectsInvalidInternalEndpointInsteadOfForwardingRawInspect
 	}
 }
 
+func TestDockerServerRejectsUnsafeInternalAddresses(t *testing.T) {
+	for _, address := range []string{"0.0.0.0", "::", "127.0.0.1", "::1", "169.254.10.20", "fe80::1", "224.0.0.1", "ff02::1"} {
+		t.Run(address, func(t *testing.T) {
+			_, err := protobufObservation(ContainerObservation{
+				ContainerID: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", Name: "mysql-a", Image: "mysql:8.4", State: "running", ObservedAt: time.Now().UTC(),
+				InternalEndpoints: []InternalEndpoint{{NetworkName: "dbpilot_acceptance", Address: address, Port: 3306, Protocol: "tcp"}},
+			}, nil, []string{"dbpilot_acceptance"})
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestDockerServerRejectsUnknownLabelsAndInvalidRuleRevision(t *testing.T) {
 	service, err := NewService(&fakeEngine{}, []string{"dbpilot.discovery.family"})
 	require.NoError(t, err)

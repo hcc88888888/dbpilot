@@ -190,9 +190,11 @@ func TestPostgresStoreUsesManagedHostHeartbeatSoStoppedPluginMetricsBecomeStale(
 	detail, err := store.GetInstance(context.Background(), scope, "mysql-1", RangeQuery{From: now.Add(-time.Hour), To: now, Step: 5 * time.Minute})
 	require.NoError(t, err)
 	require.Equal(t, StatusStale, detail.Instance.Status)
-	require.Len(t, detail.Metrics, 1)
-	require.Equal(t, StatusStale, detail.Metrics[0].Status)
-	require.Nil(t, detail.Metrics[0].Buckets[len(detail.Metrics[0].Buckets)-1].Value)
+	require.Len(t, detail.Metrics, len(MySQLBuiltinMetricIDs()))
+	for _, series := range detail.Metrics {
+		require.Equal(t, StatusStale, series.Status)
+		require.Nil(t, series.Buckets[len(series.Buckets)-1].Value)
+	}
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

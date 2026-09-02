@@ -136,6 +136,38 @@ func TestMetricTemplatePostgres16TrialConcurrencyTimeoutAndBoundedMetrics(t *tes
 	require.Equal(t, StatusTrialPassed, passed.Status)
 }
 
+func TestMetricTemplatePostgres16RecordsFixedHighCardinalityFailureWithoutCandidateRows(t *testing.T) {
+	database, scope := metricTemplatePostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	repository := NewPostgresRepository(database, jobs)
+	service := NewService(repository, DeterministicDialectValidator{Validate: func(context.Context, TemplateDefinition) error { return nil }}, repository, time.Now)
+	seedMetricTemplateTrialTarget(t, database, scope, time.Now().UTC())
+
+	_, err := service.CreateTemplate(ctx, scope, TemplateDraft{ID: "mysql.high_cardinality_failure", DatabaseFamily: "mysql", Name: "High cardinality failure"}, integrationActor("creator", "createMetricTemplate", "high-card-template"))
+	require.NoError(t, err)
+	definition := validDefinition()
+	definition.MaxRows = 20
+	definition.CardinalityLimit = 5
+	definition.LabelMappings = []LabelMapping{{SourceColumn: "dimension", Label: "dimension"}}
+	draft, err := service.CreateDraft(ctx, scope, "mysql.high_cardinality_failure", Draft{CreatedBy: "creator", TemplateDefinition: definition}, integrationActor("creator", "createMetricTemplateRevision", "high-card-draft"))
+	require.NoError(t, err)
+	validated, err := service.Validate(ctx, scope, draft.ID, draft.ResourceRevision, integrationActor("creator", "validateMetricTemplateRevision", "high-card-validate"))
+	require.NoError(t, err)
+	trialJob, err := service.StartTrial(ctx, scope, validated.ID, TrialRequest{InstanceID: "instance-task12", PluginVersionID: "version-task12", Actor: integrationActor("creator", "trialMetricTemplateRevision", "high-card-trial")})
+	require.NoError(t, err)
+
+	result := TrialResult{RevisionID: validated.ID, QueryDigest: validated.QueryDigest, StatusCode: "high_cardinality", RowCount: 11, ColumnCount: 2, DurationMillis: 10}
+	require.NoError(t, result.Validate())
+	failed, err := repository.RecordTrialResult(ctx, scope, trialJob.ID, result, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, StatusTrialFailed, failed.Status)
+	var status, code string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT status,status_code FROM metric_template_trials WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, trialJob.ID).Scan(&status, &code))
+	require.Equal(t, "failed", status)
+	require.Equal(t, "high_cardinality", code)
+}
+
 func TestMetricTemplatePostgres16WorkflowRevisionRaceRollbackAndRedaction(t *testing.T) {
 	database, scope := metricTemplatePostgresFixture(t)
 	ctx := context.Background()

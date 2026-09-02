@@ -564,41 +564,76 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 }
 
 type deferredPluginLeaseClient struct {
-	mu     sync.RWMutex
-	client *agent.ControlClient
+	mu          sync.Mutex
+	client      *agent.ControlClient
+	ready       chan struct{}
+	readyClosed bool
 }
 
 func (client *deferredPluginLeaseClient) Set(control *agent.ControlClient) {
 	client.mu.Lock()
+	if client.ready == nil {
+		client.ready = make(chan struct{})
+	}
 	client.client = control
+	if control != nil && !client.readyClosed {
+		close(client.ready)
+		client.readyClosed = true
+	}
 	client.mu.Unlock()
 }
 
+func (client *deferredPluginLeaseClient) awaitControl(ctx context.Context) *agent.ControlClient {
+	if client == nil || ctx == nil || ctx.Err() != nil {
+		return nil
+	}
+	client.mu.Lock()
+	if client.ready == nil {
+		client.ready = make(chan struct{})
+	}
+	control, ready := client.client, client.ready
+	client.mu.Unlock()
+	if control != nil {
+		return control
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-ready:
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.client
+}
+
 func (client *deferredPluginLeaseClient) LeasePluginArtifact(ctx context.Context, request pluginsupervisor.ArtifactLeaseRequest) (pluginsupervisor.ArtifactLease, error) {
-	client.mu.RLock()
-	control := client.client
-	client.mu.RUnlock()
+	control := client.awaitControl(ctx)
 	if control == nil {
+		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
+	}
+	if control.WaitConnected(ctx) != nil {
 		return pluginsupervisor.ArtifactLease{}, pluginsupervisor.ErrArtifactLease
 	}
 	return control.LeasePluginArtifact(ctx, request)
 }
 
 func (client *deferredPluginLeaseClient) LeaseCredential(ctx context.Context, request pluginsupervisor.CredentialLeaseRequest) (pluginsupervisor.CredentialLease, error) {
-	client.mu.RLock()
-	control := client.client
-	client.mu.RUnlock()
+	control := client.awaitControl(ctx)
 	if control == nil {
+		return pluginsupervisor.CredentialLease{}, agent.ErrCredentialLease
+	}
+	if control.WaitConnected(ctx) != nil {
 		return pluginsupervisor.CredentialLease{}, agent.ErrCredentialLease
 	}
 	return control.LeaseCredential(ctx, request)
 }
 
 func (client *deferredPluginLeaseClient) LeaseMetricTemplate(ctx context.Context, request metrictemplatelease.Request) (metrictemplatelease.Material, error) {
-	client.mu.RLock()
-	control := client.client
-	client.mu.RUnlock()
+	control := client.awaitControl(ctx)
 	if control == nil {
+		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
+	}
+	if control.WaitConnected(ctx) != nil {
 		return metrictemplatelease.Material{}, metrictemplatelease.ErrUnavailable
 	}
 	return control.LeaseMetricTemplate(ctx, request)

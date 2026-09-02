@@ -301,7 +301,7 @@ func protobufObservation(observation ContainerObservation, allowedLabels, allowe
 	internal := make([]*discoveryv1.DockerInternalEndpoint, 0, len(observation.InternalEndpoints))
 	for _, value := range observation.InternalEndpoints {
 		address := net.ParseIP(value.Address)
-		if !networkNamePattern.MatchString(value.NetworkName) || address == nil || value.Port == 0 || value.Protocol != "tcp" && value.Protocol != "udp" {
+		if !networkNamePattern.MatchString(value.NetworkName) || !IsSafeInternalIP(address) || value.Port == 0 || value.Protocol != "tcp" && value.Protocol != "udp" {
 			return nil, errors.New("invalid Docker internal endpoint")
 		}
 		if _, allowed := networkSet[value.NetworkName]; !allowed {

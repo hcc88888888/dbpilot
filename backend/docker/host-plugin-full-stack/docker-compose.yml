@@ -16,13 +16,13 @@ services:
       - |
         source="/workspace/backend/.tmp-host-plugin-$${DBPILOT_HOST_PLUGIN_RUN_ID}/bin"
         install -d -m 0755 /acceptance/bin /acceptance/frontend
-        for binary in dbpilot-controlplane dbpilot-agent dbpilot-fullstack-fixture dbpilot-docker-discovery dbpilot-plugin-mysql; do
+        for binary in dbpilot-controlplane dbpilot-agent dbpilot-fullstack-fixture dbpilot-docker-discovery dbpilot-plugin-mysql dbpilot-plugin-mysql-arm64; do
           test -s "$${source}/$${binary}"
           cp "$${source}/$${binary}" "/acceptance/bin/$${binary}"
         done
         cp -a /workspace/frontend/app/dist/. /acceptance/frontend/
         chown -R 10001:10001 /acceptance/bin /acceptance/frontend
-        chmod 0555 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture /acceptance/bin/dbpilot-docker-discovery /acceptance/bin/dbpilot-plugin-mysql
+        chmod 0555 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture /acceptance/bin/dbpilot-docker-discovery /acceptance/bin/dbpilot-plugin-mysql /acceptance/bin/dbpilot-plugin-mysql-arm64
         find /acceptance/frontend -type d -exec chmod 0555 {} +
         find /acceptance/frontend -type f -exec chmod 0444 {} +
     environment:
@@ -59,11 +59,27 @@ services:
         install -d -m 0700 /acceptance
         /fixture-bin/dbpilot-fullstack-fixture bootstrap --root /acceptance --host-plugin --docker-network-name "$${DBPILOT_INTERNAL_NETWORK_NAME}" >/dev/null
         cp -a /acceptance/config/. /volumes/config/
-        cp -a /acceptance/secrets/. /volumes/secrets/
         cp -a /acceptance/state/. /volumes/state/
-        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/proc-runtime /volumes/plugin-runtime /volumes/runner-artifacts
-        chown -R 10001:10001 /volumes/config /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts
-        chmod 0700 /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts
+        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/proc-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+          /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
+          /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
+        cp /acceptance/secrets/controlplane.yaml /acceptance/secrets/controlplane-http-key.pem /acceptance/secrets/controlplane-grpc-key.pem \
+          /acceptance/secrets/ca-key.pem /acceptance/secrets/command-signing-key.pem /acceptance/secrets/execution-token-key \
+          /acceptance/secrets/artifact-signing-key /acceptance/secrets/mysql-password /volumes/controlplane-secrets/
+        cp /acceptance/secrets/oidc-key.pem /acceptance/secrets/oidc-signing-key.pem /acceptance/secrets/oidc-token-credential /volumes/oidc-secrets/
+        cp /acceptance/secrets/postgres-password /volumes/postgres-secrets/
+        cp /acceptance/secrets/mysql-password /volumes/mysql-secrets/
+        cp /acceptance/config/ca.pem /acceptance/config/frontend.pem /acceptance/secrets/frontend-key.pem /volumes/frontend-tls/
+        cp /acceptance/config/ca.pem /volumes/frontend-tls/ca-certificates.crt
+        cp /acceptance/secrets/oidc-token-credential /acceptance/secrets/plugin-publisher-key.pem /volumes/runner-secrets/
+        cp /acceptance/config/ca.pem /volumes/runner-trust/
+        cp /acceptance/secrets/postgres-password /volumes/assertion-secrets/
+        chown -R 10001:10001 /volumes/config /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+          /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
+          /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
+        chmod 0700 /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+          /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
+          /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
         chown 0:10001 /volumes/helper-runtime
         chmod 0770 /volumes/helper-runtime
         chown 0:10001 /volumes/proc-runtime
@@ -78,7 +94,14 @@ services:
     volumes:
       - acceptance-bin:/fixture-bin:ro
       - acceptance-config:/volumes/config
-      - acceptance-secrets:/volumes/secrets
+      - acceptance-controlplane-secrets:/volumes/controlplane-secrets
+      - acceptance-oidc-secrets:/volumes/oidc-secrets
+      - acceptance-postgres-secrets:/volumes/postgres-secrets
+      - acceptance-mysql-secrets:/volumes/mysql-secrets
+      - acceptance-frontend-tls:/volumes/frontend-tls
+      - acceptance-runner-secrets:/volumes/runner-secrets
+      - acceptance-runner-trust:/volumes/runner-trust
+      - acceptance-assertion-secrets:/volumes/assertion-secrets
       - acceptance-state:/volumes/state
       - acceptance-artifacts:/volumes/artifacts
       - acceptance-agent-data:/volumes/agent-data
@@ -110,9 +133,7 @@ services:
       - /tmp:rw,noexec,nosuid,size=16m,mode=1777
     volumes:
       - acceptance-postgres-data:/var/lib/postgresql/data
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-postgres-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U dbpilot -d dbpilot"]
@@ -149,8 +170,7 @@ services:
     volumes:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-oidc-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/acceptance/config/ca.pem", "https://oidc:9444/healthz"]
@@ -197,7 +217,7 @@ services:
     volumes:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-controlplane-secrets:/acceptance/secrets:ro
       - acceptance-artifacts:/acceptance/artifacts:ro
       - acceptance-state:/acceptance/state
     networks: [acceptance]
@@ -243,9 +263,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - acceptance-bin:/acceptance/bin:ro
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
       - acceptance-helper-runtime:/acceptance/helper-runtime
     networks: [acceptance]
     healthcheck:
@@ -278,14 +295,13 @@ services:
       - /var/run/mysqld:rw,noexec,nosuid,size=16m
     volumes:
       - acceptance-mysql-primary-data:/var/lib/mysql
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-mysql-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     labels:
       <<: *ownership-labels
       dbpilot.discovery.family: mysql
       dbpilot.instance_id: mysql-primary
+      dbpilot.failure.raw-inspect-canary: DBPILOT_CANARY_RAW_INSPECT_7f30e2
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=$$(cat /acceptance/secrets/mysql-password) --silent"]
       interval: 2s
@@ -316,9 +332,7 @@ services:
       - /var/run/mysqld:rw,noexec,nosuid,size=16m
     volumes:
       - acceptance-mysql-secondary-data:/var/lib/mysql
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-mysql-secrets:/acceptance/secrets:ro
     networks: [acceptance]
     labels:
       <<: *ownership-labels
@@ -350,13 +364,14 @@ services:
         test "$${VERSION_ID:-}" = V10
         test "$$(uname -m)" = x86_64
         /acceptance/bin/dbpilot-agent --version >/dev/null
-        test -s /acceptance/agent-data/enrollment-token
         if test ! -s /acceptance/agent-data/enrollment/agent.crt; then
+          test -s /acceptance/agent-data/enrollment-token
           /acceptance/bin/dbpilot-agent enroll \
             --server controlplane:9445 --ca-file /acceptance/config/ca.pem \
             --token-file /acceptance/agent-data/enrollment-token --agent-id agent-online \
             --output-dir /acceptance/agent-data/enrollment
         fi
+        rm -f /acceptance/agent-data/enrollment-token
         install -d -m 0700 /acceptance/agent-data/native
         if test ! -x /acceptance/agent-data/native/mysqld-dbp; then
           cp /acceptance/bin/dbpilot-fullstack-fixture /acceptance/agent-data/native/mysqld-dbp
@@ -381,8 +396,6 @@ services:
     volumes:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
       - acceptance-agent-data:/acceptance/agent-data
       - acceptance-helper-runtime:/acceptance/helper-runtime:ro
       - acceptance-proc-runtime:/run/dbpilot-agent
@@ -462,9 +475,6 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=8m,mode=1777
     volumes:
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
       - acceptance-plugin-runtime:/acceptance/plugin-runtime:ro
     networks: [acceptance]
     labels: *ownership-labels
@@ -487,10 +497,9 @@ services:
     volumes:
       - acceptance-frontend-assets:/srv/dbpilot:ro
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-config:/etc/ssl/certs:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-frontend-tls:/acceptance/config:ro
+      - acceptance-frontend-tls:/etc/ssl/certs:ro
+      - acceptance-frontend-tls:/acceptance/secrets:ro
     networks: [acceptance, frontend-edge]
     ports:
       - target: 8443
@@ -514,6 +523,9 @@ services:
     build:
       context: ../../..
       dockerfile: backend/docker/host-plugin-full-stack/runner.Dockerfile
+      labels:
+        dbpilot.verifier: host-plugin-full-stack
+        dbpilot.run: ${DBPILOT_HOST_PLUGIN_RUN_ID:-unassigned}
     profiles: ["acceptance-runner"]
     user: "10001:10001"
     environment:
@@ -523,6 +535,7 @@ services:
       OIDC_CREDENTIAL_FILE: /acceptance/secrets/oidc-token-credential
       PLUGIN_PUBLISHER_KEY_FILE: /acceptance/secrets/plugin-publisher-key.pem
       PLUGIN_BINARY_FILE: /acceptance/bin/dbpilot-plugin-mysql
+      PLUGIN_ARM64_BINARY_FILE: /acceptance/bin/dbpilot-plugin-mysql-arm64
       TENANT_ID: tenant-acceptance
       PROJECT_ID: project-acceptance
       HOST_ID: host-acceptance
@@ -535,9 +548,8 @@ services:
       - /home/pwuser:rw,nosuid,size=64m,mode=0700,uid=10001,gid=10001
     volumes:
       - acceptance-bin:/acceptance/bin:ro
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-runner-trust:/acceptance/config:ro
+      - acceptance-runner-secrets:/acceptance/secrets:ro
       - acceptance-state:/acceptance/state
       - acceptance-agent-data:/acceptance/agent-data
       - acceptance-runner-artifacts:/acceptance/playwright
@@ -581,9 +593,7 @@ services:
       - /tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001
     volumes:
       - acceptance-bin:/acceptance/bin:ro
-      - acceptance-config:/acceptance/config:ro
-      - acceptance-secrets:/acceptance/secrets:ro
-      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-assertion-secrets:/acceptance/secrets:ro
       - acceptance-state:/acceptance/state
       - acceptance-agent-data:/acceptance/agent-data:ro
       - acceptance-plugin-runtime:/acceptance/plugin-runtime:ro
@@ -616,7 +626,21 @@ networks:
 volumes:
   acceptance-bin:
     labels: *ownership-labels
-  acceptance-secrets:
+  acceptance-controlplane-secrets:
+    labels: *ownership-labels
+  acceptance-oidc-secrets:
+    labels: *ownership-labels
+  acceptance-postgres-secrets:
+    labels: *ownership-labels
+  acceptance-mysql-secrets:
+    labels: *ownership-labels
+  acceptance-frontend-tls:
+    labels: *ownership-labels
+  acceptance-runner-secrets:
+    labels: *ownership-labels
+  acceptance-runner-trust:
+    labels: *ownership-labels
+  acceptance-assertion-secrets:
     labels: *ownership-labels
   acceptance-config:
     labels: *ownership-labels

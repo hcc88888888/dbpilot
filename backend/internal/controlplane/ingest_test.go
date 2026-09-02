@@ -81,6 +81,39 @@ func TestMetricConsumerAcceptsTelemetryEngineOTLPProtobuf(t *testing.T) {
 	require.Equal(t, "postgres-1.internal", store.samples[0].Host)
 }
 
+func TestMetricConsumerMapsHostMetricsToAuthenticatedTwoHostIdentities(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+	resolver := authenticatedHostResolver{
+		agentResolver: resolverFor("agent-a", scope, "agent-b", scope),
+		hosts:         map[string]string{"agent-a": "host-a", "agent-b": "host-b"},
+	}
+	consumer := controlplane.NewMetricConsumer(resolver, store)
+	for _, agentID := range []string{"agent-a", "agent-b"} {
+		metrics := pmetric.NewMetrics()
+		resource := metrics.ResourceMetrics().AppendEmpty()
+		resource.Resource().Attributes().PutStr("dbpilot.source.id", "inspection-host-snapshot")
+		resource.Resource().Attributes().PutStr("host.name", "payload-hostname-must-not-be-identity")
+		metric := resource.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+		metric.SetName("system.cpu.utilization")
+		point := metric.SetEmptyGauge().DataPoints().AppendEmpty()
+		point.SetDoubleValue(40)
+		point.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(-time.Minute)))
+		payload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(metrics)
+		require.NoError(t, err)
+		require.NoError(t, consumer.ConsumeMetricBatch(context.Background(), agentID, payload, now))
+	}
+	require.Len(t, store.samples, 2)
+	require.Equal(t, "system.cpu.utilization", store.samples[0].Name)
+	require.Equal(t, "host-a", store.samples[0].InstanceID)
+	require.Equal(t, "host-a", store.samples[0].Host)
+	require.Equal(t, "host-a", store.samples[0].Labels["instance"])
+	require.Equal(t, "host-a", store.samples[0].Labels["host"])
+	require.Equal(t, "host-b", store.samples[1].InstanceID)
+	require.NotEqual(t, store.samples[0].InstanceID, store.samples[1].InstanceID)
+}
+
 func TestMetricConsumerAcceptsAgentNormalizedPluginOTLP(t *testing.T) {
 	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
 	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "template-1", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}
@@ -396,6 +429,19 @@ func (*recordingStore) Query(context.Context, alert.MetricQuery) ([]alert.Metric
 }
 
 type agentResolver map[string]alert.Scope
+
+type authenticatedHostResolver struct {
+	agentResolver
+	hosts map[string]string
+}
+
+func (r authenticatedHostResolver) HostForAgent(_ context.Context, agentID string) (string, error) {
+	hostID, ok := r.hosts[agentID]
+	if !ok {
+		return "", errors.New("agent host not found")
+	}
+	return hostID, nil
+}
 
 func resolverFor(values ...any) agentResolver {
 	resolver := agentResolver{}

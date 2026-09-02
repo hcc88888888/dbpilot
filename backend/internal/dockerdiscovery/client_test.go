@@ -99,6 +99,25 @@ func TestDockerClientIgnoresEmptyInternalAddressForStoppedContainer(t *testing.T
 	require.Empty(t, observation.InternalEndpoints)
 }
 
+func TestDockerClientIgnoresEveryInternalEndpointForStoppedContainer(t *testing.T) {
+	endpoints, err := normalizeInternalEndpoints("exited", map[string]struct{}{"3306/tcp": {}}, nil, map[string]struct {
+		IPAddress string `json:"IPAddress"`
+	}{"dbpilot_acceptance": {IPAddress: "172.30.0.10"}})
+	require.NoError(t, err)
+	require.Empty(t, endpoints)
+}
+
+func TestDockerClientRejectsUnsafeInternalAddresses(t *testing.T) {
+	for _, address := range []string{"0.0.0.0", "::", "127.0.0.1", "::1", "169.254.10.20", "fe80::1", "224.0.0.1", "ff02::1"} {
+		t.Run(address, func(t *testing.T) {
+			_, err := normalizeInternalEndpoints("running", map[string]struct{}{"3306/tcp": {}}, nil, map[string]struct {
+				IPAddress string `json:"IPAddress"`
+			}{"dbpilot_acceptance": {IPAddress: address}})
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestDockerClientDialsOnlyConfiguredUnixSocket(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Docker Engine AF_UNIX client is verified in Linux cross/container gates")

@@ -14,8 +14,8 @@ const overview: MonitoringOverview = {
   stale: 2,
   offline: 0,
   metrics: [
-    series('host.cpu', 'host', 'agent-core', 'host-1', 42),
-    series('host.memory', 'host', 'agent-core', 'host-1', 61),
+    series('system.cpu.utilization', 'host', 'agent-core', 'host-1', 42),
+    series('system.memory.utilization', 'host', 'agent-core', 'host-1', 61),
     series('dbpilot.plugin.collection.status', 'plugin', 'mysql', 'assignment-1', 1),
     series('mysql.connections.current', 'database', 'mysql', 'mysql-1', 12),
     series('mysql.queries.total', 'database', 'mysql', 'mysql-1', 540),
@@ -28,7 +28,7 @@ const overview: MonitoringOverview = {
 function series(name: string, scope: 'host' | 'plugin' | 'database', source: string, resourceId: string, value: number) {
   return {
     name, scope, source, status: 'stale' as const,
-    unit: name === 'host.cpu' || name === 'host.memory' ? '%' : name === 'mysql.uptime.seconds' ? 's' : name === 'mysql.queries.total' ? '{query}' : '1',
+    unit: name === 'system.cpu.utilization' || name === 'system.memory.utilization' ? '%' : name === 'mysql.uptime.seconds' ? 's' : name === 'mysql.queries.total' ? '{query}' : '1',
     host_id: scope === 'host' ? resourceId : 'host-1',
     plugin_assignment_id: scope === 'plugin' ? resourceId : undefined,
     instance_id: scope === 'database' ? resourceId : undefined,

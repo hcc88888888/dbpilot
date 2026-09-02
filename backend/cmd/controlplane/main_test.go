@@ -44,6 +44,7 @@ import (
 	"dbpilot.local/platform/internal/plugincatalog"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestProductionMySQLMetricTemplateDialectRejectsUnsafeStatements(t *testing.T) {
@@ -182,6 +183,36 @@ func TestPluginCatalogEnablementRequiresTrustRootAndArtifactReadiness(t *testing
 	disabled := validServerConfig()
 	disabled.PluginCatalog.Enabled = false
 	require.NoError(t, validateConfig(disabled))
+}
+
+func TestCheckConfigCatchesLegacyCatalogOriginBeforeServerStartup(t *testing.T) {
+	public := ed25519.PublicKey(bytes.Repeat([]byte{0x42}, ed25519.PublicKeySize))
+	config := validServerConfig()
+	config.PluginCatalog.Enabled = true
+	config.Artifact.StorageRoot = t.TempDir()
+	config.Artifact.PluginLeaseOrigin = ""
+	config.Command = CommandSettings{SigningPrivateKeyRef: "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", ExecutionTokenKeyRef: "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"}
+	config.Identity = IdentitySettings{Mode: "oidc", Issuer: "https://issuer.example", Audience: "dbpilot"}
+	config.PluginPublishers = []PluginPublisherSettings{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)}}
+	path := filepath.Join(t.TempDir(), "controlplane.yaml")
+	write := func() {
+		body, err := yaml.Marshal(config)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(path, body, 0o600))
+	}
+	write()
+	var stdout, stderr bytes.Buffer
+	require.Equal(t, 2, run([]string{"--config", path, "--check-config"}, &stdout, &stderr))
+	require.Contains(t, stderr.String(), "plugin_lease_origin")
+	require.Empty(t, stdout.String())
+
+	config.Artifact.PluginLeaseOrigin = "https://control.example"
+	write()
+	stdout.Reset()
+	stderr.Reset()
+	require.Equal(t, 0, run([]string{"--config", path, "--check-config"}, &stdout, &stderr))
+	require.Equal(t, "configuration valid\n", stdout.String())
+	require.Empty(t, stderr.String())
 }
 
 func TestDefaultCompositionRunsPluginCatalogMigrationsWhenEnabled(t *testing.T) {

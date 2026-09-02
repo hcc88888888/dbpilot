@@ -1009,6 +1009,26 @@ func TestInvalidMetricTrialIsClassifiedBeforeTerminalCAS(t *testing.T) {
 	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
 }
 
+func TestFailedHighCardinalityTrialTerminalizesRunningJob(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-high-cardinality"}
+	fixture.lifecycle.typedResultRecorder = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	digest := bytes.Repeat([]byte{1}, sha256.Size)
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_CollectDatabaseMetrics{CollectDatabaseMetrics: &agentv1.CollectDatabaseMetrics{AssignmentId: "assignment-a", ConfigurationRevision: 1, OperationRevision: 1, InstanceIds: []string{"instance-a"}, TemplateIds: []string{"template-a"}, Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: digest, TimeoutSeconds: 5, MaxRows: 20, MaxColumns: 2, CardinalityLimit: 5}}}}})
+	require.NoError(t, err)
+	message := fixture.message(t, recorder.commandID, "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+	result := &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "METRIC_TEMPLATE_TRIAL_FAILED", ExecutionToken: token, LeaseRevision: 1, MetricTemplateTrialResult: &agentv1.MetricTemplateTrialResult{RevisionId: "revision-a", QueryDigest: digest, StatusCode: "high_cardinality", RowCount: 6, ColumnCount: 2}}
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", result)
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.Equal(t, CommandFailed, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
+}
+
 func TestCancelledMetricTrialKeepsCancelledTerminalState(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-trial-cancelled"}

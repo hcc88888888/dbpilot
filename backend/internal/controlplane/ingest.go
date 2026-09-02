@@ -42,6 +42,12 @@ type AgentScopeResolver interface {
 	ScopeForAgent(context.Context, string) (alert.Scope, error)
 }
 
+// AgentHostResolver maps an authenticated Agent to its canonical managed-host
+// identity. Payload hostnames and source IDs are never authoritative identity.
+type AgentHostResolver interface {
+	HostForAgent(context.Context, string) (string, error)
+}
+
 // MetricConsumer decodes metric batch payloads only after ingest has verified
 // the Agent identity, checksum, and batch de-duplication state.
 type MetricConsumer struct {
@@ -95,6 +101,13 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 	if err := scope.Validate(); err != nil {
 		return nil, fmt.Errorf("resolve agent scope: %w", err)
 	}
+	hostID := agentID
+	if resolver, ok := c.resolver.(AgentHostResolver); ok {
+		hostID, err = resolver.HostForAgent(ctx, agentID)
+		if err != nil || strings.TrimSpace(hostID) == "" {
+			return nil, fmt.Errorf("resolve agent host: %w", err)
+		}
+	}
 	envelope, err := decodeMetricEnvelopeForAgent(payload, agentID, receivedAt)
 	if err != nil {
 		return nil, err
@@ -127,6 +140,10 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 		for key, value := range input.Labels {
 			labels[key] = value
 		}
+		if isHostCoreMetric(input.Name) {
+			labels["instance"] = hostID
+			labels["host"] = hostID
+		}
 		if err := alert.ValidateMetricLabels(labels); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidMetricBatch, err)
 		}
@@ -135,6 +152,15 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 		samples = append(samples, sample)
 	}
 	return samples, nil
+}
+
+func isHostCoreMetric(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "system.cpu.utilization", "system.memory.utilization":
+		return true
+	default:
+		return false
+	}
 }
 
 type metricEnvelope struct {

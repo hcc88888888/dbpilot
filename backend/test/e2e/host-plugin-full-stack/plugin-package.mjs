@@ -2,7 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { createHash, sign } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 
-export function buildPluginPackage(binary, privateKey, { version, architecture = 'amd64' }) {
+export function buildPluginPackage(binary, privateKey, { version, architecture = 'amd64', tamperSignature = false }) {
   const binaryPath = 'plugin-package/bin/linux-' + architecture + '/dbpilot-plugin-mysql';
   const binaryDigest = sha256(binary);
   const manifest = canonicalJSON({
@@ -33,7 +33,9 @@ export function buildPluginPackage(binary, privateKey, { version, architecture =
     lengthPrefix(content, sha256(entry.body));
   }
   const message = Buffer.from('dbpilot-plugin-signature-v1\nmanifest-sha256:' + sha256(Buffer.from(manifest)) + '\ncontent-sha256:' + content.digest('hex') + '\n');
-  entries.push({ name: 'plugin-package/SIGNATURE.ed25519', body: sign(null, message, privateKey), mode: 0o400 });
+  const signature = sign(null, message, privateKey);
+  if (tamperSignature) signature[0] ^= 0xff;
+  entries.push({ name: 'plugin-package/SIGNATURE.ed25519', body: signature, mode: 0o400 });
   return gzipSync(tar(entries), { level: 9, mtime: 0 });
 }
 

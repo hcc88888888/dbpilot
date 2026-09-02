@@ -33,6 +33,20 @@ func TestMetricTrialRecorderNeverPromotesFailedTopLevelTypedSuccess(t *testing.T
 	require.Equal(t, "invalid_result", store.result.StatusCode)
 }
 
+func TestMetricTrialRecorderPreservesFixedHighCardinalityFailureWithoutRows(t *testing.T) {
+	store := &recordingMetricTrialStore{}
+	recorder := metricTrialResultRecorder{Store: store}
+	scope := platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}
+	digest := make([]byte, 32)
+	command := &agentv1.CollectDatabaseMetrics{Trial: true, TemplateRevisions: []*agentv1.MetricTemplateCommandReference{{TemplateId: "template-a", RevisionId: "revision-a", QueryDigest: digest, TimeoutSeconds: 5, MaxRows: 20, MaxColumns: 2, CardinalityLimit: 5}}}
+	typed := &agentv1.MetricTemplateTrialResult{RevisionId: "revision-a", QueryDigest: digest, StatusCode: "high_cardinality", RowCount: 6, ColumnCount: 2, MetricCount: 5}
+	err := recorder.RecordMetricTemplateTrial(context.Background(), scope, "job-a", "command-a", command, &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, MetricTemplateTrialResult: typed}, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, "high_cardinality", store.result.StatusCode)
+	require.Equal(t, 6, store.result.RowCount)
+	require.Empty(t, store.result.Metrics)
+}
+
 type recordingMetricTrialStore struct{ result metrictemplate.TrialResult }
 
 func (store *recordingMetricTrialStore) ClassifyTrialResult(_ context.Context, _ platformscope.Scope, _ string, result metrictemplate.TrialResult) (metrictemplate.TrialResult, error) {

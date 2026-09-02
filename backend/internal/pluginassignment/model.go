@@ -22,6 +22,7 @@ var (
 	ErrConflict           = errors.New("plugin assignment conflict")
 	ErrPrecondition       = errors.New("plugin assignment precondition failed")
 	ErrVersionUnavailable = errors.New("plugin version is not available")
+	ErrPlatformMismatch   = errors.New("plugin version platform is incompatible")
 	ErrVersionRevoked     = errors.New("plugin version is revoked")
 	ErrStaleObservation   = errors.New("plugin observation is stale")
 	ErrClaimLost          = errors.New("plugin reconciliation claim was lost")

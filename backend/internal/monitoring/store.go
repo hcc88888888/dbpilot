@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/database"
 )
 
 // QueryStore is the only boundary required by monitoring handlers. Production
@@ -155,10 +156,10 @@ func (s *MemoryStore) GetInstance(_ context.Context, scope alert.Scope, instance
 	if instance.Latest == nil {
 		instance.Latest = make(map[string]*float64)
 	}
-	metrics := metricNames(samples, scope, instanceID, query)
+	metrics := metricNames(samples, scope, instance, query)
 	detail := InstanceDetail{Instance: RedactInstance(instance), Metrics: make([]Series, 0, len(metrics))}
 	for _, metric := range metrics {
-		series := buildMetricSeries(samples, scope, instanceID, metric, query)
+		series := buildMetricSeries(samples, scope, instance, metric, query)
 		series.Status = instance.Status
 		detail.Metrics = append(detail.Metrics, series)
 		instance.Latest[metric] = latestSeriesValue(series)
@@ -186,7 +187,7 @@ func (s *MemoryStore) Series(_ context.Context, scope alert.Scope, query SeriesQ
 	if !found {
 		return Series{}, ErrInstanceNotFound
 	}
-	series := buildMetricSeries(samples, scope, query.InstanceID, query.Metric, query.Range)
+	series := buildMetricSeries(samples, scope, instance, query.Metric, query.Range)
 	series.Status = classifyForInstance(now, instance)
 	return series, nil
 }
@@ -263,13 +264,19 @@ func classifyForInstance(now time.Time, instance Instance) Status {
 	return ClassifyInstance(now, instance.LastSampleAt, instance.LastHeartbeatAt, interval)
 }
 
-func metricNames(samples []alert.MetricSample, scope alert.Scope, instanceID string, query RangeQuery) []string {
+func metricNames(samples []alert.MetricSample, scope alert.Scope, instance Instance, query RangeQuery) []string {
 	seen := make(map[string]struct{})
 	for _, sample := range samples {
-		if sample.Scope != scope || sampleInstanceID(sample) != instanceID || sample.SampledAt.Before(query.From) || sample.SampledAt.After(query.To) {
+		if sample.Scope != scope || sampleInstanceID(sample) != instance.ID || sample.SampledAt.Before(query.From) || sample.SampledAt.After(query.To) {
 			continue
 		}
 		seen[sample.Name] = struct{}{}
+	}
+	if (instance.Engine == database.MySQLFamily || instance.Labels["engine"] == string(database.MySQLFamily)) &&
+		safeMetricIdentity(instance.Labels["plugin_id"]) != "" && safeMetricIdentity(instance.Labels["assignment_id"]) != "" {
+		for _, name := range MySQLBuiltinMetricIDs() {
+			seen[name] = struct{}{}
+		}
 	}
 	result := make([]string, 0, len(seen))
 	for name := range seen {
@@ -279,22 +286,22 @@ func metricNames(samples []alert.MetricSample, scope alert.Scope, instanceID str
 	return result
 }
 
-func buildMetricSeries(samples []alert.MetricSample, scope alert.Scope, instanceID, metric string, query RangeQuery) Series {
+func buildMetricSeries(samples []alert.MetricSample, scope alert.Scope, instance Instance, metric string, query RangeQuery) Series {
 	points := make([]SamplePoint, 0)
-	var identity alert.MetricSample
+	identity := alert.MetricSample{InstanceID: instance.ID, Host: instance.Host, Labels: copyStringMap(instance.Labels)}
 	for _, sample := range samples {
-		if sample.Scope != scope || sampleInstanceID(sample) != instanceID || sample.Name != metric {
+		if sample.Scope != scope || sampleInstanceID(sample) != instance.ID || sample.Name != metric {
 			continue
 		}
-		if identity.Name == "" {
+		if identity.Name == "" || len(identity.Labels) == 0 {
 			identity = sample
 		}
 		points = append(points, SamplePoint{At: sample.SampledAt, Value: sample.Value})
 	}
 	series := BuildSeries(metric, query.From, query.To, query.Step, points)
 	series.Unit = metricUnit(metric)
-	series.InstanceID = instanceID
-	series.HostID = safeMetricIdentity(firstNonEmptyString(identity.Labels["host"], identity.Host))
+	series.InstanceID = instance.ID
+	series.HostID = safeMetricIdentity(firstNonEmptyString(identity.Labels["host"], identity.Host, instance.Host))
 	pluginID := safeMetricIdentity(identity.Labels["plugin_id"])
 	assignmentID := safeMetricIdentity(identity.Labels["assignment_id"])
 	if pluginID == "" {
@@ -317,8 +324,8 @@ func buildMetricSeries(samples []alert.MetricSample, scope alert.Scope, instance
 func monitoringSeries(samples []alert.MetricSample, scope alert.Scope, query RangeQuery, instances []Instance) []Series {
 	result := make([]Series, 0)
 	for _, instance := range instances {
-		for _, metric := range metricNames(samples, scope, instance.ID, query) {
-			series := buildMetricSeries(samples, scope, instance.ID, metric, query)
+		for _, metric := range metricNames(samples, scope, instance, query) {
+			series := buildMetricSeries(samples, scope, instance, metric, query)
 			series.Status = instance.Status
 			result = append(result, series)
 		}
@@ -337,7 +344,7 @@ func monitoringSeries(samples []alert.MetricSample, scope alert.Scope, query Ran
 
 func metricUnit(name string) string {
 	switch name {
-	case "host.cpu", "host.memory":
+	case "system.cpu.utilization", "system.memory.utilization":
 		return "%"
 	case "mysql.queries.total":
 		return "{query}"

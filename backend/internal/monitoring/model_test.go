@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/alert"
+	"dbpilot.local/platform/internal/database"
 	"github.com/stretchr/testify/require"
 )
 
@@ -55,8 +56,8 @@ func TestMemoryStoreOverviewDistinguishesMetricScopeSourceAndStaleWithoutZeros(t
 		"plugin_id": "mysql", "assignment_id": "assignment-1", "dbpilot_source_id": "plugin-metrics-v1:assignment-1",
 	}
 	samples := []alert.MetricSample{
-		{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "host.cpu", Value: 42, SampledAt: lastSample, Labels: map[string]string{"instance": "mysql-1", "host": "host-1", "component": "host"}},
-		{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "host.memory", Value: 61, SampledAt: lastSample, Labels: map[string]string{"instance": "mysql-1", "host": "host-1", "component": "host"}},
+		{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "system.cpu.utilization", Value: 42, SampledAt: lastSample, Labels: map[string]string{"instance": "mysql-1", "host": "host-1", "component": "host"}},
+		{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "system.memory.utilization", Value: 61, SampledAt: lastSample, Labels: map[string]string{"instance": "mysql-1", "host": "host-1", "component": "host"}},
 		{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "dbpilot.plugin.collection.status", Value: 1, SampledAt: lastSample, Labels: labels},
 	}
 	for index, name := range MySQLBuiltinMetricIDs() {
@@ -77,10 +78,10 @@ func TestMemoryStoreOverviewDistinguishesMetricScopeSourceAndStaleWithoutZeros(t
 		require.Equal(t, StatusStale, series.Status)
 		require.Nil(t, series.Buckets[len(series.Buckets)-1].Value, "stale series must preserve a missing bucket rather than synthesize zero")
 	}
-	require.Equal(t, MetricScopeHost, byName["host.cpu"].Scope)
-	require.Equal(t, "agent-core", byName["host.cpu"].Source)
-	require.Equal(t, "host-1", byName["host.cpu"].HostID)
-	require.Equal(t, MetricScopeHost, byName["host.memory"].Scope)
+	require.Equal(t, MetricScopeHost, byName["system.cpu.utilization"].Scope)
+	require.Equal(t, "agent-core", byName["system.cpu.utilization"].Source)
+	require.Equal(t, "host-1", byName["system.cpu.utilization"].HostID)
+	require.Equal(t, MetricScopeHost, byName["system.memory.utilization"].Scope)
 	require.Equal(t, MetricScopePlugin, byName["dbpilot.plugin.collection.status"].Scope)
 	require.Equal(t, "assignment-1", byName["dbpilot.plugin.collection.status"].PluginAssignmentID)
 	for _, name := range MySQLBuiltinMetricIDs() {
@@ -91,6 +92,35 @@ func TestMemoryStoreOverviewDistinguishesMetricScopeSourceAndStaleWithoutZeros(t
 	require.True(t, slices.Equal(MySQLBuiltinMetricIDs(), []string{
 		"mysql.connections.current", "mysql.queries.total", "mysql.threads.running", "mysql.up", "mysql.uptime.seconds",
 	}))
+}
+
+func TestMemoryStoreKeepsExpectedMySQLSeriesWhenLastSamplePrecedesWindow(t *testing.T) {
+	now := time.Date(2026, 9, 3, 10, 0, 0, 0, time.UTC)
+	scope := alert.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	labels := map[string]string{"instance": "mysql-1", "host": "host-1", "engine": "mysql", "component": "dbpilot-plugin-mysql", "plugin_id": "mysql", "assignment_id": "assignment-1"}
+	instance := Instance{ID: "mysql-1", Scope: scope, Engine: database.MySQLFamily, Host: "host-1", AgentID: "agent-1", Labels: labels, CollectEvery: time.Minute, LastSampleAt: now.Add(-2 * time.Hour), LastHeartbeatAt: now}
+	samples := []alert.MetricSample{{Scope: scope, AgentID: "agent-1", InstanceID: "mysql-1", Host: "host-1", Name: "mysql.up", Value: 1, SampledAt: now.Add(-2 * time.Hour), Labels: labels}}
+	store := NewMemoryStore([]Instance{instance}, samples, nil)
+	store.SetNow(func() time.Time { return now })
+
+	overview, err := store.Overview(context.Background(), scope, RangeQuery{From: now.Add(-time.Hour), To: now, Step: 15 * time.Minute})
+	require.NoError(t, err)
+	require.Len(t, overview.Metrics, len(MySQLBuiltinMetricIDs()))
+	byName := make(map[string]Series, len(overview.Metrics))
+	for _, series := range overview.Metrics {
+		byName[series.Name] = series
+		require.Equal(t, StatusStale, series.Status)
+		require.Equal(t, MetricScopeDatabase, series.Scope)
+		require.Equal(t, "mysql", series.Source)
+		require.Equal(t, "assignment-1", series.PluginAssignmentID)
+		require.Equal(t, "mysql-1", series.InstanceID)
+		for _, bucket := range series.Buckets {
+			require.Nil(t, bucket.Value)
+		}
+	}
+	for _, name := range MySQLBuiltinMetricIDs() {
+		require.Contains(t, byName, name)
+	}
 }
 
 func TestInstanceDTONeverCarriesRawPayloadOrSecret(t *testing.T) {

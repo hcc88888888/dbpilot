@@ -79,7 +79,10 @@ func TestServerTrialUsesDedicatedBoundedPathAndReturnsOnlyMappedMetrics(t *testi
 	server := NewServer(ServerConfig{AssignmentID: "assignment-a", OperationRevision: 9, Runtime: runtime, Parser: NewMySQLStatementParser(), Now: func() time.Time { return now }})
 	statement := []byte("SELECT 7 AS value, 'primary' AS role_name")
 	digest := sha256.Sum256(statement)
-	response, err := server.TrialMetricTemplate(context.Background(), &pluginv1.TrialMetricTemplateRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, OperationRevision: 9, InstanceId: "mysql-a", Template: &pluginv1.TrialMetricTemplateDefinition{TemplateId: "custom-a", Revision: 2, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role_name", Label: "role"}}}})
+	request := &pluginv1.TrialMetricTemplateRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, OperationRevision: 9, InstanceId: "mysql-a", Template: &pluginv1.TrialMetricTemplateDefinition{TemplateId: "custom-a", Revision: 2, QueryDigest: digest[:], QueryKind: "sql", ReadOnlyStatement: statement, CollectionIntervalSeconds: 60, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 2, CardinalityLimit: 10, ValueMappings: []*pluginv1.MetricValueMapping{{SourceColumn: "value", MetricName: "mysql.custom.value", MetricType: "gauge", Unit: "1"}}, LabelMappings: []*pluginv1.MetricLabelMapping{{SourceColumn: "role_name", Label: "role"}}}}
+	advancedOperation := proto.Clone(request).(*pluginv1.TrialMetricTemplateRequest)
+	advancedOperation.OperationRevision = 10
+	response, err := server.TrialMetricTemplate(context.Background(), request)
 	require.NoError(t, err)
 	require.True(t, response.GetSucceeded())
 	require.Equal(t, uint32(1), response.GetRowCount())
@@ -88,6 +91,9 @@ func TestServerTrialUsesDedicatedBoundedPathAndReturnsOnlyMappedMetrics(t *testi
 	require.Equal(t, "mysql.custom.value", response.GetCandidateMetrics()[0].GetMetricName())
 	require.Equal(t, map[string]string{"role": "primary"}, response.GetCandidateMetrics()[0].GetLabels())
 	require.NotContains(t, response.String(), "primary AS")
+	response, err = server.TrialMetricTemplate(context.Background(), advancedOperation)
+	require.NoError(t, err, "the Agent verified session may advance operation revision through live ApplyConfiguration without restarting the plugin")
+	require.True(t, response.GetSucceeded())
 }
 
 func TestStreamTreatsResumeAsAuthoritativeAndAckIsAtomicForBoundPairs(t *testing.T) {

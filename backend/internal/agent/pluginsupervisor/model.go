@@ -397,6 +397,10 @@ type HealthChecker interface {
 	Handshake(context.Context, Process, HealthRequest) error
 }
 
+type ConfigurationApplier interface {
+	ApplyConfiguration(context.Context, Process, HealthRequest) error
+}
+
 type UnexpectedExitCleaner interface {
 	CleanupUnexpectedExit(Process)
 }

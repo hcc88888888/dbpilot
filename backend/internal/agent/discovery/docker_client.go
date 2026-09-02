@@ -163,6 +163,9 @@ func dockerEndpoint(container *discoveryv1.DockerContainerObservation, rule doma
 		}
 		return net.JoinHostPort(endpoint.GetAddress(), fmt.Sprintf("%d", endpoint.GetPort())), endpoint.GetPort(), true
 	}
+	if len(rule.DockerNetworkNames) > 0 {
+		return "", 0, false
+	}
 	for _, port := range container.GetPorts() {
 		if port.GetProtocol() != "tcp" || !containsPort(rule.DefaultPorts, uint16(port.GetContainerPort())) {
 			continue
@@ -255,7 +258,7 @@ func validateDockerObservation(container *discoveryv1.DockerContainerObservation
 		allowedNetworks[name] = struct{}{}
 	}
 	for _, endpoint := range container.GetInternalEndpoints() {
-		if endpoint.GetPort() == 0 || endpoint.GetPort() > 65535 || net.ParseIP(endpoint.GetAddress()) == nil || !dockerNetworkNamePattern.MatchString(endpoint.GetNetworkName()) || endpoint.GetProtocol() != "tcp" && endpoint.GetProtocol() != "udp" {
+		if endpoint.GetPort() == 0 || endpoint.GetPort() > 65535 || !dockerhelper.IsSafeInternalIP(net.ParseIP(endpoint.GetAddress())) || !dockerNetworkNamePattern.MatchString(endpoint.GetNetworkName()) || endpoint.GetProtocol() != "tcp" && endpoint.GetProtocol() != "udp" {
 			return domain.ErrInvalid
 		}
 		if _, ok := allowedNetworks[endpoint.GetNetworkName()]; !ok {

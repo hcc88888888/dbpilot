@@ -314,6 +314,39 @@ func (supervisor *PluginSupervisor) makeRunning(ctx context.Context, request Rec
 	if err != nil {
 		return supervisor.fail(ctx, state, processStateForError(err), errorCode(err), err)
 	}
+	if oldProcess != nil && oldState.ProcessState == pluginstate.ProcessRunning && oldState.InstalledVersion == request.DesiredVersion && oldState.ActiveSlot != pluginstate.SlotNone {
+		applier, ok := supervisor.health.(ConfigurationApplier)
+		if !ok {
+			state.ProcessState, state.HealthState = oldState.ProcessState, oldState.HealthState
+			state.ProcessID, state.ProcessStartTicks, state.StartedAt = oldState.ProcessID, oldState.ProcessStartTicks, oldState.StartedAt
+			state.LastErrorCode = "plugin_configuration_apply_failed"
+			saved, saveErr := supervisor.store.Put(ctx, state)
+			if saveErr != nil {
+				return ObservedState{}, saveErr
+			}
+			return ObservedState{State: saved}, ErrHealthHandshake
+		}
+		applyRequest := healthRequest(request, installed, request.ConfigurationRevision, filepath.Join(supervisor.runtimeRoot, request.DatabaseFamily), oldProcess.launchNonce, supervisor.userID, supervisor.groupID)
+		if applyErr := applier.ApplyConfiguration(ctx, oldProcess.process, applyRequest); applyErr != nil {
+			state.ProcessState, state.HealthState = oldState.ProcessState, oldState.HealthState
+			state.ProcessID, state.ProcessStartTicks, state.StartedAt = oldState.ProcessID, oldState.ProcessStartTicks, oldState.StartedAt
+			state.LastErrorCode = "plugin_configuration_apply_failed"
+			saved, saveErr := supervisor.store.Put(ctx, state)
+			if saveErr != nil {
+				return ObservedState{}, saveErr
+			}
+			return ObservedState{State: saved}, applyErr
+		}
+		applyActiveConfiguration(&state, request, installed)
+		healthState, activationCode := supervisor.activationState(oldProcess.process)
+		state.ProcessState, state.HealthState, state.CircuitState = pluginstate.ProcessRunning, healthState, pluginstate.CircuitClosed
+		state.ProcessID, state.ProcessStartTicks, state.StartedAt = oldState.ProcessID, oldState.ProcessStartTicks, oldState.StartedAt
+		state.LastErrorCode, state.Failures = activationCode, nil
+		oldProcess.request = cloneRequest(request)
+		oldProcess.installed = installed
+		saved, saveErr := supervisor.store.Put(ctx, state)
+		return ObservedState{State: saved}, saveErr
+	}
 	if oldProcess != nil {
 		state.ProcessState = pluginstate.ProcessDraining
 		if _, persistErr := supervisor.store.Put(ctx, state); persistErr != nil {
@@ -409,8 +442,13 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 		return supervisor.fail(ctx, failed, pluginstate.ProcessRollback, "plugin_rollback_failed", ErrRollbackFailed)
 	}
 	rollbackRequest := requestFromActiveState(old)
-	rollbackProcess, err := supervisor.startProcess(rollbackRequest, oldInstalled, old.ActiveConfigurationRevision)
-	if err != nil || supervisor.health.Handshake(ctx, rollbackProcess.process, healthRequest(rollbackRequest, oldInstalled, old.ActiveConfigurationRevision, filepath.Join(supervisor.runtimeRoot, request.DatabaseFamily), rollbackProcess.launchNonce, supervisor.userID, supervisor.groupID)) != nil {
+	rollbackRequest.ConfigurationRevision = request.ConfigurationRevision
+	rollbackRequest.OperationRevision = request.OperationRevision
+	if request.TemplateLeaseCommandID != "" {
+		rollbackRequest.TemplateLeaseCommandID = request.TemplateLeaseCommandID
+	}
+	rollbackProcess, err := supervisor.startProcess(rollbackRequest, oldInstalled, rollbackRequest.ConfigurationRevision)
+	if err != nil || supervisor.health.Handshake(ctx, rollbackProcess.process, healthRequest(rollbackRequest, oldInstalled, rollbackRequest.ConfigurationRevision, filepath.Join(supervisor.runtimeRoot, request.DatabaseFamily), rollbackProcess.launchNonce, supervisor.userID, supervisor.groupID)) != nil {
 		if rollbackProcess != nil {
 			_ = supervisor.drainProcess(ctx, rollbackProcess)
 		}
@@ -418,6 +456,10 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 	}
 	supervisor.running[request.DatabaseFamily] = rollbackProcess
 	old.ObservedOperationRevision = request.OperationRevision
+	old.ActiveConfigurationRevision = request.ConfigurationRevision
+	if request.TemplateLeaseCommandID != "" {
+		old.ActiveTemplateLeaseCommandID = request.TemplateLeaseCommandID
+	}
 	old.DesiredState = stateForDesired(request.DesiredState)
 	rollbackHealth, _ := supervisor.activationState(rollbackProcess.process)
 	old.ProcessState, old.HealthState = pluginstate.ProcessRunning, rollbackHealth
@@ -714,6 +756,35 @@ func (supervisor *PluginSupervisor) Observation() *agentv1.PluginObservation {
 		assignments = append(assignments, assignmentObservation(state, observedAt))
 	}
 	return &agentv1.PluginObservation{HostId: supervisor.hostID, AgentId: supervisor.agentID, ObservationRevision: revision, Assignments: assignments, ObservedAt: timestamppb.New(observedAt)}
+}
+
+// RefreshObservation persists an equivalent, higher-revision snapshot when a
+// new authenticated control session is established. This lets a restarted
+// Server distinguish fresh Agent convergence from replay of an old snapshot.
+func (supervisor *PluginSupervisor) RefreshObservation(ctx context.Context) error {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil {
+		return ErrInvalidRequest
+	}
+	// Persisted-process recovery owns this lock while its verified Handshake
+	// requests credentials over the new control session. Never block that
+	// response loop merely to refresh an equivalent observation; the recovery
+	// state write itself will advance the observation once it converges.
+	if !supervisor.mu.TryLock() {
+		return nil
+	}
+	defer supervisor.mu.Unlock()
+	states := supervisor.store.List()
+	sort.Slice(states, func(i, j int) bool { return states[i].DatabaseFamily < states[j].DatabaseFamily })
+	for _, state := range states {
+		state.ObservationRevision++
+		if state.ObservationRevision == 0 {
+			return ErrInvalidRequest
+		}
+		if _, err := supervisor.store.Put(ctx, state); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func assignmentObservation(state pluginstate.FamilyState, at time.Time) *agentv1.PluginAssignmentObservation {

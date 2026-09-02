@@ -89,9 +89,9 @@ export function MonitoringPage({ fetchApi = globalThis.fetch, now = () => new Da
           <section aria-label="主机指标">
             <h2>主机资源</h2>
             <div className="summary-grid">
-              {host.filter((series) => series.name === 'host.cpu' || series.name === 'host.memory').map((series) => (
+              {host.filter((series) => series.name === 'system.cpu.utilization' || series.name === 'system.memory.utilization').map((series) => (
                 <article key={`${series.host_id}-${series.name}`}>
-                  <strong>{series.name === 'host.cpu' ? 'CPU' : '内存'} {latestValue(series)}{series.unit ?? ''}</strong>
+                  <strong>{series.name === 'system.cpu.utilization' ? 'CPU' : '内存'} {latestValue(series)}{series.unit ?? ''}</strong>
                   <span>{series.source}</span>
                   <StatusTag status={statusLabel(series.status)} tone={series.status === 'healthy' ? 'success' : series.status === 'stale' ? 'warning' : 'danger'} />
                 </article>
