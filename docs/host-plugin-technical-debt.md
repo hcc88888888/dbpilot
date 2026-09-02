@@ -53,3 +53,11 @@
 - Functional impact: none observed in Task 13 or exporter behavior. One full-suite run reported one attempt instead of the expected two; the focused test passed 10/10 repetitions immediately afterward, and a fresh complete-suite rerun passed.
 - Severity: low test-reliability issue; it does not affect the MySQL plugin runtime path.
 - Recommended remediation stage: consolidated test-harness maintenance. Replace wall-clock retry assertions with an injected clock or synchronization barrier, then retain a separate integration test for real backoff timing.
+
+## TD-FRONTEND-001: Management application main chunk exceeds 500 KiB
+
+- Affected module: React/Vite management application bundle (`frontend/app`).
+- Trigger conditions: a production build packages the current shell, generated API client and host/discovery/instance routes into the default entry chunk.
+- Functional impact: none observed. Type checking, all React workflows and the Vite production build pass; the 509.03 KiB minified entry chunk may increase initial download and parse time on slower operator networks.
+- Severity: low performance debt; it does not affect functional correctness or API isolation.
+- Recommended remediation stage: frontend performance consolidation after the remaining management modules are implemented. Introduce route-level dynamic imports and measure real gzip/parse performance before selecting stable manual chunks.

@@ -5,6 +5,7 @@ import { useAuthActions, useProjectContext } from '../auth/AuthProvider';
 const navigation = [
   { to: '/', label: '概览', end: true },
   { to: '/hosts', label: '主机' },
+  { to: '/discovery', label: '数据库发现' },
   { to: '/instances', label: '数据库实例' },
   { to: '/plugins', label: '插件' },
   { to: '/metric-templates', label: '指标模板' },
