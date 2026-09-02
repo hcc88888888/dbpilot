@@ -73,6 +73,22 @@ describe('Database instance management pages', () => {
     expect(client.getJob).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['403', Object.assign(new Error('forbidden'), { response: new Response(null, { status: 403 }) }), '没有执行此操作的权限'],
+    ['network', new TypeError('network down'), '请求失败，请稍后重试'],
+  ])('stops and reports %s job polling failures without demo fallback', async (_kind, pollingError, expectedMessage) => {
+    const client = api();
+    client.getJob = vi.fn(async () => { throw pollingError; });
+    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test', 'platform.jobs.read']);
+    await userEvent.click(await screen.findByRole('button', { name: '测试连接' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain(expectedMessage);
+    const calls = vi.mocked(client.getJob).mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    expect(client.getJob).toHaveBeenCalledTimes(calls);
+    expect(document.body.textContent).not.toMatch(/demo/i);
+  });
+
   it('loads the next instance cursor instead of silently truncating inventory', async () => {
     const client = api();
     client.listDatabaseInstances = vi.fn(async (request) => request.cursor

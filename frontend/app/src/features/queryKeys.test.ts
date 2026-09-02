@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { retryScopedMutation } from '../api/client';
 import { discoveryKeys } from './discovery/queries';
 import { hostKeys } from './hosts/queries';
 import { instanceKeys } from './instances/queries';
@@ -14,5 +15,12 @@ describe('project-scoped management query keys', () => {
     expect(instanceKeys.list(scope, { hostId: 'host-1', databaseFamily: 'mysql', status: 'monitoring' })).toEqual([
       'instances', 'tenant-a', 'project-b', 'list', { hostId: 'host-1', databaseFamily: 'mysql', status: 'monitoring' },
     ]);
+  });
+
+  it('retries only transport, throttling, timeout and server failures', () => {
+    expect(retryScopedMutation(0, Object.assign(new Error('forbidden'), { response: new Response(null, { status: 403 }) }))).toBe(false);
+    expect(retryScopedMutation(0, Object.assign(new Error('busy'), { response: new Response(null, { status: 503 }) }))).toBe(true);
+    expect(retryScopedMutation(0, new TypeError('network failed'))).toBe(true);
+    expect(retryScopedMutation(1, new TypeError('network failed'))).toBe(false);
   });
 });

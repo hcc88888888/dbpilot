@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefaultApi, DiscoveryCandidate, DiscoveryCandidatePage, ManagedDatabaseInstance } from '../../../../generated/api/dist/index.js';
 import { renderFeature } from '../../test/renderFeature';
+import { AppShell } from '../../shell/AppShell';
 import { CandidateListPage } from './CandidateListPage';
 import { hostKeys } from '../hosts/queries';
 import { instanceKeys } from '../instances/queries';
@@ -42,6 +43,18 @@ describe('Discovery candidate workflows', () => {
     renderFeature(<CandidateListPage api={client} />, []);
     expect(await screen.findByText('没有查看发现候选的权限。')).not.toBeNull();
     expect(client.listDiscoveryCandidates).not.toHaveBeenCalled();
+  });
+
+  it('closes project-specific drawers before the new project can reuse their candidate', async () => {
+    const client = api();
+    const permissions = ['discovery:view', 'discovery:manage'];
+    renderFeature(<AppShell><CandidateListPage api={client} /></AppShell>, permissions, '/', permissions);
+    await userEvent.click(await screen.findByRole('button', { name: '纳管 candidate-native' }));
+    expect(screen.getByRole('dialog', { name: '纳管数据库实例' })).not.toBeNull();
+
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Project' }), 'tenant-a/project-b');
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '纳管数据库实例' })).toBeNull());
+    expect(client.acceptDiscoveryCandidate).not.toHaveBeenCalled();
   });
 
   it('filters native and Docker candidates and shows bounded evidence plus duplicate risk', async () => {

@@ -22,7 +22,7 @@ function api(): DefaultApi {
     listHosts: vi.fn(async (): Promise<ManagedHostPage> => ({ items: [host], page: { limit: 20, hasMore: false } })),
     getHost: vi.fn(async () => host),
     listDatabaseInstances: vi.fn(async (): Promise<ManagedDatabaseInstancePage> => ({
-      items: [{ instanceId: 'db-1', tenantId: 'tenant-a', projectId: 'project-a', hostId: 'host-1', agentId: 'agent-1', databaseFamily: 'mysql', databaseVariant: 'mysql', displayName: '订单库', endpoint: '127.0.0.1:3306', credentialRef: 'vault://mysql/orders', labels: {}, capabilities: new Set(), connectionTestStatus: 'succeeded', pluginAssignmentRevision: 3, managementStatus: 'monitoring', etag: '"db-3"', pluginId: 'mysql-observer' }],
+      items: [{ instanceId: 'db-1', tenantId: 'tenant-a', projectId: 'project-a', hostId: 'host-1', agentId: 'agent-1', databaseFamily: 'mysql', databaseVariant: 'mysql', displayName: '订单库', endpoint: '127.0.0.1:3306', credentialRef: 'secret://mysql/orders', labels: {}, capabilities: new Set(), connectionTestStatus: 'succeeded', pluginAssignmentRevision: 3, managementStatus: 'monitoring', etag: '"db-3"', pluginId: 'mysql-observer' }],
       page: { limit: 20, hasMore: false },
     })),
   } as unknown as DefaultApi;

@@ -33,6 +33,7 @@ export function InstanceDetailPage({ instanceId: explicitInstanceId, api: overri
           <div className="summary-grid"><article className="panel"><h2>连接配置</h2><dl><dt>端点</dt><dd>{instance.endpoint ?? instance.unixSocket ?? '未配置'}</dd><dt>凭据引用</dt><dd>{instance.credentialRef}</dd><dt>TLS 引用</dt><dd>{instance.tlsRef ?? '未配置'}</dd></dl></article><article className="panel"><h2>采集配置</h2><dl><dt>插件</dt><dd>{instance.pluginId ?? '未分配'}</dd><dt>期望版本</dt><dd>{instance.desiredPluginVersion ?? '未指定'}</dd><dt>分配版本</dt><dd>{instance.pluginAssignmentRevision}</dd></dl></article></div>
           <ConnectionTestPanel instance={instance} job={jobQuery.data ?? test.data} pending={test.isPending} tracking={canViewJobs} onTest={() => test.mutate(mutationKey())} />
           {test.error ? <AsyncBoundary error={test.error} /> : null}
+          {jobQuery.error ? <><p className="notice notice--warning">进度跟踪失败，当前状态可能陈旧。</p><AsyncBoundary error={jobQuery.error} /></> : null}
         </> : null}
       </AsyncBoundary>
     </section>

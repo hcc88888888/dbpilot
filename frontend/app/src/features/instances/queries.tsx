@@ -54,6 +54,7 @@ export function useConnectionJob(api: DefaultApi, scope: ApiProjectScope, instan
     queryFn: ({ signal }) => api.getJob({ jobId: jobId! }, { signal }),
     enabled: enabled && Boolean(jobId),
     refetchInterval: (current) => {
+      if (current.state.error) return false;
       const status = current.state.data?.status;
       return status && terminalJobs.has(status) ? false : 2_000;
     },

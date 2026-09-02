@@ -53,6 +53,11 @@ export function useScopedRequest(scope: ApiProjectScope) {
 }
 
 export function retryScopedMutation(failureCount: number, error: unknown): boolean {
-  const aborted = typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError';
-  return !aborted && failureCount < 1;
+  if (failureCount >= 1 || typeof error !== 'object' || error === null) return false;
+  const named = error as { name?: unknown; response?: unknown };
+  if (named.name === 'AbortError' || named.name === 'RequiredError') return false;
+  if (named.response instanceof Response) {
+    return named.response.status === 408 || named.response.status === 429 || named.response.status >= 500;
+  }
+  return true;
 }

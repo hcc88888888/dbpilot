@@ -38,7 +38,7 @@ export function AppShell({ children }: React.PropsWithChildren) {
         </nav>
         <button type="button" className="sign-out" onClick={() => void signOut()}>退出登录</button>
       </aside>
-      <main className="shell-content">{children ?? <Outlet />}</main>
+      <main key={current} className="shell-content">{children ?? <Outlet />}</main>
     </div>
   );
 }
