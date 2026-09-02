@@ -19,10 +19,46 @@ import (
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/policy"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 )
+
+func TestGenerateBootstrapCreatesSignedHostPluginRuntimeConfiguration(t *testing.T) {
+	now := time.Date(2026, 9, 2, 2, 3, 4, 0, time.UTC)
+	root := filepath.Join(t.TempDir(), "host-plugin")
+	options := validBootstrapOptions(root)
+	options.Now = now
+	options.HostPlugin = true
+	options.DockerNetworkName = "dbpilot_acceptance"
+	manifest, err := GenerateBootstrap(context.Background(), options)
+	require.NoError(t, err)
+	for _, name := range []string{"agent_ca_private_key", "discovery_rule_set", "plugin_publisher_private_key", "plugin_publisher_public_key", "mysql_password"} {
+		require.FileExists(t, manifest.Files[name], name)
+	}
+
+	var controlplane, agent map[string]any
+	require.NoError(t, yaml.Unmarshal(mustRead(t, manifest.Files["controlplane_config"]), &controlplane))
+	require.NoError(t, yaml.Unmarshal(mustRead(t, manifest.Files["agent_config"]), &agent))
+	require.Equal(t, true, controlplane["plugin_catalog"].(map[string]any)["enabled"])
+	require.Equal(t, "0.0.0.0:9445", controlplane["enrollment"].(map[string]any)["listener"].(map[string]any)["address"])
+	require.Equal(t, true, agent["docker_discovery"])
+	require.Equal(t, "/acceptance/helper-runtime/docker-discovery.sock", agent["docker_discovery_socket"])
+	require.Equal(t, true, agent["plugin"].(map[string]any)["enabled"])
+	require.Equal(t, "https://controlplane:8443", agent["plugin"].(map[string]any)["artifact_origin"])
+
+	var envelope discovery.SignedRuleSet
+	require.NoError(t, json.Unmarshal(mustRead(t, manifest.Files["discovery_rule_set"]), &envelope))
+	public := mustPublicKey(t, manifest.Files["policy_public_key"]).(ed25519.PublicKey)
+	verified, err := discovery.VerifyRuleSet(public, envelope, now, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"dbpilot_acceptance"}, verified.Rules[0].DockerNetworkNames)
+
+	configText := string(mustRead(t, manifest.Files["controlplane_config"])) + string(mustRead(t, manifest.Files["agent_config"]))
+	require.NotContains(t, configText, string(mustRead(t, manifest.Files["mysql_password"])))
+	require.NotContains(t, configText, string(mustRead(t, manifest.Files["plugin_publisher_private_key"])))
+}
 
 func TestGenerateBootstrapCreatesAcceptanceTreeWithoutManifestSecrets(t *testing.T) {
 	now := time.Date(2026, 8, 29, 2, 3, 4, 0, time.UTC)

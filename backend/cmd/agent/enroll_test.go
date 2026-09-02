@@ -227,6 +227,13 @@ func TestEnrollmentNetworkAddressesStayUniqueSortedAndBounded(t *testing.T) {
 	require.Equal(t, 1, strings.Count(strings.Join(addresses, ","), "127.0.0.1"))
 }
 
+func TestCollectEnrollmentObservationUsesCanonicalExecutionPlatform(t *testing.T) {
+	observation, err := collectEnrollmentObservation(context.Background(), "agent-platform-test")
+	require.NoError(t, err)
+	require.Equal(t, runtime.GOOS, observation.OS)
+	require.Equal(t, runtime.GOARCH, observation.Architecture)
+}
+
 func validCLIHostObservation() hostinventory.Observation {
 	return hostinventory.Observation{
 		AgentID: "agent-1", Revision: 1, AgentVersion: "dev", Hostname: "db-1.example",

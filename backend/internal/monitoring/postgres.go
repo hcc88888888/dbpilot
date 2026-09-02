@@ -24,13 +24,14 @@ const (
 	HardMaximumLabels           = 64
 	HardMaximumSamples          = 50000
 	HardMaximumResponseBytes    = 4 << 20
-	stateFields                 = "instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at"
+	stateFields                 = "mi.instance_id, mi.agent_id, mi.engine, mi.host, mi.labels, mi.collect_every_ns, mi.last_sample_at, COALESCE(h.last_heartbeat_at, mi.last_heartbeat_at)"
 )
 
 var ErrQueryLimit = errors.New("monitoring query exceeds configured limit")
 
-const instancesSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 ORDER BY instance_id ASC LIMIT $3"
-const instanceSQL = "SELECT " + stateFields + " FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3"
+const monitoringStateJoinSQL = " FROM monitoring_instances mi LEFT JOIN managed_hosts h ON h.tenant_id = mi.tenant_id AND h.project_id = mi.project_id AND h.agent_id = mi.agent_id"
+const instancesSQL = "SELECT " + stateFields + monitoringStateJoinSQL + " WHERE mi.tenant_id = $1 AND mi.project_id = $2 ORDER BY mi.instance_id ASC LIMIT $3"
+const instanceSQL = "SELECT " + stateFields + monitoringStateJoinSQL + " WHERE mi.tenant_id = $1 AND mi.project_id = $2 AND mi.instance_id = $3"
 const instanceSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND sampled_at >= $4 AND sampled_at <= $5 ORDER BY sampled_at ASC, agent_id ASC, metric ASC LIMIT $6"
 const seriesSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND labels ->> 'instance' = $3 AND metric = $4 AND sampled_at >= $5 AND sampled_at <= $6 ORDER BY sampled_at ASC, agent_id ASC LIMIT $7"
 const scopeSamplesSQL = "SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples WHERE tenant_id = $1 AND project_id = $2 AND sampled_at >= $3 AND sampled_at <= $4 ORDER BY sampled_at ASC, agent_id ASC, metric ASC LIMIT $5"
@@ -87,8 +88,10 @@ func ValidateQueryLimits(limits QueryLimits) error {
 // DefaultCapabilities exposes the built-in SQL adapter catalog without opening
 // any database or resolving any secret.
 func DefaultCapabilities() []Capability {
+	mysql := database.NewMySQLFactory(nil, nil).Capabilities()
+	mysql.MetricIDs = MySQLBuiltinMetricIDs()
 	return []Capability{
-		CapabilityFromMatrix(database.MySQLFamily, database.NewMySQLFactory(nil, nil).Capabilities()),
+		CapabilityFromMatrix(database.MySQLFamily, mysql),
 		CapabilityFromMatrix(database.PostgresFamily, database.NewPostgresFactory(nil, nil).Capabilities()),
 		CapabilityFromMatrix(database.OracleFamily, database.NewOracleFactory(nil, nil).Capabilities()),
 	}

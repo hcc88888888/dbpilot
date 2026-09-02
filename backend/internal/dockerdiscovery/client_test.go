@@ -55,6 +55,50 @@ func TestDockerClientUsesOnlyExactReadAllowlist(t *testing.T) {
 	require.Equal(t, []string{"GET /info", "GET /containers/json?all=1", "GET /containers/" + id + "/json"}, requests)
 }
 
+func TestDockerClientDerivesBoundedInternalEndpointsWithoutHostPublication(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(t, "/containers/"+id+"/json", request.URL.Path)
+		_, _ = writer.Write([]byte(`{"Id":"` + id + `","Name":"/mysql-a","Config":{"Image":"mysql:8.4","ExposedPorts":{"3306/tcp":{}}},"State":{"Status":"running","Pid":123},"NetworkSettings":{"Ports":{"3306/tcp":null},"Networks":{"dbpilot_acceptance":{"IPAddress":"172.30.0.10"}}}}`))
+	}))
+	defer server.Close()
+
+	observation, err := newHTTPClient(server.Client(), server.URL).InspectContainer(context.Background(), id)
+	require.NoError(t, err)
+	require.Empty(t, observation.Ports)
+	require.Equal(t, []InternalEndpoint{{NetworkName: "dbpilot_acceptance", Address: "172.30.0.10", Port: 3306, Protocol: "tcp"}}, observation.InternalEndpoints)
+}
+
+func TestDockerClientRejectsUnsafeInternalNetworkEndpointShapes(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for name, networks := range map[string]string{
+		"empty address":  `{"dbpilot_acceptance":{"IPAddress":""}}`,
+		"non IP address": `{"dbpilot_acceptance":{"IPAddress":"mysql-a"}}`,
+		"unsafe network": `{"../acceptance":{"IPAddress":"172.30.0.10"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = writer.Write([]byte(`{"Id":"` + id + `","Name":"/mysql-a","Config":{"Image":"mysql:8.4","ExposedPorts":{"3306/tcp":{}}},"State":{"Status":"running","Pid":123},"NetworkSettings":{"Ports":{"3306/tcp":null},"Networks":` + networks + `}}`))
+			}))
+			defer server.Close()
+			_, err := newHTTPClient(server.Client(), server.URL).InspectContainer(context.Background(), id)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestDockerClientIgnoresEmptyInternalAddressForStoppedContainer(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"Id":"` + id + `","Name":"/completed-job","Config":{"Image":"fixture:1","ExposedPorts":{"3306/tcp":{}}},"State":{"Status":"exited","Pid":0},"NetworkSettings":{"Ports":{"3306/tcp":null},"Networks":{"dbpilot_acceptance":{"IPAddress":""}}}}`))
+	}))
+	defer server.Close()
+	observation, err := newHTTPClient(server.Client(), server.URL).InspectContainer(context.Background(), id)
+	require.NoError(t, err)
+	require.Equal(t, "exited", observation.State)
+	require.Empty(t, observation.InternalEndpoints)
+}
+
 func TestDockerClientDialsOnlyConfiguredUnixSocket(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Docker Engine AF_UNIX client is verified in Linux cross/container gates")

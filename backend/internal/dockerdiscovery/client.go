@@ -28,6 +28,7 @@ const (
 )
 
 var containerIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var networkNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 var ErrContainerNotFound = errors.New("Docker container disappeared")
 
 type responseStatusError struct{ code int }
@@ -52,17 +53,25 @@ type PortMapping struct {
 	Protocol      string
 }
 
+type InternalEndpoint struct {
+	NetworkName string
+	Address     string
+	Port        uint16
+	Protocol    string
+}
+
 type ContainerObservation struct {
-	ContainerID    string
-	Name           string
-	Image          string
-	State          string
-	Ports          []PortMapping
-	Labels         map[string]string
-	CommandSummary string
-	HostProcessID  uint32
-	Cgroup         string
-	ObservedAt     time.Time
+	ContainerID       string
+	Name              string
+	Image             string
+	State             string
+	Ports             []PortMapping
+	InternalEndpoints []InternalEndpoint
+	Labels            map[string]string
+	CommandSummary    string
+	HostProcessID     uint32
+	Cgroup            string
+	ObservedAt        time.Time
 }
 
 type ContainerEvent struct {
@@ -145,10 +154,11 @@ func (client *Client) InspectContainer(ctx context.Context, id string) (Containe
 		ID     string `json:"Id"`
 		Name   string `json:"Name"`
 		Config struct {
-			Image      string            `json:"Image"`
-			Entrypoint []string          `json:"Entrypoint"`
-			Cmd        []string          `json:"Cmd"`
-			Labels     map[string]string `json:"Labels"`
+			Image        string              `json:"Image"`
+			Entrypoint   []string            `json:"Entrypoint"`
+			Cmd          []string            `json:"Cmd"`
+			Labels       map[string]string   `json:"Labels"`
+			ExposedPorts map[string]struct{} `json:"ExposedPorts"`
 		} `json:"Config"`
 		State struct {
 			Status string `json:"Status"`
@@ -159,6 +169,9 @@ func (client *Client) InspectContainer(ctx context.Context, id string) (Containe
 				HostIP   string `json:"HostIp"`
 				HostPort string `json:"HostPort"`
 			} `json:"Ports"`
+			Networks map[string]struct {
+				IPAddress string `json:"IPAddress"`
+			} `json:"Networks"`
 		} `json:"NetworkSettings"`
 	}
 	if err := client.getJSON(ctx, "/containers/"+id+"/json", nil, &raw); err != nil {
@@ -175,9 +188,73 @@ func (client *Client) InspectContainer(ctx context.Context, id string) (Containe
 	if err != nil {
 		return ContainerObservation{}, err
 	}
+	internalEndpoints, err := normalizeInternalEndpoints(raw.State.Status, raw.Config.ExposedPorts, raw.NetworkSettings.Ports, raw.NetworkSettings.Networks)
+	if err != nil {
+		return ContainerObservation{}, err
+	}
 	arguments := append(append([]string(nil), raw.Config.Entrypoint...), raw.Config.Cmd...)
 	cgroup := optionalCgroupAt("/proc", raw.State.Pid)
-	return ContainerObservation{ContainerID: id, Name: strings.TrimPrefix(raw.Name, "/"), Image: raw.Config.Image, State: raw.State.Status, Ports: ports, Labels: raw.Config.Labels, CommandSummary: RedactCommand(arguments), HostProcessID: raw.State.Pid, Cgroup: cgroup, ObservedAt: time.Now().UTC()}, nil
+	return ContainerObservation{ContainerID: id, Name: strings.TrimPrefix(raw.Name, "/"), Image: raw.Config.Image, State: raw.State.Status, Ports: ports, InternalEndpoints: internalEndpoints, Labels: raw.Config.Labels, CommandSummary: RedactCommand(arguments), HostProcessID: raw.State.Pid, Cgroup: cgroup, ObservedAt: time.Now().UTC()}, nil
+}
+
+func normalizeInternalEndpoints(containerState string, exposed map[string]struct{}, mapped map[string][]struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}, networks map[string]struct {
+	IPAddress string `json:"IPAddress"`
+}) ([]InternalEndpoint, error) {
+	ports := make(map[string]struct{}, len(exposed)+len(mapped))
+	for value := range exposed {
+		ports[value] = struct{}{}
+	}
+	for value := range mapped {
+		ports[value] = struct{}{}
+	}
+	type exposedPort struct {
+		port     uint16
+		protocol string
+	}
+	parsedPorts := make([]exposedPort, 0, len(ports))
+	for value := range ports {
+		rawPort, protocol, ok := strings.Cut(value, "/")
+		port, err := strconv.ParseUint(rawPort, 10, 16)
+		if !ok || err != nil || port == 0 || protocol != "tcp" && protocol != "udp" {
+			return nil, errors.New("invalid Docker exposed port")
+		}
+		parsedPorts = append(parsedPorts, exposedPort{port: uint16(port), protocol: protocol})
+	}
+	sort.Slice(parsedPorts, func(left, right int) bool {
+		if parsedPorts[left].port != parsedPorts[right].port {
+			return parsedPorts[left].port < parsedPorts[right].port
+		}
+		return parsedPorts[left].protocol < parsedPorts[right].protocol
+	})
+	names := make([]string, 0, len(networks))
+	for name := range networks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > 32 || len(parsedPorts) > 32 || len(names)*len(parsedPorts) > 256 {
+		return nil, errors.New("Docker internal endpoint exceeds bound")
+	}
+	result := make([]InternalEndpoint, 0, len(names)*len(parsedPorts))
+	for _, name := range names {
+		address := networks[name].IPAddress
+		if !networkNamePattern.MatchString(name) {
+			return nil, errors.New("invalid Docker internal endpoint")
+		}
+		if address == "" && containerState != "running" {
+			continue
+		}
+		parsedAddress := net.ParseIP(address)
+		if parsedAddress == nil {
+			return nil, errors.New("invalid Docker internal endpoint")
+		}
+		for _, port := range parsedPorts {
+			result = append(result, InternalEndpoint{NetworkName: name, Address: parsedAddress.String(), Port: port.port, Protocol: port.protocol})
+		}
+	}
+	return result, nil
 }
 
 func optionalCgroupAt(root string, pid uint32) string {

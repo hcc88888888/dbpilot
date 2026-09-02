@@ -76,6 +76,7 @@ func (s *MemoryStore) Overview(_ context.Context, scope alert.Scope, query Range
 
 	s.mu.RLock()
 	instances := s.scopedInstancesLocked(scope)
+	samples := copySamples(s.samples)
 	source := s.source
 	s.mu.RUnlock()
 
@@ -92,6 +93,7 @@ func (s *MemoryStore) Overview(_ context.Context, scope alert.Scope, query Range
 			overview.Offline++
 		}
 	}
+	overview.Metrics = monitoringSeries(samples, scope, query, overview.Instances)
 	return overview, nil
 }
 
@@ -157,6 +159,7 @@ func (s *MemoryStore) GetInstance(_ context.Context, scope alert.Scope, instance
 	detail := InstanceDetail{Instance: RedactInstance(instance), Metrics: make([]Series, 0, len(metrics))}
 	for _, metric := range metrics {
 		series := buildMetricSeries(samples, scope, instanceID, metric, query)
+		series.Status = instance.Status
 		detail.Metrics = append(detail.Metrics, series)
 		instance.Latest[metric] = latestSeriesValue(series)
 	}
@@ -177,13 +180,15 @@ func (s *MemoryStore) Series(_ context.Context, scope alert.Scope, query SeriesQ
 	}
 
 	s.mu.RLock()
-	_, found := s.instanceLocked(scope, query.InstanceID)
+	instance, found := s.instanceLocked(scope, query.InstanceID)
 	samples := copySamples(s.samples)
 	s.mu.RUnlock()
 	if !found {
 		return Series{}, ErrInstanceNotFound
 	}
-	return buildMetricSeries(samples, scope, query.InstanceID, query.Metric, query.Range), nil
+	series := buildMetricSeries(samples, scope, query.InstanceID, query.Metric, query.Range)
+	series.Status = classifyForInstance(now, instance)
+	return series, nil
 }
 
 func (s *MemoryStore) Capabilities(_ context.Context, scope alert.Scope) ([]Capability, error) {
@@ -276,13 +281,90 @@ func metricNames(samples []alert.MetricSample, scope alert.Scope, instanceID str
 
 func buildMetricSeries(samples []alert.MetricSample, scope alert.Scope, instanceID, metric string, query RangeQuery) Series {
 	points := make([]SamplePoint, 0)
+	var identity alert.MetricSample
 	for _, sample := range samples {
 		if sample.Scope != scope || sampleInstanceID(sample) != instanceID || sample.Name != metric {
 			continue
 		}
+		if identity.Name == "" {
+			identity = sample
+		}
 		points = append(points, SamplePoint{At: sample.SampledAt, Value: sample.Value})
 	}
-	return BuildSeries(metric, query.From, query.To, query.Step, points)
+	series := BuildSeries(metric, query.From, query.To, query.Step, points)
+	series.Unit = metricUnit(metric)
+	series.InstanceID = instanceID
+	series.HostID = safeMetricIdentity(firstNonEmptyString(identity.Labels["host"], identity.Host))
+	pluginID := safeMetricIdentity(identity.Labels["plugin_id"])
+	assignmentID := safeMetricIdentity(identity.Labels["assignment_id"])
+	if pluginID == "" {
+		series.Scope = MetricScopeHost
+		series.Source = "agent-core"
+		series.InstanceID = ""
+		return series
+	}
+	series.Source = pluginID
+	series.PluginAssignmentID = assignmentID
+	if metric == "dbpilot.plugin.collection.status" {
+		series.Scope = MetricScopePlugin
+		series.InstanceID = ""
+		return series
+	}
+	series.Scope = MetricScopeDatabase
+	return series
+}
+
+func monitoringSeries(samples []alert.MetricSample, scope alert.Scope, query RangeQuery, instances []Instance) []Series {
+	result := make([]Series, 0)
+	for _, instance := range instances {
+		for _, metric := range metricNames(samples, scope, instance.ID, query) {
+			series := buildMetricSeries(samples, scope, instance.ID, metric, query)
+			series.Status = instance.Status
+			result = append(result, series)
+		}
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].Scope != result[right].Scope {
+			return result[left].Scope < result[right].Scope
+		}
+		if result[left].InstanceID != result[right].InstanceID {
+			return result[left].InstanceID < result[right].InstanceID
+		}
+		return result[left].Name < result[right].Name
+	})
+	return result
+}
+
+func metricUnit(name string) string {
+	switch name {
+	case "host.cpu", "host.memory":
+		return "%"
+	case "mysql.queries.total":
+		return "{query}"
+	case "mysql.uptime.seconds":
+		return "s"
+	case "mysql.connections.current", "mysql.threads.running", "mysql.up", "dbpilot.plugin.collection.status":
+		return "1"
+	default:
+		return ""
+	}
+}
+
+func safeMetricIdentity(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") || containsSecret(value) {
+		return ""
+	}
+	return value
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func sampleInstanceID(sample alert.MetricSample) string {

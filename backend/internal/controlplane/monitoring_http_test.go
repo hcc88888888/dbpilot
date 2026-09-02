@@ -188,6 +188,28 @@ func TestMonitoringResponseMarksMissingValueNullAndStaleInstance(t *testing.T) {
 	require.NotContains(t, response.Body.String(), "secret-token")
 }
 
+func TestMonitoringOverviewExposesScopedHostPluginAndFiveMySQLSeries(t *testing.T) {
+	fixture := monitoringFixture(t)
+	response := fixture.request(http.MethodGet, "/api/v1/tenants/t1/projects/p1/monitoring/overview?from=2026-08-27T09:00:00Z&to=2026-08-27T10:00:00Z&step=5m", memberFor("t1", "p1"))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var envelope struct {
+		Metrics []monitoring.Series `json:"metrics"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &envelope))
+	require.Len(t, envelope.Metrics, 8)
+	byName := make(map[string]monitoring.Series, len(envelope.Metrics))
+	for _, series := range envelope.Metrics {
+		byName[series.Name] = series
+	}
+	require.Equal(t, monitoring.MetricScopeHost, byName["host.cpu"].Scope)
+	require.Equal(t, monitoring.MetricScopePlugin, byName["dbpilot.plugin.collection.status"].Scope)
+	for _, name := range monitoring.MySQLBuiltinMetricIDs() {
+		require.Equal(t, monitoring.MetricScopeDatabase, byName[name].Scope)
+		require.Equal(t, monitoring.StatusStale, byName[name].Status)
+		require.Nil(t, byName[name].Buckets[len(byName[name].Buckets)-1].Value)
+	}
+}
+
 func TestMonitoringRoutesReturnInstancesSeriesAndCapabilities(t *testing.T) {
 	fixture := monitoringFixture(t)
 	cases := []string{
@@ -236,11 +258,22 @@ func monitoringFixture(t *testing.T) *monitoringHTTPFixture {
 	store := monitoring.NewMemoryStore([]monitoring.Instance{
 		{ID: "db-1", Scope: scope, Engine: database.MySQLFamily, Labels: map[string]string{"engine": "mysql", "token": "secret-token"}, LastSampleAt: now.Add(-15 * time.Minute), LastHeartbeatAt: now.Add(-time.Minute), CollectEvery: 5 * time.Minute, RawPayload: "raw-payload", Secret: "secret-token"},
 		{ID: "other", Scope: alert.Scope{TenantID: "t1", ProjectID: "p2"}, Engine: database.PostgresFamily, LastSampleAt: now, LastHeartbeatAt: now, CollectEvery: time.Minute},
-	}, []alert.MetricSample{
-		{Scope: scope, AgentID: "agent-1", InstanceID: "db-1", Name: "host.cpu", Value: 42, SampledAt: now.Add(-15 * time.Minute), Labels: map[string]string{"instance": "db-1", "host": "db-1", "component": "database", "role": "primary"}},
-	}, []monitoring.Capability{{Engine: database.MySQLFamily, Metrics: true, MetricIDs: []string{"host.cpu"}}})
+	}, monitoringFixtureSamples(scope, now), []monitoring.Capability{{Engine: database.MySQLFamily, Metrics: true, MetricIDs: monitoring.MySQLBuiltinMetricIDs()}})
 	store.SetNow(func() time.Time { return now })
 	return &monitoringHTTPFixture{scope: scope, now: now, store: store, handler: NewHTTPHandler(Services{Repository: newHTTPFixture().repository, Evaluator: healthyEvaluator{}, Monitoring: store, Now: func() time.Time { return now }}, memberFor("t1", "p1"))}
+}
+
+func monitoringFixtureSamples(scope alert.Scope, now time.Time) []alert.MetricSample {
+	lastSample := now.Add(-15 * time.Minute)
+	samples := []alert.MetricSample{
+		{Scope: scope, AgentID: "agent-1", InstanceID: "db-1", Name: "host.cpu", Value: 42, SampledAt: lastSample, Labels: map[string]string{"instance": "db-1", "host": "host-1", "component": "host", "role": "collector"}},
+		{Scope: scope, AgentID: "agent-1", InstanceID: "db-1", Name: "host.memory", Value: 61, SampledAt: lastSample, Labels: map[string]string{"instance": "db-1", "host": "host-1", "component": "host", "role": "collector"}},
+		{Scope: scope, AgentID: "agent-1", InstanceID: "db-1", Name: "dbpilot.plugin.collection.status", Value: 1, SampledAt: lastSample, Labels: map[string]string{"instance": "db-1", "host": "host-1", "component": "dbpilot-plugin-mysql", "role": "collector", "engine": "mysql", "plugin_id": "mysql", "assignment_id": "assignment-1"}},
+	}
+	for index, name := range monitoring.MySQLBuiltinMetricIDs() {
+		samples = append(samples, alert.MetricSample{Scope: scope, AgentID: "agent-1", InstanceID: "db-1", Name: name, Value: float64(index + 1), SampledAt: lastSample, Labels: map[string]string{"instance": "db-1", "host": "host-1", "component": "dbpilot-plugin-mysql", "role": "primary", "engine": "mysql", "plugin_id": "mysql", "assignment_id": "assignment-1"}})
+	}
+	return samples
 }
 
 func (fixture *monitoringHTTPFixture) request(method, path string, resolver PrincipalResolver) *httptest.ResponseRecorder {

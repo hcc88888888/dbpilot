@@ -26,6 +26,7 @@ import (
 const (
 	maximumGRPCMessageBytes = 4 << 20
 	maximumAllowedLabels    = 32
+	maximumAllowedNetworks  = 32
 	maximumInspectWorkers   = 4
 	maximumSnapshotDTOBytes = 3 << 20
 	snapshotTimeout         = 8 * time.Second
@@ -36,13 +37,14 @@ var labelKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 type Service struct {
 	discoveryv1.UnimplementedDockerDiscoveryServer
-	engine  Engine
-	allowed map[string]struct{}
-	now     func() time.Time
+	engine          Engine
+	allowedLabels   map[string]struct{}
+	allowedNetworks map[string]struct{}
+	now             func() time.Time
 }
 
-func NewService(engine Engine, allowedLabelKeys []string) (*Service, error) {
-	if engine == nil || len(allowedLabelKeys) > maximumAllowedLabels {
+func NewService(engine Engine, allowedLabelKeys []string, networkAllowlists ...[]string) (*Service, error) {
+	if engine == nil || len(allowedLabelKeys) > maximumAllowedLabels || len(networkAllowlists) > 1 {
 		return nil, errors.New("invalid Docker discovery service configuration")
 	}
 	allowed := make(map[string]struct{}, len(allowedLabelKeys))
@@ -55,11 +57,28 @@ func NewService(engine Engine, allowedLabelKeys []string) (*Service, error) {
 		}
 		allowed[key] = struct{}{}
 	}
-	return &Service{engine: engine, allowed: allowed, now: func() time.Time { return time.Now().UTC() }}, nil
+	var configuredNetworks []string
+	if len(networkAllowlists) == 1 {
+		configuredNetworks = networkAllowlists[0]
+	}
+	if len(configuredNetworks) > maximumAllowedNetworks {
+		return nil, errors.New("invalid Docker network allowlist")
+	}
+	networks := make(map[string]struct{}, len(configuredNetworks))
+	for _, name := range configuredNetworks {
+		if !networkNamePattern.MatchString(name) {
+			return nil, errors.New("invalid Docker network allowlist")
+		}
+		if _, duplicate := networks[name]; duplicate {
+			return nil, errors.New("duplicate Docker network allowlist entry")
+		}
+		networks[name] = struct{}{}
+	}
+	return &Service{engine: engine, allowedLabels: allowed, allowedNetworks: networks, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
 func (service *Service) Snapshot(ctx context.Context, request *discoveryv1.DockerSnapshotRequest) (*discoveryv1.DockerSnapshotResponse, error) {
-	allowed, err := service.validateRequest(request.GetRuleRevision(), request.GetAllowedLabelKeys())
+	allowed, err := service.validateRequest(request.GetRuleRevision(), request.GetAllowedLabelKeys(), request.GetAllowedNetworkNames())
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +135,7 @@ func (service *Service) Snapshot(ctx context.Context, request *discoveryv1.Docke
 					results <- inspectResult{index: job.index, err: inspectErr}
 					continue
 				}
-				wire, convertErr := protobufObservation(observation, allowed)
+				wire, convertErr := protobufObservation(observation, allowed.labels, allowed.networks)
 				if convertErr == nil {
 					budgetMutex.Lock()
 					budgetBytes += proto.Size(wire)
@@ -174,7 +193,7 @@ func (service *Service) Snapshot(ctx context.Context, request *discoveryv1.Docke
 var errSnapshotBudget = errors.New("Docker snapshot DTO budget exceeded")
 
 func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream grpc.ServerStreamingServer[discoveryv1.DockerEvent]) error {
-	allowed, err := service.validateRequest(request.GetRuleRevision(), request.GetAllowedLabelKeys())
+	allowed, err := service.validateRequest(request.GetRuleRevision(), request.GetAllowedLabelKeys(), request.GetAllowedNetworkNames())
 	if err != nil {
 		return err
 	}
@@ -202,7 +221,7 @@ func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream gr
 				}
 				observation = current
 			}
-			wire, convertErr := protobufObservation(observation, allowed)
+			wire, convertErr := protobufObservation(observation, allowed.labels, allowed.networks)
 			if convertErr != nil {
 				return status.Error(codes.DataLoss, "Docker event rejected")
 			}
@@ -222,29 +241,49 @@ func (service *Service) Watch(request *discoveryv1.DockerWatchRequest, stream gr
 	return nil
 }
 
-func (service *Service) validateRequest(revision uint64, keys []string) ([]string, error) {
-	if revision == 0 || len(keys) > maximumAllowedLabels {
-		return nil, status.Error(codes.InvalidArgument, "invalid Docker discovery request")
+type requestAllowlist struct {
+	labels   []string
+	networks []string
+}
+
+func (service *Service) validateRequest(revision uint64, keys, networkNames []string) (requestAllowlist, error) {
+	if revision == 0 || len(keys) > maximumAllowedLabels || len(networkNames) > maximumAllowedNetworks {
+		return requestAllowlist{}, status.Error(codes.InvalidArgument, "invalid Docker discovery request")
 	}
 	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
 		if !labelKeyPattern.MatchString(key) {
-			return nil, status.Error(codes.InvalidArgument, "invalid Docker label request")
+			return requestAllowlist{}, status.Error(codes.InvalidArgument, "invalid Docker label request")
 		}
-		if _, configured := service.allowed[key]; !configured {
-			return nil, status.Error(codes.PermissionDenied, "Docker label is not locally allowlisted")
+		if _, configured := service.allowedLabels[key]; !configured {
+			return requestAllowlist{}, status.Error(codes.PermissionDenied, "Docker label is not locally allowlisted")
 		}
 		if _, duplicate := seen[key]; duplicate {
-			return nil, status.Error(codes.InvalidArgument, "duplicate Docker label request")
+			return requestAllowlist{}, status.Error(codes.InvalidArgument, "duplicate Docker label request")
 		}
 		seen[key] = struct{}{}
 	}
 	result := append([]string(nil), keys...)
 	sort.Strings(result)
-	return result, nil
+	seenNetworks := make(map[string]struct{}, len(networkNames))
+	for _, name := range networkNames {
+		if !networkNamePattern.MatchString(name) {
+			return requestAllowlist{}, status.Error(codes.InvalidArgument, "invalid Docker network request")
+		}
+		if _, configured := service.allowedNetworks[name]; !configured {
+			return requestAllowlist{}, status.Error(codes.PermissionDenied, "Docker network is not locally allowlisted")
+		}
+		if _, duplicate := seenNetworks[name]; duplicate {
+			return requestAllowlist{}, status.Error(codes.InvalidArgument, "duplicate Docker network request")
+		}
+		seenNetworks[name] = struct{}{}
+	}
+	networks := append([]string(nil), networkNames...)
+	sort.Strings(networks)
+	return requestAllowlist{labels: result, networks: networks}, nil
 }
 
-func protobufObservation(observation ContainerObservation, allowed []string) (*discoveryv1.DockerContainerObservation, error) {
+func protobufObservation(observation ContainerObservation, allowedLabels, allowedNetworks []string) (*discoveryv1.DockerContainerObservation, error) {
 	if !containerIDPattern.MatchString(observation.ContainerID) || len(observation.Name) > 256 || len(observation.Image) > 512 || strings.ContainsAny(observation.Name+observation.Image+observation.CommandSummary+observation.Cgroup, "\x00\r\n") || len(observation.CommandSummary) > maximumCommandSummaryBytes || len(observation.Cgroup) > 512 {
 		return nil, errors.New("invalid Docker observation")
 	}
@@ -255,7 +294,34 @@ func protobufObservation(observation ContainerObservation, allowed []string) (*d
 		}
 		ports = append(ports, &discoveryv1.DockerPortMapping{HostAddress: value.HostAddress, HostPort: uint32(value.HostPort), ContainerPort: uint32(value.ContainerPort), Protocol: value.Protocol})
 	}
-	return &discoveryv1.DockerContainerObservation{ContainerId: observation.ContainerID, Name: observation.Name, Image: observation.Image, Status: protobufStatus(observation.State), Ports: ports, Labels: FilterLabels(observation.Labels, allowed), CommandSummary: RedactCommand(strings.Fields(observation.CommandSummary)), HostProcessId: observation.HostProcessID, Cgroup: observation.Cgroup, ObservedAt: timestamppb.New(observation.ObservedAt.UTC())}, nil
+	networkSet := make(map[string]struct{}, len(allowedNetworks))
+	for _, name := range allowedNetworks {
+		networkSet[name] = struct{}{}
+	}
+	internal := make([]*discoveryv1.DockerInternalEndpoint, 0, len(observation.InternalEndpoints))
+	for _, value := range observation.InternalEndpoints {
+		address := net.ParseIP(value.Address)
+		if !networkNamePattern.MatchString(value.NetworkName) || address == nil || value.Port == 0 || value.Protocol != "tcp" && value.Protocol != "udp" {
+			return nil, errors.New("invalid Docker internal endpoint")
+		}
+		if _, allowed := networkSet[value.NetworkName]; !allowed {
+			continue
+		}
+		internal = append(internal, &discoveryv1.DockerInternalEndpoint{NetworkName: value.NetworkName, Address: address.String(), Port: uint32(value.Port), Protocol: value.Protocol})
+	}
+	sort.Slice(internal, func(left, right int) bool {
+		if internal[left].GetNetworkName() != internal[right].GetNetworkName() {
+			return internal[left].GetNetworkName() < internal[right].GetNetworkName()
+		}
+		if internal[left].GetAddress() != internal[right].GetAddress() {
+			return internal[left].GetAddress() < internal[right].GetAddress()
+		}
+		if internal[left].GetPort() != internal[right].GetPort() {
+			return internal[left].GetPort() < internal[right].GetPort()
+		}
+		return internal[left].GetProtocol() < internal[right].GetProtocol()
+	})
+	return &discoveryv1.DockerContainerObservation{ContainerId: observation.ContainerID, Name: observation.Name, Image: observation.Image, Status: protobufStatus(observation.State), Ports: ports, Labels: FilterLabels(observation.Labels, allowedLabels), CommandSummary: RedactCommand(strings.Fields(observation.CommandSummary)), HostProcessId: observation.HostProcessID, Cgroup: observation.Cgroup, ObservedAt: timestamppb.New(observation.ObservedAt.UTC()), InternalEndpoints: internal}, nil
 }
 
 func protobufStatus(value string) discoveryv1.DockerContainerStatus {
@@ -267,19 +333,20 @@ func protobufEventType(value string) discoveryv1.DockerEventType {
 }
 
 type ServerConfig struct {
-	SocketPath       string
-	AllowedUID       uint32
-	AllowedGID       uint32
-	Engine           Engine
-	AllowedLabelKeys []string
-	Ready            chan<- struct{}
+	SocketPath          string
+	AllowedUID          uint32
+	AllowedGID          uint32
+	Engine              Engine
+	AllowedLabelKeys    []string
+	AllowedNetworkNames []string
+	Ready               chan<- struct{}
 }
 
 func Serve(ctx context.Context, config ServerConfig) error {
 	if ctx == nil || config.AllowedUID == 0 || config.AllowedGID == 0 || !filepath.IsAbs(config.SocketPath) {
 		return errors.New("invalid Docker discovery server configuration")
 	}
-	service, err := NewService(config.Engine, config.AllowedLabelKeys)
+	service, err := NewService(config.Engine, config.AllowedLabelKeys, config.AllowedNetworkNames)
 	if err != nil {
 		return err
 	}

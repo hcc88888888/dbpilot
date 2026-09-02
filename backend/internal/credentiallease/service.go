@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -96,7 +97,7 @@ func (service *ApplicationService) Lease(ctx context.Context, agent Authenticate
 	if closed {
 		return Lease{}, ErrLeaseRejected
 	}
-	renewalKey := agent.SessionID + "\x00" + request.AssignmentID + "\x00" + request.InstanceID
+	renewalKey := agent.SessionID + "\x00" + request.AssignmentID + "\x00" + request.InstanceID + "\x00" + strconv.FormatUint(request.ConfigurationRevision, 10) + "\x00" + strconv.FormatUint(request.OperationRevision, 10)
 	service.mu.Lock()
 	isRenewal := service.issued[renewalKey]
 	service.mu.Unlock()

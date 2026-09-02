@@ -14,6 +14,14 @@ type DiscoveryCommandRunner interface {
 
 type DiscoveryCommandExecutor struct{ Runner DiscoveryCommandRunner }
 
+func (executor DiscoveryCommandExecutor) AdditionalCapabilities() []string {
+	provider, ok := executor.Runner.(interface{ AdditionalCapabilities() []string })
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), provider.AdditionalCapabilities()...)
+}
+
 func (executor DiscoveryCommandExecutor) Execute(ctx context.Context, envelope *agentv1.CommandEnvelope, reporter ProgressReporter) (*agentv1.CommandResult, error) {
 	return executor.Runner.Execute(ctx, envelope, reporter)
 }

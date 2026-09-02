@@ -31,12 +31,13 @@ type Rule struct {
 	DockerImagePatterns    []string `json:"docker_image_patterns,omitempty"`
 	DockerLabelSelectors   []string `json:"docker_label_selectors,omitempty"`
 	DockerIdentityLabel    string   `json:"docker_identity_label,omitempty"`
+	DockerNetworkNames     []string `json:"docker_network_names,omitempty"`
 }
 
 func (rule Rule) Validate() error {
 	native := len(rule.ProcessNames)+len(rule.ExecutablePathPatterns)+len(rule.SystemdUnits) > 0
 	docker := len(rule.DockerImagePatterns) > 0 && len(rule.DockerLabelSelectors) > 0
-	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.DockerImagePatterns) > 32 || len(rule.DockerLabelSelectors) > 32 || (!native && !docker) || (len(rule.DockerImagePatterns) > 0) != (len(rule.DockerLabelSelectors) > 0) || (rule.DockerIdentityLabel != "" && (!docker || !safeDockerLabel(rule.DockerIdentityLabel))) {
+	if !identifierPattern.MatchString(rule.ID) || rule.Version == 0 || !familyPattern.MatchString(rule.DatabaseFamily) || !variantPattern.MatchString(rule.DatabaseVariant) || len(rule.ProcessNames) > 32 || len(rule.ExecutablePathPatterns) > 32 || len(rule.SystemdUnits) > 32 || len(rule.DefaultPorts) > 32 || len(rule.UnixSocketPatterns) > 32 || len(rule.DockerImagePatterns) > 32 || len(rule.DockerLabelSelectors) > 32 || len(rule.DockerNetworkNames) > 32 || (!native && !docker) || (len(rule.DockerImagePatterns) > 0) != (len(rule.DockerLabelSelectors) > 0) || (rule.DockerIdentityLabel != "" && (!docker || !safeDockerLabel(rule.DockerIdentityLabel))) {
 		return ErrInvalidRule
 	}
 	for _, value := range append(append([]string{}, rule.ProcessNames...), rule.SystemdUnits...) {
@@ -63,6 +64,16 @@ func (rule Rule) Validate() error {
 			return ErrInvalidRule
 		}
 		seenSelectors[selector] = struct{}{}
+	}
+	seenNetworks := make(map[string]struct{}, len(rule.DockerNetworkNames))
+	for _, network := range rule.DockerNetworkNames {
+		if !safeDockerLabel(network) {
+			return ErrInvalidRule
+		}
+		if _, duplicate := seenNetworks[network]; duplicate {
+			return ErrInvalidRule
+		}
+		seenNetworks[network] = struct{}{}
 	}
 	seenPorts := make(map[uint16]struct{}, len(rule.DefaultPorts))
 	for _, port := range rule.DefaultPorts {
@@ -223,6 +234,7 @@ func canonicalRuleSet(rules RuleSet) ([]byte, error) {
 		clone.Rules[index].UnixSocketPatterns = sortedStrings(clone.Rules[index].UnixSocketPatterns)
 		clone.Rules[index].DockerImagePatterns = sortedStrings(clone.Rules[index].DockerImagePatterns)
 		clone.Rules[index].DockerLabelSelectors = sortedStrings(clone.Rules[index].DockerLabelSelectors)
+		clone.Rules[index].DockerNetworkNames = sortedStrings(clone.Rules[index].DockerNetworkNames)
 		clone.Rules[index].DefaultPorts = append([]uint16(nil), clone.Rules[index].DefaultPorts...)
 		sort.Slice(clone.Rules[index].DefaultPorts, func(left, right int) bool {
 			return clone.Rules[index].DefaultPorts[left] < clone.Rules[index].DefaultPorts[right]

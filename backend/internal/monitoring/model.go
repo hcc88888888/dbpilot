@@ -146,15 +146,44 @@ type Bucket struct {
 	Value *float64  `json:"value"`
 }
 
+// MetricScope identifies the process boundary that owns a metric without
+// allowing a plugin to assert tenant or project authorization scope.
+type MetricScope string
+
+const (
+	MetricScopeHost     MetricScope = "host"
+	MetricScopePlugin   MetricScope = "plugin"
+	MetricScopeDatabase MetricScope = "database"
+)
+
+var mysqlBuiltinMetricIDs = []string{
+	"mysql.connections.current",
+	"mysql.queries.total",
+	"mysql.threads.running",
+	"mysql.up",
+	"mysql.uptime.seconds",
+}
+
+// MySQLBuiltinMetricIDs returns the first production plugin's fixed catalog.
+func MySQLBuiltinMetricIDs() []string {
+	return append([]string(nil), mysqlBuiltinMetricIDs...)
+}
+
 // Series is a normalized metric response independent of its backing store.
 type Series struct {
-	Name        string        `json:"name"`
-	Unit        string        `json:"unit,omitempty"`
-	Aggregation string        `json:"aggregation,omitempty"`
-	From        time.Time     `json:"from"`
-	To          time.Time     `json:"to"`
-	Step        time.Duration `json:"step"`
-	Buckets     []Bucket      `json:"buckets"`
+	Name               string        `json:"name"`
+	Unit               string        `json:"unit,omitempty"`
+	Aggregation        string        `json:"aggregation,omitempty"`
+	Scope              MetricScope   `json:"scope"`
+	Source             string        `json:"source"`
+	Status             Status        `json:"status"`
+	HostID             string        `json:"host_id,omitempty"`
+	PluginAssignmentID string        `json:"plugin_assignment_id,omitempty"`
+	InstanceID         string        `json:"instance_id,omitempty"`
+	From               time.Time     `json:"from"`
+	To                 time.Time     `json:"to"`
+	Step               time.Duration `json:"step"`
+	Buckets            []Bucket      `json:"buckets"`
 }
 
 // BuildSeries constructs every requested bucket and averages multiple points
@@ -204,6 +233,7 @@ type Overview struct {
 	Stale          int        `json:"stale"`
 	Offline        int        `json:"offline"`
 	Instances      []Instance `json:"instances,omitempty"`
+	Metrics        []Series   `json:"metrics,omitempty"`
 	Trend          Series     `json:"trend"`
 }
 

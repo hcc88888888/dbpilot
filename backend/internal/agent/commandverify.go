@@ -70,7 +70,7 @@ func NewCommandVerifier(agentID string, publicKey ed25519.PublicKey, capabilitie
 	for _, raw := range capabilities {
 		kind := CommandKind(raw)
 		if !knownCommandKind(kind) {
-			if raw == CapabilityCollectNowDependenciesV1 || raw == CapabilityCollectNowHostV1 || raw == PluginReconcileInstanceDescriptorsCapability {
+			if knownMetadataCapability(raw) {
 				continue
 			}
 			return nil, fmt.Errorf("unknown command capability %q", raw)
@@ -78,6 +78,17 @@ func NewCommandVerifier(agentID string, publicKey ed25519.PublicKey, capabilitie
 		allowed[kind] = struct{}{}
 	}
 	return &CommandVerifier{agentID: agentID, publicKey: append(ed25519.PublicKey(nil), publicKey...), capabilities: allowed, now: time.Now, nonces: make(map[string]nonceRecord)}, nil
+}
+
+func knownMetadataCapability(value string) bool {
+	switch value {
+	case CapabilityCollectNowDependenciesV1, CapabilityCollectNowHostV1, PluginReconcileInstanceDescriptorsCapability,
+		"metric_template_lease.v1", CapabilityDiscoverySourceResultsV1, CapabilityDiscoverySourceResultsPendingLegacyV1,
+		"docker_discovery_v1", "native_discovery_v1", "docker_discovery_configured", "docker_discovery_unavailable":
+		return true
+	default:
+		return false
+	}
 }
 
 func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandEnvelope) error {
@@ -118,6 +129,9 @@ func (v *CommandVerifier) Verify(ctx context.Context, envelope *agentv1.CommandE
 	v.mu.Unlock()
 	if reconcile := envelope.GetReconcilePlugin(); reconcile != nil {
 		targetAuthorizer = signedPluginMembership{agentID: v.agentID, instanceIDs: append([]string(nil), reconcile.GetInstanceIds()...), delegate: targetAuthorizer}
+	}
+	if collection := envelope.GetCollectDatabaseMetrics(); collection != nil {
+		targetAuthorizer = signedPluginMembership{agentID: v.agentID, instanceIDs: append([]string(nil), collection.GetInstanceIds()...), delegate: targetAuthorizer}
 	}
 	if err := commandvalidation.Validate(ctx, envelope, targetAuthorizer); err != nil {
 		if errors.Is(err, commandvalidation.ErrTargetUnauthorized) {

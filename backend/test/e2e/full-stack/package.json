@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test:support": "node --test support.test.mjs"
+  },
   "devDependencies": {
     "@playwright/test": "1.62.0"
   }

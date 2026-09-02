@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestDockerServerSnapshotReturnsOnlyFixedAllowlistedDTO(t *testing.T) {
@@ -37,6 +38,45 @@ func TestDockerServerSnapshotReturnsOnlyFixedAllowlistedDTO(t *testing.T) {
 	require.Equal(t, map[string]string{"dbpilot.discovery.family": "mysql", "password": "[REDACTED]"}, container.Labels)
 	require.NotContains(t, container.CommandSummary, "secret")
 	require.Equal(t, uint32(42), container.HostProcessId)
+}
+
+func TestDockerServerReturnsOnlyLocallyAndPerRequestAllowlistedInternalEndpoints(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	engine := &fakeEngine{list: []ContainerObservation{{ContainerID: id}}, inspect: ContainerObservation{
+		ContainerID: id, Name: "mysql-a", Image: "mysql:8.4", State: "running", ObservedAt: time.Now().UTC(),
+		InternalEndpoints: []InternalEndpoint{
+			{NetworkName: "dbpilot_acceptance", Address: "172.30.0.10", Port: 3306, Protocol: "tcp"},
+			{NetworkName: "other_network", Address: "172.31.0.10", Port: 3306, Protocol: "tcp"},
+		},
+	}}
+	service, err := NewService(engine, nil, []string{"dbpilot_acceptance"})
+	require.NoError(t, err)
+	response, err := service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 7, AllowedNetworkNames: []string{"dbpilot_acceptance"}})
+	require.NoError(t, err)
+	require.Len(t, response.GetContainers(), 1)
+	require.True(t, proto.Equal(&discoveryv1.DockerContainerObservation{InternalEndpoints: []*discoveryv1.DockerInternalEndpoint{{NetworkName: "dbpilot_acceptance", Address: "172.30.0.10", Port: 3306, Protocol: "tcp"}}}, &discoveryv1.DockerContainerObservation{InternalEndpoints: response.GetContainers()[0].GetInternalEndpoints()}))
+
+	_, err = service.Snapshot(context.Background(), &discoveryv1.DockerSnapshotRequest{RuleRevision: 7, AllowedNetworkNames: []string{"other_network"}})
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+func TestDockerServerRejectsInvalidInternalEndpointInsteadOfForwardingRawInspectData(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	for name, endpoint := range map[string]InternalEndpoint{
+		"empty address":  {NetworkName: "dbpilot_acceptance", Port: 3306, Protocol: "tcp"},
+		"non IP address": {NetworkName: "dbpilot_acceptance", Address: "mysql-a", Port: 3306, Protocol: "tcp"},
+		"wrong network":  {NetworkName: "other_network", Address: "172.31.0.10", Port: 3306, Protocol: "tcp"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wire, err := protobufObservation(ContainerObservation{ContainerID: id, Name: "mysql-a", Image: "mysql:8.4", State: "running", ObservedAt: time.Now().UTC(), InternalEndpoints: []InternalEndpoint{endpoint}}, nil, []string{"dbpilot_acceptance"})
+			if name == "wrong network" {
+				require.NoError(t, err)
+				require.Empty(t, wire.GetInternalEndpoints())
+				return
+			}
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestDockerServerRejectsUnknownLabelsAndInvalidRuleRevision(t *testing.T) {

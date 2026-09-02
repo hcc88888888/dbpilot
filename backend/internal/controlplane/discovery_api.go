@@ -168,13 +168,16 @@ func openAPIDiscoveryCandidate(value discovery.Candidate) (openapi.DiscoveryCand
 	if value.Validate() != nil {
 		return openapi.DiscoveryCandidate{}, discovery.ErrInvalid
 	}
-	evidence := make([]openapi.DiscoveryEvidence, len(value.Evidence))
-	for index, item := range value.Evidence {
+	evidence := make([]openapi.DiscoveryEvidence, 0, len(value.Evidence))
+	for _, item := range value.Evidence {
 		kind := openapi.DiscoveryEvidenceKind(item.Kind)
 		if !kind.Valid() {
+			if item.Kind == discovery.EvidenceContainerID {
+				continue
+			}
 			return openapi.DiscoveryCandidate{}, discovery.ErrInvalid
 		}
-		evidence[index] = openapi.DiscoveryEvidence{Kind: kind, Value: item.Value}
+		evidence = append(evidence, openapi.DiscoveryEvidence{Kind: kind, Value: item.Value})
 	}
 	result := openapi.DiscoveryCandidate{CandidateId: value.ID, TenantId: value.Scope.TenantID, ProjectId: value.Scope.ProjectID, HostId: value.HostID, AgentId: value.AgentID, DiscoverySource: openapi.DiscoverySource(value.Source), DatabaseFamily: value.DatabaseFamily, DatabaseVariant: value.DatabaseVariant, Confidence: float32(value.Confidence), EvidenceSummary: evidence, Fingerprint: hex.EncodeToString(value.Fingerprint[:]), RuleRevision: int64(value.RuleRevision), ObservationRevision: int64(value.ObservationRevision), FirstSeenAt: value.FirstSeenAt.UTC(), LastSeenAt: value.LastSeenAt.UTC(), Status: openapi.DiscoveryCandidateStatus(value.Status), Etag: entityTag(int64(value.ObservationRevision))}
 	if value.VersionHint != "" {

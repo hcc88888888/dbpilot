@@ -261,7 +261,7 @@ func verifyPluginArtifactReader(ctx context.Context, reader artifact.ReadSeekClo
 
 func validPluginArtifactGrant(grant PluginArtifactGrant, agentID, assignmentID, artifactID string, operationRevision uint64) bool {
 	value := grant.Artifact
-	return grant.AgentID == agentID && grant.AssignmentID == assignmentID && grant.ArtifactID == artifactID && grant.OperationRevision == operationRevision && value.ID == artifactID && value.Scope.Validate() == nil && value.Kind == "plugin_package" && value.ContentType == "application/gzip" && value.SizeBytes > 0 && value.SizeBytes <= maximumPluginArtifactSize && len(value.Checksum) == len("sha256:")+64 && strings.HasPrefix(value.Checksum, "sha256:") && value.SourceResource.ResourceType == "plugin_version" && validAgentResource(value.SourceResource.ResourceID) && value.StorageReference != ""
+	return grant.AgentID == agentID && grant.AssignmentID == assignmentID && grant.ArtifactID == artifactID && grant.OperationRevision == operationRevision && value.ID == artifactID && value.Scope.Validate() == nil && value.Kind == "plugin-package" && value.ContentType == "application/gzip" && value.SizeBytes > 0 && value.SizeBytes <= maximumPluginArtifactSize && len(value.Checksum) == len("sha256:")+64 && strings.HasPrefix(value.Checksum, "sha256:") && value.SourceResource.ResourceType == "plugin_catalog_operation" && validAgentResource(value.SourceResource.ResourceID) && value.StorageReference != ""
 }
 
 func sameArtifact(left, right artifact.Artifact) bool {

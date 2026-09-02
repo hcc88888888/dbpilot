@@ -25,6 +25,7 @@ type monitoringOverviewResponse struct {
 	Stale          int                   `json:"stale"`
 	Offline        int                   `json:"offline"`
 	Instances      []monitoring.Instance `json:"instances,omitempty"`
+	Metrics        []monitoring.Series   `json:"metrics,omitempty"`
 	Trend          monitoring.Series     `json:"trend"`
 }
 
@@ -66,7 +67,7 @@ func (api httpAPI) monitoringOverview(writer http.ResponseWriter, request *http.
 		return
 	}
 	instances := redactMonitoringInstances(value.Instances)
-	api.writeMonitoringJSON(writer, monitoringOverviewResponse{Source: monitoringSource, Scope: scope, From: value.From, To: value.To, TotalInstances: value.TotalInstances, Healthy: value.Healthy, Stale: value.Stale, Offline: value.Offline, Instances: instances, Trend: value.Trend})
+	api.writeMonitoringJSON(writer, monitoringOverviewResponse{Source: monitoringSource, Scope: scope, From: value.From, To: value.To, TotalInstances: value.TotalInstances, Healthy: value.Healthy, Stale: value.Stale, Offline: value.Offline, Instances: instances, Metrics: value.Metrics, Trend: value.Trend})
 }
 
 func (api httpAPI) monitoringInstances(writer http.ResponseWriter, request *http.Request, scope alert.Scope, _ alert.Principal) {

@@ -32,7 +32,7 @@ func TestCommandVerifierAcceptsVersionedCollectorAdvertisementsWithoutTreatingTh
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	now := time.Unix(1_725_000_000, 0).UTC()
-	verifier, err := NewCommandVerifier("agent-a", publicKey, []string{"collect_now", CapabilityCollectNowDependenciesV1, CapabilityCollectNowHostV1})
+	verifier, err := NewCommandVerifier("agent-a", publicKey, []string{"collect_now", CapabilityCollectNowDependenciesV1, CapabilityCollectNowHostV1, "metric_template_lease.v1"})
 	require.NoError(t, err)
 	verifier.now = func() time.Time { return now }
 	require.NoError(t, verifier.Verify(context.Background(), signedCollectNowEnvelope(t, privateKey, "versioned", "agent-a", []byte("nonce-versioned"), now, now.Add(time.Minute))))

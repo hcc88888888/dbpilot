@@ -78,6 +78,23 @@ func TestLeaseMetricTemplatesKeepsDifferentPerInstanceBindingsAndReleasesQueries
 	}
 }
 
+func TestLeaseMetricTemplatesPreservesInstancesWithoutCustomBindings(t *testing.T) {
+	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	reference := templateReferenceFor("template-a", "revision-a", "SELECT a")
+	leaser := &recordingTemplateLeaser{materials: map[string]metrictemplatelease.Material{"revision-a": templateMaterial(now, reference, "instance-a", "SELECT a")}}
+	request := HealthRequest{AssignmentID: "assignment-a", ConfigurationRevision: 5, OperationRevision: 7, TemplateLeaseCommandID: "command-a", TemplateIDs: []string{"template-a"}, TemplateReferences: []TemplateReference{reference}, InstanceIDs: []string{"instance-a", "instance-b"}, InstanceTemplateRefs: []InstanceTemplateReferences{{InstanceID: "instance-a", Templates: []TemplateReference{reference}}, {InstanceID: "instance-b", Templates: []TemplateReference{}}}}
+
+	configurations, releases, _, err := leaseMetricTemplates(context.Background(), leaser, request, now)
+
+	require.NoError(t, err)
+	require.Len(t, configurations, 2)
+	require.Len(t, configurations["instance-a"], 1)
+	require.Empty(t, configurations["instance-b"])
+	for _, release := range releases {
+		release()
+	}
+}
+
 func TestCredentialRenewalReusesActivePerInstanceTemplates(t *testing.T) {
 	checker := NewGatewayHealthChecker(nil)
 	templateA := testTemplateConfiguration("template-a")

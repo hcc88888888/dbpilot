@@ -253,7 +253,7 @@ func collectEnrollmentObservation(ctx context.Context, agentID string) (hostinve
 	addresses := enrollmentNetworkAddresses(interfaces)
 	observation := hostinventory.Observation{
 		AgentID: agentID, Revision: 1, AgentVersion: version, Hostname: hostname,
-		OS: info.Platform, OSVersion: info.PlatformVersion, Kernel: info.KernelVersion, Architecture: runtime.GOARCH,
+		OS: runtime.GOOS, OSVersion: info.PlatformVersion, Kernel: info.KernelVersion, Architecture: runtime.GOARCH,
 		LogicalCPUCount: uint32(logicalCPUs), MemoryCapacityBytes: memory.Total, Filesystems: filesystems,
 		NetworkAddresses: addresses, Capabilities: []string{"host.inventory.v1"}, ObservedAt: time.Now().UTC(),
 	}

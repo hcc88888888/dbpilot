@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider } from 'react-router-dom';
 import { AuthProvider } from './auth/AuthProvider';
 import { createOidcManager } from './auth/oidc';
+import { createAcceptanceAuthManager } from './auth/acceptance';
 import { AsyncBoundary } from './components/AsyncBoundary';
 import { createRouterAfterSigninCallback } from './routing/bootstrap';
 import './styles/tokens.css';
@@ -13,7 +14,7 @@ const root = createRoot(document.getElementById('root')!);
 async function startApplication() {
   try {
     const redirectUri = import.meta.env.VITE_OIDC_REDIRECT_URI ?? `${window.location.origin}/auth/callback`;
-    const manager = createOidcManager({
+    const manager = import.meta.env.VITE_DBPILOT_ACCEPTANCE === '1' ? createAcceptanceAuthManager() : createOidcManager({
       authority: import.meta.env.VITE_OIDC_AUTHORITY ?? '',
       clientId: import.meta.env.VITE_OIDC_CLIENT_ID ?? '',
       redirectUri,

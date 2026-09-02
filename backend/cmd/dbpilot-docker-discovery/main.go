@@ -27,6 +27,7 @@ func run(arguments []string, stderr io.Writer) int {
 	uid := flags.Uint64("allowed-uid", 0, "exact dbpilot Agent uid")
 	gid := flags.Uint64("allowed-gid", 0, "exact dbpilot Agent gid")
 	labels := flags.String("allowed-labels", "dbpilot.discovery.family,dbpilot.run", "comma-separated local label allowlist")
+	networks := flags.String("allowed-networks", "", "comma-separated local Docker network allowlist")
 	if err := flags.Parse(arguments); err != nil {
 		return 2
 	}
@@ -43,6 +44,11 @@ func run(arguments []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	allowedNetworks, err := parseOptionalNames(*networks)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	engine, err := dockerdiscovery.NewClient(*dockerSocket)
 	if err != nil {
 		fmt.Fprintln(stderr, "configure Docker Engine client:", err)
@@ -50,11 +56,18 @@ func run(arguments []string, stderr io.Writer) int {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := dockerdiscovery.Serve(ctx, dockerdiscovery.ServerConfig{SocketPath: *agentSocket, AllowedUID: uint32(*uid), AllowedGID: uint32(*gid), Engine: engine, AllowedLabelKeys: allowed}); err != nil {
+	if err := dockerdiscovery.Serve(ctx, dockerdiscovery.ServerConfig{SocketPath: *agentSocket, AllowedUID: uint32(*uid), AllowedGID: uint32(*gid), Engine: engine, AllowedLabelKeys: allowed, AllowedNetworkNames: allowedNetworks}); err != nil {
 		fmt.Fprintln(stderr, "serve Docker discovery helper:", err)
 		return 1
 	}
 	return 0
+}
+
+func parseOptionalNames(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	return parseLabels(raw)
 }
 
 func parseLabels(raw string) ([]string, error) {

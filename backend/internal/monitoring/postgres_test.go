@@ -70,7 +70,7 @@ func TestPostgresStoreBuildsScopedInstanceFromMetricSamples(t *testing.T) {
 
 	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
 	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
-	mock.ExpectQuery("SELECT instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at FROM monitoring_instances").
+	mock.ExpectQuery(regexp.QuoteMeta(instanceSQL)).
 		WithArgs(scope.TenantID, scope.ProjectID, "db-1").
 		WillReturnRows(instanceRows().AddRow("db-1", "agent-1", "mysql", "db-1", []byte(`{"instance":"db-1","host":"db-1","component":"database","role":"primary","engine":"mysql"}`), int64(time.Minute), now.Add(-time.Minute), now.Add(-time.Minute)))
 	mock.ExpectQuery("SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples").
@@ -95,7 +95,7 @@ func TestPostgresStoreKeepsKnownInstanceWhenRangeHasNoSamples(t *testing.T) {
 
 	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
 	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3")).
+	mock.ExpectQuery(regexp.QuoteMeta(instanceSQL)).
 		WithArgs(scope.TenantID, scope.ProjectID, "db-1").
 		WillReturnRows(instanceRows().AddRow("db-1", "agent-1", "mysql", "db-1", []byte(`{"instance":"db-1","host":"db-1","component":"database","role":"primary"}`), int64(time.Minute), now.Add(-5*time.Minute), now.Add(-time.Minute)))
 	mock.ExpectQuery("SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples").
@@ -122,7 +122,7 @@ func TestPostgresStoreRejectsOverflowBeforeAccumulatingInstances(t *testing.T) {
 	for index := 0; index <= 200; index++ {
 		rows.AddRow(fmt.Sprintf("db-%03d", index), "agent-1", "mysql", "db-1", []byte(`{"instance":"db-1","host":"db-1","component":"database","role":"primary"}`), int64(time.Minute), time.Now().UTC(), time.Now().UTC())
 	}
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 ORDER BY instance_id ASC LIMIT $3")).
+	mock.ExpectQuery(regexp.QuoteMeta(instancesSQL)).
 		WithArgs(scope.TenantID, scope.ProjectID, 201).WillReturnRows(rows)
 
 	_, err = NewPostgresStore(db, nil).ListInstances(context.Background(), scope, InstanceQuery{Limit: 10})
@@ -138,7 +138,7 @@ func TestPostgresStoreOverviewAndListIncludeBoundedSamples(t *testing.T) {
 	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
 	now := time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC)
 	state := instanceRows().AddRow("db-1", "agent-1", "mysql", "db-1", []byte(`{"instance":"db-1","host":"db-1","component":"database","role":"primary"}`), int64(time.Minute), now.Add(-time.Minute), now.Add(-time.Minute))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 ORDER BY instance_id ASC LIMIT $3")).WithArgs(scope.TenantID, scope.ProjectID, 201).WillReturnRows(state)
+	mock.ExpectQuery(regexp.QuoteMeta(instancesSQL)).WithArgs(scope.TenantID, scope.ProjectID, 201).WillReturnRows(state)
 	mock.ExpectQuery("SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples").WithArgs(scope.TenantID, scope.ProjectID, now.Add(-time.Hour), now, 10001).WillReturnRows(metricRows(now))
 
 	store := NewPostgresStore(db, nil)
@@ -148,7 +148,7 @@ func TestPostgresStoreOverviewAndListIncludeBoundedSamples(t *testing.T) {
 	require.NotEmpty(t, overview.Trend.Buckets)
 
 	state = instanceRows().AddRow("db-1", "agent-1", "mysql", "db-1", []byte(`{"instance":"db-1","host":"db-1","component":"database","role":"primary"}`), int64(time.Minute), now.Add(-time.Minute), now.Add(-time.Minute))
-	mock.ExpectQuery(regexp.QuoteMeta("SELECT instance_id, agent_id, engine, host, labels, collect_every_ns, last_sample_at, last_heartbeat_at FROM monitoring_instances WHERE tenant_id = $1 AND project_id = $2 ORDER BY instance_id ASC LIMIT $3")).WithArgs(scope.TenantID, scope.ProjectID, 201).WillReturnRows(state)
+	mock.ExpectQuery(regexp.QuoteMeta(instancesSQL)).WithArgs(scope.TenantID, scope.ProjectID, 201).WillReturnRows(state)
 	mock.ExpectQuery("SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples").WithArgs(scope.TenantID, scope.ProjectID, now.Add(-MaximumRange), now, 10001).WillReturnRows(metricRows(now))
 	page, err := store.ListInstances(context.Background(), scope, InstanceQuery{Limit: 10})
 	require.NoError(t, err)
@@ -165,6 +165,35 @@ func TestDefaultCapabilitiesIncludeCoreSQLAdapters(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres", "oracle"} {
 		require.True(t, byEngine[engine].Metrics, engine)
 	}
+	require.Equal(t, MySQLBuiltinMetricIDs(), byEngine["mysql"].MetricIDs)
+}
+
+func TestPostgresStoreUsesManagedHostHeartbeatSoStoppedPluginMetricsBecomeStale(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+	now := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
+	lastMetric := now.Add(-15 * time.Minute)
+	labels := []byte(`{"instance":"mysql-1","host":"host-1","engine":"mysql","component":"dbpilot-plugin-mysql","plugin_id":"mysql","assignment_id":"assignment-1"}`)
+	mock.ExpectQuery(`(?s)SELECT mi\.instance_id, mi\.agent_id, mi\.engine, mi\.host, mi\.labels, mi\.collect_every_ns, mi\.last_sample_at, COALESCE\(h\.last_heartbeat_at, mi\.last_heartbeat_at\).*FROM monitoring_instances mi.*LEFT JOIN managed_hosts h.*WHERE mi\.tenant_id = \$1 AND mi\.project_id = \$2 AND mi\.instance_id = \$3`).
+		WithArgs(scope.TenantID, scope.ProjectID, "mysql-1").
+		WillReturnRows(instanceRows().AddRow("mysql-1", "agent-1", "mysql", "host-1", labels, int64(5*time.Minute), lastMetric, now.Add(-time.Minute)))
+	mock.ExpectQuery("SELECT agent_id, metric, labels, value, sampled_at FROM metric_samples").
+		WithArgs(scope.TenantID, scope.ProjectID, "mysql-1", now.Add(-time.Hour), now, 10001).
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metric", "labels", "value", "sampled_at"}).
+			AddRow("agent-1", "mysql.connections.current", labels, 12.0, lastMetric))
+
+	store := NewPostgresStore(db, nil)
+	store.SetNow(func() time.Time { return now })
+	detail, err := store.GetInstance(context.Background(), scope, "mysql-1", RangeQuery{From: now.Add(-time.Hour), To: now, Step: 5 * time.Minute})
+	require.NoError(t, err)
+	require.Equal(t, StatusStale, detail.Instance.Status)
+	require.Len(t, detail.Metrics, 1)
+	require.Equal(t, StatusStale, detail.Metrics[0].Status)
+	require.Nil(t, detail.Metrics[0].Buckets[len(detail.Metrics[0].Buckets)-1].Value)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPostgresStoreResponseLimitCountsEncodedNewline(t *testing.T) {

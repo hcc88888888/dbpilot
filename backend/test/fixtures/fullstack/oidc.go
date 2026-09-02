@@ -212,7 +212,11 @@ func (handler *oidcHandler) issueToken(variant string) (string, int64, error) {
 	}
 	issuedAt, expiresAt := now, now.Add(handler.config.TokenTTL)
 	audience := handler.config.Audience
-	permissions := []string{"inspection:view", "inspection:manage", "inspection:execute", "platform.jobs.read", "platform.jobs.cancel", "platform.artifacts.read", "platform.artifacts.download", "platform.audit.read", "platform.capabilities.read"}
+	permissions := []string{
+		"inspection:view", "inspection:manage", "inspection:execute", "platform.jobs.read", "platform.jobs.cancel", "platform.artifacts.read", "platform.artifacts.download", "platform.audit.read", "platform.capabilities.read",
+		"hosts:view", "hosts:manage", "hosts:discover", "discovery:view", "discovery:manage", "database-instances:view", "database-instances:manage", "database-instances:test",
+		"plugins:view", "plugins:publish", "plugins:approve", "plugins:manage", "plugins:deploy", "metric-templates:view", "metric-templates:manage", "metric-templates:approve",
+	}
 	switch variant {
 	case "wrong_audience":
 		audience += "-wrong"
@@ -221,8 +225,12 @@ func (handler *oidcHandler) issueToken(variant string) (string, int64, error) {
 	case "missing_permission":
 		permissions = withoutString(permissions, "inspection:execute")
 	}
+	subject := "acceptance-admin"
+	if variant == "approver" {
+		subject = "acceptance-approver"
+	}
 	claims := map[string]any{
-		"sub": "acceptance-admin", "iss": handler.config.Issuer, "aud": audience,
+		"sub": subject, "iss": handler.config.Issuer, "aud": audience,
 		"iat": issuedAt.Unix(), "exp": expiresAt.Unix(),
 		"dbpilot_platform_admin": false,
 		"dbpilot_projects":       []platformscope.Scope{{TenantID: handler.config.TenantID, ProjectID: handler.config.ProjectID}},
@@ -248,7 +256,7 @@ func (handler *oidcHandler) issueToken(variant string) (string, int64, error) {
 
 func validOIDCVariant(value string) bool {
 	switch value {
-	case "valid", "wrong_audience", "expired", "missing_permission":
+	case "valid", "approver", "wrong_audience", "expired", "missing_permission":
 		return true
 	default:
 		return false

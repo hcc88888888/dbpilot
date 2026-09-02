@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/policy"
 	"gopkg.in/yaml.v3"
 )
@@ -31,15 +32,17 @@ import (
 const maximumOIDCTokenTTL = 15 * time.Minute
 
 type BootstrapOptions struct {
-	Root           string
-	Issuer         string
-	Audience       string
-	TenantID       string
-	ProjectID      string
-	OnlineAgentID  string
-	OfflineAgentID string
-	Now            time.Time
-	Random         io.Reader
+	Root              string
+	Issuer            string
+	Audience          string
+	TenantID          string
+	ProjectID         string
+	OnlineAgentID     string
+	OfflineAgentID    string
+	Now               time.Time
+	Random            io.Reader
+	HostPlugin        bool
+	DockerNetworkName string
 }
 
 type BootstrapManifest struct {
@@ -61,6 +64,19 @@ type generatedAuthority struct {
 type generatedCertificate struct {
 	certificatePEM []byte
 	privateKeyPEM  []byte
+}
+
+func safeBootstrapIdentifier(value string) bool {
+	if value == "" || len(value) > 128 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for index, character := range value {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || index > 0 && (character == '_' || character == '-' || character == '.') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (BootstrapManifest, error) {
@@ -109,6 +125,11 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 	}
 	if err := writer.write("untrusted_ca_cert", "config/untrusted-ca.pem", untrustedCA.certificatePEM, 0o644); err != nil {
 		return BootstrapManifest{}, err
+	}
+	if options.HostPlugin {
+		if err := writer.writePrivateKey("agent_ca_private_key", "secrets/ca-key.pem", ca.privateKey); err != nil {
+			return BootstrapManifest{}, err
+		}
 	}
 
 	certificates := []struct {
@@ -166,6 +187,44 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 	if err := writer.writePublicKey("policy_public_key", "config/policy-signing-public.pem", policyPublic); err != nil {
 		return BootstrapManifest{}, err
 	}
+	var pluginPublisherPublic ed25519.PublicKey
+	var pluginPublisherPrivate ed25519.PrivateKey
+	var discoveryEnvelope discovery.SignedRuleSet
+	var discoveryAttestation discovery.RuleAttestation
+	if options.HostPlugin {
+		if !safeBootstrapIdentifier(options.DockerNetworkName) {
+			return BootstrapManifest{}, errors.New("bootstrap Docker network name is invalid")
+		}
+		pluginPublisherPublic, pluginPublisherPrivate, err = ed25519.GenerateKey(randomSource)
+		if err != nil {
+			return BootstrapManifest{}, fmt.Errorf("generate plugin publisher key: %w", err)
+		}
+		if err := writer.writePrivateKey("plugin_publisher_private_key", "secrets/plugin-publisher-key.pem", pluginPublisherPrivate); err != nil {
+			return BootstrapManifest{}, err
+		}
+		if err := writer.writePublicKey("plugin_publisher_public_key", "config/plugin-publisher-public.pem", pluginPublisherPublic); err != nil {
+			return BootstrapManifest{}, err
+		}
+		rules := discovery.RuleSet{
+			Revision: 1, IssuedAt: now.Add(-time.Minute), ExpiresAt: now.Add(24 * time.Hour), ScanInterval: time.Minute, DisappearanceGrace: 2 * time.Minute,
+			Rules: []discovery.Rule{{ID: "mysql-acceptance", Version: 1, DatabaseFamily: "mysql", DatabaseVariant: "mysql", ProcessNames: []string{"mysqld-dbp"}, DefaultPorts: []uint16{3306}, DockerImagePatterns: []string{`^mysql:8\.4$`}, DockerLabelSelectors: []string{"dbpilot.discovery.family=mysql"}, DockerIdentityLabel: "dbpilot.instance_id", DockerNetworkNames: []string{options.DockerNetworkName}}},
+		}
+		discoveryEnvelope, err = discovery.SignRuleSetWithKey(policyPrivate, "acceptance-discovery-key", rules)
+		if err != nil {
+			return BootstrapManifest{}, fmt.Errorf("sign discovery rules: %w", err)
+		}
+		discoveryAttestation, err = discovery.AttestationFor(discoveryEnvelope)
+		if err != nil {
+			return BootstrapManifest{}, fmt.Errorf("build discovery attestation: %w", err)
+		}
+		body, marshalErr := json.Marshal(discoveryEnvelope)
+		if marshalErr != nil {
+			return BootstrapManifest{}, fmt.Errorf("marshal discovery rules: %w", marshalErr)
+		}
+		if err := writer.write("discovery_rule_set", "config/discovery-rule-set.json", append(body, '\n'), 0o644); err != nil {
+			return BootstrapManifest{}, err
+		}
+	}
 
 	executionKey, err := randomPrintableSecret(randomSource, 32)
 	if err != nil {
@@ -183,6 +242,13 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 	if err != nil {
 		return BootstrapManifest{}, fmt.Errorf("generate OIDC credential: %w", err)
 	}
+	var mysqlPassword []byte
+	if options.HostPlugin {
+		mysqlPassword, err = randomPrintableSecret(randomSource, 32)
+		if err != nil {
+			return BootstrapManifest{}, fmt.Errorf("generate MySQL password: %w", err)
+		}
+	}
 	for _, secret := range []struct {
 		name string
 		path string
@@ -192,7 +258,11 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		{"artifact_key", "secrets/artifact-signing-key", artifactKey},
 		{"postgres_password", "secrets/postgres-password", postgresPassword},
 		{"token_credential", "secrets/oidc-token-credential", credential},
+		{"mysql_password", "secrets/mysql-password", mysqlPassword},
 	} {
+		if len(secret.body) == 0 {
+			continue
+		}
 		if err := writer.write(secret.name, secret.path, secret.body, 0o600); err != nil {
 			return BootstrapManifest{}, err
 		}
@@ -244,7 +314,7 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 	containerPath := func(relative string) string {
 		return filepath.ToSlash(filepath.Join(root, filepath.FromSlash(relative)))
 	}
-	controlplaneConfig, err := yaml.Marshal(map[string]any{
+	controlplaneValues := map[string]any{
 		"database_url":      "postgres://dbpilot:" + url.QueryEscape(string(postgresPassword)) + "@postgres/dbpilot?sslmode=disable",
 		"http":              map[string]any{"address": "0.0.0.0:8443", "tls": map[string]any{"cert_file": containerPath("config/controlplane-http.pem"), "key_file": containerPath("secrets/controlplane-http-key.pem")}},
 		"identity":          map[string]any{"mode": "oidc", "issuer": options.Issuer, "audience": options.Audience},
@@ -252,7 +322,7 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		"webhook_allowlist": []string{"hooks.example.invalid"}, "event_url_base": "https://frontend:8443",
 		"evaluation_every": "5s", "retry_every": "5s",
 		"command":           map[string]any{"signing_private_key_ref": "env://DBPILOT_COMMAND_SIGNING_PRIVATE_KEY", "execution_token_key_ref": "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY"},
-		"artifact":          map[string]any{"storage_root": containerPath("state/artifacts"), "signing_key_ref": "secret://controlplane/artifact-download"},
+		"artifact":          map[string]any{"storage_root": containerPath("state/artifacts"), "signing_key_ref": "secret://controlplane/artifact-download", "plugin_lease_origin": "https://controlplane:8443"},
 		"monitoring":        map[string]any{"maximum_instances": 200, "maximum_metrics": 50, "maximum_labels": 32, "maximum_samples": 10000, "maximum_response_bytes": 1048576},
 		"evaluation_scopes": []any{map[string]any{"tenant_id": options.TenantID, "project_id": options.ProjectID}},
 		"agents": map[string]any{
@@ -262,7 +332,20 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 			"agent-claimed-id":     rogueAgentAssignment(options, "Mismatched claimed Agent", "agent-claimed-id"),
 			"agent-certificate-id": rogueAgentAssignment(options, "Mismatched certificate Agent", "agent-certificate-id"),
 		},
-	})
+	}
+	if options.HostPlugin {
+		publicKey := base64.StdEncoding.EncodeToString(pluginPublisherPublic)
+		controlplaneValues["plugin_catalog"] = map[string]any{"enabled": true}
+		controlplaneValues["plugin_publishers"] = []any{map[string]any{"publisher_id": "acceptance-publisher", "key_id": "acceptance-key", "public_key": publicKey}}
+		controlplaneValues["discovery_rule_keys"] = map[string]string{"acceptance-discovery-key": base64.StdEncoding.EncodeToString(policyPublic)}
+		controlplaneValues["discovery_rule_policies"] = []any{map[string]any{"key_id": discoveryAttestation.KeyID, "revision": discoveryAttestation.Revision, "digest": hex.EncodeToString(discoveryAttestation.Digest[:]), "issued_at": discoveryAttestation.IssuedAt, "expires_at": discoveryAttestation.ExpiresAt, "disappearance_grace": discoveryAttestation.DisappearanceGrace}}
+		controlplaneValues["enrollment"] = map[string]any{
+			"listener": map[string]any{"address": "0.0.0.0:9445", "tls": map[string]any{"cert_file": containerPath("config/controlplane-grpc.pem"), "key_file": containerPath("secrets/controlplane-grpc-key.pem")}},
+			"agent_ca": map[string]any{"cert_file": containerPath("config/ca.pem"), "key_file": containerPath("secrets/ca-key.pem")}, "certificate_lifetime": "24h",
+		}
+		controlplaneValues["credential_leases"] = map[string]any{"enabled": true, "ttl": "5m", "environment": map[string]any{"secret://acceptance/mysql": map[string]any{"username": "dbpilot", "variable": "DBPILOT_MYSQL_PASSWORD", "revision": 1}}}
+	}
+	controlplaneConfig, err := yaml.Marshal(controlplaneValues)
 	if err != nil {
 		return BootstrapManifest{}, fmt.Errorf("marshal control-plane config: %w", err)
 	}
@@ -284,14 +367,29 @@ func GenerateBootstrap(ctx context.Context, options BootstrapOptions) (Bootstrap
 		{"agent_untrusted_config", "config/agent-untrusted.yaml", "agent-untrusted", "config/agent-untrusted.pem", "secrets/agent-untrusted-key.pem", "config/policy-untrusted-envelope.json", "agent-untrusted"},
 	}
 	for _, configured := range agentConfigs {
-		body, marshalErr := yaml.Marshal(map[string]any{
+		agentValues := map[string]any{
 			"agent_id": configured.agentID, "server_address": "controlplane:9443",
 			"ca_file": containerPath("config/ca.pem"), "cert_file": containerPath(configured.certPath), "key_file": containerPath(configured.keyPath),
 			"policy_public_key_file": containerPath("config/policy-signing-public.pem"), "policy_file": containerPath(configured.policyPath),
 			"data_directory": containerPath("state/" + configured.dataSuffix), "allowed_log_roots": []string{"/var/log/dbpilot"}, "file_collection_enabled": true,
 			"database_process_names": []string{"dbpilot-agent"},
 			"control":                map[string]any{"public_key_file": containerPath("config/command-signing-public.pem"), "journal_path": containerPath("state/" + configured.dataSuffix + "/command-journal.db"), "heartbeat_interval": "5s", "reconnect_backoff": "1s"},
-		})
+		}
+		if options.HostPlugin && configured.agentID == options.OnlineAgentID {
+			publicKey := base64.StdEncoding.EncodeToString(pluginPublisherPublic)
+			agentValues["host_id"] = "host-acceptance"
+			agentValues["ca_file"] = "/acceptance/agent-data/enrollment/ca.crt"
+			agentValues["cert_file"] = "/acceptance/agent-data/enrollment/agent.crt"
+			agentValues["key_file"] = "/acceptance/agent-data/enrollment/agent.key"
+			agentValues["data_directory"] = "/acceptance/agent-data"
+			agentValues["discovery_rule_set_file"] = containerPath("config/discovery-rule-set.json")
+			agentValues["docker_discovery"] = true
+			agentValues["docker_discovery_socket"] = "/acceptance/helper-runtime/docker-discovery.sock"
+			agentValues["database_process_names"] = []string{"mysqld-dbp"}
+			agentValues["control"] = map[string]any{"public_key_file": containerPath("config/command-signing-public.pem"), "journal_path": "/acceptance/agent-data/command-journal.db", "heartbeat_interval": "5s", "reconnect_backoff": "1s"}
+			agentValues["plugin"] = map[string]any{"enabled": true, "artifact_origin": "https://controlplane:8443", "publishers": []any{map[string]any{"publisher_id": "acceptance-publisher", "key_id": "acceptance-key", "public_key": publicKey}}, "user_id": 10001, "group_id": 10001, "maximum_artifact_bytes": 268435456, "download_timeout": "1m"}
+		}
+		body, marshalErr := yaml.Marshal(agentValues)
 		if marshalErr != nil {
 			return BootstrapManifest{}, fmt.Errorf("marshal Agent config: %w", marshalErr)
 		}

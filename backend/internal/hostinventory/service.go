@@ -63,6 +63,7 @@ func (service ApplicationService) RecordHello(ctx context.Context, agentID strin
 	if ctx == nil || service.Repository == nil || service.AgentScopes == nil || !identifierPattern.MatchString(agentID) || !validUTC(at) {
 		return Host{}, ErrInvalid
 	}
+	at = at.Truncate(time.Microsecond)
 	scope, err := service.AgentScopes.ScopeForAgent(ctx, agentID)
 	if err != nil {
 		return Host{}, err
@@ -91,6 +92,7 @@ func (service ApplicationService) RecordHeartbeat(ctx context.Context, agentID s
 	if ctx == nil || service.Repository == nil || service.AgentScopes == nil || !identifierPattern.MatchString(agentID) || !validUTC(at) {
 		return Host{}, ErrInvalid
 	}
+	at = at.Truncate(time.Microsecond)
 	scope, err := service.AgentScopes.ScopeForAgent(ctx, agentID)
 	if err != nil {
 		return Host{}, err

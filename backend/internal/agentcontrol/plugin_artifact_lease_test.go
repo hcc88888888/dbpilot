@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -164,7 +165,7 @@ func newLeaseIssuerFixture(t *testing.T) *leaseIssuerFixture {
 	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
 	body := []byte("immutable signed plugin package")
 	digest := sha256.Sum256(body)
-	artifactValue := artifact.Artifact{ID: "artifact-1", Scope: scope, Kind: "plugin_package", ContentType: "application/gzip", SizeBytes: int64(len(body)), Checksum: "sha256:" + hex.EncodeToString(digest[:]), SourceResource: artifact.ResourceReference{ResourceType: "plugin_version", ResourceID: "version-1"}, CreatedAt: now, StorageReference: "sha256/blob"}
+	artifactValue := artifact.Artifact{ID: "artifact-1", Scope: scope, Kind: "plugin-package", ContentType: "application/gzip", SizeBytes: int64(len(body)), Checksum: "sha256:" + hex.EncodeToString(digest[:]), SourceResource: artifact.ResourceReference{ResourceType: "plugin_catalog_operation", ResourceID: "plugin-operation-" + strings.Repeat("a", 32)}, CreatedAt: now, StorageReference: "sha256/blob"}
 	authorizer := &leaseFixtureAuthorizer{agentID: "agent-1", assignmentID: "assignment-1", artifactID: "artifact-1", operationRevision: 7, artifact: artifactValue}
 	fixture := &leaseIssuerFixture{scope: scope, artifact: artifactValue, body: body, authorizer: authorizer}
 	fixture.blobs = leaseFixtureBlobStore{body: body}

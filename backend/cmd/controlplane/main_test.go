@@ -38,11 +38,86 @@ import (
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/inspection"
 	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/metrictemplate"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+func TestProductionMySQLMetricTemplateDialectRejectsUnsafeStatements(t *testing.T) {
+	validator := mysqlMetricTemplateDialect{}
+	definition := metrictemplate.TemplateDefinition{DatabaseFamily: "mysql", Variants: []string{"mysql"}, Name: "acceptance", QueryKind: metrictemplate.QuerySQL, ReadOnlyStatement: "SELECT 1 AS value", CollectionIntervalSeconds: 10, TimeoutSeconds: 5, MaxRows: 1, MaxColumns: 1, ValueMappings: []metrictemplate.ValueMapping{{SourceColumn: "value", MetricName: "mysql.acceptance.value", MetricType: metrictemplate.MetricGauge, Unit: "1"}}, CardinalityLimit: 10}
+	validated, err := validator.ValidateReadOnly(context.Background(), definition)
+	require.NoError(t, err)
+	require.Empty(t, validated.ReadOnlyStatement)
+	for _, statement := range []string{"DELETE FROM mysql.user", "SELECT 1; SELECT 2", "SELECT SLEEP(1)"} {
+		unsafe := definition
+		unsafe.ReadOnlyStatement = statement
+		_, err := validator.ValidateReadOnly(context.Background(), unsafe)
+		require.Error(t, err, statement)
+	}
+}
+
+func TestLivePluginArtifactAuthorizerAcceptsCanonicalCatalogArtifactProvenance(t *testing.T) {
+	now := time.Date(2026, 9, 2, 15, 0, 0, 0, time.UTC)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+	digest := strings.Repeat("a", 64)
+	manifest := strings.Repeat("b", 64)
+	assignment := pluginassignment.Assignment{
+		ID: "assignment-1", Scope: scope, HostID: "host-1", AgentID: "agent-1", PluginID: "mysql", DatabaseFamily: "mysql",
+		DesiredVersionID: "plugin-version-1", DesiredVersion: "1.0.0", ArtifactID: "plugin-package-1", ArtifactSHA256: digest, ManifestDigest: manifest,
+		DesiredState: pluginassignment.DesiredRunning, ConfigurationRevision: 1, OperationRevision: 1, RolloutPercentage: 100,
+		InstanceIDs: []string{"dbi-1"}, TemplateRevisionIDs: []string{}, ReconcileState: pluginassignment.ReconcilePending, Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	version := plugincatalog.PluginVersion{
+		ID: assignment.DesiredVersionID, Scope: scope, PluginID: assignment.PluginID, Version: assignment.DesiredVersion, Status: plugincatalog.StatusAvailable,
+		ArtifactID: assignment.ArtifactID, PackageSHA256: digest, ManifestDigest: manifest, PublisherID: "publisher-1", SigningKeyID: "key-1",
+		ProtocolVersion: "v1", MinimumAgentProtocolVersion: "v1", MaximumAgentProtocolVersion: "v1", SupportedVariants: []string{"mysql"},
+		DatabaseVersionRange: ">=8 <9", Capabilities: []string{"metrics.collect"}, MetricTemplateSchemaVersion: 1,
+		Platforms: []plugincatalog.Platform{{OperatingSystem: "linux", Architecture: "amd64", SHA256: digest, SizeBytes: 1}}, Revision: 1, CreatedAt: now,
+	}
+	stored := artifact.Artifact{
+		ID: assignment.ArtifactID, Scope: scope, Kind: "plugin-package", ContentType: "application/gzip", SizeBytes: 1,
+		Checksum: "sha256:" + digest, SourceResource: artifact.ResourceReference{ResourceType: "plugin_catalog_operation", ResourceID: "plugin-operation-" + strings.Repeat("c", 32)},
+		CreatedAt: now, StorageReference: "sha256/" + digest + ".blob",
+	}
+	authorizer := livePluginArtifactAuthorizer{
+		AgentScopes: fixedEnrolledAgentScopes{scopes: map[string]platformscope.Scope{"agent-1": scope}},
+		Assignments: staticPluginArtifactAssignmentReader{value: assignment}, Versions: staticPluginArtifactVersionReader{value: version},
+		Artifacts: staticPluginArtifactMetadataReader{value: stored}, ExecutionFences: alwaysActivePluginArtifactFence{}, Now: func() time.Time { return now },
+	}
+
+	grant, err := authorizer.AuthorizePluginArtifact(context.Background(), assignment.AgentID, assignment.ID, assignment.ArtifactID, assignment.OperationRevision)
+
+	require.NoError(t, err)
+	require.Equal(t, stored, grant.Artifact)
+}
+
+type staticPluginArtifactAssignmentReader struct{ value pluginassignment.Assignment }
+
+func (reader staticPluginArtifactAssignmentReader) Get(context.Context, platformscope.Scope, string) (pluginassignment.Assignment, error) {
+	return reader.value, nil
+}
+
+type staticPluginArtifactVersionReader struct{ value plugincatalog.PluginVersion }
+
+func (reader staticPluginArtifactVersionReader) ListVersions(context.Context, platformscope.Scope, plugincatalog.VersionFilter) (plugincatalog.VersionPage, error) {
+	return plugincatalog.VersionPage{Items: []plugincatalog.PluginVersion{reader.value}}, nil
+}
+
+type staticPluginArtifactMetadataReader struct{ value artifact.Artifact }
+
+func (reader staticPluginArtifactMetadataReader) Get(context.Context, platformscope.Scope, string) (artifact.Artifact, error) {
+	return reader.value, nil
+}
+
+type alwaysActivePluginArtifactFence struct{}
+
+func (alwaysActivePluginArtifactFence) ExecutionLeaseActive(string, string, time.Time) bool {
+	return true
+}
 
 func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	config, err := loadConfig(filepath.Join("..", "..", "config", "controlplane.yaml.example"))
@@ -93,9 +168,13 @@ func TestPluginCatalogEnablementRequiresTrustRootAndArtifactReadiness(t *testing
 	config := validServerConfig()
 	config.PluginCatalog.Enabled = true
 	config.Artifact.StorageRoot = t.TempDir()
+	config.Artifact.PluginLeaseOrigin = "https://control.example"
 	require.ErrorContains(t, validateConfig(config), "publisher")
 
 	config.PluginPublishers = []PluginPublisherSettings{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)}}
+	config.Artifact.PluginLeaseOrigin = ""
+	require.ErrorContains(t, validateConfig(config), "plugin_lease_origin")
+	config.Artifact.PluginLeaseOrigin = "https://control.example"
 	require.NoError(t, validateConfig(config))
 	config.Artifact.StorageRoot = ""
 	require.ErrorContains(t, validateConfig(config), "storage_root")
@@ -145,6 +224,7 @@ func TestDefaultCompositionRunsPluginCatalogMigrationsWhenEnabled(t *testing.T) 
 	config.PluginCatalog.Enabled = true
 	config.PluginPublishers = []PluginPublisherSettings{{PublisherID: "publisher-1", KeyID: "key-1", PublicKey: base64.StdEncoding.EncodeToString(public)}}
 	config.Artifact.StorageRoot = t.TempDir()
+	config.Artifact.PluginLeaseOrigin = "https://control.example"
 	config.Migrate = nil
 	server, err := NewServer(config)
 	require.NoError(t, err)

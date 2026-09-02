@@ -9,6 +9,7 @@
     "contracts:verify": "pwsh -NoProfile -File scripts/contracts/verify-drift.ps1",
     "contracts:mock:start": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1",
     "contracts:mock:test": "pwsh -NoProfile -File scripts/contracts/start-mock.ps1 -Test",
+    "test:node": "node --test tests/contracts/*.test.mjs frontend/tests/*.test.js && npm --prefix backend/test/e2e/full-stack run test:support",
     "frontend:test": "npm --prefix frontend/app test -- --run",
     "frontend:build": "npm --prefix frontend/app run build"
   },

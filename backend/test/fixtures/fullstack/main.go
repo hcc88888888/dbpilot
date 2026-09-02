@@ -32,7 +32,7 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		stderr = io.Discard
 	}
 	if len(arguments) == 0 {
-		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, database, journal, replay, or summary")
+		fmt.Fprintln(stderr, "subcommand is required: bootstrap, oidc, native, database, journal, replay, summary, or host-plugin")
 		return 2
 	}
 	switch arguments[0] {
@@ -40,6 +40,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runBootstrap(arguments[1:], stdout, stderr)
 	case "oidc":
 		return runOIDC(arguments[1:], stderr)
+	case "native":
+		return runNativeFixture(arguments[1:], stderr)
 	case "database":
 		return runDatabaseAssertions(arguments[1:], stderr)
 	case "journal":
@@ -48,6 +50,8 @@ func run(arguments []string, stdout, stderr io.Writer) int {
 		return runReplayAssertions(arguments[1:], stderr)
 	case "summary":
 		return runSummary(arguments[1:], stdout, stderr)
+	case "host-plugin":
+		return runHostPluginAssertions(arguments[1:], stdout, stderr)
 	default:
 		fmt.Fprintln(stderr, "unknown subcommand")
 		return 2
@@ -165,12 +169,15 @@ func runBootstrap(arguments []string, stdout, stderr io.Writer) int {
 	projectID := flags.String("project-id", "project-acceptance", "acceptance project ID")
 	onlineAgentID := flags.String("online-agent-id", "agent-online", "online Agent ID")
 	offlineAgentID := flags.String("offline-agent-id", "agent-offline", "offline Agent ID")
+	hostPlugin := flags.Bool("host-plugin", false, "generate host plugin platform materials")
+	dockerNetworkName := flags.String("docker-network-name", "", "exact locally allowlisted Docker network")
 	if err := flags.Parse(arguments); err != nil || flags.NArg() != 0 {
 		return 2
 	}
 	manifest, err := GenerateBootstrap(context.Background(), BootstrapOptions{
 		Root: *root, Issuer: *issuer, Audience: *audience, TenantID: *tenantID, ProjectID: *projectID,
 		OnlineAgentID: *onlineAgentID, OfflineAgentID: *offlineAgentID, Now: time.Now().UTC(), Random: rand.Reader,
+		HostPlugin: *hostPlugin, DockerNetworkName: *dockerNetworkName,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "bootstrap generation failed")

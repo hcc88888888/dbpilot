@@ -53,6 +53,9 @@ artifact:
   # route rejects traversal, symlink escape, size drift, and checksum drift.
   storage_root: "/var/lib/dbpilot/artifacts"
   signing_key_ref: "secret://controlplane/artifact-download"
+  # Direct mTLS HTTP origin reachable by Agents. Do not point this at a
+  # browser-facing TLS terminator because the lease is bound to Agent identity.
+  plugin_lease_origin: "https://controlplane.internal:8443"
 plugin_catalog:
   # Disabled is explicit during incremental rollout. When enabled, configure
   # at least one non-secret Ed25519 public key below.

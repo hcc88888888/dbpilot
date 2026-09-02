@@ -581,6 +581,15 @@ func (session *Session) RunMetricStreamReady(ctx context.Context, sink MetricSin
 	return session.runMetricStream(ctx, sink, ready)
 }
 
+// HasResumeCursors reports whether the exact assignment/configuration has
+// durable metric receipts. A fresh process with receipts must resume its
+// stream before producing another sequence; a first deployment may perform
+// its activation CollectNow before opening the stream.
+func (session *Session) HasResumeCursors(ctx context.Context, sink MetricSink) (bool, error) {
+	values, err := session.resumeCursors(ctx, sink)
+	return len(values) > 0, err
+}
+
 func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, ready chan<- error) error {
 	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || !session.isConfigured() {
 		reportStreamReady(ready, errGateway)

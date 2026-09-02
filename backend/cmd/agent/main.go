@@ -381,7 +381,7 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 		var dockerDetector agentdiscovery.Detector
 		if settings.DockerDiscovery {
 			var detector *agentdiscovery.DockerDetector
-			detector, dockerDiscoveryConnection, loadErr = agentdiscovery.NewDockerDetectorAt(ctx, settings.DockerDiscoverySocket, ruleSet.Revision, agentdiscovery.DockerAllowedLabelKeys(ruleSet.Rules))
+			detector, dockerDiscoveryConnection, loadErr = agentdiscovery.NewDockerDetectorAt(ctx, settings.DockerDiscoverySocket, ruleSet.Revision, agentdiscovery.DockerAllowedLabelKeys(ruleSet.Rules), agentdiscovery.DockerAllowedNetworkNames(ruleSet.Rules))
 			if loadErr != nil {
 				_ = store.Close()
 				return fmt.Errorf("configure Docker discovery: %w", loadErr)

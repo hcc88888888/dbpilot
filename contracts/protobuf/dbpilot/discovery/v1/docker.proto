@@ -14,6 +14,7 @@ service DockerDiscovery {
 message DockerSnapshotRequest {
   uint64 rule_revision = 1;
   repeated string allowed_label_keys = 2;
+  repeated string allowed_network_names = 3;
 }
 
 message DockerSnapshotResponse {
@@ -25,6 +26,7 @@ message DockerSnapshotResponse {
 message DockerWatchRequest {
   uint64 rule_revision = 1;
   repeated string allowed_label_keys = 2;
+  repeated string allowed_network_names = 3;
 }
 
 message DockerContainerObservation {
@@ -38,6 +40,7 @@ message DockerContainerObservation {
   uint32 host_process_id = 8;
   string cgroup = 9;
   google.protobuf.Timestamp observed_at = 10;
+  repeated DockerInternalEndpoint internal_endpoints = 11;
 }
 
 enum DockerContainerStatus {
@@ -55,6 +58,13 @@ message DockerPortMapping {
   string host_address = 1;
   uint32 host_port = 2;
   uint32 container_port = 3;
+  string protocol = 4;
+}
+
+message DockerInternalEndpoint {
+  string network_name = 1;
+  string address = 2;
+  uint32 port = 3;
   string protocol = 4;
 }
 

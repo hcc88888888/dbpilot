@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -94,11 +95,11 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 	}
 	session, err := checker.client.Open(expected)
 	if err != nil {
-		return ErrHealthHandshake
+		return healthHandshakeFailure("open")
 	}
 	capabilities, handshakeErr := session.Handshake(ctx, expected)
 	if handshakeErr != nil {
-		return ErrHealthHandshake
+		return healthHandshakeFailure("protocol")
 	}
 	if len(request.SupportedVariants) == 0 || len(request.SignedCapabilities) == 0 || request.MetricTemplateSchemaVersion == 0 || len(request.InstanceDescriptors) == 0 {
 		checker.storeActivation(process.PID(), session, pluginstate.HealthDegraded, "plugin_reconcile_unavailable")
@@ -146,34 +147,40 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 				instance.Templates = cloneTemplateConfigurations(perInstance[instance.GetInstanceId()])
 			}
 			if session.SetExpectedInstanceTemplateConfigurations(perInstance) != nil {
-				return ErrHealthHandshake
+				return healthHandshakeFailure("template_projection")
 			}
 		}
 		configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
 		defer configuration.Release()
 		if err := session.ApplyConfiguration(ctx, configuration); err != nil {
-			return ErrHealthHandshake
+			return healthHandshakeFailure("apply_configuration")
 		}
 		for _, instanceID := range request.InstanceIDs {
 			result, validateErr := session.ValidateInstance(ctx, instanceID)
 			if validateErr != nil || !result.Valid {
-				return ErrHealthHandshake
+				return healthHandshakeFailure("validate_instance")
 			}
 		}
 		checker.storeActiveCredentialConfiguration(process.PID(), configuration, configurationValidFor)
 		checker.scheduleCredentialRenewal(process, session, request, configurationValidFor)
 		if err := session.CheckHealth(ctx); err != nil {
-			return ErrHealthHandshake
+			return healthHandshakeFailure("health")
 		}
 		if sink := checker.client.MetricSink(); sink != nil {
-			for _, instance := range instances {
-				templateIDs, configuredErr := session.ConfiguredTemplateIDs(instance.GetInstanceId())
-				if configuredErr != nil {
-					return ErrHealthHandshake
-				}
-				for _, templateID := range templateIDs {
-					if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, []string{templateID}); err != nil {
-						return ErrHealthHandshake
+			hasResumeCursors, resumeErr := session.HasResumeCursors(ctx, sink)
+			if resumeErr != nil {
+				return healthHandshakeFailure("metric_resume")
+			}
+			if !hasResumeCursors {
+				for _, instance := range instances {
+					templateIDs, configuredErr := session.ConfiguredTemplateIDs(instance.GetInstanceId())
+					if configuredErr != nil {
+						return healthHandshakeFailure("configured_templates")
+					}
+					for _, templateID := range templateIDs {
+						if err := session.CollectNow(ctx, []string{instance.GetInstanceId()}, []string{templateID}); err != nil {
+							return healthHandshakeFailure("initial_collection")
+						}
 					}
 				}
 			}
@@ -192,13 +199,13 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 			}()
 			if readyErr := <-ready; readyErr != nil {
 				cancel()
-				return ErrHealthHandshake
+				return healthHandshakeFailure("metric_stream")
 			}
 			select {
 			case streamErr := <-streamResult:
 				cancel()
 				if streamErr != nil {
-					return ErrHealthHandshake
+					return healthHandshakeFailure("metric_stream")
 				}
 			default:
 			}
@@ -209,6 +216,11 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 	}
 	checker.storeActivation(process.PID(), session, pluginstate.HealthHealthy, "")
 	return nil
+}
+
+func healthHandshakeFailure(stage string) error {
+	log.Printf("database plugin health handshake failed: stage=%s", stage)
+	return ErrHealthHandshake
 }
 
 func clonePluginConfiguration(value plugingateway.PluginConfiguration) plugingateway.PluginConfiguration {
@@ -250,6 +262,9 @@ func leaseMetricTemplates(ctx context.Context, leaser MetricTemplateLeaser, requ
 		return nil, nil, 0, ErrHealthHandshake
 	}
 	result := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(request.InstanceIDs))
+	for _, instanceID := range request.InstanceIDs {
+		result[instanceID] = []*pluginv1.MetricTemplateConfiguration{}
+	}
 	releases := make([]func(), 0)
 	validFor := time.Duration(0)
 	failed := true

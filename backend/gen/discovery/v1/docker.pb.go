@@ -142,11 +142,12 @@ func (DockerEventType) EnumDescriptor() ([]byte, []int) {
 }
 
 type DockerSnapshotRequest struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	RuleRevision     uint64                 `protobuf:"varint,1,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
-	AllowedLabelKeys []string               `protobuf:"bytes,2,rep,name=allowed_label_keys,json=allowedLabelKeys,proto3" json:"allowed_label_keys,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	RuleRevision        uint64                 `protobuf:"varint,1,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
+	AllowedLabelKeys    []string               `protobuf:"bytes,2,rep,name=allowed_label_keys,json=allowedLabelKeys,proto3" json:"allowed_label_keys,omitempty"`
+	AllowedNetworkNames []string               `protobuf:"bytes,3,rep,name=allowed_network_names,json=allowedNetworkNames,proto3" json:"allowed_network_names,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *DockerSnapshotRequest) Reset() {
@@ -189,6 +190,13 @@ func (x *DockerSnapshotRequest) GetRuleRevision() uint64 {
 func (x *DockerSnapshotRequest) GetAllowedLabelKeys() []string {
 	if x != nil {
 		return x.AllowedLabelKeys
+	}
+	return nil
+}
+
+func (x *DockerSnapshotRequest) GetAllowedNetworkNames() []string {
+	if x != nil {
+		return x.AllowedNetworkNames
 	}
 	return nil
 }
@@ -254,11 +262,12 @@ func (x *DockerSnapshotResponse) GetErrorCode() string {
 }
 
 type DockerWatchRequest struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	RuleRevision     uint64                 `protobuf:"varint,1,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
-	AllowedLabelKeys []string               `protobuf:"bytes,2,rep,name=allowed_label_keys,json=allowedLabelKeys,proto3" json:"allowed_label_keys,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	RuleRevision        uint64                 `protobuf:"varint,1,opt,name=rule_revision,json=ruleRevision,proto3" json:"rule_revision,omitempty"`
+	AllowedLabelKeys    []string               `protobuf:"bytes,2,rep,name=allowed_label_keys,json=allowedLabelKeys,proto3" json:"allowed_label_keys,omitempty"`
+	AllowedNetworkNames []string               `protobuf:"bytes,3,rep,name=allowed_network_names,json=allowedNetworkNames,proto3" json:"allowed_network_names,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *DockerWatchRequest) Reset() {
@@ -305,20 +314,28 @@ func (x *DockerWatchRequest) GetAllowedLabelKeys() []string {
 	return nil
 }
 
+func (x *DockerWatchRequest) GetAllowedNetworkNames() []string {
+	if x != nil {
+		return x.AllowedNetworkNames
+	}
+	return nil
+}
+
 type DockerContainerObservation struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	ContainerId    string                 `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
-	Name           string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Image          string                 `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
-	Status         DockerContainerStatus  `protobuf:"varint,4,opt,name=status,proto3,enum=dbpilot.discovery.v1.DockerContainerStatus" json:"status,omitempty"`
-	Ports          []*DockerPortMapping   `protobuf:"bytes,5,rep,name=ports,proto3" json:"ports,omitempty"`
-	Labels         map[string]string      `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	CommandSummary string                 `protobuf:"bytes,7,opt,name=command_summary,json=commandSummary,proto3" json:"command_summary,omitempty"`
-	HostProcessId  uint32                 `protobuf:"varint,8,opt,name=host_process_id,json=hostProcessId,proto3" json:"host_process_id,omitempty"`
-	Cgroup         string                 `protobuf:"bytes,9,opt,name=cgroup,proto3" json:"cgroup,omitempty"`
-	ObservedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state             protoimpl.MessageState    `protogen:"open.v1"`
+	ContainerId       string                    `protobuf:"bytes,1,opt,name=container_id,json=containerId,proto3" json:"container_id,omitempty"`
+	Name              string                    `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Image             string                    `protobuf:"bytes,3,opt,name=image,proto3" json:"image,omitempty"`
+	Status            DockerContainerStatus     `protobuf:"varint,4,opt,name=status,proto3,enum=dbpilot.discovery.v1.DockerContainerStatus" json:"status,omitempty"`
+	Ports             []*DockerPortMapping      `protobuf:"bytes,5,rep,name=ports,proto3" json:"ports,omitempty"`
+	Labels            map[string]string         `protobuf:"bytes,6,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	CommandSummary    string                    `protobuf:"bytes,7,opt,name=command_summary,json=commandSummary,proto3" json:"command_summary,omitempty"`
+	HostProcessId     uint32                    `protobuf:"varint,8,opt,name=host_process_id,json=hostProcessId,proto3" json:"host_process_id,omitempty"`
+	Cgroup            string                    `protobuf:"bytes,9,opt,name=cgroup,proto3" json:"cgroup,omitempty"`
+	ObservedAt        *timestamppb.Timestamp    `protobuf:"bytes,10,opt,name=observed_at,json=observedAt,proto3" json:"observed_at,omitempty"`
+	InternalEndpoints []*DockerInternalEndpoint `protobuf:"bytes,11,rep,name=internal_endpoints,json=internalEndpoints,proto3" json:"internal_endpoints,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *DockerContainerObservation) Reset() {
@@ -421,6 +438,13 @@ func (x *DockerContainerObservation) GetObservedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *DockerContainerObservation) GetInternalEndpoints() []*DockerInternalEndpoint {
+	if x != nil {
+		return x.InternalEndpoints
+	}
+	return nil
+}
+
 type DockerPortMapping struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	HostAddress   string                 `protobuf:"bytes,1,opt,name=host_address,json=hostAddress,proto3" json:"host_address,omitempty"`
@@ -489,6 +513,74 @@ func (x *DockerPortMapping) GetProtocol() string {
 	return ""
 }
 
+type DockerInternalEndpoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NetworkName   string                 `protobuf:"bytes,1,opt,name=network_name,json=networkName,proto3" json:"network_name,omitempty"`
+	Address       string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	Port          uint32                 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
+	Protocol      string                 `protobuf:"bytes,4,opt,name=protocol,proto3" json:"protocol,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DockerInternalEndpoint) Reset() {
+	*x = DockerInternalEndpoint{}
+	mi := &file_discovery_v1_docker_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DockerInternalEndpoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DockerInternalEndpoint) ProtoMessage() {}
+
+func (x *DockerInternalEndpoint) ProtoReflect() protoreflect.Message {
+	mi := &file_discovery_v1_docker_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DockerInternalEndpoint.ProtoReflect.Descriptor instead.
+func (*DockerInternalEndpoint) Descriptor() ([]byte, []int) {
+	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *DockerInternalEndpoint) GetNetworkName() string {
+	if x != nil {
+		return x.NetworkName
+	}
+	return ""
+}
+
+func (x *DockerInternalEndpoint) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *DockerInternalEndpoint) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *DockerInternalEndpoint) GetProtocol() string {
+	if x != nil {
+		return x.Protocol
+	}
+	return ""
+}
+
 type DockerEvent struct {
 	state         protoimpl.MessageState      `protogen:"open.v1"`
 	EventId       string                      `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
@@ -501,7 +593,7 @@ type DockerEvent struct {
 
 func (x *DockerEvent) Reset() {
 	*x = DockerEvent{}
-	mi := &file_discovery_v1_docker_proto_msgTypes[5]
+	mi := &file_discovery_v1_docker_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -513,7 +605,7 @@ func (x *DockerEvent) String() string {
 func (*DockerEvent) ProtoMessage() {}
 
 func (x *DockerEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_discovery_v1_docker_proto_msgTypes[5]
+	mi := &file_discovery_v1_docker_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -526,7 +618,7 @@ func (x *DockerEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DockerEvent.ProtoReflect.Descriptor instead.
 func (*DockerEvent) Descriptor() ([]byte, []int) {
-	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{5}
+	return file_discovery_v1_docker_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *DockerEvent) GetEventId() string {
@@ -561,10 +653,11 @@ var File_discovery_v1_docker_proto protoreflect.FileDescriptor
 
 const file_discovery_v1_docker_proto_rawDesc = "" +
 	"\n" +
-	"\x19discovery/v1/docker.proto\x12\x14dbpilot.discovery.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"j\n" +
+	"\x19discovery/v1/docker.proto\x12\x14dbpilot.discovery.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x9e\x01\n" +
 	"\x15DockerSnapshotRequest\x12#\n" +
 	"\rrule_revision\x18\x01 \x01(\x04R\fruleRevision\x12,\n" +
-	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\"\xc6\x01\n" +
+	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\x122\n" +
+	"\x15allowed_network_names\x18\x03 \x03(\tR\x13allowedNetworkNames\"\xc6\x01\n" +
 	"\x16DockerSnapshotResponse\x12P\n" +
 	"\n" +
 	"containers\x18\x01 \x03(\v20.dbpilot.discovery.v1.DockerContainerObservationR\n" +
@@ -572,10 +665,11 @@ const file_discovery_v1_docker_proto_rawDesc = "" +
 	"\vobserved_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"observedAt\x12\x1d\n" +
 	"\n" +
-	"error_code\x18\x03 \x01(\tR\terrorCode\"g\n" +
+	"error_code\x18\x03 \x01(\tR\terrorCode\"\x9b\x01\n" +
 	"\x12DockerWatchRequest\x12#\n" +
 	"\rrule_revision\x18\x01 \x01(\x04R\fruleRevision\x12,\n" +
-	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\"\xa4\x04\n" +
+	"\x12allowed_label_keys\x18\x02 \x03(\tR\x10allowedLabelKeys\x122\n" +
+	"\x15allowed_network_names\x18\x03 \x03(\tR\x13allowedNetworkNames\"\x81\x05\n" +
 	"\x1aDockerContainerObservation\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -588,7 +682,8 @@ const file_discovery_v1_docker_proto_rawDesc = "" +
 	"\x06cgroup\x18\t \x01(\tR\x06cgroup\x12;\n" +
 	"\vobserved_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"observedAt\x1a9\n" +
+	"observedAt\x12[\n" +
+	"\x12internal_endpoints\x18\v \x03(\v2,.dbpilot.discovery.v1.DockerInternalEndpointR\x11internalEndpoints\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x96\x01\n" +
@@ -596,6 +691,11 @@ const file_discovery_v1_docker_proto_rawDesc = "" +
 	"\fhost_address\x18\x01 \x01(\tR\vhostAddress\x12\x1b\n" +
 	"\thost_port\x18\x02 \x01(\rR\bhostPort\x12%\n" +
 	"\x0econtainer_port\x18\x03 \x01(\rR\rcontainerPort\x12\x1a\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"\x85\x01\n" +
+	"\x16DockerInternalEndpoint\x12!\n" +
+	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x18\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x12\n" +
+	"\x04port\x18\x03 \x01(\rR\x04port\x12\x1a\n" +
 	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"\xf0\x01\n" +
 	"\vDockerEvent\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x129\n" +
@@ -635,7 +735,7 @@ func file_discovery_v1_docker_proto_rawDescGZIP() []byte {
 }
 
 var file_discovery_v1_docker_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_discovery_v1_docker_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_discovery_v1_docker_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_discovery_v1_docker_proto_goTypes = []any{
 	(DockerContainerStatus)(0),         // 0: dbpilot.discovery.v1.DockerContainerStatus
 	(DockerEventType)(0),               // 1: dbpilot.discovery.v1.DockerEventType
@@ -644,29 +744,31 @@ var file_discovery_v1_docker_proto_goTypes = []any{
 	(*DockerWatchRequest)(nil),         // 4: dbpilot.discovery.v1.DockerWatchRequest
 	(*DockerContainerObservation)(nil), // 5: dbpilot.discovery.v1.DockerContainerObservation
 	(*DockerPortMapping)(nil),          // 6: dbpilot.discovery.v1.DockerPortMapping
-	(*DockerEvent)(nil),                // 7: dbpilot.discovery.v1.DockerEvent
-	nil,                                // 8: dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
-	(*timestamppb.Timestamp)(nil),      // 9: google.protobuf.Timestamp
+	(*DockerInternalEndpoint)(nil),     // 7: dbpilot.discovery.v1.DockerInternalEndpoint
+	(*DockerEvent)(nil),                // 8: dbpilot.discovery.v1.DockerEvent
+	nil,                                // 9: dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
+	(*timestamppb.Timestamp)(nil),      // 10: google.protobuf.Timestamp
 }
 var file_discovery_v1_docker_proto_depIdxs = []int32{
 	5,  // 0: dbpilot.discovery.v1.DockerSnapshotResponse.containers:type_name -> dbpilot.discovery.v1.DockerContainerObservation
-	9,  // 1: dbpilot.discovery.v1.DockerSnapshotResponse.observed_at:type_name -> google.protobuf.Timestamp
+	10, // 1: dbpilot.discovery.v1.DockerSnapshotResponse.observed_at:type_name -> google.protobuf.Timestamp
 	0,  // 2: dbpilot.discovery.v1.DockerContainerObservation.status:type_name -> dbpilot.discovery.v1.DockerContainerStatus
 	6,  // 3: dbpilot.discovery.v1.DockerContainerObservation.ports:type_name -> dbpilot.discovery.v1.DockerPortMapping
-	8,  // 4: dbpilot.discovery.v1.DockerContainerObservation.labels:type_name -> dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
-	9,  // 5: dbpilot.discovery.v1.DockerContainerObservation.observed_at:type_name -> google.protobuf.Timestamp
-	1,  // 6: dbpilot.discovery.v1.DockerEvent.type:type_name -> dbpilot.discovery.v1.DockerEventType
-	5,  // 7: dbpilot.discovery.v1.DockerEvent.container:type_name -> dbpilot.discovery.v1.DockerContainerObservation
-	9,  // 8: dbpilot.discovery.v1.DockerEvent.occurred_at:type_name -> google.protobuf.Timestamp
-	2,  // 9: dbpilot.discovery.v1.DockerDiscovery.Snapshot:input_type -> dbpilot.discovery.v1.DockerSnapshotRequest
-	4,  // 10: dbpilot.discovery.v1.DockerDiscovery.Watch:input_type -> dbpilot.discovery.v1.DockerWatchRequest
-	3,  // 11: dbpilot.discovery.v1.DockerDiscovery.Snapshot:output_type -> dbpilot.discovery.v1.DockerSnapshotResponse
-	7,  // 12: dbpilot.discovery.v1.DockerDiscovery.Watch:output_type -> dbpilot.discovery.v1.DockerEvent
-	11, // [11:13] is the sub-list for method output_type
-	9,  // [9:11] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	9,  // 4: dbpilot.discovery.v1.DockerContainerObservation.labels:type_name -> dbpilot.discovery.v1.DockerContainerObservation.LabelsEntry
+	10, // 5: dbpilot.discovery.v1.DockerContainerObservation.observed_at:type_name -> google.protobuf.Timestamp
+	7,  // 6: dbpilot.discovery.v1.DockerContainerObservation.internal_endpoints:type_name -> dbpilot.discovery.v1.DockerInternalEndpoint
+	1,  // 7: dbpilot.discovery.v1.DockerEvent.type:type_name -> dbpilot.discovery.v1.DockerEventType
+	5,  // 8: dbpilot.discovery.v1.DockerEvent.container:type_name -> dbpilot.discovery.v1.DockerContainerObservation
+	10, // 9: dbpilot.discovery.v1.DockerEvent.occurred_at:type_name -> google.protobuf.Timestamp
+	2,  // 10: dbpilot.discovery.v1.DockerDiscovery.Snapshot:input_type -> dbpilot.discovery.v1.DockerSnapshotRequest
+	4,  // 11: dbpilot.discovery.v1.DockerDiscovery.Watch:input_type -> dbpilot.discovery.v1.DockerWatchRequest
+	3,  // 12: dbpilot.discovery.v1.DockerDiscovery.Snapshot:output_type -> dbpilot.discovery.v1.DockerSnapshotResponse
+	8,  // 13: dbpilot.discovery.v1.DockerDiscovery.Watch:output_type -> dbpilot.discovery.v1.DockerEvent
+	12, // [12:14] is the sub-list for method output_type
+	10, // [10:12] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_discovery_v1_docker_proto_init() }
@@ -680,7 +782,7 @@ func file_discovery_v1_docker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_discovery_v1_docker_proto_rawDesc), len(file_discovery_v1_docker_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

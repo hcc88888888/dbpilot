@@ -436,7 +436,7 @@ func (supervisor *PluginSupervisor) rollback(ctx context.Context, request Reconc
 	old.DesiredCredentialsComplete = request.CredentialsComplete
 	sort.Strings(old.DesiredInstanceIDs)
 	sort.Strings(old.DesiredTemplateIDs)
-	old = supervisor.recordFailure(old, "plugin_rollback_"+errorCode(cause))
+	old = supervisor.recordFailure(old, "plugin_upgrade_rolled_back")
 	saved, saveErr := supervisor.store.Put(ctx, old)
 	if saveErr != nil {
 		return ObservedState{}, saveErr

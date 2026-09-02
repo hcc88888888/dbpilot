@@ -61,3 +61,11 @@
 - Functional impact: none observed. Type checking, all React workflows and the Vite production build pass; the approximately 514 KiB minified entry chunk may increase initial download and parse time on slower operator networks.
 - Severity: low performance debt; it does not affect functional correctness or API isolation.
 - Recommended remediation stage: frontend performance consolidation after the remaining management modules are implemented. Introduce route-level dynamic imports and measure real gzip/parse performance before selecting stable manual chunks.
+
+## TD-TEST-003: Docker proc-helper proof disables the default AppArmor profile
+
+- Affected module: Task 17 Kylin Compose acceptance `proc-helper` sidecar only.
+- Trigger conditions: the helper shares the Agent PID namespace on Docker Desktop and must inspect the allowlisted database fixture's `/proc/<pid>/fd`; Docker's default cross-container AppArmor profile denies that access even with the documented `SYS_PTRACE` and `DAC_READ_SEARCH` capability bound.
+- Functional impact: none for the verified discovery workflow. The sidecar remains read-only, has no Docker Socket, no configuration/secret/artifact mounts, no external network peers, and returns only the fixed process-name allowlist protocol. Production systemd units do not use this Docker AppArmor profile.
+- Severity: low for release-test isolation; medium if this Compose topology were reused as a production deployment without review.
+- Recommended remediation stage: release-infrastructure hardening before treating Compose as a deployable topology. Install a dedicated narrow AppArmor profile for the helper (or run the native Kylin VM/systemd evidence) and replace `apparmor=unconfined`; keep the current exact-capability/no-secret-mount assertions.

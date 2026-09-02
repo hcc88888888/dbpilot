@@ -140,11 +140,13 @@ from the repository root:
 
 ```powershell
 npm ci
+npm ci --prefix frontend/app
+npm ci --prefix backend/test/e2e/full-stack
 npm run contracts:lint
 npm run contracts:breaking
 npm run contracts:generate
 npm run contracts:verify
-node --test
+npm run test:node
 Push-Location backend; go test ./...; Pop-Location
 npm run contracts:mock:test
 powershell -NoProfile -File backend/scripts/verify-host-inspection.ps1
@@ -303,3 +305,31 @@ for prerequisites, exact invocation, phase evidence, redacted failure artifacts,
 and the recorded-ID/ownership-label cleanup contract. The live private-image CI
 job is manual opt-in; pull requests run only Compose parsing and fake-Docker
 lifecycle safety.
+
+## Host database-plugin production acceptance
+
+The database-plugin release topology uses Agent core for host metrics/native
+discovery and one independently supervised plugin process per Agent/database
+family. Only the restricted `dbpilot-docker-discovery` helper owns the raw
+Docker Socket. Two internal-only MySQL services deliberately publish no host
+ports and are served by one MySQL plugin process.
+
+Run the complete Kylin linux/amd64 gate from the repository root:
+
+```powershell
+powershell -NoProfile -File backend/scripts/verify-host-plugin-full-stack.ps1 `
+  -KylinImage 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' `
+  -Architecture amd64 `
+  -GoBinary 'C:\absolute\go.exe'
+```
+
+The verifier cross-builds production binaries, builds Vite assets, enrolls the
+Agent, validates restricted native/Docker discovery, signed package rejection
+and publication, one-process/two-instance metrics, custom-template approval,
+stale/null stop behavior, rollback, restart convergence, browser rendering,
+PostgreSQL, spool, journal, and Audit. It publishes only the Nginx frontend on
+an ephemeral loopback port and removes exact recorded labelled resources on
+every exit path. See
+[`../docs/host-database-plugin-operations.md`](../docs/host-database-plugin-operations.md)
+for deployment, key/credential rotation, backup/restore, retention, and the
+remaining real CentOS/Kylin host evidence boundary.

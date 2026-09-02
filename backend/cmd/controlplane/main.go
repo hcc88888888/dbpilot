@@ -51,6 +51,7 @@ import (
 	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/metrictemplate"
 	"dbpilot.local/platform/internal/monitoring"
+	"dbpilot.local/platform/internal/mysqlplugin"
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
@@ -112,6 +113,7 @@ type ArtifactSettings struct {
 	StorageRoot       string `yaml:"storage_root"`
 	SigningKeyRef     string `yaml:"signing_key_ref"`
 	PluginLeaseKeyRef string `yaml:"plugin_lease_key_ref,omitempty"`
+	PluginLeaseOrigin string `yaml:"plugin_lease_origin,omitempty"`
 }
 
 type PluginPublisherSettings struct {
@@ -122,6 +124,19 @@ type PluginPublisherSettings struct {
 
 type PluginCatalogSettings struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type mysqlMetricTemplateDialect struct{}
+
+func (mysqlMetricTemplateDialect) ValidateReadOnly(ctx context.Context, definition metrictemplate.TemplateDefinition) (metrictemplate.ValidatedDefinition, error) {
+	if ctx == nil || ctx.Err() != nil || definition.DatabaseFamily != "mysql" {
+		return metrictemplate.ValidatedDefinition{}, metrictemplate.ErrDialectRejected
+	}
+	validated, err := metrictemplate.ValidateDefinition(definition)
+	if err != nil || mysqlplugin.NewMySQLStatementParser().Validate(definition.ReadOnlyStatement) != nil {
+		return metrictemplate.ValidatedDefinition{}, metrictemplate.ErrDialectRejected
+	}
+	return validated, nil
 }
 
 type CredentialLeaseSettings struct {
@@ -590,10 +605,7 @@ func NewServer(config Config) (*Server, error) {
 		assignmentService = pluginassignment.NewService(assignmentRepository)
 		metricRepository = metrictemplate.NewPostgresRepository(database, jobRepository)
 		pluginReconciler = reconciliation.NewPluginReconcilerWithTemplateLoader(assignmentRepository, metricRepository, agentRegistry)
-		// Task12 fixture keeps the authoritative dialect boundary explicit. The
-		// Task13 MySQL plugin replaces this deterministic acceptance adapter with
-		// its AST parser before custom templates can be enabled in production.
-		metricDialect := metrictemplate.DeterministicDialectValidator{Validate: func(context.Context, metrictemplate.TemplateDefinition) error { return nil }}
+		metricDialect := mysqlMetricTemplateDialect{}
 		metricTemplateService = metrictemplate.NewService(metricRepository, metricDialect, metricRepository, time.Now)
 		metricTemplateLeases, err = metrictemplate.NewLeaseService(metrictemplate.LeaseConfig{Authorizer: metrictemplate.PostgresLeaseAuthorizer{Database: database, Fences: agentRegistry, Now: time.Now}, Audit: metrictemplate.PostgresLeaseAuditRecorder{Database: database}, Now: time.Now})
 		if err != nil {
@@ -614,7 +626,7 @@ func NewServer(config Config) (*Server, error) {
 			return nil, errors.New("configure plugin artifact lease key")
 		}
 		authorizer := livePluginArtifactAuthorizer{AgentScopes: hostRepository, Assignments: assignmentService, Versions: pluginCatalogService, Artifacts: artifactService, ExecutionFences: agentRegistry, Now: time.Now}
-		pluginArtifactLeaseIssuer, err = agentcontrol.NewPluginArtifactLeaseIssuer(agentcontrol.PluginArtifactLeaseIssuerConfig{Origin: strings.TrimRight(config.EventURLBase, "/"), HMACKey: leaseKey, TTL: time.Minute, MaximumLeases: 4096, Authorizer: authorizer})
+		pluginArtifactLeaseIssuer, err = agentcontrol.NewPluginArtifactLeaseIssuer(agentcontrol.PluginArtifactLeaseIssuerConfig{Origin: strings.TrimRight(config.Artifact.PluginLeaseOrigin, "/"), HMACKey: leaseKey, TTL: time.Minute, MaximumLeases: 4096, Authorizer: authorizer})
 		for index := range leaseKey {
 			leaseKey[index] = 0
 		}
@@ -980,6 +992,12 @@ func validateConfig(config Config) error {
 	if config.PluginCatalog.Enabled && strings.TrimSpace(config.Artifact.StorageRoot) == "" {
 		return errors.New("artifact.storage_root is required when plugin catalog is enabled")
 	}
+	if config.PluginCatalog.Enabled {
+		pluginOrigin, parseErr := url.Parse(config.Artifact.PluginLeaseOrigin)
+		if parseErr != nil || pluginOrigin.Scheme != "https" || pluginOrigin.Host == "" || pluginOrigin.User != nil || pluginOrigin.RawQuery != "" || pluginOrigin.Fragment != "" || strings.TrimRight(pluginOrigin.Path, "/") != "" {
+			return errors.New("artifact.plugin_lease_origin must be a canonical HTTPS origin when plugin catalog is enabled")
+		}
+	}
 	if err := monitoring.ValidateQueryLimits(config.Monitoring.limits()); err != nil {
 		return errors.New("monitoring limits are invalid")
 	}
@@ -1199,10 +1217,19 @@ func (authorizer livePluginArtifactAuthorizer) AuthorizePluginArtifact(ctx conte
 		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
 	}
 	value, err := authorizer.Artifacts.Get(ctx, scope, artifactID)
-	if err != nil || value.ID != artifactID || value.Scope != scope || value.Kind != "plugin_package" || value.ContentType != "application/gzip" || value.SizeBytes <= 0 || value.SizeBytes > 256<<20 || value.Checksum != "sha256:"+assignment.ArtifactSHA256 || value.SourceResource.ResourceType != "plugin_version" || value.SourceResource.ResourceID != assignment.DesiredVersionID || value.StorageReference == "" {
+	if err != nil || value.ID != artifactID || value.Scope != scope || value.Kind != "plugin-package" || value.ContentType != "application/gzip" || value.SizeBytes <= 0 || value.SizeBytes > 256<<20 || value.Checksum != "sha256:"+assignment.ArtifactSHA256 || value.SourceResource.ResourceType != "plugin_catalog_operation" || !validPluginCatalogOperationID(value.SourceResource.ResourceID) || value.StorageReference == "" {
 		return agentcontrol.PluginArtifactGrant{}, agentcontrol.ErrPluginArtifactLeaseRejected
 	}
 	return agentcontrol.PluginArtifactGrant{AgentID: agentID, AssignmentID: assignmentID, ArtifactID: artifactID, OperationRevision: operationRevision, Artifact: value}, nil
+}
+
+func validPluginCatalogOperationID(value string) bool {
+	const prefix = "plugin-operation-"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	digest, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	return err == nil && len(digest) == 16
 }
 
 var _ agentcontrol.PluginArtifactAuthorizer = livePluginArtifactAuthorizer{}

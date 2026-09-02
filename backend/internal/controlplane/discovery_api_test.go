@@ -28,6 +28,25 @@ func TestDiscoveryAPIListsOnlyScopedRedactedCandidates(t *testing.T) {
 	require.NotContains(t, response.Body.String(), "hunter2")
 }
 
+func TestDiscoveryAPIKeepsInternalContainerIDEvidenceOutOfCanonicalDTO(t *testing.T) {
+	candidate := discoveryAPICandidate(platformTestScope)
+	candidate.Source = discovery.SourceDocker
+	candidate.ContainerIdentity = "mysql-primary"
+	candidate.Evidence = append(candidate.Evidence, discovery.Evidence{Kind: discovery.EvidenceContainerID, Value: strings.Repeat("a", 64)})
+	service := &discoveryAPIService{candidate: candidate}
+	request := httptest.NewRequest(http.MethodGet, platformBasePath+"/discovery-candidates", nil)
+	response := servePlatformRequest(Services{Discovery: service}, principalWith(platformTestScope, openapi.PermissionListDiscoveryCandidates), request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	var page openapi.DiscoveryCandidatePage
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, "mysql-primary", *page.Items[0].ContainerIdentity)
+	for _, evidence := range page.Items[0].EvidenceSummary {
+		require.NotEqual(t, discovery.EvidenceContainerID, discovery.EvidenceKind(evidence.Kind))
+	}
+	require.NotContains(t, response.Body.String(), strings.Repeat("a", 64))
+}
+
 func TestDiscoveryAPIIgnoreRequiresPermissionAndIsIdempotent(t *testing.T) {
 	service := &discoveryAPIService{candidate: discoveryAPICandidate(platformTestScope)}
 	services := Services{Discovery: service, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Audit: &recordingAuditService{}}

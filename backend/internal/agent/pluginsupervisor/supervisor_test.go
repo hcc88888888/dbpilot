@@ -67,6 +67,7 @@ func TestSupervisorFailedUpgradeRollsBackOldSlotProcessAndConfiguration(t *testi
 	require.Equal(t, pluginstate.SlotA, fixture.installer.active)
 	require.Equal(t, "1.0.0", observed.State.InstalledVersion)
 	require.Equal(t, pluginstate.ProcessRunning, observed.State.ProcessState)
+	require.Equal(t, "plugin_upgrade_rolled_back", observed.State.LastErrorCode)
 	require.Equal(t, 3, fixture.runner.startCount(), "old, failed new, restored old")
 	require.Equal(t, "1.0.0", fixture.runner.configurations[2].Version)
 	require.Equal(t, []string{"mysql-1", "mysql-2"}, fixture.runner.configurations[2].InstanceIDs)

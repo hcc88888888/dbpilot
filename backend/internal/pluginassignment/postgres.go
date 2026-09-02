@@ -575,6 +575,18 @@ func (repository *PostgresRepository) mutate(ctx context.Context, scope platform
 				}
 				return Assignment{}, mapError(err)
 			}
+			if before.ConfigurationRevision != value.ConfigurationRevision {
+				result, updateErr := tx.ExecContext(ctx, `UPDATE managed_database_instances instance SET desired_plugin_version=$1,plugin_assignment_revision=$2,revision=revision+1,updated_at=$3 FROM plugin_assignment_instances binding WHERE binding.tenant_id=$4 AND binding.project_id=$5 AND binding.assignment_id=$6 AND binding.instance_id=instance.instance_id AND instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.management_status<>'retired'`, value.DesiredVersion, value.ConfigurationRevision, value.UpdatedAt, scope.TenantID, scope.ProjectID, value.ID)
+				if updateErr != nil {
+					rollback()
+					return Assignment{}, mapError(updateErr)
+				}
+				rows, rowsErr := result.RowsAffected()
+				if rowsErr != nil || rows != int64(len(value.InstanceIDs)) {
+					rollback()
+					return Assignment{}, ErrConflict
+				}
+			}
 		}
 		if value.Validate() != nil {
 			rollback()
@@ -691,6 +703,19 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 		if _, err := tx.ExecContext(ctx, `UPDATE plugin_assignments SET reconcile_state=$1,blocked_reason=$2,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$3 AND project_id=$4 AND assignment_id=$5`, state, reason, report.Scope.TenantID, report.Scope.ProjectID, value.ID); err != nil {
 			rollback()
 			return mapError(err)
+		}
+		validatedInstances := observed.ProcessState == ProcessRunning && observed.Health == HealthHealthy && observed.InstalledVersion == value.DesiredVersion && observed.ActiveConfigurationRevision == value.ConfigurationRevision && observed.ObservedOperationRevision == value.OperationRevision && observed.BoundInstanceCount == uint32(len(value.InstanceIDs)) && value.DesiredState == DesiredRunning
+		if validatedInstances {
+			result, updateErr := tx.ExecContext(ctx, `UPDATE managed_database_instances instance SET management_status='managed',revision=CASE WHEN instance.management_status='managed' THEN instance.revision ELSE instance.revision+1 END,updated_at=CASE WHEN instance.management_status='managed' THEN instance.updated_at ELSE $1 END FROM plugin_assignment_instances binding WHERE binding.tenant_id=$2 AND binding.project_id=$3 AND binding.assignment_id=$4 AND binding.instance_id=instance.instance_id AND instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.host_id=$5 AND instance.agent_id=$6 AND instance.database_family=$7 AND instance.plugin_assignment_revision=$8 AND instance.management_status<>'retired'`, receivedAt, value.Scope.TenantID, value.Scope.ProjectID, value.ID, value.HostID, value.AgentID, value.DatabaseFamily, value.ConfigurationRevision)
+			if updateErr != nil {
+				rollback()
+				return mapError(updateErr)
+			}
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil || rows != int64(len(value.InstanceIDs)) {
+				rollback()
+				return ErrConflict
+			}
 		}
 	}
 	return repository.commit(tx)

@@ -72,7 +72,11 @@ func TestNewOIDCServerServesDiscoveryJWKSAndProductionVerifiableToken(t *testing
 	require.Equal(t, []platformscope.Scope{{TenantID: "tenant-acceptance", ProjectID: "project-acceptance"}}, claims.Projects)
 	require.Equal(t, []controlplane.OIDCGrant{{
 		TenantID: "tenant-acceptance", ProjectID: "project-acceptance",
-		Permissions: []string{"inspection:view", "inspection:manage", "inspection:execute", "platform.jobs.read", "platform.jobs.cancel", "platform.artifacts.read", "platform.artifacts.download", "platform.audit.read", "platform.capabilities.read"},
+		Permissions: []string{
+			"inspection:view", "inspection:manage", "inspection:execute", "platform.jobs.read", "platform.jobs.cancel", "platform.artifacts.read", "platform.artifacts.download", "platform.audit.read", "platform.capabilities.read",
+			"hosts:view", "hosts:manage", "hosts:discover", "discovery:view", "discovery:manage", "database-instances:view", "database-instances:manage", "database-instances:test",
+			"plugins:view", "plugins:publish", "plugins:approve", "plugins:manage", "plugins:deploy", "metric-templates:view", "metric-templates:manage", "metric-templates:approve",
+		},
 	}}, claims.Grants)
 }
 
@@ -103,6 +107,20 @@ func TestNewOIDCServerIssuesClosedNegativeVariants(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, response.StatusCode)
 	require.NoError(t, response.Body.Close())
+}
+
+func TestNewOIDCServerIssuesDistinctAcceptanceApprover(t *testing.T) {
+	fixture := startOIDCFixture(t)
+	ctx := coreosoidc.ClientContext(context.Background(), fixture.client)
+	verifier, err := controlplane.NewOIDCTokenVerifier(ctx, fixture.issuer, "dbpilot-control-plane")
+	require.NoError(t, err)
+	token := fixture.token(t, "approver", fixture.credential)
+	rawClaims, err := verifier.Verify(ctx, token.AccessToken)
+	require.NoError(t, err)
+	var claims controlplane.OIDCClaims
+	require.NoError(t, json.Unmarshal(rawClaims, &claims))
+	require.Equal(t, "acceptance-approver", claims.Subject)
+	require.Contains(t, claims.Grants[0].Permissions, "metric-templates:approve")
 }
 
 func TestNewOIDCServerRejectsCredentialsBoundsAndUnexpectedRoutesWithoutLoggingSecrets(t *testing.T) {

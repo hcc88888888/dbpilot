@@ -1,0 +1,644 @@
+name: ${DBPILOT_ACCEPTANCE_PROJECT:-dbpilot-host-plugin-acceptance}
+
+x-labels: &ownership-labels
+  dbpilot.verifier: host-plugin-full-stack
+  dbpilot.run: ${DBPILOT_HOST_PLUGIN_RUN_ID:-unassigned}
+
+x-kylin-image: &kylin-image ${DBPILOT_KYLIN_IMAGE:-cr.kylinos.cn/kylin/kylin-server-platform:v10sp1}
+
+services:
+  asset-builder:
+    image: golang:1.27.0-bookworm
+    user: "0:0"
+    working_dir: /workspace/backend
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        source="/workspace/backend/.tmp-host-plugin-$${DBPILOT_HOST_PLUGIN_RUN_ID}/bin"
+        install -d -m 0755 /acceptance/bin /acceptance/frontend
+        for binary in dbpilot-controlplane dbpilot-agent dbpilot-fullstack-fixture dbpilot-docker-discovery dbpilot-plugin-mysql; do
+          test -s "$${source}/$${binary}"
+          cp "$${source}/$${binary}" "/acceptance/bin/$${binary}"
+        done
+        cp -a /workspace/frontend/app/dist/. /acceptance/frontend/
+        chown -R 10001:10001 /acceptance/bin /acceptance/frontend
+        chmod 0555 /acceptance/bin/dbpilot-controlplane /acceptance/bin/dbpilot-agent /acceptance/bin/dbpilot-fullstack-fixture /acceptance/bin/dbpilot-docker-discovery /acceptance/bin/dbpilot-plugin-mysql
+        find /acceptance/frontend -type d -exec chmod 0555 {} +
+        find /acceptance/frontend -type f -exec chmod 0444 {} +
+    environment:
+      DBPILOT_HOST_PLUGIN_RUN_ID: ${DBPILOT_HOST_PLUGIN_RUN_ID:-unassigned}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    volumes:
+      - ../../..:/workspace:ro
+      - acceptance-bin:/acceptance/bin
+      - acceptance-frontend-assets:/acceptance/frontend
+    networks: [builder-egress]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 4.0
+    mem_limit: 4g
+    pids_limit: 512
+
+  bootstrap:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "0:0"
+    environment:
+      DBPILOT_INTERNAL_NETWORK_NAME: ${DBPILOT_ACCEPTANCE_PROJECT:-dbpilot-host-plugin-acceptance}-acceptance
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        install -d -m 0700 /acceptance
+        /fixture-bin/dbpilot-fullstack-fixture bootstrap --root /acceptance --host-plugin --docker-network-name "$${DBPILOT_INTERNAL_NETWORK_NAME}" >/dev/null
+        cp -a /acceptance/config/. /volumes/config/
+        cp -a /acceptance/secrets/. /volumes/secrets/
+        cp -a /acceptance/state/. /volumes/state/
+        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/proc-runtime /volumes/plugin-runtime /volumes/runner-artifacts
+        chown -R 10001:10001 /volumes/config /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts
+        chmod 0700 /volumes/secrets /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts
+        chown 0:10001 /volumes/helper-runtime
+        chmod 0770 /volumes/helper-runtime
+        chown 0:10001 /volumes/proc-runtime
+        chmod 0770 /volumes/proc-runtime
+    depends_on:
+      asset-builder:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /acceptance:rw,nosuid,size=32m,mode=0700
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-bin:/fixture-bin:ro
+      - acceptance-config:/volumes/config
+      - acceptance-secrets:/volumes/secrets
+      - acceptance-state:/volumes/state
+      - acceptance-artifacts:/volumes/artifacts
+      - acceptance-agent-data:/volumes/agent-data
+      - acceptance-helper-runtime:/volumes/helper-runtime
+      - acceptance-proc-runtime:/volumes/proc-runtime
+      - acceptance-plugin-runtime:/volumes/plugin-runtime
+      - acceptance-runner-artifacts:/volumes/runner-artifacts
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dbpilot
+      POSTGRES_USER: dbpilot
+      POSTGRES_PASSWORD_FILE: /acceptance/secrets/postgres-password
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql:rw,noexec,nosuid,size=16m
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-postgres-data:/var/lib/postgresql/data
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbpilot -d dbpilot"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+
+  oidc:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        exec /acceptance/bin/dbpilot-fullstack-fixture oidc --config /acceptance/config/oidc.json
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/acceptance/config/ca.pem", "https://oidc:9444/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 45
+      start_period: 3s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  controlplane:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-controlplane --version >/dev/null
+        export DBPILOT_COMMAND_SIGNING_PRIVATE_KEY="$$(cat /acceptance/secrets/command-signing-key.pem)"
+        export DBPILOT_COMMAND_EXECUTION_TOKEN_KEY="$$(cat /acceptance/secrets/execution-token-key)"
+        export DBPILOT_SECRET_CONTROLPLANE_ARTIFACT_DOWNLOAD="$$(cat /acceptance/secrets/artifact-signing-key)"
+        export DBPILOT_MYSQL_PASSWORD="$$(cat /acceptance/secrets/mysql-password)"
+        export SSL_CERT_FILE=/acceptance/config/ca.pem
+        exec /acceptance/bin/dbpilot-controlplane --config /acceptance/secrets/controlplane.yaml
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      oidc:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-state:/acceptance/state
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/acceptance/config/ca.pem", "https://controlplane:8443/readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.5
+    mem_limit: 1g
+    pids_limit: 256
+
+  docker-discovery:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "0:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    environment:
+      DBPILOT_INTERNAL_NETWORK_NAME: ${DBPILOT_ACCEPTANCE_PROJECT:-dbpilot-host-plugin-acceptance}-acceptance
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        exec /acceptance/bin/dbpilot-docker-discovery \
+          --docker-socket /var/run/docker.sock \
+          --agent-socket /acceptance/helper-runtime/docker-discovery.sock \
+          --allowed-uid 10001 --allowed-gid 10001 \
+          --allowed-labels dbpilot.discovery.family,dbpilot.instance_id,dbpilot.run \
+          --allowed-networks "$${DBPILOT_INTERNAL_NETWORK_NAME}"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-helper-runtime:/acceptance/helper-runtime
+    networks: [acceptance]
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /acceptance/helper-runtime/docker-discovery.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+  mysql-primary:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: dbpilot
+      MYSQL_USER: dbpilot
+      MYSQL_PASSWORD_FILE: /acceptance/secrets/mysql-password
+      MYSQL_ROOT_PASSWORD_FILE: /acceptance/secrets/mysql-password
+    expose: ["3306"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+      - /var/run/mysqld:rw,noexec,nosuid,size=16m
+    volumes:
+      - acceptance-mysql-primary-data:/var/lib/mysql
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+    networks: [acceptance]
+    labels:
+      <<: *ownership-labels
+      dbpilot.discovery.family: mysql
+      dbpilot.instance_id: mysql-primary
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=$$(cat /acceptance/secrets/mysql-password) --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 10s
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+
+  mysql-secondary:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: dbpilot
+      MYSQL_USER: dbpilot
+      MYSQL_PASSWORD_FILE: /acceptance/secrets/mysql-password
+      MYSQL_ROOT_PASSWORD_FILE: /acceptance/secrets/mysql-password
+    expose: ["3306"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+      - /var/run/mysqld:rw,noexec,nosuid,size=16m
+    volumes:
+      - acceptance-mysql-secondary-data:/var/lib/mysql
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+    networks: [acceptance]
+    labels:
+      <<: *ownership-labels
+      dbpilot.discovery.family: mysql
+      dbpilot.instance_id: mysql-secondary
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=$$(cat /acceptance/secrets/mysql-password) --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+      start_period: 10s
+    restart: "no"
+    cap_drop: ["NET_RAW"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+
+  agent:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "10001:10001"
+    working_dir: /acceptance/agent-data
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        /acceptance/bin/dbpilot-agent --version >/dev/null
+        test -s /acceptance/agent-data/enrollment-token
+        if test ! -s /acceptance/agent-data/enrollment/agent.crt; then
+          /acceptance/bin/dbpilot-agent enroll \
+            --server controlplane:9445 --ca-file /acceptance/config/ca.pem \
+            --token-file /acceptance/agent-data/enrollment-token --agent-id agent-online \
+            --output-dir /acceptance/agent-data/enrollment
+        fi
+        install -d -m 0700 /acceptance/agent-data/native
+        if test ! -x /acceptance/agent-data/native/mysqld-dbp; then
+          cp /acceptance/bin/dbpilot-fullstack-fixture /acceptance/agent-data/native/mysqld-dbp
+          chmod 0500 /acceptance/agent-data/native/mysqld-dbp
+        fi
+        /acceptance/agent-data/native/mysqld-dbp native --address 127.0.0.1:3306 &
+        printf '%s\n' 'WARN controlled acceptance file-log source' >/var/log/dbpilot/acceptance.log
+        exec /acceptance/bin/dbpilot-agent --config /acceptance/config/agent.yaml
+    depends_on:
+      controlplane:
+        condition: service_healthy
+      docker-discovery:
+        condition: service_healthy
+      mysql-primary:
+        condition: service_healthy
+      mysql-secondary:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=32m,mode=1777,uid=10001,gid=10001
+      - /var/log/dbpilot:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-agent-data:/acceptance/agent-data
+      - acceptance-helper-runtime:/acceptance/helper-runtime:ro
+      - acceptance-proc-runtime:/run/dbpilot-agent
+      - acceptance-plugin-runtime:/acceptance/agent-data/plugin-runtime
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 1.5
+    mem_limit: 768m
+    pids_limit: 256
+
+  proc-helper:
+    image: *kylin-image
+    platform: linux/amd64
+    user: "0:10001"
+    pid: "service:agent"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        exec /acceptance/bin/dbpilot-agent proc-helper \
+          --allowed-uid 10001 --allowed-gid 10001 \
+          --allowed-process-names mysqld-dbp
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,mode=1777
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-proc-runtime:/run/dbpilot-agent
+    networks: [proc-isolation]
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/dbpilot-agent/proc-helper.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    cap_add: ["DAC_READ_SEARCH", "SYS_PTRACE"]
+    security_opt: ["no-new-privileges:true", "apparmor=unconfined"]
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 32
+
+  mysql-plugin:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["plugin-probe"]
+    user: "10001:10001"
+    pid: "service:agent"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for attempt in $$(seq 1 120); do
+          count="$$(pgrep -fc '/dbpilot-plugin-mysql ')"
+          if test "$${count}" -eq 1; then exec sleep 86400; fi
+          sleep 1
+        done
+        echo 'expected exactly one dbpilot-plugin-mysql process' >&2
+        exit 1
+    depends_on:
+      agent:
+        condition: service_started
+      mysql-primary:
+        condition: service_healthy
+      mysql-secondary:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,mode=1777
+    volumes:
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-plugin-runtime:/acceptance/plugin-runtime:ro
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+
+  frontend:
+    image: nginx:1.29.1-alpine
+    user: "10001:10001"
+    depends_on:
+      controlplane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - acceptance-frontend-assets:/srv/dbpilot:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-config:/etc/ssl/certs:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+    networks: [acceptance, frontend-edge]
+    ports:
+      - target: 8443
+        published: "0"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "https://frontend:8443/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 96
+
+  acceptance-runner:
+    build:
+      context: ../../..
+      dockerfile: backend/docker/host-plugin-full-stack/runner.Dockerfile
+    profiles: ["acceptance-runner"]
+    user: "10001:10001"
+    environment:
+      FRONTEND_URL: https://frontend:8443
+      OIDC_URL: https://oidc:9444
+      OIDC_CA_FILE: /acceptance/config/ca.pem
+      OIDC_CREDENTIAL_FILE: /acceptance/secrets/oidc-token-credential
+      PLUGIN_PUBLISHER_KEY_FILE: /acceptance/secrets/plugin-publisher-key.pem
+      PLUGIN_BINARY_FILE: /acceptance/bin/dbpilot-plugin-mysql
+      TENANT_ID: tenant-acceptance
+      PROJECT_ID: project-acceptance
+      HOST_ID: host-acceptance
+      AGENT_ID: agent-online
+      AGENT_DATA_DIR: /acceptance/agent-data
+      ACCEPTANCE_STATE_FILE: /acceptance/state/host-plugin-phase.json
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m,mode=1777
+      - /home/pwuser:rw,nosuid,size=64m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-state:/acceptance/state
+      - acceptance-agent-data:/acceptance/agent-data
+      - acceptance-runner-artifacts:/acceptance/playwright
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2.0
+    mem_limit: 2g
+    pids_limit: 512
+
+  assertions:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["assertions"]
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    environment:
+      DBPILOT_ASSERTION_PHASE: host-plugin
+    command:
+      - |
+        . /etc/os-release
+        test "$${ID:-}" = kylin
+        test "$${VERSION_ID:-}" = V10
+        test "$$(uname -m)" = x86_64
+        password="$$(cat /acceptance/secrets/postgres-password)"
+        umask 077
+        printf 'postgres://dbpilot:%s@postgres/dbpilot?sslmode=disable' "$${password}" >/tmp/postgres-dsn
+        exec /acceptance/bin/dbpilot-fullstack-fixture host-plugin \
+          --phase "$${DBPILOT_ASSERTION_PHASE}" \
+          --dsn-file /tmp/postgres-dsn \
+          --agent-data /acceptance/agent-data \
+          --state-file /acceptance/state/host-plugin-phase.json \
+          --tenant-id tenant-acceptance --project-id project-acceptance --agent-id agent-online
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-bin:/acceptance/bin:ro
+      - acceptance-config:/acceptance/config:ro
+      - acceptance-secrets:/acceptance/secrets:ro
+      - acceptance-artifacts:/acceptance/artifacts:ro
+      - acceptance-state:/acceptance/state
+      - acceptance-agent-data:/acceptance/agent-data:ro
+      - acceptance-plugin-runtime:/acceptance/plugin-runtime:ro
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+
+networks:
+  acceptance:
+    name: ${DBPILOT_ACCEPTANCE_PROJECT:-dbpilot-host-plugin-acceptance}-acceptance
+    driver: bridge
+    internal: true
+    labels: *ownership-labels
+  builder-egress:
+    driver: bridge
+    labels: *ownership-labels
+  frontend-edge:
+    driver: bridge
+    labels: *ownership-labels
+  proc-isolation:
+    driver: bridge
+    internal: true
+    labels: *ownership-labels
+
+volumes:
+  acceptance-bin:
+    labels: *ownership-labels
+  acceptance-secrets:
+    labels: *ownership-labels
+  acceptance-config:
+    labels: *ownership-labels
+  acceptance-state:
+    labels: *ownership-labels
+  acceptance-artifacts:
+    labels: *ownership-labels
+  acceptance-agent-data:
+    labels: *ownership-labels
+  acceptance-plugin-runtime:
+    labels: *ownership-labels
+  acceptance-helper-runtime:
+    labels: *ownership-labels
+  acceptance-proc-runtime:
+    labels: *ownership-labels
+  acceptance-postgres-data:
+    labels: *ownership-labels
+  acceptance-mysql-primary-data:
+    labels: *ownership-labels
+  acceptance-mysql-secondary-data:
+    labels: *ownership-labels
+  acceptance-frontend-assets:
+    labels: *ownership-labels
+  acceptance-runner-artifacts:
+    labels: *ownership-labels

@@ -1,6 +1,6 @@
 # DBPilot 数据库运维管理系统
 
-DBPilot 是一套面向企业生产环境的数据库运维管理平台，覆盖**监控告警、SQL 质量、变更审批、数据安全、容量治理**等运维场景。系统以 Go 后端（遥测采集 Agent + 控制面）与原生 Web 前端（无框架）构成，目标平台为 CentOS 7+ / Kylin V10，安全模型基于 mTLS 与签名策略。
+DBPilot 是一套面向企业生产环境的数据库运维管理平台，覆盖**监控告警、SQL 质量、变更审批、数据安全、容量治理**等运维场景。系统以 Go 后端（遥测采集 Agent + 控制面）与 React/Vite 管理壳（保留旧模块迁移挂载点）构成，目标平台为 CentOS 7+ / Kylin V10，安全模型基于 mTLS 与签名策略。
 
 > 仓库来源：https://github.com/hcc88888888/dbpilot.git（main 分支）
 
@@ -38,8 +38,8 @@ DBPilot 是一套面向企业生产环境的数据库运维管理平台，覆盖
 ## 技术栈
 
 - **后端**：Go 1.27、gRPC/Protobuf、PostgreSQL、bbolt、Docker Compose
-- **前端**：原生 HTML / CSS / JavaScript（ES Module，无框架、无构建工具）
-- **测试**：Go `go test`；前端 Node.js 内置 `node --test`（node:test + assert/strict）
+- **前端**：React 19、TypeScript、Vite，以及迁移期旧 HTML/CSS/ES Module 模块
+- **测试**：Go `go test`；React/Vitest；显式限定文件集的 Node.js `node:test`；Playwright 真实浏览器验收
 
 ---
 
@@ -64,14 +64,17 @@ DBPilot 是一套面向企业生产环境的数据库运维管理平台，覆盖
 
 ## 本地运行
 
-前端为纯静态页面，任意静态服务器均可：
+管理壳使用 Vite：
 
 ```bash
-python -m http.server 8080 --directory .
-# 浏览器打开 http://localhost:8080/index.html
+npm ci --prefix frontend/app
+npm --prefix frontend/app run dev
 ```
 
-无后端配置时模块自动使用内置演示数据（界面标注「演示数据」）；配置控制面地址后走真实 API：
+旧 ES Module 挂载点仍可用静态服务器调试，但 React 生产路由同源 Nginx
+提供 `/api/` 代理。访问令牌只由内存 token provider 在每次请求时读取，不写入
+`localStorage` / `sessionStorage`；已配置的 HTTP 请求失败时不回退到演示数据。
+旧模块的显式本地演示模式可使用：
 
 ```js
 window.DBPILOT_CONTROL_PLANE_URL = 'https://control-plane.example.com';
@@ -86,10 +89,14 @@ window.DBPILOT_ALERT_CONTEXT = { authenticated: true, tenantId: 'xxx', projectId
 
 ```bash
 npm ci
+npm ci --prefix frontend/app
+npm ci --prefix backend/test/e2e/full-stack
 npm run contracts:lint
 npm run contracts:breaking
 npm run contracts:verify
-node --test
+npm run test:node
+npm --prefix frontend/app test -- --run
+npm --prefix frontend/app run build
 cd backend && go test ./...
 ```
 
@@ -103,6 +110,8 @@ OpenAPI 与 Agent Protobuf 的唯一可编辑源分别位于 `contracts/openapi/
 `backend/gen/`、`frontend/generated/` 的生成结果；不得直接手改生成文件。
 `contracts:breaking` 以 `origin/main` 为基线阻止破坏性 Agent v1 变更，
 `contracts:verify` 会重新生成并拒绝 drift。
+裸 `node --test` 会误递归收集 Playwright/Vitest 文件；仓库 Node 合同门禁固定
+使用 `npm run test:node`，Playwright 和 Vitest 分别由各自 package 的命令运行。
 
 开发期间可用 `npm run contracts:mock:start` 启动 Prism，结束后运行对应的
 Docker Compose `down`；自动化路径优先使用会自行清理的
@@ -115,6 +124,9 @@ powershell -NoProfile -File backend/scripts/verify-host-inspection.ps1
 powershell -NoProfile -File backend/scripts/verify-contract-foundation.ps1
 powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
   -Image 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' -Architecture amd64
+powershell -NoProfile -File backend/scripts/verify-host-plugin-full-stack.ps1 `
+  -KylinImage 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1' `
+  -Architecture amd64 -GoBinary 'C:\absolute\go.exe'
 ```
 
 主机巡检 PostgreSQL 脚本只发布动态分配的 loopback 端口，并在 `finally` 中按记录的
@@ -122,6 +134,9 @@ powershell -NoProfile -File backend/scripts/verify-kylin-docker.ps1 `
 运行生产 Agent/native host reader，解码真实 spool 中非空 CPU、内存、文件系统、负载和
 snapshot timestamp，并验证 ResultAck 已写入 journal；静态数据、通用 Linux 或
 `-SkipKylin` 不构成完成证据。GitHub CI 运行公开 PostgreSQL 门禁，不依赖私有 Kylin registry。
+主机与数据库插件的注册、Docker Helper 边界、发布者密钥、凭据租约、
+模板审批、回滚、备份恢复和发布证据见
+[`docs/host-database-plugin-operations.md`](docs/host-database-plugin-operations.md)。
 
 完整的浏览器、OIDC、Agent mTLS、重启补发、非法身份、PostgreSQL 与 journal
 Compose 验收由 `backend/scripts/verify-full-stack-compose.ps1` 统一编排。它只接受精确

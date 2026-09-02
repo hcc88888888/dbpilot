@@ -179,6 +179,30 @@ func TestSubsequentNonceUsesDurableRenewalAuthorization(t *testing.T) {
 	require.Equal(t, 2, renewal.calls)
 }
 
+func TestNewReconcileOperationUsesLiveExecutionAuthorizationNotRenewalHistory(t *testing.T) {
+	now := time.Now().UTC().Add(10 * time.Second)
+	initial := &testAuthorizer{grant: validGrant(now)}
+	renewal := &testRenewalAuthorizer{grant: validGrant(now)}
+	service, err := NewService(Config{Authorizer: initial, Renewals: renewal, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("operation-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, Random: bytes.NewReader(bytes.Repeat([]byte{0x7e}, 64))})
+	require.NoError(t, err)
+	agent := AuthenticatedAgent{AgentID: "agent-1", SessionID: "session-1"}
+	first, err := service.Lease(context.Background(), agent, validRequest())
+	require.NoError(t, err)
+	first.Release()
+
+	next := validRequest()
+	next.Nonce = bytes.Repeat([]byte{0x7f}, 32)
+	next.OperationRevision++
+	initial.mu.Lock()
+	initial.grant.OperationRevision = next.OperationRevision
+	initial.mu.Unlock()
+	second, err := service.Lease(context.Background(), agent, next)
+
+	require.NoError(t, err)
+	second.Release()
+	require.Zero(t, renewal.calls, "a new reconcile operation is protected by its live command execution fence")
+}
+
 func TestTombstoneEvictionNeverDeletesNewGenerationOrConsumesLiveCapacity(t *testing.T) {
 	now := time.Now().UTC()
 	service, err := NewService(Config{Authorizer: &testAuthorizer{grant: validGrant(now)}, Provider: &testProvider{credential: Credential{Username: "monitor", SecretBytes: []byte("capacity-secret"), Revision: 11}}, Clock: testClock{now: now}, Audit: &testAudit{}, TTL: time.Minute, MaximumLive: 1, Random: bytes.NewReader(bytes.Repeat([]byte{0x7a}, 64))})

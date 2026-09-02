@@ -6,6 +6,7 @@ import { HostDetailPage } from '../features/hosts/HostDetailPage';
 import { HostListPage } from '../features/hosts/HostListPage';
 import { InstanceDetailPage } from '../features/instances/InstanceDetailPage';
 import { InstanceListPage } from '../features/instances/InstanceListPage';
+import { MonitoringPage } from '../features/monitoring/MonitoringPage';
 import { AssignmentPage } from '../features/plugins/AssignmentPage';
 import { PluginCatalogPage } from '../features/plugins/PluginCatalogPage';
 import { TemplateEditor } from '../features/templates/TemplateEditor';
@@ -38,6 +39,7 @@ export function createAppRouter() {
         { path: 'discovery', element: <CandidateListPage /> },
         { path: 'instances', element: <InstanceListPage /> },
         { path: 'instances/:id', element: <InstanceDetailPage /> },
+        { path: 'monitoring', element: <MonitoringPage /> },
         { path: 'plugins', element: <PluginCatalogPage /> },
         { path: 'plugins/:id', element: <PluginDetailRoute /> },
         { path: 'plugin-assignments', element: <AssignmentPage /> },

@@ -66,6 +66,34 @@ func TestServiceRecordHelloUsesAuthenticatedScopeWithoutInventingHeartbeat(t *te
 	require.Equal(t, previousHeartbeat, got.LastHeartbeatAt, "Hello must never seed or advance real Heartbeat liveness")
 }
 
+func TestServiceAcceptsPostgresMicrosecondPrecisionForLiveSessionTimes(t *testing.T) {
+	now := time.Date(2026, 8, 30, 9, 0, 0, 123456789, time.UTC)
+	persisted := now.Truncate(time.Microsecond)
+	scope := platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}
+
+	t.Run("hello", func(t *testing.T) {
+		host := validHostFixture()
+		host.LastHelloAt = persisted
+		repository := &recordingRepository{recordHelloResult: host}
+		service := ApplicationService{Repository: repository, AgentScopes: &fixedAgentScopes{scope: scope}, Now: func() time.Time { return now }, StaleAfter: time.Minute, OfflineAfter: 5 * time.Minute}
+
+		_, err := service.RecordHello(context.Background(), host.AgentID, now)
+
+		require.NoError(t, err)
+	})
+
+	t.Run("heartbeat", func(t *testing.T) {
+		host := validHostFixture()
+		host.LastHeartbeatAt = persisted
+		repository := &recordingRepository{recordHeartbeatResult: host}
+		service := ApplicationService{Repository: repository, AgentScopes: &fixedAgentScopes{scope: scope}, Now: func() time.Time { return now }, StaleAfter: time.Minute, OfflineAfter: 5 * time.Minute}
+
+		_, err := service.RecordHeartbeat(context.Background(), host.AgentID, now)
+
+		require.NoError(t, err)
+	})
+}
+
 func TestServiceRecordHeartbeatClassifiesAgainstCurrentTime(t *testing.T) {
 	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
 	heartbeatAt := now.Add(-2 * time.Minute)

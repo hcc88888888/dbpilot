@@ -131,6 +131,9 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 2, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 5, ObservedAt: now}
 	require.NoError(t, service.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 5, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
+	var managedInstances int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='managed'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&managedInstances))
+	require.Equal(t, 2, managedInstances, "a healthy matching plugin observation proves ValidateInstance and promotes all bound instances")
 	matching, err := reconciler.Reconcile(ctx, time.Now().UTC(), 10)
 	require.NoError(t, err)
 	require.Zero(t, matching.Enqueued)
@@ -252,6 +255,30 @@ func TestPluginAssignmentRetirementDetachesMembershipAndLastInstanceQueuesAbsent
 	require.Equal(t, []string{newInstance.ID}, page.Items[0].InstanceIDs)
 	_, err = reconciliation.NewPluginReconciler(assignments).ReconcileAssignment(ctx, page.Items[0], time.Now().UTC())
 	require.NoError(t, err)
+}
+
+func TestPluginAssignmentVersionChangeAdvancesEveryInstanceProjection(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	instances := databaseinstance.NewPostgresRepositoryWithProvisioner(database, assignments)
+	candidate, request := insertAssignmentCandidate(t, database, scope, hostID, agentID, "version-projection", "127.0.0.1:3325", 43)
+	instance, err := instances.AcceptCandidate(ctx, scope, candidate, request)
+	require.NoError(t, err)
+	page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assignment := page.Items[0]
+	seedCompatiblePluginVersion(t, database, scope, time.Now().UTC())
+	nextVersion := "3.0.0"
+	updated, err := assignments.SetDesiredState(ctx, scope, assignment.ID, assignment.Revision, pluginassignment.DesiredUpdate{DesiredVersion: &nextVersion, Audit: pluginassignment.MutationAudit{Actor: "operator", OperationID: "updatePluginAssignment", IdempotencyKey: "version-projection", RequestFingerprint: "sha256:4343434343434343434343434343434343434343434343434343434343434343", RequestID: "request-version-projection"}})
+	require.NoError(t, err)
+	var projectedRevision uint64
+	var projectedVersion string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT plugin_assignment_revision,desired_plugin_version FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, instance.ID).Scan(&projectedRevision, &projectedVersion))
+	require.Equal(t, updated.ConfigurationRevision, projectedRevision)
+	require.Equal(t, updated.DesiredVersion, projectedVersion)
 }
 
 func TestPluginAssignmentFreshnessWaitsForOnlineHostAndFreshObservation(t *testing.T) {
