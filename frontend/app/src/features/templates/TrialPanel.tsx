@@ -2,8 +2,8 @@ import React from 'react';
 import type { Job, MetricTemplateRevision } from '../../../../generated/api/dist/index.js';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 
-export function TrialPanel({ revision, resultRevision, job, pending, onCancel, onConfirm }: {
-  revision?: MetricTemplateRevision; resultRevision?: MetricTemplateRevision; job?: Job; pending: boolean; onCancel(): void; onConfirm(instanceId: string, pluginVersionId: string): void;
+export function TrialPanel({ revision, job, pending, onCancel, onConfirm }: {
+  revision?: MetricTemplateRevision; job?: Job; pending: boolean; onCancel(): void; onConfirm(instanceId: string, pluginVersionId: string): void;
 }) {
   const [instanceId, setInstanceId] = React.useState('');
   const [pluginVersionId, setPluginVersionId] = React.useState('');
@@ -18,6 +18,6 @@ export function TrialPanel({ revision, resultRevision, job, pending, onCancel, o
       </div>
     </ConfirmDialog>
     {pending ? <p role="status">正在创建试运行任务…</p> : null}
-    {job && resultRevision ? <article className="panel"><h2>试运行结果</h2><p>{resultRevision.valueMappings.length} 个候选指标</p><p>{resultRevision.labelMappings.length} 个标签</p><div role="status" className="job-progress"><strong>{job.status}</strong><span>{job.progress.completedTargets} / {job.progress.totalTargets}</span></div></article> : null}
+    {job ? <article className="panel"><h2>试运行任务</h2><div role="status" className="job-progress"><strong>{job.status}</strong><span>{job.progress.completedTargets} / {job.progress.totalTargets}</span></div></article> : null}
   </>;
 }

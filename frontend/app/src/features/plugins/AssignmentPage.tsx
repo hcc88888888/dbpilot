@@ -9,7 +9,7 @@ import { StatusTag } from '../../components/StatusTag';
 import { usePluginsApi } from './api';
 import { useChangeAssignment, usePluginAssignments, usePluginJob } from './queries';
 import { RolloutDialog } from './RolloutDialog';
-import type { AssignmentAction, AssignmentChange } from './types';
+import { assignmentActions, type AssignmentAction, type AssignmentChange } from './types';
 
 function JobState({ api, assignmentId, jobId, canView }: { api: DefaultApi; assignmentId: string; jobId?: string; canView: boolean }) {
   const scope = useProjectContext();
@@ -43,7 +43,7 @@ export function AssignmentPage({ api: override }: { api?: DefaultApi }) {
           { key: 'observedState', header: '实际', render: (row) => row.observedState ? `${row.observedState.processState} / ${row.observedState.installedVersion ?? '未安装'}` : '未观测' },
           { key: 'reconcileState', header: '偏差', render: (row) => <><StatusTag status={row.reconcileState} tone={row.reconcileState === 'converged' ? 'success' : 'warning'} />{row.reconcileReason ? <small className="truth-warning">{row.reconcileReason}</small> : null}</> },
           { key: 'operationRevision', header: '电路/实例', render: (row) => <>{row.observedState?.circuitState ?? '未知'}<br />{row.observedState?.boundInstanceCount ?? 0} 个实例</> },
-          { key: 'etag', header: '操作', render: (row) => canManage ? <div className="row-actions">{(['deploy', 'stop', 'upgrade', 'rollback'] as AssignmentAction[]).map((action) => {
+          { key: 'etag', header: '操作', render: (row) => canManage ? <div className="row-actions">{assignmentActions(row).map((action) => {
             const label = { deploy: '部署', stop: '停止', upgrade: '升级', rollback: '回滚' }[action];
             return <button key={action} type="button" aria-label={`${label} ${row.assignmentId}`} onClick={() => setSelection({ action, assignment: row })}>{label}</button>;
           })}</div> : <span className="muted">无部署权限</span> },

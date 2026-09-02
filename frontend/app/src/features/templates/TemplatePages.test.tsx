@@ -1,5 +1,5 @@
 import React from 'react';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { Route, Routes, useParams } from 'react-router-dom';
@@ -8,6 +8,7 @@ import { renderFeature } from '../../test/renderFeature';
 import { TemplateEditor } from './TemplateEditor';
 import { TemplateListPage } from './TemplateListPage';
 import { templateKeys } from './queries';
+import { TrialPanel } from './TrialPanel';
 
 const template: MetricTemplate = {
   templateId: 'mysql-connections', databaseFamily: 'mysql', name: 'MySQL Connections', description: 'Connection health', builtin: false,
@@ -59,6 +60,17 @@ function TemplateEditorRouteForTest({ api }: { api: DefaultApi }) {
 }
 
 describe('Metric template management pages', () => {
+  it.each(['queued', 'running', 'failed', 'succeeded'] as const)('shows only real %s trial job state without fabricated result counts or raw summaries', (status) => {
+    render(<TrialPanel job={{ ...job, status, resultSummary: 'RAW_ROW password=do-not-render' }} pending={false} onCancel={() => undefined} onConfirm={() => undefined} />);
+
+    const trialPanel = screen.getByRole('heading', { name: '试运行任务' }).closest('article')!;
+    expect(screen.getByText(status)).not.toBeNull();
+    expect(screen.getByText('0 / 1')).not.toBeNull();
+    expect(within(trialPanel).queryByText(/candidate|候选指标|标签/i)).toBeNull();
+    expect(document.body.textContent).not.toContain('RAW_ROW');
+    expect(document.body.textContent).not.toContain('do-not-render');
+  });
+
   it('fails closed without requesting templates or revisions', async () => {
     const client = templateApi();
     renderFeature(<><TemplateListPage api={client} /><TemplateEditor templateId="mysql-connections" api={client} /></>, []);
@@ -133,7 +145,7 @@ describe('Metric template management pages', () => {
     expect(document.querySelector('script')).toBeNull();
   });
 
-  it('validates and trials a revision, showing metric counts and real job progress but no raw rows', async () => {
+  it('validates and trials a revision, showing real job progress but no fabricated counts or raw rows', async () => {
     const client = templateApi();
     client.listMetricTemplateRevisions = vi.fn(async () => ({ items: [draftRevision, validatedRevision], page: { limit: 100, hasMore: false } }));
     renderFeature(<TemplateEditor templateId="mysql-connections" api={client} />, ['metric-templates:view', 'metric-templates:manage', 'platform.jobs.read']);
@@ -148,23 +160,45 @@ describe('Metric template management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: '确认试运行' }));
 
     expect(await screen.findByText('succeeded')).not.toBeNull();
-    expect(screen.getByText('2 个候选指标')).not.toBeNull();
-    expect(screen.getByText('1 个标签')).not.toBeNull();
+    const trialPanel = screen.getByRole('heading', { name: '试运行任务' }).closest('article')!;
+    expect(within(trialPanel).queryByText(/candidate|候选指标|标签/i)).toBeNull();
     expect(document.body.textContent).not.toContain('RAW_ROW');
     expect(document.body.textContent).not.toContain('do-not-render');
+  });
+
+  it('refreshes revisions after a trial job reaches a terminal state', async () => {
+    const client = templateApi();
+    client.listMetricTemplateRevisions = vi.fn(async () => ({ items: [validatedRevision], page: { limit: 100, hasMore: false } }));
+    client.getJob = vi.fn()
+      .mockResolvedValueOnce({ ...job, status: 'running' })
+      .mockResolvedValue({ ...job, status: 'succeeded', outcome: 'complete', progress: { ...job.progress, completedTargets: 1 } });
+    renderFeature(<TemplateEditor templateId="mysql-connections" api={client} />, ['metric-templates:view', 'metric-templates:manage', 'platform.jobs.read']);
+
+    await userEvent.click(await screen.findByRole('button', { name: '试运行 revision-validated' }));
+    await userEvent.type(screen.getByLabelText('目标实例 ID'), 'instance-1');
+    await userEvent.type(screen.getByLabelText('插件版本 ID'), 'plugin-version-1');
+    await userEvent.click(screen.getByRole('button', { name: '确认试运行' }));
+
+    expect(await screen.findByText('running')).not.toBeNull();
+    const callsBeforeTerminal = vi.mocked(client.listMetricTemplateRevisions).mock.calls.length;
+    expect(await screen.findByText('succeeded', undefined, { timeout: 2_600 })).not.toBeNull();
+    await waitFor(() => expect(vi.mocked(client.listMetricTemplateRevisions).mock.calls.length).toBeGreaterThan(callsBeforeTerminal));
   });
 
   it('keeps approval, publication and rollback distinct and lets the server reject self-approval', async () => {
     const client = templateApi();
     client.listMetricTemplateRevisions = vi.fn(async () => ({ items: [revision, approvedRevision, oldRevision], page: { limit: 100, hasMore: false } }));
     client.approveMetricTemplateRevision = vi.fn(async () => {
-      throw Object.assign(new Error('self approval rejected'), { response: new Response(null, { status: 409 }) });
+      throw Object.assign(new Error('self approval rejected'), { response: new Response(JSON.stringify({
+        type: 'https://dbpilot.dev/problems/template-self-approval', title: 'Forbidden', status: 403,
+        code: 'template_self_approval_forbidden', request_id: 'request-self-approval',
+      }), { status: 403, headers: { 'content-type': 'application/problem+json' } }) });
     });
     renderFeature(<TemplateEditor templateId="mysql-connections" api={client} />, ['metric-templates:view', 'metric-templates:approve']);
 
     await userEvent.click(await screen.findByRole('button', { name: '审批 revision-2' }));
     await userEvent.click(screen.getByRole('button', { name: '确认审批' }));
-    expect((await screen.findByRole('alert')).textContent).toContain('不能审批自己创建的修订');
+    expect(await screen.findByText('不能审批自己创建的修订')).not.toBeNull();
     expect(client.publishMetricTemplateRevision).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByRole('button', { name: '发布 revision-approved' }));
@@ -176,6 +210,24 @@ describe('Metric template management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: '回滚到 revision-1' }));
     await userEvent.click(screen.getByRole('button', { name: '确认回滚' }));
     await waitFor(() => expect(client.publishMetricTemplateRevision).toHaveBeenCalledWith(expect.objectContaining({ revisionId: 'revision-1', ifMatch: '"revision-1"' }), expect.anything()));
+  });
+
+  it('does not mislabel an ordinary 409 approval conflict as self-approval', async () => {
+    const client = templateApi();
+    client.listMetricTemplateRevisions = vi.fn(async () => ({ items: [revision], page: { limit: 100, hasMore: false } }));
+    client.approveMetricTemplateRevision = vi.fn(async () => {
+      throw Object.assign(new Error('conflict'), { response: new Response(JSON.stringify({
+        type: 'https://dbpilot.dev/problems/state-conflict', title: 'Conflict', status: 409,
+        code: 'state_revision_conflict', request_id: 'request-conflict',
+      }), { status: 409, headers: { 'content-type': 'application/problem+json' } }) });
+    });
+    renderFeature(<TemplateEditor templateId="mysql-connections" api={client} />, ['metric-templates:view', 'metric-templates:approve']);
+
+    await userEvent.click(await screen.findByRole('button', { name: '审批 revision-2' }));
+    await userEvent.click(screen.getByRole('button', { name: '确认审批' }));
+
+    expect(await screen.findByText('资源状态冲突，请刷新后重试')).not.toBeNull();
+    expect(document.body.textContent).not.toContain('不能审批自己创建的修订');
   });
 
   it('keeps ETag and idempotency key stable across a retryable validation failure', async () => {

@@ -15,11 +15,15 @@ export function RolloutDialog({ action, assignment, onCancel, onConfirm }: {
   }, [action, assignment]);
   if (!assignment) return null;
   const label = action ? labels[action] : '';
+  const normalizedVersion = version.trim();
+  const invalidVersion = action === 'upgrade' || action === 'rollback'
+    ? !normalizedVersion || normalizedVersion === assignment.desiredVersion
+    : false;
   return (
-    <ConfirmDialog open={Boolean(action)} title={`${label}插件`} confirmLabel={`确认${label}`} onCancel={onCancel} onConfirm={() => {
-      if (!action) return;
+    <ConfirmDialog open={Boolean(action)} title={`${label}插件`} confirmLabel={`确认${label}`} confirmDisabled={invalidVersion} onCancel={onCancel} onConfirm={() => {
+      if (!action || invalidVersion) return;
       if (action === 'stop') onConfirm({ desiredState: 'stopped' });
-      else onConfirm({ desiredState: 'running', ...(action === 'upgrade' || action === 'rollback' ? { desiredVersion: version.trim() } : {}) });
+      else onConfirm({ desiredState: 'running', ...(action === 'upgrade' || action === 'rollback' ? { desiredVersion: normalizedVersion } : {}) });
     }}>
       <p>分配 {assignment.assignmentId} 的期望状态将被更新，随后创建调谐任务。</p>
       {action === 'upgrade' || action === 'rollback' ? <label>目标版本<input aria-label="目标版本" value={version} onChange={(event) => setVersion(event.target.value)} /></label> : null}

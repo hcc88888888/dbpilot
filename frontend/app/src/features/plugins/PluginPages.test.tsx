@@ -37,6 +37,22 @@ const assignment: PluginAssignment = {
   },
   createdAt: new Date('2026-09-01T00:00:00Z'), updatedAt: new Date('2026-09-01T02:00:00Z'), etag: '"assignment-12"',
 };
+const convergedAssignment: PluginAssignment = {
+  ...assignment, reconcileState: 'converged', reconcileReason: undefined,
+  observedState: { ...assignment.observedState!, installedVersion: '1.1.0', circuitState: 'closed', health: 'healthy' },
+};
+const stoppedAssignment: PluginAssignment = {
+  ...assignment, desiredState: 'stopped', reconcileState: 'converged', reconcileReason: undefined,
+  observedState: { ...assignment.observedState!, installedVersion: '1.1.0', processState: 'stopped', circuitState: 'closed', health: 'healthy' },
+};
+const absentAssignment: PluginAssignment = {
+  ...assignment, desiredState: 'absent', reconcileState: 'converged', reconcileReason: undefined,
+  observedState: { ...assignment.observedState!, installedVersion: undefined, processState: 'absent', circuitState: 'closed', health: 'unknown' },
+};
+const startingWithoutVersionAssignment: PluginAssignment = {
+  ...assignment, reconcileState: 'pending', reconcileReason: undefined,
+  observedState: { ...assignment.observedState!, installedVersion: undefined, processState: 'starting', circuitState: 'closed', health: 'unknown' },
+};
 
 const job: Job = {
   id: 'job-1', type: 'plugin.reconcile', status: 'queued', outcome: 'none', tenantId: 'tenant-a', projectId: 'project-a',
@@ -144,12 +160,29 @@ describe('Plugin management pages', () => {
   });
 
   it.each([
-    ['部署', { desiredState: 'running' }],
-    ['停止', { desiredState: 'stopped' }],
-    ['升级', { desiredVersion: '1.2.0', desiredState: 'running' }],
-    ['回滚', { desiredVersion: '1.0.0', desiredState: 'running' }],
-  ] as const)('confirms %s and starts a real reconciliation job', async (action, expectedPatch) => {
+    ['converged running', convergedAssignment, ['停止', '升级'], ['部署', '回滚']],
+    ['stopped', stoppedAssignment, ['部署'], ['停止', '升级', '回滚']],
+    ['absent', absentAssignment, ['部署'], ['停止', '升级', '回滚']],
+    ['starting without an installed version', startingWithoutVersionAssignment, ['停止'], ['部署', '升级', '回滚']],
+    ['version drift', assignment, ['停止', '升级', '回滚'], ['部署']],
+  ] as const)('shows only valid assignment actions for %s state', async (_label, value, visible, hidden) => {
     const client = pluginApi();
+    client.listPluginAssignments = vi.fn(async () => ({ items: [value], page: { limit: 100, hasMore: false } }));
+    renderFeature(<AssignmentPage api={client} />, ['plugins:view', 'plugins:manage', 'plugins:deploy']);
+
+    await screen.findByText(value.assignmentId);
+    for (const action of visible) expect(screen.getByRole('button', { name: `${action} ${value.assignmentId}` })).not.toBeNull();
+    for (const action of hidden) expect(screen.queryByRole('button', { name: `${action} ${value.assignmentId}` })).toBeNull();
+  });
+
+  it.each([
+    ['部署', stoppedAssignment, { desiredState: 'running' }],
+    ['停止', assignment, { desiredState: 'stopped' }],
+    ['升级', assignment, { desiredVersion: '1.2.0', desiredState: 'running' }],
+    ['回滚', assignment, { desiredVersion: '1.0.0', desiredState: 'running' }],
+  ] as const)('confirms %s and starts a real reconciliation job', async (action, sourceAssignment, expectedPatch) => {
+    const client = pluginApi();
+    client.listPluginAssignments = vi.fn(async () => ({ items: [sourceAssignment], page: { limit: 100, hasMore: false } }));
     renderFeature(<AssignmentPage api={client} />, ['plugins:view', 'plugins:manage', 'plugins:deploy', 'platform.jobs.read']);
 
     await userEvent.click(await screen.findByRole('button', { name: `${action} assignment-1` }));
@@ -164,6 +197,17 @@ describe('Plugin management pages', () => {
     expect(client.reconcilePluginAssignment).toHaveBeenCalledWith(expect.objectContaining({ assignmentId: 'assignment-1', idempotencyKey: expect.any(String) }), expect.anything());
     expect(await screen.findByText('succeeded')).not.toBeNull();
     expect(screen.getByText('1 / 1')).not.toBeNull();
+  });
+
+  it('does not allow an upgrade with an empty target version', async () => {
+    const client = pluginApi();
+    renderFeature(<AssignmentPage api={client} />, ['plugins:view', 'plugins:manage', 'plugins:deploy']);
+
+    await userEvent.click(await screen.findByRole('button', { name: '升级 assignment-1' }));
+    await userEvent.clear(screen.getByLabelText('目标版本'));
+
+    expect(screen.getByRole('button', { name: '确认升级' }).hasAttribute('disabled')).toBe(true);
+    expect(client.updatePluginAssignment).not.toHaveBeenCalled();
   });
 
   it('refreshes assignments after desired state changed even when reconciliation fails', async () => {

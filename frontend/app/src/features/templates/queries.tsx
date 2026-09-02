@@ -83,11 +83,11 @@ export function useTrialRevision(api: DefaultApi, scope: ApiProjectScope, templa
     retry: retryScopedRequest,
     mutationFn: ({ revision, instanceId, pluginVersionId, idempotencyKey }: {
       revision: MetricTemplateRevision; instanceId: string; pluginVersionId: string; idempotencyKey: string;
-    }) => request(async (signal) => ({ revision, job: await api.trialMetricTemplateRevision({
+    }) => request(async (signal) => ({ revisionId: revision.revisionId, job: await api.trialMetricTemplateRevision({
       revisionId: revision.revisionId, idempotencyKey, metricTemplateTrialRequest: { instanceId, pluginVersionId },
     }, { signal }) })),
-    onSuccess: ({ revision, job }) => {
-      queryClient.setQueryData(templateKeys.job(scope, revision.revisionId, job.id), job);
+    onSuccess: ({ revisionId, job }) => {
+      queryClient.setQueryData(templateKeys.job(scope, revisionId, job.id), job);
       return refreshRevision(queryClient, scope, templateId);
     },
   });

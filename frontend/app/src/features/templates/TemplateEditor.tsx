@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import type { DefaultApi, MetricTemplateRevision, MetricValueType } from '../../../../generated/api/dist/index.js';
+import { instanceOfProblem, ProblemFromJSON, type DefaultApi, type MetricTemplateRevision, type MetricValueType } from '../../../../generated/api/dist/index.js';
 import { mutationKey } from '../../api/client';
 import { useProjectContext } from '../../auth/AuthProvider';
 import { AsyncBoundary } from '../../components/AsyncBoundary';
@@ -15,8 +15,27 @@ import {
 } from './queries';
 import { TrialPanel } from './TrialPanel';
 
-function isConflict(error: unknown) {
-  return Boolean(error && typeof error === 'object' && (error as { response?: unknown }).response instanceof Response && (error as { response: Response }).response.status === 409);
+function errorResponse(error: unknown): Response | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const response = (error as { response?: unknown }).response;
+  return response instanceof Response ? response : undefined;
+}
+
+function useProblemCode(error: unknown) {
+  const [parsed, setParsed] = React.useState<{ source: unknown; code?: string }>({ source: undefined });
+  React.useEffect(() => {
+    let active = true;
+    setParsed({ source: error });
+    const response = errorResponse(error);
+    if (!response || !response.headers.get('content-type')?.toLowerCase().includes('application/problem+json')) return () => { active = false; };
+    void response.clone().json().then((wireValue: unknown) => {
+      if (!wireValue || typeof wireValue !== 'object') return;
+      const problem = ProblemFromJSON(wireValue);
+      if (active && problem && instanceOfProblem(problem)) setParsed({ source: error, code: problem.code });
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [error]);
+  return parsed.source === error ? parsed.code : undefined;
 }
 
 export function TemplateEditor({ templateId, api: override }: { templateId: string; api?: DefaultApi }) {
@@ -33,6 +52,7 @@ export function TemplateEditor({ templateId, api: override }: { templateId: stri
   const trialRevision = useTrialRevision(api, project, templateId);
   const approveRevision = useApproveRevision(api, project, templateId);
   const publishRevision = usePublishRevision(api, project, templateId);
+  const approvalProblemCode = useProblemCode(approveRevision.error);
   const [statement, setStatement] = React.useState('');
   const [variants, setVariants] = React.useState('');
   const [metricSourceColumn, setMetricSourceColumn] = React.useState('');
@@ -63,7 +83,7 @@ export function TemplateEditor({ templateId, api: override }: { templateId: stri
     setLabelSourceColumn(labelMapping?.sourceColumn ?? '');
     setLabelName(labelMapping?.label ?? '');
   }, [latestRevision, routeFamily, templateId]);
-  const trialJob = useTrialJob(api, project, trialRevision.data?.revision.revisionId ?? '', trialRevision.data?.job.id, canViewJobs);
+  const trialJob = useTrialJob(api, project, trialRevision.data?.revisionId ?? '', trialRevision.data?.job.id, canViewJobs);
   if (!canView) return <section className="management-page"><PageHeader title="指标模板详情" /><p role="alert" className="notice">没有查看指标模板详情的权限。</p></section>;
   return (
     <section className="management-page">
@@ -108,8 +128,12 @@ export function TemplateEditor({ templateId, api: override }: { templateId: stri
         {revisionsQuery.hasNextPage ? <button type="button" onClick={() => void revisionsQuery.fetchNextPage()}>加载更多修订</button> : null}
       </AsyncBoundary>
       <AsyncBoundary error={validateRevision.error ?? trialRevision.error ?? publishRevision.error} />
-      {approveRevision.error ? <p role="alert">{isConflict(approveRevision.error) ? '不能审批自己创建的修订' : '审批失败，请稍后重试'}</p> : null}
-      <TrialPanel revision={trialTarget} resultRevision={trialRevision.data?.revision} pending={trialRevision.isPending} job={trialJob.data ?? trialRevision.data?.job} onCancel={() => setTrialTarget(undefined)} onConfirm={(instanceId, pluginVersionId) => {
+      {approveRevision.error ? <p role="alert">{approvalProblemCode === 'template_self_approval_forbidden'
+        ? '不能审批自己创建的修订'
+        : [409, 412].includes(errorResponse(approveRevision.error)?.status ?? 0)
+          ? '资源状态冲突，请刷新后重试'
+          : '审批失败，请稍后重试'}</p> : null}
+      <TrialPanel revision={trialTarget} pending={trialRevision.isPending} job={trialJob.data ?? trialRevision.data?.job} onCancel={() => setTrialTarget(undefined)} onConfirm={(instanceId, pluginVersionId) => {
         if (!trialTarget) return;
         trialRevision.mutate({ revision: trialTarget, instanceId, pluginVersionId, idempotencyKey: mutationKey() });
         setTrialTarget(undefined);

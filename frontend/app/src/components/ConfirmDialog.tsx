@@ -1,7 +1,7 @@
 import React from 'react';
 import { trapModalFocus } from './focus';
 
-export function ConfirmDialog({ open, title, confirmLabel, onConfirm, onCancel, children }: React.PropsWithChildren<{ open: boolean; title: string; confirmLabel: string; onConfirm(): void; onCancel(): void }>) {
+export function ConfirmDialog({ open, title, confirmLabel, confirmDisabled = false, onConfirm, onCancel, children }: React.PropsWithChildren<{ open: boolean; title: string; confirmLabel: string; confirmDisabled?: boolean; onConfirm(): void; onCancel(): void }>) {
   const titleId = React.useId();
   const cancelButton = React.useRef<HTMLButtonElement>(null);
   const previousFocus = React.useRef<HTMLElement | null>(null);
@@ -25,7 +25,7 @@ export function ConfirmDialog({ open, title, confirmLabel, onConfirm, onCancel, 
         <div>{children}</div>
         <footer>
           <button ref={cancelButton} type="button" onClick={onCancel}>取消</button>
-          <button type="button" className="button button--danger" onClick={onConfirm}>{confirmLabel}</button>
+          <button type="button" className="button button--danger" disabled={confirmDisabled} onClick={onConfirm}>{confirmLabel}</button>
         </footer>
       </div>
     </section>
