@@ -1,5 +1,6 @@
 import React from 'react';
 import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { DefaultApi, ManagedDatabaseInstancePage, ManagedHost, ManagedHostPage } from '../../../../generated/api/dist/index.js';
 import { renderFeature } from '../../test/renderFeature';
@@ -36,6 +37,15 @@ describe('Host management pages', () => {
     expect(client.listHosts).not.toHaveBeenCalled();
   });
 
+  it('does not leak instance metadata from host detail when only instance view permission is granted', async () => {
+    const client = api();
+    renderFeature(<HostDetailPage hostId="host-1" api={client} />, ['database-instances:view']);
+
+    expect(await screen.findByText('没有查看主机的权限。')).not.toBeNull();
+    expect(client.getHost).not.toHaveBeenCalled();
+    expect(client.listDatabaseInstances).not.toHaveBeenCalled();
+  });
+
   it('passes TanStack cancellation through to the generated request', async () => {
     let requestSignal: AbortSignal | undefined;
     const client = {
@@ -57,6 +67,18 @@ describe('Host management pages', () => {
     expect(screen.getByText('数据可能已过期')).not.toBeNull();
     expect(screen.getByText('CPU 可用 4 / 16')).not.toBeNull();
     expect(screen.getByText('内存可用 12 / 64')).not.toBeNull();
+  });
+
+  it('loads the next host cursor instead of silently truncating inventory', async () => {
+    const client = api();
+    client.listHosts = vi.fn(async (request) => request.cursor
+      ? { items: [{ ...host, hostId: 'host-2', displayName: '支付主机 02' }], page: { limit: 1, hasMore: false } }
+      : { items: [host], page: { limit: 1, hasMore: true, nextCursor: 'host-cursor-2' } });
+    renderFeature(<HostListPage api={client} />, ['hosts:view']);
+
+    await userEvent.click(await screen.findByRole('button', { name: '加载更多主机' }));
+    expect(await screen.findByRole('link', { name: '支付主机 02' })).not.toBeNull();
+    expect(client.listHosts).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: 'host-cursor-2' }), expect.anything());
   });
 
   it('shows host capability evidence and an instance/plugin summary on detail', async () => {

@@ -27,16 +27,16 @@ export function HostListPage({ api: override }: { api?: DefaultApi }) {
   const canView = project.permissions.has('hosts:view');
   const [status, setStatus] = React.useState<HostStatus | undefined>();
   const query = useHostList(api, project, { status }, canView);
-  const rows = (query.data?.items ?? []).map((host) => ({ ...host, id: host.hostId }));
+  const rows = (query.data?.pages.flatMap((page) => page.items) ?? []).map((host) => ({ ...host, id: host.hostId }));
 
   if (!canView) return <section className="management-page"><PageHeader title="主机管理" /><p role="alert" className="notice">没有查看主机的权限。</p></section>;
   return (
     <section className="management-page">
       <PageHeader title="主机管理" description="查看 Agent 在线状态、主机资源与发现能力。" />
-      <FilterBar label="主机筛选">
+      <FilterBar label="主机筛选" onSubmit={(event) => event.preventDefault()}>
         <label>状态
           <select aria-label="主机状态" value={status ?? ''} onChange={(event) => setStatus((event.target.value || undefined) as HostStatus | undefined)}>
-            <option value="">全部</option><option value="online">在线</option><option value="stale">数据陈旧</option><option value="offline">离线</option>
+            <option value="">全部</option><option value="pending">待注册</option><option value="enrolling">注册中</option><option value="online">在线</option><option value="stale">数据陈旧</option><option value="offline">离线</option><option value="decommissioned">已退役</option>
           </select>
         </label>
       </FilterBar>
@@ -51,6 +51,7 @@ export function HostListPage({ api: override }: { api?: DefaultApi }) {
             { key: 'capabilities', header: '能力', render: (row) => `${row.capabilities.filter((item) => item.available).length} / ${row.capabilities.length} 可用` },
           ]} />
         )}
+        {query.hasNextPage ? <button type="button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>{query.isFetchingNextPage ? '正在加载…' : '加载更多主机'}</button> : null}
       </AsyncBoundary>
     </section>
   );

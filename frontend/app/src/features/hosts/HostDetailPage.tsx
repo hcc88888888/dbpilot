@@ -16,8 +16,9 @@ export function HostDetailPage({ hostId: explicitHostId, api: override }: { host
   const canView = project.permissions.has('hosts:view');
   const hostQuery = useHost(api, project, hostId, canView);
   const canViewInstances = project.permissions.has('database-instances:view');
-  const instanceQuery = useHostInstances(api, project, hostId, canViewInstances);
+  const instanceQuery = useHostInstances(api, project, hostId, canView && canViewInstances);
   const host = hostQuery.data;
+  const instances = instanceQuery.data?.pages.flatMap((page) => page.items) ?? [];
 
   if (!canView) return <section className="management-page"><PageHeader title="主机详情" /><p role="alert" className="notice">没有查看主机的权限。</p></section>;
   return (
@@ -33,7 +34,7 @@ export function HostDetailPage({ hostId: explicitHostId, api: override }: { host
             <article className="panel"><h2>资源概览</h2><dl><dt>CPU</dt><dd>{host.cpuSummary ? `${host.cpuSummary.available} / ${host.cpuSummary.capacity} 可用` : '未上报'}</dd><dt>内存</dt><dd>{host.memorySummary ? `${host.memorySummary.available} / ${host.memorySummary.capacity} 可用` : '未上报'}</dd><dt>最后心跳</dt><dd>{host.lastHeartbeatAt?.toLocaleString() ?? '从未收到'}</dd></dl></article>
           </div>
           <article className="panel"><h2>采集与发现能力</h2><ul className="capability-list">{host.capabilities.map((capability) => <li key={capability.name}><StatusTag status={capability.available ? '可用' : '不可用'} tone={capability.available ? 'success' : 'warning'} /> <span>{capability.name === 'docker_discovery' ? 'Docker 发现' : capability.name === 'native_discovery' ? '原生进程发现' : capability.name}{!capability.available ? '不可用' : ''}</span></li>)}</ul></article>
-          {canViewInstances ? <article className="panel"><h2>数据库与插件</h2><AsyncBoundary loading={instanceQuery.isPending} error={instanceQuery.error}>{instanceQuery.data?.items.length ? <ul className="resource-list">{instanceQuery.data.items.map((instance) => <li key={instance.instanceId}><Link to={`/instances/${encodeURIComponent(instance.instanceId)}`}>{instance.displayName}</Link><span>{instance.databaseFamily}</span><span>{instance.pluginId ?? '插件未分配'}</span></li>)}</ul> : <p>暂无数据库实例。</p>}</AsyncBoundary></article> : <p className="notice">没有查看数据库实例的权限。</p>}
+          {canViewInstances ? <article className="panel"><h2>数据库与插件</h2><AsyncBoundary loading={instanceQuery.isPending} error={instanceQuery.error}>{instances.length ? <ul className="resource-list">{instances.map((instance) => <li key={instance.instanceId}><Link to={`/instances/${encodeURIComponent(instance.instanceId)}`}>{instance.displayName}</Link><span>{instance.databaseFamily}</span><span>{instance.pluginId ?? '插件未分配'}</span></li>)}</ul> : <p>暂无数据库实例。</p>}{instanceQuery.hasNextPage ? <button type="button" disabled={instanceQuery.isFetchingNextPage} onClick={() => void instanceQuery.fetchNextPage()}>加载更多数据库</button> : null}</AsyncBoundary></article> : <p className="notice">没有查看数据库实例的权限。</p>}
         </> : null}
       </AsyncBoundary>
     </section>

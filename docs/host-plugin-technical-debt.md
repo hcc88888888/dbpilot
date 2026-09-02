@@ -58,6 +58,6 @@
 
 - Affected module: React/Vite management application bundle (`frontend/app`).
 - Trigger conditions: a production build packages the current shell, generated API client and host/discovery/instance routes into the default entry chunk.
-- Functional impact: none observed. Type checking, all React workflows and the Vite production build pass; the 509.03 KiB minified entry chunk may increase initial download and parse time on slower operator networks.
+- Functional impact: none observed. Type checking, all React workflows and the Vite production build pass; the approximately 514 KiB minified entry chunk may increase initial download and parse time on slower operator networks.
 - Severity: low performance debt; it does not affect functional correctness or API isolation.
 - Recommended remediation stage: frontend performance consolidation after the remaining management modules are implemented. Introduce route-level dynamic imports and measure real gzip/parse performance before selecting stable manual chunks.

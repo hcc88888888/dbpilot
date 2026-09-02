@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import type { DefaultApi } from '../../../../generated/api/dist/index.js';
 import type { ApiProjectScope } from '../../api/client';
 import type { HostFilters } from './types';
@@ -13,9 +13,11 @@ export const hostKeys = {
 };
 
 export function useHostList(api: DefaultApi, scope: ApiProjectScope, filters: HostFilters, enabled = true) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: hostKeys.list(scope, filters),
-    queryFn: ({ signal }) => api.listHosts({ ...filters, limit: 100 }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ signal, pageParam }) => api.listHosts({ ...filters, cursor: pageParam, limit: 100 }, { signal }),
+    getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
     enabled,
   });
 }
@@ -29,9 +31,11 @@ export function useHost(api: DefaultApi, scope: ApiProjectScope, hostId: string,
 }
 
 export function useHostInstances(api: DefaultApi, scope: ApiProjectScope, hostId: string, enabled: boolean) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: hostKeys.instances(scope, hostId),
-    queryFn: ({ signal }) => api.listDatabaseInstances({ hostId, limit: 100 }, { signal }),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ signal, pageParam }) => api.listDatabaseInstances({ hostId, cursor: pageParam, limit: 100 }, { signal }),
+    getNextPageParam: (lastPage) => lastPage.page.hasMore ? lastPage.page.nextCursor ?? undefined : undefined,
     enabled: enabled && Boolean(hostId),
   });
 }

@@ -9,7 +9,7 @@ import { InstanceListPage } from './InstanceListPage';
 
 const instance: ManagedDatabaseInstance = {
   instanceId: 'db-1', tenantId: 'tenant-a', projectId: 'project-a', hostId: 'host-1', agentId: 'agent-1', databaseFamily: 'mysql', databaseVariant: 'mysql',
-  displayName: '订单数据库', endpoint: '10.0.0.8:3306', version: '8.4.2', credentialRef: 'vault://mysql/orders', tlsRef: 'vault://tls/orders',
+  displayName: '订单数据库', endpoint: '10.0.0.8:3306', version: '8.4.2', credentialRef: 'secret://mysql/orders', tlsRef: 'secret://tls/orders',
   pluginId: 'mysql-observer', desiredPluginVersion: '1.0.0', labels: { env: 'prod' }, capabilities: new Set(['metrics']),
   connectionTestStatus: 'authentication_failed', connectionTestAt: new Date('2026-09-01T00:05:00Z'), pluginAssignmentRevision: 4,
   managementStatus: 'degraded', etag: '"db-4"',
@@ -30,6 +30,7 @@ function api(status = 200) {
     }),
     getDatabaseInstance: vi.fn(async () => instance),
     testDatabaseInstanceConnection: vi.fn(async () => job),
+    getJob: vi.fn(async () => ({ ...job, status: 'succeeded', outcome: 'complete', progress: { ...job.progress, completedTargets: 1 } })),
   } as unknown as DefaultApi;
 }
 
@@ -51,14 +52,37 @@ describe('Database instance management pages', () => {
 
   it('starts a connection-test job with an idempotency key and reports real job progress', async () => {
     const client = api();
-    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test']);
+    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test', 'platform.jobs.read']);
     expect(await screen.findByRole('heading', { name: '订单数据库' })).not.toBeNull();
-    expect(screen.getByText('vault://mysql/orders')).not.toBeNull();
+    expect(screen.getByText('secret://mysql/orders')).not.toBeNull();
     expect(screen.queryByLabelText(/密码|secret/i)).toBeNull();
     await userEvent.click(screen.getByRole('button', { name: '测试连接' }));
-    await waitFor(() => expect(client.testDatabaseInstanceConnection).toHaveBeenCalledWith({ instanceId: 'db-1', idempotencyKey: expect.any(String) }));
+    await waitFor(() => expect(client.testDatabaseInstanceConnection).toHaveBeenCalledWith({ instanceId: 'db-1', idempotencyKey: expect.any(String) }, expect.objectContaining({ signal: expect.any(AbortSignal) })));
+    expect(await screen.findByText('succeeded')).not.toBeNull();
+    expect(screen.getByText('1 / 1')).not.toBeNull();
+    expect(client.getJob).toHaveBeenCalledWith({ jobId: 'job-1' }, expect.anything());
+  });
+
+  it('keeps the initial job status without polling when jobs view permission is absent', async () => {
+    const client = api();
+    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test']);
+    await userEvent.click(await screen.findByRole('button', { name: '测试连接' }));
+
     expect(await screen.findByText('queued')).not.toBeNull();
-    expect(screen.getByText('0 / 1')).not.toBeNull();
+    expect(screen.getByText('没有查看任务进度的权限，仅显示任务创建时状态。')).not.toBeNull();
+    expect(client.getJob).not.toHaveBeenCalled();
+  });
+
+  it('loads the next instance cursor instead of silently truncating inventory', async () => {
+    const client = api();
+    client.listDatabaseInstances = vi.fn(async (request) => request.cursor
+      ? { items: [{ ...instance, instanceId: 'db-2', displayName: '订单数据库 02' }], page: { limit: 1, hasMore: false } }
+      : { items: [instance], page: { limit: 1, hasMore: true, nextCursor: 'instance-cursor-2' } });
+    renderFeature(<InstanceListPage api={client} />, ['database-instances:view']);
+
+    await userEvent.click(await screen.findByRole('button', { name: '加载更多实例' }));
+    expect(await screen.findByRole('link', { name: '订单数据库 02' })).not.toBeNull();
+    expect(client.listDatabaseInstances).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: 'instance-cursor-2' }), expect.anything());
   });
 
   it('shows 403 as a permission error with no demo fallback', async () => {
