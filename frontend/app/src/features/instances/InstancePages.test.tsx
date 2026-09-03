@@ -84,7 +84,7 @@ describe('Database instance management pages', () => {
 
   it('keeps the connection-test button disabled while a test is pending', async () => {
     const client = api();
-    client.getDatabaseInstance = vi.fn(async () => ({ ...instance, connectionTestStatus: 'pending' }));
+    client.getDatabaseInstance = vi.fn(async () => ({ ...instance, connectionTestStatus: 'pending' as const }));
     renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test']);
 
     expect((await screen.findByRole('button', { name: '测试进行中…' }) as HTMLButtonElement).disabled).toBe(true);
