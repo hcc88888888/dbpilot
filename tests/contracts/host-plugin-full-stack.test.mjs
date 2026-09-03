@@ -383,7 +383,7 @@ test('runner image build and registration failure windows remain exact-cleanable
     'finally retries late image visibility, records the canonical ID, then removes only that ID');
 });
 
-test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding child', { skip: process.platform !== 'win32' }, async () => {
+test('PowerShell 5.1 and 7 atomically own over-capacity late-spawn and inaccessible process trees', { skip: process.platform !== 'win32' }, async () => {
   assert.equal(existsSync(boundedProcessFile), true, 'the production bounded-process helper exists');
   assert.equal(existsSync(boundedGateFile), true, 'the pre-assignment process gate exists');
   const boundedSource = await readFile(boundedProcessFile, 'utf8');
@@ -391,23 +391,66 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
   assert.match(boundedSource, /CreateKillOnClose\(\)[\s\S]*\$process\.Start\(\)[\s\S]*Assign\([^\r\n]+\)[\s\S]*\.Set\(\)/);
   assert.match(gateSource, /WaitOne\([^)]*\)[\s\S]*& \$command @arguments/);
   const root = await mkdtemp(join(tmpdir(), 'dbpilot-pipe-'));
-  const child = join(root, 'child.ps1');
   const parentSource = join(root, 'parent.cs');
   const parent = join(root, 'parent.exe');
   const pidFile = join(root, 'child.pid');
-  await writeFile(child, "[Console]::Out.WriteLine('pipe-held'); Start-Sleep -Seconds 30\n", 'utf8');
+  const deniedReadyFile = join(root, 'denied.ready');
+  const deniedVerifiedFile = join(root, 'denied.verified');
+  const deniedFinallyFile = join(root, 'denied.finally');
+  const lateReadyFile = join(root, 'late.ready');
+  const stressFinallyFile = join(root, 'stress.finally');
   await writeFile(parentSource, [
     'using System;',
     'using System.Collections.Generic;',
+    'using System.ComponentModel;',
     'using System.Diagnostics;',
     'using System.IO;',
+    'using System.Reflection;',
+    'using System.Runtime.InteropServices;',
+    'using System.Security.AccessControl;',
+    'using System.Security.Principal;',
+    'using System.Threading;',
     'public static class ImmediateParent {',
-    '  public static int Main() {',
-    '    var info = new ProcessStartInfo(Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD_EXE"), "-NoProfile -File \\\"" + Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD") + "\\\"");',
+    '  [DllImport("advapi32.dll", SetLastError = true)] static extern bool SetKernelObjectSecurity(IntPtr handle, int information, byte[] descriptor);',
+    '  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();',
+    '  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);',
+    '  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);',
+    '  static void DenySynchronize() {',
+    '    var sid = WindowsIdentity.GetCurrent().User.Value;',
+    '    var descriptor = new RawSecurityDescriptor("D:P(D;;0x00100000;;;" + sid + ")(A;;0x00001001;;;" + sid + ")(A;;GA;;;SY)(A;;GA;;;BA)");',
+    '    var binary = new byte[descriptor.BinaryLength]; descriptor.GetBinaryForm(binary, 0);',
+    '    if (!SetKernelObjectSecurity(GetCurrentProcess(), 4, binary)) throw new Win32Exception(Marshal.GetLastWin32Error());',
+    '  }',
+    '  public static int Main(string[] args) {',
+    '    if (args.Length == 1 && args[0] == "--hold-child") { Console.Out.WriteLine("pipe-held-late"); Thread.Sleep(30000); return 0; }',
+    '    if (args.Length == 1 && args[0] == "--quick-child") { Thread.Sleep(Environment.TickCount & 31); return 0; }',
+    '    if (args.Length == 2 && args[0] == "--late-spawner") {',
+    '      using (var parent = Process.GetProcessById(Int32.Parse(args[1]))) { File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_LATE_READY"), "ready"); parent.WaitForExit(); } var lateSelf = Assembly.GetEntryAssembly().Location;',
+    '      for (var index = 0; index < 12; index++) { var held = Process.Start(new ProcessStartInfo(lateSelf, "--hold-child") { UseShellExecute = false, CreateNoWindow = true }); File.AppendAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), "," + held.Id + ":" + held.StartTime.ToUniversalTime().Ticks); Thread.Sleep(5); }',
+    '      for (var index = 0; index < 128; index++) {',
+    '        var quick = Process.Start(new ProcessStartInfo(lateSelf, "--quick-child") { UseShellExecute = false, CreateNoWindow = true }); File.AppendAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), "," + quick.Id + ":" + quick.StartTime.ToUniversalTime().Ticks); Thread.Sleep(20);',
+    '      }',
+    '      Thread.Sleep(30000); return 0;',
+    '    }',
+    '    if (args.Length == 1 && args[0] == "--denied-child") { DenySynchronize(); File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_DENIED_READY"), "ready"); Console.Out.WriteLine("pipe-held-denied"); Thread.Sleep(30000); return 0; }',
+    '    if (Environment.GetEnvironmentVariable("DBPILOT_PIPE_MODE") == "denied") {',
+    '      var deniedInfo = new ProcessStartInfo(Assembly.GetEntryAssembly().Location, "--denied-child"); deniedInfo.UseShellExecute = false; deniedInfo.CreateNoWindow = true;',
+    '      var denied = Process.Start(deniedInfo); File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), denied.Id + ":" + denied.StartTime.ToUniversalTime().Ticks);',
+    '      var until = DateTime.UtcNow.AddSeconds(5); while (!File.Exists(Environment.GetEnvironmentVariable("DBPILOT_DENIED_READY")) && DateTime.UtcNow < until) Thread.Sleep(5);',
+    '      if (!File.Exists(Environment.GetEnvironmentVariable("DBPILOT_DENIED_READY"))) return 3;',
+    '      var probe = OpenProcess(0x00100000, false, (uint)denied.Id); if (probe != IntPtr.Zero) { CloseHandle(probe); return 4; }',
+    '      if (Marshal.GetLastWin32Error() != 5) return 5; probe = OpenProcess(0x00001000, false, (uint)denied.Id); if (probe == IntPtr.Zero) return 6; CloseHandle(probe);',
+    '      File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_DENIED_VERIFIED"), "access-denied-query-allowed"); return 0;',
+    '    }',
+    '    var self = Assembly.GetEntryAssembly().Location;',
+    '    var info = new ProcessStartInfo(self, "--hold-child");',
     '    info.UseShellExecute = false; info.CreateNoWindow = true;',
     '    var childIdentities = new List<string>();',
-    '    for (var index = 0; index < 8; index++) { var child = Process.Start(info); childIdentities.Add(child.Id + ":" + child.StartTime.ToUniversalTime().Ticks); }',
+    '    for (var index = 0; index < 24; index++) { var child = Process.Start(info); childIdentities.Add(child.Id + ":" + child.StartTime.ToUniversalTime().Ticks); }',
     '    File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), string.Join(",", childIdentities));',
+    '    var lateInfo = new ProcessStartInfo(self, "--late-spawner " + Process.GetCurrentProcess().Id); lateInfo.UseShellExecute = false; lateInfo.CreateNoWindow = true;',
+    '    var late = Process.Start(lateInfo); File.AppendAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), "," + late.Id + ":" + late.StartTime.ToUniversalTime().Ticks);',
+    '    var lateUntil = DateTime.UtcNow.AddSeconds(5); while (!File.Exists(Environment.GetEnvironmentVariable("DBPILOT_LATE_READY")) && DateTime.UtcNow < lateUntil) Thread.Yield();',
     '    return 0;',
     '  }',
     '}',
@@ -423,33 +466,70 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
     ]) {
       if (executable !== 'pwsh' && !existsSync(executable)) continue;
       const unrelated = spawn(executable, ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
+      const unrelatedStartedResult = spawnSync(executable, ['-NoProfile', '-Command', `(Get-Process -Id ${unrelated.pid}).StartTime.ToUniversalTime().Ticks`], { encoding: 'utf8' });
+      assert.equal(unrelatedStartedResult.status, 0, unrelatedStartedResult.stderr);
+      const unrelatedStarted = unrelatedStartedResult.stdout.trim();
+      const deniedCommand = [
+        `. '${containerSafetyFile.replaceAll("'", "''")}'`,
+        `. '${boundedProcessFile.replaceAll("'", "''")}'`,
+        '$code = 9',
+        "try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; $code = 9 } catch { if ($_.Exception.Message -ceq 'Bounded process tree termination did not settle.') { $parts=[IO.File]::ReadAllText($env:DBPILOT_PIPE_PID).Split(':'); $candidate=Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue; $running=$false; if($null -ne $candidate) { try { $running=-not $candidate.HasExited -and [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq [string]$parts[1] } catch {} }; if($running) { Write-Error 'inaccessible exact child remained running after bounded return'; $code=7 } else { $code = 0 } } else { Write-Error $_; $code = 8 } } finally { [IO.File]::WriteAllText($env:DBPILOT_DENIED_FINALLY, 'done') }",
+        'exit $code',
+      ].join('; ');
       const command = [
         `. '${containerSafetyFile.replaceAll("'", "''")}'`,
         `. '${boundedProcessFile.replaceAll("'", "''")}'`,
-        "try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 }; $ownedChildren = [IO.File]::ReadAllText($env:DBPILOT_PIPE_PID).Split(',') | ForEach-Object { $parts = $_.Split(':'); [pscustomobject]@{ Id = [int]$parts[0]; Started = [string]$parts[1] } }; $isExactChildRunning = { param($child) $candidate = Get-Process -Id $child.Id -ErrorAction SilentlyContinue; if ($null -eq $candidate -or $candidate.HasExited) { return $false }; return [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq $child.Started }; if (@($ownedChildren | Where-Object { & $isExactChildRunning $_ }).Count -ne 0) { Write-Error 'owned child remained running after bounded return'; exit 7 } }; exit 0",
+        "$code = 9; try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; $code = 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; $code = 8 } else { $ownedChildren = [IO.File]::ReadAllText($env:DBPILOT_PIPE_PID).Split(',') | ForEach-Object { $parts = $_.Split(':'); [pscustomobject]@{ Id = [int]$parts[0]; Started = [string]$parts[1] } }; $isExactChildRunning = { param($child) $candidate = Get-Process -Id $child.Id -ErrorAction SilentlyContinue; if ($null -eq $candidate -or $candidate.HasExited) { return $false }; try { return [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq $child.Started } catch { return $false } }; if (@($ownedChildren | Where-Object { & $isExactChildRunning $_ }).Count -ne 0) { Write-Error 'owned child remained running after bounded return'; $code = 7 } else { $code = 0 } } } finally { [IO.File]::WriteAllText($env:DBPILOT_STRESS_FINALLY, 'done') }; exit $code",
       ].join('; ');
-      const started = Date.now();
       try {
+        const deniedStartedAt = Date.now();
+        const deniedResult = spawnSync(executable, ['-NoProfile', '-Command', deniedCommand], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          timeout: 6_000,
+          env: {
+            ...process.env,
+            DBPILOT_PIPE_MODE: 'denied',
+            DBPILOT_PIPE_PARENT: parent,
+            DBPILOT_PIPE_PID: pidFile,
+            DBPILOT_DENIED_READY: deniedReadyFile,
+            DBPILOT_DENIED_VERIFIED: deniedVerifiedFile,
+            DBPILOT_DENIED_FINALLY: deniedFinallyFile,
+          },
+        });
+        assert.equal((await readFile(deniedVerifiedFile, 'utf8')).trim(), 'access-denied-query-allowed', `${executable} fixture did not deny SYNCHRONIZE while retaining query access`);
+        assert.equal(deniedResult.status, 0, `${executable} did not fail closed when SYNCHRONIZE access was denied: ${deniedResult.stderr || deniedResult.stdout}`);
+        assert.ok(Date.now() - deniedStartedAt < 2_500, `${executable} exceeded the two-second fail-closed deadline`);
+        assert.equal((await readFile(deniedFinallyFile, 'utf8')).trim(), 'done', `${executable} skipped denied-access finally cleanup`);
+        const [deniedPID, deniedStarted] = (await readFile(pidFile, 'utf8')).trim().split(':');
+        assert.ok(Number.isInteger(Number(deniedPID)) && /^\d+$/.test(deniedStarted), `${executable} did not record the inaccessible process identity`);
+        await rm(pidFile, { force: true });
+        await rm(deniedReadyFile, { force: true });
+        await rm(deniedVerifiedFile, { force: true });
+        await rm(deniedFinallyFile, { force: true });
+
+        const stressStarted = Date.now();
         const result = spawnSync(executable, ['-NoProfile', '-Command', command], {
           cwd: repoRoot,
           encoding: 'utf8',
           timeout: 12_000,
-          env: { ...process.env, DBPILOT_PIPE_CHILD_EXE: executable, DBPILOT_PIPE_CHILD: child, DBPILOT_PIPE_PARENT: parent, DBPILOT_PIPE_PID: pidFile },
+          env: { ...process.env, DBPILOT_PIPE_MODE: 'stress', DBPILOT_PIPE_PARENT: parent, DBPILOT_PIPE_PID: pidFile, DBPILOT_LATE_READY: lateReadyFile, DBPILOT_STRESS_FINALLY: stressFinallyFile },
         });
         assert.equal(result.status, 0, `${executable} did not bound the inherited output pipe: ${result.stderr || result.stdout}`);
-        assert.ok(Date.now() - started < 8_000, `${executable} exceeded the bounded output deadline`);
+        assert.ok(Date.now() - stressStarted < 2_500, `${executable} exceeded the two-second end-to-end deadline`);
+        assert.equal((await readFile(stressFinallyFile, 'utf8')).trim(), 'done', `${executable} skipped stress finally cleanup`);
         const children = (await readFile(pidFile, 'utf8')).trim().split(',').map((value) => {
           const [pid, started] = value.split(':');
           return { pid: Number(pid), started };
         });
-        assert.equal(children.length, 8);
-        for (const child of children) {
-          const alive = spawnSync(executable, ['-NoProfile', '-Command', `$candidate=Get-Process -Id ${child.pid} -ErrorAction SilentlyContinue; $running=$false; if($null -ne $candidate) { try { $candidate.Refresh(); $running = -not $candidate.HasExited -and [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq '${child.started}' } catch { $running=$false } }; if($running) { exit 1 }`], { encoding: 'utf8' });
-          assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive: ${alive.stdout}\n${alive.stderr}`);
-        }
-        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `if (-not (Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue)) { exit 1 }`]);
-        assert.equal(unrelatedAlive.status, 0, `${executable} terminated an unrelated process`);
+        assert.ok(children.length > 48, `${executable} did not exercise over-capacity late-spawn and disappearing members`);
+        const alive = spawnSync(executable, ['-NoProfile', '-Command', "$running=@([IO.File]::ReadAllText($env:DBPILOT_IDENTITY_FILE).Split(',') | ForEach-Object { $parts=$_.Split(':'); $candidate=Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue; if($null -ne $candidate) { try { if(-not $candidate.HasExited -and [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq [string]$parts[1]) { $_ } } catch {} } }); if($running.Count -ne 0) { $running | Write-Error; exit 1 }"], { encoding: 'utf8', env: { ...process.env, DBPILOT_IDENTITY_FILE: pidFile } });
+        assert.equal(alive.status, 0, `${executable} left an exact pipe-holding child alive: ${alive.stdout}\n${alive.stderr}`);
+        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `$candidate=Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue; if($null -eq $candidate) { exit 1 }; try { if([string]$candidate.StartTime.ToUniversalTime().Ticks -cne '${unrelatedStarted}') { exit 1 } } catch { exit 1 }`]);
+        assert.equal(unrelatedAlive.status, 0, `${executable} did not preserve the exact unrelated process identity`);
         await rm(pidFile, { force: true });
+        await rm(lateReadyFile, { force: true });
+        await rm(stressFinallyFile, { force: true });
       } finally {
         unrelated.kill();
       }
@@ -466,9 +546,9 @@ test('PowerShell 5.1 and 7 incrementally bound noisy output and kill only the ex
   const childPIDFile = join(root, 'child.pid');
   const finallyFile = join(root, 'finally.txt');
   await writeFile(noisy, [
-    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_PARENT_PID, [string]$PID)',
+    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_PARENT_PID, ([string]$PID + ":" + [string](Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks))',
     "$child = Start-Process -FilePath $env:DBPILOT_NOISY_CHILD_EXE -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
-    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_CHILD_PID, [string]$child.Id)',
+    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_CHILD_PID, ([string]$child.Id + ":" + [string]$child.StartTime.ToUniversalTime().Ticks))',
     "$chunk = 'x' * 8192",
     'for ($index = 0; $index -lt 2048; $index++) { [Console]::Out.Write($chunk) }',
     'Start-Sleep -Seconds 30',
@@ -481,11 +561,14 @@ test('PowerShell 5.1 and 7 incrementally bound noisy output and kill only the ex
     ]) {
       if (executable !== 'pwsh' && !existsSync(executable)) continue;
       const unrelated = spawn(executable, ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
+      const unrelatedStartedResult = spawnSync(executable, ['-NoProfile', '-Command', `(Get-Process -Id ${unrelated.pid}).StartTime.ToUniversalTime().Ticks`], { encoding: 'utf8' });
+      assert.equal(unrelatedStartedResult.status, 0, unrelatedStartedResult.stderr);
+      const unrelatedStarted = unrelatedStartedResult.stdout.trim();
       const command = [
         `. '${containerSafetyFile.replaceAll("'", "''")}'`,
         `. '${boundedProcessFile.replaceAll("'", "''")}'`,
         '$code = 9',
-        "try { $null = Invoke-BoundedProcess -Command (Get-Process -Id $PID).Path -Arguments @('-NoProfile','-File',$env:DBPILOT_NOISY_SCRIPT) -TimeoutSeconds 10 -StartFailure 'noisy start' -TimeoutFailure 'noisy deadline' } catch { if ($_.Exception.Message -ceq 'Bounded process output exceeded its limit.') { $code = 0 } else { Write-Error $_; $code = 8 } } finally { [IO.File]::WriteAllText($env:DBPILOT_NOISY_FINALLY, 'done') }",
+        "try { $null = Invoke-BoundedProcess -Command (Get-Process -Id $PID).Path -Arguments @('-NoProfile','-File',$env:DBPILOT_NOISY_SCRIPT) -TimeoutSeconds 10 -StartFailure 'noisy start' -TimeoutFailure 'noisy deadline' } catch { if ($_.Exception.Message -ceq 'Bounded process output exceeded its limit.') { $running=@(@($env:DBPILOT_NOISY_PARENT_PID,$env:DBPILOT_NOISY_CHILD_PID) | ForEach-Object { $parts=[IO.File]::ReadAllText($_).Split(':'); $candidate=Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue; if($null -ne $candidate) { try { if(-not $candidate.HasExited -and [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq [string]$parts[1]) { $_ } } catch {} } }); if($running.Count -eq 0) { $code = 0 } else { $running | Write-Error; $code = 7 } } else { Write-Error $_; $code = 8 } } finally { [IO.File]::WriteAllText($env:DBPILOT_NOISY_FINALLY, 'done') }",
         'exit $code',
       ].join('; ');
       const started = Date.now();
@@ -507,13 +590,12 @@ test('PowerShell 5.1 and 7 incrementally bound noisy output and kill only the ex
         assert.ok(Date.now() - started < 6000, `${executable} did not terminate promptly at limit+1`);
         assert.equal((await readFile(finallyFile, 'utf8')).trim(), 'done', `${executable} skipped finally cleanup`);
         for (const pidFile of [parentPIDFile, childPIDFile]) {
-          const pid = Number((await readFile(pidFile, 'utf8')).trim());
-          const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { exit 1 }`]);
-          assert.equal(alive.status, 0, `${executable} left an exact noisy-tree process alive`);
+          const [pid, started] = (await readFile(pidFile, 'utf8')).trim().split(':');
+          assert.ok(Number.isInteger(Number(pid)) && /^\d+$/.test(started), `${executable} did not record exact noisy-tree identity from ${pidFile}`);
           await rm(pidFile, { force: true });
         }
-        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `if (-not (Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue)) { exit 1 }`]);
-        assert.equal(unrelatedAlive.status, 0, `${executable} terminated an unrelated process`);
+        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `$candidate=Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue; if($null -eq $candidate) { exit 1 }; try { if([string]$candidate.StartTime.ToUniversalTime().Ticks -cne '${unrelatedStarted}') { exit 1 } } catch { exit 1 }`]);
+        assert.equal(unrelatedAlive.status, 0, `${executable} did not preserve the exact unrelated process identity`);
         await rm(finallyFile, { force: true });
       } finally {
         unrelated.kill();

@@ -13,9 +13,26 @@ public static class DBPilotProcessJob
     private const uint JobObjectBasicAccountingInformation = 1;
     private const uint JobObjectBasicProcessIdList = 3;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+    private const uint ProcessQueryLimitedInformation = 0x00001000;
     private const uint Synchronize = 0x00100000;
     private const uint WaitObject0 = 0;
     private const uint WaitTimeout = 258;
+    private const uint WaitFailed = 0xFFFFFFFF;
+    private const int ErrorInvalidParameter = 87;
+    private const int ErrorMoreData = 234;
+    private const int MaximumProcessIds = 65536;
+
+    private sealed class ObservedProcess
+    {
+        public readonly IntPtr Handle;
+        public readonly bool Synchronizable;
+
+        public ObservedProcess(IntPtr handle, bool synchronizable)
+        {
+            Handle = handle;
+            Synchronizable = synchronizable;
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimitInformation
@@ -85,7 +102,13 @@ public static class DBPilotProcessJob
     private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
@@ -120,75 +143,183 @@ public static class DBPilotProcessJob
         if (!AssignProcessToJobObject(job, process)) throw new Win32Exception(Marshal.GetLastWin32Error());
     }
 
-    public static bool TerminateAndWait(IntPtr job, int timeoutMilliseconds)
+    public static bool TerminateAndWait(IntPtr job, long deadlineTimestamp)
     {
-        if (job == IntPtr.Zero || timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
-        List<IntPtr> processes = OpenActiveProcesses(job);
-        Stopwatch watch = Stopwatch.StartNew();
+        if (job == IntPtr.Zero) throw new ArgumentException("job");
+        Dictionary<uint, ObservedProcess> processes = new Dictionary<uint, ObservedProcess>();
         try
         {
-            if (!TerminateJobObject(job, 1)) throw new Win32Exception(Marshal.GetLastWin32Error());
-            foreach (IntPtr process in processes)
+            int emptyPasses = 0;
+            while (true)
             {
-                long remaining = timeoutMilliseconds - watch.ElapsedMilliseconds;
-                if (remaining < 0) return false;
-                uint result = WaitForSingleObject(process, (uint)remaining);
-                if (result == WaitTimeout) return false;
-                if (result != WaitObject0) throw new Win32Exception(Marshal.GetLastWin32Error());
-            }
-            int size = Marshal.SizeOf(typeof(BasicAccountingInformation));
-            IntPtr pointer = Marshal.AllocHGlobal(size);
-            try
-            {
-                while (true)
+                Exception captureFailure = null;
+                try
                 {
-                    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, pointer, (uint)size, IntPtr.Zero))
-                        throw new Win32Exception(Marshal.GetLastWin32Error());
-                    BasicAccountingInformation information = (BasicAccountingInformation)Marshal.PtrToStructure(pointer, typeof(BasicAccountingInformation));
-                    if (information.ActiveProcesses == 0) return true;
-                    if (watch.ElapsedMilliseconds >= timeoutMilliseconds) return false;
-                    Thread.Sleep(1);
+                    CaptureActiveProcesses(job, processes, deadlineTimestamp);
                 }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(pointer);
+                catch (Exception error)
+                {
+                    captureFailure = error;
+                }
+
+                int terminateError = 0;
+                if (!TerminateJobObject(job, 1)) terminateError = Marshal.GetLastWin32Error();
+                if (captureFailure != null || terminateError != 0)
+                {
+                    try { WaitForProcesses(processes, deadlineTimestamp); } catch { }
+                    try { WaitForActiveZero(job, deadlineTimestamp); } catch { }
+                    if (captureFailure != null) throw captureFailure;
+                    throw new Win32Exception(terminateError);
+                }
+
+                if (!WaitForProcesses(processes, deadlineTimestamp)) return false;
+
+                uint[] active;
+                try
+                {
+                    active = CaptureActiveProcesses(job, processes, deadlineTimestamp);
+                }
+                catch (Exception error)
+                {
+                    TerminateJobObject(job, 1);
+                    try { WaitForProcesses(processes, deadlineTimestamp); } catch { }
+                    try { WaitForActiveZero(job, deadlineTimestamp); } catch { }
+                    throw error;
+                }
+
+                uint activeCount = QueryActiveCount(job);
+                if (active.Length == 0 && activeCount == 0)
+                {
+                    emptyPasses++;
+                    if (emptyPasses == 2) return true;
+                    Thread.Yield();
+                }
+                else
+                {
+                    emptyPasses = 0;
+                }
             }
         }
         finally
         {
-            foreach (IntPtr process in processes) CloseHandle(process);
+            foreach (ObservedProcess process in processes.Values) CloseHandle(process.Handle);
         }
     }
 
-    private static List<IntPtr> OpenActiveProcesses(IntPtr job)
+    private static uint[] CaptureActiveProcesses(IntPtr job, Dictionary<uint, ObservedProcess> processes, long deadlineTimestamp)
+    {
+        uint[] processIds = QueryActiveProcessIds(job, deadlineTimestamp);
+        List<uint> disappeared = new List<uint>();
+        foreach (uint processId in processIds)
+        {
+            if (processes.ContainsKey(processId)) continue;
+            ThrowIfDeadlineExpired(deadlineTimestamp);
+            IntPtr process = OpenProcess(Synchronize | ProcessQueryLimitedInformation, false, processId);
+            if (process == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == ErrorInvalidParameter)
+                {
+                    disappeared.Add(processId);
+                    continue;
+                }
+                IntPtr auditProcess = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+                if (auditProcess != IntPtr.Zero)
+                {
+                    try
+                    {
+                        bool departed;
+                        if (TrackProcess(job, processId, auditProcess, false, processes, out departed)) auditProcess = IntPtr.Zero;
+                    }
+                    finally
+                    {
+                        if (auditProcess != IntPtr.Zero) CloseHandle(auditProcess);
+                    }
+                }
+                throw new Win32Exception(error);
+            }
+            try
+            {
+                bool departed;
+                if (TrackProcess(job, processId, process, true, processes, out departed)) process = IntPtr.Zero;
+                else if (departed) disappeared.Add(processId);
+            }
+            finally
+            {
+                if (process != IntPtr.Zero) CloseHandle(process);
+            }
+        }
+
+        if (disappeared.Count != 0)
+        {
+            uint[] confirmation = QueryActiveProcessIds(job, deadlineTimestamp);
+            foreach (uint processId in disappeared)
+            {
+                if (Array.IndexOf(confirmation, processId) >= 0)
+                    throw new Win32Exception(ErrorInvalidParameter);
+            }
+        }
+        return processIds;
+    }
+
+    private static bool TrackProcess(IntPtr job, uint processId, IntPtr process, bool synchronizable, Dictionary<uint, ObservedProcess> processes, out bool departed)
+    {
+        departed = false;
+        bool isMember;
+        if (!IsProcessInJob(process, job, out isMember))
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (HasExited(process, synchronizable)) return false;
+            throw new Win32Exception(error);
+        }
+        if (!isMember)
+        {
+            if (HasExited(process, synchronizable)) return false;
+            departed = true;
+            return false;
+        }
+        processes.Add(processId, new ObservedProcess(process, synchronizable));
+        return true;
+    }
+
+    private static uint[] QueryActiveProcessIds(IntPtr job, long deadlineTimestamp)
     {
         int capacity = 16;
-        while (capacity <= 16384)
+        while (true)
         {
+            ThrowIfDeadlineExpired(deadlineTimestamp);
             int size = checked(8 + IntPtr.Size * capacity);
             IntPtr pointer = Marshal.AllocHGlobal(size);
             try
             {
+                Marshal.WriteInt64(pointer, 0);
                 if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, pointer, (uint)size, IntPtr.Zero))
                 {
                     int error = Marshal.GetLastWin32Error();
-                    if (error == 234)
+                    if (error == ErrorMoreData)
                     {
-                        int assigned = Marshal.ReadInt32(pointer, 0);
-                        capacity = Math.Max(capacity * 2, assigned + 16);
+                        uint assignedOnFailure = unchecked((uint)Marshal.ReadInt32(pointer, 0));
+                        capacity = GrowCapacity(capacity, assignedOnFailure);
                         continue;
                     }
                     throw new Win32Exception(error);
                 }
-                int count = Marshal.ReadInt32(pointer, 4);
-                List<IntPtr> result = new List<IntPtr>(count);
-                for (int index = 0; index < count; index++)
+                uint assigned = unchecked((uint)Marshal.ReadInt32(pointer, 0));
+                uint returned = unchecked((uint)Marshal.ReadInt32(pointer, 4));
+                if (returned > capacity || returned > assigned)
+                    throw new InvalidOperationException("job process list returned invalid counts");
+                if (returned != assigned)
+                {
+                    capacity = GrowCapacity(capacity, assigned);
+                    continue;
+                }
+                uint[] result = new uint[returned];
+                for (int index = 0; index < result.Length; index++)
                 {
                     long raw = Marshal.ReadIntPtr(pointer, 8 + index * IntPtr.Size).ToInt64();
-                    if (raw <= 0 || raw > UInt32.MaxValue) continue;
-                    IntPtr process = OpenProcess(Synchronize, false, (uint)raw);
-                    if (process != IntPtr.Zero) result.Add(process);
+                    if (raw <= 0 || raw > UInt32.MaxValue)
+                        throw new InvalidOperationException("job process list returned an invalid process identifier");
+                    result[index] = (uint)raw;
                 }
                 return result;
             }
@@ -197,7 +328,100 @@ public static class DBPilotProcessJob
                 Marshal.FreeHGlobal(pointer);
             }
         }
-        throw new InvalidOperationException("job process list exceeds its bound");
+    }
+
+    private static int GrowCapacity(int capacity, uint assigned)
+    {
+        long next = Math.Max((long)capacity * 2, (long)assigned);
+        if (next <= capacity || next > MaximumProcessIds)
+            throw new InvalidOperationException("job process list exceeds its bound");
+        return (int)next;
+    }
+
+    private static bool WaitForProcesses(Dictionary<uint, ObservedProcess> processes, long deadlineTimestamp)
+    {
+        foreach (ObservedProcess process in processes.Values)
+        {
+            if (process.Synchronizable)
+            {
+                int remaining = RemainingMilliseconds(deadlineTimestamp);
+                uint result = WaitForSingleObject(process.Handle, (uint)remaining);
+                if (result == WaitTimeout) return false;
+                if (result == WaitFailed) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (result != WaitObject0) throw new InvalidOperationException("unexpected process wait result");
+                continue;
+            }
+            while (!HasExited(process.Handle, false))
+            {
+                if (RemainingMilliseconds(deadlineTimestamp) == 0) return false;
+                Thread.Yield();
+            }
+        }
+        return true;
+    }
+
+    private static bool HasExited(IntPtr process, bool synchronizable)
+    {
+        if (synchronizable)
+        {
+            uint result = WaitForSingleObject(process, 0);
+            if (result == WaitObject0) return true;
+            if (result == WaitTimeout) return false;
+            if (result == WaitFailed) throw new Win32Exception(Marshal.GetLastWin32Error());
+            throw new InvalidOperationException("unexpected process wait result");
+        }
+        uint exitCode;
+        if (!GetExitCodeProcess(process, out exitCode)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return exitCode != 259;
+    }
+
+    private static uint QueryActiveCount(IntPtr job)
+    {
+        int size = Marshal.SizeOf(typeof(BasicAccountingInformation));
+        IntPtr pointer = Marshal.AllocHGlobal(size);
+        try
+        {
+            if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, pointer, (uint)size, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            BasicAccountingInformation information = (BasicAccountingInformation)Marshal.PtrToStructure(pointer, typeof(BasicAccountingInformation));
+            return information.ActiveProcesses;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pointer);
+        }
+    }
+
+    private static bool WaitForActiveZero(IntPtr job, long deadlineTimestamp)
+    {
+        try
+        {
+            while (true)
+            {
+                if (QueryActiveCount(job) == 0) return true;
+                if (RemainingMilliseconds(deadlineTimestamp) == 0) return false;
+                Thread.Yield();
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ThrowIfDeadlineExpired(long deadlineTimestamp)
+    {
+        if (RemainingMilliseconds(deadlineTimestamp) == 0)
+            throw new TimeoutException("bounded process deadline expired");
+    }
+
+    private static int RemainingMilliseconds(long deadlineTimestamp)
+    {
+        long ticks = deadlineTimestamp - Stopwatch.GetTimestamp();
+        if (ticks <= 0) return 0;
+        double milliseconds = Math.Ceiling(ticks * 1000.0 / Stopwatch.Frequency);
+        if (milliseconds >= Int32.MaxValue) return Int32.MaxValue;
+        return (int)milliseconds;
     }
 }
 '@
@@ -252,43 +476,72 @@ function Set-BoundedProcessArguments {
     $StartInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-DBPilotNativeArgument ([string]$_) }) -join ' ')
 }
 
+function Get-BoundedRemainingMilliseconds {
+    param([long]$DeadlineTimestamp)
+    $remainingTicks = $DeadlineTimestamp - [Diagnostics.Stopwatch]::GetTimestamp()
+    if ($remainingTicks -le 0) { return 0 }
+    $remaining = [Math]::Ceiling(([double]$remainingTicks * 1000.0) / [Diagnostics.Stopwatch]::Frequency)
+    if ($remaining -ge [int]::MaxValue) { return [int]::MaxValue }
+    return [int]$remaining
+}
+
 function Stop-BoundedProcessTree {
-    param([Diagnostics.Process]$Process)
-    try { if ($Process.HasExited) { return } } catch { return }
-    if ($env:OS -eq 'Windows_NT') {
-        $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-        if (Test-Path -LiteralPath $taskkill -PathType Leaf) {
-            try {
-                $killer = Start-Process -FilePath $taskkill -ArgumentList @('/PID', [string]$Process.Id, '/T', '/F') -WindowStyle Hidden -PassThru
-                if (-not $killer.WaitForExit(10000)) { try { $killer.Kill() } catch { } }
-                $killer.Dispose()
-            } catch { }
-        }
-    }
-    try { if ($Process.HasExited) { return } } catch { return }
+    param([Diagnostics.Process]$Process, [long]$DeadlineTimestamp)
+    try { $null = $Process.Id } catch { return $true }
+    try { if ($Process.HasExited) { return $true } } catch { return $true }
     try {
-        $treeKill = $Process.GetType().GetMethod('Kill', [type[]]@([bool]))
-        if ($null -ne $treeKill) { $null = $treeKill.Invoke($Process, @($true)) } else { $Process.Kill() }
-    } catch { try { $Process.Kill() } catch { } }
+        if ($env:OS -ne 'Windows_NT') {
+            $treeKill = $Process.GetType().GetMethod('Kill', [type[]]@([bool]))
+            if ($null -ne $treeKill) { $null = $treeKill.Invoke($Process, @($true)) } else { $Process.Kill() }
+        } else {
+            $Process.Kill()
+        }
+    } catch { }
+    try { if ($Process.HasExited) { return $true } } catch { return $true }
+    $remaining = Get-BoundedRemainingMilliseconds $DeadlineTimestamp
+    if ($remaining -le 0) { return $false }
+    try { return $Process.WaitForExit($remaining) } catch { return $false }
 }
 
 function Stop-BoundedOwnedProcessTree {
-    param([Diagnostics.Process]$Process, [IntPtr]$Job)
+    param(
+        [Diagnostics.Process]$Process,
+        [IntPtr]$Job,
+        [bool]$JobAssigned,
+        [long]$DeadlineTimestamp
+    )
     $settled = $true
     if ($Job -ne [IntPtr]::Zero) {
-        try { $settled = [DBPilotProcessJob]::TerminateAndWait($Job, 2000) }
-        catch { $settled = $false }
-        finally { $null = [DBPilotProcessJob]::CloseHandle($Job) }
+        if ($JobAssigned) {
+            try { $settled = [DBPilotProcessJob]::TerminateAndWait($Job, $DeadlineTimestamp) }
+            catch { $settled = $false }
+        }
+        try {
+            if (-not [DBPilotProcessJob]::CloseHandle($Job)) { $settled = $false }
+        } catch {
+            $settled = $false
+        }
     }
-    Stop-BoundedProcessTree $Process
-    return $settled
+    if (-not $JobAssigned -or -not $settled) {
+        $rootSettled = Stop-BoundedProcessTree $Process $DeadlineTimestamp
+        if (-not $JobAssigned -and -not $rootSettled) { $settled = $false }
+    }
+    return [bool]$settled
 }
 
 function Wait-BoundedOutputTask {
-    param([Threading.Tasks.Task]$Task, [DateTime]$Deadline)
-    $remaining = [int][Math]::Floor(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
+    param([Threading.Tasks.Task]$Task, [long]$DeadlineTimestamp)
+    if ($null -eq $Task -or $Task.IsCompleted) { return $true }
+    $remaining = Get-BoundedRemainingMilliseconds $DeadlineTimestamp
     if ($remaining -le 0) { return $false }
-    return $Task.Wait($remaining)
+    try { return $Task.Wait($remaining) } catch { return $false }
+}
+
+function Wait-BoundedOutputTasks {
+    param([Threading.Tasks.Task]$StdoutTask, [Threading.Tasks.Task]$StderrTask, [long]$DeadlineTimestamp)
+    if (-not (Wait-BoundedOutputTask $StdoutTask $DeadlineTimestamp)) { return $false }
+    if (-not (Wait-BoundedOutputTask $StderrTask $DeadlineTimestamp)) { return $false }
+    return $true
 }
 
 function Invoke-BoundedProcess {
@@ -299,6 +552,13 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory = $true)][string]$StartFailure,
         [Parameter(Mandatory = $true)][string]$TimeoutFailure
     )
+    if ($TimeoutSeconds -le 0) { throw $TimeoutFailure }
+    $startedTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+    $timeoutMilliseconds = [long]$TimeoutSeconds * 1000L
+    $deadlineTimestamp = $startedTimestamp + [long][Math]::Ceiling(([double]$TimeoutSeconds * [Diagnostics.Stopwatch]::Frequency))
+    $teardownReserveMilliseconds = [long][Math]::Min(500.0, [Math]::Max(100.0, [Math]::Ceiling($timeoutMilliseconds / 4.0)))
+    $teardownReserveTicks = [long][Math]::Ceiling(($teardownReserveMilliseconds * [double][Diagnostics.Stopwatch]::Frequency) / 1000.0)
+    $executionDeadlineTimestamp = $deadlineTimestamp - $teardownReserveTicks
     $commandArguments = @($Arguments)
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $gateEvent = $null
@@ -332,71 +592,89 @@ function Invoke-BoundedProcess {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $job = [IntPtr]::Zero
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $jobAssigned = $false
+    $stdoutTask = $null
+    $stderrTask = $null
     try {
         try {
             if ($env:OS -eq 'Windows_NT') { $job = [DBPilotProcessJob]::CreateKillOnClose() }
             if (-not $process.Start()) { throw $StartFailure }
             if ($env:OS -eq 'Windows_NT') {
                 [DBPilotProcessJob]::Assign($job, $process.Handle)
+                $jobAssigned = $true
                 $null = $gateEvent.Set()
             }
         } catch {
-            $settled = Stop-BoundedOwnedProcessTree $process $job
+            $settled = Stop-BoundedOwnedProcessTree $process $job $jobAssigned $deadlineTimestamp
             $job = [IntPtr]::Zero
             if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
             throw $StartFailure
         }
         $outputLimit = 1000000
-        $stdoutTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardOutput, $outputLimit)
-        $stderrTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardError, $outputLimit)
+        try {
+            $stdoutTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardOutput, $outputLimit)
+            $stderrTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardError, $outputLimit)
+        } catch {
+            $settled = Stop-BoundedOwnedProcessTree $process $job $jobAssigned $deadlineTimestamp
+            $job = [IntPtr]::Zero
+            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
+            throw $TimeoutFailure
+        }
         $stdoutResult = $null
         $stderrResult = $null
+        $failure = $null
         while ($true) {
             try {
                 if ($null -eq $stdoutResult -and $stdoutTask.IsCompleted) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
                 if ($null -eq $stderrResult -and $stderrTask.IsCompleted) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
             } catch {
-                $settled = Stop-BoundedOwnedProcessTree $process $job
-                $job = [IntPtr]::Zero
-                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
-                throw $TimeoutFailure
+                $failure = 'timeout'
+                break
             }
             if (($null -ne $stdoutResult -and $stdoutResult.Overflow) -or ($null -ne $stderrResult -and $stderrResult.Overflow)) {
-                $settled = Stop-BoundedOwnedProcessTree $process $job
-                $job = [IntPtr]::Zero
-                $null = $process.WaitForExit(2000)
-                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
-                throw 'Bounded process output exceeded its limit.'
+                $failure = 'overflow'
+                break
             }
-            $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            $remaining = Get-BoundedRemainingMilliseconds $executionDeadlineTimestamp
             if ($remaining -le 0) {
-                $settled = Stop-BoundedOwnedProcessTree $process $job
-                $job = [IntPtr]::Zero
-                $null = $process.WaitForExit(2000)
-                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
-                throw $TimeoutFailure
+                $failure = 'timeout'
+                break
             }
             if ($process.WaitForExit([Math]::Min(20, $remaining))) { break }
         }
-        try {
-            if ($null -eq $stdoutResult -and -not (Wait-BoundedOutputTask $stdoutTask $deadline)) { throw $TimeoutFailure }
-            if ($null -eq $stderrResult -and -not (Wait-BoundedOutputTask $stderrTask $deadline)) { throw $TimeoutFailure }
-            if ($null -eq $stdoutResult) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
-            if ($null -eq $stderrResult) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
-        } catch {
-            $settled = Stop-BoundedOwnedProcessTree $process $job
+        if ($null -eq $failure) {
+            try {
+                if ($null -eq $stdoutResult -and -not (Wait-BoundedOutputTask $stdoutTask $executionDeadlineTimestamp)) { $failure = 'timeout' }
+                if ($null -eq $failure -and $null -eq $stderrResult -and -not (Wait-BoundedOutputTask $stderrTask $executionDeadlineTimestamp)) { $failure = 'timeout' }
+                if ($null -eq $failure -and $null -eq $stdoutResult) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
+                if ($null -eq $failure -and $null -eq $stderrResult) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
+            } catch {
+                $failure = 'timeout'
+            }
+        }
+        if ($null -eq $failure -and ($stdoutResult.Overflow -or $stderrResult.Overflow)) { $failure = 'overflow' }
+        if ($null -ne $failure) {
+            $settled = Stop-BoundedOwnedProcessTree $process $job $jobAssigned $deadlineTimestamp
             $job = [IntPtr]::Zero
-            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
+            $outputsSettled = Wait-BoundedOutputTasks $stdoutTask $stderrTask $deadlineTimestamp
+            if (-not $settled -or -not $outputsSettled) { throw 'Bounded process tree termination did not settle.' }
+            if ($failure -eq 'overflow') { throw 'Bounded process output exceeded its limit.' }
             throw $TimeoutFailure
         }
-        if ($stdoutResult.Overflow -or $stderrResult.Overflow) {
-            $settled = Stop-BoundedOwnedProcessTree $process $job
+        $exitCode = $process.ExitCode
+        $settled = Stop-BoundedOwnedProcessTree $process $job $jobAssigned $deadlineTimestamp
+        $job = [IntPtr]::Zero
+        if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
+        return [pscustomobject]@{ ExitCode = $exitCode; Stdout = $stdoutResult.Text.Trim(); Stderr = $stderrResult.Text.Trim(); StdoutTruncated = $false; StderrTruncated = $false }
+    } catch {
+        $failureRecord = $_
+        if ($job -ne [IntPtr]::Zero) {
+            $settled = Stop-BoundedOwnedProcessTree $process $job $jobAssigned $deadlineTimestamp
             $job = [IntPtr]::Zero
-            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
-            throw 'Bounded process output exceeded its limit.'
+            $outputsSettled = Wait-BoundedOutputTasks $stdoutTask $stderrTask $deadlineTimestamp
+            if (-not $settled -or -not $outputsSettled) { throw 'Bounded process tree termination did not settle.' }
         }
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdoutResult.Text.Trim(); Stderr = $stderrResult.Text.Trim(); StdoutTruncated = $false; StderrTruncated = $false }
+        throw $failureRecord
     } finally {
         if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job) }
         if ($null -ne $gateEvent) { $gateEvent.Dispose() }
