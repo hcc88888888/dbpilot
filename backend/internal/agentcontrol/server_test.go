@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"math/big"
 	"net/url"
 	"path/filepath"
 	"sync"
@@ -453,7 +454,7 @@ func inspectEnvelope(commandID, agentID string, expiresAt time.Time) *agentv1.Co
 
 func tlsPeerContext(t *testing.T, verified bool, rawURIs ...string) context.Context {
 	t.Helper()
-	certificate := &x509.Certificate{}
+	certificate := &x509.Certificate{Raw: []byte("agent-control-test-leaf"), SerialNumber: big.NewInt(1)}
 	for _, rawURI := range rawURIs {
 		identityURI, err := url.Parse(rawURI)
 		require.NoError(t, err)

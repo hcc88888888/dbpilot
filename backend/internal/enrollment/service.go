@@ -24,8 +24,13 @@ const csrProofDomain = "dbpilot-agent-enrollment-csr-proof-v1"
 type ApplicationService struct {
 	Tokens       EnrollmentStore
 	Certificates CertificateIssuer
+	Sessions     CredentialSessionTerminator
 	Random       io.Reader
 	Now          func() time.Time
+}
+
+type CredentialSessionTerminator interface {
+	TerminateSuperseded(string, [sha256.Size]byte) bool
 }
 
 func (service ApplicationService) Create(ctx context.Context, scope platformscope.Scope, request CreateRequest) (CreatedEnrollment, error) {
@@ -142,6 +147,7 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 		if err := validateEnrollmentResult(*resolution.Response, grant); err != nil {
 			return EnrollResult{}, errors.New("stored Agent enrollment response is invalid")
 		}
+		service.terminatePriorSession(grant.AgentID, resolution.Response.CertificateFingerprint)
 		return cloneEnrollmentResult(*resolution.Response), nil
 	}
 	certificatePEM, chainPEM, expiresAt, err := service.Certificates.SignAgentCSR(ctx, grant, request.CSRPEM)
@@ -153,6 +159,10 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 		CertificateChainPEM: append([]byte(nil), chainPEM...), ExpiresAt: expiresAt,
 		EnrollmentRevision: grant.EnrollmentRevision,
 	}
+	result, err = normalizeEnrollmentResult(result, grant)
+	if err != nil {
+		return EnrollResult{}, errors.New("issue Agent enrollment certificate")
+	}
 	observation := request.Observation
 	observation.HostID = grant.HostID
 	completed, err := service.Tokens.Complete(ctx, EnrollmentCompletion{Key: key, Grant: grant, Observation: observation, Result: result, CompletedAt: now})
@@ -160,15 +170,23 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 		if validateEnrollmentResult(completed, grant) != nil {
 			return EnrollResult{}, errors.New("completed Agent enrollment response is invalid")
 		}
+		service.terminatePriorSession(grant.AgentID, completed.CertificateFingerprint)
 		return cloneEnrollmentResult(completed), nil
 	}
 	// A connection loss can make COMMIT outcome unknown. Resolve by the exact
 	// token/CSR/Agent/Host key before reporting failure or asking for a new token.
 	recovered, resolveErr := service.Tokens.Resolve(ctx, key)
 	if resolveErr == nil && recovered.Response != nil && validateEnrollmentResult(*recovered.Response, grant) == nil {
+		service.terminatePriorSession(grant.AgentID, recovered.Response.CertificateFingerprint)
 		return cloneEnrollmentResult(*recovered.Response), nil
 	}
 	return EnrollResult{}, errors.New("complete Agent enrollment attempt")
+}
+
+func (service ApplicationService) terminatePriorSession(agentID string, activeFingerprint [sha256.Size]byte) {
+	if service.Sessions != nil {
+		service.Sessions.TerminateSuperseded(agentID, activeFingerprint)
+	}
 }
 
 func (service ApplicationService) now() time.Time {
@@ -226,11 +244,39 @@ func verifiedCSRProofInputs(agentID string, csrPEM, publicKeyDER []byte) ([]byte
 }
 
 func validateEnrollmentResult(result EnrollResult, grant EnrollmentGrant) error {
+	fingerprint, serial, err := enrollmentCertificateIdentity(result.CertificatePEM)
 	if result.HostID != grant.HostID || result.AgentID != grant.AgentID || len(result.CertificatePEM) == 0 || len(result.CertificateChainPEM) == 0 ||
-		!validUTC(result.ExpiresAt) || result.EnrollmentRevision != grant.EnrollmentRevision {
+		!validUTC(result.ExpiresAt) || result.EnrollmentRevision != grant.EnrollmentRevision || result.CredentialGeneration != grant.Generation || result.CredentialGeneration == 0 ||
+		err != nil || result.CertificateFingerprint != fingerprint || result.CertificateSerial != serial {
 		return ErrEnrollmentRequestInvalid
 	}
 	return nil
+}
+
+func normalizeEnrollmentResult(result EnrollResult, grant EnrollmentGrant) (EnrollResult, error) {
+	if grant.Generation == 0 {
+		return EnrollResult{}, ErrEnrollmentRequestInvalid
+	}
+	fingerprint, serial, err := enrollmentCertificateIdentity(result.CertificatePEM)
+	if err != nil {
+		return EnrollResult{}, err
+	}
+	result.CertificateFingerprint = fingerprint
+	result.CertificateSerial = serial
+	result.CredentialGeneration = grant.Generation
+	return result, nil
+}
+
+func enrollmentCertificateIdentity(certificatePEM []byte) ([sha256.Size]byte, string, error) {
+	block, rest := pem.Decode(certificatePEM)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		return [sha256.Size]byte{}, "", ErrEnrollmentRequestInvalid
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || certificate.SerialNumber == nil || certificate.SerialNumber.Sign() <= 0 || len(certificate.Raw) == 0 {
+		return [sha256.Size]byte{}, "", ErrEnrollmentRequestInvalid
+	}
+	return sha256.Sum256(certificate.Raw), certificate.SerialNumber.Text(16), nil
 }
 
 func cloneEnrollmentResult(result EnrollResult) EnrollResult {

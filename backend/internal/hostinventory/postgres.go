@@ -3,6 +3,7 @@ package hostinventory
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const hostColumnsSQL = "tenant_id, project_id, host_id, agent_id, display_name, hostname, operating_system, operating_system_version, kernel_version, architecture, logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses, labels, container_runtime, capabilities, agent_version, enrollment_revision, observation_revision, enrolled_at, last_hello_at, last_heartbeat_at, status, version, decommission_actor, decommission_operation, decommission_idempotency_key, decommission_fingerprint, decommission_owner_token"
+const hostColumnsSQL = "tenant_id, project_id, host_id, agent_id, display_name, hostname, operating_system, operating_system_version, kernel_version, architecture, logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses, labels, container_runtime, capabilities, agent_version, enrollment_revision, credential_generation, active_certificate_fingerprint, active_certificate_serial, credential_revoked_at, observation_revision, enrolled_at, last_hello_at, last_heartbeat_at, status, version, decommission_actor, decommission_operation, decommission_idempotency_key, decommission_fingerprint, decommission_owner_token"
 
 const getHostSQL = "SELECT " + hostColumnsSQL + " FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3"
 const getHostByAgentSQL = "SELECT " + hostColumnsSQL + " FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND agent_id = $3"
@@ -101,6 +102,10 @@ RETURNING ` + hostColumnsSQL
 
 const decommissionHostSQL = `UPDATE managed_hosts SET
     status = 'decommissioned',
+    credential_generation = credential_generation + 1,
+    active_certificate_fingerprint = ''::bytea,
+    active_certificate_serial = '',
+    credential_revoked_at = $5,
     decommission_actor = $6,
     decommission_operation = $7,
     decommission_idempotency_key = $8,
@@ -318,7 +323,8 @@ func (repository *PostgresRepository) List(ctx context.Context, scope platformsc
         operating_system, operating_system_version, kernel_version, architecture,
         logical_cpu_count, memory_capacity_bytes, filesystems, network_addresses,
         labels, container_runtime, capabilities, agent_version, enrollment_revision,
-		observation_revision, enrolled_at, last_hello_at, last_heartbeat_at,
+		credential_generation, active_certificate_fingerprint, active_certificate_serial,
+		credential_revoked_at, observation_revision, enrolled_at, last_hello_at, last_heartbeat_at,
 		` + classification + ` AS status, version, decommission_actor, decommission_operation,
 		decommission_idempotency_key, decommission_fingerprint, decommission_owner_token
     FROM managed_hosts WHERE tenant_id = $1 AND project_id = $2 AND ($3 = '' OR host_id > $3)
@@ -401,27 +407,34 @@ type rowScanner interface{ Scan(...any) error }
 
 func scanHost(scanner rowScanner) (Host, error) {
 	var host Host
-	var logicalCPUCount, memoryCapacityBytes, enrollmentRevision, observationRevision, version int64
+	var logicalCPUCount, memoryCapacityBytes, enrollmentRevision, credentialGeneration, observationRevision, version int64
 	var filesystems, addresses, labels, capabilities []byte
-	var helloAt, heartbeatAt sql.NullTime
+	var certificateFingerprint []byte
+	var certificateSerial string
+	var credentialRevokedAt, helloAt, heartbeatAt sql.NullTime
 	var decommissionActor, decommissionOperation, decommissionKey, decommissionFingerprint, decommissionOwner sql.NullString
 	err := scanner.Scan(
 		&host.Scope.TenantID, &host.Scope.ProjectID, &host.ID, &host.AgentID, &host.DisplayName, &host.Hostname,
 		&host.OperatingSystem, &host.OperatingSystemVersion, &host.KernelVersion, &host.Architecture,
 		&logicalCPUCount, &memoryCapacityBytes, &filesystems, &addresses, &labels, &host.ContainerRuntime,
-		&capabilities, &host.AgentVersion, &enrollmentRevision, &observationRevision, &host.EnrolledAt,
+		&capabilities, &host.AgentVersion, &enrollmentRevision, &credentialGeneration, &certificateFingerprint, &certificateSerial, &credentialRevokedAt, &observationRevision, &host.EnrolledAt,
 		&helloAt, &heartbeatAt, &host.Status, &version,
 		&decommissionActor, &decommissionOperation, &decommissionKey, &decommissionFingerprint, &decommissionOwner,
 	)
 	if err != nil {
 		return Host{}, err
 	}
-	if logicalCPUCount < 0 || memoryCapacityBytes < 0 || enrollmentRevision < 1 || observationRevision < 0 || version < 1 {
+	if logicalCPUCount < 0 || memoryCapacityBytes < 0 || enrollmentRevision < 1 || credentialGeneration < 0 || observationRevision < 0 || version < 1 || len(certificateFingerprint) != 0 && len(certificateFingerprint) != 32 {
 		return Host{}, ErrInvalid
 	}
 	host.CPU = ResourceSummary{Capacity: uint64(logicalCPUCount)}
 	host.Memory = ResourceSummary{Capacity: uint64(memoryCapacityBytes)}
-	host.EnrollmentRevision, host.ObservationRevision, host.Version = uint64(enrollmentRevision), uint64(observationRevision), uint64(version)
+	host.EnrollmentRevision, host.CredentialGeneration, host.ObservationRevision, host.Version = uint64(enrollmentRevision), uint64(credentialGeneration), uint64(observationRevision), uint64(version)
+	host.CertificateFingerprint, host.CertificateSerial = hex.EncodeToString(certificateFingerprint), certificateSerial
+	if credentialRevokedAt.Valid {
+		at := credentialRevokedAt.Time.UTC()
+		host.CredentialRevokedAt = &at
+	}
 	if err := json.Unmarshal(filesystems, &host.Filesystems); err != nil {
 		return Host{}, fmt.Errorf("decode host filesystems: %w", err)
 	}
@@ -460,7 +473,7 @@ func hostColumnNames() []string {
 	return []string{
 		"tenant_id", "project_id", "host_id", "agent_id", "display_name", "hostname", "operating_system", "operating_system_version", "kernel_version", "architecture",
 		"logical_cpu_count", "memory_capacity_bytes", "filesystems", "network_addresses", "labels", "container_runtime", "capabilities", "agent_version",
-		"enrollment_revision", "observation_revision", "enrolled_at", "last_hello_at", "last_heartbeat_at", "status", "version",
+		"enrollment_revision", "credential_generation", "active_certificate_fingerprint", "active_certificate_serial", "credential_revoked_at", "observation_revision", "enrolled_at", "last_hello_at", "last_heartbeat_at", "status", "version",
 		"decommission_actor", "decommission_operation", "decommission_idempotency_key", "decommission_fingerprint", "decommission_owner_token",
 	}
 }

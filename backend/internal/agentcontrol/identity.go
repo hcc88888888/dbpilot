@@ -2,6 +2,7 @@ package agentcontrol
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -26,6 +27,30 @@ func verifiedAgentID(ctx context.Context) (string, error) {
 		return "", errMissingVerifiedIdentity
 	}
 	return spiffeAgentFromTLS(tlsInfo.State)
+}
+
+func verifiedAgentCredential(ctx context.Context, expectedAgentID string) ([sha256.Size]byte, string, error) {
+	peerInfo, ok := peer.FromContext(ctx)
+	if !ok || peerInfo.AuthInfo == nil {
+		return [sha256.Size]byte{}, "", errMissingVerifiedIdentity
+	}
+	tlsInfo, ok := peerInfo.AuthInfo.(credentials.TLSInfo)
+	if !ok || len(tlsInfo.State.VerifiedChains) == 0 || len(tlsInfo.State.PeerCertificates) == 0 {
+		return [sha256.Size]byte{}, "", errMissingVerifiedIdentity
+	}
+	return credentialFromTLSState(tlsInfo.State, expectedAgentID)
+}
+
+func credentialFromTLSState(state tls.ConnectionState, expectedAgentID string) ([sha256.Size]byte, string, error) {
+	agentID, err := spiffeAgentFromTLS(state)
+	if len(state.PeerCertificates) == 0 {
+		return [sha256.Size]byte{}, "", errMissingVerifiedIdentity
+	}
+	leaf := state.PeerCertificates[0]
+	if err != nil || agentID != expectedAgentID || leaf == nil || len(leaf.Raw) == 0 || leaf.SerialNumber == nil || leaf.SerialNumber.Sign() <= 0 {
+		return [sha256.Size]byte{}, "", errMissingVerifiedIdentity
+	}
+	return sha256.Sum256(leaf.Raw), leaf.SerialNumber.Text(16), nil
 }
 
 func spiffeAgentFromTLS(state tls.ConnectionState) (string, error) {

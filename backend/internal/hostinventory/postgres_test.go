@@ -3,6 +3,7 @@ package hostinventory
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -261,6 +262,12 @@ func TestRunMigrationsUsesSharedRegistryExactlyOnce(t *testing.T) {
 	mock.ExpectExec(`(?s)ALTER TABLE managed_hosts.*decommission_actor.*managed_hosts_decommission_correlation`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("hostinventory/migrations/0002_decommission_correlation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("hostinventory/migrations/0003_agent_credentials.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE managed_hosts.*credential_generation.*active_certificate_fingerprint.*managed_hosts_active_credential_shape").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("hostinventory/migrations/0003_agent_credentials.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -279,6 +286,11 @@ func hostRows(first Host, mutate ...func(*Host)) *sqlmock.Rows {
 		addresses, _ := json.Marshal(host.NetworkAddresses)
 		labels, _ := json.Marshal(host.Labels)
 		capabilities, _ := json.Marshal(host.Capabilities)
+		certificateFingerprint, _ := hex.DecodeString(host.CertificateFingerprint)
+		var revokedAt any
+		if host.CredentialRevokedAt != nil {
+			revokedAt = *host.CredentialRevokedAt
+		}
 		var actor, operation, key, fingerprint, owner any
 		if host.DecommissionTransition != nil {
 			actor = host.DecommissionTransition.Actor
@@ -290,7 +302,7 @@ func hostRows(first Host, mutate ...func(*Host)) *sqlmock.Rows {
 		rows.AddRow(host.Scope.TenantID, host.Scope.ProjectID, host.ID, host.AgentID, host.DisplayName, host.Hostname,
 			host.OperatingSystem, host.OperatingSystemVersion, host.KernelVersion, host.Architecture, host.CPU.Capacity,
 			host.Memory.Capacity, filesystems, addresses, labels, host.ContainerRuntime, capabilities, host.AgentVersion,
-			host.EnrollmentRevision, host.ObservationRevision, host.EnrolledAt, nullableTime(host.LastHelloAt), nullableTime(host.LastHeartbeatAt), host.Status, host.Version,
+			host.EnrollmentRevision, host.CredentialGeneration, certificateFingerprint, host.CertificateSerial, revokedAt, host.ObservationRevision, host.EnrolledAt, nullableTime(host.LastHelloAt), nullableTime(host.LastHeartbeatAt), host.Status, host.Version,
 			actor, operation, key, fingerprint, owner)
 	}
 	return rows

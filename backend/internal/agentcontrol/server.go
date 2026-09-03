@@ -59,15 +59,20 @@ func (NoopObserver) Result(_ context.Context, _ string, result *agentv1.CommandR
 
 type Server struct {
 	agentv1.UnimplementedAgentControlServer
-	registry        *Registry
-	observer        Observer
-	hosts           HostObserver
-	discovery       DiscoveryObserver
-	plugins         PluginObserver
-	pluginArtifacts PluginArtifactLeaseIssueService
-	credentials     CredentialLeaseIssueService
-	metricTemplates MetricTemplateLeaseIssueService
-	now             func() time.Time
+	registry              *Registry
+	observer              Observer
+	hosts                 HostObserver
+	discovery             DiscoveryObserver
+	plugins               PluginObserver
+	pluginArtifacts       PluginArtifactLeaseIssueService
+	credentials           CredentialLeaseIssueService
+	metricTemplates       MetricTemplateLeaseIssueService
+	credentialsAuthorizer AgentCredentialAuthorizer
+	now                   func() time.Time
+}
+
+type AgentCredentialAuthorizer interface {
+	AuthorizeAgentCredential(context.Context, string, [sha256.Size]byte, string) error
 }
 
 type PluginArtifactLeaseIssueService interface {
@@ -157,6 +162,10 @@ func WithMetricTemplateLeaseIssuer(issuer MetricTemplateLeaseIssueService) Serve
 	}
 }
 
+func WithAgentCredentialAuthorizer(authorizer AgentCredentialAuthorizer) ServerOption {
+	return func(server *Server) { server.credentialsAuthorizer = authorizer }
+}
+
 func NewServer(registry *Registry, observer Observer, options ...ServerOption) *Server {
 	if registry == nil {
 		registry = NewRegistry(64)
@@ -178,6 +187,14 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	if err != nil {
 		return status.Error(codes.Unauthenticated, err.Error())
 	}
+	var credentialFingerprint [sha256.Size]byte
+	var credentialSerial string
+	if s.credentialsAuthorizer != nil {
+		credentialFingerprint, credentialSerial, err = verifiedAgentCredential(stream.Context(), agentID)
+		if err != nil || s.credentialsAuthorizer.AuthorizeAgentCredential(stream.Context(), agentID, credentialFingerprint, credentialSerial) != nil {
+			return status.Error(codes.Unauthenticated, "Agent credential is not active")
+		}
+	}
 	first, err := stream.Recv()
 	if err != nil {
 		return status.Error(codes.InvalidArgument, "Hello must be the first Agent message")
@@ -197,7 +214,7 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	}
 
 	sessionContext, cancel := context.WithCancel(stream.Context())
-	if err := s.registry.register(agentID, hello.GetCapabilities(), hello.GetActiveCommands(), cancel); err != nil {
+	if err := s.registry.registerCredential(agentID, hello.GetCapabilities(), hello.GetActiveCommands(), credentialFingerprint, credentialSerial, cancel); err != nil {
 		cancel()
 		if errors.Is(err, ErrDuplicateSession) {
 			return status.Error(codes.AlreadyExists, err.Error())

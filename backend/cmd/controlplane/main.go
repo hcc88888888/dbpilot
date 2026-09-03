@@ -443,6 +443,7 @@ func NewServer(config Config) (*Server, error) {
 	}
 	repository := alert.NewPostgresRepository(database)
 	hostRepository := hostinventory.NewPostgresRepository(database)
+	agentCredentialRepository := enrollment.NewPostgresRepository(database)
 	resolver := runtimeAgentResolver{configured: buildConfiguredAgentResolver(config.Agents), enrolled: hostRepository}
 	metricConsumer := controlplane.NewMetricConsumer(resolver, repository)
 	ingestService := ingest.NewDurableService(resolver, postgresLogBatchDeduplicator{database: database}, metricConsumer)
@@ -644,7 +645,7 @@ func NewServer(config Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("configure plugin artifact leases: %w", err)
 		}
-		pluginArtifactContent, err = agentcontrol.NewPluginArtifactLeaseHTTPHandler(pluginArtifactLeaseIssuer, artifactBlobs)
+		pluginArtifactContent, err = agentcontrol.NewPluginArtifactLeaseHTTPHandler(pluginArtifactLeaseIssuer, artifactBlobs, agentCredentialRepository)
 		if err != nil {
 			return nil, fmt.Errorf("configure plugin artifact content: %w", err)
 		}
@@ -748,7 +749,7 @@ func NewServer(config Config) (*Server, error) {
 			return nil, fmt.Errorf("validate enrollment CA against AgentControl trust: %w", err)
 		}
 		enrollmentService = &enrollment.ApplicationService{
-			Tokens: enrollment.NewPostgresRepository(database), Certificates: issuer,
+			Tokens: agentCredentialRepository, Certificates: issuer, Sessions: agentRegistry,
 			Now: func() time.Time { return time.Now().UTC() },
 		}
 	}
@@ -780,6 +781,7 @@ func NewServer(config Config) (*Server, error) {
 		Enrollment:                 enrollmentService,
 		Discovery:                  discoveryService,
 		HostRediscovery:            hostRediscovery,
+		AgentSessions:              agentRegistry,
 		DatabaseInstances:          databaseInstanceService,
 		PluginCatalog:              pluginCatalogService,
 		PluginAssignments:          assignmentService,
@@ -839,7 +841,7 @@ func NewServer(config Config) (*Server, error) {
 	if commandObserver == nil {
 		commandObserver = commandLifecycle
 	}
-	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer), agentcontrol.WithMetricTemplateLeaseIssuer(metricTemplateLeaseWire)))
+	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer), agentcontrol.WithMetricTemplateLeaseIssuer(metricTemplateLeaseWire), agentcontrol.WithAgentCredentialAuthorizer(agentCredentialRepository)))
 	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, metricTemplateLeases: metricTemplateLeases, failMetricTrials: func(ctx context.Context, at time.Time) error {
 		if metricRepository == nil {
 			return nil

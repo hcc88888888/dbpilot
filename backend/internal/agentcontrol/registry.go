@@ -41,18 +41,20 @@ func IsRetryableDispatchError(err error) bool {
 }
 
 type session struct {
-	sessionID       string
-	agentID         string
-	capabilities    map[string]struct{}
-	capabilityList  []string
-	active          []*agentv1.CommandRecoveryState
-	send            chan *agentv1.ServerMessage
-	cancel          context.CancelFunc
-	lastHeartbeat   time.Time
-	leaseDurations  map[string]time.Duration
-	leases          map[string]time.Time
-	executionTokens map[string][]byte
-	leaseRevisions  map[string]uint64
+	sessionID        string
+	agentID          string
+	credentialLeaf   [sha256.Size]byte
+	credentialSerial string
+	capabilities     map[string]struct{}
+	capabilityList   []string
+	active           []*agentv1.CommandRecoveryState
+	send             chan *agentv1.ServerMessage
+	cancel           context.CancelFunc
+	lastHeartbeat    time.Time
+	leaseDurations   map[string]time.Duration
+	leases           map[string]time.Time
+	executionTokens  map[string][]byte
+	leaseRevisions   map[string]uint64
 }
 
 // SessionInfo is a defensive snapshot of an authenticated live Agent session.
@@ -83,6 +85,10 @@ func NewRegistry(queueCapacity int) *Registry {
 }
 
 func (r *Registry) register(agentID string, capabilities []string, active []*agentv1.CommandRecoveryState, cancel context.CancelFunc) error {
+	return r.registerCredential(agentID, capabilities, active, [sha256.Size]byte{}, "", cancel)
+}
+
+func (r *Registry) registerCredential(agentID string, capabilities []string, active []*agentv1.CommandRecoveryState, fingerprint [sha256.Size]byte, serial string, cancel context.CancelFunc) error {
 	capabilitySet := make(map[string]struct{}, len(capabilities))
 	for _, capability := range capabilities {
 		capability = strings.TrimSpace(capability)
@@ -103,8 +109,8 @@ func (r *Registry) register(agentID string, capabilities []string, active []*age
 	}
 	r.sessionSequence++
 	r.sessions[agentID] = &session{
-		sessionID: fmt.Sprintf("session-%d", r.sessionSequence),
-		agentID:   agentID, capabilities: capabilitySet, capabilityList: capabilityList,
+		sessionID: fmt.Sprintf("session-%d", r.sessionSequence), agentID: agentID,
+		credentialLeaf: fingerprint, credentialSerial: serial, capabilities: capabilitySet, capabilityList: capabilityList,
 		active: cloneRecoveryStates(active), send: make(chan *agentv1.ServerMessage, r.queueCapacity), cancel: cancel,
 		leaseDurations: make(map[string]time.Duration), leases: make(map[string]time.Time),
 		executionTokens: make(map[string][]byte), leaseRevisions: make(map[string]uint64),
@@ -127,6 +133,59 @@ func (r *Registry) unregister(agentID string, expected *session) {
 			clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
 		default:
 			return
+		}
+	}
+}
+
+// Terminate removes and cancels the exact live Agent session. It is used only
+// after a credential-generation or host-status transaction has committed.
+func (r *Registry) Terminate(agentID string) bool {
+	if r == nil || strings.TrimSpace(agentID) == "" {
+		return false
+	}
+	r.mu.Lock()
+	current := r.sessions[agentID]
+	if current != nil {
+		delete(r.sessions, agentID)
+		for {
+			select {
+			case message := <-current.send:
+				clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+				clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
+			default:
+				r.mu.Unlock()
+				current.cancel()
+				return true
+			}
+		}
+	}
+	r.mu.Unlock()
+	return false
+}
+
+// TerminateSuperseded cancels only a session authenticated with a credential
+// other than the newly committed leaf. This preserves a new-certificate
+// reconnect that races the post-commit replacement cleanup.
+func (r *Registry) TerminateSuperseded(agentID string, activeFingerprint [sha256.Size]byte) bool {
+	if r == nil || strings.TrimSpace(agentID) == "" || activeFingerprint == ([sha256.Size]byte{}) {
+		return false
+	}
+	r.mu.Lock()
+	current := r.sessions[agentID]
+	if current == nil || current.credentialLeaf == activeFingerprint {
+		r.mu.Unlock()
+		return false
+	}
+	delete(r.sessions, agentID)
+	for {
+		select {
+		case message := <-current.send:
+			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+			clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
+		default:
+			r.mu.Unlock()
+			current.cancel()
+			return true
 		}
 	}
 }

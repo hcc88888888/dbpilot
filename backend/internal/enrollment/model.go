@@ -83,7 +83,7 @@ func (token EnrollmentToken) Validate() error {
 func (token EnrollmentToken) Grant() EnrollmentGrant {
 	return EnrollmentGrant{
 		Scope: token.Scope, HostID: token.HostID, AgentID: token.AgentID, DisplayName: token.DisplayName,
-		Labels: cloneLabels(token.Labels), EnrollmentRevision: token.EnrollmentRevision,
+		Labels: cloneLabels(token.Labels), EnrollmentRevision: token.EnrollmentRevision, Generation: token.Generation,
 	}
 }
 
@@ -99,6 +99,7 @@ type EnrollmentGrant struct {
 	DisplayName        string
 	Labels             map[string]string
 	EnrollmentRevision uint64
+	Generation         uint64
 }
 
 func (grant EnrollmentGrant) Validate() error {
@@ -141,12 +142,15 @@ type EnrollRequest struct {
 }
 
 type EnrollResult struct {
-	HostID              string
-	AgentID             string
-	CertificatePEM      []byte
-	CertificateChainPEM []byte
-	ExpiresAt           time.Time
-	EnrollmentRevision  uint64
+	HostID                 string
+	AgentID                string
+	CertificatePEM         []byte
+	CertificateChainPEM    []byte
+	ExpiresAt              time.Time
+	EnrollmentRevision     uint64
+	CredentialGeneration   uint64
+	CertificateFingerprint [sha256.Size]byte
+	CertificateSerial      string
 }
 
 type EnrollmentAttemptKey struct {

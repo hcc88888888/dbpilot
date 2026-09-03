@@ -166,15 +166,20 @@ func (issuer *PluginArtifactLeaseIssuer) pruneLocked(now time.Time) {
 }
 
 type PluginArtifactLeaseHTTPHandler struct {
-	issuer *PluginArtifactLeaseIssuer
-	blobs  PluginArtifactArtifactBlobStore
+	issuer      *PluginArtifactLeaseIssuer
+	blobs       PluginArtifactArtifactBlobStore
+	credentials AgentCredentialAuthorizer
 }
 
-func NewPluginArtifactLeaseHTTPHandler(issuer *PluginArtifactLeaseIssuer, blobs PluginArtifactArtifactBlobStore) (*PluginArtifactLeaseHTTPHandler, error) {
-	if issuer == nil || blobs == nil {
+func NewPluginArtifactLeaseHTTPHandler(issuer *PluginArtifactLeaseIssuer, blobs PluginArtifactArtifactBlobStore, authorizers ...AgentCredentialAuthorizer) (*PluginArtifactLeaseHTTPHandler, error) {
+	if issuer == nil || blobs == nil || len(authorizers) > 1 || len(authorizers) == 1 && authorizers[0] == nil {
 		return nil, ErrPluginArtifactLeaseRejected
 	}
-	return &PluginArtifactLeaseHTTPHandler{issuer: issuer, blobs: blobs}, nil
+	handler := &PluginArtifactLeaseHTTPHandler{issuer: issuer, blobs: blobs}
+	if len(authorizers) == 1 {
+		handler.credentials = authorizers[0]
+	}
+	return handler, nil
 }
 
 func (handler *PluginArtifactLeaseHTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -190,6 +195,13 @@ func (handler *PluginArtifactLeaseHTTPHandler) ServeHTTP(writer http.ResponseWri
 	if err != nil {
 		writePluginArtifactError(writer, http.StatusForbidden)
 		return
+	}
+	if handler.credentials != nil {
+		fingerprint, serial, credentialErr := credentialFromTLSState(*request.TLS, agentID)
+		if credentialErr != nil || handler.credentials.AuthorizeAgentCredential(request.Context(), agentID, fingerprint, serial) != nil {
+			writePluginArtifactError(writer, http.StatusForbidden)
+			return
+		}
 	}
 	leaseID := request.PathValue("leaseID")
 	if leaseID == "" && strings.HasPrefix(request.URL.Path, pluginArtifactPathPrefix) {

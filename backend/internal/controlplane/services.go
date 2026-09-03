@@ -68,6 +68,10 @@ type HostRediscoveryService interface {
 	Start(context.Context, platformscope.Scope, string, rediscovery.RediscoveryRequest) (job.Job, error)
 }
 
+type AgentSessionTerminator interface {
+	Terminate(string) bool
+}
+
 // InspectionOverview is the storage-neutral aggregate returned by the host
 // inspection application boundary.
 type InspectionOverview struct {
@@ -122,6 +126,7 @@ type Services struct {
 	Enrollment                 EnrollmentService
 	Discovery                  discovery.Service
 	HostRediscovery            HostRediscoveryService
+	AgentSessions              AgentSessionTerminator
 	DatabaseInstances          databaseinstance.Service
 	PluginCatalog              plugincatalog.CatalogService
 	PluginAssignments          pluginassignment.Service

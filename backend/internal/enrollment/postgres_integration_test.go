@@ -1,7 +1,9 @@
 package enrollment
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"errors"
@@ -88,6 +90,7 @@ func TestEnrollmentPostgresIntegrationConcurrentCompletionExpiryAndLostResponseR
 		if attempt.err == nil {
 			winners++
 			token = attempt.token
+			token.Generation = attempt.creation.Generation
 			require.Equal(t, EnrollmentTokenCreation{Generation: 2, Replaced: true}, attempt.creation)
 			continue
 		}
@@ -112,10 +115,13 @@ func TestEnrollmentPostgresIntegrationConcurrentCompletionExpiryAndLostResponseR
 		OS: "linux", Architecture: "amd64", LogicalCPUCount: 2, MemoryCapacityBytes: 1 << 30,
 		NetworkAddresses: []string{"127.0.0.1"}, Capabilities: []string{"host.inventory.v1"}, ObservedAt: now,
 	}
+	certificate, _ := testCertificateAuthority(t, now)
 	want := EnrollResult{
-		HostID: hostID, AgentID: agentID, CertificatePEM: []byte("public-certificate"), CertificateChainPEM: []byte("public-chain"),
+		HostID: hostID, AgentID: agentID, CertificatePEM: certificate, CertificateChainPEM: certificate,
 		ExpiresAt: now.Add(24 * time.Hour), EnrollmentRevision: 1,
 	}
+	want, err = normalizeEnrollmentResult(want, grant)
+	require.NoError(t, err)
 	completion := EnrollmentCompletion{Key: key, Grant: grant, Observation: observation, Result: want, CompletedAt: now}
 
 	const consumers = 24
@@ -169,6 +175,80 @@ func TestEnrollmentPostgresIntegrationConcurrentCompletionExpiryAndLostResponseR
 	expiredKey := EnrollmentAttemptKey{TokenHash: expired.TokenHash, CSRDigest: csrDigest, AgentID: expired.AgentID, HostID: expired.HostID}
 	_, err = repository.Resolve(ctx, expiredKey)
 	require.ErrorIs(t, err, ErrEnrollmentTokenInvalid, "database CURRENT_TIMESTAMP controls the expiry boundary")
+}
+
+func TestEnrollmentPostgresCredentialGenerationRejectsOldLeafAfterReplacementAndDecommission(t *testing.T) {
+	if os.Getenv("DBPILOT_ENROLLMENT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ENROLLMENT_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_ENROLLMENT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ENROLLMENT_POSTGRES_DSN is required")
+	}
+	database, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	ctx := context.Background()
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	require.NoError(t, hostinventory.RunMigrations(ctx, database))
+	require.NoError(t, RunMigrations(ctx, database))
+	suffix := fmt.Sprintf("generation-%d", time.Now().UnixNano())
+	scope := platformscope.Scope{TenantID: "tenant-" + suffix, ProjectID: "project-" + suffix}
+	hostID, agentID := "host-"+suffix, "agent-"+suffix
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM audit_events WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_issuances WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM host_observations WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_tokens WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+	})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	caCertificate, caKey := testCertificateAuthority(t, now)
+	issuer, err := NewAgentCertificateIssuer(caCertificate, caKey, time.Hour, func() time.Time { return now }, rand.Reader)
+	require.NoError(t, err)
+	repository := NewPostgresRepository(database)
+	sessions := &recordingCredentialSessions{}
+	service := ApplicationService{Tokens: repository, Certificates: issuer, Sessions: sessions, Random: bytes.NewReader(bytes.Repeat([]byte{1}, EnrollmentTokenBytes)), Now: func() time.Time { return now }}
+	createRequest := CreateRequest{HostID: hostID, AgentID: agentID, DisplayName: "Generation Host", Labels: map[string]string{}, ExpiresIn: time.Hour, IssuedBy: "operator", IdempotencyKey: "create-generation", RequestFingerprint: "sha256:" + fmt.Sprintf("%064x", 101), Audit: EnrollmentAudit{Actor: "operator", RequestID: "request-create", OperationID: "createHostEnrollment", IdempotencyKey: "create-generation"}}
+	created, err := service.Create(ctx, scope, createRequest)
+	require.NoError(t, err)
+	firstRequest := signedEnrollRequest(t, created.Token, agentID, now)
+	first, err := service.Enroll(ctx, firstRequest)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), first.CredentialGeneration)
+	require.NoError(t, repository.AuthorizeAgentCredential(ctx, agentID, first.CertificateFingerprint, first.CertificateSerial))
+
+	service.Random = bytes.NewReader(bytes.Repeat([]byte{2}, EnrollmentTokenBytes))
+	createRequest.IdempotencyKey = "replace-generation"
+	createRequest.RequestFingerprint = "sha256:" + fmt.Sprintf("%064x", 102)
+	createRequest.Audit = EnrollmentAudit{Actor: "operator", RequestID: "request-replace", OperationID: "replaceHostEnrollment", IdempotencyKey: "replace-generation"}
+	replacement, err := service.Replace(ctx, scope, createRequest, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), replacement.Generation)
+	second, err := service.Enroll(ctx, signedEnrollRequest(t, replacement.Token, agentID, now))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), second.CredentialGeneration)
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, agentID, first.CertificateFingerprint, first.CertificateSerial))
+	require.NoError(t, repository.AuthorizeAgentCredential(ctx, agentID, second.CertificateFingerprint, second.CertificateSerial))
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, "agent-other-"+suffix, second.CertificateFingerprint, second.CertificateSerial), "a leaf must not authorize another tenant or Agent identity")
+	var oldRevoked bool
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT revoked_at IS NOT NULL FROM agent_enrollment_issuances WHERE credential_generation=1 AND tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, hostID).Scan(&oldRevoked))
+	require.True(t, oldRevoked)
+
+	hostRepository := hostinventory.NewPostgresRepository(database)
+	host, err := hostRepository.Get(ctx, scope, hostID)
+	require.NoError(t, err)
+	transition := hostinventory.DecommissionTransition{Actor: "operator", OperationID: "decommissionHost", IdempotencyKey: "decommission-generation", Fingerprint: "sha256:" + fmt.Sprintf("%064x", 103), OwnerToken: "owner-" + fmt.Sprintf("%064x", 104)}
+	decommissioned, err := hostRepository.Decommission(hostinventory.WithDecommissionTransition(ctx, transition), scope, hostID, host.Version, now.Add(time.Second), transition)
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), decommissioned.CredentialGeneration)
+	require.NotNil(t, decommissioned.CredentialRevokedAt)
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, agentID, second.CertificateFingerprint, second.CertificateSerial))
+	var currentRevoked bool
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT revoked_at IS NOT NULL FROM agent_enrollment_issuances WHERE credential_generation=2 AND tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, hostID).Scan(&currentRevoked))
+	require.True(t, currentRevoked, "decommission must revoke the current issuance in the same database transaction")
+	require.Equal(t, []string{agentID, agentID}, sessions.agents, "each committed generation performs superseded-session cleanup")
+	require.Equal(t, [][32]byte{first.CertificateFingerprint, second.CertificateFingerprint}, sessions.fingerprints)
 }
 
 func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
@@ -234,7 +314,10 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 	key := EnrollmentAttemptKey{TokenHash: token.TokenHash, CSRDigest: csrDigest, AgentID: token.AgentID, HostID: token.HostID}
 	resolved, err := repository.Resolve(ctx, key)
 	require.NoError(t, err)
-	result := EnrollResult{HostID: token.HostID, AgentID: token.AgentID, CertificatePEM: []byte("certificate"), CertificateChainPEM: []byte("chain"), ExpiresAt: now.Add(time.Hour), EnrollmentRevision: 1}
+	certificate, _ := testCertificateAuthority(t, now)
+	result := EnrollResult{HostID: token.HostID, AgentID: token.AgentID, CertificatePEM: certificate, CertificateChainPEM: certificate, ExpiresAt: now.Add(time.Hour), EnrollmentRevision: 1}
+	result, err = normalizeEnrollmentResult(result, resolved.Grant)
+	require.NoError(t, err)
 	observation := hostinventory.Observation{HostID: token.HostID, AgentID: token.AgentID, Revision: 1, AgentVersion: "upgrade", Hostname: "upgrade.example", OS: "linux", Architecture: "amd64", LogicalCPUCount: 1, MemoryCapacityBytes: 1 << 20, NetworkAddresses: []string{}, Capabilities: []string{}, ObservedAt: now}
 	completed, err := repository.Complete(ctx, EnrollmentCompletion{Key: key, Grant: resolved.Grant, Observation: observation, Result: result, CompletedAt: now})
 	require.NoError(t, err)

@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -90,6 +91,25 @@ func TestPluginArtifactLeaseHTTPHandlerBindsTLSAgentAndRevalidatesOperation(t *t
 	require.Equal(t, http.StatusForbidden, recorder.Code)
 }
 
+func TestPluginArtifactLeaseHTTPHandlerRejectsRevokedLeafBeforeOpeningArtifact(t *testing.T) {
+	fixture := newLeaseIssuerFixture(t)
+	lease, err := fixture.issuer.Issue(context.Background(), "agent-1", &agentv1.PluginArtifactLeaseRequest{RequestNonce: bytes.Repeat([]byte{8}, 32), AssignmentId: "assignment-1", ArtifactId: "artifact-1", OperationRevision: 7})
+	require.NoError(t, err)
+	credentials := &recordingAgentCredentialAuthorizer{err: errors.New("old generation")}
+	handler, err := NewPluginArtifactLeaseHTTPHandler(fixture.issuer, fixture.blobs, credentials)
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodGet, lease.GetDownloadUrl(), nil)
+	request.SetPathValue("leaseID", lease.GetLeaseId())
+	request.Header.Set(pluginArtifactLeaseHeader, lease.GetRequestHeaders()[pluginArtifactLeaseHeader])
+	request.TLS = verifiedAgentTLSState(t, "agent-1")
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Equal(t, "agent-1", credentials.agentID)
+}
+
 func TestAgentControlRoutesLeaseRequestThroughAuthenticatedSession(t *testing.T) {
 	registry := NewRegistry(4)
 	require.NoError(t, registry.register("agent-1", []string{"plugin.reconcile.v1", "plugin_reconcile.instance_descriptors.v1"}, nil, func() {}))
@@ -128,15 +148,27 @@ func TestPluginArtifactLeaseRealMTLSServerServesOnlyBoundAgent(t *testing.T) {
 	require.NoError(t, err)
 	ca, caKey, roots := testPluginLeaseCA(t)
 	serverCertificate := testPluginLeaseCertificate(t, ca, caKey, "server", "", false)
-	agentCertificate := testPluginLeaseCertificate(t, ca, caKey, "agent-1", "agent-1", true)
+	oldAgentCertificate := testPluginLeaseCertificate(t, ca, caKey, "agent-1-old", "agent-1", true)
+	agentCertificate := testPluginLeaseCertificate(t, ca, caKey, "agent-1-current", "agent-1", true)
+	leaf, err := x509.ParseCertificate(agentCertificate.Certificate[0])
+	require.NoError(t, err)
+	credentialAuthorizer := exactLeafAuthorizer{fingerprint: sha256.Sum256(leaf.Raw), serial: leaf.SerialNumber.Text(16)}
+	handler, err = NewPluginArtifactLeaseHTTPHandler(fixture.issuer, fixture.blobs, credentialAuthorizer)
+	require.NoError(t, err)
 	server := httptest.NewUnstartedServer(handler)
 	server.TLS = &tls.Config{Certificates: []tls.Certificate{serverCertificate}, ClientCAs: roots, ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS12}
 	server.StartTLS()
 	defer server.Close()
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{agentCertificate}, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
+	oldClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{oldAgentCertificate}, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	request, err := http.NewRequest(http.MethodGet, server.URL+pluginArtifactPathPrefix+lease.GetLeaseId(), nil)
 	require.NoError(t, err)
 	request.Header.Set(pluginArtifactLeaseHeader, lease.GetRequestHeaders()[pluginArtifactLeaseHeader])
+	oldResponse, err := oldClient.Do(request.Clone(context.Background()))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusForbidden, oldResponse.StatusCode)
+	require.NoError(t, oldResponse.Body.Close())
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{agentCertificate}, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	response, err := client.Do(request)
 	require.NoError(t, err)
 	body, err := io.ReadAll(response.Body)
@@ -148,6 +180,18 @@ func TestPluginArtifactLeaseRealMTLSServerServesOnlyBoundAgent(t *testing.T) {
 	noCertificate := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	_, err = noCertificate.Do(request.Clone(context.Background()))
 	require.Error(t, err)
+}
+
+type exactLeafAuthorizer struct {
+	fingerprint [sha256.Size]byte
+	serial      string
+}
+
+func (authorizer exactLeafAuthorizer) AuthorizeAgentCredential(_ context.Context, _ string, fingerprint [sha256.Size]byte, serial string) error {
+	if fingerprint != authorizer.fingerprint || serial != authorizer.serial {
+		return errors.New("credential is not current")
+	}
+	return nil
 }
 
 type leaseIssuerFixture struct {
@@ -216,7 +260,7 @@ func verifiedAgentTLSState(t *testing.T, agentID string) *tls.ConnectionState {
 	t.Helper()
 	identity, err := url.Parse("spiffe://dbpilot.local/agent/" + agentID)
 	require.NoError(t, err)
-	certificate := &x509.Certificate{URIs: []*url.URL{identity}}
+	certificate := &x509.Certificate{Raw: []byte("plugin-artifact-test-leaf-" + agentID), SerialNumber: big.NewInt(7), URIs: []*url.URL{identity}}
 	return &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certificate}, VerifiedChains: [][]*x509.Certificate{{certificate}}}
 }
 

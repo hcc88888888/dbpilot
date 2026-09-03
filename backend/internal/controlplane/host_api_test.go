@@ -83,7 +83,8 @@ func TestManagedHostDecommissionUsesETagIdempotencyAndAuditOnce(t *testing.T) {
 	host.Status, host.Version = hostinventory.HostDecommissioned, 3
 	hosts := &recordingHostService{decommissionValue: host}
 	audits := &recordingAuditService{}
-	services := Services{Hosts: hosts, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore())}
+	sessions := &recordingAgentSessionTerminator{}
+	services := Services{Hosts: hosts, Audit: audits, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), AgentSessions: sessions}
 	principal := principalWith(platformTestScope, openapi.PermissionDecommissionHost)
 	request := newDecommissionHostRequest(`"2"`, "decommission-host-1")
 	request.Header.Set("X-Request-ID", "request-host-decommission")
@@ -107,6 +108,7 @@ func TestManagedHostDecommissionUsesETagIdempotencyAndAuditOnce(t *testing.T) {
 	require.Equal(t, "host.decommissioned", audits.records[0].Action)
 	require.Equal(t, "host", audits.records[0].Resource.Type)
 	require.Equal(t, "host-1", audits.records[0].Resource.ID)
+	require.Equal(t, []string{"agent-1"}, sessions.agents)
 }
 
 func TestManagedHostDecommissionMapsVersionConflictToPreconditionAndAbortsClaim(t *testing.T) {
@@ -301,3 +303,10 @@ func (service *competingHostService) Decommission(ctx context.Context, scope pla
 }
 
 var _ hostinventory.Service = (*competingHostService)(nil)
+
+type recordingAgentSessionTerminator struct{ agents []string }
+
+func (terminator *recordingAgentSessionTerminator) Terminate(agentID string) bool {
+	terminator.agents = append(terminator.agents, agentID)
+	return true
+}

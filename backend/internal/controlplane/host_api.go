@@ -175,6 +175,9 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 		if current.Status != hostinventory.HostDecommissioned || current.Version != uint64(version)+1 || current.DecommissionTransition == nil || !current.DecommissionTransition.Matches(expectedTransition) {
 			return idempotency.Response{}, idempotency.ErrInProgress
 		}
+		if api.services.AgentSessions != nil {
+			api.services.AgentSessions.Terminate(current.AgentID)
+		}
 		return storedHostDecommissionResponse(current, scope, request.HostId, expectedTransition)
 	})
 	if err != nil {
@@ -203,6 +206,9 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 			}
 		}
 		return nil, err
+	}
+	if api.services.AgentSessions != nil {
+		api.services.AgentSessions.Terminate(host.AgentID)
 	}
 	stored, err := storedHostDecommissionResponse(host, scope, request.HostId, transition)
 	if err != nil {

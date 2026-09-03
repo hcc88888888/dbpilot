@@ -115,6 +115,10 @@ type Host struct {
 	Capabilities           []Capability            `json:"capabilities"`
 	AgentVersion           string                  `json:"agent_version,omitempty"`
 	EnrollmentRevision     uint64                  `json:"enrollment_revision"`
+	CredentialGeneration   uint64                  `json:"credential_generation"`
+	CertificateFingerprint string                  `json:"-"`
+	CertificateSerial      string                  `json:"-"`
+	CredentialRevokedAt    *time.Time              `json:"-"`
 	ObservationRevision    uint64                  `json:"observation_revision"`
 	EnrolledAt             time.Time               `json:"enrolled_at"`
 	LastHelloAt            time.Time               `json:"last_hello_at,omitempty"`
@@ -184,13 +188,15 @@ var capabilityPattern = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,127}$`)
 var labelNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
 var fingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var ownerTokenPattern = regexp.MustCompile(`^owner-[0-9a-f]{64}$`)
+var fingerprintHexPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var serialPattern = regexp.MustCompile(`^[0-9a-f]+$`)
 
 func (host Host) Validate() error {
 	if host.Scope.Validate() != nil || !identifierPattern.MatchString(host.ID) || !identifierPattern.MatchString(host.AgentID) ||
 		!boundedRequired(host.DisplayName, 120) || !boundedRequired(host.Hostname, 253) ||
 		!boundedRequired(host.OperatingSystem, 64) || !boundedOptional(host.OperatingSystemVersion, 128) ||
 		!boundedOptional(host.KernelVersion, 128) || !boundedRequired(host.Architecture, 32) ||
-		!boundedOptional(host.AgentVersion, 64) || !validPostgresRevision(host.EnrollmentRevision, false) ||
+		!boundedOptional(host.AgentVersion, 64) || !validPostgresRevision(host.EnrollmentRevision, false) || !validPostgresRevision(host.CredentialGeneration, true) || !validCredentialState(host) ||
 		!validPostgresRevision(host.ObservationRevision, true) || !validPostgresRevision(host.Version, false) ||
 		!validUTC(host.EnrolledAt) || !validOptionalUTC(host.LastHelloAt) || !validOptionalUTC(host.LastHeartbeatAt) ||
 		!validHostStatus(host.Status) || !validContainerRuntime(host.ContainerRuntime) ||
@@ -200,6 +206,13 @@ func (host Host) Validate() error {
 		return ErrInvalid
 	}
 	return nil
+}
+
+func validCredentialState(host Host) bool {
+	active := host.CredentialGeneration > 0 && fingerprintHexPattern.MatchString(host.CertificateFingerprint) && serialPattern.MatchString(host.CertificateSerial) && host.CredentialRevokedAt == nil && host.Status != HostDecommissioned
+	legacy := host.CredentialGeneration == 0 && host.CertificateFingerprint == "" && host.CertificateSerial == "" && host.CredentialRevokedAt == nil
+	revoked := host.CredentialGeneration > 0 && host.CertificateFingerprint == "" && host.CertificateSerial == "" && host.CredentialRevokedAt != nil && validUTC(*host.CredentialRevokedAt) && host.Status == HostDecommissioned
+	return active || legacy || revoked
 }
 
 func (observation Observation) Validate() error {

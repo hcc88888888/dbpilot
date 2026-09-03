@@ -108,7 +108,7 @@ func TestPostgresResolveReplacementRequiresExactScopeAndOperationCorrelation(t *
 		HostID: "host-1", AgentID: "agent-1", IssuedBy: "operator-1", IdempotencyKey: "replace-1",
 		RequestFingerprint: "sha256:" + strings.Repeat("1", 64),
 	}
-	mock.ExpectQuery(`(?s)SELECT enrollment_revision, generation.*tenant_id = \$1.*project_id = \$2.*host_id = \$3.*agent_id = \$4.*issued_by = \$5.*idempotency_key = \$6.*request_fingerprint = \$7.*consumed_at IS NULL`).
+	mock.ExpectQuery(`(?s)SELECT enrollment_revision, generation.*tenant_id = \$1.*project_id = \$2.*host_id = \$3.*agent_id = \$4.*issued_by = \$5.*idempotency_key = \$6.*request_fingerprint = \$7`).
 		WithArgs(scope.TenantID, scope.ProjectID, request.HostID, request.AgentID, request.IssuedBy, request.IdempotencyKey, request.RequestFingerprint).
 		WillReturnRows(sqlmock.NewRows([]string{"enrollment_revision", "generation"}).AddRow(3, 8))
 
@@ -128,7 +128,7 @@ func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) 
 	key := EnrollmentAttemptKey{TokenHash: hash, CSRDigest: csrDigest, AgentID: "agent-1", HostID: "host-1"}
 	grant := EnrollmentGrant{
 		Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, HostID: "host-1", AgentID: "agent-1",
-		DisplayName: "Primary database host", Labels: map[string]string{"role": "database"}, EnrollmentRevision: 1,
+		DisplayName: "Primary database host", Labels: map[string]string{"role": "database"}, EnrollmentRevision: 1, Generation: 1,
 	}
 	labels, err := json.Marshal(grant.Labels)
 	require.NoError(t, err)
@@ -136,13 +136,16 @@ func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) 
 	mock.ExpectQuery(`(?s)SELECT.*t.consumed_at.*expires_at > CURRENT_TIMESTAMP.*LEFT JOIN agent_enrollment_issuances`).
 		WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
-		nil, true, nil, nil, nil, nil, nil, nil,
+		nil, true, 1, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	))
 	issuedAt := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	expiresAt := issuedAt.Add(time.Hour)
+	certificate, _ := testCertificateAuthority(t, issuedAt)
+	fingerprint, serial, err := enrollmentCertificateIdentity(certificate)
+	require.NoError(t, err)
 	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
-		issuedAt, false, csrDigest[:], []byte("certificate"), []byte("chain"), expiresAt, issuedAt, grant.EnrollmentRevision,
+		issuedAt, false, 1, csrDigest[:], certificate, certificate, expiresAt, issuedAt, grant.EnrollmentRevision, 1, fingerprint[:], serial,
 	))
 	repository := NewPostgresRepository(database)
 
@@ -152,7 +155,7 @@ func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) 
 	require.Nil(t, first.Response)
 	replayed, err := repository.Resolve(context.Background(), key)
 	require.NoError(t, err)
-	require.Equal(t, []byte("certificate"), replayed.Response.CertificatePEM)
+	require.Equal(t, certificate, replayed.Response.CertificatePEM)
 	require.Equal(t, expiresAt, replayed.Response.ExpiresAt)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -168,7 +171,7 @@ func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 	labels, _ := json.Marshal(grant.Labels)
 	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(enrollmentResolutionColumns()).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
-		nil, false, nil, nil, nil, nil, nil, nil,
+		nil, false, grant.Generation, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	))
 
 	_, err = NewPostgresRepository(database).Resolve(context.Background(), key)
@@ -181,7 +184,7 @@ func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 func enrollmentResolutionColumns() []string {
 	return []string{
 		"tenant_id", "project_id", "host_id", "agent_id", "display_name", "labels", "enrollment_revision",
-		"consumed_at", "active", "csr_digest", "certificate_pem", "certificate_chain_pem", "expires_at", "issued_at", "issuance_revision",
+		"consumed_at", "active", "generation", "csr_digest", "certificate_pem", "certificate_chain_pem", "expires_at", "issued_at", "issuance_revision", "credential_generation", "certificate_fingerprint", "certificate_serial",
 	}
 }
 
@@ -202,11 +205,32 @@ func TestRunMigrationsCreatesHashOnlyEnrollmentTable(t *testing.T) {
 	mock.ExpectExec(`(?s)ALTER TABLE agent_enrollment_tokens.*request_fingerprint.*generation.*CREATE TABLE IF NOT EXISTS agent_enrollment_issuances.*csr_digest BYTEA.*certificate_pem BYTEA`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0002_recoverable_enrollment.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0003_certificate_generation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE agent_enrollment_issuances.*credential_generation.*certificate_fingerprint.*agent_enrollment_tokens_identity_generation_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0003_certificate_generation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0004_decommission_credential_revocation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE FUNCTION revoke_agent_issuances_on_host_decommission.*CREATE TRIGGER managed_hosts_revoke_agent_issuances.*UPDATE agent_enrollment_issuances").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0004_decommission_credential_revocation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectQuery("SELECT issuance.token_hash").WillReturnRows(sqlmock.NewRows([]string{"token_hash", "certificate_pem", "generation", "tenant_id", "project_id", "host_id", "agent_id", "issued_at"}))
 
 	err = RunMigrations(context.Background(), database)
 
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func bytesOfEnrollmentTest(value byte, count int) []byte {
+	result := make([]byte, count)
+	for index := range result {
+		result[index] = value
+	}
+	return result
 }
 
 func TestEnrollmentMigration0001RemainsByteIdenticalToAppliedSchema(t *testing.T) {

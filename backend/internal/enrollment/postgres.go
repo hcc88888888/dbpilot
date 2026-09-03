@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -24,7 +25,8 @@ RETURNING token_hash, generation`
 const findEnrollmentTokenReplacementSQL = `SELECT token_hash, consumed_at, generation
 FROM agent_enrollment_tokens
 WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3 AND agent_id = $4
-  AND consumed_at IS NULL
+ORDER BY generation DESC
+LIMIT 1
 FOR UPDATE`
 
 const replaceEnrollmentTokenSQL = `UPDATE agent_enrollment_tokens SET
@@ -37,21 +39,22 @@ RETURNING token_hash, generation`
 const resolveReplacementSQL = `SELECT enrollment_revision, generation
 FROM agent_enrollment_tokens
 WHERE tenant_id = $1 AND project_id = $2 AND host_id = $3 AND agent_id = $4
-  AND issued_by = $5 AND idempotency_key = $6 AND request_fingerprint = $7
-  AND consumed_at IS NULL`
+  AND issued_by = $5 AND idempotency_key = $6 AND request_fingerprint = $7`
 
 const resolveEnrollmentSQL = `SELECT
     t.tenant_id, t.project_id, t.host_id, t.agent_id, t.display_name, t.labels, t.enrollment_revision,
-    t.consumed_at, (t.expires_at > CURRENT_TIMESTAMP) AS active,
-    i.csr_digest, i.certificate_pem, i.certificate_chain_pem, i.expires_at, i.issued_at, i.enrollment_revision
+	    t.consumed_at, (t.expires_at > CURRENT_TIMESTAMP) AS active, t.generation,
+	    i.csr_digest, i.certificate_pem, i.certificate_chain_pem, i.expires_at, i.issued_at, i.enrollment_revision,
+	    i.credential_generation, i.certificate_fingerprint, i.certificate_serial
 FROM agent_enrollment_tokens t
 LEFT JOIN agent_enrollment_issuances i ON i.token_hash = t.token_hash
 WHERE t.token_hash = $1`
 
 const insertIssuanceSQL = `INSERT INTO agent_enrollment_issuances (
     token_hash, csr_digest, tenant_id, project_id, host_id, agent_id,
-    certificate_pem, certificate_chain_pem, expires_at, issued_at, enrollment_revision
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+	    certificate_pem, certificate_chain_pem, expires_at, issued_at, enrollment_revision
+	    , credential_generation, certificate_fingerprint, certificate_serial
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`
 
 const consumeCommittedTokenSQL = `UPDATE agent_enrollment_tokens
 SET consumed_at = CURRENT_TIMESTAMP
@@ -153,7 +156,7 @@ func (repository *PostgresRepository) Replace(ctx context.Context, token Enrollm
 		rollback()
 		return EnrollmentTokenCreation{}, mapPostgresError(err)
 	}
-	if consumedAt.Valid || generation < 1 {
+	if generation < 1 {
 		rollback()
 		return EnrollmentTokenCreation{}, ErrEnrollmentConflict
 	}
@@ -162,10 +165,18 @@ func (repository *PostgresRepository) Replace(ctx context.Context, token Enrollm
 		return EnrollmentTokenCreation{}, ErrEnrollmentGenerationConflict
 	}
 	generation++
-	err = transaction.QueryRowContext(ctx, replaceEnrollmentTokenSQL,
-		token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt,
-		token.EnrollmentRevision, generation, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, existingHash, expectedGeneration,
-	).Scan(&existingHash, &generation)
+	if consumedAt.Valid {
+		err = transaction.QueryRowContext(ctx, createEnrollmentTokenSQL,
+			token.TokenHash[:], token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID,
+			token.DisplayName, labels, token.ExpiresAt, token.CreatedAt, token.EnrollmentRevision,
+			token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, generation,
+		).Scan(&existingHash, &generation)
+	} else {
+		err = transaction.QueryRowContext(ctx, replaceEnrollmentTokenSQL,
+			token.TokenHash[:], token.HostID, token.AgentID, token.DisplayName, labels, token.ExpiresAt, token.CreatedAt,
+			token.EnrollmentRevision, generation, token.IssuedBy, token.IdempotencyKey, token.RequestFingerprint, existingHash, expectedGeneration,
+		).Scan(&existingHash, &generation)
+	}
 	if err != nil {
 		rollback()
 		return EnrollmentTokenCreation{}, mapPostgresError(err)
@@ -236,7 +247,27 @@ func (repository *PostgresRepository) Resolve(ctx context.Context, key Enrollmen
 	return resolveEnrollment(ctx, repository.database, resolveEnrollmentSQL, key)
 }
 
+func (repository *PostgresRepository) AuthorizeAgentCredential(ctx context.Context, agentID string, fingerprint [sha256.Size]byte, serial string) error {
+	if repository == nil || repository.database == nil || ctx == nil || !identifierPattern.MatchString(agentID) || fingerprint == ([sha256.Size]byte{}) || serial == "" {
+		return ErrEnrollmentTokenInvalid
+	}
+	var status string
+	var generation int64
+	var storedFingerprint []byte
+	var storedSerial string
+	var revokedAt sql.NullTime
+	err := repository.database.QueryRowContext(ctx, `SELECT status,credential_generation,active_certificate_fingerprint,active_certificate_serial,credential_revoked_at FROM managed_hosts WHERE agent_id=$1`, agentID).Scan(&status, &generation, &storedFingerprint, &storedSerial, &revokedAt)
+	if err != nil || status == string(hostinventory.HostDecommissioned) || generation < 1 || revokedAt.Valid || len(storedFingerprint) != sha256.Size || len(storedSerial) != len(serial) || subtle.ConstantTimeCompare(storedFingerprint, fingerprint[:]) != 1 || subtle.ConstantTimeCompare([]byte(storedSerial), []byte(serial)) != 1 {
+		return ErrEnrollmentTokenInvalid
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) Complete(ctx context.Context, completion EnrollmentCompletion) (EnrollResult, error) {
+	normalized, normalizeErr := normalizeEnrollmentResult(completion.Result, completion.Grant)
+	if normalizeErr == nil {
+		completion.Result = normalized
+	}
 	if repository == nil || repository.database == nil || ctx == nil || completion.Key.Validate() != nil || completion.Grant.Validate() != nil ||
 		completion.Observation.Validate() != nil || !validUTC(completion.CompletedAt) || validateEnrollmentResult(completion.Result, completion.Grant) != nil ||
 		completion.Key.AgentID != completion.Grant.AgentID || completion.Key.HostID != completion.Grant.HostID ||
@@ -266,14 +297,35 @@ func (repository *PostgresRepository) Complete(ctx context.Context, completion E
 		HostID: completion.Grant.HostID, AgentID: completion.Grant.AgentID, DisplayName: completion.Grant.DisplayName,
 		Labels: completion.Grant.Labels, Revision: completion.Grant.EnrollmentRevision, EnrolledAt: completion.CompletedAt,
 	}, completion.Observation, completion.CompletedAt); err != nil {
-		rollback()
-		return EnrollResult{}, fmt.Errorf("record enrolled Host: %w", err)
+		if !errors.Is(err, hostinventory.ErrConflict) {
+			rollback()
+			return EnrollResult{}, fmt.Errorf("record enrolled Host: %w", err)
+		}
+		existing, getErr := hostRepository.Get(ctx, completion.Grant.Scope, completion.Grant.HostID)
+		if getErr != nil || existing.AgentID != completion.Grant.AgentID || existing.Status == hostinventory.HostDecommissioned {
+			rollback()
+			return EnrollResult{}, ErrEnrollmentConflict
+		}
 	}
 	if _, err := transaction.ExecContext(ctx, insertIssuanceSQL,
 		completion.Key.TokenHash[:], completion.Key.CSRDigest[:], completion.Grant.Scope.TenantID, completion.Grant.Scope.ProjectID,
 		completion.Grant.HostID, completion.Grant.AgentID, completion.Result.CertificatePEM, completion.Result.CertificateChainPEM,
 		completion.Result.ExpiresAt, completion.CompletedAt, completion.Grant.EnrollmentRevision,
+		completion.Result.CredentialGeneration, completion.Result.CertificateFingerprint[:], completion.Result.CertificateSerial,
 	); err != nil {
+		rollback()
+		return EnrollResult{}, mapPostgresError(err)
+	}
+	activated, err := transaction.ExecContext(ctx, `UPDATE managed_hosts SET credential_generation=$1,active_certificate_fingerprint=$2,active_certificate_serial=$3,credential_revoked_at=NULL,version=version+1,updated_at=$4 WHERE tenant_id=$5 AND project_id=$6 AND host_id=$7 AND agent_id=$8 AND status<>'decommissioned' AND credential_generation<$1`, completion.Result.CredentialGeneration, completion.Result.CertificateFingerprint[:], completion.Result.CertificateSerial, completion.CompletedAt, completion.Grant.Scope.TenantID, completion.Grant.Scope.ProjectID, completion.Grant.HostID, completion.Grant.AgentID)
+	if err != nil {
+		rollback()
+		return EnrollResult{}, mapPostgresError(err)
+	}
+	if rows, rowsErr := activated.RowsAffected(); rowsErr != nil || rows != 1 {
+		rollback()
+		return EnrollResult{}, ErrEnrollmentGenerationConflict
+	}
+	if _, err := transaction.ExecContext(ctx, `UPDATE agent_enrollment_issuances SET revoked_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND host_id=$4 AND agent_id=$5 AND credential_generation<$6 AND revoked_at IS NULL`, completion.CompletedAt, completion.Grant.Scope.TenantID, completion.Grant.Scope.ProjectID, completion.Grant.HostID, completion.Grant.AgentID, completion.Result.CredentialGeneration); err != nil {
 		rollback()
 		return EnrollResult{}, mapPostgresError(err)
 	}
@@ -294,7 +346,7 @@ func (repository *PostgresRepository) Complete(ctx context.Context, completion E
 }
 
 func enrollmentGrantsEqual(first, second EnrollmentGrant) bool {
-	if first.Scope != second.Scope || first.HostID != second.HostID || first.AgentID != second.AgentID || first.DisplayName != second.DisplayName || first.EnrollmentRevision != second.EnrollmentRevision || len(first.Labels) != len(second.Labels) {
+	if first.Scope != second.Scope || first.HostID != second.HostID || first.AgentID != second.AgentID || first.DisplayName != second.DisplayName || first.EnrollmentRevision != second.EnrollmentRevision || first.Generation != second.Generation || len(first.Labels) != len(second.Labels) {
 		return false
 	}
 	for key, value := range first.Labels {
@@ -309,14 +361,18 @@ func resolveEnrollment(ctx context.Context, querier enrollmentRowQuerier, query 
 	var grant EnrollmentGrant
 	var labels []byte
 	var revision int64
+	var generation int64
 	var consumedAt sql.NullTime
 	var active bool
 	var issuanceDigest, certificatePEM, chainPEM []byte
 	var issuanceExpiresAt, issuedAt sql.NullTime
-	var issuanceRevision sql.NullInt64
+	var issuanceRevision, credentialGeneration sql.NullInt64
+	var certificateFingerprint []byte
+	var certificateSerial sql.NullString
 	err := querier.QueryRowContext(ctx, query, key.TokenHash[:]).Scan(
 		&grant.Scope.TenantID, &grant.Scope.ProjectID, &grant.HostID, &grant.AgentID, &grant.DisplayName, &labels, &revision,
-		&consumedAt, &active, &issuanceDigest, &certificatePEM, &chainPEM, &issuanceExpiresAt, &issuedAt, &issuanceRevision,
+		&consumedAt, &active, &generation, &issuanceDigest, &certificatePEM, &chainPEM, &issuanceExpiresAt, &issuedAt, &issuanceRevision,
+		&credentialGeneration, &certificateFingerprint, &certificateSerial,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EnrollmentResolution{}, ErrEnrollmentTokenInvalid
@@ -324,23 +380,24 @@ func resolveEnrollment(ctx context.Context, querier enrollmentRowQuerier, query 
 	if err != nil {
 		return EnrollmentResolution{}, mapPostgresError(err)
 	}
-	if revision < 1 || json.Unmarshal(labels, &grant.Labels) != nil {
+	if revision < 1 || generation < 1 || json.Unmarshal(labels, &grant.Labels) != nil {
 		return EnrollmentResolution{}, ErrEnrollmentRequestInvalid
 	}
-	grant.EnrollmentRevision = uint64(revision)
+	grant.EnrollmentRevision, grant.Generation = uint64(revision), uint64(generation)
 	if grant.Validate() != nil || grant.AgentID != key.AgentID || (key.HostID != "" && grant.HostID != key.HostID) {
 		return EnrollmentResolution{}, ErrEnrollmentTokenInvalid
 	}
 	if len(issuanceDigest) != 0 {
 		if len(issuanceDigest) != len(key.CSRDigest) || !bytes.Equal(issuanceDigest, key.CSRDigest[:]) || !consumedAt.Valid ||
-			len(certificatePEM) == 0 || len(chainPEM) == 0 || !issuanceExpiresAt.Valid || !issuedAt.Valid || !issuanceRevision.Valid || issuanceRevision.Int64 < 1 {
+			len(certificatePEM) == 0 || len(chainPEM) == 0 || !issuanceExpiresAt.Valid || !issuedAt.Valid || !issuanceRevision.Valid || issuanceRevision.Int64 < 1 || !credentialGeneration.Valid || credentialGeneration.Int64 != generation || len(certificateFingerprint) != sha256.Size || !certificateSerial.Valid || certificateSerial.String == "" {
 			return EnrollmentResolution{}, ErrEnrollmentTokenInvalid
 		}
 		response := EnrollResult{
 			HostID: grant.HostID, AgentID: grant.AgentID, CertificatePEM: append([]byte(nil), certificatePEM...),
 			CertificateChainPEM: append([]byte(nil), chainPEM...), ExpiresAt: issuanceExpiresAt.Time.UTC(),
-			EnrollmentRevision: uint64(issuanceRevision.Int64),
+			EnrollmentRevision: uint64(issuanceRevision.Int64), CredentialGeneration: uint64(credentialGeneration.Int64), CertificateSerial: certificateSerial.String,
 		}
+		copy(response.CertificateFingerprint[:], certificateFingerprint)
 		if validateEnrollmentResult(response, grant) != nil {
 			return EnrollmentResolution{}, ErrEnrollmentRequestInvalid
 		}
