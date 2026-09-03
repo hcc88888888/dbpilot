@@ -319,6 +319,30 @@ func TestDatabaseInstancePostgresPagesUpdatesAndRetiresWithCAS(t *testing.T) {
 	require.Equal(t, 1, retireAudits)
 }
 
+func TestDatabaseInstancePostgresCredentialChangeInvalidatesPriorConnectionSuccess(t *testing.T) {
+	database, scope, hostID, agentID := databaseInstancePostgresFixture(t)
+	ctx := context.Background()
+	repository := NewPostgresRepository(database)
+	candidateID := insertCurrentCandidate(t, database, scope, hostID, agentID, "candidate-credential-reset", "127.0.0.1:3340", "mysql-reset.service", 31)
+	request := integrationAcceptRequest("credential-reset-accept", 31)
+	request.Endpoint = "127.0.0.1:3340"
+	request.Audit.RequestFingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	instance, err := repository.AcceptCandidate(ctx, scope, candidateID, request)
+	require.NoError(t, err)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, err = database.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state='plugin_available',connection_test_status='succeeded',connection_test_at=$1,management_status='managed' WHERE tenant_id=$2 AND project_id=$3 AND instance_id=$4`, now, scope.TenantID, scope.ProjectID, instance.ID)
+	require.NoError(t, err)
+	instance, err = repository.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	credential := "secret://vault/database/mysql/rotated"
+	updated, err := repository.Update(ctx, scope, instance.ID, instance.Revision, Update{CredentialRef: &credential, Audit: MutationAudit{Actor: "operator", OperationID: "updateDatabaseInstance", IdempotencyKey: "credential-reset", RequestFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", RequestID: "request-reset"}})
+	require.NoError(t, err)
+	require.Equal(t, ConnectionNotTested, updated.ConnectionTestStatus)
+	require.Nil(t, updated.ConnectionTestAt)
+	require.Empty(t, updated.ConnectionTestErrorCode)
+	require.Equal(t, StatusProvisioning, updated.ManagementStatus)
+}
+
 func TestDatabaseInstancePostgresRetiredCandidateRequiresExplicitReactivation(t *testing.T) {
 	database, scope, hostID, agentID := databaseInstancePostgresFixture(t)
 	ctx := context.Background()

@@ -93,6 +93,8 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusUnprocessableEntity, "template_capacity", "Metric template publication capacity is exceeded"
 	case errors.Is(err, databaseinstance.ErrPluginMissing):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_not_installed", "Database plugin is not installed"
+	case errors.Is(err, databaseinstance.ErrPluginUnavailable):
+		status, code, title = http.StatusUnprocessableEntity, "plugin_unavailable", "Database plugin is unavailable"
 	case errors.Is(err, plugincatalog.ErrManifestRejected):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_manifest_rejected", "Plugin manifest was rejected"
 	case errors.Is(err, plugincatalog.ErrSignatureRejected), errors.Is(err, plugincatalog.ErrUnknownPublisher):

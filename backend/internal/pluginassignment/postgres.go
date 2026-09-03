@@ -711,21 +711,48 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
 			rollback()
 			return mapError(err)
 		}
-		validatedInstances := observed.ProcessState == ProcessRunning && observed.Health == HealthHealthy && observed.InstalledVersion == value.DesiredVersion && observed.ActiveConfigurationRevision == value.ConfigurationRevision && observed.ObservedOperationRevision == value.OperationRevision && observed.BoundInstanceCount == uint32(len(value.InstanceIDs)) && value.DesiredState == DesiredRunning
-		if validatedInstances {
-			result, updateErr := tx.ExecContext(ctx, `UPDATE managed_database_instances instance SET management_status=CASE WHEN instance.management_status IN ('managed','monitoring') THEN instance.management_status ELSE 'managed' END,revision=CASE WHEN instance.management_status IN ('managed','monitoring') THEN instance.revision ELSE instance.revision+1 END,updated_at=CASE WHEN instance.management_status IN ('managed','monitoring') THEN instance.updated_at ELSE $1 END FROM plugin_assignment_instances binding WHERE binding.tenant_id=$2 AND binding.project_id=$3 AND binding.assignment_id=$4 AND binding.instance_id=instance.instance_id AND instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.host_id=$5 AND instance.agent_id=$6 AND instance.database_family=$7 AND instance.plugin_assignment_revision=$8 AND instance.management_status<>'retired'`, receivedAt, value.Scope.TenantID, value.Scope.ProjectID, value.ID, value.HostID, value.AgentID, value.DatabaseFamily, value.ConfigurationRevision)
-			if updateErr != nil {
-				rollback()
-				return mapError(updateErr)
-			}
-			rows, rowsErr := result.RowsAffected()
-			if rowsErr != nil || rows != int64(len(value.InstanceIDs)) {
-				rollback()
-				return ErrConflict
-			}
+		capabilityState, lifecycleMode := instanceLifecycleObservation(value, observed)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE managed_database_instances instance SET capability_state=$1,management_status=CASE
+            WHEN $2='healthy' THEN CASE
+                WHEN instance.connection_test_status='succeeded' AND instance.management_status='monitoring' THEN 'monitoring'
+                WHEN instance.connection_test_status='succeeded' THEN 'managed'
+                WHEN instance.management_status IN ('connection_testing','authentication_failed','tls_failed','unreachable','unsupported_version') THEN instance.management_status
+                ELSE 'provisioning' END
+            WHEN $2='degraded' THEN CASE WHEN instance.management_status IN ('managed','monitoring','degraded','offline') THEN 'degraded' ELSE instance.management_status END
+            WHEN $2='unavailable' THEN CASE WHEN instance.management_status IN ('managed','monitoring','degraded','offline') THEN 'offline' ELSE instance.management_status END
+            ELSE CASE WHEN instance.management_status IN ('connection_testing','authentication_failed','tls_failed','unreachable','unsupported_version') THEN instance.management_status ELSE 'plugin_failed' END END,
+            revision=instance.revision+1,updated_at=$3
+        FROM plugin_assignment_instances binding
+        WHERE binding.tenant_id=$4 AND binding.project_id=$5 AND binding.assignment_id=$6 AND binding.instance_id=instance.instance_id
+          AND instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.host_id=$7 AND instance.agent_id=$8
+          AND instance.database_family=$9 AND instance.plugin_assignment_revision=$10 AND instance.management_status<>'retired'`, capabilityState, lifecycleMode, receivedAt, value.Scope.TenantID, value.Scope.ProjectID, value.ID, value.HostID, value.AgentID, value.DatabaseFamily, value.ConfigurationRevision)
+		if updateErr != nil {
+			rollback()
+			return mapError(updateErr)
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil || rows != int64(len(value.InstanceIDs)) {
+			rollback()
+			return ErrConflict
 		}
 	}
 	return repository.commit(tx)
+}
+
+func instanceLifecycleObservation(assignment Assignment, observed ObservedState) (string, string) {
+	exact := observed.InstalledVersion == assignment.DesiredVersion && observed.ActiveConfigurationRevision == assignment.ConfigurationRevision && observed.ObservedOperationRevision == assignment.OperationRevision && observed.BoundInstanceCount == uint32(len(assignment.InstanceIDs)) && assignment.DesiredState == DesiredRunning
+	if exact && observed.ProcessState == ProcessRunning && observed.Health == HealthHealthy {
+		return "plugin_available", "healthy"
+	}
+	if exact && (observed.ProcessState == ProcessRunning || observed.ProcessState == ProcessDegraded) && observed.Health == HealthDegraded {
+		return "degraded", "degraded"
+	}
+	switch observed.ProcessState {
+	case ProcessAbsent, ProcessInstalled, ProcessStopped:
+		return "plugin_unavailable", "unavailable"
+	default:
+		return "plugin_failed", "failed"
+	}
 }
 
 func (repository *PostgresRepository) getObservation(ctx context.Context, scope platformscope.Scope, id string) (ObservedState, error) {

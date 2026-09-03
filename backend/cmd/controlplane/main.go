@@ -649,7 +649,8 @@ func NewServer(config Config) (*Server, error) {
 			return nil, fmt.Errorf("configure plugin artifact content: %w", err)
 		}
 	}
-	databaseInstanceService := databaseinstance.NewService(databaseinstance.NewPostgresRepositoryWithProvisioner(database, acceptanceProvisioner))
+	databaseInstanceRepository := databaseinstance.NewPostgresRepositoryWithRuntime(database, acceptanceProvisioner, jobRepository)
+	databaseInstanceService := databaseinstance.NewService(databaseInstanceRepository)
 	var credentialLeaseIssuer agentcontrol.CredentialLeaseIssueService
 	var leaseService *credentiallease.ApplicationService
 	if config.CredentialLeases.Enabled {
@@ -821,8 +822,9 @@ func NewServer(config Config) (*Server, error) {
 	commandLifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
 		TargetAuthorizer: targetAuthorizer, TokenProtector: commandTokenProtector,
-		TypedResultRecorder: metricTrialResultRecorder{Store: metricRepository},
-		OnError:             func(err error) { log.Printf("command lifecycle event failed: %v", err) },
+		TypedResultRecorder:     metricTrialResultRecorder{Store: metricRepository},
+		DatabaseInstanceResults: databaseInstanceResultRecorder{Store: databaseInstanceRepository},
+		OnError:                 func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {
 		if artifactBlobs != nil {

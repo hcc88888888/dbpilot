@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
@@ -49,6 +50,9 @@ func (repository *stubRepository) Update(context.Context, platformscope.Scope, s
 }
 func (repository *stubRepository) Retire(context.Context, platformscope.Scope, string, uint64, MutationAudit) (Instance, error) {
 	return validInstance(), nil
+}
+func (repository *stubRepository) StartValidation(context.Context, platformscope.Scope, string, ValidationRequest) (job.Job, error) {
+	return job.Job{}, ErrPluginUnavailable
 }
 
 var _ Repository = (*stubRepository)(nil)

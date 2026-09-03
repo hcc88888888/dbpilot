@@ -1009,6 +1009,56 @@ func TestInvalidMetricTrialIsClassifiedBeforeTerminalCAS(t *testing.T) {
 	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
 }
 
+func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCode(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-instance-validation", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+
+	fixture.lifecycle.Progress(context.Background(), "agent-a", &agentv1.CommandProgress{CommandId: message.ID, Percent: 10, ExecutionToken: token, LeaseRevision: 1})
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "instance_authentication_failed", ExecutionToken: token, LeaseRevision: 1})
+
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.Equal(t, 1, recorder.progressCalls)
+	require.Equal(t, 1, recorder.resultCalls)
+	require.Equal(t, "instance-a", recorder.command.GetInstanceId())
+	require.Equal(t, "instance_authentication_failed", recorder.result.GetErrorCode())
+
+	raw := fixture.message(t, "command-instance-raw", "agent-a")
+	raw.Payload = payload
+	fixture.persistence.messages[raw.ID] = raw
+	rawToken := fixture.fenceMessage(t, raw.ID)
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: raw.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "password=raw", ExecutionToken: rawToken, LeaseRevision: 1})
+	require.ErrorIs(t, err, ErrInvalidCommandPayload)
+	require.Equal(t, CommandActive, fixture.persistence.messages[raw.ID].CommandStatus)
+}
+
+type recordingDatabaseValidationRecorder struct {
+	progressCalls int
+	resultCalls   int
+	command       *agentv1.ValidateDatabaseInstance
+	result        *agentv1.CommandResult
+}
+
+func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValidationProgress(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, _ time.Time) error {
+	recorder.progressCalls++
+	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
+	return nil
+}
+func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValidationResult(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, _ time.Time) error {
+	recorder.resultCalls++
+	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
+	recorder.result = proto.Clone(result).(*agentv1.CommandResult)
+	return nil
+}
+
 func TestFailedHighCardinalityTrialTerminalizesRunningJob(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-high-cardinality"}

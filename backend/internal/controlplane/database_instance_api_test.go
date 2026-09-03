@@ -12,6 +12,7 @@ import (
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
@@ -90,7 +91,7 @@ func TestDatabaseInstanceAPIRetiredCandidateOnlyReplaysOriginalHistoricalRespons
 }
 
 func TestDatabaseInstanceAPIListsUpdatesRetiresAndReturnsFixedPluginMissingProblem(t *testing.T) {
-	instances := &databaseInstanceAPIService{instance: controlplaneDatabaseInstance()}
+	instances := &databaseInstanceAPIService{instance: controlplaneDatabaseInstance(), validationErr: databaseinstance.ErrPluginMissing}
 	services := Services{DatabaseInstances: instances}
 	list := servePlatformRequest(services, principalWith(platformTestScope, openapi.PermissionListDatabaseInstances), httptest.NewRequest(http.MethodGet, platformBasePath+"/database-instances?database_family=mysql&limit=1", nil))
 	require.Equal(t, http.StatusOK, list.Code, list.Body.String())
@@ -123,6 +124,49 @@ func TestDatabaseInstanceAPIListsUpdatesRetiresAndReturnsFixedPluginMissingProbl
 	require.Equal(t, `"3"`, retired.Header().Get("ETag"))
 }
 
+func TestDatabaseInstanceConnectionTestReturnsDurableJobAndMapsInternalRunningState(t *testing.T) {
+	now := time.Date(2026, 9, 4, 5, 0, 0, 0, time.UTC)
+	instance := controlplaneDatabaseInstance()
+	instance.PluginID, instance.PluginAssignmentRevision = "mysql", 7
+	instance.CapabilityState = databaseinstance.CapabilityPluginAvailable
+	service := &databaseInstanceAPIService{instance: instance, validationJob: job.Job{ID: "job-validate-a", Type: "database_instance.validate", Scope: platformTestScope, Status: job.StatusQueued, Outcome: job.OutcomeNone, InstanceID: instance.ID, TargetResourceIDs: []string{instance.AgentID}, InitiatedBy: "trusted-user", SourceResource: job.ResourceReference{ResourceType: "database_instance", ResourceID: instance.ID}, IdempotencyKey: "internal-a", Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: now, RequestID: "request-a", TraceID: "trace-a"}}
+	request := httptest.NewRequest(http.MethodPost, platformBasePath+"/database-instances/instance-1/actions/test-connection", nil)
+	request.Header.Set("Idempotency-Key", "validate-a")
+
+	response := servePlatformRequest(Services{DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionTestDatabaseInstanceConnection), request)
+
+	require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+	require.Equal(t, `"1"`, response.Header().Get("ETag"))
+	require.Equal(t, platformBasePath+"/jobs/job-validate-a", response.Header().Get("Location"))
+	require.Equal(t, "trusted-user", service.validationRequest.Audit.Actor)
+	require.Equal(t, "testDatabaseInstanceConnection", service.validationRequest.Audit.OperationID)
+	require.NotEmpty(t, service.validationRequest.Audit.RequestFingerprint)
+
+	running := instance
+	running.ConnectionTestStatus = databaseinstance.ConnectionRunning
+	running.ConnectionTestAt = &now
+	running.ManagementStatus = databaseinstance.StatusConnectionTesting
+	service.instance = running
+	get := servePlatformRequest(Services{DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionGetDatabaseInstance), httptest.NewRequest(http.MethodGet, platformBasePath+"/database-instances/instance-1", nil))
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	var body openapi.ManagedDatabaseInstance
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &body))
+	require.Equal(t, openapi.ConnectionTestStatusPending, body.ConnectionTestStatus)
+
+	pluginFailed := instance
+	pluginFailed.ConnectionTestStatus = databaseinstance.ConnectionPluginFailed
+	pluginFailed.ConnectionTestErrorCode = databaseinstance.ConnectionErrorPlugin
+	pluginFailed.ConnectionTestAt = &now
+	pluginFailed.CapabilityState = databaseinstance.CapabilityPluginFailed
+	pluginFailed.ManagementStatus = databaseinstance.StatusPluginFailed
+	service.instance = pluginFailed
+	get = servePlatformRequest(Services{DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionGetDatabaseInstance), httptest.NewRequest(http.MethodGet, platformBasePath+"/database-instances/instance-1", nil))
+	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
+	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &body))
+	require.Equal(t, openapi.ConnectionTestStatusNotTested, body.ConnectionTestStatus, "the v1 contract has no plugin failure member; capability and management state carry that failure")
+	require.Contains(t, body.Capabilities, "plugin_failed")
+}
+
 type databaseInstanceAPIService struct {
 	instance          databaseinstance.Instance
 	acceptScope       platformscope.Scope
@@ -130,6 +174,9 @@ type databaseInstanceAPIService struct {
 	acceptRequest     databaseinstance.AcceptCandidateRequest
 	acceptResponses   map[string]databaseinstance.Instance
 	acceptErrors      map[string]error
+	validationJob     job.Job
+	validationErr     error
+	validationRequest databaseinstance.ValidationRequest
 }
 
 func (service *databaseInstanceAPIService) AcceptCandidate(_ context.Context, scope platformscope.Scope, candidateID string, request databaseinstance.AcceptCandidateRequest) (databaseinstance.Instance, error) {
@@ -170,6 +217,10 @@ func (service *databaseInstanceAPIService) Retire(_ context.Context, scope platf
 	value.RetiredAt = &retired
 	service.instance = value
 	return value, nil
+}
+func (service *databaseInstanceAPIService) StartValidation(_ context.Context, _ platformscope.Scope, _ string, request databaseinstance.ValidationRequest) (job.Job, error) {
+	service.validationRequest = request
+	return service.validationJob, service.validationErr
 }
 
 func controlplaneDatabaseInstance() databaseinstance.Instance {

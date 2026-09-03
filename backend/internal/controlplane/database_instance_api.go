@@ -3,12 +3,19 @@ package controlplane
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
+	"dbpilot.local/platform/internal/idempotency"
+	"dbpilot.local/platform/internal/job"
+	"dbpilot.local/platform/internal/platformscope"
 )
 
 func (api platformAPI) AcceptDiscoveryCandidate(ctx context.Context, request openapi.AcceptDiscoveryCandidateRequestObject) (openapi.AcceptDiscoveryCandidateResponseObject, error) {
@@ -204,21 +211,51 @@ func (api platformAPI) TestDatabaseInstanceConnection(ctx context.Context, reque
 	if api.services.DatabaseInstances == nil {
 		return nil, ErrServiceUnavailable
 	}
-	scope, _, err := platformRequestIdentity(ctx)
+	scope, principal, err := platformRequestIdentity(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if !validIdempotencyKey(request.Params.IdempotencyKey) {
 		return nil, ErrInvalidRequest
 	}
-	value, err := api.services.DatabaseInstances.Get(ctx, scope, request.InstanceId)
+	fingerprint, err := platformIdempotencyFingerprint(ctx, "testDatabaseInstanceConnection", request.InstanceId, "")
 	if err != nil {
 		return nil, err
 	}
-	if value.CapabilityState == databaseinstance.CapabilityPluginNotInstalled || value.PluginID == "" || value.PluginAssignmentRevision == 0 {
-		return nil, databaseinstance.ErrPluginMissing
+	value, err := api.services.DatabaseInstances.StartValidation(ctx, scope, request.InstanceId, databaseinstance.ValidationRequest{Audit: instanceMutationAudit(ctx, principal, "testDatabaseInstanceConnection", request.Params.IdempotencyKey, fingerprint)})
+	if err != nil {
+		return nil, err
 	}
-	return nil, ErrServiceUnavailable
+	stored, err := storedDatabaseInstanceValidationResponse(value, scope, request.InstanceId)
+	if err != nil {
+		return nil, err
+	}
+	return databaseInstanceValidationResponse{response: stored}, nil
+}
+
+type databaseInstanceValidationResponse struct{ response idempotency.Response }
+
+func (response databaseInstanceValidationResponse) VisitTestDatabaseInstanceConnectionResponse(writer http.ResponseWriter) error {
+	return writeIdempotencyResponse(writer, response.response)
+}
+
+func storedDatabaseInstanceValidationResponse(value job.Job, scope platformscope.Scope, instanceID string) (idempotency.Response, error) {
+	if value.Scope != scope || value.Type != "database_instance.validate" || value.InstanceID != instanceID || value.SourceResource != (job.ResourceReference{ResourceType: "database_instance", ResourceID: instanceID}) || value.Version < 1 {
+		return idempotency.Response{}, errors.New("stored database instance validation Job is invalid")
+	}
+	body, err := openAPIJob(value)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("ETag", entityTag(value.Version))
+	headers.Set("Location", fmt.Sprintf("/api/v1/tenants/%s/projects/%s/jobs/%s", url.PathEscape(scope.TenantID), url.PathEscape(scope.ProjectID), url.PathEscape(value.ID)))
+	return idempotency.Response{Status: http.StatusAccepted, Header: headers, Body: encoded}, nil
 }
 
 func instanceMutationAudit(ctx context.Context, principal Principal, operationID, key, fingerprint string) databaseinstance.MutationAudit {
@@ -242,6 +279,11 @@ func openAPIManagedDatabaseInstance(value databaseinstance.Instance) (openapi.Ma
 	}
 	status := openapi.DatabaseManagementStatus(value.ManagementStatus)
 	connection := openapi.ConnectionTestStatus(value.ConnectionTestStatus)
+	if value.ConnectionTestStatus == databaseinstance.ConnectionQueued || value.ConnectionTestStatus == databaseinstance.ConnectionRunning {
+		connection = openapi.ConnectionTestStatusPending
+	} else if value.ConnectionTestStatus == databaseinstance.ConnectionPluginFailed {
+		connection = openapi.ConnectionTestStatusNotTested
+	}
 	if !status.Valid() || !connection.Valid() {
 		return openapi.ManagedDatabaseInstance{}, databaseinstance.ErrInvalid
 	}

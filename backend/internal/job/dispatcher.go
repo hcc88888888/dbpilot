@@ -92,19 +92,20 @@ type CommandAuditRecorder interface {
 }
 
 type CommandLifecycleConfig struct {
-	DispatchRepository  DispatchRepository
-	Jobs                Repository
-	Agents              agentcontrol.Dispatcher
-	Signer              CommandSigner
-	Audit               CommandAuditRecorder
-	ClaimLimit          int
-	Now                 func() time.Time
-	NonceReader         io.Reader
-	TokenReader         io.Reader
-	TokenProtector      TokenProtector
-	OnError             func(error)
-	TargetAuthorizer    commandvalidation.TargetAuthorizer
-	TypedResultRecorder CommandTypedResultRecorder
+	DispatchRepository      DispatchRepository
+	Jobs                    Repository
+	Agents                  agentcontrol.Dispatcher
+	Signer                  CommandSigner
+	Audit                   CommandAuditRecorder
+	ClaimLimit              int
+	Now                     func() time.Time
+	NonceReader             io.Reader
+	TokenReader             io.Reader
+	TokenProtector          TokenProtector
+	OnError                 func(error)
+	TargetAuthorizer        commandvalidation.TargetAuthorizer
+	TypedResultRecorder     CommandTypedResultRecorder
+	DatabaseInstanceResults CommandDatabaseInstanceResultRecorder
 }
 
 type CommandTypedResultRecorder interface {
@@ -112,24 +113,30 @@ type CommandTypedResultRecorder interface {
 	RecordMetricTemplateTrial(context.Context, platformscope.Scope, string, string, *agentv1.CollectDatabaseMetrics, *agentv1.CommandResult, time.Time) error
 }
 
+type CommandDatabaseInstanceResultRecorder interface {
+	RecordDatabaseInstanceValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
+	RecordDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, time.Time) error
+}
+
 // CommandLifecycle is both the periodic transactional-outbox worker and the
 // AgentControl observer. Every callback resolves command correlation from the
 // durable outbox row; no process-local command map is authoritative.
 type CommandLifecycle struct {
-	dispatchRepository  DispatchRepository
-	jobs                Repository
-	agents              agentcontrol.Dispatcher
-	signer              CommandSigner
-	audit               CommandAuditRecorder
-	claimLimit          int
-	now                 func() time.Time
-	nonceReader         io.Reader
-	tokenReader         io.Reader
-	tokenProtector      TokenProtector
-	onError             func(error)
-	targetAuthorizer    commandvalidation.TargetAuthorizer
-	typedResultRecorder CommandTypedResultRecorder
-	transitionStripes   [64]sync.Mutex
+	dispatchRepository      DispatchRepository
+	jobs                    Repository
+	agents                  agentcontrol.Dispatcher
+	signer                  CommandSigner
+	audit                   CommandAuditRecorder
+	claimLimit              int
+	now                     func() time.Time
+	nonceReader             io.Reader
+	tokenReader             io.Reader
+	tokenProtector          TokenProtector
+	onError                 func(error)
+	targetAuthorizer        commandvalidation.TargetAuthorizer
+	typedResultRecorder     CommandTypedResultRecorder
+	databaseInstanceResults CommandDatabaseInstanceResultRecorder
+	transitionStripes       [64]sync.Mutex
 }
 
 func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, error) {
@@ -158,8 +165,9 @@ func NewCommandLifecycle(config CommandLifecycleConfig) (*CommandLifecycle, erro
 		dispatchRepository: config.DispatchRepository, jobs: config.Jobs, agents: config.Agents,
 		signer: config.Signer, audit: config.Audit, claimLimit: config.ClaimLimit,
 		now: config.Now, nonceReader: config.NonceReader, tokenReader: config.TokenReader, tokenProtector: config.TokenProtector, onError: config.OnError,
-		targetAuthorizer:    config.TargetAuthorizer,
-		typedResultRecorder: config.TypedResultRecorder,
+		targetAuthorizer:        config.TargetAuthorizer,
+		typedResultRecorder:     config.TypedResultRecorder,
+		databaseInstanceResults: config.DatabaseInstanceResults,
 	}, nil
 }
 
@@ -948,6 +956,25 @@ func (lifecycle *CommandLifecycle) Progress(ctx context.Context, agentID string,
 			return
 		}
 	}
+	envelope, decodeErr := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	if decodeErr != nil {
+		lifecycle.onError(decodeErr)
+		return
+	}
+	if envelope.GetAgentId() != agentID || message.TargetID != agentID {
+		lifecycle.onError(ErrCommandAgentMismatch)
+		return
+	}
+	if command := envelope.GetValidateDatabaseInstance(); command != nil {
+		if lifecycle.databaseInstanceResults == nil {
+			lifecycle.onError(ErrInvalidCommandPayload)
+			return
+		}
+		if err := lifecycle.databaseInstanceResults.RecordDatabaseInstanceValidationProgress(ctx, message.Scope, message.JobID, message.ID, command, lifecycle.currentTime()); err != nil {
+			lifecycle.onError(err)
+			return
+		}
+	}
 	lifecycle.observe(ctx, agentID, progress.GetCommandId(), "command.progress", "success", TargetResult{Status: TargetRunning}, map[string]any{"percent": progress.GetPercent()})
 }
 
@@ -1010,6 +1037,10 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	target.TargetID = message.TargetID
 	at := lifecycle.currentTime()
 	trialCommand := envelope.GetCollectDatabaseMetrics()
+	validationCommand := envelope.GetValidateDatabaseInstance()
+	if validationCommand != nil && (lifecycle.databaseInstanceResults == nil || !validDatabaseInstanceValidationResult(result)) {
+		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
+	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if lifecycle.typedResultRecorder == nil {
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
@@ -1046,6 +1077,11 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
 	}
+	if validationCommand != nil {
+		if err := lifecycle.databaseInstanceResults.RecordDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, validationCommand, result, at); err != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+		}
+	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if err := lifecycle.typedResultRecorder.RecordMetricTemplateTrial(ctx, message.Scope, message.JobID, message.ID, trialCommand, result, at); err != nil {
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
@@ -1080,6 +1116,27 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
 	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
+}
+
+func validDatabaseInstanceValidationResult(result *agentv1.CommandResult) bool {
+	if result == nil {
+		return false
+	}
+	switch result.GetState() {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED:
+		return result.GetErrorCode() == ""
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED:
+		switch result.GetErrorCode() {
+		case "instance_authentication_failed", "instance_tls_failed", "instance_unreachable", "database_version_unsupported", "plugin_failed":
+			return true
+		default:
+			return false
+		}
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return true
+	default:
+		return false
+	}
 }
 
 func matchingTerminalTarget(stored, incoming TargetResult) bool {

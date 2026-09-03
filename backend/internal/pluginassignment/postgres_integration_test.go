@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/databaseinstance"
 	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/hostinventory"
@@ -131,15 +132,17 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	var monitoringInstanceID string
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT instance_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 ORDER BY instance_id LIMIT 1`, scope.TenantID, scope.ProjectID).Scan(&monitoringInstanceID))
-	_, err = database.ExecContext(ctx, `UPDATE managed_database_instances SET management_status='monitoring' WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, monitoringInstanceID)
+	_, err = database.ExecContext(ctx, `UPDATE managed_database_instances SET management_status='monitoring',connection_test_status='succeeded',connection_test_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, monitoringInstanceID, now)
 	require.NoError(t, err)
 	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 2, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 5, ObservedAt: now}
 	require.NoError(t, service.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 5, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
-	var managedInstances, monitoringInstances int
+	var managedInstances, monitoringInstances, provisioningInstances int
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='managed'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&managedInstances))
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='monitoring'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&monitoringInstances))
-	require.Equal(t, 1, managedInstances, "a healthy matching plugin observation promotes newly bound instances")
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='provisioning'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&provisioningInstances))
+	require.Zero(t, managedInstances, "plugin health alone cannot pretend an untested connection is managed")
 	require.Equal(t, 1, monitoringInstances, "a healthy matching plugin observation must not downgrade an already monitored instance")
+	require.Equal(t, 1, provisioningInstances)
 	matching, err := reconciler.Reconcile(ctx, time.Now().UTC(), 10)
 	require.NoError(t, err)
 	require.Zero(t, matching.Enqueued)
@@ -171,6 +174,99 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.NoError(t, err)
 	_, err = reconciler.ReconcileAssignment(ctx, stopping, time.Now().UTC())
 	require.NoError(t, err, "revoked running plugins must still accept a safe stop command")
+}
+
+func TestDatabaseInstanceValidationPostgresLifecycleIsFencedIdempotentAndClassified(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	instances := databaseinstance.NewPostgresRepositoryWithRuntime(database, assignments, jobs)
+	candidateID, accept := insertAssignmentCandidate(t, database, scope, hostID, agentID, "candidate-validation", "127.0.0.1:3310", 15)
+	instance, err := instances.AcceptCandidate(ctx, scope, candidateID, accept)
+	require.NoError(t, err)
+	page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assignment := page.Items[0]
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 1, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 1, ObservedAt: now}
+	require.NoError(t, pluginassignment.NewService(assignments).RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 1, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.CapabilityPluginAvailable, instance.CapabilityState)
+	require.Equal(t, databaseinstance.StatusProvisioning, instance.ManagementStatus, "plugin health cannot skip connection validation")
+
+	validation := databaseinstance.ValidationRequest{Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "testDatabaseInstanceConnection", IdempotencyKey: "validate-auth", RequestFingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RequestID: "request-auth", TraceID: "trace-auth"}}
+	first, err := instances.StartValidation(ctx, scope, instance.ID, validation)
+	require.NoError(t, err)
+	replayed, err := instances.StartValidation(ctx, scope, instance.ID, validation)
+	require.NoError(t, err)
+	require.Equal(t, first.ID, replayed.ID)
+	var commandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, first.ID).Scan(&commandID))
+	command := &agentv1.ValidateDatabaseInstance{AssignmentId: assignment.ID, InstanceId: instance.ID, ConfigurationRevision: assignment.ConfigurationRevision}
+	require.NoError(t, instances.RecordValidationProgress(ctx, scope, first.ID, commandID, command, now.Add(time.Second)))
+	require.NoError(t, instances.RecordValidationResult(ctx, scope, first.ID, commandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(2*time.Second)))
+	require.NoError(t, instances.RecordValidationResult(ctx, scope, first.ID, commandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(3*time.Second)), "terminal retry must be idempotent")
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionAuthenticationFailed, instance.ConnectionTestStatus)
+	require.Equal(t, databaseinstance.ConnectionErrorAuthentication, instance.ConnectionTestErrorCode)
+	require.Equal(t, databaseinstance.StatusAuthenticationFailed, instance.ManagementStatus)
+
+	validation.Audit.IdempotencyKey = "validate-success"
+	validation.Audit.RequestFingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	validation.Audit.RequestID = "request-success"
+	succeeded, err := instances.StartValidation(ctx, scope, instance.ID, validation)
+	require.NoError(t, err)
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, succeeded.ID).Scan(&commandID))
+	require.NoError(t, instances.RecordValidationResult(ctx, scope, succeeded.ID, commandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionSucceeded}, now.Add(4*time.Second)))
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionSucceeded, instance.ConnectionTestStatus)
+	require.Empty(t, instance.ConnectionTestErrorCode)
+	require.Equal(t, databaseinstance.StatusManaged, instance.ManagementStatus)
+
+	assignmentService := pluginassignment.NewService(assignments)
+	for _, transition := range []struct {
+		revision   uint64
+		process    pluginassignment.ProcessState
+		health     pluginassignment.HealthState
+		circuit    pluginassignment.CircuitState
+		capability databaseinstance.CapabilityState
+		management databaseinstance.ManagementStatus
+	}{
+		{2, pluginassignment.ProcessDegraded, pluginassignment.HealthDegraded, pluginassignment.CircuitClosed, databaseinstance.CapabilityDegraded, databaseinstance.StatusDegraded},
+		{3, pluginassignment.ProcessStopped, pluginassignment.HealthUnknown, pluginassignment.CircuitClosed, databaseinstance.CapabilityPluginUnavailable, databaseinstance.StatusOffline},
+		{4, pluginassignment.ProcessCircuitOpen, pluginassignment.HealthUnhealthy, pluginassignment.CircuitOpen, databaseinstance.CapabilityPluginFailed, databaseinstance.StatusPluginFailed},
+		{5, pluginassignment.ProcessRunning, pluginassignment.HealthHealthy, pluginassignment.CircuitClosed, databaseinstance.CapabilityPluginAvailable, databaseinstance.StatusManaged},
+	} {
+		observed.ObservationRevision, observed.ProcessState, observed.Health, observed.CircuitState = transition.revision, transition.process, transition.health, transition.circuit
+		observed.ObservedAt = now.Add(time.Duration(transition.revision) * time.Second)
+		require.NoError(t, assignmentService.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: transition.revision, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: observed.ObservedAt}))
+		instance, err = instances.Get(ctx, scope, instance.ID)
+		require.NoError(t, err)
+		require.Equal(t, transition.capability, instance.CapabilityState)
+		require.Equal(t, transition.management, instance.ManagementStatus)
+	}
+	observed.ObservationRevision = 4
+	require.ErrorIs(t, assignmentService.RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 4, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: observed.ObservedAt}), pluginassignment.ErrStaleObservation)
+
+	var jobsCount, outboxCount, startedAudit, terminalAudit int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND job_type='database_instance.validate'`, scope.TenantID, scope.ProjectID).Scan(&jobsCount))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM command_outbox outbox JOIN jobs value ON value.tenant_id=outbox.tenant_id AND value.project_id=outbox.project_id AND value.id=outbox.job_id WHERE value.tenant_id=$1 AND value.project_id=$2 AND value.job_type='database_instance.validate'`, scope.TenantID, scope.ProjectID).Scan(&outboxCount))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND action='database_instance.connection_test_started'`, scope.TenantID, scope.ProjectID).Scan(&startedAudit))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND action IN ('database_instance.connection_test_succeeded','database_instance.connection_test_failed')`, scope.TenantID, scope.ProjectID).Scan(&terminalAudit))
+	require.Equal(t, 2, jobsCount)
+	require.Equal(t, 2, outboxCount)
+	require.Equal(t, 2, startedAudit)
+	require.Equal(t, 2, terminalAudit)
+	var auditDetails string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT COALESCE(string_agg(detail::text,' '),'') FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND action LIKE 'database_instance.connection_test_%'`, scope.TenantID, scope.ProjectID).Scan(&auditDetails))
+	require.NotContains(t, strings.ToLower(auditDetails), "password")
+	require.NotContains(t, strings.ToLower(auditDetails), "secret://")
+	require.NotContains(t, auditDetails, instance.CredentialRef)
 }
 
 func TestPluginAssignmentLegacyKylinAndCentOSHostsSelectLinuxPackage(t *testing.T) {

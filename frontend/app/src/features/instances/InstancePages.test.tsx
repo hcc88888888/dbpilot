@@ -10,7 +10,7 @@ import { InstanceListPage } from './InstanceListPage';
 const instance: ManagedDatabaseInstance = {
   instanceId: 'db-1', tenantId: 'tenant-a', projectId: 'project-a', hostId: 'host-1', agentId: 'agent-1', databaseFamily: 'mysql', databaseVariant: 'mysql',
   displayName: '订单数据库', endpoint: '10.0.0.8:3306', version: '8.4.2', credentialRef: 'secret://mysql/orders', tlsRef: 'secret://tls/orders',
-  pluginId: 'mysql-observer', desiredPluginVersion: '1.0.0', labels: { env: 'prod' }, capabilities: new Set(['metrics']),
+  pluginId: 'mysql-observer', desiredPluginVersion: '1.0.0', labels: { env: 'prod' }, capabilities: new Set(['metrics', 'plugin_available']),
   connectionTestStatus: 'authentication_failed', connectionTestAt: new Date('2026-09-01T00:05:00Z'), pluginAssignmentRevision: 4,
   managementStatus: 'degraded', etag: '"db-4"',
 };
@@ -71,6 +71,23 @@ describe('Database instance management pages', () => {
     expect(await screen.findByText('queued')).not.toBeNull();
     expect(screen.getByText('没有查看任务进度的权限，仅显示任务创建时状态。')).not.toBeNull();
     expect(client.getJob).not.toHaveBeenCalled();
+  });
+
+  it('disables connection testing when the plugin capability is unavailable', async () => {
+    const client = api();
+    client.getDatabaseInstance = vi.fn(async () => ({ ...instance, capabilities: new Set(['plugin_unavailable']) }));
+    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test']);
+
+    expect((await screen.findByRole('button', { name: '测试连接' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText('当前插件不可用于连接测试。')).not.toBeNull();
+  });
+
+  it('keeps the connection-test button disabled while a test is pending', async () => {
+    const client = api();
+    client.getDatabaseInstance = vi.fn(async () => ({ ...instance, connectionTestStatus: 'pending' }));
+    renderFeature(<InstanceDetailPage instanceId="db-1" api={client} />, ['database-instances:view', 'database-instances:test']);
+
+    expect((await screen.findByRole('button', { name: '测试进行中…' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it.each([

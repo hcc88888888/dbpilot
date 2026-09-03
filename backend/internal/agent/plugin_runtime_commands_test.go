@@ -40,13 +40,15 @@ func TestPluginRuntimeExecutorPreservesFixedValidationFailureWithoutRawError(t *
 	require.NoError(t, err)
 	fence := pluginsupervisor.ExecutionFence{CommandID: "command-a", ExecutionToken: bytesOfAgent(7, sha256.Size), LeaseRevision: 2, StartedAt: time.Now().UTC()}
 	envelope := &agentv1.CommandEnvelope{CommandId: "command-a", Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 8}}}
+	reporter := &fencedProgressReporter{fence: fence}
 
-	result, err := executor.Execute(context.Background(), envelope, &fencedProgressReporter{fence: fence})
+	result, err := executor.Execute(context.Background(), envelope, reporter)
 
 	require.NoError(t, err)
 	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, result.GetState())
 	require.Equal(t, "instance_authentication_failed", result.GetErrorCode())
 	require.NotContains(t, result.GetSummary(), "password")
+	require.Equal(t, []uint32{10, 100}, reporter.percents)
 }
 
 func TestPluginRuntimeExecutorRejectsUnknownCommandAndMissingFence(t *testing.T) {

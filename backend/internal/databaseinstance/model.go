@@ -17,11 +17,12 @@ import (
 const DefaultListLimit = 50
 
 var (
-	ErrInvalid       = errors.New("invalid database instance value")
-	ErrNotFound      = errors.New("database instance not found")
-	ErrConflict      = errors.New("database instance conflict")
-	ErrPrecondition  = errors.New("database instance precondition failed")
-	ErrPluginMissing = errors.New("database plugin is not installed")
+	ErrInvalid           = errors.New("invalid database instance value")
+	ErrNotFound          = errors.New("database instance not found")
+	ErrConflict          = errors.New("database instance conflict")
+	ErrPrecondition      = errors.New("database instance precondition failed")
+	ErrPluginMissing     = errors.New("database plugin is not installed")
+	ErrPluginUnavailable = errors.New("database plugin is unavailable")
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -53,12 +54,36 @@ const (
 type ConnectionTestStatus string
 
 const (
-	ConnectionNotTested ConnectionTestStatus = "not_tested"
+	ConnectionNotTested            ConnectionTestStatus = "not_tested"
+	ConnectionQueued               ConnectionTestStatus = "queued"
+	ConnectionRunning              ConnectionTestStatus = "running"
+	ConnectionSucceeded            ConnectionTestStatus = "succeeded"
+	ConnectionAuthenticationFailed ConnectionTestStatus = "authentication_failed"
+	ConnectionTLSFailed            ConnectionTestStatus = "tls_failed"
+	ConnectionUnreachable          ConnectionTestStatus = "unreachable"
+	ConnectionUnsupportedVersion   ConnectionTestStatus = "unsupported_version"
+	ConnectionPluginFailed         ConnectionTestStatus = "plugin_failed"
 )
 
 type CapabilityState string
 
-const CapabilityPluginNotInstalled CapabilityState = "plugin_not_installed"
+const (
+	CapabilityPluginNotInstalled CapabilityState = "plugin_not_installed"
+	CapabilityPluginAvailable    CapabilityState = "plugin_available"
+	CapabilityPluginUnavailable  CapabilityState = "plugin_unavailable"
+	CapabilityPluginFailed       CapabilityState = "plugin_failed"
+	CapabilityDegraded           CapabilityState = "degraded"
+)
+
+type ConnectionTestErrorCode string
+
+const (
+	ConnectionErrorAuthentication     ConnectionTestErrorCode = "instance_authentication_failed"
+	ConnectionErrorTLS                ConnectionTestErrorCode = "instance_tls_failed"
+	ConnectionErrorUnreachable        ConnectionTestErrorCode = "instance_unreachable"
+	ConnectionErrorUnsupportedVersion ConnectionTestErrorCode = "database_version_unsupported"
+	ConnectionErrorPlugin             ConnectionTestErrorCode = "plugin_failed"
+)
 
 type MutationAudit struct {
 	Actor              string
@@ -124,6 +149,7 @@ type Instance struct {
 	Capabilities             []string
 	CapabilityState          CapabilityState
 	ConnectionTestStatus     ConnectionTestStatus
+	ConnectionTestErrorCode  ConnectionTestErrorCode
 	ConnectionTestAt         *time.Time
 	PluginAssignmentRevision uint64
 	ManagementStatus         ManagementStatus
@@ -134,7 +160,7 @@ type Instance struct {
 }
 
 func (value Instance) Validate() error {
-	if !identifierPattern.MatchString(value.ID) || value.Scope.Validate() != nil || !identifierPattern.MatchString(value.HostID) || !identifierPattern.MatchString(value.AgentID) || !identifierPattern.MatchString(value.CandidateID) || (value.DiscoverySource != discovery.SourceNative && value.DiscoverySource != discovery.SourceDocker) || !fingerprintPattern.MatchString(value.SourceFingerprint) || !bounded(value.SourceIdentity, 512, true) || !familyPattern.MatchString(value.DatabaseFamily) || !variantPattern.MatchString(value.DatabaseVariant) || !bounded(value.DisplayName, 120, true) || !validConnection(value.Endpoint, value.UnixSocket) || !validSecretReference(value.CredentialRef, true) || !validSecretReference(value.TLSRef, false) || !validLabels(value.Labels) || len(value.Capabilities) > 64 || value.CapabilityState != CapabilityPluginNotInstalled || value.ConnectionTestStatus != ConnectionNotTested || !validManagementStatus(value.ManagementStatus) || value.Revision == 0 || !validUTC(value.CreatedAt) || !validUTC(value.UpdatedAt) || value.UpdatedAt.Before(value.CreatedAt) {
+	if !identifierPattern.MatchString(value.ID) || value.Scope.Validate() != nil || !identifierPattern.MatchString(value.HostID) || !identifierPattern.MatchString(value.AgentID) || !identifierPattern.MatchString(value.CandidateID) || (value.DiscoverySource != discovery.SourceNative && value.DiscoverySource != discovery.SourceDocker) || !fingerprintPattern.MatchString(value.SourceFingerprint) || !bounded(value.SourceIdentity, 512, true) || !familyPattern.MatchString(value.DatabaseFamily) || !variantPattern.MatchString(value.DatabaseVariant) || !bounded(value.DisplayName, 120, true) || !validConnection(value.Endpoint, value.UnixSocket) || !validSecretReference(value.CredentialRef, true) || !validSecretReference(value.TLSRef, false) || !validLabels(value.Labels) || len(value.Capabilities) > 64 || !validCapabilityState(value.CapabilityState) || !validConnectionTestState(value.ConnectionTestStatus, value.ConnectionTestErrorCode, value.ConnectionTestAt) || !validManagementStatus(value.ManagementStatus) || value.Revision == 0 || !validUTC(value.CreatedAt) || !validUTC(value.UpdatedAt) || value.UpdatedAt.Before(value.CreatedAt) {
 		return ErrInvalid
 	}
 	for _, capability := range value.Capabilities {
@@ -146,6 +172,40 @@ func (value Instance) Validate() error {
 		return ErrInvalid
 	}
 	return nil
+}
+
+func validCapabilityState(value CapabilityState) bool {
+	switch value {
+	case CapabilityPluginNotInstalled, CapabilityPluginAvailable, CapabilityPluginUnavailable, CapabilityPluginFailed, CapabilityDegraded:
+		return true
+	default:
+		return false
+	}
+}
+
+func validConnectionTestState(status ConnectionTestStatus, code ConnectionTestErrorCode, at *time.Time) bool {
+	if status == ConnectionNotTested {
+		return code == "" && at == nil
+	}
+	if at == nil || !validUTC(*at) {
+		return false
+	}
+	switch status {
+	case ConnectionQueued, ConnectionRunning, ConnectionSucceeded:
+		return code == ""
+	case ConnectionAuthenticationFailed:
+		return code == ConnectionErrorAuthentication
+	case ConnectionTLSFailed:
+		return code == ConnectionErrorTLS
+	case ConnectionUnreachable:
+		return code == ConnectionErrorUnreachable
+	case ConnectionUnsupportedVersion:
+		return code == ConnectionErrorUnsupportedVersion
+	case ConnectionPluginFailed:
+		return code == ConnectionErrorPlugin
+	default:
+		return false
+	}
 }
 
 func (value Instance) FutureAssignmentKey() string {

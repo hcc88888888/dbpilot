@@ -3,7 +3,10 @@ package databaseinstance
 import (
 	"context"
 	"database/sql"
+	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
 
@@ -34,6 +37,7 @@ type Repository interface {
 	Get(context.Context, platformscope.Scope, string) (Instance, error)
 	Update(context.Context, platformscope.Scope, string, uint64, Update) (Instance, error)
 	Retire(context.Context, platformscope.Scope, string, uint64, MutationAudit) (Instance, error)
+	StartValidation(context.Context, platformscope.Scope, string, ValidationRequest) (job.Job, error)
 }
 
 type Service interface {
@@ -42,4 +46,28 @@ type Service interface {
 	Get(context.Context, platformscope.Scope, string) (Instance, error)
 	Update(context.Context, platformscope.Scope, string, uint64, Update) (Instance, error)
 	Retire(context.Context, platformscope.Scope, string, uint64, MutationAudit) (Instance, error)
+	StartValidation(context.Context, platformscope.Scope, string, ValidationRequest) (job.Job, error)
+}
+
+type ValidationJobStore interface {
+	CreateInTx(context.Context, *sql.Tx, job.Job, []job.OutboxMessage) error
+	Get(context.Context, platformscope.Scope, string) (job.Job, error)
+}
+
+type ValidationResult struct {
+	Status    ConnectionTestStatus
+	ErrorCode ConnectionTestErrorCode
+}
+
+func (result ValidationResult) Validate() error {
+	now := time.Now().UTC()
+	if !validConnectionTestState(result.Status, result.ErrorCode, &now) || result.Status == ConnectionQueued || result.Status == ConnectionRunning || result.Status == ConnectionNotTested {
+		return ErrInvalid
+	}
+	return nil
+}
+
+type ValidationResultRecorder interface {
+	RecordValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
+	RecordValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, ValidationResult, time.Time) error
 }

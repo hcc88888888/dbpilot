@@ -3,6 +3,7 @@ package databaseinstance
 import (
 	"context"
 
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
 
@@ -61,6 +62,20 @@ func (service ApplicationService) Retire(ctx context.Context, scope platformscop
 	}
 	value, err := service.Repository.Retire(ctx, scope, instanceID, revision, audit)
 	return checkedInstance(value, err, scope, instanceID)
+}
+
+func (service ApplicationService) StartValidation(ctx context.Context, scope platformscope.Scope, instanceID string, request ValidationRequest) (job.Job, error) {
+	if ctx == nil || service.Repository == nil || scope.Validate() != nil || !identifierPattern.MatchString(instanceID) || request.Validate() != nil {
+		return job.Job{}, ErrInvalid
+	}
+	value, err := service.Repository.StartValidation(ctx, scope, instanceID, request)
+	if err != nil {
+		return job.Job{}, err
+	}
+	if value.Scope != scope || value.InstanceID != instanceID || value.Type != "database_instance.validate" || value.SourceResource != (job.ResourceReference{ResourceType: "database_instance", ResourceID: instanceID}) || value.Version < 1 {
+		return job.Job{}, ErrInvalid
+	}
+	return value, nil
 }
 
 func checkedInstance(value Instance, err error, scope platformscope.Scope, expectedID string) (Instance, error) {

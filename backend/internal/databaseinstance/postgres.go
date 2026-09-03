@@ -16,12 +16,13 @@ import (
 	"github.com/lib/pq"
 )
 
-const instanceColumns = `instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,unix_socket,version_hint,edition,discovered_role,topology,credential_ref,tls_ref,plugin_id,desired_plugin_version,template_profile_id,labels,capabilities,capability_state,connection_test_status,connection_test_at,plugin_assignment_revision,management_status,revision,created_at,updated_at,retired_at`
+const instanceColumns = `instance_id,tenant_id,project_id,host_id,agent_id,candidate_id,discovery_source,source_fingerprint,source_identity,database_family,database_variant,display_name,endpoint,unix_socket,version_hint,edition,discovered_role,topology,credential_ref,tls_ref,plugin_id,desired_plugin_version,template_profile_id,labels,capabilities,capability_state,connection_test_status,connection_test_error_code,connection_test_at,plugin_assignment_revision,management_status,revision,created_at,updated_at,retired_at`
 
 type PostgresRepository struct {
 	database    *sql.DB
 	commit      func(*sql.Tx) error
 	provisioner AcceptanceProvisioner
+	jobs        ValidationJobStore
 }
 
 func NewPostgresRepository(database *sql.DB) *PostgresRepository {
@@ -30,6 +31,10 @@ func NewPostgresRepository(database *sql.DB) *PostgresRepository {
 
 func NewPostgresRepositoryWithProvisioner(database *sql.DB, provisioner AcceptanceProvisioner) *PostgresRepository {
 	return &PostgresRepository{database: database, provisioner: provisioner, commit: func(transaction *sql.Tx) error { return transaction.Commit() }}
+}
+
+func NewPostgresRepositoryWithRuntime(database *sql.DB, provisioner AcceptanceProvisioner, jobs ValidationJobStore) *PostgresRepository {
+	return &PostgresRepository{database: database, provisioner: provisioner, jobs: jobs, commit: func(transaction *sql.Tx) error { return transaction.Commit() }}
 }
 
 func (repository *PostgresRepository) AcceptCandidate(ctx context.Context, scope platformscope.Scope, candidateID string, request AcceptCandidateRequest) (Instance, error) {
@@ -184,7 +189,7 @@ func (repository *PostgresRepository) acceptCandidateOnce(ctx context.Context, s
 	}
 	labels, _ := json.Marshal(value.Labels)
 	capabilities := []byte("[]")
-	_, err = transaction.ExecContext(ctx, `INSERT INTO managed_database_instances (`+instanceColumns+`,canonical_connection) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)`, instanceArgs(value, labels, capabilities, canonicalConnection(value.Endpoint, value.UnixSocket))...)
+	_, err = transaction.ExecContext(ctx, `INSERT INTO managed_database_instances (`+instanceColumns+`,canonical_connection) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)`, instanceArgs(value, labels, capabilities, canonicalConnection(value.Endpoint, value.UnixSocket))...)
 	if err != nil {
 		rollback()
 		return Instance{}, mapPostgresError(err)
@@ -348,6 +353,7 @@ func (repository *PostgresRepository) Update(ctx context.Context, scope platform
 		if update.DisplayName != nil {
 			value.DisplayName = *update.DisplayName
 		}
+		connectionChanged := update.CredentialRef != nil && *update.CredentialRef != value.CredentialRef || update.TLSRef != nil && *update.TLSRef != value.TLSRef || update.DesiredPluginVersion != nil && *update.DesiredPluginVersion != value.DesiredPluginVersion
 		if update.CredentialRef != nil {
 			value.CredentialRef = *update.CredentialRef
 		}
@@ -362,6 +368,12 @@ func (repository *PostgresRepository) Update(ctx context.Context, scope platform
 		}
 		if update.Labels != nil {
 			value.Labels = cloneLabels(*update.Labels)
+		}
+		if connectionChanged {
+			value.ConnectionTestStatus = ConnectionNotTested
+			value.ConnectionTestErrorCode = ""
+			value.ConnectionTestAt = nil
+			value.ManagementStatus = StatusProvisioning
 		}
 		return nil
 	})
@@ -435,7 +447,7 @@ func (repository *PostgresRepository) mutateOnce(ctx context.Context, scope plat
 		return Instance{}, ErrInvalid
 	}
 	labels, _ := json.Marshal(value.Labels)
-	result, err := transaction.ExecContext(ctx, `UPDATE managed_database_instances SET display_name=$4,credential_ref=$5,tls_ref=$6,desired_plugin_version=$7,template_profile_id=$8,labels=$9,management_status=$10,revision=$11,updated_at=$12,retired_at=$13 WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3 AND revision=$14`, scope.TenantID, scope.ProjectID, instanceID, value.DisplayName, value.CredentialRef, value.TLSRef, value.DesiredPluginVersion, value.TemplateProfileID, labels, value.ManagementStatus, value.Revision, now, value.RetiredAt, revision)
+	result, err := transaction.ExecContext(ctx, `UPDATE managed_database_instances SET display_name=$4,credential_ref=$5,tls_ref=$6,desired_plugin_version=$7,template_profile_id=$8,labels=$9,capability_state=$10,connection_test_status=$11,connection_test_error_code=$12,connection_test_at=$13,management_status=$14,revision=$15,updated_at=$16,retired_at=$17 WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3 AND revision=$18`, scope.TenantID, scope.ProjectID, instanceID, value.DisplayName, value.CredentialRef, value.TLSRef, value.DesiredPluginVersion, value.TemplateProfileID, labels, value.CapabilityState, value.ConnectionTestStatus, value.ConnectionTestErrorCode, value.ConnectionTestAt, value.ManagementStatus, value.Revision, now, value.RetiredAt, revision)
 	if err != nil {
 		rollback()
 		return Instance{}, mapPostgresError(err)
@@ -648,7 +660,7 @@ func scanInstance(scanner rowScanner) (Instance, error) {
 	var labels, capabilities []byte
 	var connectionAt, retiredAt sql.NullTime
 	var assignmentRevision, revision int64
-	err := scanner.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.HostID, &value.AgentID, &value.CandidateID, &source, &value.SourceFingerprint, &value.SourceIdentity, &value.DatabaseFamily, &value.DatabaseVariant, &value.DisplayName, &value.Endpoint, &value.UnixSocket, &value.Version, &value.Edition, &value.Role, &value.Topology, &value.CredentialRef, &value.TLSRef, &value.PluginID, &value.DesiredPluginVersion, &value.TemplateProfileID, &labels, &capabilities, &value.CapabilityState, &value.ConnectionTestStatus, &connectionAt, &assignmentRevision, &value.ManagementStatus, &revision, &value.CreatedAt, &value.UpdatedAt, &retiredAt)
+	err := scanner.Scan(&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.HostID, &value.AgentID, &value.CandidateID, &source, &value.SourceFingerprint, &value.SourceIdentity, &value.DatabaseFamily, &value.DatabaseVariant, &value.DisplayName, &value.Endpoint, &value.UnixSocket, &value.Version, &value.Edition, &value.Role, &value.Topology, &value.CredentialRef, &value.TLSRef, &value.PluginID, &value.DesiredPluginVersion, &value.TemplateProfileID, &labels, &capabilities, &value.CapabilityState, &value.ConnectionTestStatus, &value.ConnectionTestErrorCode, &connectionAt, &assignmentRevision, &value.ManagementStatus, &revision, &value.CreatedAt, &value.UpdatedAt, &retiredAt)
 	if err != nil {
 		return Instance{}, err
 	}
@@ -675,7 +687,7 @@ func scanInstance(scanner rowScanner) (Instance, error) {
 }
 
 func instanceArgs(value Instance, labels, capabilities []byte, canonical string) []any {
-	return []any{value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.HostID, value.AgentID, value.CandidateID, value.DiscoverySource, value.SourceFingerprint, value.SourceIdentity, value.DatabaseFamily, value.DatabaseVariant, value.DisplayName, value.Endpoint, value.UnixSocket, value.Version, value.Edition, value.Role, value.Topology, value.CredentialRef, value.TLSRef, value.PluginID, value.DesiredPluginVersion, value.TemplateProfileID, labels, capabilities, value.CapabilityState, value.ConnectionTestStatus, value.ConnectionTestAt, value.PluginAssignmentRevision, value.ManagementStatus, value.Revision, value.CreatedAt, value.UpdatedAt, value.RetiredAt, canonical}
+	return []any{value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.HostID, value.AgentID, value.CandidateID, value.DiscoverySource, value.SourceFingerprint, value.SourceIdentity, value.DatabaseFamily, value.DatabaseVariant, value.DisplayName, value.Endpoint, value.UnixSocket, value.Version, value.Edition, value.Role, value.Topology, value.CredentialRef, value.TLSRef, value.PluginID, value.DesiredPluginVersion, value.TemplateProfileID, labels, capabilities, value.CapabilityState, value.ConnectionTestStatus, value.ConnectionTestErrorCode, value.ConnectionTestAt, value.PluginAssignmentRevision, value.ManagementStatus, value.Revision, value.CreatedAt, value.UpdatedAt, value.RetiredAt, canonical}
 }
 
 func mapPostgresError(err error) error {

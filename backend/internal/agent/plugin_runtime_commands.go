@@ -54,9 +54,15 @@ func (executor *PluginRuntimeExecutor) Execute(ctx context.Context, envelope *ag
 		if command.ValidateDatabaseInstance == nil {
 			return nil, errors.New("database instance validation command is invalid")
 		}
+		if err := reporter.Report(&agentv1.CommandProgress{CommandId: envelope.GetCommandId(), Percent: 10, Stage: "database_validation_running", Message: "database instance validation running"}); err != nil {
+			return nil, err
+		}
 		result, err := executor.runtime.ValidateDatabaseInstance(ctx, command.ValidateDatabaseInstance, fence)
 		if err != nil {
 			return failedPluginRuntimeResult(envelope.GetCommandId(), "plugin_failed", "database instance validation failed"), nil
+		}
+		if err := reporter.Report(&agentv1.CommandProgress{CommandId: envelope.GetCommandId(), Percent: 100, Stage: "database_validation_finished", Message: "database instance validation finished"}); err != nil {
+			return nil, err
 		}
 		if !result.Valid {
 			return failedPluginRuntimeResult(envelope.GetCommandId(), canonicalValidationErrorCode(result.ErrorCode), "database instance validation failed"), nil
