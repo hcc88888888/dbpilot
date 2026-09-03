@@ -195,7 +195,7 @@ func TestDatabaseInstanceValidationPostgresLifecycleIsFencedIdempotentAndClassif
 	instance, err = instances.Get(ctx, scope, instance.ID)
 	require.NoError(t, err)
 	require.Equal(t, databaseinstance.CapabilityPluginAvailable, instance.CapabilityState)
-	require.Equal(t, databaseinstance.StatusProvisioning, instance.ManagementStatus, "plugin health cannot skip connection validation")
+	require.Equal(t, databaseinstance.StatusManaged, instance.ManagementStatus, "plugin availability and connection-test state must remain independent lifecycle facts")
 
 	validation := databaseinstance.ValidationRequest{Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "testDatabaseInstanceConnection", IdempotencyKey: "validate-auth", RequestFingerprint: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", RequestID: "request-auth", TraceID: "trace-auth"}}
 	first, err := instances.StartValidation(ctx, scope, instance.ID, validation)
