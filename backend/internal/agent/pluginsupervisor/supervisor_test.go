@@ -325,6 +325,30 @@ func TestSupervisorRetriesWaitingCredentialsAfterControlSessionReconnect(t *test
 	require.Equal(t, 2, fixture.runner.startCount())
 }
 
+func TestSupervisorControlReconnectWaitsForPersistedRestartToReachDeferredCredentials(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	first, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	state, ok := fixture.store.Get("mysql")
+	require.True(t, ok)
+	state.ProcessState, state.HealthState, state.LastErrorCode = pluginstate.ProcessRestarting, pluginstate.HealthUnhealthy, ""
+	_, err = fixture.store.Put(context.Background(), state)
+	require.NoError(t, err)
+	require.NoError(t, fixture.supervisor.RecoverDeferredPlugins(context.Background()))
+
+	state.ProcessState, state.HealthState, state.LastErrorCode = pluginstate.ProcessRunning, pluginstate.HealthDegraded, "waiting_credentials"
+	_, err = fixture.store.Put(context.Background(), state)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		recovered, exists := fixture.store.Get("mysql")
+		return exists && recovered.ProcessState == pluginstate.ProcessRunning && recovered.HealthState == pluginstate.HealthHealthy && recovered.ProcessID != first.State.ProcessID
+	}, time.Second, time.Millisecond)
+	require.Equal(t, 2, fixture.runner.startCount())
+}
+
 func TestSupervisorRejectsEqualRevisionSemanticConflictAcrossRestart(t *testing.T) {
 	fixture := newSupervisorFixture(t)
 	request := validReconcileRequest()

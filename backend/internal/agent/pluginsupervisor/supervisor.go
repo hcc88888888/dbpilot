@@ -64,6 +64,7 @@ type PluginSupervisor struct {
 	shuttingDown     atomic.Bool
 	refreshPending   atomic.Bool
 	refreshWorker    atomic.Bool
+	deferredRecovery atomic.Bool
 }
 
 type managedProcess struct {
@@ -937,23 +938,53 @@ func (supervisor *PluginSupervisor) RecoverDeferredPlugins(ctx context.Context) 
 	if supervisor == nil || ctx == nil || ctx.Err() != nil {
 		return ErrInvalidRequest
 	}
-	supervisor.mu.Lock()
-	families := make([]string, 0, len(supervisor.running))
-	for family := range supervisor.running {
-		families = append(families, family)
+	supervisor.startDeferredRecoveryWorker()
+	return nil
+}
+
+func (supervisor *PluginSupervisor) startDeferredRecoveryWorker() {
+	if supervisor == nil || supervisor.shuttingDown.Load() || !supervisor.deferredRecovery.CompareAndSwap(false, true) {
+		return
 	}
-	sort.Strings(families)
+	go func() {
+		defer supervisor.deferredRecovery.Store(false)
+		deadline := time.Now().Add(30 * time.Second)
+		for !supervisor.shuttingDown.Load() && time.Now().Before(deadline) {
+			restarted, pending, err := supervisor.recoverDeferredPluginsOnce(context.Background())
+			if restarted || err != nil || !pending {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+}
+
+func (supervisor *PluginSupervisor) recoverDeferredPluginsOnce(ctx context.Context) (bool, bool, error) {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil {
+		return false, false, ErrInvalidRequest
+	}
+	supervisor.mu.Lock()
+	states := supervisor.store.List()
+	sort.Slice(states, func(left, right int) bool { return states[left].DatabaseFamily < states[right].DatabaseFamily })
 	type deferredRestart struct{ family, fingerprint string }
-	restarts := make([]deferredRestart, 0, len(families))
-	for _, family := range families {
+	restarts := make([]deferredRestart, 0, len(states))
+	pending := false
+	for _, state := range states {
+		if state.DesiredState != pluginstate.DesiredRunning {
+			continue
+		}
+		family := state.DatabaseFamily
 		process := supervisor.running[family]
-		state, ok := supervisor.store.Get(family)
-		if !ok || process == nil || state.DesiredState != pluginstate.DesiredRunning || state.ProcessState != pluginstate.ProcessRunning || state.HealthState != pluginstate.HealthDegraded || state.LastErrorCode != "waiting_credentials" {
+		if process == nil || state.ProcessState != pluginstate.ProcessRunning {
+			pending = true
+			continue
+		}
+		if state.HealthState != pluginstate.HealthDegraded || state.LastErrorCode != "waiting_credentials" {
 			continue
 		}
 		if err := supervisor.drainProcess(ctx, process); err != nil {
 			supervisor.mu.Unlock()
-			return err
+			return false, pending, err
 		}
 		delete(supervisor.running, family)
 		state.ProcessState, state.HealthState = pluginstate.ProcessRestarting, pluginstate.HealthUnhealthy
@@ -961,11 +992,11 @@ func (supervisor *PluginSupervisor) RecoverDeferredPlugins(ctx context.Context) 
 		state.ObservationRevision++
 		if state.ObservationRevision == 0 {
 			supervisor.mu.Unlock()
-			return ErrInvalidRequest
+			return false, pending, ErrInvalidRequest
 		}
 		if _, err := supervisor.store.Put(ctx, state); err != nil {
 			supervisor.mu.Unlock()
-			return err
+			return false, pending, err
 		}
 		restarts = append(restarts, deferredRestart{family: family, fingerprint: state.RequestFingerprint})
 	}
@@ -973,7 +1004,7 @@ func (supervisor *PluginSupervisor) RecoverDeferredPlugins(ctx context.Context) 
 	for _, restart := range restarts {
 		go supervisor.restartPersisted(restart.family, restart.fingerprint, 0)
 	}
-	return nil
+	return len(restarts) > 0, pending, nil
 }
 
 // RefreshObservation persists an equivalent, higher-revision snapshot when a
