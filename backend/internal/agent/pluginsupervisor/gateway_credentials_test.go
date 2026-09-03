@@ -143,6 +143,42 @@ func TestGatewayUnexpectedExitFencesBlockedLateLeaseSuccess(t *testing.T) {
 	require.Empty(t, checker.leaseFlights)
 }
 
+func TestMetricStreamFailureOwnershipArmsOrObservesCompletionAtomically(t *testing.T) {
+	t.Run("failure completes between ready and arm", func(t *testing.T) {
+		process := &fakeProcess{pid: 4401}
+		handle := &metricStreamHandle{cancel: func() {}, done: make(chan struct{})}
+		release := make(chan struct{})
+		go func() {
+			<-release
+			handle.complete(ErrHealthHandshake, true, process)
+		}()
+		close(release)
+		<-handle.done
+
+		require.ErrorIs(t, handle.armOrKill(process), ErrHealthHandshake)
+		require.True(t, process.stopped, "arm must observe and own an already completed failed stream")
+	})
+
+	t.Run("failure after arm", func(t *testing.T) {
+		process := &fakeProcess{pid: 4402}
+		handle := &metricStreamHandle{cancel: func() {}, done: make(chan struct{})}
+		require.NoError(t, handle.armOrKill(process))
+
+		handle.complete(ErrHealthHandshake, true, process)
+
+		require.True(t, process.stopped, "a successful arm must own every later unexpected failure")
+	})
+
+	t.Run("failure before ready with initial ownership", func(t *testing.T) {
+		process := &fakeProcess{pid: 4403}
+		handle := &metricStreamHandle{cancel: func() {}, done: make(chan struct{}), killOnFailure: true}
+
+		handle.complete(ErrHealthHandshake, true, process)
+
+		require.True(t, process.stopped, "the initial stream owner must kill a pre-ready failure")
+	})
+}
+
 type slowCredentialLeaser struct {
 	calls    atomic.Int32
 	release  chan struct{}

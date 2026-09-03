@@ -451,6 +451,71 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
   }
 });
 
+test('PowerShell 5.1 and 7 incrementally bound noisy output and kill only the exact tree', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dbpilot-noisy-'));
+  const noisy = join(root, 'noisy.ps1');
+  const parentPIDFile = join(root, 'parent.pid');
+  const childPIDFile = join(root, 'child.pid');
+  const finallyFile = join(root, 'finally.txt');
+  await writeFile(noisy, [
+    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_PARENT_PID, [string]$PID)',
+    "$child = Start-Process -FilePath $env:DBPILOT_NOISY_CHILD_EXE -ArgumentList @('-NoProfile','-Command','Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru",
+    '[IO.File]::WriteAllText($env:DBPILOT_NOISY_CHILD_PID, [string]$child.Id)',
+    "$chunk = 'x' * 8192",
+    'for ($index = 0; $index -lt 2048; $index++) { [Console]::Out.Write($chunk) }',
+    'Start-Sleep -Seconds 30',
+    '',
+  ].join('\n'), 'utf8');
+  try {
+    for (const executable of [
+      'pwsh',
+      join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    ]) {
+      if (executable !== 'pwsh' && !existsSync(executable)) continue;
+      const unrelated = spawn(executable, ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
+      const command = [
+        `. '${containerSafetyFile.replaceAll("'", "''")}'`,
+        `. '${boundedProcessFile.replaceAll("'", "''")}'`,
+        '$code = 9',
+        "try { $null = Invoke-BoundedProcess -Command (Get-Process -Id $PID).Path -Arguments @('-NoProfile','-File',$env:DBPILOT_NOISY_SCRIPT) -TimeoutSeconds 10 -StartFailure 'noisy start' -TimeoutFailure 'noisy deadline' } catch { if ($_.Exception.Message -ceq 'Bounded process output exceeded its limit.') { $code = 0 } else { Write-Error $_; $code = 8 } } finally { [IO.File]::WriteAllText($env:DBPILOT_NOISY_FINALLY, 'done') }",
+        'exit $code',
+      ].join('; ');
+      const started = Date.now();
+      try {
+        const result = spawnSync(executable, ['-NoProfile', '-Command', command], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          timeout: 20_000,
+          env: {
+            ...process.env,
+            DBPILOT_NOISY_CHILD_EXE: executable,
+            DBPILOT_NOISY_SCRIPT: noisy,
+            DBPILOT_NOISY_PARENT_PID: parentPIDFile,
+            DBPILOT_NOISY_CHILD_PID: childPIDFile,
+            DBPILOT_NOISY_FINALLY: finallyFile,
+          },
+        });
+        assert.equal(result.status, 0, `${executable} did not fail on bounded output: ${result.stderr || result.stdout}`);
+        assert.ok(Date.now() - started < 6000, `${executable} did not terminate promptly at limit+1`);
+        assert.equal((await readFile(finallyFile, 'utf8')).trim(), 'done', `${executable} skipped finally cleanup`);
+        for (const pidFile of [parentPIDFile, childPIDFile]) {
+          const pid = Number((await readFile(pidFile, 'utf8')).trim());
+          const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { exit 1 }`]);
+          assert.equal(alive.status, 0, `${executable} left an exact noisy-tree process alive`);
+          await rm(pidFile, { force: true });
+        }
+        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `if (-not (Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue)) { exit 1 }`]);
+        assert.equal(unrelatedAlive.status, 0, `${executable} terminated an unrelated process`);
+        await rm(finallyFile, { force: true });
+      } finally {
+        unrelated.kill();
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('repository Node gate is explicit and cannot recursively collect package-owned Playwright or Vitest suites', async () => {
   const metadata = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
   const legacy = JSON.parse(await readFile(join(repoRoot, 'backend', 'test', 'e2e', 'full-stack', 'package.json'), 'utf8'));

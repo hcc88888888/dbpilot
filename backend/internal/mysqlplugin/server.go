@@ -67,6 +67,7 @@ type Server struct {
 	rollbackFrom    uint64
 	rollbackTo      uint64
 	rollbackMetrics *metricNamespaceSnapshot
+	rollbackPending map[string]struct{}
 }
 
 func NewServer(config ServerConfig) *Server {
@@ -141,8 +142,14 @@ func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.
 	if targetRevision < previousRevision {
 		server.rollbackFrom, server.rollbackTo = 0, 0
 		server.rollbackMetrics = nil
+		server.rollbackPending = nil
 	} else if targetRevision > previousRevision {
 		server.rollbackFrom, server.rollbackTo = targetRevision, previousRevision
+		if previousRevision != 0 {
+			server.rollbackPending = server.boundPairs()
+		} else {
+			server.rollbackPending = nil
+		}
 	}
 	server.pruneCursors()
 	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(request.GetInstances()))
@@ -468,8 +475,14 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 	server.mu.Unlock()
 	server.configurationMu.Lock()
 	if server.rollbackFrom == request.GetConfigurationRevision() {
-		server.rollbackFrom, server.rollbackTo = 0, 0
-		server.rollbackMetrics = nil
+		for key := range proposed {
+			delete(server.rollbackPending, key)
+		}
+		if len(server.rollbackPending) == 0 {
+			server.rollbackFrom, server.rollbackTo = 0, 0
+			server.rollbackMetrics = nil
+			server.rollbackPending = nil
+		}
 	}
 	server.configurationMu.Unlock()
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: accepted}, nil

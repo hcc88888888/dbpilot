@@ -5,6 +5,7 @@ package pluginsupervisor
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -155,6 +156,30 @@ func TestGatewayHealthCheckerRollsBackFailedLiveProbeAndReopensOldStream(t *test
 	checker.CleanupUnexpectedExit(process)
 }
 
+func TestGatewayHealthCheckerRollsBackWhenCandidateStreamFailsAfterFirstPairACK(t *testing.T) {
+	checker, fixture, process, initial := newTransactionalGatewayHealthFixture(t, 0)
+	fixture.mu.Lock()
+	fixture.failStreamRevision = 5
+	fixture.candidateACK = make(chan struct{})
+	fixture.mu.Unlock()
+	candidate := initial
+	candidate.ConfigurationRevision = 5
+	candidate.OperationRevision = 9
+
+	require.ErrorIs(t, checker.ApplyConfiguration(context.Background(), process, candidate), ErrHealthHandshake)
+
+	fixture.mu.Lock()
+	require.Equal(t, []uint64{4, 5, 4}, fixture.appliedRevisions)
+	require.Equal(t, []uint64{4, 5, 4}, fixture.streamStarts)
+	require.Contains(t, fixture.streamStops, uint64(4))
+	fixture.mu.Unlock()
+	require.False(t, process.stopped, "a pre-ready stream failure must preserve the verified PID after exact rollback")
+	require.Equal(t, uint64(4), checker.sessions[process.pid].ConfigurationRevision())
+	require.Equal(t, uint64(8), checker.sessions[process.pid].OperationRevision())
+	require.Equal(t, uint64(4), checker.activeCredentials[process.pid].configuration.ConfigurationRevision)
+	checker.CleanupUnexpectedExit(process)
+}
+
 func newTransactionalGatewayHealthFixture(t *testing.T, failValidationRevision uint64) (*GatewayHealthChecker, *transactionalHealthFixtureServer, *fakeProcess, HealthRequest) {
 	t.Helper()
 	root, err := os.MkdirTemp("", "dbptxn-")
@@ -203,6 +228,9 @@ type transactionalHealthFixtureServer struct {
 	digest                 []byte
 	activeRevision         uint64
 	failValidationRevision uint64
+	failStreamRevision     uint64
+	candidateACK           chan struct{}
+	candidateACKOnce       sync.Once
 	appliedRevisions       []uint64
 	validations            []string
 	collections            []string
@@ -271,9 +299,17 @@ func (server *transactionalHealthFixtureServer) StreamMetrics(request *pluginv1.
 		pending[index] = proto.Clone(batch).(*pluginv1.PluginMetricBatch)
 	}
 	server.mu.Unlock()
-	for _, batch := range pending {
+	for index, batch := range pending {
 		if err := stream.Send(batch); err != nil {
 			return err
+		}
+		if request.GetConfigurationRevision() == server.failStreamRevision && index == 0 {
+			select {
+			case <-server.candidateACK:
+				return errors.New("candidate_stream_failed")
+			case <-stream.Context().Done():
+				return stream.Context().Err()
+			}
 		}
 	}
 	<-stream.Context().Done()
@@ -289,6 +325,9 @@ func (server *transactionalHealthFixtureServer) AcknowledgeMetrics(_ context.Con
 	accepted := make([]*pluginv1.PluginMetricCursor, len(request.GetCursors()))
 	for index, cursor := range request.GetCursors() {
 		accepted[index] = proto.Clone(cursor).(*pluginv1.PluginMetricCursor)
+	}
+	if request.GetConfigurationRevision() == server.failStreamRevision && server.candidateACK != nil {
+		server.candidateACKOnce.Do(func() { close(server.candidateACK) })
 	}
 	server.pending[request.GetConfigurationRevision()] = nil
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: accepted}, nil

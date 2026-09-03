@@ -50,13 +50,19 @@ type metricStreamHandle struct {
 	mu            sync.Mutex
 	err           error
 	killOnFailure bool
+	completed     bool
 }
 
-func (handle *metricStreamHandle) complete(err error) {
+func (handle *metricStreamHandle) complete(err error, unexpectedFailure bool, process Process) {
 	handle.mu.Lock()
 	handle.err = err
-	handle.mu.Unlock()
+	handle.completed = true
+	kill := unexpectedFailure && handle.killOnFailure
 	close(handle.done)
+	handle.mu.Unlock()
+	if kill {
+		_ = process.Kill()
+	}
 }
 
 func (handle *metricStreamHandle) result() error {
@@ -65,16 +71,16 @@ func (handle *metricStreamHandle) result() error {
 	return handle.err
 }
 
-func (handle *metricStreamHandle) enableKillOnFailure() {
+func (handle *metricStreamHandle) armOrKill(process Process) error {
 	handle.mu.Lock()
+	if handle.completed {
+		handle.mu.Unlock()
+		_ = process.Kill()
+		return ErrHealthHandshake
+	}
 	handle.killOnFailure = true
 	handle.mu.Unlock()
-}
-
-func (handle *metricStreamHandle) shouldKillOnFailure() bool {
-	handle.mu.Lock()
-	defer handle.mu.Unlock()
-	return handle.killOnFailure
+	return nil
 }
 
 type credentialFlight struct {
@@ -138,10 +144,7 @@ func (checker *GatewayHealthChecker) startMetricStream(ctx context.Context, proc
 		} else {
 			streamErr = session.RunMetricStreamReady(streamContext, checker.client.MetricSink(), ready)
 		}
-		handle.complete(streamErr)
-		if streamErr != nil && streamContext.Err() == nil && handle.shouldKillOnFailure() {
-			_ = process.Kill()
-		}
+		handle.complete(streamErr, streamErr != nil && streamContext.Err() == nil, process)
 	}()
 	select {
 	case readyErr := <-ready:
@@ -413,6 +416,9 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 			return healthHandshakeFailure("metric_stream_reopen")
 		}
 	}
+	if candidateStream != nil && candidateStream.armOrKill(process) != nil {
+		return healthHandshakeFailure("metric_stream_arm")
+	}
 	if err := session.FinalizeConfigurationUpdate(); err != nil {
 		if candidateStream != nil {
 			stopContext, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -423,7 +429,6 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 		return healthHandshakeFailure("configuration_commit")
 	}
 	if candidateStream != nil {
-		candidateStream.enableKillOnFailure()
 		checker.mu.Lock()
 		checker.streams[process.PID()] = candidateStream
 		checker.mu.Unlock()

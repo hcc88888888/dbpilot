@@ -82,9 +82,47 @@ public static class DBPilotProcessJob
         return job;
     }
 
-    public static void Assign(IntPtr job, IntPtr process)
+public static void Assign(IntPtr job, IntPtr process)
     {
         if (!AssignProcessToJobObject(job, process)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+}
+
+if ($null -eq ('DBPilotBoundedOutputReader' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+
+public sealed class DBPilotBoundedOutput
+{
+    public readonly string Text;
+    public readonly bool Overflow;
+
+    public DBPilotBoundedOutput(string text, bool overflow)
+    {
+        Text = text;
+        Overflow = overflow;
+    }
+}
+
+public static class DBPilotBoundedOutputReader
+{
+    public static async Task<DBPilotBoundedOutput> ReadAsync(TextReader reader, int limit)
+    {
+        if (reader == null || limit <= 0) throw new ArgumentOutOfRangeException("limit");
+        char[] buffer = new char[checked(limit + 1)];
+        int length = 0;
+        while (length < buffer.Length)
+        {
+            int count = await reader.ReadAsync(buffer, length, buffer.Length - length).ConfigureAwait(false);
+            if (count == 0) return new DBPilotBoundedOutput(new string(buffer, 0, length), false);
+            length += count;
+            if (length > limit) return new DBPilotBoundedOutput(null, true);
+        }
+        return new DBPilotBoundedOutput(null, true);
     }
 }
 '@
@@ -183,27 +221,51 @@ function Invoke-BoundedProcess {
             Stop-BoundedProcessTree $process
             throw $StartFailure
         }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-        if ($remaining -le 0 -or -not $process.WaitForExit($remaining)) {
+        $outputLimit = 1000000
+        $stdoutTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardOutput, $outputLimit)
+        $stderrTask = [DBPilotBoundedOutputReader]::ReadAsync($process.StandardError, $outputLimit)
+        $stdoutResult = $null
+        $stderrResult = $null
+        while ($true) {
+            try {
+                if ($null -eq $stdoutResult -and $stdoutTask.IsCompleted) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
+                if ($null -eq $stderrResult -and $stderrTask.IsCompleted) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
+            } catch {
+                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
+                Stop-BoundedProcessTree $process
+                throw $TimeoutFailure
+            }
+            if (($null -ne $stdoutResult -and $stdoutResult.Overflow) -or ($null -ne $stderrResult -and $stderrResult.Overflow)) {
+                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
+                Stop-BoundedProcessTree $process
+                $null = $process.WaitForExit(2000)
+                throw 'Bounded process output exceeded its limit.'
+            }
+            $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if ($remaining -le 0) {
+                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
+                Stop-BoundedProcessTree $process
+                $null = $process.WaitForExit(2000)
+                throw $TimeoutFailure
+            }
+            if ($process.WaitForExit([Math]::Min(20, $remaining))) { break }
+        }
+        try {
+            if ($null -eq $stdoutResult -and -not (Wait-BoundedOutputTask $stdoutTask $deadline)) { throw $TimeoutFailure }
+            if ($null -eq $stderrResult -and -not (Wait-BoundedOutputTask $stderrTask $deadline)) { throw $TimeoutFailure }
+            if ($null -eq $stdoutResult) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
+            if ($null -eq $stderrResult) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
+        } catch {
             if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
             Stop-BoundedProcessTree $process
-            $null = $process.WaitForExit(2000)
             throw $TimeoutFailure
         }
-        if (-not (Wait-BoundedOutputTask $stdoutTask $deadline) -or -not (Wait-BoundedOutputTask $stderrTask $deadline)) {
+        if ($stdoutResult.Overflow -or $stderrResult.Overflow) {
             if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
             Stop-BoundedProcessTree $process
-            throw $TimeoutFailure
+            throw 'Bounded process output exceeded its limit.'
         }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $stdoutTruncated = $stdout.Length -gt 1000000
-        $stderrTruncated = $stderr.Length -gt 1000000
-        if ($stdoutTruncated) { $stdout = $stdout.Substring($stdout.Length - 1000000) }
-        if ($stderrTruncated) { $stderr = $stderr.Substring($stderr.Length - 1000000) }
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout.Trim(); Stderr = $stderr.Trim(); StdoutTruncated = $stdoutTruncated; StderrTruncated = $stderrTruncated }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdoutResult.Text.Trim(); Stderr = $stderrResult.Text.Trim(); StdoutTruncated = $false; StderrTruncated = $false }
     } finally {
         if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job) }
         if ($null -ne $gateEvent) { $gateEvent.Dispose() }
