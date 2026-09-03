@@ -51,6 +51,55 @@ func TestServerApplyValidateHealthAndCredentialRemovalRecovery(t *testing.T) {
 	require.True(t, validation.GetValid())
 }
 
+func TestServerAllowsOnlyImmediateUnacknowledgedConfigurationRollback(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	server := NewServer(ServerConfig{AssignmentID: "assignment-a", OperationRevision: 9, Runtime: NewRuntime(&fakePoolFactory{}, RuntimeOptions{}), Parser: NewMySQLStatementParser(), Now: func() time.Time { return now }})
+	configuration := func(revision, credentialRevision uint64, username string) *pluginv1.ApplyPluginConfigurationRequest {
+		instance := fixtureInstance("mysql-a", "127.0.0.1:33061", username, []byte("secret"), now.Add(time.Minute))
+		instance.CredentialLease.CredentialRevision = credentialRevision
+		return &pluginv1.ApplyPluginConfigurationRequest{AssignmentId: "assignment-a", ConfigurationRevision: revision, Instances: []*pluginv1.PluginInstanceConfiguration{instance}}
+	}
+	response, err := server.ApplyConfiguration(context.Background(), configuration(4, 1, "old"))
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode())
+	oldCollection, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up"}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), oldCollection.GetBatches()[0].GetSequence())
+	oldBatch := oldCollection.GetBatches()[0]
+	oldACK, err := server.AcknowledgeMetrics(context.Background(), &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, Cursors: []*pluginv1.PluginMetricCursor{{InstanceId: oldBatch.GetInstanceId(), TemplateId: oldBatch.GetTemplateId(), Sequence: oldBatch.GetSequence()}}})
+	require.NoError(t, err)
+	require.Empty(t, oldACK.GetErrorCode())
+	response, err = server.ApplyConfiguration(context.Background(), configuration(5, 2, "candidate"))
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode())
+	candidateCollection, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 5, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up"}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), candidateCollection.GetBatches()[0].GetSequence(), "a new configuration starts a new cursor namespace")
+	response, err = server.ApplyConfiguration(context.Background(), configuration(4, 1, "old"))
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode(), "the unacknowledged candidate may roll back exactly once")
+	require.Equal(t, uint64(4), server.runtime.Revision())
+	restoredCollection, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 4, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up"}})
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), restoredCollection.GetBatches()[0].GetSequence(), "rollback restores the prior cursor namespace")
+
+	response, err = server.ApplyConfiguration(context.Background(), configuration(5, 2, "candidate"))
+	require.NoError(t, err)
+	require.Empty(t, response.GetErrorCode())
+	collected, err := server.CollectNow(context.Background(), &pluginv1.CollectPluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 5, InstanceIds: []string{"mysql-a"}, TemplateIds: []string{"mysql.up"}})
+	require.NoError(t, err)
+	require.Len(t, collected.GetBatches(), 1)
+	require.Equal(t, uint64(1), collected.GetBatches()[0].GetSequence())
+	batch := collected.GetBatches()[0]
+	acknowledged, err := server.AcknowledgeMetrics(context.Background(), &pluginv1.AcknowledgePluginMetricsRequest{AssignmentId: "assignment-a", ConfigurationRevision: 5, Cursors: []*pluginv1.PluginMetricCursor{{InstanceId: batch.GetInstanceId(), TemplateId: batch.GetTemplateId(), Sequence: batch.GetSequence()}}})
+	require.NoError(t, err)
+	require.Empty(t, acknowledged.GetErrorCode())
+	response, err = server.ApplyConfiguration(context.Background(), configuration(4, 1, "old"))
+	require.NoError(t, err)
+	require.Equal(t, "configuration_rejected", response.GetErrorCode(), "an acknowledged cursor closes the rollback window")
+	require.Equal(t, uint64(5), server.runtime.Revision())
+}
+
 func TestServerHandshakeAdvertisesFiveDigestVerifiedBuiltinDescriptorsWithoutSQL(t *testing.T) {
 	nonce := make([]byte, sha256.Size)
 	challenge := make([]byte, sha256.Size)
@@ -91,9 +140,12 @@ func TestServerTrialUsesDedicatedBoundedPathAndReturnsOnlyMappedMetrics(t *testi
 	require.Equal(t, "mysql.custom.value", response.GetCandidateMetrics()[0].GetMetricName())
 	require.Equal(t, map[string]string{"role": "primary"}, response.GetCandidateMetrics()[0].GetLabels())
 	require.NotContains(t, response.String(), "primary AS")
-	response, err = server.TrialMetricTemplate(context.Background(), advancedOperation)
-	require.NoError(t, err, "the Agent verified session may advance operation revision through live ApplyConfiguration without restarting the plugin")
-	require.True(t, response.GetSucceeded())
+	_, err = server.TrialMetricTemplate(context.Background(), advancedOperation)
+	require.Error(t, err, "the plugin must reject a future operation revision just as it rejects a stale one")
+	staleOperation := proto.Clone(request).(*pluginv1.TrialMetricTemplateRequest)
+	staleOperation.OperationRevision = 8
+	_, err = server.TrialMetricTemplate(context.Background(), staleOperation)
+	require.Error(t, err)
 }
 
 func TestStreamTreatsResumeAsAuthoritativeAndAckIsAtomicForBoundPairs(t *testing.T) {

@@ -137,14 +137,22 @@ func NewRuntime(factory PoolFactory, options RuntimeOptions) *Runtime {
 }
 
 func (runtime *Runtime) Apply(ctx context.Context, configuration Config) error {
-	return runtime.apply(ctx, configuration, nil)
+	return runtime.apply(ctx, configuration, nil, 0)
 }
 
 func (runtime *Runtime) ApplyWithSwap(ctx context.Context, configuration Config, onSwap func()) error {
-	return runtime.apply(ctx, configuration, onSwap)
+	return runtime.apply(ctx, configuration, onSwap, 0)
 }
 
-func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap func()) error {
+func (runtime *Runtime) ApplyRollback(ctx context.Context, configuration Config, expectedCurrentRevision uint64, onSwap func()) error {
+	if expectedCurrentRevision == 0 {
+		configuration.Release()
+		return ErrConfigurationRejected
+	}
+	return runtime.apply(ctx, configuration, onSwap, expectedCurrentRevision)
+}
+
+func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap func(), rollbackFrom uint64) error {
 	defer configuration.Release()
 	if runtime == nil || runtime.factory == nil || ctx == nil || ctx.Err() != nil || configuration.AssignmentID == "" || configuration.Revision == 0 || len(configuration.Instances) == 0 || len(configuration.Instances) > MaxInstances {
 		return ErrConfigurationRejected
@@ -164,7 +172,7 @@ func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap 
 		runtime.mu.RUnlock()
 		return ErrConfigurationRejected
 	}
-	if configuration.Revision < runtime.config.Revision {
+	if configuration.Revision < runtime.config.Revision && runtime.config.Revision != rollbackFrom {
 		runtime.mu.RUnlock()
 		return ErrConfigurationRejected
 	}
@@ -194,7 +202,7 @@ func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap 
 		}
 	}()
 	for _, source := range configuration.Instances {
-		if source.Credential.Revision > 0 && source.Credential.Revision < snapshotCredentialRevisions[source.ID] {
+		if source.Credential.Revision > 0 && source.Credential.Revision < snapshotCredentialRevisions[source.ID] && (rollbackFrom == 0 || snapshotRevision != rollbackFrom) {
 			return ErrConfigurationRejected
 		}
 		fingerprint := instanceFingerprint(source)
@@ -226,12 +234,12 @@ func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap 
 		candidates[source.ID] = candidate
 	}
 	runtime.mu.Lock()
-	if runtime.generation != snapshotGeneration || runtime.config.AssignmentID != snapshotAssignment || runtime.config.Revision != snapshotRevision || runtime.config.AssignmentID != "" && runtime.config.AssignmentID != configuration.AssignmentID || configuration.Revision < runtime.config.Revision {
+	if runtime.generation != snapshotGeneration || runtime.config.AssignmentID != snapshotAssignment || runtime.config.Revision != snapshotRevision || runtime.config.AssignmentID != "" && runtime.config.AssignmentID != configuration.AssignmentID || configuration.Revision < runtime.config.Revision && runtime.config.Revision != rollbackFrom {
 		runtime.mu.Unlock()
 		return ErrConfigurationRejected
 	}
 	for _, source := range configuration.Instances {
-		if source.Credential.Revision > 0 && source.Credential.Revision < runtime.credentialRevisions[source.ID] {
+		if source.Credential.Revision > 0 && source.Credential.Revision < runtime.credentialRevisions[source.ID] && (rollbackFrom == 0 || runtime.config.Revision != rollbackFrom) {
 			runtime.mu.Unlock()
 			return ErrConfigurationRejected
 		}
@@ -250,7 +258,9 @@ func (runtime *Runtime) apply(ctx context.Context, configuration Config, onSwap 
 	runtime.config = Config{AssignmentID: configuration.AssignmentID, Revision: configuration.Revision}
 	runtime.values = candidates
 	for _, source := range configuration.Instances {
-		if source.Credential.Revision > runtime.credentialRevisions[source.ID] {
+		if rollbackFrom != 0 {
+			runtime.credentialRevisions[source.ID] = source.Credential.Revision
+		} else if source.Credential.Revision > runtime.credentialRevisions[source.ID] {
 			runtime.credentialRevisions[source.ID] = source.Credential.Revision
 		}
 	}

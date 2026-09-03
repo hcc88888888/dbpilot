@@ -29,7 +29,8 @@ type GatewayHealthChecker struct {
 	templates         MetricTemplateLeaser
 	mu                sync.Mutex
 	sessions          map[int]*plugingateway.Session
-	streams           map[int]context.CancelFunc
+	streams           map[int]*metricStreamHandle
+	mutations         map[int]*sync.Mutex
 	expiries          map[int]context.CancelFunc
 	activation        map[int]gatewayActivation
 	cache             *credentialcache.Cache
@@ -41,6 +42,39 @@ type GatewayHealthChecker struct {
 type activeCredentialConfiguration struct {
 	configuration plugingateway.PluginConfiguration
 	deadline      time.Time
+}
+
+type metricStreamHandle struct {
+	cancel        context.CancelFunc
+	done          chan struct{}
+	mu            sync.Mutex
+	err           error
+	killOnFailure bool
+}
+
+func (handle *metricStreamHandle) complete(err error) {
+	handle.mu.Lock()
+	handle.err = err
+	handle.mu.Unlock()
+	close(handle.done)
+}
+
+func (handle *metricStreamHandle) result() error {
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	return handle.err
+}
+
+func (handle *metricStreamHandle) enableKillOnFailure() {
+	handle.mu.Lock()
+	handle.killOnFailure = true
+	handle.mu.Unlock()
+}
+
+func (handle *metricStreamHandle) shouldKillOnFailure() bool {
+	handle.mu.Lock()
+	defer handle.mu.Unlock()
+	return handle.killOnFailure
 }
 
 type credentialFlight struct {
@@ -67,7 +101,7 @@ type gatewayActivation struct {
 }
 
 func NewGatewayHealthChecker(client *plugingateway.Client) *GatewayHealthChecker {
-	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]context.CancelFunc), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now), leaseFlights: make(map[string]*credentialFlight), activeCredentials: make(map[int]activeCredentialConfiguration), leaseEpochs: make(map[string]uint64)}
+	return &GatewayHealthChecker{client: client, sessions: make(map[int]*plugingateway.Session), streams: make(map[int]*metricStreamHandle), mutations: make(map[int]*sync.Mutex), expiries: make(map[int]context.CancelFunc), activation: make(map[int]gatewayActivation), cache: credentialcache.New(time.Now), leaseFlights: make(map[string]*credentialFlight), activeCredentials: make(map[int]activeCredentialConfiguration), leaseEpochs: make(map[string]uint64)}
 }
 
 func NewGatewayHealthCheckerWithCredentials(client *plugingateway.Client, credentials CredentialLeaser) *GatewayHealthChecker {
@@ -77,6 +111,73 @@ func NewGatewayHealthCheckerWithCredentials(client *plugingateway.Client, creden
 		checker.templates = templates
 	}
 	return checker
+}
+
+func (checker *GatewayHealthChecker) mutationFor(pid int) *sync.Mutex {
+	checker.mu.Lock()
+	defer checker.mu.Unlock()
+	mutation := checker.mutations[pid]
+	if mutation == nil {
+		mutation = &sync.Mutex{}
+		checker.mutations[pid] = mutation
+	}
+	return mutation
+}
+
+func (checker *GatewayHealthChecker) startMetricStream(ctx context.Context, process Process, session *plugingateway.Session, requireCommit, killOnFailure bool) (*metricStreamHandle, error) {
+	if checker == nil || checker.client == nil || ctx == nil || ctx.Err() != nil || process == nil || session == nil || checker.client.MetricSink() == nil {
+		return nil, ErrHealthHandshake
+	}
+	streamContext, cancel := context.WithCancel(context.Background())
+	handle := &metricStreamHandle{cancel: cancel, done: make(chan struct{}), killOnFailure: killOnFailure}
+	ready := make(chan error, 1)
+	go func() {
+		var streamErr error
+		if requireCommit {
+			streamErr = session.RunMetricStreamCommitted(streamContext, checker.client.MetricSink(), ready)
+		} else {
+			streamErr = session.RunMetricStreamReady(streamContext, checker.client.MetricSink(), ready)
+		}
+		handle.complete(streamErr)
+		if streamErr != nil && streamContext.Err() == nil && handle.shouldKillOnFailure() {
+			_ = process.Kill()
+		}
+	}()
+	select {
+	case readyErr := <-ready:
+		if readyErr != nil {
+			stopContext, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = stopMetricStream(stopContext, handle)
+			stopCancel()
+			return nil, ErrHealthHandshake
+		}
+	case <-ctx.Done():
+		stopContext, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = stopMetricStream(stopContext, handle)
+		stopCancel()
+		return nil, ErrHealthHandshake
+	}
+	select {
+	case <-handle.done:
+		if handle.result() != nil {
+			return nil, ErrHealthHandshake
+		}
+	default:
+	}
+	return handle, nil
+}
+
+func stopMetricStream(ctx context.Context, handle *metricStreamHandle) error {
+	if handle == nil {
+		return nil
+	}
+	handle.cancel()
+	select {
+	case <-handle.done:
+		return nil
+	case <-ctx.Done():
+		return ErrHealthHandshake
+	}
 }
 
 func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Process, request HealthRequest) error {
@@ -184,33 +285,12 @@ func (checker *GatewayHealthChecker) Handshake(ctx context.Context, process Proc
 					}
 				}
 			}
-			streamContext, cancel := context.WithCancel(context.Background())
-			ready := make(chan error, 1)
-			streamResult := make(chan error, 1)
-			go func() {
-				streamErr := session.RunMetricStreamReady(streamContext, sink, ready)
-				streamResult <- streamErr
-				if streamErr != nil && streamContext.Err() == nil {
-					// A plugin whose metric stream ends has lost a core correctness
-					// boundary. Terminate it so Task9's monitored process lifecycle
-					// records the failure and applies its restart/circuit policy.
-					_ = process.Kill()
-				}
-			}()
-			if readyErr := <-ready; readyErr != nil {
-				cancel()
+			stream, streamErr := checker.startMetricStream(ctx, process, session, false, true)
+			if streamErr != nil {
 				return healthHandshakeFailure("metric_stream")
 			}
-			select {
-			case streamErr := <-streamResult:
-				cancel()
-				if streamErr != nil {
-					return healthHandshakeFailure("metric_stream")
-				}
-			default:
-			}
 			checker.mu.Lock()
-			checker.streams[process.PID()] = cancel
+			checker.streams[process.PID()] = stream
 			checker.mu.Unlock()
 		}
 	}
@@ -222,10 +302,20 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 	if checker == nil || checker.client == nil || process == nil || ctx == nil || ctx.Err() != nil {
 		return ErrHealthHandshake
 	}
+	mutation := checker.mutationFor(process.PID())
+	mutation.Lock()
+	defer mutation.Unlock()
 	checker.mu.Lock()
 	session := checker.sessions[process.PID()]
+	previousStream := checker.streams[process.PID()]
+	active, hasActive := checker.activeCredentials[process.PID()]
+	previous := clonePluginConfiguration(active.configuration)
 	checker.mu.Unlock()
+	defer previous.Release()
 	if session == nil || session.AssignmentID() != request.AssignmentID || len(request.SupportedVariants) == 0 || len(request.SignedCapabilities) == 0 || request.MetricTemplateSchemaVersion == 0 || len(request.InstanceDescriptors) == 0 {
+		return ErrHealthHandshake
+	}
+	if !hasActive || previous.AssignmentID != request.AssignmentID || previous.ConfigurationRevision != session.ConfigurationRevision() || checker.credentials != nil && !time.Now().Before(active.deadline) {
 		return ErrHealthHandshake
 	}
 	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 && len(request.TemplateIDs) > 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
@@ -277,8 +367,66 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 	}
 	configuration := plugingateway.PluginConfiguration{AssignmentID: request.AssignmentID, ConfigurationRevision: request.ConfigurationRevision, Instances: instances}
 	defer configuration.Release()
-	if err := session.ApplyConfigurationUpdate(ctx, expected, configuration); err != nil {
+	if previousStream != nil {
+		if stopMetricStream(ctx, previousStream) != nil {
+			_ = process.Kill()
+			return healthHandshakeFailure("metric_stream_quiesce")
+		}
+		checker.mu.Lock()
+		if checker.streams[process.PID()] == previousStream {
+			delete(checker.streams, process.PID())
+		}
+		checker.mu.Unlock()
+	}
+	reopenPrevious := func(reopenContext context.Context) error {
+		if previousStream == nil {
+			return nil
+		}
+		stream, streamErr := checker.startMetricStream(reopenContext, process, session, false, true)
+		if streamErr != nil {
+			_ = process.Kill()
+			return ErrHealthHandshake
+		}
+		checker.mu.Lock()
+		checker.streams[process.PID()] = stream
+		checker.mu.Unlock()
+		return nil
+	}
+	if err := session.ApplyConfigurationUpdate(ctx, expected, configuration, previous); err != nil {
+		recoveryContext, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_ = reopenPrevious(recoveryContext)
+		recoveryCancel()
 		return healthHandshakeFailure("apply_configuration_update")
+	}
+	var candidateStream *metricStreamHandle
+	if previousStream != nil {
+		var streamErr error
+		candidateStream, streamErr = checker.startMetricStream(ctx, process, session, true, false)
+		if streamErr != nil {
+			recoveryContext, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer recoveryCancel()
+			if rollbackErr := session.RollbackConfigurationUpdate(recoveryContext, previous); rollbackErr != nil {
+				_ = process.Kill()
+				return healthHandshakeFailure("configuration_rollback")
+			}
+			_ = reopenPrevious(recoveryContext)
+			return healthHandshakeFailure("metric_stream_reopen")
+		}
+	}
+	if err := session.FinalizeConfigurationUpdate(); err != nil {
+		if candidateStream != nil {
+			stopContext, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = stopMetricStream(stopContext, candidateStream)
+			stopCancel()
+		}
+		_ = process.Kill()
+		return healthHandshakeFailure("configuration_commit")
+	}
+	if candidateStream != nil {
+		candidateStream.enableKillOnFailure()
+		checker.mu.Lock()
+		checker.streams[process.PID()] = candidateStream
+		checker.mu.Unlock()
 	}
 	checker.storeActiveCredentialConfiguration(process.PID(), configuration, configurationValidFor)
 	checker.scheduleCredentialRenewal(process, session, request, configurationValidFor)
@@ -466,6 +614,7 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 	checker.expiries[process.PID()] = cancel
 	checker.mu.Unlock()
 	go func() {
+		mutation := checker.mutationFor(process.PID())
 		deadline := time.Now().Add(validFor)
 		backoff := time.Second
 		removed := false
@@ -492,6 +641,11 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 				timer.Stop()
 				return
 			case <-timer.C:
+			}
+			mutation.Lock()
+			if ctx.Err() != nil {
+				mutation.Unlock()
+				return
 			}
 			callContext, callCancel := context.WithTimeout(ctx, 15*time.Second)
 			checker.invalidateCredentialFlights(request.AssignmentID)
@@ -525,6 +679,7 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 						release()
 					}
 					callCancel()
+					mutation.Unlock()
 					continue
 				}
 				configuration.Release()
@@ -534,6 +689,7 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 				if applied && !checker.rollbackCredentialConfiguration(callContext, process.PID(), session, request.InstanceIDs) {
 					callCancel()
 					checker.forceCredentialStop(process, session, request.AssignmentID)
+					mutation.Unlock()
 					return
 				}
 			}
@@ -544,6 +700,7 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 				clearCancel()
 				if removeErr != nil {
 					checker.forceCredentialStop(process, session, request.AssignmentID)
+					mutation.Unlock()
 					return
 				}
 				checker.cache.InvalidateAssignment(request.AssignmentID)
@@ -558,6 +715,7 @@ func (checker *GatewayHealthChecker) scheduleCredentialRenewal(process Process, 
 			if backoff < 10*time.Second {
 				backoff *= 2
 			}
+			mutation.Unlock()
 		}
 	}()
 }
@@ -605,8 +763,8 @@ func (checker *GatewayHealthChecker) rollbackCredentialConfiguration(ctx context
 
 func (checker *GatewayHealthChecker) forceCredentialStop(process Process, session *plugingateway.Session, assignmentID string) {
 	checker.mu.Lock()
-	if cancel := checker.streams[process.PID()]; cancel != nil {
-		cancel()
+	if stream := checker.streams[process.PID()]; stream != nil {
+		stream.cancel()
 		delete(checker.streams, process.PID())
 	}
 	active := checker.activeCredentials[process.PID()]
@@ -771,10 +929,13 @@ func (checker *GatewayHealthChecker) Shutdown(ctx context.Context, process Proce
 	if checker == nil || process == nil || timeout <= 0 {
 		return ErrHealthHandshake
 	}
+	mutation := checker.mutationFor(process.PID())
+	mutation.Lock()
+	defer mutation.Unlock()
 	checker.mu.Lock()
 	session := checker.sessions[process.PID()]
-	if cancel := checker.streams[process.PID()]; cancel != nil {
-		cancel()
+	stream := checker.streams[process.PID()]
+	if stream != nil {
 		delete(checker.streams, process.PID())
 	}
 	if cancel := checker.expiries[process.PID()]; cancel != nil {
@@ -786,6 +947,10 @@ func (checker *GatewayHealthChecker) Shutdown(ctx context.Context, process Proce
 	active := checker.activeCredentials[process.PID()]
 	delete(checker.activeCredentials, process.PID())
 	checker.mu.Unlock()
+	if stopMetricStream(ctx, stream) != nil {
+		active.configuration.Release()
+		return ErrHealthHandshake
+	}
 	active.configuration.Release()
 	if session == nil {
 		return ErrHealthHandshake
@@ -804,10 +969,13 @@ func (checker *GatewayHealthChecker) CleanupUnexpectedExit(process Process) {
 		return
 	}
 	pid := process.PID()
+	mutation := checker.mutationFor(pid)
+	mutation.Lock()
+	defer mutation.Unlock()
 	checker.mu.Lock()
 	session := checker.sessions[pid]
-	if cancel := checker.streams[pid]; cancel != nil {
-		cancel()
+	if stream := checker.streams[pid]; stream != nil {
+		stream.cancel()
 	}
 	if cancel := checker.expiries[pid]; cancel != nil {
 		cancel()

@@ -56,6 +56,19 @@ func TestPrepareEnrollmentGenerationPrecedesRPCAndResumesSameCSR(t *testing.T) {
 	require.DirExists(t, output)
 }
 
+func TestPrepareEnrollmentGenerationOnDockerNamedVolume(t *testing.T) {
+	root := os.Getenv("DBPILOT_ENROLLMENT_VOLUME_TEST_ROOT")
+	if root == "" {
+		t.Skip("Docker named-volume test root is not configured")
+	}
+	observation, err := collectEnrollmentObservation(context.Background(), "agent-online")
+	require.NoError(t, err)
+	generation, err := prepareEnrollmentGeneration(filepath.Join(root, "enrollment"), "agent-online", bytes.Repeat([]byte{0x51}, enrollment.EnrollmentTokenBytes), observation, rand.Reader)
+	require.NoError(t, err)
+	require.NotNil(t, generation)
+	require.FileExists(t, filepath.Join(generation.stageDirectory, enrollmentPrepareFilename))
+}
+
 func TestEnrollmentGenerationCompletesManifestAndPublishesDirectoryAtomically(t *testing.T) {
 	root := t.TempDir()
 	output := filepath.Join(root, "credentials")

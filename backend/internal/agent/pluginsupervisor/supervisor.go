@@ -60,6 +60,8 @@ type PluginSupervisor struct {
 	now              func() time.Time
 	running          map[string]*managedProcess
 	shuttingDown     atomic.Bool
+	refreshPending   atomic.Bool
+	refreshWorker    atomic.Bool
 }
 
 type managedProcess struct {
@@ -765,14 +767,21 @@ func (supervisor *PluginSupervisor) RefreshObservation(ctx context.Context) erro
 	if supervisor == nil || ctx == nil || ctx.Err() != nil {
 		return ErrInvalidRequest
 	}
-	// Persisted-process recovery owns this lock while its verified Handshake
-	// requests credentials over the new control session. Never block that
-	// response loop merely to refresh an equivalent observation; the recovery
-	// state write itself will advance the observation once it converges.
-	if !supervisor.mu.TryLock() {
-		return nil
+	supervisor.refreshPending.Store(true)
+	if supervisor.mu.TryLock() {
+		supervisor.refreshPending.Store(false)
+		err := supervisor.refreshObservationLocked(ctx)
+		supervisor.mu.Unlock()
+		if supervisor.refreshPending.Load() {
+			supervisor.startObservationRefreshWorker()
+		}
+		return err
 	}
-	defer supervisor.mu.Unlock()
+	supervisor.startObservationRefreshWorker()
+	return nil
+}
+
+func (supervisor *PluginSupervisor) refreshObservationLocked(ctx context.Context) error {
 	states := supervisor.store.List()
 	sort.Slice(states, func(i, j int) bool { return states[i].DatabaseFamily < states[j].DatabaseFamily })
 	for _, state := range states {
@@ -785,6 +794,36 @@ func (supervisor *PluginSupervisor) RefreshObservation(ctx context.Context) erro
 		}
 	}
 	return nil
+}
+
+func (supervisor *PluginSupervisor) startObservationRefreshWorker() {
+	if supervisor == nil || supervisor.shuttingDown.Load() || !supervisor.refreshWorker.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			supervisor.refreshWorker.Store(false)
+			if supervisor.refreshPending.Load() && !supervisor.shuttingDown.Load() {
+				supervisor.startObservationRefreshWorker()
+			}
+		}()
+		for supervisor.refreshPending.Load() && !supervisor.shuttingDown.Load() {
+			if !supervisor.mu.TryLock() {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			if !supervisor.refreshPending.Swap(false) {
+				supervisor.mu.Unlock()
+				continue
+			}
+			err := supervisor.refreshObservationLocked(context.Background())
+			supervisor.mu.Unlock()
+			if err != nil {
+				supervisor.refreshPending.Store(true)
+				time.Sleep(25 * time.Millisecond)
+			}
+		}
+	}()
 }
 
 func assignmentObservation(state pluginstate.FamilyState, at time.Time) *agentv1.PluginAssignmentObservation {

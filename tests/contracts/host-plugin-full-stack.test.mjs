@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ const nginxFile = join(repoRoot, 'backend', 'docker', 'host-plugin-full-stack', 
 const runnerFile = join(repoRoot, 'backend', 'docker', 'host-plugin-full-stack', 'runner.Dockerfile');
 const verifierFile = join(repoRoot, 'backend', 'scripts', 'verify-host-plugin-full-stack.ps1');
 const boundedProcessFile = join(repoRoot, 'backend', 'scripts', 'bounded-process.ps1');
+const boundedGateFile = join(repoRoot, 'backend', 'scripts', 'bounded-process-gate.ps1');
 const containerSafetyFile = join(repoRoot, 'backend', 'scripts', 'container-safety.ps1');
 const e2eRoot = join(repoRoot, 'backend', 'test', 'e2e', 'host-plugin-full-stack');
 const approvedKylinImage = 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1';
@@ -20,6 +21,7 @@ const approvedKylinImage = 'cr.kylinos.cn/kylin/kylin-server-platform:v10sp1';
 const serviceNames = [
   'acceptance-runner',
   'agent',
+  'assertion-exporter',
   'assertions',
   'asset-builder',
   'bootstrap',
@@ -37,10 +39,12 @@ const serviceNames = [
 const volumeNames = [
   'acceptance-agent-data',
   'acceptance-artifacts',
+  'acceptance-assertion-input',
   'acceptance-assertion-secrets',
   'acceptance-bin',
   'acceptance-config',
   'acceptance-controlplane-secrets',
+  'acceptance-enrollment-inbox',
   'acceptance-frontend-assets',
   'acceptance-frontend-tls',
   'acceptance-helper-runtime',
@@ -66,6 +70,7 @@ function loadCompose() {
     env: {
       ...process.env,
       DBPILOT_HOST_PLUGIN_RUN_ID: 'contract000000000000000000000000',
+      DBPILOT_HOST_PLUGIN_RUNNER_IMAGE: 'dbpilot-host-plugin-runner:contract000000000000000000000000',
       DBPILOT_KYLIN_IMAGE: approvedKylinImage,
     },
   });
@@ -105,6 +110,7 @@ test('host plugin Compose resolves the exact labelled production topology', () =
     oidc: approvedKylinImage,
     controlplane: approvedKylinImage,
     agent: approvedKylinImage,
+    'assertion-exporter': approvedKylinImage,
     'proc-helper': approvedKylinImage,
     'docker-discovery': approvedKylinImage,
     'mysql-primary': 'mysql:8.4',
@@ -120,6 +126,7 @@ test('host plugin Compose resolves the exact labelled production topology', () =
     }
   }
   assert.equal(config.services['acceptance-runner'].build.dockerfile, 'backend/docker/host-plugin-full-stack/runner.Dockerfile');
+  assert.equal(config.services['acceptance-runner'].image, 'dbpilot-host-plugin-runner:contract000000000000000000000000');
   assert.equal(config.services['acceptance-runner'].build.labels['dbpilot.verifier'], 'host-plugin-full-stack');
   assert.equal(config.services['acceptance-runner'].build.labels['dbpilot.run'], 'contract000000000000000000000000');
 
@@ -201,7 +208,7 @@ test('one MySQL plugin process is configured for both MySQL instances', () => {
   assert.equal((command.match(/pgrep -fc '\/dbpilot-plugin-mysql '/g) ?? []).length, 1);
   assert.doesNotMatch(command, /\/acceptance\/bin\/dbpilot-plugin-mysql/);
   const agentCommand = commandText(services.agent);
-  assert.match(agentCommand, /if test ! -s \/acceptance\/agent-data\/enrollment\/agent\.crt; then\s+test -s \/acceptance\/agent-data\/enrollment-token/);
+  assert.match(agentCommand, /if test ! -s \/acceptance\/agent-data\/enrollment\/agent\.crt; then\s+test -s \/acceptance\/enrollment-inbox\/enrollment-token/);
   assert.match(agentCommand, /controlled acceptance file-log source/);
   assert.match(agentCommand, /\/acceptance\/agent-data\/native\/mysqld-dbp/);
   assert.doesNotMatch(agentCommand, /\/tmp\/mysqld-dbp/);
@@ -232,23 +239,30 @@ test('runtime services receive only least-privilege secret and trust volumes', (
   assert.equal(mountAt(services.frontend, '/etc/ssl/certs').source, 'acceptance-frontend-tls');
   assert.equal(mountAt(services['acceptance-runner'], '/acceptance/config').source, 'acceptance-runner-trust');
   const agentCommand = commandText(services.agent);
-  const tokenRemoval = agentCommand.indexOf('rm -f /acceptance/agent-data/enrollment-token');
+  const tokenRemoval = agentCommand.indexOf('rm -f /acceptance/enrollment-inbox/enrollment-token');
   assert.ok(tokenRemoval > agentCommand.indexOf('--output-dir /acceptance/agent-data/enrollment'));
   assert.ok(tokenRemoval < agentCommand.indexOf('exec /acceptance/bin/dbpilot-agent --config'),
     'the one-time enrollment token is removed before the long-running Agent starts');
   assert.deepEqual(writableTargets(services['asset-builder']), ['/acceptance/bin', '/acceptance/frontend']);
-  assert.deepEqual(writableTargets(services.bootstrap), ['/volumes/agent-data', '/volumes/artifacts', '/volumes/assertion-secrets', '/volumes/config', '/volumes/controlplane-secrets', '/volumes/frontend-tls', '/volumes/helper-runtime', '/volumes/mysql-secrets', '/volumes/oidc-secrets', '/volumes/plugin-runtime', '/volumes/postgres-secrets', '/volumes/proc-runtime', '/volumes/runner-artifacts', '/volumes/runner-secrets', '/volumes/runner-trust', '/volumes/state']);
+  assert.deepEqual(writableTargets(services.bootstrap), ['/volumes/agent-data', '/volumes/artifacts', '/volumes/assertion-input', '/volumes/assertion-secrets', '/volumes/config', '/volumes/controlplane-secrets', '/volumes/enrollment-inbox', '/volumes/frontend-tls', '/volumes/helper-runtime', '/volumes/mysql-secrets', '/volumes/oidc-secrets', '/volumes/plugin-runtime', '/volumes/postgres-secrets', '/volumes/proc-runtime', '/volumes/runner-artifacts', '/volumes/runner-secrets', '/volumes/runner-trust', '/volumes/state']);
   assert.deepEqual(writableTargets(services.postgres), ['/var/lib/postgresql/data']);
   assert.deepEqual(writableTargets(services.oidc), []);
   assert.deepEqual(writableTargets(services.controlplane), ['/acceptance/state']);
-  assert.deepEqual(writableTargets(services.agent), ['/acceptance/agent-data', '/acceptance/agent-data/plugin-runtime', '/run/dbpilot-agent']);
+  assert.deepEqual(writableTargets(services.agent), ['/acceptance/agent-data', '/acceptance/agent-data/plugin-runtime', '/acceptance/enrollment-inbox', '/run/dbpilot-agent']);
+  assert.equal(mountAt(services.agent, '/acceptance/agent-data').volume?.nocopy, true,
+    'the pre-owned empty Agent volume must not be copy-up reset to root before enrollment');
   assert.deepEqual(writableTargets(services['proc-helper']), ['/run/dbpilot-agent']);
   assert.deepEqual(writableTargets(services['docker-discovery']), ['/acceptance/helper-runtime']);
   assert.deepEqual(writableTargets(services['mysql-primary']), ['/var/lib/mysql']);
   assert.deepEqual(writableTargets(services['mysql-secondary']), ['/var/lib/mysql']);
   assert.deepEqual(writableTargets(services['mysql-plugin']), []);
   assert.deepEqual(writableTargets(services.frontend), []);
-  assert.deepEqual(writableTargets(services['acceptance-runner']), ['/acceptance/agent-data', '/acceptance/playwright', '/acceptance/state']);
+  assert.deepEqual(writableTargets(services['acceptance-runner']), ['/acceptance/enrollment-inbox', '/acceptance/playwright', '/acceptance/state']);
+  assert.equal(mountAt(services['acceptance-runner'], '/acceptance/agent-data'), undefined, 'ordinary browser phases cannot read Agent private state');
+  assert.equal(mountAt(services.assertions, '/acceptance/agent-data'), undefined, 'assertions consume only the exported diagnostic projection');
+  assert.equal(mountAt(services.assertions, '/acceptance/assertion-input').source, 'acceptance-assertion-input');
+  assert.deepEqual(writableTargets(services['assertion-exporter']), ['/acceptance/assertion-input']);
+  assert.equal(mountAt(services['assertion-exporter'], '/acceptance/agent-data').read_only, true);
   assert.deepEqual(writableTargets(services.assertions), ['/acceptance/state']);
 });
 
@@ -306,8 +320,14 @@ test('Playwright runner is exactly locked and invokes only its package-owned sui
   assert.match(acceptanceSpec, /diagnostic_stage/);
   assert.match(verifier, /Get-AcceptanceFailureStage/);
   assert.match(verifier, /Assert-FailureCanariesAbsent/);
+  const canaryScanner = verifier.slice(verifier.indexOf('function Assert-FailureCanariesAbsent'), verifier.indexOf('function Remove-SafeFailureArtifactDirectory'));
+  assert.doesNotMatch(canaryScanner, /--tail/);
+  assert.doesNotMatch(canaryScanner, /ExitCode\s+-ne\s+0\)\s*\{\s*continue/);
+  assert.match(canaryScanner, /StdoutTruncated[\s\S]*throw/);
+  assert.match(canaryScanner, /StderrTruncated[\s\S]*throw/);
   assert.doesNotMatch(verifier, /\.png/);
   assert.doesNotMatch(verifier, /playwright\/\./);
+  assert.match(await readFile(join(repoRoot, 'backend', 'test', 'fixtures', 'fullstack', 'host_plugin_assertions.go'), 'utf8'), /candidate_metrics='\[\]'::jsonb/);
 });
 
 test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerShell and pwsh', async () => {
@@ -320,6 +340,8 @@ test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerS
   assert.match(verifier, /Remove-DBPilotRecordedVolume/);
   assert.match(verifier, /Assert-ZeroResidualResources/);
   assert.match(verifier, /ownedImageIDs/);
+  assert.match(verifier, /DBPILOT_HOST_PLUGIN_RUNNER_IMAGE/);
+  assert.match(verifier, /runnerImageReference/);
   assert.match(verifier, /Remove-OwnedRunnerImage/);
   assert.match(verifier, /image', 'ls'[\s\S]*label=dbpilot\.verifier/);
   assert.doesNotMatch(verifier, /Get-ComposeArguments @\('pull'/, 'release verification must use exact local image identities without registry drift');
@@ -344,45 +366,85 @@ test('PowerShell verifier has bounded ownership-safe lifecycle on Windows PowerS
   }
 });
 
-test('PowerShell 5.1 and 7 bound output pipes held by a child after its parent exits', { skip: process.platform !== 'win32' }, async () => {
+test('runner image build and registration failure windows remain exact-cleanable', async () => {
+  const verifier = await readFile(verifierFile, 'utf8');
+  const resources = verifier.slice(verifier.indexOf('function Register-OwnedResources'), verifier.indexOf('function Register-OwnedRunnerImageID'));
+  const discovery = verifier.slice(verifier.indexOf('function Register-OwnedRunnerImages'), verifier.indexOf('function Remove-OwnedRunnerImage'));
+  const finalizer = verifier.slice(verifier.lastIndexOf('finally {'));
+  const imageReference = verifier.indexOf('$runnerImageReference = "dbpilot-host-plugin-runner:$RunId"');
+  const imageBuild = verifier.indexOf("@('build', 'acceptance-runner')");
+  assert.ok(imageReference >= 0 && imageReference < imageBuild, 'the unique image identity is declared before the risky build');
+  assert.match(resources, /Register-OwnedRunnerImages -RetrySeconds \$RunnerImageRetrySeconds/);
+  assert.match(discovery, /image', 'inspect'[\s\S]*\$runnerImageReference/);
+  assert.match(discovery, /label=dbpilot\.verifier=\$verifierLabel[\s\S]*label=dbpilot\.run=\$RunId/);
+  assert.match(discovery, /Register-OwnedRunnerImageID \$candidate/);
+  assert.match(discovery, /Start-Sleep -Seconds 1/);
+  assert.match(finalizer, /Register-OwnedResources -RunnerImageRetrySeconds 5[\s\S]*Remove-OwnedRunnerImage \$id/,
+    'finally retries late image visibility, records the canonical ID, then removes only that ID');
+});
+
+test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding child', { skip: process.platform !== 'win32' }, async () => {
   assert.equal(existsSync(boundedProcessFile), true, 'the production bounded-process helper exists');
+  assert.equal(existsSync(boundedGateFile), true, 'the pre-assignment process gate exists');
+  const boundedSource = await readFile(boundedProcessFile, 'utf8');
+  const gateSource = await readFile(boundedGateFile, 'utf8');
+  assert.match(boundedSource, /CreateKillOnClose\(\)[\s\S]*\$process\.Start\(\)[\s\S]*Assign\([^\r\n]+\)[\s\S]*\.Set\(\)/);
+  assert.match(gateSource, /WaitOne\([^)]*\)[\s\S]*& \$command @arguments/);
   const root = await mkdtemp(join(tmpdir(), 'dbpilot-pipe-'));
   const child = join(root, 'child.ps1');
-  const parent = join(root, 'parent.ps1');
+  const parentSource = join(root, 'parent.cs');
+  const parent = join(root, 'parent.exe');
   const pidFile = join(root, 'child.pid');
   await writeFile(child, "[Console]::Out.WriteLine('pipe-held'); Start-Sleep -Seconds 30\n", 'utf8');
-  await writeFile(parent, [
-    "$arguments = '-NoProfile -File \"' + $env:DBPILOT_PIPE_CHILD + '\"'",
-    '$child = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $arguments -NoNewWindow -PassThru',
-    '[IO.File]::WriteAllText($env:DBPILOT_PIPE_PID, [string]$child.Id)',
-    'Start-Sleep -Milliseconds 750',
-    'exit 0',
+  await writeFile(parentSource, [
+    'using System;',
+    'using System.Diagnostics;',
+    'using System.IO;',
+    'public static class ImmediateParent {',
+    '  public static int Main() {',
+    '    var info = new ProcessStartInfo(Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD_EXE"), "-NoProfile -File \\\"" + Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD") + "\\\"");',
+    '    info.UseShellExecute = false; info.CreateNoWindow = true;',
+    '    var child = Process.Start(info);',
+    '    File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), child.Id.ToString());',
+    '    return 0;',
+    '  }',
+    '}',
     '',
   ].join('\n'), 'utf8');
+  const compiler = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const compile = spawnSync(compiler, ['-NoProfile', '-Command', `Add-Type -TypeDefinition ([IO.File]::ReadAllText($env:DBPILOT_PARENT_SOURCE)) -OutputAssembly $env:DBPILOT_PIPE_PARENT -OutputType ConsoleApplication`], { encoding: 'utf8', env: { ...process.env, DBPILOT_PARENT_SOURCE: parentSource, DBPILOT_PIPE_PARENT: parent } });
+  assert.equal(compile.status, 0, compile.stderr || compile.stdout);
   try {
     for (const executable of [
       'pwsh',
       join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
     ]) {
       if (executable !== 'pwsh' && !existsSync(executable)) continue;
+      const unrelated = spawn(executable, ['-NoProfile', '-Command', 'Start-Sleep -Seconds 30'], { stdio: 'ignore' });
       const command = [
         `. '${containerSafetyFile.replaceAll("'", "''")}'`,
         `. '${boundedProcessFile.replaceAll("'", "''")}'`,
-        "try { Invoke-BoundedProcess -Command (Get-Process -Id $PID).Path -Arguments @('-NoProfile','-File',$env:DBPILOT_PIPE_PARENT) -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 } }; exit 0",
+        "try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 } }; exit 0",
       ].join('; ');
       const started = Date.now();
-      const result = spawnSync(executable, ['-NoProfile', '-Command', command], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-        timeout: 12_000,
-        env: { ...process.env, DBPILOT_PIPE_CHILD: child, DBPILOT_PIPE_PARENT: parent, DBPILOT_PIPE_PID: pidFile },
-      });
-      assert.equal(result.status, 0, `${executable} did not bound the inherited output pipe: ${result.stderr || result.stdout}`);
-      assert.ok(Date.now() - started < 8_000, `${executable} exceeded the bounded output deadline`);
-      const childPID = Number((await readFile(pidFile, 'utf8')).trim());
-      const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${childPID} -ErrorAction SilentlyContinue) { exit 1 }`]);
-      assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive`);
-      await rm(pidFile, { force: true });
+      try {
+        const result = spawnSync(executable, ['-NoProfile', '-Command', command], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          timeout: 12_000,
+          env: { ...process.env, DBPILOT_PIPE_CHILD_EXE: executable, DBPILOT_PIPE_CHILD: child, DBPILOT_PIPE_PARENT: parent, DBPILOT_PIPE_PID: pidFile },
+        });
+        assert.equal(result.status, 0, `${executable} did not bound the inherited output pipe: ${result.stderr || result.stdout}`);
+        assert.ok(Date.now() - started < 8_000, `${executable} exceeded the bounded output deadline`);
+        const childPID = Number((await readFile(pidFile, 'utf8')).trim());
+        const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${childPID} -ErrorAction SilentlyContinue) { exit 1 }`]);
+        assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive`);
+        const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `if (-not (Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue)) { exit 1 }`]);
+        assert.equal(unrelatedAlive.status, 0, `${executable} terminated an unrelated process`);
+        await rm(pidFile, { force: true });
+      } finally {
+        unrelated.kill();
+      }
     }
   } finally {
     await rm(root, { recursive: true, force: true });

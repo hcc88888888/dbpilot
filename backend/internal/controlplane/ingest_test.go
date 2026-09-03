@@ -114,6 +114,42 @@ func TestMetricConsumerMapsHostMetricsToAuthenticatedTwoHostIdentities(t *testin
 	require.NotEqual(t, store.samples[0].InstanceID, store.samples[1].InstanceID)
 }
 
+func TestMetricConsumerUsesTrustedHostProducerInsteadOfMetricName(t *testing.T) {
+	now := time.Date(2026, time.September, 4, 10, 0, 0, 0, time.UTC)
+	store := &recordingStore{}
+	scope := alert.Scope{TenantID: "t1", ProjectID: "p1"}
+	consumer := controlplane.NewMetricConsumer(authenticatedHostResolver{agentResolver: resolverFor("agent-a", scope), hosts: map[string]string{"agent-a": "host-a"}}, store)
+
+	plugin := pmetric.NewMetrics()
+	pluginResource := plugin.ResourceMetrics().AppendEmpty()
+	pluginResource.Resource().Attributes().PutStr("dbpilot.source.id", "dbpilot-plugin:mysql:assignment-a")
+	pluginResource.Resource().Attributes().PutStr("service.instance.id", "mysql-a")
+	pluginMetric := pluginResource.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	pluginMetric.SetName("system.cpu.utilization")
+	pluginPoint := pluginMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+	pluginPoint.SetDoubleValue(1)
+	pluginPoint.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	pluginPayload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(plugin)
+	require.NoError(t, err)
+	require.NoError(t, consumer.ConsumeMetricBatch(context.Background(), "agent-a", pluginPayload, now))
+
+	host := pmetric.NewMetrics()
+	hostResource := host.ResourceMetrics().AppendEmpty()
+	hostResource.Resource().Attributes().PutStr("dbpilot.source.id", "inspection-host-snapshot")
+	hostMetric := hostResource.ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	hostMetric.SetName("system.cpu.logical.count")
+	hostPoint := hostMetric.SetEmptyGauge().DataPoints().AppendEmpty()
+	hostPoint.SetIntValue(8)
+	hostPoint.SetTimestamp(pcommon.NewTimestampFromTime(now))
+	hostPayload, err := (&pmetric.ProtoMarshaler{}).MarshalMetrics(host)
+	require.NoError(t, err)
+	require.NoError(t, consumer.ConsumeMetricBatch(context.Background(), "agent-a", hostPayload, now))
+
+	require.Len(t, store.samples, 2)
+	require.Equal(t, "mysql-a", store.samples[0].InstanceID, "a plugin metric name must not enter host attribution")
+	require.Equal(t, "host-a", store.samples[1].InstanceID, "all trusted host-producer metrics use authenticated host identity")
+}
+
 func TestMetricConsumerAcceptsAgentNormalizedPluginOTLP(t *testing.T) {
 	now := time.Date(2026, time.August, 31, 10, 0, 0, 0, time.UTC)
 	batch := &pluginv1.PluginMetricBatch{PluginId: "mysql", PluginVersion: "1.0.0", DatabaseFamily: "mysql", DatabaseVariant: "mysql", InstanceId: "mysql-1", ConfigurationRevision: 4, TemplateId: "template-1", TemplateRevision: 1, Sequence: 1, CollectedAt: timestamppb.New(now), CollectionStatus: pluginv1.PluginCollectionStatus_PLUGIN_COLLECTION_STATUS_SUCCEEDED, Samples: []*pluginv1.PluginMetricSample{{MetricName: "mysql.connections.current", Value: 12, Unit: "1", MetricType: pluginv1.PluginMetricType_PLUGIN_METRIC_TYPE_GAUGE, SampledAt: timestamppb.New(now)}}}

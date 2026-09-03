@@ -335,10 +335,29 @@ func TestSupervisorRefreshesEquivalentObservationAfterControlReconnect(t *testin
 	require.NoError(t, err)
 	before := fixture.supervisor.Observation()
 	require.NoError(t, fixture.supervisor.RefreshObservation(context.Background()))
-	after := fixture.supervisor.Observation()
-	require.Greater(t, after.GetObservationRevision(), before.GetObservationRevision())
-	require.True(t, after.GetObservedAt().AsTime().After(before.GetObservedAt().AsTime()))
+	require.Eventually(t, func() bool {
+		after := fixture.supervisor.Observation()
+		return after.GetObservationRevision() > before.GetObservationRevision() && after.GetObservedAt().AsTime().After(before.GetObservedAt().AsTime())
+	}, time.Second, time.Millisecond)
 	require.Equal(t, stored.ProcessID, fixture.store.families["mysql"].ProcessID)
+}
+
+func TestSupervisorCoalescesReconnectRefreshAndFlushesAfterMutationUnlock(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	state := pluginstate.FamilyState{AssignmentID: "assignment-mysql", PluginID: "mysql", DatabaseFamily: "mysql", InstalledVersion: "1.0.0", ActiveSlot: pluginstate.SlotA, DesiredState: pluginstate.DesiredRunning, RequestFingerprint: strings.Repeat("a", 64), ProcessState: pluginstate.ProcessRunning, HealthState: pluginstate.HealthHealthy, CircuitState: pluginstate.CircuitClosed, ActiveConfigurationRevision: 1, DesiredConfigurationRevision: 1, ObservedOperationRevision: 1, ObservationRevision: 5, BoundInstanceCount: 1, ActiveInstanceIDs: []string{"mysql-1"}}
+	_, err := fixture.store.Put(context.Background(), state)
+	require.NoError(t, err)
+	before, _ := fixture.store.Get("mysql")
+	fixture.supervisor.mu.Lock()
+	require.NoError(t, fixture.supervisor.RefreshObservation(context.Background()))
+	require.NoError(t, fixture.supervisor.RefreshObservation(context.Background()))
+	during, _ := fixture.store.Get("mysql")
+	require.Equal(t, before.ObservationRevision, during.ObservationRevision)
+	fixture.supervisor.mu.Unlock()
+	require.Eventually(t, func() bool {
+		after, ok := fixture.store.Get("mysql")
+		return ok && after.ObservationRevision == before.ObservationRevision+1
+	}, time.Second, time.Millisecond)
 }
 
 func TestNewSupervisorRecoversPersistedFamilySlotsBeforeAcceptingCommands(t *testing.T) {

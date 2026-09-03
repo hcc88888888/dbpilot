@@ -173,15 +173,23 @@ func stringRevision(value uint64) string {
 }
 
 type Session struct {
-	client                *Client
+	client                  *Client
+	expected                ExpectedPlugin
+	launchOperationRevision uint64
+	mu                      sync.Mutex
+	lanesMu                 sync.Mutex
+	lanes                   map[cursorKey]*sync.Mutex
+	handshaken              bool
+	configurationRevision   uint64
+	instances               map[string]*pluginv1.PluginInstanceConfiguration
+	builtinTemplates        map[string]*pluginv1.BuiltinMetricTemplateDescriptor
+	pendingRollback         *sessionConfigurationSnapshot
+}
+
+type sessionConfigurationSnapshot struct {
 	expected              ExpectedPlugin
-	mu                    sync.Mutex
-	lanesMu               sync.Mutex
-	lanes                 map[cursorKey]*sync.Mutex
-	handshaken            bool
 	configurationRevision uint64
 	instances             map[string]*pluginv1.PluginInstanceConfiguration
-	builtinTemplates      map[string]*pluginv1.BuiltinMetricTemplateDescriptor
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -201,7 +209,7 @@ func (client *Client) Open(expected ExpectedPlugin) (*Session, error) {
 	if client == nil || client.config.Scope.validateAgent() != nil || validateExpected(client.config.RuntimeRoot, expected) != nil {
 		return nil, errGateway
 	}
-	return &Session{client: client, expected: cloneExpected(expected)}, nil
+	return &Session{client: client, expected: cloneExpected(expected), launchOperationRevision: expected.OperationRevision}, nil
 }
 
 func (session *Session) Handshake(ctx context.Context, expected ExpectedPlugin) (Capabilities, error) {
@@ -247,17 +255,8 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 	if session == nil || ctx == nil || ctx.Err() != nil || configuration.validate(session.expected) != nil || !session.isHandshaken() {
 		return errGateway
 	}
-	request := canonicalApplyRequest(configuration)
-	defer clearConfigurationSecrets(request)
-	responseErr := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
-		response, err := client.ApplyConfiguration(callContext, request)
-		if err != nil || !validApplyResponse(response, configuration) {
-			return errGateway
-		}
-		return nil
-	})
-	if responseErr != nil {
-		return responseErr
+	if err := session.applyConfigurationRPC(ctx, configuration); err != nil {
+		return err
 	}
 	session.mu.Lock()
 	session.configurationRevision = configuration.ConfigurationRevision
@@ -267,6 +266,18 @@ func (session *Session) ApplyConfiguration(ctx context.Context, configuration Pl
 	}
 	session.mu.Unlock()
 	return nil
+}
+
+func (session *Session) applyConfigurationRPC(ctx context.Context, configuration PluginConfiguration) error {
+	request := canonicalApplyRequest(configuration)
+	defer clearConfigurationSecrets(request)
+	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
+		response, err := client.ApplyConfiguration(callContext, request)
+		if err != nil || !validApplyResponse(response, configuration) {
+			return errGateway
+		}
+		return nil
+	})
 }
 
 func (session *Session) AssignmentID() string {
@@ -415,10 +426,19 @@ func (session *Session) ValidateInstance(ctx context.Context, instanceID string)
 }
 
 func (session *Session) TrialMetricTemplate(ctx context.Context, configurationRevision, operationRevision uint64, instanceID string, template *pluginv1.TrialMetricTemplateDefinition) (TrialResult, error) {
-	if session == nil || ctx == nil || ctx.Err() != nil || configurationRevision == 0 || operationRevision == 0 || configurationRevision != session.currentRevision() || operationRevision != session.expected.OperationRevision || !session.readyForInstance(instanceID) || !validTrialTemplateDefinition(template) {
+	if session == nil || ctx == nil || ctx.Err() != nil {
 		return TrialResult{}, errGateway
 	}
-	request := &pluginv1.TrialMetricTemplateRequest{AssignmentId: session.expected.AssignmentID, ConfigurationRevision: session.currentRevision(), OperationRevision: operationRevision, InstanceId: instanceID, Template: proto.Clone(template).(*pluginv1.TrialMetricTemplateDefinition)}
+	session.mu.Lock()
+	assignmentID, currentOperation, launchOperation := session.expected.AssignmentID, session.expected.OperationRevision, session.launchOperationRevision
+	session.mu.Unlock()
+	if launchOperation == 0 {
+		launchOperation = currentOperation
+	}
+	if configurationRevision == 0 || operationRevision == 0 || configurationRevision != session.currentRevision() || operationRevision != currentOperation || launchOperation == 0 || !session.readyForInstance(instanceID) || !validTrialTemplateDefinition(template) {
+		return TrialResult{}, errGateway
+	}
+	request := &pluginv1.TrialMetricTemplateRequest{AssignmentId: assignmentID, ConfigurationRevision: session.currentRevision(), OperationRevision: launchOperation, InstanceId: instanceID, Template: proto.Clone(template).(*pluginv1.TrialMetricTemplateDefinition)}
 	var result TrialResult
 	err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
 		var trialErr error
@@ -438,6 +458,8 @@ func (session *Session) OperationRevision() uint64 {
 	if session == nil {
 		return 0
 	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
 	return session.expected.OperationRevision
 }
 
@@ -571,54 +593,180 @@ func (session *Session) CollectNow(ctx context.Context, instanceIDs, templateIDs
 }
 
 func (session *Session) RunMetricStream(ctx context.Context, sink MetricSink) error {
-	return session.runMetricStream(ctx, sink, nil)
+	return session.runMetricStream(ctx, sink, nil, false)
 }
 
 // RunMetricStreamReady reports readiness only after the verified stream has
 // received server headers. Dial/header setup is bounded by the unary timeout;
 // the receive loop is owned solely by the Supervisor lifetime context.
 func (session *Session) RunMetricStreamReady(ctx context.Context, sink MetricSink, ready chan<- error) error {
-	return session.runMetricStream(ctx, sink, ready)
+	return session.runMetricStream(ctx, sink, ready, false)
 }
 
-// ApplyConfigurationUpdate changes only the configuration projection of an
-// already verified live session. Neither the session's verified binary
-// identity nor its retained configuration changes unless the plugin accepts
-// the complete atomic request.
-func (session *Session) ApplyConfigurationUpdate(ctx context.Context, expected ExpectedPlugin, configuration PluginConfiguration) error {
+// RunMetricStreamCommitted reports readiness only after the first batch in
+// the current configuration namespace has been durably spooled and ACKed.
+// Live Apply uses this stronger boundary before committing its transaction.
+func (session *Session) RunMetricStreamCommitted(ctx context.Context, sink MetricSink, ready chan<- error) error {
+	return session.runMetricStream(ctx, sink, ready, true)
+}
+
+// ApplyConfigurationUpdate stages a same-process configuration transaction.
+// It leaves the previous session projection intact until the plugin has
+// accepted the candidate and every configured instance has passed validation
+// and an initial collection. The caller must then reopen the metric stream and
+// either FinalizeConfigurationUpdate after its first durable ACK or invoke
+// RollbackConfigurationUpdate with the exact previous configuration.
+func (session *Session) ApplyConfigurationUpdate(ctx context.Context, expected ExpectedPlugin, configuration, previous PluginConfiguration) error {
 	if session == nil || ctx == nil || ctx.Err() != nil || validateExpected(filepath.Dir(expected.RuntimeDirectory), expected) != nil || configuration.validate(expected) != nil {
 		return errGateway
 	}
 	session.mu.Lock()
-	current := cloneExpected(session.expected)
-	handshaken := session.handshaken
+	snapshot := sessionConfigurationSnapshot{expected: cloneExpected(session.expected), configurationRevision: session.configurationRevision, instances: cloneInstanceMap(session.instances)}
+	handshaken, pending := session.handshaken, session.pendingRollback
 	session.mu.Unlock()
-	if !handshaken || !sameVerifiedRuntime(current, expected) || expected.ConfigurationRevision <= current.ConfigurationRevision || expected.OperationRevision <= current.OperationRevision {
+	if !handshaken || pending != nil || previous.validate(snapshot.expected) != nil || previous.ConfigurationRevision != snapshot.configurationRevision || !sameVerifiedRuntime(snapshot.expected, expected) || expected.ConfigurationRevision <= snapshot.expected.ConfigurationRevision || expected.OperationRevision <= snapshot.expected.OperationRevision {
 		return errGateway
 	}
-	request := canonicalApplyRequest(configuration)
-	defer clearConfigurationSecrets(request)
-	if err := session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
-		response, err := client.ApplyConfiguration(callContext, request)
-		if err != nil || !validApplyResponse(response, configuration) {
-			return errGateway
+	if err := session.applyConfigurationRPC(ctx, configuration); err != nil {
+		if session.restoreConfigurationRPC(previous) != nil {
+			session.mu.Lock()
+			session.handshaken = false
+			session.mu.Unlock()
 		}
-		return nil
-	}); err != nil {
-		return err
+		return errGateway
+	}
+	if err := session.probeConfiguration(ctx, expected, configuration); err != nil {
+		if rollbackErr := session.restoreConfigurationRPC(previous); rollbackErr != nil {
+			session.mu.Lock()
+			session.handshaken = false
+			session.mu.Unlock()
+		}
+		return errGateway
 	}
 	session.mu.Lock()
-	defer session.mu.Unlock()
-	if !session.handshaken || !sameExpected(session.expected, current) {
+	if !session.handshaken || session.pendingRollback != nil || !sameExpected(session.expected, snapshot.expected) || session.configurationRevision != snapshot.configurationRevision {
+		session.mu.Unlock()
+		_ = session.restoreConfigurationRPC(previous)
 		return errGateway
 	}
 	session.expected = cloneExpected(expected)
 	session.configurationRevision = configuration.ConfigurationRevision
-	session.instances = make(map[string]*pluginv1.PluginInstanceConfiguration, len(configuration.Instances))
-	for _, instance := range configuration.Instances {
-		session.instances[instance.GetInstanceId()] = cloneInstanceWithoutCredential(instance)
+	session.instances = instanceMapWithoutCredentials(configuration.Instances)
+	session.pendingRollback = &snapshot
+	session.mu.Unlock()
+	return nil
+}
+
+func (session *Session) restoreConfigurationRPC(previous PluginConfiguration) error {
+	if session == nil || session.client == nil {
+		return errGateway
+	}
+	restoreContext, cancel := context.WithTimeout(context.Background(), session.client.config.Timeout)
+	defer cancel()
+	return session.applyConfigurationRPC(restoreContext, previous)
+}
+
+// FinalizeConfigurationUpdate commits a staged configuration after the new
+// cursor namespace has produced its first durable spool receipt and ACK.
+func (session *Session) FinalizeConfigurationUpdate() error {
+	if session == nil {
+		return errGateway
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.pendingRollback == nil || !session.handshaken {
+		return errGateway
+	}
+	session.pendingRollback = nil
+	return nil
+}
+
+// RollbackConfigurationUpdate restores the exact pre-update projection while
+// retaining the already verified process and handshake identity.
+func (session *Session) RollbackConfigurationUpdate(ctx context.Context, previous PluginConfiguration) error {
+	if session == nil || ctx == nil || ctx.Err() != nil {
+		return errGateway
+	}
+	session.mu.Lock()
+	snapshot := session.pendingRollback
+	session.mu.Unlock()
+	if snapshot == nil || previous.validate(snapshot.expected) != nil || previous.ConfigurationRevision != snapshot.configurationRevision {
+		return errGateway
+	}
+	if err := session.applyConfigurationRPC(ctx, previous); err != nil {
+		return errGateway
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.pendingRollback != snapshot {
+		return errGateway
+	}
+	session.expected = cloneExpected(snapshot.expected)
+	session.configurationRevision = snapshot.configurationRevision
+	session.instances = cloneInstanceMap(snapshot.instances)
+	session.pendingRollback = nil
+	return nil
+}
+
+func (session *Session) probeConfiguration(ctx context.Context, expected ExpectedPlugin, configuration PluginConfiguration) error {
+	instances := instanceMapWithoutCredentials(configuration.Instances)
+	instanceIDs := append([]string(nil), expected.InstanceIDs...)
+	sort.Strings(instanceIDs)
+	for _, instanceID := range instanceIDs {
+		if err := session.validateConfigurationInstance(ctx, expected, instanceID); err != nil {
+			return err
+		}
+	}
+	for _, instanceID := range instanceIDs {
+		instance := instances[instanceID]
+		if instance == nil {
+			return errGateway
+		}
+		templateIDs := session.configuredTemplateIDs(instance)
+		if len(templateIDs) == 0 || session.collectConfigurationInstance(ctx, expected, instances, instanceID, templateIDs) != nil {
+			return errGateway
+		}
 	}
 	return nil
+}
+
+func (session *Session) validateConfigurationInstance(ctx context.Context, expected ExpectedPlugin, instanceID string) error {
+	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
+		response, err := client.ValidateInstance(callContext, &pluginv1.ValidatePluginInstanceRequest{AssignmentId: expected.AssignmentID, InstanceId: instanceID, ConfigurationRevision: expected.ConfigurationRevision})
+		if err != nil || !validValidationResponse(response, instanceID, expected.SignedCapabilities) || !response.GetValid() {
+			return errGateway
+		}
+		return nil
+	})
+}
+
+func (session *Session) collectConfigurationInstance(ctx context.Context, expected ExpectedPlugin, instances map[string]*pluginv1.PluginInstanceConfiguration, instanceID string, templateIDs []string) error {
+	request := canonicalCollectRequest(expected.AssignmentID, expected.ConfigurationRevision, []string{instanceID}, templateIDs)
+	if proto.Size(request) > maxRPCMessageBytes {
+		return errGateway
+	}
+	return session.invoke(ctx, func(client pluginv1.PluginRuntimeClient, callContext context.Context) error {
+		response, err := client.CollectNow(callContext, request)
+		if err != nil || !validCollectResponseEnvelope(response, len(templateIDs)) {
+			return errGateway
+		}
+		seen := make(map[string]struct{}, len(response.GetBatches()))
+		for _, batch := range response.GetBatches() {
+			if !batchConfiguredFor(batch, expected, expected.ConfigurationRevision, instances, session.builtinTemplates) {
+				return errGateway
+			}
+			key := batch.GetInstanceId() + "\x00" + batch.GetTemplateId()
+			if _, duplicate := seen[key]; duplicate {
+				return errGateway
+			}
+			seen[key] = struct{}{}
+			scope := metricScopeFor(session.client.config.Scope, batch, expected, expected.ConfigurationRevision, instances, session.builtinTemplates)
+			if _, _, normalizeErr := normalizeBatch(batch, scope, session.client.config.Now().UTC()); normalizeErr != nil {
+				return errGateway
+			}
+		}
+		return nil
+	})
 }
 
 func sameVerifiedRuntime(left, right ExpectedPlugin) bool {
@@ -634,10 +782,27 @@ func (session *Session) HasResumeCursors(ctx context.Context, sink MetricSink) (
 	return len(values) > 0, err
 }
 
-func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, ready chan<- error) error {
+func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, ready chan<- error, readyAfterCommit bool) error {
 	if session == nil || ctx == nil || ctx.Err() != nil || sink == nil || !session.isConfigured() {
 		reportStreamReady(ready, errGateway)
 		return errGateway
+	}
+	commitPairs := make(map[string]struct{})
+	if readyAfterCommit {
+		session.mu.Lock()
+		for _, instanceID := range session.expected.InstanceIDs {
+			instance := session.instances[instanceID]
+			if instance != nil {
+				for _, templateID := range session.configuredTemplateIDs(instance) {
+					commitPairs[instanceID+"\x00"+templateID] = struct{}{}
+				}
+			}
+		}
+		session.mu.Unlock()
+		if len(commitPairs) == 0 {
+			reportStreamReady(ready, errGateway)
+			return errGateway
+		}
 	}
 	dialContext, dialCancel := context.WithTimeout(ctx, session.client.config.Timeout)
 	connection, err := dialVerifiedPlugin(dialContext, session.client.config.RuntimeRoot, session.expected)
@@ -680,14 +845,29 @@ func (session *Session) runMetricStream(ctx context.Context, sink MetricSink, re
 		reportStreamReady(ready, errGateway)
 		return errGateway
 	}
-	reportStreamReady(ready, nil)
+	readyReported := false
+	if !readyAfterCommit {
+		reportStreamReady(ready, nil)
+		readyReported = true
+	}
 	for {
 		batch, receiveErr := stream.Recv()
 		if errors.Is(receiveErr, io.EOF) || receiveErr != nil {
+			if !readyReported {
+				reportStreamReady(ready, errGateway)
+			}
 			return errGateway
 		}
 		if err := session.appendAndAcknowledge(streamContext, batch, sink, runtimeClient); err != nil {
+			if !readyReported {
+				reportStreamReady(ready, errGateway)
+			}
 			return err
+		}
+		delete(commitPairs, batch.GetInstanceId()+"\x00"+batch.GetTemplateId())
+		if !readyReported && len(commitPairs) == 0 {
+			reportStreamReady(ready, nil)
+			readyReported = true
 		}
 	}
 }
@@ -907,10 +1087,14 @@ func (session *Session) appendBatchInLane(ctx context.Context, batch *pluginv1.P
 }
 
 func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) bool {
-	if batch == nil || batch.GetPluginId() != session.expected.PluginID || batch.GetPluginVersion() != session.expected.Version || batch.GetDatabaseFamily() != session.expected.DatabaseFamily || batch.GetConfigurationRevision() != session.configurationRevision || !session.hasTemplate(batch.GetTemplateId()) {
+	return batchConfiguredFor(batch, session.expected, session.configurationRevision, session.instances, session.builtinTemplates)
+}
+
+func batchConfiguredFor(batch *pluginv1.PluginMetricBatch, expected ExpectedPlugin, revision uint64, instances map[string]*pluginv1.PluginInstanceConfiguration, builtins map[string]*pluginv1.BuiltinMetricTemplateDescriptor) bool {
+	if batch == nil || batch.GetPluginId() != expected.PluginID || batch.GetPluginVersion() != expected.Version || batch.GetDatabaseFamily() != expected.DatabaseFamily || batch.GetConfigurationRevision() != revision || (!contains(expected.TemplateIDs, batch.GetTemplateId()) && builtins[batch.GetTemplateId()] == nil) {
 		return false
 	}
-	configured := session.instances[batch.GetInstanceId()]
+	configured := instances[batch.GetInstanceId()]
 	if configured == nil || batch.GetDatabaseVariant() != configured.GetDatabaseVariant() {
 		return false
 	}
@@ -919,22 +1103,29 @@ func (session *Session) isBatchConfigured(batch *pluginv1.PluginMetricBatch) boo
 			return validateBatchAgainstTemplate(batch, template)
 		}
 	}
-	if builtin := session.builtinTemplates[batch.GetTemplateId()]; builtin != nil && builtin.GetRevision() == batch.GetTemplateRevision() {
+	if builtin := builtins[batch.GetTemplateId()]; builtin != nil && builtin.GetRevision() == batch.GetTemplateRevision() {
 		return validateBatchAgainstBuiltin(batch, builtin)
 	}
 	return false
 }
 
 func (session *Session) metricScope(batch *pluginv1.PluginMetricBatch) MetricScope {
-	scope := session.client.config.Scope
-	scope.AssignmentID = session.expected.AssignmentID
-	scope.InstanceIDs = append([]string(nil), session.expected.InstanceIDs...)
-	scope.TemplateIDs = session.allTemplateIDs()
-	scope.DatabaseFamily = session.expected.DatabaseFamily
-	scope.PluginID = session.expected.PluginID
-	scope.PluginVersion = session.expected.Version
-	scope.ConfigurationRevision = session.configurationRevision
-	scope.DatabaseVariant = session.instances[batch.GetInstanceId()].GetDatabaseVariant()
+	return metricScopeFor(session.client.config.Scope, batch, session.expected, session.configurationRevision, session.instances, session.builtinTemplates)
+}
+
+func metricScopeFor(scope MetricScope, batch *pluginv1.PluginMetricBatch, expected ExpectedPlugin, revision uint64, instances map[string]*pluginv1.PluginInstanceConfiguration, builtins map[string]*pluginv1.BuiltinMetricTemplateDescriptor) MetricScope {
+	scope.AssignmentID = expected.AssignmentID
+	scope.InstanceIDs = append([]string(nil), expected.InstanceIDs...)
+	scope.TemplateIDs = append([]string(nil), expected.TemplateIDs...)
+	for id := range builtins {
+		scope.TemplateIDs = append(scope.TemplateIDs, id)
+	}
+	sort.Strings(scope.TemplateIDs)
+	scope.DatabaseFamily = expected.DatabaseFamily
+	scope.PluginID = expected.PluginID
+	scope.PluginVersion = expected.Version
+	scope.ConfigurationRevision = revision
+	scope.DatabaseVariant = instances[batch.GetInstanceId()].GetDatabaseVariant()
 	scope.TemplateRevision = batch.GetTemplateRevision()
 	return scope
 }
@@ -1395,6 +1586,26 @@ func cloneInstancesWithoutCredentials(values []*pluginv1.PluginInstanceConfigura
 	result := make([]*pluginv1.PluginInstanceConfiguration, len(values))
 	for index, value := range values {
 		result[index] = cloneInstanceWithoutCredential(value)
+	}
+	return result
+}
+
+func instanceMapWithoutCredentials(values []*pluginv1.PluginInstanceConfiguration) map[string]*pluginv1.PluginInstanceConfiguration {
+	result := make(map[string]*pluginv1.PluginInstanceConfiguration, len(values))
+	for _, value := range values {
+		if value != nil {
+			result[value.GetInstanceId()] = cloneInstanceWithoutCredential(value)
+		}
+	}
+	return result
+}
+
+func cloneInstanceMap(values map[string]*pluginv1.PluginInstanceConfiguration) map[string]*pluginv1.PluginInstanceConfiguration {
+	result := make(map[string]*pluginv1.PluginInstanceConfiguration, len(values))
+	for id, value := range values {
+		if value != nil {
+			result[id] = cloneInstanceWithoutCredential(value)
+		}
 	}
 	return result
 }

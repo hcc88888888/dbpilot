@@ -60,7 +60,7 @@ services:
         /fixture-bin/dbpilot-fullstack-fixture bootstrap --root /acceptance --host-plugin --docker-network-name "$${DBPILOT_INTERNAL_NETWORK_NAME}" >/dev/null
         cp -a /acceptance/config/. /volumes/config/
         cp -a /acceptance/state/. /volumes/state/
-        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/proc-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+        install -d -m 0700 /volumes/artifacts /volumes/agent-data /volumes/assertion-input /volumes/enrollment-inbox /volumes/helper-runtime /volumes/proc-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
           /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
           /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
         cp /acceptance/secrets/controlplane.yaml /acceptance/secrets/controlplane-http-key.pem /acceptance/secrets/controlplane-grpc-key.pem \
@@ -74,10 +74,10 @@ services:
         cp /acceptance/secrets/oidc-token-credential /acceptance/secrets/plugin-publisher-key.pem /volumes/runner-secrets/
         cp /acceptance/config/ca.pem /volumes/runner-trust/
         cp /acceptance/secrets/postgres-password /volumes/assertion-secrets/
-        chown -R 10001:10001 /volumes/config /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+        chown -R 10001:10001 /volumes/config /volumes/state /volumes/artifacts /volumes/agent-data /volumes/assertion-input /volumes/enrollment-inbox /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
           /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
           /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
-        chmod 0700 /volumes/state /volumes/artifacts /volumes/agent-data /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
+        chmod 0700 /volumes/state /volumes/artifacts /volumes/agent-data /volumes/assertion-input /volumes/enrollment-inbox /volumes/helper-runtime /volumes/plugin-runtime /volumes/runner-artifacts \
           /volumes/controlplane-secrets /volumes/oidc-secrets /volumes/postgres-secrets /volumes/mysql-secrets \
           /volumes/frontend-tls /volumes/runner-secrets /volumes/runner-trust /volumes/assertion-secrets
         chown 0:10001 /volumes/helper-runtime
@@ -105,6 +105,8 @@ services:
       - acceptance-state:/volumes/state
       - acceptance-artifacts:/volumes/artifacts
       - acceptance-agent-data:/volumes/agent-data
+      - acceptance-assertion-input:/volumes/assertion-input
+      - acceptance-enrollment-inbox:/volumes/enrollment-inbox
       - acceptance-helper-runtime:/volumes/helper-runtime
       - acceptance-proc-runtime:/volumes/proc-runtime
       - acceptance-plugin-runtime:/volumes/plugin-runtime
@@ -365,13 +367,13 @@ services:
         test "$$(uname -m)" = x86_64
         /acceptance/bin/dbpilot-agent --version >/dev/null
         if test ! -s /acceptance/agent-data/enrollment/agent.crt; then
-          test -s /acceptance/agent-data/enrollment-token
+          test -s /acceptance/enrollment-inbox/enrollment-token
           /acceptance/bin/dbpilot-agent enroll \
             --server controlplane:9445 --ca-file /acceptance/config/ca.pem \
-            --token-file /acceptance/agent-data/enrollment-token --agent-id agent-online \
+            --token-file /acceptance/enrollment-inbox/enrollment-token --agent-id agent-online \
             --output-dir /acceptance/agent-data/enrollment
         fi
-        rm -f /acceptance/agent-data/enrollment-token
+        rm -f /acceptance/enrollment-inbox/enrollment-token
         install -d -m 0700 /acceptance/agent-data/native
         if test ! -x /acceptance/agent-data/native/mysqld-dbp; then
           cp /acceptance/bin/dbpilot-fullstack-fixture /acceptance/agent-data/native/mysqld-dbp
@@ -396,7 +398,12 @@ services:
     volumes:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-config:/acceptance/config:ro
-      - acceptance-agent-data:/acceptance/agent-data
+      - type: volume
+        source: acceptance-agent-data
+        target: /acceptance/agent-data
+        volume:
+          nocopy: true
+      - acceptance-enrollment-inbox:/acceptance/enrollment-inbox
       - acceptance-helper-runtime:/acceptance/helper-runtime:ro
       - acceptance-proc-runtime:/run/dbpilot-agent
       - acceptance-plugin-runtime:/acceptance/agent-data/plugin-runtime
@@ -520,6 +527,7 @@ services:
     pids_limit: 96
 
   acceptance-runner:
+    image: ${DBPILOT_HOST_PLUGIN_RUNNER_IMAGE:-dbpilot-host-plugin-runner:unassigned}
     build:
       context: ../../..
       dockerfile: backend/docker/host-plugin-full-stack/runner.Dockerfile
@@ -540,7 +548,7 @@ services:
       PROJECT_ID: project-acceptance
       HOST_ID: host-acceptance
       AGENT_ID: agent-online
-      AGENT_DATA_DIR: /acceptance/agent-data
+      ENROLLMENT_INBOX_DIR: /acceptance/enrollment-inbox
       ACCEPTANCE_STATE_FILE: /acceptance/state/host-plugin-phase.json
     read_only: true
     tmpfs:
@@ -551,7 +559,7 @@ services:
       - acceptance-runner-trust:/acceptance/config:ro
       - acceptance-runner-secrets:/acceptance/secrets:ro
       - acceptance-state:/acceptance/state
-      - acceptance-agent-data:/acceptance/agent-data
+      - acceptance-enrollment-inbox:/acceptance/enrollment-inbox
       - acceptance-runner-artifacts:/acceptance/playwright
     networks: [acceptance]
     labels: *ownership-labels
@@ -561,6 +569,35 @@ services:
     cpus: 2.0
     mem_limit: 2g
     pids_limit: 512
+
+  assertion-exporter:
+    image: *kylin-image
+    platform: linux/amd64
+    profiles: ["assertions"]
+    user: "10001:10001"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        for name in command-journal.db state.db; do
+          test -f "/acceptance/agent-data/$${name}"
+          test ! -L "/acceptance/agent-data/$${name}"
+          install -m 0400 "/acceptance/agent-data/$${name}" "/acceptance/assertion-input/$${name}"
+        done
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,mode=0700,uid=10001,gid=10001
+    volumes:
+      - acceptance-agent-data:/acceptance/agent-data:ro
+      - acceptance-assertion-input:/acceptance/assertion-input
+    networks: [acceptance]
+    labels: *ownership-labels
+    restart: "no"
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.25
+    mem_limit: 64m
+    pids_limit: 32
 
   assertions:
     image: *kylin-image
@@ -582,7 +619,7 @@ services:
         exec /acceptance/bin/dbpilot-fullstack-fixture host-plugin \
           --phase "$${DBPILOT_ASSERTION_PHASE}" \
           --dsn-file /tmp/postgres-dsn \
-          --agent-data /acceptance/agent-data \
+          --agent-data /acceptance/assertion-input \
           --state-file /acceptance/state/host-plugin-phase.json \
           --tenant-id tenant-acceptance --project-id project-acceptance --agent-id agent-online
     depends_on:
@@ -595,7 +632,7 @@ services:
       - acceptance-bin:/acceptance/bin:ro
       - acceptance-assertion-secrets:/acceptance/secrets:ro
       - acceptance-state:/acceptance/state
-      - acceptance-agent-data:/acceptance/agent-data:ro
+      - acceptance-assertion-input:/acceptance/assertion-input:ro
       - acceptance-plugin-runtime:/acceptance/plugin-runtime:ro
     networks: [acceptance]
     labels: *ownership-labels
@@ -649,6 +686,10 @@ volumes:
   acceptance-artifacts:
     labels: *ownership-labels
   acceptance-agent-data:
+    labels: *ownership-labels
+  acceptance-assertion-input:
+    labels: *ownership-labels
+  acceptance-enrollment-inbox:
     labels: *ownership-labels
   acceptance-plugin-runtime:
     labels: *ownership-labels

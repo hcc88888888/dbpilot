@@ -113,7 +113,7 @@ func TestGatewayUnexpectedExitZerosActiveCredentialsAndCancelsLifetimes(t *testi
 	configuration := plugingateway.PluginConfiguration{AssignmentID: "assignment-1", ConfigurationRevision: 5, Instances: []*pluginv1.PluginInstanceConfiguration{{InstanceId: "instance-1", CredentialLease: &pluginv1.CredentialLease{SecretBytes: secret}}}}
 	checker.activeCredentials[process.pid] = activeCredentialConfiguration{configuration: configuration, deadline: time.Now().Add(time.Minute)}
 	streamCancelled, renewalCancelled := false, false
-	checker.streams[process.pid] = func() { streamCancelled = true }
+	checker.streams[process.pid] = &metricStreamHandle{cancel: func() { streamCancelled = true }, done: make(chan struct{})}
 	checker.expiries[process.pid] = func() { renewalCancelled = true }
 	checker.CleanupUnexpectedExit(process)
 	require.True(t, streamCancelled)

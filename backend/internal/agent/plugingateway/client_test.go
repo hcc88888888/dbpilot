@@ -674,6 +674,8 @@ func TestTrialMetricTemplateRejectsStaleConfigurationAndOperation(t *testing.T) 
 	require.Error(t, err)
 	_, err = session.TrialMetricTemplate(context.Background(), 4, 8, "mysql-1", definition)
 	require.Error(t, err)
+	_, err = session.TrialMetricTemplate(context.Background(), 4, 10, "mysql-1", definition)
+	require.Error(t, err)
 }
 
 func TestTrialGatewayAcceptsFixedHighCardinalityCode(t *testing.T) {

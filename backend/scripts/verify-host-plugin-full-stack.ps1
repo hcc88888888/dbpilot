@@ -65,6 +65,7 @@ $GoBinary = Resolve-RequiredExecutable $GoBinary 'go' $goCandidates 'Go 1.27.0 i
 
 $RunId = [guid]::NewGuid().ToString('N')
 $projectName = "dbpilot-host-plugin-$RunId"
+$runnerImageReference = "dbpilot-host-plugin-runner:$RunId"
 $verifierLabel = 'host-plugin-full-stack'
 $verifierOwnershipFilter = 'dbpilot.verifier=host-plugin-full-stack'
 if ($verifierOwnershipFilter -cne "dbpilot.verifier=$verifierLabel") { throw 'Verifier ownership filter is inconsistent.' }
@@ -87,11 +88,12 @@ $temporaryCreated = $false
 $ownershipStarted = $false
 
 $savedEnvironment = @{}
-foreach ($name in @('DBPILOT_ACCEPTANCE_PROJECT', 'DBPILOT_HOST_PLUGIN_RUN_ID', 'DBPILOT_KYLIN_IMAGE')) {
+foreach ($name in @('DBPILOT_ACCEPTANCE_PROJECT', 'DBPILOT_HOST_PLUGIN_RUN_ID', 'DBPILOT_HOST_PLUGIN_RUNNER_IMAGE', 'DBPILOT_KYLIN_IMAGE')) {
     $savedEnvironment[$name] = if (Test-Path "Env:$name") { [pscustomobject]@{ Exists = $true; Value = [Environment]::GetEnvironmentVariable($name) } } else { [pscustomobject]@{ Exists = $false; Value = $null } }
 }
 $env:DBPILOT_ACCEPTANCE_PROJECT = $projectName
 $env:DBPILOT_HOST_PLUGIN_RUN_ID = $RunId
+$env:DBPILOT_HOST_PLUGIN_RUNNER_IMAGE = $runnerImageReference
 $env:DBPILOT_KYLIN_IMAGE = $KylinImage
 
 function Get-UTCInstant {
@@ -201,7 +203,8 @@ function Register-OwnedVolume {
 }
 
 function Register-OwnedResources {
-    $containers = ConvertTo-OutputLines (Invoke-DockerCapture @('ps', '-a', '--no-trunc', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to discover owned Compose containers.')
+	param([ValidateRange(0, 30)][int]$RunnerImageRetrySeconds = 0)
+	$containers = ConvertTo-OutputLines (Invoke-DockerCapture @('ps', '-a', '--no-trunc', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to discover owned Compose containers.')
     foreach ($id in $containers | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) {
         if ($containerIDs.Add($id)) { Write-ResourceLedger }
         if ($ownedContainerIDs.Contains($id)) { continue }
@@ -218,19 +221,38 @@ function Register-OwnedResources {
     }
     $volumes = ConvertTo-OutputLines (Invoke-DockerCapture @('volume', 'ls', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.Name}}') 'Unable to discover owned Compose volumes.')
     foreach ($name in $volumes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) { Register-OwnedVolume $name }
+	Register-OwnedRunnerImages -RetrySeconds $RunnerImageRetrySeconds
     Write-ResourceLedger
 }
 
-function Register-OwnedRunnerImage {
-    $imageMatches = @(ConvertTo-OutputLines (Invoke-DockerCapture @('image', 'ls', '--no-trunc', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to resolve the acceptance-runner image ID.'))
-    if ($imageMatches.Count -ne 1) { throw 'The acceptance-runner image ownership query was not unique.' }
-    $id = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{.Id}}', $imageMatches[0]) 'Unable to canonicalize the acceptance-runner image ID.').Trim()
+function Register-OwnedRunnerImageID {
+    param([string]$Candidate)
+    $id = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{.Id}}', $Candidate) 'Unable to canonicalize the acceptance-runner image ID.').Trim()
     if ($id -notmatch '^sha256:[0-9a-f]{64}$') { throw 'The acceptance-runner image ID is invalid.' }
     $labels = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{ index .Config.Labels "dbpilot.verifier" }}|{{ index .Config.Labels "dbpilot.run" }}', $id) 'Unable to inspect acceptance-runner image ownership.').Trim()
     if ($labels -cne "$verifierLabel|$RunId") { throw 'The acceptance-runner image ownership labels do not match.' }
     $null = $imageIDs.Add($id)
     $null = $ownedImageIDs.Add($id)
     Write-ResourceLedger
+}
+
+function Register-OwnedRunnerImages {
+	param([ValidateRange(0, 30)][int]$RetrySeconds = 0)
+	$deadline = [DateTime]::UtcNow.AddSeconds($RetrySeconds)
+	do {
+		try {
+			$candidates = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+			$reference = Invoke-DockerProcess @('image', 'inspect', '--format', '{{.Id}}', $runnerImageReference)
+			if ($reference.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($reference.Stdout)) { $null = $candidates.Add($reference.Stdout.Trim()) }
+			$labelMatches = @(ConvertTo-OutputLines (Invoke-DockerCapture @('image', 'ls', '--no-trunc', '--filter', "label=dbpilot.verifier=$verifierLabel", '--filter', "label=dbpilot.run=$RunId", '--format', '{{.ID}}') 'Unable to discover labelled acceptance-runner images.'))
+			foreach ($candidate in $labelMatches) { $null = $candidates.Add($candidate) }
+			foreach ($candidate in $candidates) { Register-OwnedRunnerImageID $candidate }
+		} catch {
+			if ([DateTime]::UtcNow -ge $deadline) { throw }
+		}
+		if ([DateTime]::UtcNow -ge $deadline) { return }
+		Start-Sleep -Seconds 1
+	} while ($true)
 }
 
 function Remove-OwnedRunnerImage {
@@ -255,6 +277,8 @@ function Assert-NoRunOwnershipCollision {
         $matches = ConvertTo-OutputLines (Invoke-DockerCapture $arguments 'Unable to audit host-plugin full-stack run ownership before creation.')
         if ($matches.Count -ne 0) { throw 'Host-plugin host-plugin full-stack run ownership collision detected before creation.' }
     }
+    $tagMatches = ConvertTo-OutputLines (Invoke-DockerCapture @('image', 'ls', '--no-trunc', '--filter', "reference=$runnerImageReference", '--format', '{{.ID}}') 'Unable to audit the acceptance-runner image reference before build.')
+    if ($tagMatches.Count -ne 0) { throw 'The acceptance-runner image reference already exists.' }
 }
 
 function Get-ServiceContainerID {
@@ -381,6 +405,13 @@ function Invoke-ComposeJob {
 function Invoke-AssertionPhase {
     param([ValidateSet('host-plugin', 'trial-diagnostic')][string]$Phase)
     return Invoke-ComposeJob -Service 'assertions' -Environment @{ DBPILOT_ASSERTION_PHASE = $Phase }
+}
+
+function Invoke-AssertionExport {
+    Invoke-ComposeChecked @('--profile', 'assertions', 'up', '--pull', 'never', '-d', '--no-deps', 'assertion-exporter')
+    Register-OwnedResources
+    $exporterID = Get-ServiceContainerID 'assertion-exporter'
+    if ((Wait-ContainerExit $exporterID 'assertion-exporter') -ne 0) { throw 'The assertion-exporter service failed.' }
 }
 
 function Write-TrialFailureDiagnostic {
@@ -528,8 +559,10 @@ function Assert-FailureCanariesAbsent {
         'DBPILOT_CANARY_NON_PEM_PRIVATE_KEY_7f30e2'
     )
     foreach ($id in $ownedContainerIDs) {
-        $result = Invoke-DockerProcess @('logs', '--tail', '500', $id)
-        if ($result.ExitCode -ne 0) { continue }
+        $result = Invoke-DockerProcess @('logs', $id)
+        if ($result.ExitCode -ne 0) { throw 'An owned container log could not be read.' }
+        if ($result.StdoutTruncated) { throw 'An owned container stdout log exceeded the audit bound.' }
+        if ($result.StderrTruncated) { throw 'An owned container stderr log exceeded the audit bound.' }
         $body = @($result.Stdout, $result.Stderr) -join [Environment]::NewLine
         foreach ($canary in $canaries) {
             if ($body.Contains($canary)) { throw 'A prohibited failure canary entered a container log.' }
@@ -642,7 +675,7 @@ try {
     Invoke-ComposeChecked @('--profile', '*', 'config', '--quiet')
     Invoke-PublicImageMaterialization
     Invoke-ComposeChecked -Arguments @('build', 'acceptance-runner') -TimeoutSeconds $BuildTimeoutSeconds -Failure 'The acceptance-runner image build failed.' -TimeoutFailure 'The acceptance-runner image build timed out.'
-    Register-OwnedRunnerImage
+    Register-OwnedRunnerImages
     Register-OwnedResources
 
     Invoke-ComposeChecked @('up', '--pull', 'never', '-d', '--no-deps', 'asset-builder')
@@ -727,6 +760,7 @@ try {
     Remove-SafeFailureArtifactDirectory $canaryArtifacts
     Invoke-DockerChecked @('stop', '--time', '20', $procHelperID)
     Invoke-DockerChecked @('stop', '--time', '20', $agentID)
+    Invoke-AssertionExport
     $null = Invoke-AssertionPhase 'host-plugin'
 
     Write-Host "Host-plugin full-stack acceptance passed: frontend_port=$frontendPort."
@@ -737,13 +771,14 @@ catch {
 		try {
 			Invoke-DockerChecked @('stop', '--time', '20', $procHelperID)
 			Invoke-DockerChecked @('stop', '--time', '20', $agentID)
+			Invoke-AssertionExport
 			Write-TrialFailureDiagnostic (Invoke-AssertionPhase 'trial-diagnostic')
 		} catch { Write-Warning 'The bounded trial diagnostic could not be collected.' }
 	}
 }
 finally {
     if ($ownershipStarted) {
-        try { Register-OwnedResources } catch { $cleanupFailures.Add($_) }
+		try { Register-OwnedResources -RunnerImageRetrySeconds 5 } catch { $cleanupFailures.Add($_) }
     }
     if ($null -ne $primaryFailure -and $ownershipStarted) {
         try {

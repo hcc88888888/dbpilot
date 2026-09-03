@@ -79,11 +79,18 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	degradedLease, err := requestCredentialLease(ctx, restartedService, success, 0x27)
 	require.NoError(t, err, "the exact audited fence may leave the bounded waiting-credentials recovery state")
 	degradedLease.Release()
-	_, err = database.Exec(`UPDATE plugin_observations SET active_configuration_revision=4,observed_operation_revision=6,health='healthy',last_error_code='plugin_upgrade_rolled_back',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(950*time.Millisecond))
+	_, err = database.Exec(`UPDATE plugin_observations SET active_configuration_revision=5,observed_operation_revision=7,health='healthy',last_error_code='plugin_upgrade_rolled_back',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(950*time.Millisecond))
 	require.NoError(t, err)
 	rollbackLease, err := requestCredentialLease(ctx, restartedService, success, 0x29)
-	require.NoError(t, err, "the exact current audit and terminal operation fence a restored binary while its last rollback observation is stale")
+	require.NoError(t, err, "the exact current terminal operation and signed rollback observation authorize recovery")
 	rollbackLease.Release()
+	_, err = database.Exec(`UPDATE plugin_observations SET active_configuration_revision=4,observed_operation_revision=6,observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(975*time.Millisecond))
+	require.NoError(t, err)
+	providerCallsBeforeStaleRollback := restartProvider.Calls()
+	staleRollbackLease, err := requestCredentialLease(ctx, restartedService, success, 0x2a)
+	staleRollbackLease.Release()
+	require.ErrorIs(t, err, credentiallease.ErrLeaseRejected, "a stale 4/6 observation cannot replay the current 5/7 rollback authorization")
+	require.Equal(t, providerCallsBeforeStaleRollback, restartProvider.Calls())
 	_, err = database.Exec(`UPDATE plugin_observations SET process_state='running',process_id=123,started_at=$4,health='healthy',last_error_code='',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(time.Second))
 	require.NoError(t, err)
 
@@ -154,6 +161,22 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 		}},
 		{name: "observation operation revision", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
 			_, err := database.Exec(`UPDATE plugin_observations SET observed_operation_revision=observed_operation_revision-1 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
+			require.NoError(t, err)
+		}},
+		{name: "observation installed version", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
+			_, err := database.Exec(`UPDATE plugin_observations SET installed_version='0.9.0' WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
+			require.NoError(t, err)
+		}},
+		{name: "observation active slot", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
+			_, err := database.Exec(`UPDATE plugin_observations SET active_slot='none' WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
+			require.NoError(t, err)
+		}},
+		{name: "observation freshness", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
+			_, err := database.Exec(`UPDATE plugin_observations SET received_at=CURRENT_TIMESTAMP-INTERVAL '10 minutes' WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
+			require.NoError(t, err)
+		}},
+		{name: "observation identity", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {
+			_, err := database.Exec(`UPDATE plugin_observations SET agent_id='agent-other' WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, value.tenantID, value.projectID, value.assignmentID)
 			require.NoError(t, err)
 		}},
 		{name: "agent identity", mutate: func(t *testing.T, database *sql.DB, value durableRenewalFixture) {

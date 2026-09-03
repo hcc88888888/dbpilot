@@ -5,7 +5,7 @@ import { buildPluginPackage } from './plugin-package.mjs';
 const required = [
   'FRONTEND_URL', 'OIDC_URL', 'OIDC_CREDENTIAL_FILE', 'PLUGIN_PUBLISHER_KEY_FILE',
   'PLUGIN_BINARY_FILE', 'PLUGIN_ARM64_BINARY_FILE', 'TENANT_ID', 'PROJECT_ID', 'HOST_ID', 'AGENT_ID',
-  'AGENT_DATA_DIR', 'ACCEPTANCE_STATE_FILE', 'DBPILOT_ACCEPTANCE_PHASE',
+  'ENROLLMENT_INBOX_DIR', 'ACCEPTANCE_STATE_FILE', 'DBPILOT_ACCEPTANCE_PHASE',
 ];
 const env = Object.fromEntries(required.map((name) => {
   const value = process.env[name]?.trim();
@@ -36,7 +36,7 @@ test('create one-time enrollment without retaining its token', async ({ request 
     status: 201,
   });
   expect(response.body.enrollment_token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-  const tokenPath = env.AGENT_DATA_DIR + '/enrollment-token';
+  const tokenPath = env.ENROLLMENT_INBOX_DIR + '/enrollment-token';
   await writeFile(tokenPath + '.tmp', response.body.enrollment_token + '\n', { mode: 0o600 });
   await rename(tokenPath + '.tmp', tokenPath);
   await chmod(tokenPath, 0o600);

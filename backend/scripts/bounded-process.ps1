@@ -90,6 +90,8 @@ public static class DBPilotProcessJob
 '@
 }
 
+$script:DBPilotBoundedProcessGatePath = Join-Path $PSScriptRoot 'bounded-process-gate.ps1'
+
 function Set-BoundedProcessArguments {
     param([Diagnostics.ProcessStartInfo]$StartInfo, [string[]]$Arguments)
     if ($null -ne $StartInfo.PSObject.Properties['ArgumentList']) {
@@ -134,9 +136,22 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory = $true)][string]$StartFailure,
         [Parameter(Mandatory = $true)][string]$TimeoutFailure
     )
-    $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $commandArguments = @($Arguments)
-    if ([IO.Path]::GetExtension($Command) -ieq '.ps1') {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $gateEvent = $null
+    if ($env:OS -eq 'Windows_NT') {
+        if (-not (Test-Path -LiteralPath $script:DBPilotBoundedProcessGatePath -PathType Leaf)) { throw $StartFailure }
+        $startInfo.FileName = (Get-Process -Id $PID).Path
+        $gateEventName = 'Local\DBPilotBounded-' + [Guid]::NewGuid().ToString('N')
+        $created = $false
+        $gateEvent = [Threading.EventWaitHandle]::new($false, [Threading.EventResetMode]::ManualReset, $gateEventName, [ref]$created)
+        if (-not $created) { $gateEvent.Dispose(); throw $StartFailure }
+        $startInfo.EnvironmentVariables['DBPILOT_BOUNDED_GATE_EVENT'] = $gateEventName
+        $startInfo.EnvironmentVariables['DBPILOT_BOUNDED_GATE_COMMAND'] = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Command))
+        $encodedArguments = ConvertTo-Json -InputObject ([object[]]$commandArguments) -Compress
+        $startInfo.EnvironmentVariables['DBPILOT_BOUNDED_GATE_ARGUMENTS'] = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($encodedArguments))
+        $commandArguments = @('-NoProfile', '-File', $script:DBPilotBoundedProcessGatePath)
+    } elseif ([IO.Path]::GetExtension($Command) -ieq '.ps1') {
         $startInfo.FileName = (Get-Process -Id $PID).Path
         $commandArguments = @('-NoProfile', '-File', $Command) + $commandArguments
     } else {
@@ -147,6 +162,7 @@ function Invoke-BoundedProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     foreach ($key in [Environment]::GetEnvironmentVariables().Keys) {
+        if ([string]$key -like 'DBPILOT_BOUNDED_GATE_*') { continue }
         $startInfo.EnvironmentVariables[[string]$key] = [string][Environment]::GetEnvironmentVariable([string]$key)
     }
     Set-BoundedProcessArguments $startInfo $commandArguments
@@ -156,10 +172,11 @@ function Invoke-BoundedProcess {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     try {
         try {
+            if ($env:OS -eq 'Windows_NT') { $job = [DBPilotProcessJob]::CreateKillOnClose() }
             if (-not $process.Start()) { throw $StartFailure }
             if ($env:OS -eq 'Windows_NT') {
-                $job = [DBPilotProcessJob]::CreateKillOnClose()
                 [DBPilotProcessJob]::Assign($job, $process.Handle)
+                $null = $gateEvent.Set()
             }
         } catch {
             if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
@@ -182,11 +199,14 @@ function Invoke-BoundedProcess {
         }
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($stdout.Length -gt 1000000) { $stdout = $stdout.Substring($stdout.Length - 1000000) }
-        if ($stderr.Length -gt 1000000) { $stderr = $stderr.Substring($stderr.Length - 1000000) }
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout.Trim(); Stderr = $stderr.Trim() }
+        $stdoutTruncated = $stdout.Length -gt 1000000
+        $stderrTruncated = $stderr.Length -gt 1000000
+        if ($stdoutTruncated) { $stdout = $stdout.Substring($stdout.Length - 1000000) }
+        if ($stderrTruncated) { $stderr = $stderr.Substring($stderr.Length - 1000000) }
+        return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdout.Trim(); Stderr = $stderr.Trim(); StdoutTruncated = $stdoutTruncated; StderrTruncated = $stderrTruncated }
     } finally {
         if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job) }
+        if ($null -ne $gateEvent) { $gateEvent.Dispose() }
         $process.Dispose()
     }
 }

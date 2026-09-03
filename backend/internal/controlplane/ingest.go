@@ -140,7 +140,7 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 		for key, value := range input.Labels {
 			labels[key] = value
 		}
-		if isHostCoreMetric(input.Name) {
+		if isHostCoreProducer(labels) {
 			labels["instance"] = hostID
 			labels["host"] = hostID
 		}
@@ -154,13 +154,8 @@ func (c *MetricConsumer) metricSamples(ctx context.Context, agentID string, payl
 	return samples, nil
 }
 
-func isHostCoreMetric(name string) bool {
-	switch strings.TrimSpace(name) {
-	case "system.cpu.utilization", "system.memory.utilization":
-		return true
-	default:
-		return false
-	}
+func isHostCoreProducer(labels map[string]string) bool {
+	return labels["dbpilot_source_id"] == "inspection-host-snapshot"
 }
 
 type metricEnvelope struct {

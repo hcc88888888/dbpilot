@@ -38,23 +38,35 @@ type ServerConfig struct {
 	StreamInterval        time.Duration
 }
 
+type metricNamespaceSnapshot struct {
+	sequences    map[string]uint64
+	acknowledged map[string]uint64
+	nextDue      map[string]time.Time
+	pending      map[string]*pluginv1.PluginMetricBatch
+	pendingBytes int
+}
+
 type Server struct {
 	pluginv1.UnimplementedPluginRuntimeServer
-	config        ServerConfig
-	runtime       *Runtime
-	collector     *Collector
-	parser        StatementParser
-	mu            sync.Mutex
-	instanceLanes map[string]*sync.Mutex
-	sequences     map[string]uint64
-	acknowledged  map[string]uint64
-	shuttingDown  bool
-	shutdown      chan struct{}
-	shutdownOnce  sync.Once
-	streams       sync.WaitGroup
-	nextDue       map[string]time.Time
-	pending       map[string]*pluginv1.PluginMetricBatch
-	pendingBytes  int
+	config          ServerConfig
+	runtime         *Runtime
+	collector       *Collector
+	parser          StatementParser
+	mu              sync.Mutex
+	instanceLanes   map[string]*sync.Mutex
+	sequences       map[string]uint64
+	acknowledged    map[string]uint64
+	shuttingDown    bool
+	shutdown        chan struct{}
+	shutdownOnce    sync.Once
+	streams         sync.WaitGroup
+	nextDue         map[string]time.Time
+	pending         map[string]*pluginv1.PluginMetricBatch
+	pendingBytes    int
+	configurationMu sync.Mutex
+	rollbackFrom    uint64
+	rollbackTo      uint64
+	rollbackMetrics *metricNamespaceSnapshot
 }
 
 func NewServer(config ServerConfig) *Server {
@@ -96,6 +108,8 @@ func (server *Server) Handshake(_ context.Context, request *pluginv1.PluginHands
 
 func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.ApplyPluginConfigurationRequest) (*pluginv1.ApplyPluginConfigurationResponse, error) {
 	defer clearApplyRequest(request)
+	server.configurationMu.Lock()
+	defer server.configurationMu.Unlock()
 	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || server.isShuttingDown() {
 		return nil, errors.New("configuration_rejected")
 	}
@@ -105,20 +119,30 @@ func (server *Server) ApplyConfiguration(ctx context.Context, request *pluginv1.
 	}
 	previousRevision := server.runtime.Revision()
 	targetRevision := request.GetConfigurationRevision()
-	if err = server.runtime.ApplyWithSwap(ctx, configuration, func() {
-		if previousRevision != 0 && previousRevision != targetRevision {
-			server.mu.Lock()
-			server.nextDue = map[string]time.Time{}
-			server.pending = map[string]*pluginv1.PluginMetricBatch{}
-			server.pendingBytes = 0
-			server.mu.Unlock()
+	apply := server.runtime.ApplyWithSwap
+	if targetRevision < previousRevision {
+		if server.rollbackFrom != previousRevision || server.rollbackTo != targetRevision || server.rollbackMetrics == nil {
+			configuration.Release()
+			return &pluginv1.ApplyPluginConfigurationResponse{ErrorCode: "configuration_rejected"}, nil
 		}
+		apply = func(applyContext context.Context, rollback Config, onSwap func()) error {
+			return server.runtime.ApplyRollback(applyContext, rollback, previousRevision, onSwap)
+		}
+	}
+	if err = apply(ctx, configuration, func() {
+		server.swapMetricNamespace(previousRevision, targetRevision)
 	}); err != nil {
 		code := "connection_rejected"
 		if errors.Is(err, ErrConfigurationRejected) {
 			code = "configuration_rejected"
 		}
 		return &pluginv1.ApplyPluginConfigurationResponse{ErrorCode: code}, nil
+	}
+	if targetRevision < previousRevision {
+		server.rollbackFrom, server.rollbackTo = 0, 0
+		server.rollbackMetrics = nil
+	} else if targetRevision > previousRevision {
+		server.rollbackFrom, server.rollbackTo = targetRevision, previousRevision
 	}
 	server.pruneCursors()
 	results := make([]*pluginv1.PluginInstanceConfigurationResult, 0, len(request.GetInstances()))
@@ -290,7 +314,7 @@ func (server *Server) instanceLane(instanceID string) *sync.Mutex {
 func (server *Server) TrialMetricTemplate(ctx context.Context, request *pluginv1.TrialMetricTemplateRequest) (*pluginv1.TrialMetricTemplateResponse, error) {
 	started := server.config.Now().UTC()
 	defer clearTrialRequest(request)
-	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || request.GetOperationRevision() == 0 || request.GetTemplate() == nil {
+	if request == nil || request.GetAssignmentId() != server.config.AssignmentID || request.GetConfigurationRevision() != server.runtime.Revision() || request.GetOperationRevision() != server.config.OperationRevision || request.GetTemplate() == nil {
 		return nil, errors.New("trial_rejected")
 	}
 	definition := request.GetTemplate()
@@ -416,18 +440,20 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 	proposed := make(map[string]uint64, len(request.GetCursors()))
 	accepted := make([]*pluginv1.PluginMetricCursor, 0, len(request.GetCursors()))
 	server.mu.Lock()
-	defer server.mu.Unlock()
 	for _, cursor := range request.GetCursors() {
 		key := cursorKey(cursor.GetInstanceId(), cursor.GetTemplateId())
 		if _, ok := bound[key]; !ok {
+			server.mu.Unlock()
 			return &pluginv1.AcknowledgePluginMetricsResponse{ErrorCode: "cursor_rejected"}, nil
 		}
 		if _, duplicate := proposed[key]; duplicate {
+			server.mu.Unlock()
 			return &pluginv1.AcknowledgePluginMetricsResponse{ErrorCode: "cursor_rejected"}, nil
 		}
 		sequence := cursor.GetSequence()
 		pending := server.pending[key]
 		if sequence == 0 || sequence != server.acknowledged[key] && (pending == nil || pending.GetSequence() != sequence || server.sequences[key] != sequence) {
+			server.mu.Unlock()
 			return &pluginv1.AcknowledgePluginMetricsResponse{ErrorCode: "cursor_rejected"}, nil
 		}
 		proposed[key] = cursor.GetSequence()
@@ -439,6 +465,13 @@ func (server *Server) AcknowledgeMetrics(_ context.Context, request *pluginv1.Ac
 			server.removePendingLocked(key)
 		}
 	}
+	server.mu.Unlock()
+	server.configurationMu.Lock()
+	if server.rollbackFrom == request.GetConfigurationRevision() {
+		server.rollbackFrom, server.rollbackTo = 0, 0
+		server.rollbackMetrics = nil
+	}
+	server.configurationMu.Unlock()
 	return &pluginv1.AcknowledgePluginMetricsResponse{AcceptedCursors: accepted}, nil
 }
 
@@ -586,9 +619,68 @@ func (server *Server) pendingBatch(instanceID, templateID string) *pluginv1.Plug
 	return nil
 }
 
+func (server *Server) swapMetricNamespace(previousRevision, targetRevision uint64) {
+	if previousRevision == targetRevision {
+		return
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if targetRevision < previousRevision {
+		snapshot := server.rollbackMetrics
+		server.sequences = snapshot.sequences
+		server.acknowledged = snapshot.acknowledged
+		server.nextDue = snapshot.nextDue
+		server.pending = snapshot.pending
+		server.pendingBytes = snapshot.pendingBytes
+		return
+	}
+	if previousRevision != 0 {
+		server.rollbackMetrics = &metricNamespaceSnapshot{
+			sequences:    cloneUint64Map(server.sequences),
+			acknowledged: cloneUint64Map(server.acknowledged),
+			nextDue:      cloneTimeMap(server.nextDue),
+			pending:      clonePendingMap(server.pending),
+			pendingBytes: server.pendingBytes,
+		}
+	} else {
+		server.rollbackMetrics = nil
+	}
+	server.sequences = map[string]uint64{}
+	server.acknowledged = map[string]uint64{}
+	server.nextDue = map[string]time.Time{}
+	server.pending = map[string]*pluginv1.PluginMetricBatch{}
+	server.pendingBytes = 0
+}
+
+func cloneUint64Map(values map[string]uint64) map[string]uint64 {
+	result := make(map[string]uint64, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneTimeMap(values map[string]time.Time) map[string]time.Time {
+	result := make(map[string]time.Time, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func clonePendingMap(values map[string]*pluginv1.PluginMetricBatch) map[string]*pluginv1.PluginMetricBatch {
+	result := make(map[string]*pluginv1.PluginMetricBatch, len(values))
+	for key, value := range values {
+		if value != nil {
+			result[key] = proto.Clone(value).(*pluginv1.PluginMetricBatch)
+		}
+	}
+	return result
+}
+
 func (server *Server) prepareResume(cursors []*pluginv1.PluginMetricCursor) ([]*pluginv1.PluginMetricBatch, error) {
 	bound := server.boundPairs()
-	if len(cursors) != len(bound) || len(bound) == 0 || len(bound) > MaxInstances*MaxTemplates {
+	if len(cursors) > len(bound) || len(bound) == 0 || len(bound) > MaxInstances*MaxTemplates {
 		return nil, errors.New("stream_rejected")
 	}
 	resume := make(map[string]uint64, len(bound))
@@ -601,6 +693,11 @@ func (server *Server) prepareResume(cursors []*pluginv1.PluginMetricCursor) ([]*
 			return nil, errors.New("stream_rejected")
 		}
 		resume[key] = cursor.GetSequence()
+	}
+	for key := range bound {
+		if _, exists := resume[key]; !exists {
+			resume[key] = 0
+		}
 	}
 	server.mu.Lock()
 	defer server.mu.Unlock()

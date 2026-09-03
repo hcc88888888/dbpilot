@@ -200,7 +200,7 @@ func AssertHostPluginDatabase(ctx context.Context, database *sql.DB, tenantID, p
 		{"observation", `SELECT COUNT(*) FROM plugin_observations WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3 AND installed_version='1.0.0' AND process_state='running' AND bound_instance_count=2 AND active_configuration_revision>0 AND observed_operation_revision>0`, []any{tenantID, projectID, state.AssignmentID}, 1},
 		{"metrics", `SELECT COUNT(DISTINCT metric) FROM metric_samples WHERE tenant_id=$1 AND project_id=$2 AND labels->>'instance' IN ($3,$4) AND metric IN ('mysql.connections.current','mysql.queries.total','mysql.threads.running','mysql.up','mysql.uptime.seconds')`, []any{tenantID, projectID, state.InstanceIDs[0], state.InstanceIDs[1]}, 5},
 		{"template", `SELECT COUNT(*) FROM metric_template_revisions WHERE tenant_id=$1 AND project_id=$2 AND revision_id=$3 AND status='published' AND query_digest ~ '^[0-9a-f]{64}$' AND read_only_statement<>''`, []any{tenantID, projectID, state.TemplateRevisionID}, 1},
-		{"high_cardinality", `SELECT COUNT(*) FROM metric_template_trials WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3 AND revision_id=$4 AND status='failed' AND status_code='high_cardinality'`, []any{tenantID, projectID, state.HighCardinalityJobID, state.HighCardinalityRevisionID}, 1},
+		{"high_cardinality", `SELECT COUNT(*) FROM metric_template_trials WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3 AND revision_id=$4 AND status='failed' AND status_code='high_cardinality' AND candidate_metrics='[]'::jsonb`, []any{tenantID, projectID, state.HighCardinalityJobID, state.HighCardinalityRevisionID}, 1},
 	}
 	for _, check := range checks {
 		var count int
