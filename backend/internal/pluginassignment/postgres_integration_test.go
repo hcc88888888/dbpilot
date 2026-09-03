@@ -81,7 +81,7 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	seedIncompatiblePluginVersion(t, database, scope, time.Now().UTC())
 	incompatible := "2.0.0"
 	_, err = service.SetDesiredState(ctx, scope, assignment.ID, assignment.Revision, pluginassignment.DesiredUpdate{DesiredVersion: &incompatible, Audit: pluginassignment.MutationAudit{Actor: "operator", OperationID: "updatePluginAssignment", IdempotencyKey: "incompatible-version", RequestFingerprint: "sha256:abababababababababababababababababababababababababababababababab", RequestID: "request-incompatible"}})
-	require.ErrorIs(t, err, pluginassignment.ErrVersionUnavailable)
+	require.ErrorIs(t, err, pluginassignment.ErrPlatformMismatch)
 	revisionRace := make(chan error, 2)
 	for index, state := range []pluginassignment.DesiredState{pluginassignment.DesiredStopped, pluginassignment.DesiredInstalled} {
 		index, state := index, state
@@ -140,9 +140,9 @@ func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *t
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='managed'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&managedInstances))
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='monitoring'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&monitoringInstances))
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND plugin_assignment_revision=$3 AND management_status='provisioning'`, scope.TenantID, scope.ProjectID, assignment.ConfigurationRevision).Scan(&provisioningInstances))
-	require.Zero(t, managedInstances, "plugin health alone cannot pretend an untested connection is managed")
+	require.Equal(t, 1, managedInstances, "a healthy exact plugin observation must make an untested instance available for managed workflows")
 	require.Equal(t, 1, monitoringInstances, "a healthy matching plugin observation must not downgrade an already monitored instance")
-	require.Equal(t, 1, provisioningInstances)
+	require.Zero(t, provisioningInstances)
 	matching, err := reconciler.Reconcile(ctx, time.Now().UTC(), 10)
 	require.NoError(t, err)
 	require.Zero(t, matching.Enqueued)

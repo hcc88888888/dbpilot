@@ -717,7 +717,7 @@ func (repository *PostgresRepository) RecordObservation(ctx context.Context, rep
                 WHEN instance.connection_test_status='succeeded' AND instance.management_status='monitoring' THEN 'monitoring'
                 WHEN instance.connection_test_status='succeeded' THEN 'managed'
                 WHEN instance.management_status IN ('connection_testing','authentication_failed','tls_failed','unreachable','unsupported_version') THEN instance.management_status
-                ELSE 'provisioning' END
+                ELSE 'managed' END
             WHEN $2='degraded' THEN CASE WHEN instance.management_status IN ('managed','monitoring','degraded','offline') THEN 'degraded' ELSE instance.management_status END
             WHEN $2='unavailable' THEN CASE WHEN instance.management_status IN ('managed','monitoring','degraded','offline') THEN 'offline' ELSE instance.management_status END
             ELSE CASE WHEN instance.management_status IN ('connection_testing','authentication_failed','tls_failed','unreachable','unsupported_version') THEN instance.management_status ELSE 'plugin_failed' END END,
