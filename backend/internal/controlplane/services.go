@@ -21,6 +21,7 @@ import (
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
+	"dbpilot.local/platform/internal/rediscovery"
 )
 
 type JobService interface {
@@ -61,6 +62,10 @@ type EnrollmentService interface {
 type PluginAssignmentReconciler interface {
 	ReconcileAssignment(context.Context, pluginassignment.Assignment, time.Time) (job.Job, error)
 	FindScheduledJob(context.Context, pluginassignment.Assignment) (job.Job, bool, error)
+}
+
+type HostRediscoveryService interface {
+	Start(context.Context, platformscope.Scope, string, rediscovery.RediscoveryRequest) (job.Job, error)
 }
 
 // InspectionOverview is the storage-neutral aggregate returned by the host
@@ -116,6 +121,7 @@ type Services struct {
 	Hosts                      hostinventory.Service
 	Enrollment                 EnrollmentService
 	Discovery                  discovery.Service
+	HostRediscovery            HostRediscoveryService
 	DatabaseInstances          databaseinstance.Service
 	PluginCatalog              plugincatalog.CatalogService
 	PluginAssignments          pluginassignment.Service

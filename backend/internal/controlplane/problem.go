@@ -23,6 +23,7 @@ import (
 	"dbpilot.local/platform/internal/platformscope"
 	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
+	"dbpilot.local/platform/internal/rediscovery"
 )
 
 var (
@@ -72,6 +73,10 @@ func newRequestID() string {
 func problemForError(err error, requestID, instance string) openapi.Problem {
 	status, code, title := http.StatusInternalServerError, "internal_error", "Internal server error"
 	switch {
+	case errors.Is(err, rediscovery.ErrHostNotOnline):
+		status, code, title = http.StatusConflict, "host_not_online", "Host is not online"
+	case errors.Is(err, rediscovery.ErrRediscoveryUnavailable):
+		status, code, title = http.StatusUnprocessableEntity, "discovery_unavailable", "Database discovery is unavailable"
 	case errors.Is(err, metrictemplate.ErrValidationFailed), errors.Is(err, metrictemplate.ErrDialectRejected):
 		status, code, title = http.StatusUnprocessableEntity, "template_validation_failed", "Metric template validation failed"
 	case errors.Is(err, metrictemplate.ErrTrialFailed):
@@ -112,7 +117,7 @@ func problemForError(err error, requestID, instance string) openapi.Problem {
 		status, code, title = http.StatusUnprocessableEntity, "plugin_assignment_capacity", "Plugin assignment capacity is exceeded"
 	case errors.Is(err, plugincatalog.ErrPackageTooLarge):
 		status, code, title = http.StatusUnprocessableEntity, "plugin_manifest_rejected", "Plugin package exceeds verification limits"
-	case errors.Is(err, ErrInvalidRequest), errors.Is(err, metrictemplate.ErrInvalid), errors.Is(err, databaseinstance.ErrInvalid), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, enrollment.ErrEnrollmentRequestInvalid), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, discovery.ErrInvalid), errors.Is(err, discovery.ErrSecretEvidence), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets), errors.Is(err, plugincatalog.ErrInvalid), errors.Is(err, pluginassignment.ErrInvalid):
+	case errors.Is(err, ErrInvalidRequest), errors.Is(err, rediscovery.ErrInvalid), errors.Is(err, metrictemplate.ErrInvalid), errors.Is(err, databaseinstance.ErrInvalid), errors.Is(err, artifact.ErrInvalid), errors.Is(err, audit.ErrInvalidEvent), errors.Is(err, audit.ErrInvalidCursor), errors.Is(err, enrollment.ErrEnrollmentRequestInvalid), errors.Is(err, hostinventory.ErrInvalid), errors.Is(err, discovery.ErrInvalid), errors.Is(err, discovery.ErrSecretEvidence), errors.Is(err, platformscope.ErrInvalid), errors.Is(err, inspection.ErrInvalid), errors.Is(err, inspection.ErrInvalidItem), errors.Is(err, inspection.ErrInvalidSchedule), errors.Is(err, inspection.ErrInvalidReport), errors.Is(err, inspection.ErrUnsafeReport), errors.Is(err, inspection.ErrReportTooLarge), errors.Is(err, inspection.ErrUnknownTarget), errors.Is(err, inspection.ErrNoTargets), errors.Is(err, plugincatalog.ErrInvalid), errors.Is(err, pluginassignment.ErrInvalid):
 		status, code, title = http.StatusBadRequest, "invalid_request", "Request validation failed"
 	case errors.Is(err, inspection.ErrReportBudgetExceeded), errors.Is(err, inspection.ErrReportBudgetOverflow):
 		status, code, title = http.StatusUnprocessableEntity, "inspection_report_budget_exceeded", "Inspection run exceeds report limits"

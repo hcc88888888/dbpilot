@@ -56,6 +56,7 @@ import (
 	"dbpilot.local/platform/internal/pluginassignment"
 	"dbpilot.local/platform/internal/plugincatalog"
 	"dbpilot.local/platform/internal/reconciliation"
+	"dbpilot.local/platform/internal/rediscovery"
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -599,6 +600,7 @@ func NewServer(config Config) (*Server, error) {
 		return nil, policyErr
 	}
 	discoveryService.Policies = discovery.StaticRulePolicyRegistry{Allowed: discoveryPolicies}
+	hostRediscovery := &rediscovery.RediscoveryCoordinator{Hosts: hostInventoryService, Jobs: jobRepository, Capabilities: agentRegistry, Policies: discoveryPolicies, RuleKeys: discoveryKeys, Now: func() time.Time { return time.Now().UTC() }}
 	var assignmentRepository *pluginassignment.PostgresRepository
 	var assignmentService *pluginassignment.ApplicationService
 	var pluginReconciler *reconciliation.PluginReconciler
@@ -776,6 +778,7 @@ func NewServer(config Config) (*Server, error) {
 		Hosts:                      hostInventoryService,
 		Enrollment:                 enrollmentService,
 		Discovery:                  discoveryService,
+		HostRediscovery:            hostRediscovery,
 		DatabaseInstances:          databaseInstanceService,
 		PluginCatalog:              pluginCatalogService,
 		PluginAssignments:          assignmentService,

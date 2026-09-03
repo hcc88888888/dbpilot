@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"dbpilot.local/platform/gen/openapi"
 	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/idempotency"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
+	"dbpilot.local/platform/internal/rediscovery"
 )
 
 func (api platformAPI) ListHosts(ctx context.Context, request openapi.ListHostsRequestObject) (openapi.ListHostsResponseObject, error) {
@@ -209,6 +213,133 @@ func (api platformAPI) DecommissionHost(ctx context.Context, request openapi.Dec
 		return nil, err
 	}
 	return hostDecommissionIdempotentResponse{response: completed}, nil
+}
+
+func (api platformAPI) RediscoverHost(ctx context.Context, request openapi.RediscoverHostRequestObject) (openapi.RediscoverHostResponseObject, error) {
+	if api.services.HostRediscovery == nil || api.services.Idempotency == nil || api.services.Audit == nil {
+		return nil, ErrServiceUnavailable
+	}
+	if !validIdempotencyKey(request.Params.IdempotencyKey) {
+		return nil, ErrInvalidRequest
+	}
+	scope, principal, err := platformRequestIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fingerprint, err := platformIdempotencyFingerprint(ctx, "rediscoverHost", request.HostId, "")
+	if err != nil {
+		return nil, err
+	}
+	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "rediscoverHost", IdempotencyKey: request.Params.IdempotencyKey}
+	auditPayload, reconcile, err := httpActionAuditReconciliation(ctx, api.services.Audit, scope, principal, "host.rediscovery_requested", "host", request.HostId, "success", key.OperationID, key.IdempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	recovery := hostRediscoveryRecovery{RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx)}
+	if metadata, ok := ctx.Value(platformRequestMetadataContextKey{}).(platformRequestMetadata); ok {
+		recovery.Instance = metadata.Path
+	}
+	recoveryJSON, err := json.Marshal(recovery)
+	if err != nil {
+		return nil, err
+	}
+	run := func(callContext context.Context, value hostRediscoveryRecovery) (idempotency.Response, error) {
+		created, startErr := api.services.HostRediscovery.Start(callContext, scope, request.HostId, rediscovery.RediscoveryRequest{Actor: principal.Subject, IdempotencyKey: request.Params.IdempotencyKey, RequestFingerprint: fingerprint, RequestID: value.RequestID, TraceID: value.TraceID})
+		if startErr != nil {
+			if errors.Is(startErr, rediscovery.ErrHostNotOnline) || errors.Is(startErr, rediscovery.ErrRediscoveryUnavailable) || errors.Is(startErr, rediscovery.ErrInvalid) || errors.Is(startErr, hostinventory.ErrNotFound) {
+				return idempotency.Response{}, hostRediscoveryPreMutationError{err: startErr}
+			}
+			return idempotency.Response{}, startErr
+		}
+		return storedHostRediscoveryResponse(created, scope, request.HostId)
+	}
+	begin := func() (idempotency.Claim, error) {
+		return api.services.Idempotency.BeginRecoverable(ctx, key, fingerprint, recoveryJSON, reconcile, func(recoveryContext context.Context, processing idempotency.ProcessingClaim) (idempotency.Response, error) {
+			var original hostRediscoveryRecovery
+			if json.Unmarshal(processing.Reconciliation, &original) != nil || original.RequestID == "" || original.TraceID == "" {
+				return idempotency.Response{}, idempotency.ErrInvalid
+			}
+			stored, runErr := run(recoveryContext, original)
+			var before hostRediscoveryPreMutationError
+			if errors.As(runErr, &before) {
+				if abortErr := api.services.Idempotency.Abort(recoveryContext, key, fingerprint, processing.OwnerToken); abortErr != nil {
+					return idempotency.Response{}, abortErr
+				}
+				return idempotency.Response{}, before.err
+			}
+			return stored, runErr
+		})
+	}
+	var claim idempotency.Claim
+	for attempt := 0; attempt < 4; attempt++ {
+		claim, err = begin()
+		if !errors.Is(err, idempotency.ErrOwnershipConflict) {
+			break
+		}
+	}
+	if err != nil {
+		var before hostRediscoveryPreMutationError
+		if errors.As(err, &before) {
+			return nil, before.err
+		}
+		return nil, err
+	}
+	if claim.Response != nil {
+		return hostRediscoveryIdempotentResponse{response: *claim.Response}, nil
+	}
+	stored, err := run(ctx, recovery)
+	if err != nil {
+		var before hostRediscoveryPreMutationError
+		if errors.As(err, &before) {
+			if abortErr := api.services.Idempotency.Abort(ctx, key, fingerprint, claim.OwnerToken); abortErr != nil {
+				return nil, abortErr
+			}
+			return nil, before.err
+		}
+		return nil, err
+	}
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, auditPayload, reconcile)
+	if err != nil {
+		return nil, err
+	}
+	return hostRediscoveryIdempotentResponse{response: completed}, nil
+}
+
+type hostRediscoveryRecovery struct {
+	RequestID string `json:"request_id"`
+	TraceID   string `json:"trace_id"`
+	Instance  string `json:"instance,omitempty"`
+}
+
+type hostRediscoveryPreMutationError struct{ err error }
+
+func (value hostRediscoveryPreMutationError) Error() string { return value.err.Error() }
+func (value hostRediscoveryPreMutationError) Unwrap() error { return value.err }
+
+type hostRediscoveryIdempotentResponse struct{ response idempotency.Response }
+
+func (response hostRediscoveryIdempotentResponse) VisitRediscoverHostResponse(writer http.ResponseWriter) error {
+	return writeIdempotencyResponse(writer, response.response)
+}
+
+func storedHostRediscoveryResponse(value job.Job, scope platformscope.Scope, hostID string) (idempotency.Response, error) {
+	if value.Scope != scope || value.Type != "host.rediscover" || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || value.Version < 1 {
+		return idempotency.Response{}, errors.New("stored host rediscovery Job is invalid")
+	}
+	body, err := openAPIJob(value)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return idempotency.Response{}, err
+	}
+	location := fmt.Sprintf("/api/v1/tenants/%s/projects/%s/jobs/%s", url.PathEscape(scope.TenantID), url.PathEscape(scope.ProjectID), url.PathEscape(value.ID))
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("ETag", entityTag(value.Version))
+	headers.Set("Location", location)
+	return idempotency.Response{Status: http.StatusAccepted, Header: headers, Body: encoded}, nil
 }
 
 func hostDecommissionTransition(key idempotency.Key, fingerprint, owner string) hostinventory.DecommissionTransition {

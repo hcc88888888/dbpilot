@@ -14,9 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var task1UnimplementedOperationNames = []string{
-	"RediscoverHost",
-}
+var task1UnimplementedOperationNames = []string{}
 
 func TestTask1UnimplementedPlatformAPIInventory(t *testing.T) {
 	adapter := unimplementedPlatformAPI{}
@@ -38,7 +36,7 @@ func TestTask1UnimplementedPlatformAPIInventory(t *testing.T) {
 		require.ErrorIs(t, err, ErrServiceUnavailable, method.Name)
 	}
 
-	expected := append([]string(nil), task1UnimplementedOperationNames...)
+	expected := append([]string{}, task1UnimplementedOperationNames...)
 	sort.Strings(expected)
 	sort.Strings(got)
 	require.Equal(t, expected, got)
@@ -47,6 +45,7 @@ func TestTask1UnimplementedPlatformAPIInventory(t *testing.T) {
 	for _, operation := range expected {
 		require.NotContains(t, explicitPlatformMethods, operation, "%s must have exactly one implementation owner", operation)
 	}
+	require.Contains(t, explicitPlatformMethods, "RediscoverHost")
 }
 
 func explicitReceiverMethods(t *testing.T, receiverName string) map[string]struct{} {
