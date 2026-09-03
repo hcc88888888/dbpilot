@@ -63,7 +63,6 @@ SELECT 1 FROM credential_lease_audits cla
 WHERE cla.tenant_id=pa.tenant_id AND cla.project_id=pa.project_id AND cla.agent_id=pa.agent_id AND cla.host_id=pa.host_id
 AND cla.assignment_id=pa.assignment_id AND cla.instance_id=di.instance_id
 AND cla.configuration_revision=pa.configuration_revision AND cla.operation_revision=pa.operation_revision
-AND cla.instance_revision=di.revision
 AND cla.credential_ref_hash='sha256:' || encode(sha256(convert_to('dbpilot-credential-reference-audit-v1','UTF8') || decode('00','hex') || convert_to(di.credential_ref,'UTF8')),'hex')
 AND cla.result='issued')`
 	var value Authorization

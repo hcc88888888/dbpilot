@@ -59,6 +59,11 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	require.GreaterOrEqual(t, inactiveFence.calls, 2, "initial and post-provider authorization must both observe the absent live fence")
 	assertIssuedAuditIsHashOnly(t, database, success, renewedLease)
 	renewedLease.Release()
+	_, err = database.Exec(`UPDATE managed_database_instances SET capability_state='degraded',management_status='degraded',revision=revision+1,updated_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, success.tenantID, success.projectID, success.instanceID, now.Add(250*time.Millisecond))
+	require.NoError(t, err)
+	lifecycleLease, err := requestCredentialLease(ctx, restartedService, success, 0x2b)
+	require.NoError(t, err, "a plugin-health lifecycle projection must not invalidate the exact audited credential reference fence")
+	lifecycleLease.Release()
 	_, err = database.Exec(`UPDATE plugin_observations SET process_state='stopped',process_id=0,started_at=NULL,health='unknown',last_error_code='agent_restart_reconciled',observation_revision=observation_revision+1,observed_at=$4,received_at=$4 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, success.tenantID, success.projectID, success.assignmentID, now.Add(500*time.Millisecond))
 	require.NoError(t, err)
 	recoveredLease, err := requestCredentialLease(ctx, restartedService, success, 0x25)
@@ -95,14 +100,14 @@ func TestPostgresProductionMigrationsProveDurableCredentialRenewal(t *testing.T)
 	require.NoError(t, err)
 
 	updated, err := databaseinstance.NewPostgresRepository(database).Update(ctx,
-		platformscope.Scope{TenantID: success.tenantID, ProjectID: success.projectID}, success.instanceID, 9,
+		platformscope.Scope{TenantID: success.tenantID, ProjectID: success.projectID}, success.instanceID, 10,
 		databaseinstance.Update{CredentialRef: &rotatedRef, Audit: databaseinstance.MutationAudit{
 			Actor: "operator-1", OperationID: "updateDatabaseInstance", IdempotencyKey: "rotate-success",
 			RequestFingerprint: "sha256:" + strings.Repeat("c", 64), RequestID: "request-rotate-success",
 		}},
 	)
 	require.NoError(t, err)
-	require.Equal(t, uint64(10), updated.Revision)
+	require.Equal(t, uint64(11), updated.Revision)
 	require.Equal(t, rotatedRef, updated.CredentialRef)
 	providerCallsBeforeDrift := restartProvider.Calls()
 	driftedLease, err := requestCredentialLease(ctx, restartedService, success, 0x23)
@@ -352,7 +357,7 @@ func newCredentialLeaseService(t *testing.T, database *sql.DB, fence *recordingF
 		Clock:      credentiallease.PostgresClock{Database: database},
 		Audit:      credentiallease.PostgresAuditRecorder{Database: database},
 		TTL:        30 * time.Second,
-		Random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 96)),
+		Random:     bytes.NewReader(bytes.Repeat([]byte{0x42}, 128)),
 	})
 	require.NoError(t, err)
 	return service
