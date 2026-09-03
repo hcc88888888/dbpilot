@@ -486,6 +486,30 @@ func TestControlClientDoesNotPublishStreamBeforeHelloAck(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestControlClientRecoversDeferredPluginsOnlyAfterHelloAck(t *testing.T) {
+	stream := newFakeControlStream()
+	client := newTransportTestClient(t, (&sequenceStreamOpener{streams: []ControlStream{stream}}).Open)
+	provider := &recoveringPluginObservationProvider{recovered: make(chan struct{}, 1)}
+	client.pluginObservations = provider
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- client.Run(ctx) }()
+	require.NotNil(t, stream.nextSent(t).GetHello())
+	select {
+	case <-provider.recovered:
+		t.Fatal("deferred plugin recovery ran before the authenticated HelloAck")
+	case <-time.After(20 * time.Millisecond):
+	}
+	stream.receive <- helloAckMessage()
+	select {
+	case <-provider.recovered:
+	case <-time.After(time.Second):
+		t.Fatal("deferred plugin recovery did not run after the authenticated HelloAck")
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestControlClientNegotiatesDiscoverySourceResultsIndependently(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -1203,6 +1227,15 @@ func (s *fakeControlStream) nextSent(t *testing.T) *agentv1.AgentMessage {
 
 func helloAckMessage() *agentv1.ServerMessage {
 	return &agentv1.ServerMessage{Message: &agentv1.ServerMessage_HelloAck{HelloAck: &agentv1.HelloAck{ProtocolVersion: ControlProtocolVersion}}}
+}
+
+type recoveringPluginObservationProvider struct{ recovered chan struct{} }
+
+func (*recoveringPluginObservationProvider) Observation() *agentv1.PluginObservation { return nil }
+
+func (provider *recoveringPluginObservationProvider) RecoverDeferredPlugins(context.Context) error {
+	provider.recovered <- struct{}{}
+	return nil
 }
 
 type recordingCommandJournal struct {

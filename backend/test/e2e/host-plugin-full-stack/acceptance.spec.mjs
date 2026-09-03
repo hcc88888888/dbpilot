@@ -319,16 +319,30 @@ test('Agent and Server restart require observations and all ten series after an 
   const boundary = state.restart_boundaries?.[restartKind];
   expect(boundary?.observed_at).toBeTruthy();
   expect(boundary?.sample_at).toBeTruthy();
+  await markDiagnosticStage(phase + '-observation');
   const assignment = await poll(async () => {
     const current = (await api(request, token, '/plugin-assignments/' + encodeURIComponent(state.assignment_id))).body;
     return current.desired_state === 'running' && current.observed_state?.process_state === 'running' && current.observed_state?.bound_instance_count === 2
       && Date.parse(current.observed_state.observed_at) > Date.parse(boundary.observed_at) ? current : undefined;
   }, 180_000, restartKind + ' post-restart observation convergence');
   expect(assignment.configuration_revision).toBeGreaterThan(0);
+  await markDiagnosticStage(phase + '-metrics');
+  let metricDiagnostic = '';
   await poll(async () => {
     const overview = (await api(request, token, monitoringURL())).body;
     const database = currentMySQLSeries(overview, state.instance_ids);
-    return database.length === 10 && database.every((series) => series.status === 'healthy' && series.buckets.some((bucket) => bucket.value !== null && Date.parse(bucket.at) > Date.parse(boundary.sample_at))) ? overview : undefined;
+    const converged = database.length === 10 && database.every((series) => series.status === 'healthy' && series.buckets.some((bucket) => bucket.value !== null && Date.parse(bucket.at) > Date.parse(boundary.sample_at)));
+    if (converged) return overview;
+    const allFresh = database.length === 10 && database.every((series) => series.buckets.some((bucket) => bucket.value !== null && Date.parse(bucket.at) > Date.parse(boundary.sample_at)));
+    const nextDiagnostic = database.length !== 10 ? 'count'
+      : database.some((series) => series.status === 'offline') ? (allFresh ? 'offline-fresh' : 'offline-old')
+        : database.some((series) => series.status === 'stale') ? (allFresh ? 'stale-fresh' : 'stale-old')
+          : 'unknown';
+    if (nextDiagnostic !== metricDiagnostic) {
+      metricDiagnostic = nextDiagnostic;
+      await markDiagnosticStage(phase + '-metrics-' + nextDiagnostic);
+    }
+    return undefined;
   }, 120_000, restartKind + ' post-restart ten-series convergence');
   // The final PostgreSQL assertion checks the stronger persisted identity
   // tuple (Agent, metric, series_fingerprint, sampled_at) for zero duplicates.

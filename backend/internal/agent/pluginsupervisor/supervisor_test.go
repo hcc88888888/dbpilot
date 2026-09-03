@@ -303,6 +303,28 @@ func TestSupervisorPreSessionHandshakeFailureStillTerminatesRejectedProcess(t *t
 	require.Equal(t, 1, fixture.health.shutdownCalls)
 }
 
+func TestSupervisorRetriesWaitingCredentialsAfterControlSessionReconnect(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	fixture.health.activationHealth = pluginstate.HealthDegraded
+	fixture.health.activationCode = "waiting_credentials"
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	first, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	require.Equal(t, pluginstate.HealthDegraded, first.State.HealthState)
+	firstPID := first.State.ProcessID
+
+	fixture.health.activationHealth = pluginstate.HealthHealthy
+	fixture.health.activationCode = ""
+	require.NoError(t, fixture.supervisor.RecoverDeferredPlugins(context.Background()))
+	require.Eventually(t, func() bool {
+		state, ok := fixture.store.Get("mysql")
+		return ok && state.ProcessState == pluginstate.ProcessRunning && state.HealthState == pluginstate.HealthHealthy && state.ProcessID != firstPID
+	}, time.Second, time.Millisecond)
+	require.Equal(t, 2, fixture.runner.startCount())
+}
+
 func TestSupervisorRejectsEqualRevisionSemanticConflictAcrossRestart(t *testing.T) {
 	fixture := newSupervisorFixture(t)
 	request := validReconcileRequest()

@@ -501,6 +501,11 @@ func (c *ControlClient) runSession(ctx context.Context, cancel context.CancelFun
 	session.wait.Add(1)
 	go c.runSendLoop(session)
 	c.setSession(session)
+	if recovery, ok := c.pluginObservations.(interface{ RecoverDeferredPlugins(context.Context) error }); ok {
+		if err := recovery.RecoverDeferredPlugins(session.ctx); err != nil {
+			return fmt.Errorf("recover deferred plugins after control reconnect: %w", err)
+		}
+	}
 	if refresher, ok := c.pluginObservations.(interface{ RefreshObservation(context.Context) error }); ok {
 		if err := refresher.RefreshObservation(session.ctx); err != nil {
 			return fmt.Errorf("refresh plugin observation after control reconnect: %w", err)

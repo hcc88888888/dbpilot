@@ -929,6 +929,53 @@ func (supervisor *PluginSupervisor) Observation() *agentv1.PluginObservation {
 	return &agentv1.PluginObservation{HostId: supervisor.hostID, AgentId: supervisor.agentID, ObservationRevision: revision, Assignments: assignments, ObservedAt: timestamppb.New(observedAt)}
 }
 
+// RecoverDeferredPlugins retries only processes that started before the
+// authenticated control session could issue credential leases. It preserves
+// the committed desired state and does not count the reconnect race as a
+// plugin failure.
+func (supervisor *PluginSupervisor) RecoverDeferredPlugins(ctx context.Context) error {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil {
+		return ErrInvalidRequest
+	}
+	supervisor.mu.Lock()
+	families := make([]string, 0, len(supervisor.running))
+	for family := range supervisor.running {
+		families = append(families, family)
+	}
+	sort.Strings(families)
+	type deferredRestart struct{ family, fingerprint string }
+	restarts := make([]deferredRestart, 0, len(families))
+	for _, family := range families {
+		process := supervisor.running[family]
+		state, ok := supervisor.store.Get(family)
+		if !ok || process == nil || state.DesiredState != pluginstate.DesiredRunning || state.ProcessState != pluginstate.ProcessRunning || state.HealthState != pluginstate.HealthDegraded || state.LastErrorCode != "waiting_credentials" {
+			continue
+		}
+		if err := supervisor.drainProcess(ctx, process); err != nil {
+			supervisor.mu.Unlock()
+			return err
+		}
+		delete(supervisor.running, family)
+		state.ProcessState, state.HealthState = pluginstate.ProcessRestarting, pluginstate.HealthUnhealthy
+		state.ProcessID, state.ProcessStartTicks, state.StartedAt = 0, 0, time.Time{}
+		state.ObservationRevision++
+		if state.ObservationRevision == 0 {
+			supervisor.mu.Unlock()
+			return ErrInvalidRequest
+		}
+		if _, err := supervisor.store.Put(ctx, state); err != nil {
+			supervisor.mu.Unlock()
+			return err
+		}
+		restarts = append(restarts, deferredRestart{family: family, fingerprint: state.RequestFingerprint})
+	}
+	supervisor.mu.Unlock()
+	for _, restart := range restarts {
+		go supervisor.restartPersisted(restart.family, restart.fingerprint, 0)
+	}
+	return nil
+}
+
 // RefreshObservation persists an equivalent, higher-revision snapshot when a
 // new authenticated control session is established. This lets a restarted
 // Server distinguish fresh Agent convergence from replay of an old snapshot.
