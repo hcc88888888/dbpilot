@@ -398,14 +398,16 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
   await writeFile(child, "[Console]::Out.WriteLine('pipe-held'); Start-Sleep -Seconds 30\n", 'utf8');
   await writeFile(parentSource, [
     'using System;',
+    'using System.Collections.Generic;',
     'using System.Diagnostics;',
     'using System.IO;',
     'public static class ImmediateParent {',
     '  public static int Main() {',
     '    var info = new ProcessStartInfo(Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD_EXE"), "-NoProfile -File \\\"" + Environment.GetEnvironmentVariable("DBPILOT_PIPE_CHILD") + "\\\"");',
     '    info.UseShellExecute = false; info.CreateNoWindow = true;',
-    '    var child = Process.Start(info);',
-    '    File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), child.Id.ToString());',
+    '    var childIdentities = new List<string>();',
+    '    for (var index = 0; index < 8; index++) { var child = Process.Start(info); childIdentities.Add(child.Id + ":" + child.StartTime.ToUniversalTime().Ticks); }',
+    '    File.WriteAllText(Environment.GetEnvironmentVariable("DBPILOT_PIPE_PID"), string.Join(",", childIdentities));',
     '    return 0;',
     '  }',
     '}',
@@ -424,7 +426,7 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
       const command = [
         `. '${containerSafetyFile.replaceAll("'", "''")}'`,
         `. '${boundedProcessFile.replaceAll("'", "''")}'`,
-        "try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 } }; exit 0",
+        "try { Invoke-BoundedProcess -Command $env:DBPILOT_PIPE_PARENT -Arguments @() -TimeoutSeconds 2 -StartFailure 'pipe start' -TimeoutFailure 'pipe deadline'; exit 9 } catch { if ($_.Exception.Message -cne 'pipe deadline') { Write-Error $_; exit 8 }; $ownedChildren = [IO.File]::ReadAllText($env:DBPILOT_PIPE_PID).Split(',') | ForEach-Object { $parts = $_.Split(':'); [pscustomobject]@{ Id = [int]$parts[0]; Started = [string]$parts[1] } }; $isExactChildRunning = { param($child) $candidate = Get-Process -Id $child.Id -ErrorAction SilentlyContinue; if ($null -eq $candidate -or $candidate.HasExited) { return $false }; return [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq $child.Started }; if (@($ownedChildren | Where-Object { & $isExactChildRunning $_ }).Count -ne 0) { Write-Error 'owned child remained running after bounded return'; exit 7 } }; exit 0",
       ].join('; ');
       const started = Date.now();
       try {
@@ -436,9 +438,15 @@ test('PowerShell 5.1 and 7 atomically own a zero-delay parent and pipe-holding c
         });
         assert.equal(result.status, 0, `${executable} did not bound the inherited output pipe: ${result.stderr || result.stdout}`);
         assert.ok(Date.now() - started < 8_000, `${executable} exceeded the bounded output deadline`);
-        const childPID = Number((await readFile(pidFile, 'utf8')).trim());
-        const alive = spawnSync(executable, ['-NoProfile', '-Command', `if (Get-Process -Id ${childPID} -ErrorAction SilentlyContinue) { exit 1 }`]);
-        assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive`);
+        const children = (await readFile(pidFile, 'utf8')).trim().split(',').map((value) => {
+          const [pid, started] = value.split(':');
+          return { pid: Number(pid), started };
+        });
+        assert.equal(children.length, 8);
+        for (const child of children) {
+          const alive = spawnSync(executable, ['-NoProfile', '-Command', `$candidate=Get-Process -Id ${child.pid} -ErrorAction SilentlyContinue; $running=$false; if($null -ne $candidate) { try { $candidate.Refresh(); $running = -not $candidate.HasExited -and [string]$candidate.StartTime.ToUniversalTime().Ticks -ceq '${child.started}' } catch { $running=$false } }; if($running) { exit 1 }`], { encoding: 'utf8' });
+          assert.equal(alive.status, 0, `${executable} left the exact pipe-holding child alive: ${alive.stdout}\n${alive.stderr}`);
+        }
         const unrelatedAlive = spawnSync(executable, ['-NoProfile', '-Command', `if (-not (Get-Process -Id ${unrelated.pid} -ErrorAction SilentlyContinue)) { exit 1 }`]);
         assert.equal(unrelatedAlive.status, 0, `${executable} terminated an unrelated process`);
         await rm(pidFile, { force: true });

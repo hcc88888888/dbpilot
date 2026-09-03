@@ -1,13 +1,21 @@
 if ($env:OS -eq 'Windows_NT' -and $null -eq ('DBPilotProcessJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public static class DBPilotProcessJob
 {
     private const uint JobObjectExtendedLimitInformation = 9;
+    private const uint JobObjectBasicAccountingInformation = 1;
+    private const uint JobObjectBasicProcessIdList = 3;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+    private const uint Synchronize = 0x00100000;
+    private const uint WaitObject0 = 0;
+    private const uint WaitTimeout = 258;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BasicLimitInformation
@@ -45,6 +53,19 @@ public static class DBPilotProcessJob
         public UIntPtr PeakJobMemoryUsed;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BasicAccountingInformation
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
 
@@ -53,6 +74,18 @@ public static class DBPilotProcessJob
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(IntPtr job, uint informationClass, IntPtr information, uint length, IntPtr returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr handle);
@@ -82,9 +115,89 @@ public static class DBPilotProcessJob
         return job;
     }
 
-public static void Assign(IntPtr job, IntPtr process)
+    public static void Assign(IntPtr job, IntPtr process)
     {
         if (!AssignProcessToJobObject(job, process)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static bool TerminateAndWait(IntPtr job, int timeoutMilliseconds)
+    {
+        if (job == IntPtr.Zero || timeoutMilliseconds < 0) throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        List<IntPtr> processes = OpenActiveProcesses(job);
+        Stopwatch watch = Stopwatch.StartNew();
+        try
+        {
+            if (!TerminateJobObject(job, 1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            foreach (IntPtr process in processes)
+            {
+                long remaining = timeoutMilliseconds - watch.ElapsedMilliseconds;
+                if (remaining < 0) return false;
+                uint result = WaitForSingleObject(process, (uint)remaining);
+                if (result == WaitTimeout) return false;
+                if (result != WaitObject0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            int size = Marshal.SizeOf(typeof(BasicAccountingInformation));
+            IntPtr pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                while (true)
+                {
+                    if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, pointer, (uint)size, IntPtr.Zero))
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    BasicAccountingInformation information = (BasicAccountingInformation)Marshal.PtrToStructure(pointer, typeof(BasicAccountingInformation));
+                    if (information.ActiveProcesses == 0) return true;
+                    if (watch.ElapsedMilliseconds >= timeoutMilliseconds) return false;
+                    Thread.Sleep(1);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+        finally
+        {
+            foreach (IntPtr process in processes) CloseHandle(process);
+        }
+    }
+
+    private static List<IntPtr> OpenActiveProcesses(IntPtr job)
+    {
+        int capacity = 16;
+        while (capacity <= 16384)
+        {
+            int size = checked(8 + IntPtr.Size * capacity);
+            IntPtr pointer = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, pointer, (uint)size, IntPtr.Zero))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error == 234)
+                    {
+                        int assigned = Marshal.ReadInt32(pointer, 0);
+                        capacity = Math.Max(capacity * 2, assigned + 16);
+                        continue;
+                    }
+                    throw new Win32Exception(error);
+                }
+                int count = Marshal.ReadInt32(pointer, 4);
+                List<IntPtr> result = new List<IntPtr>(count);
+                for (int index = 0; index < count; index++)
+                {
+                    long raw = Marshal.ReadIntPtr(pointer, 8 + index * IntPtr.Size).ToInt64();
+                    if (raw <= 0 || raw > UInt32.MaxValue) continue;
+                    IntPtr process = OpenProcess(Synchronize, false, (uint)raw);
+                    if (process != IntPtr.Zero) result.Add(process);
+                }
+                return result;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pointer);
+            }
+        }
+        throw new InvalidOperationException("job process list exceeds its bound");
     }
 }
 '@
@@ -159,6 +272,18 @@ function Stop-BoundedProcessTree {
     } catch { try { $Process.Kill() } catch { } }
 }
 
+function Stop-BoundedOwnedProcessTree {
+    param([Diagnostics.Process]$Process, [IntPtr]$Job)
+    $settled = $true
+    if ($Job -ne [IntPtr]::Zero) {
+        try { $settled = [DBPilotProcessJob]::TerminateAndWait($Job, 2000) }
+        catch { $settled = $false }
+        finally { $null = [DBPilotProcessJob]::CloseHandle($Job) }
+    }
+    Stop-BoundedProcessTree $Process
+    return $settled
+}
+
 function Wait-BoundedOutputTask {
     param([Threading.Tasks.Task]$Task, [DateTime]$Deadline)
     $remaining = [int][Math]::Floor(($Deadline - [DateTime]::UtcNow).TotalMilliseconds)
@@ -217,8 +342,9 @@ function Invoke-BoundedProcess {
                 $null = $gateEvent.Set()
             }
         } catch {
-            if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-            Stop-BoundedProcessTree $process
+            $settled = Stop-BoundedOwnedProcessTree $process $job
+            $job = [IntPtr]::Zero
+            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
             throw $StartFailure
         }
         $outputLimit = 1000000
@@ -231,21 +357,24 @@ function Invoke-BoundedProcess {
                 if ($null -eq $stdoutResult -and $stdoutTask.IsCompleted) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
                 if ($null -eq $stderrResult -and $stderrTask.IsCompleted) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
             } catch {
-                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-                Stop-BoundedProcessTree $process
+                $settled = Stop-BoundedOwnedProcessTree $process $job
+                $job = [IntPtr]::Zero
+                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
                 throw $TimeoutFailure
             }
             if (($null -ne $stdoutResult -and $stdoutResult.Overflow) -or ($null -ne $stderrResult -and $stderrResult.Overflow)) {
-                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-                Stop-BoundedProcessTree $process
+                $settled = Stop-BoundedOwnedProcessTree $process $job
+                $job = [IntPtr]::Zero
                 $null = $process.WaitForExit(2000)
+                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
                 throw 'Bounded process output exceeded its limit.'
             }
             $remaining = [int][Math]::Floor(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
             if ($remaining -le 0) {
-                if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-                Stop-BoundedProcessTree $process
+                $settled = Stop-BoundedOwnedProcessTree $process $job
+                $job = [IntPtr]::Zero
                 $null = $process.WaitForExit(2000)
+                if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
                 throw $TimeoutFailure
             }
             if ($process.WaitForExit([Math]::Min(20, $remaining))) { break }
@@ -256,13 +385,15 @@ function Invoke-BoundedProcess {
             if ($null -eq $stdoutResult) { $stdoutResult = $stdoutTask.GetAwaiter().GetResult() }
             if ($null -eq $stderrResult) { $stderrResult = $stderrTask.GetAwaiter().GetResult() }
         } catch {
-            if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-            Stop-BoundedProcessTree $process
+            $settled = Stop-BoundedOwnedProcessTree $process $job
+            $job = [IntPtr]::Zero
+            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
             throw $TimeoutFailure
         }
         if ($stdoutResult.Overflow -or $stderrResult.Overflow) {
-            if ($job -ne [IntPtr]::Zero) { $null = [DBPilotProcessJob]::CloseHandle($job); $job = [IntPtr]::Zero }
-            Stop-BoundedProcessTree $process
+            $settled = Stop-BoundedOwnedProcessTree $process $job
+            $job = [IntPtr]::Zero
+            if (-not $settled) { throw 'Bounded process tree termination did not settle.' }
             throw 'Bounded process output exceeded its limit.'
         }
         return [pscustomobject]@{ ExitCode = $process.ExitCode; Stdout = $stdoutResult.Text.Trim(); Stderr = $stderrResult.Text.Trim(); StdoutTruncated = $false; StderrTruncated = $false }
