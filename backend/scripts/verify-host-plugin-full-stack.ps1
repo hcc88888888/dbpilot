@@ -225,11 +225,25 @@ function Register-OwnedResources {
     Write-ResourceLedger
 }
 
+function Get-RunnerImageOwnershipLabels {
+    param([string]$ImageID, [string]$Failure)
+    $json = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{json .Config.Labels}}', $ImageID) $Failure).Trim()
+    try {
+        $labels = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+        $verifier = $labels.PSObject.Properties['dbpilot.verifier']
+        $run = $labels.PSObject.Properties['dbpilot.run']
+        if ($null -eq $verifier -or $null -eq $run) { throw $Failure }
+        return ([string]$verifier.Value + '|' + [string]$run.Value)
+    } catch {
+        throw $Failure
+    }
+}
+
 function Register-OwnedRunnerImageID {
     param([string]$Candidate)
     $id = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{.Id}}', $Candidate) 'Unable to canonicalize the acceptance-runner image ID.').Trim()
     if ($id -notmatch '^sha256:[0-9a-f]{64}$') { throw 'The acceptance-runner image ID is invalid.' }
-    $labels = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{ index .Config.Labels "dbpilot.verifier" }}|{{ index .Config.Labels "dbpilot.run" }}', $id) 'Unable to inspect acceptance-runner image ownership.').Trim()
+    $labels = Get-RunnerImageOwnershipLabels $id 'Unable to inspect acceptance-runner image ownership.'
     if ($labels -cne "$verifierLabel|$RunId") { throw 'The acceptance-runner image ownership labels do not match.' }
     $null = $imageIDs.Add($id)
     $null = $ownedImageIDs.Add($id)
@@ -258,7 +272,7 @@ function Register-OwnedRunnerImages {
 function Remove-OwnedRunnerImage {
     param([string]$ImageID)
     if (-not $ownedImageIDs.Contains($ImageID) -or $ImageID -notmatch '^sha256:[0-9a-f]{64}$') { throw 'Refusing unrecorded acceptance-runner image cleanup.' }
-    $labels = (Invoke-DockerCapture @('image', 'inspect', '--format', '{{ index .Config.Labels "dbpilot.verifier" }}|{{ index .Config.Labels "dbpilot.run" }}', $ImageID) 'Unable to revalidate acceptance-runner image ownership.').Trim()
+    $labels = Get-RunnerImageOwnershipLabels $ImageID 'Unable to revalidate acceptance-runner image ownership.'
     if ($labels -cne "$verifierLabel|$RunId") { throw 'Refusing mismatched acceptance-runner image cleanup.' }
     Invoke-DockerChecked @('image', 'rm', $ImageID) -Failure 'Unable to remove the exact acceptance-runner image.'
 }

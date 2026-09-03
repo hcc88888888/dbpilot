@@ -378,6 +378,8 @@ test('runner image build and registration failure windows remain exact-cleanable
   assert.match(discovery, /image', 'inspect'[\s\S]*\$runnerImageReference/);
   assert.match(discovery, /label=dbpilot\.verifier=\$verifierLabel[\s\S]*label=dbpilot\.run=\$RunId/);
   assert.match(discovery, /Register-OwnedRunnerImageID \$candidate/);
+  assert.match(verifier, /\{\{json \.Config\.Labels\}\}/, 'real Docker label inspection avoids nested native-argument quotes on Windows');
+  assert.doesNotMatch(verifier, /index \.Config\.Labels/, 'PowerShell must not pass quoted Go-template keys through native argument reconstruction');
   assert.match(discovery, /Start-Sleep -Seconds 1/);
   assert.match(finalizer, /Register-OwnedResources -RunnerImageRetrySeconds 5[\s\S]*Remove-OwnedRunnerImage \$id/,
     'finally retries late image visibility, records the canonical ID, then removes only that ID');
