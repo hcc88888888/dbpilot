@@ -1,6 +1,7 @@
 package pluginsupervisor
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/credentialcache"
 	"dbpilot.local/platform/internal/agent/metrictemplatelease"
@@ -321,7 +323,7 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 	if !hasActive || previous.AssignmentID != request.AssignmentID || previous.ConfigurationRevision != session.ConfigurationRevision() || checker.credentials != nil && !time.Now().Before(active.deadline) {
 		return ErrHealthHandshake
 	}
-	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 && len(request.TemplateIDs) > 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
+	if len(request.TemplateConfigurations) == 0 && len(request.TemplateReferences) == 0 && len(request.InstanceTemplateConfigurations) == 0 && len(request.TemplateIDs) > 0 || len(request.TemplateConfigurations) > 0 && !sameTemplateProjection(request.TemplateIDs, request.TemplateConfigurations) || len(request.TemplateReferences) > 0 && !validTemplateReferences(request.TemplateIDs, request.InstanceIDs, request.TemplateLeaseCommandID, request.TemplateReferences, request.InstanceTemplateRefs) {
 		return ErrHealthHandshake
 	}
 	var instances []*pluginv1.PluginInstanceConfiguration
@@ -342,6 +344,15 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 	for _, release := range releases {
 		defer release()
 	}
+	if len(request.InstanceTemplateConfigurations) > 0 {
+		for _, instance := range instances {
+			templates, exists := request.InstanceTemplateConfigurations[instance.GetInstanceId()]
+			if !exists {
+				return ErrHealthHandshake
+			}
+			instance.Templates = cloneTemplateConfigurations(templates)
+		}
+	}
 	expected := plugingateway.ExpectedPlugin{
 		PID: process.PID(), ExpectedUserID: request.ExpectedUserID, ExpectedGroupID: request.ExpectedGroupID,
 		RuntimeDirectory: request.RuntimeDirectory, AssignmentID: request.AssignmentID, PluginID: request.PluginID,
@@ -350,7 +361,7 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 		LaunchNonce: append([]byte(nil), request.LaunchNonce...), ConfigurationRevision: request.ConfigurationRevision,
 		OperationRevision: request.OperationRevision, InstanceIDs: append([]string(nil), request.InstanceIDs...), TemplateIDs: append([]string(nil), request.TemplateIDs...),
 		SupportedVariants: append([]string(nil), request.SupportedVariants...), SignedCapabilities: append([]string(nil), request.SignedCapabilities...), MetricTemplateSchemaVersion: request.MetricTemplateSchemaVersion,
-		TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations),
+		TemplateConfigurations: cloneTemplateConfigurations(request.TemplateConfigurations), InstanceTemplateConfigurations: cloneTemplateConfigurationMap(request.InstanceTemplateConfigurations),
 	}
 	if len(request.TemplateReferences) > 0 {
 		if checker.templates == nil {
@@ -437,6 +448,93 @@ func (checker *GatewayHealthChecker) ApplyConfiguration(ctx context.Context, pro
 	checker.scheduleCredentialRenewal(process, session, request, configurationValidFor)
 	checker.storeActivation(process.PID(), session, pluginstate.HealthHealthy, "")
 	return nil
+}
+
+func (checker *GatewayHealthChecker) ApplyTypedConfiguration(ctx context.Context, process Process, request HealthRequest, command *agentv1.ApplyPluginConfiguration) error {
+	if checker == nil || process == nil || command == nil || command.GetAssignmentId() != request.AssignmentID || command.GetConfigurationRevision() != request.ConfigurationRevision {
+		return ErrHealthHandshake
+	}
+	checker.mu.Lock()
+	active, ok := checker.activeCredentials[process.PID()]
+	previous := clonePluginConfiguration(active.configuration)
+	checker.mu.Unlock()
+	defer previous.Release()
+	if !ok || previous.AssignmentID != request.AssignmentID || len(previous.Instances) != len(command.GetInstances()) {
+		return ErrHealthHandshake
+	}
+	byID := make(map[string]*pluginv1.PluginInstanceConfiguration, len(previous.Instances))
+	for _, instance := range previous.Instances {
+		byID[instance.GetInstanceId()] = instance
+	}
+	request.ExpectedCredentialRevisions = make(map[string]uint64, len(command.GetInstances()))
+	request.InstanceTemplateConfigurations = make(map[string][]*pluginv1.MetricTemplateConfiguration, len(command.GetInstances()))
+	for _, instance := range command.GetInstances() {
+		stored := byID[instance.GetInstanceId()]
+		if stored == nil || instance.GetCredentialRevision() == 0 || stored.GetDatabaseVariant() != instance.GetDatabaseVariant() || stored.GetEndpoint() != instance.GetEndpoint() || stored.GetUnixSocket() != instance.GetUnixSocket() || !samePublicTemplateProjection(stored.GetTemplates(), instance.GetTemplates()) {
+			return ErrHealthHandshake
+		}
+		request.ExpectedCredentialRevisions[instance.GetInstanceId()] = instance.GetCredentialRevision()
+		request.InstanceTemplateConfigurations[instance.GetInstanceId()] = cloneTemplateConfigurations(stored.GetTemplates())
+		delete(byID, instance.GetInstanceId())
+	}
+	if len(byID) != 0 {
+		return ErrHealthHandshake
+	}
+	request.TemplateConfigurations = nil
+	request.TemplateLeaseCommandID = ""
+	request.TemplateReferences = nil
+	request.InstanceTemplateRefs = nil
+	return checker.ApplyConfiguration(ctx, process, request)
+}
+
+func (checker *GatewayHealthChecker) ValidateTypedInstance(ctx context.Context, process Process, request HealthRequest, instanceID string) (plugingateway.ValidationResult, error) {
+	if checker == nil || process == nil || instanceID == "" || request.AssignmentID == "" {
+		return plugingateway.ValidationResult{}, ErrHealthHandshake
+	}
+	mutation := checker.mutationFor(process.PID())
+	mutation.Lock()
+	defer mutation.Unlock()
+	checker.mu.Lock()
+	session := checker.sessions[process.PID()]
+	active, ok := checker.activeCredentials[process.PID()]
+	checker.mu.Unlock()
+	if session == nil || !ok || session.AssignmentID() != request.AssignmentID || session.ConfigurationRevision() != request.ConfigurationRevision || session.OperationRevision() != request.OperationRevision || !time.Now().Before(active.deadline) {
+		return plugingateway.ValidationResult{}, ErrHealthHandshake
+	}
+	result, err := session.ValidateInstance(ctx, instanceID)
+	if err != nil {
+		return plugingateway.ValidationResult{}, ErrHealthHandshake
+	}
+	return result, nil
+}
+
+func samePublicTemplateProjection(stored []*pluginv1.MetricTemplateConfiguration, command []*agentv1.PluginTemplateRevision) bool {
+	if len(stored) != len(command) {
+		return false
+	}
+	byID := make(map[string]*pluginv1.MetricTemplateConfiguration, len(stored))
+	for _, template := range stored {
+		byID[template.GetTemplateId()] = template
+	}
+	for _, template := range command {
+		current := byID[template.GetTemplateId()]
+		if current == nil || current.GetRevision() != template.GetRevision() || !bytes.Equal(current.GetQueryDigest(), template.GetQueryDigest()) {
+			return false
+		}
+		delete(byID, template.GetTemplateId())
+	}
+	return len(byID) == 0
+}
+
+func cloneTemplateConfigurationMap(values map[string][]*pluginv1.MetricTemplateConfiguration) map[string][]*pluginv1.MetricTemplateConfiguration {
+	if values == nil {
+		return nil
+	}
+	result := make(map[string][]*pluginv1.MetricTemplateConfiguration, len(values))
+	for instanceID, templates := range values {
+		result[instanceID] = cloneTemplateConfigurations(templates)
+	}
+	return result
 }
 
 func healthHandshakeFailure(stage string) error {
@@ -559,7 +657,8 @@ func leaseInstancesWithCache(ctx context.Context, leaser CredentialLeaser, cache
 	var minimumValidFor time.Duration
 	for _, descriptor := range request.InstanceDescriptors {
 		lease, err := leaser.LeaseCredential(ctx, CredentialLeaseRequest{AssignmentID: request.AssignmentID, InstanceID: descriptor.InstanceID, DatabaseFamily: request.DatabaseFamily, ConfigurationRevision: request.ConfigurationRevision, OperationRevision: request.OperationRevision})
-		if err != nil || lease.LeaseID == "" || lease.AssignmentID != request.AssignmentID || lease.InstanceID != descriptor.InstanceID || lease.DatabaseFamily != request.DatabaseFamily || lease.CredentialRevision == 0 || lease.ConfigurationRevision != request.ConfigurationRevision || lease.OperationRevision != request.OperationRevision || lease.ValidFor <= 0 || len(lease.SecretBytes) == 0 {
+		expectedCredentialRevision := request.ExpectedCredentialRevisions[descriptor.InstanceID]
+		if err != nil || lease.LeaseID == "" || lease.AssignmentID != request.AssignmentID || lease.InstanceID != descriptor.InstanceID || lease.DatabaseFamily != request.DatabaseFamily || lease.CredentialRevision == 0 || expectedCredentialRevision != 0 && lease.CredentialRevision != expectedCredentialRevision || lease.ConfigurationRevision != request.ConfigurationRevision || lease.OperationRevision != request.OperationRevision || lease.ValidFor <= 0 || len(lease.SecretBytes) == 0 {
 			lease.Release()
 			return fail()
 		}

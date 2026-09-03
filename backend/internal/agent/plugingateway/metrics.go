@@ -336,7 +336,7 @@ func fixedPluginCode(value string) string {
 	switch value {
 	case "":
 		return ""
-	case "waiting_credentials", "waiting_templates", "instance_unreachable", "authentication_failed", "timeout", "unsupported", "result_limit_exceeded", "high_cardinality":
+	case "waiting_credentials", "waiting_templates", "instance_unreachable", "authentication_failed", "tls_failed", "timeout", "unsupported", "unsupported_version", "plugin_failed", "result_limit_exceeded", "high_cardinality":
 		return value
 	default:
 		return "plugin_failed"

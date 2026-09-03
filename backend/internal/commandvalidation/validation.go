@@ -85,6 +85,26 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 			return ErrInvalidCommand
 		}
 		targets = value.GetInstanceIds()
+	case *agentv1.CommandEnvelope_ApplyPluginConfiguration:
+		value := command.ApplyPluginConfiguration
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || value.GetConfigurationRevision() == 0 || !validPluginConfigurations(value.GetInstances()) {
+			return ErrInvalidCommand
+		}
+		targets = make([]string, len(value.GetInstances()))
+		for index, instance := range value.GetInstances() {
+			targets[index] = instance.GetInstanceId()
+		}
+	case *agentv1.CommandEnvelope_ValidateDatabaseInstance:
+		value := command.ValidateDatabaseInstance
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || !validIdentifier(value.GetInstanceId()) || value.GetConfigurationRevision() == 0 {
+			return ErrInvalidCommand
+		}
+		targets = []string{value.GetInstanceId()}
+	case *agentv1.CommandEnvelope_DrainPlugin:
+		value := command.DrainPlugin
+		if value == nil || !validIdentifier(value.GetAssignmentId()) || value.GetOperationRevision() == 0 || value.GetTimeoutSeconds() == 0 || value.GetTimeoutSeconds() > 60 {
+			return ErrInvalidCommand
+		}
 	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
 		value := command.CollectDatabaseMetrics
 		if value == nil || !validIdentifier(value.GetAssignmentId()) || value.GetConfigurationRevision() == 0 || value.GetOperationRevision() == 0 || !validIdentifierList(value.GetInstanceIds(), true) || !validIdentifierList(value.GetTemplateIds(), true) || !validMetricTemplateReferences(value.GetTemplateIds(), value.GetTemplateRevisions()) || value.GetTrial() && (len(value.GetInstanceIds()) != 1 || len(value.GetTemplateRevisions()) != 1) {
@@ -111,6 +131,51 @@ func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer
 		}
 	}
 	return nil
+}
+
+func validPluginConfigurations(values []*agentv1.PluginInstanceConfiguration) bool {
+	if len(values) == 0 || len(values) > maximumListItems {
+		return false
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == nil || !validIdentifier(value.GetInstanceId()) || !validIdentifier(value.GetDatabaseVariant()) || value.GetCredentialRevision() == 0 || !validPluginConnection(value.GetEndpoint(), value.GetUnixSocket()) || !validPluginTemplateRevisions(value.GetTemplates()) {
+			return false
+		}
+		if _, duplicate := seen[value.GetInstanceId()]; duplicate {
+			return false
+		}
+		seen[value.GetInstanceId()] = struct{}{}
+	}
+	return true
+}
+
+func validPluginConnection(endpoint, socket string) bool {
+	if (endpoint == "") == (socket == "") {
+		return false
+	}
+	if endpoint != "" {
+		normalized, err := discovery.NormalizeEndpoint(endpoint)
+		return err == nil && normalized == endpoint
+	}
+	return len(socket) <= 512 && strings.HasPrefix(socket, "/") && path.Clean(socket) == socket && !strings.Contains(socket, "..")
+}
+
+func validPluginTemplateRevisions(values []*agentv1.PluginTemplateRevision) bool {
+	if len(values) > maximumListItems {
+		return false
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if value == nil || !validIdentifier(value.GetTemplateId()) || value.GetRevision() == 0 || len(value.GetQueryDigest()) != sha256.Size {
+			return false
+		}
+		if _, duplicate := seen[value.GetTemplateId()]; duplicate {
+			return false
+		}
+		seen[value.GetTemplateId()] = struct{}{}
+	}
+	return true
 }
 
 func validReconcileTemplateShape(value *agentv1.ReconcilePlugin) bool {

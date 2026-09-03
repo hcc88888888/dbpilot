@@ -16,6 +16,7 @@ import (
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/metrictemplatelease"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"google.golang.org/protobuf/proto"
 )
@@ -367,30 +368,32 @@ type ProcessRunner interface {
 }
 
 type HealthRequest struct {
-	AssignmentID                string
-	PluginID                    string
-	DatabaseFamily              string
-	Version                     string
-	ProtocolVersion             string
-	ExecutableSHA256            []byte
-	ExecutablePath              string
-	ConfigurationRevision       uint64
-	OperationRevision           uint64
-	InstanceIDs                 []string
-	InstanceDescriptors         []InstanceDescriptor
-	TemplateIDs                 []string
-	SupportedVariants           []string
-	SignedCapabilities          []string
-	MetricTemplateSchemaVersion uint32
-	TemplateConfigurations      []*pluginv1.MetricTemplateConfiguration
-	TemplateLeaseCommandID      string
-	TemplateReferences          []TemplateReference
-	InstanceTemplateRefs        []InstanceTemplateReferences
-	CredentialsComplete         bool
-	RuntimeDirectory            string
-	LaunchNonce                 []byte
-	ExpectedUserID              uint32
-	ExpectedGroupID             uint32
+	AssignmentID                   string
+	PluginID                       string
+	DatabaseFamily                 string
+	Version                        string
+	ProtocolVersion                string
+	ExecutableSHA256               []byte
+	ExecutablePath                 string
+	ConfigurationRevision          uint64
+	OperationRevision              uint64
+	InstanceIDs                    []string
+	InstanceDescriptors            []InstanceDescriptor
+	TemplateIDs                    []string
+	SupportedVariants              []string
+	SignedCapabilities             []string
+	MetricTemplateSchemaVersion    uint32
+	TemplateConfigurations         []*pluginv1.MetricTemplateConfiguration
+	TemplateLeaseCommandID         string
+	TemplateReferences             []TemplateReference
+	InstanceTemplateRefs           []InstanceTemplateReferences
+	InstanceTemplateConfigurations map[string][]*pluginv1.MetricTemplateConfiguration
+	ExpectedCredentialRevisions    map[string]uint64
+	CredentialsComplete            bool
+	RuntimeDirectory               string
+	LaunchNonce                    []byte
+	ExpectedUserID                 uint32
+	ExpectedGroupID                uint32
 }
 
 type HealthChecker interface {
@@ -399,6 +402,14 @@ type HealthChecker interface {
 
 type ConfigurationApplier interface {
 	ApplyConfiguration(context.Context, Process, HealthRequest) error
+}
+
+type TypedConfigurationApplier interface {
+	ApplyTypedConfiguration(context.Context, Process, HealthRequest, *agentv1.ApplyPluginConfiguration) error
+}
+
+type TypedInstanceValidator interface {
+	ValidateTypedInstance(context.Context, Process, HealthRequest, string) (plugingateway.ValidationResult, error)
 }
 
 type UnexpectedExitCleaner interface {

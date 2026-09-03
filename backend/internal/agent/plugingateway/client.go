@@ -624,7 +624,7 @@ func (session *Session) ApplyConfigurationUpdate(ctx context.Context, expected E
 	snapshot := sessionConfigurationSnapshot{expected: cloneExpected(session.expected), configurationRevision: session.configurationRevision, instances: cloneInstanceMap(session.instances)}
 	handshaken, pending := session.handshaken, session.pendingRollback
 	session.mu.Unlock()
-	if !handshaken || pending != nil || previous.validate(snapshot.expected) != nil || previous.ConfigurationRevision != snapshot.configurationRevision || !sameVerifiedRuntime(snapshot.expected, expected) || expected.ConfigurationRevision <= snapshot.expected.ConfigurationRevision || expected.OperationRevision <= snapshot.expected.OperationRevision {
+	if !handshaken || pending != nil || previous.validate(snapshot.expected) != nil || previous.ConfigurationRevision != snapshot.configurationRevision || !sameVerifiedRuntime(snapshot.expected, expected) || expected.ConfigurationRevision <= snapshot.expected.ConfigurationRevision || expected.OperationRevision < snapshot.expected.OperationRevision {
 		return errGateway
 	}
 	if err := session.applyConfigurationRPC(ctx, configuration); err != nil {

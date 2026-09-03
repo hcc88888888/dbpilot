@@ -1,6 +1,7 @@
 package pluginsupervisor
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -219,6 +221,173 @@ func (supervisor *PluginSupervisor) Start(ctx context.Context, prepared Prepared
 	default:
 		return ObservedState{}, ErrInvalidRequest
 	}
+}
+
+func (supervisor *PluginSupervisor) ApplyPluginConfiguration(ctx context.Context, command *agentv1.ApplyPluginConfiguration, fence ExecutionFence) error {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil || command == nil || fence.Validate() != nil {
+		return ErrInvalidFence
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	family, process, state, ok := supervisor.runningAssignment(command.GetAssignmentId())
+	if !ok || command.GetConfigurationRevision() != state.ActiveConfigurationRevision+1 || !matchingTypedConfiguration(process.request, command) {
+		return ErrInvalidFence
+	}
+	applier, ok := supervisor.health.(TypedConfigurationApplier)
+	if !ok {
+		return ErrHealthHandshake
+	}
+	next := cloneRequest(process.request)
+	next.ConfigurationRevision = command.GetConfigurationRevision()
+	request := healthRequest(next, process.installed, next.ConfigurationRevision, filepath.Join(supervisor.runtimeRoot, family), process.launchNonce, supervisor.userID, supervisor.groupID)
+	if err := applier.ApplyTypedConfiguration(ctx, process.process, request, command); err != nil {
+		return err
+	}
+	process.request = cloneRequest(next)
+	state.DesiredConfigurationRevision = next.ConfigurationRevision
+	state.RequestFingerprint = next.Fingerprint()
+	state.ObservationRevision++
+	state.LastErrorCode = ""
+	applyActiveConfiguration(&state, next, process.installed)
+	_, err := supervisor.store.Put(ctx, state)
+	return err
+}
+
+func (supervisor *PluginSupervisor) ValidateDatabaseInstance(ctx context.Context, command *agentv1.ValidateDatabaseInstance, fence ExecutionFence) (plugingateway.ValidationResult, error) {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil || command == nil || fence.Validate() != nil {
+		return plugingateway.ValidationResult{}, ErrInvalidFence
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	family, process, state, ok := supervisor.runningAssignment(command.GetAssignmentId())
+	if !ok || command.GetConfigurationRevision() != state.ActiveConfigurationRevision || !containsResource(state.ActiveInstanceIDs, command.GetInstanceId()) {
+		return plugingateway.ValidationResult{}, ErrInvalidFence
+	}
+	validator, ok := supervisor.health.(TypedInstanceValidator)
+	if !ok {
+		return plugingateway.ValidationResult{}, ErrHealthHandshake
+	}
+	request := healthRequest(process.request, process.installed, state.ActiveConfigurationRevision, filepath.Join(supervisor.runtimeRoot, family), process.launchNonce, supervisor.userID, supervisor.groupID)
+	result, err := validator.ValidateTypedInstance(ctx, process.process, request, command.GetInstanceId())
+	if err != nil || result.InstanceID != command.GetInstanceId() {
+		return plugingateway.ValidationResult{}, ErrHealthHandshake
+	}
+	return result, nil
+}
+
+func (supervisor *PluginSupervisor) DrainPlugin(ctx context.Context, command *agentv1.DrainPlugin, fence ExecutionFence) error {
+	if supervisor == nil || ctx == nil || ctx.Err() != nil || command == nil || fence.Validate() != nil || command.GetTimeoutSeconds() == 0 || command.GetTimeoutSeconds() > 60 {
+		return ErrInvalidFence
+	}
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	family, process, state, ok := supervisor.runningAssignment(command.GetAssignmentId())
+	if !ok || command.GetOperationRevision() != state.ObservedOperationRevision {
+		return ErrInvalidFence
+	}
+	state.ProcessState = pluginstate.ProcessDraining
+	state.ObservationRevision++
+	if _, err := supervisor.store.Put(ctx, state); err != nil {
+		return err
+	}
+	drainContext, cancel := context.WithTimeout(ctx, time.Duration(command.GetTimeoutSeconds())*time.Second)
+	err := supervisor.drainProcess(drainContext, process)
+	cancel()
+	delete(supervisor.running, family)
+	state.ProcessID, state.ProcessStartTicks, state.StartedAt = 0, 0, time.Time{}
+	state.ObservationRevision++
+	if err != nil {
+		state.ProcessState, state.HealthState, state.LastErrorCode = pluginstate.ProcessDegraded, pluginstate.HealthUnhealthy, "plugin_drain_failed"
+		_, _ = supervisor.store.Put(context.Background(), state)
+		return err
+	}
+	state.ProcessState, state.HealthState, state.LastErrorCode = pluginstate.ProcessStopped, pluginstate.HealthUnknown, ""
+	_, err = supervisor.store.Put(ctx, state)
+	return err
+}
+
+func (supervisor *PluginSupervisor) runningAssignment(assignmentID string) (string, *managedProcess, pluginstate.FamilyState, bool) {
+	if !resourceIdentifier.MatchString(assignmentID) {
+		return "", nil, pluginstate.FamilyState{}, false
+	}
+	for family, process := range supervisor.running {
+		if process == nil || process.process == nil || process.request.AssignmentID != assignmentID {
+			continue
+		}
+		state, exists := supervisor.store.Get(family)
+		if !exists || state.AssignmentID != assignmentID || state.DatabaseFamily != family || state.PluginID != process.request.PluginID || state.InstalledVersion != process.request.DesiredVersion || state.ProcessState != pluginstate.ProcessRunning || state.ProcessID != process.process.PID() || state.ActiveConfigurationRevision != process.request.ConfigurationRevision || state.ObservedOperationRevision != process.request.OperationRevision {
+			return "", nil, pluginstate.FamilyState{}, false
+		}
+		return family, process, state, true
+	}
+	return "", nil, pluginstate.FamilyState{}, false
+}
+
+func matchingTypedConfiguration(request ReconcileRequest, command *agentv1.ApplyPluginConfiguration) bool {
+	if command == nil || command.GetAssignmentId() != request.AssignmentID || len(command.GetInstances()) != len(request.InstanceDescriptors) || len(command.GetInstances()) == 0 {
+		return false
+	}
+	descriptors := make(map[string]InstanceDescriptor, len(request.InstanceDescriptors))
+	for _, descriptor := range request.InstanceDescriptors {
+		descriptors[descriptor.InstanceID] = descriptor
+	}
+	for _, instance := range command.GetInstances() {
+		descriptor, exists := descriptors[instance.GetInstanceId()]
+		if !exists || instance.GetCredentialRevision() == 0 || instance.GetDatabaseVariant() != descriptor.DatabaseVariant || instance.GetEndpoint() != descriptor.Endpoint || instance.GetUnixSocket() != descriptor.UnixSocket || !matchingTypedTemplates(request, instance) {
+			return false
+		}
+		delete(descriptors, instance.GetInstanceId())
+	}
+	return len(descriptors) == 0
+}
+
+func matchingTypedTemplates(request ReconcileRequest, instance *agentv1.PluginInstanceConfiguration) bool {
+	if len(request.InstanceTemplateRefs) > 0 {
+		ids := map[string]TemplateReference{}
+		for _, refs := range request.InstanceTemplateRefs {
+			if refs.InstanceID == instance.GetInstanceId() {
+				for _, reference := range refs.Templates {
+					ids[reference.TemplateID] = reference
+				}
+				break
+			}
+		}
+		if len(ids) != len(instance.GetTemplates()) {
+			return false
+		}
+		for _, template := range instance.GetTemplates() {
+			reference, ok := ids[template.GetTemplateId()]
+			if !ok || template.GetRevision() == 0 || !bytes.Equal(template.GetQueryDigest(), reference.QueryDigest) {
+				return false
+			}
+			delete(ids, template.GetTemplateId())
+		}
+		return len(ids) == 0
+	}
+	if len(request.TemplateConfigurations) != len(instance.GetTemplates()) {
+		return false
+	}
+	byID := make(map[string]*pluginv1.MetricTemplateConfiguration, len(request.TemplateConfigurations))
+	for _, template := range request.TemplateConfigurations {
+		byID[template.GetTemplateId()] = template
+	}
+	for _, template := range instance.GetTemplates() {
+		current := byID[template.GetTemplateId()]
+		if current == nil || current.GetRevision() != template.GetRevision() || !bytes.Equal(current.GetQueryDigest(), template.GetQueryDigest()) {
+			return false
+		}
+		delete(byID, template.GetTemplateId())
+	}
+	return len(byID) == 0
+}
+
+func containsResource(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func stateConverged(state pluginstate.FamilyState, desired DesiredState, hasProcess bool) bool {

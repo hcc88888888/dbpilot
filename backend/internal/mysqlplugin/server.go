@@ -3,7 +3,10 @@ package mysqlplugin
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -11,6 +14,7 @@ import (
 
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
+	"github.com/go-sql-driver/mysql"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -174,7 +178,7 @@ func (server *Server) ValidateInstance(ctx context.Context, request *pluginv1.Va
 	defer cancel()
 	rows, err := instance.Pool.QueryContext(callContext, "SELECT VERSION(), @@version_comment")
 	if err != nil {
-		return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: false, ErrorCode: "connection_unavailable"}, nil
+		return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: false, ErrorCode: classifyValidationConnectionError(err)}, nil
 	}
 	defer rows.Close()
 	var version, edition string
@@ -183,9 +187,32 @@ func (server *Server) ValidateInstance(ctx context.Context, request *pluginv1.Va
 	}
 	lower := strings.ToLower(version + " " + edition)
 	if !strings.HasPrefix(version, "8.") || strings.Contains(lower, "mariadb") || strings.Contains(lower, "tidb") || strings.Contains(lower, "oceanbase") {
-		return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: false, ErrorCode: "unsupported_database"}, nil
+		return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: false, ErrorCode: "unsupported_version"}, nil
 	}
 	return &pluginv1.ValidatePluginInstanceResponse{InstanceId: request.GetInstanceId(), Valid: true, DatabaseVersion: version, DatabaseEdition: boundedText(edition, 128), Capabilities: []string{"metrics.collect"}}, nil
+}
+
+func classifyValidationConnectionError(err error) string {
+	var mysqlError *mysql.MySQLError
+	if errors.As(err, &mysqlError) {
+		switch mysqlError.Number {
+		case 1044, 1045, 1698:
+			return "authentication_failed"
+		}
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalidCertificate x509.CertificateInvalidError
+	var verification *tls.CertificateVerificationError
+	var recordHeader tls.RecordHeaderError
+	if errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &invalidCertificate) || errors.As(err, &verification) || errors.As(err, &recordHeader) {
+		return "tls_failed"
+	}
+	var networkError *net.OpError
+	if errors.As(err, &networkError) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "instance_unreachable"
+	}
+	return "plugin_failed"
 }
 
 func (server *Server) CollectNow(ctx context.Context, request *pluginv1.CollectPluginMetricsRequest) (*pluginv1.CollectPluginMetricsResponse, error) {

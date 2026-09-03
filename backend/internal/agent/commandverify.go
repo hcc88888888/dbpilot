@@ -35,6 +35,9 @@ const (
 	CommandKindCollectDiagnostic        CommandKind = "collect_diagnostic"
 	CommandKindDiscoverDatabases        CommandKind = "discover_databases"
 	CommandKindReconcilePlugin          CommandKind = "plugin.reconcile.v1"
+	CommandKindApplyPluginConfiguration CommandKind = "plugin.configuration.apply.v1"
+	CommandKindValidateDatabaseInstance CommandKind = "plugin.instance.validate.v1"
+	CommandKindDrainPlugin              CommandKind = "plugin.drain.v1"
 	CommandKindCollectDatabaseMetrics   CommandKind = "plugin.metrics.collect.v1"
 )
 
@@ -208,6 +211,12 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 		return CommandKindDiscoverDatabases, true
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		return CommandKindReconcilePlugin, true
+	case *agentv1.CommandEnvelope_ApplyPluginConfiguration:
+		return CommandKindApplyPluginConfiguration, true
+	case *agentv1.CommandEnvelope_ValidateDatabaseInstance:
+		return CommandKindValidateDatabaseInstance, true
+	case *agentv1.CommandEnvelope_DrainPlugin:
+		return CommandKindDrainPlugin, true
 	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
 		return CommandKindCollectDatabaseMetrics, true
 	default:
@@ -217,7 +226,7 @@ func envelopeCommandKind(envelope *agentv1.CommandEnvelope) (CommandKind, bool) 
 
 func knownCommandKind(kind CommandKind) bool {
 	switch kind {
-	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic, CommandKindDiscoverDatabases, CommandKindReconcilePlugin, CommandKindCollectDatabaseMetrics:
+	case CommandKindCollectNow, CommandKindInspectInstance, CommandKindExecuteSQL, CommandKindExecuteRegisteredProcess, CommandKindCollectDiagnostic, CommandKindDiscoverDatabases, CommandKindReconcilePlugin, CommandKindApplyPluginConfiguration, CommandKindValidateDatabaseInstance, CommandKindDrainPlugin, CommandKindCollectDatabaseMetrics:
 		return true
 	default:
 		return false

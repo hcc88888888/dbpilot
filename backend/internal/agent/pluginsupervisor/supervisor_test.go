@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
+	"dbpilot.local/platform/internal/agent/plugingateway"
 	"dbpilot.local/platform/internal/agent/pluginstate"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
@@ -102,6 +104,60 @@ func TestSupervisorHigherConfigurationRevisionAppliesAtomicallyToSameProcess(t *
 	require.Equal(t, []string{"mysql-1", "mysql-2", "mysql-3"}, fixture.health.applied[0].InstanceIDs)
 	require.Equal(t, uint64(2), observed.State.ActiveConfigurationRevision)
 	require.Equal(t, uint32(3), observed.State.BoundInstanceCount)
+}
+
+func TestSupervisorTypedRuntimeUsesExactRunningProcessAndRevisionFences(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	observed, err := fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+	processID := observed.State.ProcessID
+
+	apply := &agentv1.ApplyPluginConfiguration{AssignmentId: request.AssignmentID, ConfigurationRevision: 2, Instances: []*agentv1.PluginInstanceConfiguration{
+		{InstanceId: "mysql-1", DatabaseVariant: "mysql", Endpoint: "127.0.0.1:3306", CredentialRevision: 2, Templates: []*agentv1.PluginTemplateRevision{{TemplateId: "template-1", Revision: 1, QueryDigest: bytesOf(4, sha256.Size)}}},
+		{InstanceId: "mysql-2", DatabaseVariant: "mysql", UnixSocket: "/run/mysql-2.sock", CredentialRevision: 2, Templates: []*agentv1.PluginTemplateRevision{{TemplateId: "template-1", Revision: 1, QueryDigest: bytesOf(4, sha256.Size)}}},
+	}}
+	require.NoError(t, fixture.supervisor.ApplyPluginConfiguration(context.Background(), apply, validFence()))
+	state, ok := fixture.store.Get("mysql")
+	require.True(t, ok)
+	require.Equal(t, processID, state.ProcessID)
+	require.Equal(t, uint64(2), state.ActiveConfigurationRevision)
+	require.Equal(t, 1, fixture.health.typedApplyCalls)
+
+	fixture.health.validation = plugingateway.ValidationResult{InstanceID: "mysql-1", Valid: true, DatabaseVersion: "8.4.0"}
+	result, err := fixture.supervisor.ValidateDatabaseInstance(context.Background(), &agentv1.ValidateDatabaseInstance{AssignmentId: request.AssignmentID, InstanceId: "mysql-1", ConfigurationRevision: 2}, validFence())
+	require.NoError(t, err)
+	require.True(t, result.Valid)
+	require.Equal(t, 1, fixture.health.typedValidateCalls)
+
+	require.NoError(t, fixture.supervisor.DrainPlugin(context.Background(), &agentv1.DrainPlugin{AssignmentId: request.AssignmentID, OperationRevision: request.OperationRevision, TimeoutSeconds: 1}, validFence()))
+	state, ok = fixture.store.Get("mysql")
+	require.True(t, ok)
+	require.Equal(t, pluginstate.ProcessStopped, state.ProcessState)
+	require.Zero(t, state.ProcessID)
+	require.True(t, fixture.runner.processes[0].stopped)
+}
+
+func TestSupervisorTypedRuntimeRejectsStaleOrCrossAssignmentCommands(t *testing.T) {
+	fixture := newSupervisorFixture(t)
+	request := validReconcileRequest()
+	prepared, err := fixture.supervisor.Prepare(context.Background(), request)
+	require.NoError(t, err)
+	_, err = fixture.supervisor.Start(context.Background(), prepared, validFence())
+	require.NoError(t, err)
+
+	wrong := &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-other", InstanceId: "mysql-1", ConfigurationRevision: 1}
+	_, err = fixture.supervisor.ValidateDatabaseInstance(context.Background(), wrong, validFence())
+	require.ErrorIs(t, err, ErrInvalidFence)
+	stale := &agentv1.ValidateDatabaseInstance{AssignmentId: request.AssignmentID, InstanceId: "mysql-1", ConfigurationRevision: 2}
+	_, err = fixture.supervisor.ValidateDatabaseInstance(context.Background(), stale, validFence())
+	require.ErrorIs(t, err, ErrInvalidFence)
+	drain := &agentv1.DrainPlugin{AssignmentId: request.AssignmentID, OperationRevision: 2, TimeoutSeconds: 1}
+	require.ErrorIs(t, fixture.supervisor.DrainPlugin(context.Background(), drain, validFence()), ErrInvalidFence)
+	require.Zero(t, fixture.health.typedValidateCalls)
+	require.False(t, fixture.runner.processes[0].stopped)
 }
 
 func TestSupervisorFailedSameVersionConfigurationKeepsOldProcessAndConfiguration(t *testing.T) {
@@ -562,14 +618,27 @@ func (process *fakeProcess) Wait() error {
 }
 
 type fakeHealthChecker struct {
-	failVersion      string
-	shutdownErr      error
-	shutdownCalls    int
-	activationHealth pluginstate.HealthState
-	activationCode   string
-	requests         []HealthRequest
-	applied          []HealthRequest
-	applyErr         error
+	failVersion        string
+	shutdownErr        error
+	shutdownCalls      int
+	activationHealth   pluginstate.HealthState
+	activationCode     string
+	requests           []HealthRequest
+	applied            []HealthRequest
+	applyErr           error
+	typedApplyCalls    int
+	typedValidateCalls int
+	validation         plugingateway.ValidationResult
+}
+
+func (checker *fakeHealthChecker) ApplyTypedConfiguration(context.Context, Process, HealthRequest, *agentv1.ApplyPluginConfiguration) error {
+	checker.typedApplyCalls++
+	return checker.applyErr
+}
+
+func (checker *fakeHealthChecker) ValidateTypedInstance(context.Context, Process, HealthRequest, string) (plugingateway.ValidationResult, error) {
+	checker.typedValidateCalls++
+	return checker.validation, nil
 }
 
 func (checker *fakeHealthChecker) ApplyConfiguration(_ context.Context, _ Process, request HealthRequest) error {

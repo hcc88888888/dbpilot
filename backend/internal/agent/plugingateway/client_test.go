@@ -141,6 +141,13 @@ func TestValidationResultRequiresCanonicalSecretSafeTextAndExactInvariants(t *te
 	}
 }
 
+func TestValidationFailureCodesPreserveOnlyTheClassifiedConnectionVocabulary(t *testing.T) {
+	for _, code := range []string{"authentication_failed", "tls_failed", "instance_unreachable", "unsupported_version", "plugin_failed"} {
+		require.Equal(t, code, fixedPluginCode(code), code)
+	}
+	require.Equal(t, "plugin_failed", fixedPluginCode("password=raw-driver-detail"))
+}
+
 func TestAppendBatchRequiresExactTemplateMetricAndLabelMappings(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	root := t.TempDir()

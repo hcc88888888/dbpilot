@@ -3,9 +3,11 @@ package mysqlplugin
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	pluginv1 "dbpilot.local/platform/gen/plugin/v1"
 	"dbpilot.local/platform/internal/agent/pluginsupervisor"
 	"dbpilot.local/platform/internal/plugincontract"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
@@ -521,7 +524,7 @@ func TestValidateInstanceAcceptsOnlyMySQLEight(t *testing.T) {
 	tests := []struct {
 		name, version, edition, code string
 		valid                        bool
-	}{{"mysql8", "8.4.0", "MySQL Community Server", "", true}, {"mysql5", "5.7.44", "MySQL Community Server", "unsupported_database", false}, {"mariadb", "8.0.0-MariaDB", "MariaDB Server", "unsupported_database", false}, {"tidb", "8.0.11-TiDB-v8.5.0", "TiDB Server", "unsupported_database", false}, {"oceanbase", "8.0.30-OceanBase", "OceanBase", "unsupported_database", false}}
+	}{{"mysql8", "8.4.0", "MySQL Community Server", "", true}, {"mysql5", "5.7.44", "MySQL Community Server", "unsupported_version", false}, {"mariadb", "8.0.0-MariaDB", "MariaDB Server", "unsupported_version", false}, {"tidb", "8.0.11-TiDB-v8.5.0", "TiDB Server", "unsupported_version", false}, {"oceanbase", "8.0.30-OceanBase", "OceanBase", "unsupported_version", false}}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
@@ -534,6 +537,41 @@ func TestValidateInstanceAcceptsOnlyMySQLEight(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateInstanceClassifiesConnectionFailuresWithoutRawDriverErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{name: "authentication", err: &mysql.MySQLError{Number: 1045, Message: "password secret must not escape"}, code: "authentication_failed"},
+		{name: "tls", err: x509.UnknownAuthorityError{}, code: "tls_failed"},
+		{name: "unreachable", err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("endpoint unavailable")}, code: "instance_unreachable"},
+		{name: "plugin", err: errors.New("raw driver password=secret"), code: "plugin_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})
+			runtime.replaceForTest(Config{AssignmentID: "assignment-a", Revision: 1}, map[string]InstanceRuntime{"mysql-a": {Config: fixtureDecodedInstance("mysql-a", "monitor"), Pool: validationErrorPool{err: test.err}}})
+			server := NewServer(ServerConfig{AssignmentID: "assignment-a", OperationRevision: 1, Runtime: runtime})
+
+			response, err := server.ValidateInstance(context.Background(), &pluginv1.ValidatePluginInstanceRequest{AssignmentId: "assignment-a", InstanceId: "mysql-a", ConfigurationRevision: 1})
+
+			require.NoError(t, err)
+			require.False(t, response.GetValid())
+			require.Equal(t, test.code, response.GetErrorCode())
+			require.NotContains(t, response.String(), "secret")
+		})
+	}
+}
+
+type validationErrorPool struct{ err error }
+
+func (validationErrorPool) PingContext(context.Context) error { return nil }
+func (pool validationErrorPool) QueryContext(context.Context, string, ...any) (Rows, error) {
+	return nil, pool.err
+}
+func (validationErrorPool) Close() error { return nil }
 
 func TestCollectNowKeepsSuccessfulUpBatchWhenStatusQueryFails(t *testing.T) {
 	runtime := NewRuntime(&fakePoolFactory{}, RuntimeOptions{})

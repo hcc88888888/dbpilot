@@ -495,6 +495,10 @@ func runRuntime(ctx context.Context, settings agentConfig) error {
 			_ = store.Close()
 			return errors.New("register plugin reconcile executor")
 		}
+		if registerErr := registerPluginRuntimeExecutors(executors, pluginSupervisor); registerErr != nil {
+			_ = store.Close()
+			return errors.New("register typed plugin runtime executors")
+		}
 		trialExecutor, trialErr := agent.NewMetricTemplateTrialExecutor(pluginLeases, pluginGatewayHealth)
 		if trialErr != nil {
 			_ = store.Close()
@@ -699,6 +703,22 @@ func configuredCommandExecutors(host agent.Collector, collector *agent.Dependenc
 		return nil, fmt.Errorf("register CollectNow executor: %w", err)
 	}
 	return executors, nil
+}
+
+func registerPluginRuntimeExecutors(registry *agent.ExecutorRegistry, runtime agent.PluginCommandRuntime) error {
+	if registry == nil {
+		return errors.New("plugin runtime executor registry is required")
+	}
+	executor, err := agent.NewPluginRuntimeExecutor(runtime)
+	if err != nil {
+		return err
+	}
+	for _, kind := range []agent.CommandKind{agent.CommandKindApplyPluginConfiguration, agent.CommandKindValidateDatabaseInstance, agent.CommandKindDrainPlugin} {
+		if err := registry.Register(kind, executor); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func loadDiscoveryRuleSet(path string, publicKey ed25519.PublicKey, now time.Time, state *agentdiscovery.RuleStateStore) (discoverydomain.RuleSet, discoverydomain.RuleAttestation, error) {

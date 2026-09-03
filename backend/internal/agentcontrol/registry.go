@@ -432,6 +432,8 @@ func commandCapabilities(envelope *agentv1.CommandEnvelope) []string {
 		return []string{"execute_registered_process"}
 	case *agentv1.CommandEnvelope_CollectDiagnostic:
 		return []string{"collect_diagnostic"}
+	case *agentv1.CommandEnvelope_DiscoverDatabases:
+		return []string{"discover_databases"}
 	case *agentv1.CommandEnvelope_ReconcilePlugin:
 		command := envelope.GetReconcilePlugin()
 		capabilities := []string{"plugin.reconcile.v1"}
@@ -442,6 +444,12 @@ func commandCapabilities(envelope *agentv1.CommandEnvelope) []string {
 			capabilities = append(capabilities, "metric_template_lease.v1")
 		}
 		return capabilities
+	case *agentv1.CommandEnvelope_ApplyPluginConfiguration:
+		return []string{"plugin.configuration.apply.v1"}
+	case *agentv1.CommandEnvelope_ValidateDatabaseInstance:
+		return []string{"plugin.instance.validate.v1"}
+	case *agentv1.CommandEnvelope_DrainPlugin:
+		return []string{"plugin.drain.v1"}
 	case *agentv1.CommandEnvelope_CollectDatabaseMetrics:
 		capabilities := []string{"plugin.metrics.collect.v1"}
 		if len(envelope.GetCollectDatabaseMetrics().GetTemplateRevisions()) > 0 {
