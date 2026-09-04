@@ -22,8 +22,13 @@ func (recorder databaseInstanceResultRecorder) RecordDatabaseInstanceValidationP
 }
 
 func (recorder databaseInstanceResultRecorder) RecordDatabaseInstanceValidationResult(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, at time.Time) error {
+	_, err := recorder.FinalizeDatabaseInstanceValidationResult(ctx, scope, jobID, commandID, command, result, at)
+	return err
+}
+
+func (recorder databaseInstanceResultRecorder) FinalizeDatabaseInstanceValidationResult(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, at time.Time) (*agentv1.CommandResult, error) {
 	if recorder.Store == nil || result == nil {
-		return errors.New("database instance validation result store is unavailable")
+		return nil, errors.New("database instance validation result store is unavailable")
 	}
 	outcome := databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}
 	if result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED && result.GetErrorCode() == "" {
@@ -40,7 +45,27 @@ func (recorder databaseInstanceResultRecorder) RecordDatabaseInstanceValidationR
 			outcome = databaseinstance.ValidationResult{Status: databaseinstance.ConnectionUnsupportedVersion, ErrorCode: databaseinstance.ConnectionErrorUnsupportedVersion}
 		}
 	}
-	return recorder.Store.RecordValidationResult(ctx, scope, jobID, commandID, command, outcome, at)
+	effective, err := recorder.Store.FinalizeValidationResult(ctx, scope, jobID, commandID, command, outcome, at)
+	if err != nil {
+		return nil, err
+	}
+	return effectiveValidationCommandResult(commandID, result.GetState(), effective), nil
+}
+
+func effectiveValidationCommandResult(commandID string, incoming agentv1.CommandResultState, effective databaseinstance.ValidationResult) *agentv1.CommandResult {
+	switch incoming {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		return &agentv1.CommandResult{CommandId: commandID, State: incoming, Summary: "database instance connection validation cancelled"}
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return &agentv1.CommandResult{CommandId: commandID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, Summary: "database instance connection validation timed out"}
+	}
+	result := &agentv1.CommandResult{CommandId: commandID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, Summary: "database instance connection validation failed", ErrorCode: string(effective.ErrorCode)}
+	if effective.Status == databaseinstance.ConnectionSucceeded {
+		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
+		result.Summary = "database instance connection validation succeeded"
+		result.ErrorCode = ""
+	}
+	return result
 }
 
 func (recorder databaseInstanceResultRecorder) ReconcileDatabaseInstanceValidationTerminals(ctx context.Context, at time.Time, limit int) (int, error) {

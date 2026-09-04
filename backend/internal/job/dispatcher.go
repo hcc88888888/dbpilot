@@ -115,7 +115,7 @@ type CommandTypedResultRecorder interface {
 
 type CommandDatabaseInstanceResultRecorder interface {
 	RecordDatabaseInstanceValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
-	RecordDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, time.Time) error
+	FinalizeDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, time.Time) (*agentv1.CommandResult, error)
 	ReconcileDatabaseInstanceValidationTerminals(context.Context, time.Time, int) (int, error)
 }
 
@@ -472,7 +472,7 @@ func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time
 			result = append(result, fmt.Errorf("load expired command %q: %w", claim.CommandID, lookupErr))
 			continue
 		}
-		if terminalErr := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, TargetResult{TargetID: message.TargetID, Status: TargetTimedOut}, at); terminalErr != nil {
+		if _, terminalErr := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, TargetResult{TargetID: message.TargetID, Status: TargetTimedOut}, at); terminalErr != nil {
 			result = append(result, fmt.Errorf("finalize expired database validation %q: %w", claim.CommandID, terminalErr))
 		}
 	}
@@ -1059,7 +1059,21 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	validationResult := result
 	if validationCommand != nil {
 		validationResult = canonicalDatabaseInstanceValidationResult(result)
+		validationResult, err = lifecycle.databaseInstanceResults.FinalizeDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, validationCommand, validationResult, at)
+		if err != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+		}
 		target = databaseInstanceValidationTarget(message.TargetID, validationResult, at)
+		switch target.Status {
+		case TargetSucceeded:
+			commandStatus, auditResult = CommandSucceeded, "success"
+		case TargetCancelled:
+			commandStatus, auditResult = CommandCancelled, "failure"
+		case TargetTimedOut:
+			commandStatus, auditResult = CommandTimedOut, "failure"
+		default:
+			commandStatus, auditResult = CommandFailed, "failure"
+		}
 	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if lifecycle.typedResultRecorder == nil {
@@ -1117,7 +1131,11 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
 	}
-	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
+	applyTarget := lifecycle.applyTarget
+	if validationCommand != nil {
+		applyTarget = lifecycle.applyEffectiveTarget
+	}
+	value, _, err := applyTarget(ctx, message, target, at)
 	if err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
@@ -1188,20 +1206,20 @@ func databaseInstanceValidationTarget(targetID string, result *agentv1.CommandRe
 	return target
 }
 
-func (lifecycle *CommandLifecycle) finalizeDatabaseInstanceValidationTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) error {
+func (lifecycle *CommandLifecycle) finalizeDatabaseInstanceValidationTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) (TargetResult, error) {
 	if !isTerminalTarget(target.Status) {
-		return nil
+		return target, nil
 	}
 	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
 	if err != nil {
-		return err
+		return TargetResult{}, err
 	}
 	command := envelope.GetValidateDatabaseInstance()
 	if command == nil {
-		return nil
+		return target, nil
 	}
 	if lifecycle.databaseInstanceResults == nil {
-		return ErrInvalidCommandPayload
+		return TargetResult{}, ErrInvalidCommandPayload
 	}
 	result := &agentv1.CommandResult{CommandId: message.ID}
 	switch target.Status {
@@ -1216,7 +1234,11 @@ func (lifecycle *CommandLifecycle) finalizeDatabaseInstanceValidationTarget(ctx 
 		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT
 	}
 	result = canonicalDatabaseInstanceValidationResult(result)
-	return lifecycle.databaseInstanceResults.RecordDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, command, result, at)
+	effective, err := lifecycle.databaseInstanceResults.FinalizeDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, command, result, at)
+	if err != nil {
+		return TargetResult{}, err
+	}
+	return databaseInstanceValidationTarget(message.TargetID, effective, at), nil
 }
 
 func fixedDatabaseInstanceValidationError(value string) string {
@@ -1278,8 +1300,20 @@ func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, command
 }
 
 func (lifecycle *CommandLifecycle) applyTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) (Job, bool, error) {
-	if err := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, target, at); err != nil {
-		return Job{}, false, err
+	return lifecycle.applyTargetWithProjection(ctx, message, target, at, true)
+}
+
+func (lifecycle *CommandLifecycle) applyEffectiveTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) (Job, bool, error) {
+	return lifecycle.applyTargetWithProjection(ctx, message, target, at, false)
+}
+
+func (lifecycle *CommandLifecycle) applyTargetWithProjection(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time, finalizeProjection bool) (Job, bool, error) {
+	if finalizeProjection {
+		effective, err := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, target, at)
+		if err != nil {
+			return Job{}, false, err
+		}
+		target = effective
 	}
 	mutated := false
 	for attempt := 0; attempt < commandTransitionAttempts; attempt++ {

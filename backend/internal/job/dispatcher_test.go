@@ -1057,6 +1057,7 @@ type recordingDatabaseValidationRecorder struct {
 	resultCalls   int
 	command       *agentv1.ValidateDatabaseInstance
 	result        *agentv1.CommandResult
+	effective     *agentv1.CommandResult
 }
 
 func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValidationProgress(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, _ time.Time) error {
@@ -1072,6 +1073,17 @@ func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValid
 }
 func (recorder *recordingDatabaseValidationRecorder) ReconcileDatabaseInstanceValidationTerminals(context.Context, time.Time, int) (int, error) {
 	return 0, nil
+}
+func (recorder *recordingDatabaseValidationRecorder) FinalizeDatabaseInstanceValidationResult(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, _ time.Time) (*agentv1.CommandResult, error) {
+	recorder.resultCalls++
+	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
+	recorder.result = proto.Clone(result).(*agentv1.CommandResult)
+	if recorder.effective != nil {
+		effective := proto.Clone(recorder.effective).(*agentv1.CommandResult)
+		effective.CommandId = result.GetCommandId()
+		return effective, nil
+	}
+	return proto.Clone(result).(*agentv1.CommandResult), nil
 }
 
 func TestDatabaseInstanceValidationProjectionFinalizesForEveryTerminalTarget(t *testing.T) {
@@ -1141,6 +1153,30 @@ func TestDatabaseInstanceValidationExecutionExpiryFinalizesProjection(t *testing
 	require.NoError(t, err)
 	require.Equal(t, 1, recorder.resultCalls)
 	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, recorder.result.GetState())
+}
+
+func TestDatabaseInstanceValidationEffectiveFencedOutcomeOwnsCommandJobAndAudit(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{effective: &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "plugin_failed", Summary: "database instance connection validation failed"}}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-validation-stale-success", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database instance connection validation succeeded", ExecutionToken: token, LeaseRevision: 1})
+
+	require.NoError(t, err)
+	require.True(t, outcome.Persisted)
+	require.Equal(t, CommandFailed, fixture.persistence.messages[message.ID].CommandStatus)
+	require.Equal(t, StatusFailed, fixture.persistence.currentJob().Status)
+	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
+	require.Equal(t, "plugin_failed", fixture.persistence.currentJob().TargetResults[0].ErrorSummary)
+	require.Equal(t, "database instance connection validation failed", fixture.persistence.currentJob().TargetResults[0].ResultSummary)
+	require.Equal(t, "failure", fixture.audit.events[len(fixture.audit.events)-1].Result)
 }
 
 func TestFailedHighCardinalityTrialTerminalizesRunningJob(t *testing.T) {

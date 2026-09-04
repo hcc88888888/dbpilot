@@ -305,7 +305,9 @@ func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDe
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, staleFence.ID).Scan(&staleFenceCommandID))
 	_, err = database.ExecContext(ctx, `UPDATE plugin_assignments SET operation_revision=operation_revision+1 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, scope.TenantID, scope.ProjectID, assignment.ID)
 	require.NoError(t, err)
-	require.NoError(t, instances.RecordValidationResult(ctx, scope, staleFence.ID, staleFenceCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(time.Second)))
+	effective, err := instances.FinalizeValidationResult(ctx, scope, staleFence.ID, staleFenceCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(time.Second))
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, effective)
 	instance, err = instances.Get(ctx, scope, instance.ID)
 	require.NoError(t, err)
 	require.Equal(t, databaseinstance.ConnectionPluginFailed, instance.ConnectionTestStatus, "every failure classification must pass the current assignment and operation fence")
@@ -335,8 +337,9 @@ func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDe
 	var retryCommandID string
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, retry.ID).Scan(&retryCommandID))
 
-	err = instances.RecordValidationResult(ctx, scope, timedOut.ID, timedOutCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(3*time.Second))
-	require.ErrorIs(t, err, databaseinstance.ErrConflict)
+	effective, err = instances.FinalizeValidationResult(ctx, scope, timedOut.ID, timedOutCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(3*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, effective, "late delivery must replay the stored effective timeout outcome")
 	instance, err = instances.Get(ctx, scope, instance.ID)
 	require.NoError(t, err)
 	require.Equal(t, databaseinstance.ConnectionQueued, instance.ConnectionTestStatus, "a stale failure must not overwrite the newer validation generation")
@@ -358,16 +361,23 @@ func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDe
 	var concurrentCommandID string
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, concurrent.ID).Scan(&concurrentCommandID))
 	start := make(chan struct{})
-	terminalErrors := make(chan error, 16)
+	type terminalDelivery struct {
+		effective databaseinstance.ValidationResult
+		err       error
+	}
+	terminalDeliveries := make(chan terminalDelivery, 16)
 	for index := 0; index < 16; index++ {
 		go func() {
 			<-start
-			terminalErrors <- instances.RecordValidationResult(ctx, scope, concurrent.ID, concurrentCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionUnreachable, ErrorCode: databaseinstance.ConnectionErrorUnreachable}, now.Add(6*time.Second))
+			effective, terminalErr := instances.FinalizeValidationResult(ctx, scope, concurrent.ID, concurrentCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionUnreachable, ErrorCode: databaseinstance.ConnectionErrorUnreachable}, now.Add(6*time.Second))
+			terminalDeliveries <- terminalDelivery{effective: effective, err: terminalErr}
 		}()
 	}
 	close(start)
 	for index := 0; index < 16; index++ {
-		require.NoError(t, <-terminalErrors)
+		delivery := <-terminalDeliveries
+		require.NoError(t, delivery.err)
+		require.Equal(t, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionUnreachable, ErrorCode: databaseinstance.ConnectionErrorUnreachable}, delivery.effective)
 	}
 	instance, err = instances.Get(ctx, scope, instance.ID)
 	require.NoError(t, err)

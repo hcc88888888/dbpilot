@@ -174,6 +174,21 @@ func (repository *PostgresRepository) RecordValidationResult(ctx context.Context
 	return last
 }
 
+func (repository *PostgresRepository) FinalizeValidationResult(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, outcome ValidationResult, at time.Time) (ValidationResult, error) {
+	if err := repository.RecordValidationResult(ctx, scope, jobID, commandID, command, outcome, at); err != nil {
+		return ValidationResult{}, err
+	}
+	var effective ValidationResult
+	err := repository.database.QueryRowContext(ctx, `SELECT status,error_code FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3 AND command_id=$4`, scope.TenantID, scope.ProjectID, jobID, commandID).Scan(&effective.Status, &effective.ErrorCode)
+	if err != nil {
+		return ValidationResult{}, mapPostgresError(err)
+	}
+	if effective.Validate() != nil {
+		return ValidationResult{}, ErrInvalid
+	}
+	return effective, nil
+}
+
 func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, outcome ValidationResult, at time.Time) error {
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -188,9 +203,6 @@ func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Con
 		return ErrConflict
 	}
 	if terminalConnectionStatus(state.Status) {
-		if state.Status != outcome.Status || state.ErrorCode != outcome.ErrorCode {
-			return ErrConflict
-		}
 		return tx.Commit()
 	}
 	if state.Status != ConnectionQueued && state.Status != ConnectionRunning {
