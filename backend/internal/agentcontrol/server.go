@@ -214,15 +214,15 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 	}
 
 	sessionContext, cancel := context.WithCancel(stream.Context())
-	if err := s.registry.registerCredential(agentID, hello.GetCapabilities(), hello.GetActiveCommands(), credentialFingerprint, credentialSerial, cancel); err != nil {
+	current, err := s.registry.registerCredential(agentID, hello.GetCapabilities(), hello.GetActiveCommands(), credentialFingerprint, credentialSerial, cancel)
+	if err != nil {
 		cancel()
 		if errors.Is(err, ErrDuplicateSession) {
 			return status.Error(codes.AlreadyExists, err.Error())
 		}
 		return status.Error(codes.Internal, err.Error())
 	}
-	current, ok := s.registry.liveSession(agentID)
-	if !ok || current == nil {
+	if current == nil {
 		cancel()
 		return status.Error(codes.Internal, "Agent session registration failed")
 	}

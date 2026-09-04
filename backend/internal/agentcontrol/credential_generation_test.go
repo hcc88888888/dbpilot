@@ -91,7 +91,8 @@ func TestRegistryTerminatesOnlyExactDatabaseConfirmedCredentialAndPreservesNewSe
 	oldFingerprint := sha256.Sum256([]byte("old-leaf"))
 	newFingerprint := sha256.Sum256([]byte("new-leaf"))
 	cancelled := make(chan struct{}, 1)
-	require.NoError(t, registry.registerCredential("agent-a", []string{"collect_now"}, nil, oldFingerprint, "01", func() { cancelled <- struct{}{} }))
+	_, err := registry.registerCredential("agent-a", []string{"collect_now"}, nil, oldFingerprint, "01", func() { cancelled <- struct{}{} })
+	require.NoError(t, err)
 	current, ok := registry.liveSession("agent-a")
 	require.True(t, ok)
 	now := time.Now().UTC()
@@ -111,11 +112,36 @@ func TestRegistryTerminatesOnlyExactDatabaseConfirmedCredentialAndPreservesNewSe
 		t.Fatal("superseded session cancellation was not delivered")
 	}
 
-	require.NoError(t, registry.registerCredential("agent-a", []string{"collect_now"}, nil, newFingerprint, "02", func() {}))
+	_, err = registry.registerCredential("agent-a", []string{"collect_now"}, nil, newFingerprint, "02", func() {})
+	require.NoError(t, err)
 	require.False(t, terminator.TerminateCredential("agent-a", oldFingerprint, "01"), "late cleanup for an old leaf must preserve the new session")
 	info, ok := registry.Session("agent-a")
 	require.True(t, ok)
 	require.Equal(t, "agent-a", info.AgentID)
+}
+
+func TestRegistryCredentialRegistrationReturnsExactSessionForPostRegisterReauth(t *testing.T) {
+	registry := NewRegistry(1)
+	registrar, ok := any(registry).(interface {
+		registerCredential(string, []string, []*agentv1.CommandRecoveryState, [sha256.Size]byte, string, context.CancelFunc) (*session, error)
+	})
+	require.True(t, ok, "credential registration must return the exact created session")
+	if !ok {
+		return
+	}
+	oldFingerprint := sha256.Sum256([]byte("old-registration"))
+	oldSession, err := registrar.registerCredential("agent-a", []string{"collect_now"}, nil, oldFingerprint, "01", func() {})
+	require.NoError(t, err)
+	require.NotNil(t, oldSession)
+	require.Same(t, oldSession, registry.sessions["agent-a"])
+	require.True(t, registry.terminateSession("agent-a", oldSession))
+
+	newFingerprint := sha256.Sum256([]byte("new-registration"))
+	newSession, err := registrar.registerCredential("agent-a", []string{"collect_now"}, nil, newFingerprint, "02", func() {})
+	require.NoError(t, err)
+	require.NotSame(t, oldSession, newSession)
+	require.False(t, registry.terminateSession("agent-a", oldSession), "late reauth cleanup for the returned old registration must preserve its replacement")
+	require.Same(t, newSession, registry.sessions["agent-a"])
 }
 
 func TestAgentControlOldLeafReconnectFailsAfterReplacementAndCurrentLeafFailsAfterDecommission(t *testing.T) {

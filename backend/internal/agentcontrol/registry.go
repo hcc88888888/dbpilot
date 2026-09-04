@@ -85,10 +85,11 @@ func NewRegistry(queueCapacity int) *Registry {
 }
 
 func (r *Registry) register(agentID string, capabilities []string, active []*agentv1.CommandRecoveryState, cancel context.CancelFunc) error {
-	return r.registerCredential(agentID, capabilities, active, [sha256.Size]byte{}, "", cancel)
+	_, err := r.registerCredential(agentID, capabilities, active, [sha256.Size]byte{}, "", cancel)
+	return err
 }
 
-func (r *Registry) registerCredential(agentID string, capabilities []string, active []*agentv1.CommandRecoveryState, fingerprint [sha256.Size]byte, serial string, cancel context.CancelFunc) error {
+func (r *Registry) registerCredential(agentID string, capabilities []string, active []*agentv1.CommandRecoveryState, fingerprint [sha256.Size]byte, serial string, cancel context.CancelFunc) (*session, error) {
 	capabilitySet := make(map[string]struct{}, len(capabilities))
 	for _, capability := range capabilities {
 		capability = strings.TrimSpace(capability)
@@ -105,17 +106,18 @@ func (r *Registry) registerCredential(agentID string, capabilities []string, act
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.sessions[agentID]; exists {
-		return ErrDuplicateSession
+		return nil, ErrDuplicateSession
 	}
 	r.sessionSequence++
-	r.sessions[agentID] = &session{
+	created := &session{
 		sessionID: fmt.Sprintf("session-%d", r.sessionSequence), agentID: agentID,
 		credentialLeaf: fingerprint, credentialSerial: serial, capabilities: capabilitySet, capabilityList: capabilityList,
 		active: cloneRecoveryStates(active), send: make(chan *agentv1.ServerMessage, r.queueCapacity), cancel: cancel,
 		leaseDurations: make(map[string]time.Duration), leases: make(map[string]time.Time),
 		executionTokens: make(map[string][]byte), leaseRevisions: make(map[string]uint64),
 	}
-	return nil
+	r.sessions[agentID] = created
+	return created, nil
 }
 
 func (r *Registry) unregister(agentID string, expected *session) {
