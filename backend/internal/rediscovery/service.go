@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	rediscoveryLease   = 2 * time.Minute
-	rediscoveryTimeout = 5 * time.Minute
+	rediscoveryLease            = 2 * time.Minute
+	rediscoveryTimeout          = 5 * time.Minute
+	rediscoveryDigestKeyVersion = "v2"
 )
 
 var (
@@ -43,6 +44,7 @@ type JobStore interface {
 	CreateWithOutbox(context.Context, job.Job, []job.OutboxMessage) error
 	Get(context.Context, platformscope.Scope, string) (job.Job, error)
 	GetOperation(context.Context, platformscope.Scope, string, string) (job.Job, job.OutboxMessage, error)
+	UpgradeOperationIdempotencyKey(context.Context, job.Job, job.OutboxMessage, string) (job.Job, job.OutboxMessage, error)
 }
 
 type CapabilitySource interface {
@@ -137,8 +139,22 @@ func (service *RediscoveryCoordinator) resolveImmutableOperation(ctx context.Con
 	if err != nil {
 		return job.Job{}, false, err
 	}
-	if !sameRediscoveryOperation(value, message, scope, hostID, jobID, commandID, request) {
+	currentKey, legacy, valid := rediscoveryOperationKey(value, message, scope, hostID, jobID, commandID, request)
+	if !valid {
 		return job.Job{}, false, ErrRediscoveryUnavailable
+	}
+	if legacy {
+		value, message, err = service.Jobs.UpgradeOperationIdempotencyKey(ctx, value, message, currentKey)
+		if errors.Is(err, job.ErrConflict) || errors.Is(err, job.ErrNotFound) {
+			return job.Job{}, false, ErrRediscoveryUnavailable
+		}
+		if err != nil {
+			return job.Job{}, false, err
+		}
+		upgradedKey, stillLegacy, upgradedValid := rediscoveryOperationKey(value, message, scope, hostID, jobID, commandID, request)
+		if !upgradedValid || stillLegacy || upgradedKey != currentKey {
+			return job.Job{}, false, ErrRediscoveryUnavailable
+		}
 	}
 	return value, true, nil
 }
@@ -175,8 +191,8 @@ func buildRediscoveryJob(host hostinventory.Host, ruleRevision uint64, includeNa
 		return job.Job{}, job.OutboxMessage{}, ErrInvalid
 	}
 	timeout := at.Add(rediscoveryTimeout)
-	payloadDigest := sha256.Sum256(payload)
-	value := job.Job{ID: jobID, Type: "host.rediscover", Scope: host.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{host.AgentID}, InitiatedBy: request.Actor, SourceResource: job.ResourceReference{ResourceType: "host", ResourceID: host.ID}, IdempotencyKey: "host-rediscover-" + suffix + "-command-sha256-" + hex.EncodeToString(payloadDigest[:]), Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at, TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: rediscoveryLease, RequestID: request.RequestID, TraceID: request.TraceID}
+	currentKey, _, _ := rediscoveryIdempotencyKeys(suffix, payload)
+	value := job.Job{ID: jobID, Type: "host.rediscover", Scope: host.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{host.AgentID}, InitiatedBy: request.Actor, SourceResource: job.ResourceReference{ResourceType: "host", ResourceID: host.ID}, IdempotencyKey: currentKey, Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at, TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: rediscoveryLease, RequestID: request.RequestID, TraceID: request.TraceID}
 	message := job.OutboxMessage{ID: commandID, Scope: host.Scope, JobID: jobID, TargetID: host.AgentID, Type: "agent.command", Payload: payload, AvailableAt: at, CreatedAt: at}
 	return value, message, nil
 }
@@ -188,27 +204,42 @@ func rediscoveryOperationIdentity(scope platformscope.Scope, hostID string, requ
 	return "job-host-rediscover-" + suffix, "command-host-rediscover-" + suffix, suffix
 }
 
-func sameRediscoveryOperation(value job.Job, message job.OutboxMessage, scope platformscope.Scope, hostID, jobID, commandID string, request RediscoveryRequest) bool {
+func rediscoveryOperationKey(value job.Job, message job.OutboxMessage, scope platformscope.Scope, hostID, jobID, commandID string, request RediscoveryRequest) (string, bool, bool) {
 	requestSuffix := strings.TrimPrefix(jobID, "job-host-rediscover-")
-	keyPrefix := "host-rediscover-" + requestSuffix + "-command-sha256-"
-	if value.ID != jobID || value.Type != "host.rediscover" || value.Scope != scope || value.InitiatedBy != request.Actor || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || !strings.HasPrefix(value.IdempotencyKey, keyPrefix) || len(value.IdempotencyKey) != len(keyPrefix)+sha256.Size*2 || value.Version < 1 || value.RequestID != request.RequestID || value.TraceID != request.TraceID || len(value.TargetResourceIDs) != 1 ||
+	if requestSuffix == jobID || len(requestSuffix) != sha256.Size || value.ID != jobID || value.Type != "host.rediscover" || value.Scope != scope || value.InitiatedBy != request.Actor || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || value.Version < 1 || value.RequestID != request.RequestID || value.TraceID != request.TraceID || len(value.TargetResourceIDs) != 1 ||
 		message.ID != commandID || message.Scope != scope || message.JobID != jobID || message.TargetID != value.TargetResourceIDs[0] || message.Type != "agent.command" {
-		return false
+		return "", false, false
 	}
 	envelope := new(agentv1.CommandEnvelope)
 	if proto.Unmarshal(message.Payload, envelope) != nil || len(envelope.ProtoReflect().GetUnknown()) != 0 || envelope.GetAgentId() != message.TargetID || envelope.GetCommandId() != "" || envelope.GetJobId() != "" || envelope.GetIssuedAt() != nil || envelope.GetExpiresAt() != nil || len(envelope.GetNonce()) != 0 || len(envelope.GetSignature()) != 0 || envelope.GetLeaseSeconds() != uint32(rediscoveryLease/time.Second) {
-		return false
+		return "", false, false
 	}
 	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
 	if err != nil || !bytes.Equal(canonical, message.Payload) {
-		return false
-	}
-	payloadDigest := sha256.Sum256(canonical)
-	if value.IdempotencyKey != keyPrefix+hex.EncodeToString(payloadDigest[:]) {
-		return false
+		return "", false, false
 	}
 	command := envelope.GetDiscoverDatabases()
-	return command != nil && command.GetHostId() == hostID && command.GetRuleRevision() > 0 && (command.GetIncludeNative() || command.GetIncludeDocker())
+	if command == nil || command.GetHostId() != hostID || command.GetRuleRevision() == 0 || (!command.GetIncludeNative() && !command.GetIncludeDocker()) {
+		return "", false, false
+	}
+	currentKey, legacyDigestKey, legacyKey := rediscoveryIdempotencyKeys(requestSuffix, canonical)
+	switch value.IdempotencyKey {
+	case currentKey:
+		return currentKey, false, true
+	case legacyDigestKey, legacyKey:
+		return currentKey, true, true
+	default:
+		return "", false, false
+	}
+}
+
+func rediscoveryIdempotencyKeys(requestSuffix string, payload []byte) (string, string, string) {
+	payloadDigest := sha256.Sum256(payload)
+	digest := hex.EncodeToString(payloadDigest[:])
+	legacyKey := "host-rediscover-" + requestSuffix
+	legacyDigestKey := legacyKey + "-command-sha256-" + digest
+	currentKey := "host-rediscover-" + rediscoveryDigestKeyVersion + "-" + requestSuffix + "-command-sha256-" + digest
+	return currentKey, legacyDigestKey, legacyKey
 }
 
 func boundedText(value string, maximum int) bool {

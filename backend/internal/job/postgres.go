@@ -227,6 +227,90 @@ func (repository *PostgresRepository) GetOperation(ctx context.Context, scope pl
 	return value, message, nil
 }
 
+// UpgradeOperationIdempotencyKey binds a verified legacy operation snapshot to
+// a stronger key without allowing the Job or its sole Outbox payload to change
+// between verification and the one-way update.
+func (repository *PostgresRepository) UpgradeOperationIdempotencyKey(ctx context.Context, expected Job, expectedMessage OutboxMessage, currentKey string) (Job, OutboxMessage, error) {
+	if repository == nil || repository.db == nil || ctx == nil || expected.Scope.Validate() != nil || strings.TrimSpace(expected.ID) == "" || strings.TrimSpace(expectedMessage.ID) == "" || expectedMessage.Scope != expected.Scope || expectedMessage.JobID != expected.ID || strings.TrimSpace(expected.IdempotencyKey) == "" || strings.TrimSpace(currentKey) == "" || currentKey == expected.IdempotencyKey {
+		return Job{}, OutboxMessage{}, ErrConflict
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return Job{}, OutboxMessage{}, fmt.Errorf("begin operation key upgrade: %w", err)
+	}
+	rollback := func(cause error) (Job, OutboxMessage, error) {
+		_ = tx.Rollback()
+		return Job{}, OutboxMessage{}, cause
+	}
+	value, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID))
+	if err != nil {
+		return rollback(classifyReadError("lock operation Job for key upgrade", err))
+	}
+	results, err := getTargetsFrom(ctx, tx, expected.Scope, expected.ID)
+	if err != nil {
+		return rollback(err)
+	}
+	value.TargetResults = results
+	value.TargetResourceIDs = make([]string, len(results))
+	for index := range results {
+		value.TargetResourceIDs[index] = results[index].TargetID
+	}
+	value = normalizeJobUTC(value)
+	if err := ValidateTargets(value); err != nil {
+		return rollback(fmt.Errorf("validate operation Job key upgrade targets: %w", err))
+	}
+	var outboxCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID).Scan(&outboxCount); err != nil {
+		return rollback(classifyReadError("count operation key upgrade outbox", err))
+	}
+	if outboxCount != 1 {
+		return rollback(ErrConflict)
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL+` FOR UPDATE`, expectedMessage.ID, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(ErrConflict)
+	}
+	if err != nil {
+		return rollback(classifyReadError("lock operation outbox for key upgrade", err))
+	}
+	if !sameOperationUpgradeSnapshot(value, message, expected, expectedMessage) || value.IdempotencyKey != expected.IdempotencyKey && value.IdempotencyKey != currentKey {
+		return rollback(ErrConflict)
+	}
+	if value.IdempotencyKey != currentKey {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE jobs SET idempotency_key=$1 WHERE tenant_id=$2 AND project_id=$3 AND id=$4 AND idempotency_key=$5`, currentKey, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID, expected.IdempotencyKey)
+		if updateErr != nil {
+			return rollback(classifyWriteError("upgrade operation idempotency key", updateErr))
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+			return rollback(ErrConflict)
+		}
+		value.IdempotencyKey = currentKey
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, OutboxMessage{}, fmt.Errorf("commit operation key upgrade: %w", err)
+	}
+	return value, message, nil
+}
+
+func sameOperationUpgradeSnapshot(value Job, message OutboxMessage, expected Job, expectedMessage OutboxMessage) bool {
+	if value.ID != expected.ID || value.Type != expected.Type || value.Scope != expected.Scope || value.InstanceID != expected.InstanceID || value.InitiatedBy != expected.InitiatedBy || value.SourceResource != expected.SourceResource || value.RequestID != expected.RequestID || value.TraceID != expected.TraceID || !value.CreatedAt.Equal(expected.CreatedAt) || !sameTimePointer(value.TimeoutAt, expected.TimeoutAt) || value.MaxConcurrency != expected.MaxConcurrency || value.TargetTimeout != expected.TargetTimeout || len(value.TargetResourceIDs) != len(expected.TargetResourceIDs) {
+		return false
+	}
+	for index := range value.TargetResourceIDs {
+		if value.TargetResourceIDs[index] != expected.TargetResourceIDs[index] {
+			return false
+		}
+	}
+	return message.ID == expectedMessage.ID && message.Scope == expectedMessage.Scope && message.JobID == expectedMessage.JobID && message.TargetID == expectedMessage.TargetID && message.Type == expectedMessage.Type && bytes.Equal(message.Payload, expectedMessage.Payload) && message.AvailableAt.Equal(expectedMessage.AvailableAt) && message.CreatedAt.Equal(expectedMessage.CreatedAt)
+}
+
+func sameTimePointer(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
 func (repository *PostgresRepository) Transition(ctx context.Context, transition Transition) (Job, error) {
 	if repository == nil || repository.db == nil {
 		return Job{}, errors.New("job PostgreSQL repository is unavailable")
