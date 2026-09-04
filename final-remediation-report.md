@@ -572,7 +572,7 @@ or Task17-owned Docker resources.
 
 ## Fix round 5
 
-Status: **DONE** on product HEAD `3b8d306`. The final two rereview findings
+Status: **DONE** on product HEAD `d25e8fb`. The final two rereview findings
 were reproduced first and closed with two additive migrations. No existing
 migration or protected contract/generated/proto/foundation path changed.
 
@@ -582,8 +582,9 @@ migration or protected contract/generated/proto/foundation path changed.
    `job/migrations/0007b_validation_target_outbox_bridge.sql` sorts after the
    retired-winner migrations and before the existing `0008`. For an active,
    non-retired historical validation whose Job is still nonterminal, an
-   independently terminal Job target is the sole effective-outcome evidence.
-   The migration normalizes an opposite raw Outbox terminal status/phase to
+   independently terminal Job target is the sole effective-outcome evidence;
+   the Job may be nonterminal or already agree with that target. The migration
+   normalizes an opposite raw Outbox terminal status/phase to
    that target before `0008` evaluates its conflict guard. Matching evidence is
    unchanged, while a nonterminal target supplies no evidence and remains for
    the later two-sided quarantine migration. The bridge also runs safely when
@@ -613,8 +614,9 @@ CAS.
 Focused GREEN and real PostgreSQL runs prove:
 
 - target success/failure overrides the opposite raw Outbox status before
-  `0008`, matching evidence remains unchanged, and evidence-free rows retain
-  the expected validation and Command quarantine;
+  `0008`, including when an existing terminal Job agrees with that target;
+  matching evidence remains unchanged, and evidence-free rows retain the
+  expected validation and Command quarantine;
 - the bridge repairs both pre-`0008` and already-applied schemas, and repeated
   migration startup is idempotent;
 - lease expiry followed by worker B reclaim gives B a different random token;
@@ -631,7 +633,7 @@ Focused GREEN and real PostgreSQL runs prove:
 | `go test ./... -count=1` | PASS, all Go packages |
 | `go vet ./...` | PASS |
 | Full Job PostgreSQL migration/failpoint/reconciler suite | PASS, 25.621s |
-| Full database-instance PostgreSQL historical migration suite | PASS, 27.914s |
+| Full database-instance PostgreSQL historical migration suite | PASS, 27.057s |
 | Full plugin-assignment PostgreSQL suite | PASS, 28.055s |
 | Terminal claim concurrent stress | PASS, 20/20 |
 | Task17 lifecycle contract | PASS, fresh 13/13 after focused teardown 5/5 |
@@ -652,6 +654,7 @@ Round 5 product commits:
 
 1. `f63a91f` `fix(instances): bridge historical validation target outcomes`
 2. `3b8d306` `fix(jobs): fence terminal reconciliation claims`
+3. `d25e8fb` `fix(instances): accept agreeing historical job evidence`
 
 The dedicated PostgreSQL container
 `dbpilot-final-remediation-r5-pg` was verified by exact full ID and
