@@ -721,3 +721,44 @@ Post-review product commits:
 1. `7dd9d5f` `fix(instances): preserve historical command rejection`
 2. `dc8ac1e` `fix(instances): repair applied validation terminal evidence`
 3. `b13df20` `fix(instances): repair matching recorded audit state`
+
+## Final acceptance fix
+
+Status: **DONE** on product HEAD `7c18d8f`.
+
+Migration `0011_applied_validation_target_repair.sql` now classifies every
+existing terminal command Audit family by terminal semantics and its published
+detail shape: runtime `command.result`, rejected `command.acknowledged`,
+delivery/prepared/execution timeouts, cancellation paths, historical recovery,
+and database-instance validation events. A semantically matching append-only
+event remains byte-for-byte authoritative for action, dedupe key and detail;
+the migration reconstructs the Outbox recorded marker from that event and the
+dispatcher does not append a second terminal Audit. Only an action/result/shape
+that contradicts the trusted terminal target fails startup.
+
+Reviewer four-cell PostgreSQL matrix:
+
+| Cell | Result |
+| --- | --- |
+| runtime success event, marker null | PASS; original event retained, marker rebuilt, no second `command.result` |
+| matching rejected acknowledgement, marker null | PASS; `command.acknowledged` action/dedupe/detail retained, no second acknowledgement |
+| opposite acknowledgement, marker null | PASS; deterministic fail-closed |
+| wrong database-instance validation action/result | PASS; deterministic fail-closed |
+
+Final acceptance gates:
+
+| Gate | Result |
+| --- | --- |
+| Full Job PostgreSQL suite | PASS, 17.853s |
+| Full database-instance PostgreSQL suite | PASS, 40.191s |
+| `go test ./... -count=1` | PASS |
+| `go vet ./...` | PASS |
+| Task17 static lifecycle contract | PASS, 13/13 |
+
+Kylin full-stack was not rerun because this acceptance change is confined to
+the already-applied historical-data branch of `0011`; a fresh full-stack
+database still records `0011` as a deliberate no-op before database-instance
+tables exist. No runtime topology, Agent, plugin, browser, or teardown path
+changed.
+
+Acceptance commit: `7c18d8f` `fix(instances): preserve matching terminal audit evidence`.
