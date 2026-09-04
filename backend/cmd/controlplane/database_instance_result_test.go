@@ -124,6 +124,13 @@ func (store *recordingValidationResultStore) FinalizeValidationResult(_ context.
 	}
 	return result, nil
 }
+func (store *recordingValidationResultStore) PersistValidationResultWithCommandCAS(_ context.Context, _ platformscope.Scope, jobID, commandID string, _ *agentv1.ValidateDatabaseInstance, _ *agentv1.CommandResult, input job.TerminalResultCAS) (databaseinstance.ValidationResult, job.TerminalResultOutcome, error) {
+	effective := store.effective
+	if effective.Status == "" {
+		effective = store.result
+	}
+	return effective, job.TerminalResultOutcome{CommandID: commandID, JobID: jobID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
 func (store *recordingValidationResultStore) ReconcileValidationTerminals(context.Context, time.Time, int) (int, error) {
 	return 0, nil
 }

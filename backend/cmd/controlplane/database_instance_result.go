@@ -58,6 +58,17 @@ func (recorder databaseInstanceResultRecorder) FinalizeDatabaseInstanceValidatio
 	return effectiveValidationCommandResult(commandID, result.GetState(), effective), nil
 }
 
+func (recorder databaseInstanceResultRecorder) PersistDatabaseInstanceValidationResult(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, input job.TerminalResultCAS) (*agentv1.CommandResult, job.TerminalResultOutcome, error) {
+	if recorder.Store == nil || result == nil {
+		return nil, job.TerminalResultOutcome{}, errors.New("database instance validation result store is unavailable")
+	}
+	effective, terminal, err := recorder.Store.PersistValidationResultWithCommandCAS(ctx, scope, jobID, commandID, command, result, input)
+	if err != nil {
+		return nil, terminal, err
+	}
+	return effectiveValidationCommandResult(commandID, result.GetState(), effective), terminal, nil
+}
+
 func effectiveValidationCommandResult(commandID string, incoming agentv1.CommandResultState, effective databaseinstance.ValidationResult) *agentv1.CommandResult {
 	switch incoming {
 	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:

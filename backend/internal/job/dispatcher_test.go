@@ -810,7 +810,7 @@ func TestRejectedAcknowledgementDurablyTerminalizesTargetBeforePublication(t *te
 
 func TestValidationRejectedAcknowledgementPersistsOnlyFixedOutcome(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
-	recorder := &recordingDatabaseValidationRecorder{}
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 	fixture.lifecycle.databaseInstanceResults = recorder
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
 	require.NoError(t, err)
@@ -1042,7 +1042,7 @@ func TestInvalidMetricTrialIsClassifiedBeforeTerminalCAS(t *testing.T) {
 
 func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCode(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
-	recorder := &recordingDatabaseValidationRecorder{}
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 	fixture.lifecycle.databaseInstanceResults = recorder
 	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
@@ -1083,11 +1083,13 @@ func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCod
 }
 
 type recordingDatabaseValidationRecorder struct {
+	persistence   *memoryCommandPersistence
 	progressCalls int
 	resultCalls   int
 	command       *agentv1.ValidateDatabaseInstance
 	result        *agentv1.CommandResult
 	effective     *agentv1.CommandResult
+	finalizeError error
 }
 
 func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValidationProgress(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, _ time.Time) error {
@@ -1108,12 +1110,47 @@ func (recorder *recordingDatabaseValidationRecorder) FinalizeDatabaseInstanceVal
 	recorder.resultCalls++
 	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
 	recorder.result = proto.Clone(result).(*agentv1.CommandResult)
+	if recorder.finalizeError != nil {
+		return nil, recorder.finalizeError
+	}
 	if recorder.effective != nil {
 		effective := proto.Clone(recorder.effective).(*agentv1.CommandResult)
 		effective.CommandId = result.GetCommandId()
 		return effective, nil
 	}
 	return proto.Clone(result).(*agentv1.CommandResult), nil
+}
+
+func (recorder *recordingDatabaseValidationRecorder) PersistDatabaseInstanceValidationResult(_ context.Context, _ platformscope.Scope, _, _ string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, input TerminalResultCAS) (*agentv1.CommandResult, TerminalResultOutcome, error) {
+	if recorder.finalizeError != nil {
+		return nil, TerminalResultOutcome{}, recorder.finalizeError
+	}
+	if recorder.persistence == nil {
+		return nil, TerminalResultOutcome{}, errors.New("validation persistence is unavailable")
+	}
+	effective := proto.Clone(result).(*agentv1.CommandResult)
+	if recorder.effective != nil {
+		effective = proto.Clone(recorder.effective).(*agentv1.CommandResult)
+		effective.CommandId = result.GetCommandId()
+	}
+	switch databaseInstanceValidationTarget("target", effective, input.At).Status {
+	case TargetSucceeded:
+		input.Status = CommandSucceeded
+	case TargetCancelled:
+		input.Status = CommandCancelled
+	case TargetTimedOut:
+		input.Status = CommandTimedOut
+	default:
+		input.Status = CommandFailed
+	}
+	terminal, err := recorder.persistence.PersistTerminalResult(context.Background(), input)
+	if err != nil || terminal.Conflict {
+		return nil, terminal, err
+	}
+	recorder.resultCalls++
+	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
+	recorder.result = proto.Clone(result).(*agentv1.CommandResult)
+	return effective, terminal, nil
 }
 
 func TestDatabaseInstanceValidationProjectionFinalizesForEveryTerminalTarget(t *testing.T) {
@@ -1131,7 +1168,7 @@ func TestDatabaseInstanceValidationProjectionFinalizesForEveryTerminalTarget(t *
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSingleTargetCommandLifecycleFixture(t)
-			recorder := &recordingDatabaseValidationRecorder{}
+			recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 			fixture.lifecycle.databaseInstanceResults = recorder
 			fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
 			payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
@@ -1159,7 +1196,7 @@ func TestDatabaseInstanceValidationProjectionFinalizesForEveryTerminalTarget(t *
 
 func TestDatabaseInstanceValidationExecutionExpiryFinalizesProjection(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
-	recorder := &recordingDatabaseValidationRecorder{}
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 	fixture.lifecycle.databaseInstanceResults = recorder
 	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
@@ -1187,7 +1224,7 @@ func TestDatabaseInstanceValidationExecutionExpiryFinalizesProjection(t *testing
 
 func TestDatabaseInstanceValidationEffectiveFencedOutcomeOwnsCommandJobAndAudit(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
-	recorder := &recordingDatabaseValidationRecorder{effective: &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "plugin_failed", Summary: "database instance connection validation failed"}}
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence, effective: &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "plugin_failed", Summary: "database instance connection validation failed"}}
 	fixture.lifecycle.databaseInstanceResults = recorder
 	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
@@ -1222,7 +1259,7 @@ func TestDatabaseInstanceValidationExecutionCASPrecedesProjectionMutation(t *tes
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSingleTargetCommandLifecycleFixture(t)
-			recorder := &recordingDatabaseValidationRecorder{}
+			recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 			fixture.lifecycle.databaseInstanceResults = recorder
 			fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
 			payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
@@ -1253,9 +1290,28 @@ func TestDatabaseInstanceValidationExecutionCASPrecedesProjectionMutation(t *tes
 	}
 }
 
+func TestDatabaseInstanceValidationProjectionFailureDoesNotCommitRawCommandWinner(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence, finalizeError: errors.New("projection transaction failed")}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-validation-atomic", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	token := fixture.fenceMessage(t, message.ID)
+
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database instance connection validation succeeded", ExecutionToken: token, LeaseRevision: 1})
+
+	require.ErrorContains(t, err, "projection transaction failed")
+	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus, "validation projection and Command CAS must roll back together")
+	require.Empty(t, fixture.persistence.currentJob().TargetResults)
+}
+
 func TestDatabaseInstanceValidationTerminalizationDoesNotReauthorizeMutableTarget(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
-	recorder := &recordingDatabaseValidationRecorder{}
+	recorder := &recordingDatabaseValidationRecorder{persistence: fixture.persistence}
 	fixture.lifecycle.databaseInstanceResults = recorder
 	fixture.lifecycle.targetAuthorizer = rejectingValidationTarget{}
 	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-detached", ConfigurationRevision: 7}}})
@@ -1979,19 +2035,6 @@ func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, 
 	message.RecoveryClaimedRevision = 0
 	store.messages[input.CommandID] = message
 	return TerminalResultOutcome{CommandID: input.CommandID, JobID: message.JobID, TargetID: message.TargetID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
-}
-func (store *memoryCommandPersistence) CorrectValidationTerminalStatus(_ context.Context, scope platformscope.Scope, commandID string, digest [32]byte, from, to CommandStatus, at time.Time) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	message, ok := store.messages[commandID]
-	if !ok || message.Scope != scope || message.CommandStatus != from || !bytes.Equal(message.TerminalResultDigest, digest[:]) {
-		return ErrConflict
-	}
-	message.CommandStatus = to
-	message.Phase = phaseForCommandStatus(to)
-	message.TerminalAt = timePointer(at)
-	store.messages[commandID] = message
-	return nil
 }
 func (store *memoryCommandPersistence) LookupCommand(_ context.Context, id string) (OutboxMessage, error) {
 	store.mu.Lock()

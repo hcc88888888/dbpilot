@@ -25,6 +25,7 @@ import (
 	"dbpilot.local/platform/internal/reconciliation"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestPluginAssignmentPostgresConcurrentProvisionObservationAndReconcile(t *testing.T) {
@@ -271,6 +272,95 @@ func TestDatabaseInstanceValidationPostgresLifecycleIsFencedIdempotentAndClassif
 	require.NotContains(t, strings.ToLower(auditDetails), "password")
 	require.NotContains(t, strings.ToLower(auditDetails), "secret://")
 	require.NotContains(t, auditDetails, instance.CredentialRef)
+}
+
+func TestDatabaseInstanceValidationPostgresAtomicCASCrashRepairUsesEffectiveWinner(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		staleFence    bool
+		result        *agentv1.CommandResult
+		wantResult    databaseinstance.ValidationResult
+		wantErrorCode string
+	}{
+		{name: "stale success", staleFence: true, result: &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database instance connection validation succeeded"}, wantResult: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, wantErrorCode: "plugin_failed"},
+		{name: "typed failure", result: &agentv1.CommandResult{State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "instance_tls_failed", Summary: "database instance connection validation failed"}, wantResult: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionTLSFailed, ErrorCode: databaseinstance.ConnectionErrorTLS}, wantErrorCode: "instance_tls_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+			ctx := context.Background()
+			jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+			assignments := pluginassignment.NewPostgresRepository(database, jobs)
+			instances := databaseinstance.NewPostgresRepositoryWithRuntime(database, assignments, jobs)
+			candidateID, accept := insertAssignmentCandidate(t, database, scope, hostID, agentID, "candidate-atomic-"+strings.ReplaceAll(test.name, " ", "-"), "127.0.0.1:3314", 18)
+			instance, err := instances.AcceptCandidate(ctx, scope, candidateID, accept)
+			require.NoError(t, err)
+			page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+			require.NoError(t, err)
+			require.Len(t, page.Items, 1)
+			assignment := page.Items[0]
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 1, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 1, ObservedAt: now}
+			require.NoError(t, pluginassignment.NewService(assignments).RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 1, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
+			request := databaseinstance.ValidationRequest{Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "testDatabaseInstanceConnection", IdempotencyKey: "validate-atomic-" + strings.ReplaceAll(test.name, " ", "-"), RequestFingerprint: "sha256:1919191919191919191919191919191919191919191919191919191919191919", RequestID: "request-atomic-" + strings.ReplaceAll(test.name, " ", "-"), TraceID: "trace-atomic"}}
+			created, err := instances.StartValidation(ctx, scope, instance.ID, request)
+			require.NoError(t, err)
+			var commandID string
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, created.ID).Scan(&commandID))
+			message, err := jobs.LookupCommand(ctx, commandID)
+			require.NoError(t, err)
+			prepared, err := jobs.PrepareCommandEnvelope(ctx, scope, commandID, message.Payload)
+			require.NoError(t, err)
+			prepareDigest := sha256.Sum256(prepared)
+			require.NoError(t, jobs.MarkPrepared(ctx, scope, commandID, prepareDigest, now))
+			token := sha256.Sum256([]byte("validation-token:" + test.name))
+			tokenHash := sha256.Sum256(token[:])
+			grant, err := jobs.AuthorizeStart(ctx, scope, commandID, prepareDigest, tokenHash, []byte("encrypted-test-token"), now, now.Add(time.Minute))
+			require.NoError(t, err)
+			if test.staleFence {
+				_, err = database.ExecContext(ctx, `UPDATE plugin_assignments SET operation_revision=operation_revision+1 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, scope.TenantID, scope.ProjectID, assignment.ID)
+				require.NoError(t, err)
+			}
+			command := &agentv1.ValidateDatabaseInstance{AssignmentId: assignment.ID, InstanceId: instance.ID, ConfigurationRevision: assignment.ConfigurationRevision}
+			result := proto.Clone(test.result).(*agentv1.CommandResult)
+			result.CommandId = commandID
+			resultDigest := sha256.Sum256([]byte("terminal-result:" + test.name))
+			rawStatus := job.CommandSucceeded
+			if result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED {
+				rawStatus = job.CommandFailed
+			}
+			input := job.TerminalResultCAS{Scope: scope, CommandID: commandID, TokenHash: tokenHash, ExpectedExecutionRevision: grant.ExecutionRevision, Status: rawStatus, ResultDigest: resultDigest, At: now.Add(time.Second)}
+
+			effective, terminal, err := instances.PersistValidationResultWithCommandCAS(ctx, scope, created.ID, commandID, command, result, input)
+
+			require.NoError(t, err)
+			require.Equal(t, test.wantResult, effective)
+			require.Equal(t, job.CommandFailed, terminal.Status)
+			require.True(t, terminal.Persisted)
+			stranded, err := jobs.Get(ctx, scope, created.ID)
+			require.NoError(t, err)
+			require.Equal(t, job.StatusQueued, stranded.Status, "failpoint stops after the durable validation CAS before Job mutation")
+			storedCommand, err := jobs.LookupCommand(ctx, commandID)
+			require.NoError(t, err)
+			require.Equal(t, job.CommandFailed, storedCommand.CommandStatus)
+			replayed, duplicate, err := instances.PersistValidationResultWithCommandCAS(ctx, scope, created.ID, commandID, command, result, input)
+			require.NoError(t, err)
+			require.Equal(t, effective, replayed)
+			require.True(t, duplicate.Duplicate)
+			repairs, err := instances.ListValidationJobRepairs(ctx, now.Add(2*time.Second), 8)
+			require.NoError(t, err)
+			require.Len(t, repairs, 1)
+			require.Equal(t, test.wantResult, repairs[0].Result)
+			require.Equal(t, job.CommandFailed, repairs[0].Cause)
+			target := job.TargetResult{TargetID: agentID, Status: job.TargetFailed, ErrorSummary: test.wantErrorCode, ResultSummary: "database instance connection validation failed", FinishedAt: &repairs[0].At}
+			require.NoError(t, jobs.RepairValidationTerminal(ctx, scope, created.ID, commandID, agentID, target, repairs[0].Cause, repairs[0].At))
+			repaired, err := jobs.Get(ctx, scope, created.ID)
+			require.NoError(t, err)
+			require.Equal(t, job.StatusFailed, repaired.Status)
+			var terminalAudits int
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND command_id=$3 AND action IN ('database_instance.connection_test_succeeded','database_instance.connection_test_failed')`, scope.TenantID, scope.ProjectID, commandID).Scan(&terminalAudits))
+			require.Equal(t, 1, terminalAudits)
+		})
+	}
 }
 
 func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDelivery(t *testing.T) {

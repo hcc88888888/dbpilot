@@ -768,24 +768,6 @@ func (repository *PostgresRepository) MarkCommandTerminal(ctx context.Context, s
 	return repository.execScopedCommand(ctx, markCommandTerminalSQL, []any{string(status), at.UTC(), scope.TenantID, scope.ProjectID, id})
 }
 
-func (repository *PostgresRepository) CorrectValidationTerminalStatus(ctx context.Context, scope platformscope.Scope, commandID string, resultDigest [sha256.Size]byte, from, to CommandStatus, at time.Time) error {
-	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(commandID) == "" || resultDigest == ([sha256.Size]byte{}) || !terminalCommandStatus(from) || !terminalCommandStatus(to) || from == CommandRejected || to == CommandRejected || at.IsZero() {
-		return ErrInvalidCommandPayload
-	}
-	result, err := repository.db.ExecContext(ctx, `UPDATE command_outbox SET command_status=$1,command_phase=$1,terminal_at=COALESCE(terminal_at,$2) WHERE tenant_id=$3 AND project_id=$4 AND id=$5 AND command_status=$6 AND terminal_result_digest=$7`, string(to), at.UTC(), scope.TenantID, scope.ProjectID, commandID, string(from), resultDigest[:])
-	if err != nil {
-		return classifyWriteError("correct validation terminal status", err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read validation terminal correction: %w", err)
-	}
-	if rows != 1 {
-		return ErrConflict
-	}
-	return nil
-}
-
 func CancelValidationInTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, jobID, commandID, agentID string, at time.Time) error {
 	if ctx == nil || tx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || at.IsZero() {
 		return ErrInvalidCommandPayload

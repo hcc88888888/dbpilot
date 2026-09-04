@@ -85,5 +85,6 @@ type ValidationResultRecorder interface {
 	RecordValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
 	RecordValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, ValidationResult, time.Time) error
 	FinalizeValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, ValidationResult, time.Time) (ValidationResult, error)
+	PersistValidationResultWithCommandCAS(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, job.TerminalResultCAS) (ValidationResult, job.TerminalResultOutcome, error)
 	ReconcileValidationTerminals(context.Context, time.Time, int) (int, error)
 }

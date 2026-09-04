@@ -3,6 +3,7 @@ package databaseinstance
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -189,6 +190,166 @@ func (repository *PostgresRepository) FinalizeValidationResult(ctx context.Conte
 	return effective, nil
 }
 
+func (repository *PostgresRepository) PersistValidationResultWithCommandCAS(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, result *agentv1.CommandResult, input job.TerminalResultCAS) (ValidationResult, job.TerminalResultOutcome, error) {
+	base := job.TerminalResultOutcome{CommandID: commandID, JobID: jobID}
+	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(jobID) || !identifierPattern.MatchString(commandID) || command == nil || result == nil || result.GetCommandId() != commandID || input.Scope != scope || input.CommandID != commandID || input.ExpectedExecutionRevision == 0 || input.At.IsZero() || !validUTC(input.At) {
+		return ValidationResult{}, base, ErrInvalid
+	}
+	incoming, rawStatus, err := validationCommandOutcome(result)
+	if err != nil || input.Status != rawStatus || input.Status == job.CommandRejected {
+		return ValidationResult{}, base, ErrInvalid
+	}
+	var last error
+	for attempt := 0; attempt < 16; attempt++ {
+		effective, terminal, persistErr := repository.persistValidationResultWithCommandCASOnce(ctx, scope, jobID, commandID, command, result.GetState(), incoming, input)
+		if !isSerializationFailure(persistErr) {
+			return effective, terminal, persistErr
+		}
+		last = persistErr
+	}
+	return ValidationResult{}, base, last
+}
+
+func (repository *PostgresRepository) persistValidationResultWithCommandCASOnce(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, incomingState agentv1.CommandResultState, incoming ValidationResult, input job.TerminalResultCAS) (ValidationResult, job.TerminalResultOutcome, error) {
+	base := job.TerminalResultOutcome{CommandID: commandID, JobID: jobID}
+	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return ValidationResult{}, base, err
+	}
+	rollback := func(cause error) (ValidationResult, job.TerminalResultOutcome, error) {
+		_ = tx.Rollback()
+		return ValidationResult{}, base, cause
+	}
+	var phase job.CommandPhase
+	var storedStatus job.CommandStatus
+	var targetID string
+	var storedTokenHash, storedDigest []byte
+	var storedExecutionRevision uint64
+	err = tx.QueryRowContext(ctx, `SELECT target_id,command_phase,command_status,execution_token_hash,execution_revision,terminal_result_digest FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 AND job_id=$4 FOR UPDATE`, scope.TenantID, scope.ProjectID, commandID, jobID).Scan(&targetID, &phase, &storedStatus, &storedTokenHash, &storedExecutionRevision, &storedDigest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(job.ErrNotFound)
+	}
+	if err != nil {
+		return rollback(mapPostgresError(err))
+	}
+	base.TargetID, base.Status = targetID, storedStatus
+	if len(storedDigest) == sha256.Size {
+		copy(base.ResultDigest[:], storedDigest)
+	}
+	fenceMatches := len(storedTokenHash) == sha256.Size && subtle.ConstantTimeCompare(storedTokenHash, input.TokenHash[:]) == 1 && storedExecutionRevision == input.ExpectedExecutionRevision
+	if !fenceMatches {
+		return rollback(job.ErrConflict)
+	}
+	state, err := loadValidationState(ctx, tx, scope, jobID, commandID)
+	if err != nil {
+		return rollback(err)
+	}
+	if !state.matches(command) {
+		return rollback(job.ErrConflict)
+	}
+	effective := ValidationResult{Status: state.Status, ErrorCode: state.ErrorCode}
+	if !terminalConnectionStatus(state.Status) {
+		if state.Status != ConnectionQueued && state.Status != ConnectionRunning {
+			return rollback(job.ErrConflict)
+		}
+		effective = incoming
+		if !validationFenceCurrent(ctx, tx, scope, state) {
+			effective = ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}
+		}
+	}
+	effectiveStatus := effectiveValidationCommandStatus(incomingState, effective)
+	terminalPhase := phase == job.CommandPhaseSucceeded || phase == job.CommandPhaseFailed || phase == job.CommandPhaseCancelled || phase == job.CommandPhaseTimedOut || phase == job.CommandPhaseRejected
+	if terminalPhase {
+		if phase == job.CommandPhaseTimedOut && storedStatus == job.CommandTimedOut && len(storedDigest) == 0 && input.AllowTimedOutDigestAttach && effectiveStatus == job.CommandTimedOut {
+			// The timeout worker already won; attach only the matching interrupted
+			// result digest while finalizing the same effective projection below.
+		} else if storedStatus == effectiveStatus && len(storedDigest) == sha256.Size && subtle.ConstantTimeCompare(storedDigest, input.ResultDigest[:]) == 1 {
+			if !terminalConnectionStatus(state.Status) {
+				if err := applyValidationResultTx(ctx, tx, scope, state, effective, input.At); err != nil {
+					return rollback(err)
+				}
+			}
+			base.Status, base.ResultDigest, base.Persisted, base.Duplicate = effectiveStatus, input.ResultDigest, true, true
+			if err := repository.commit(tx); err != nil {
+				return ValidationResult{}, job.TerminalResultOutcome{}, err
+			}
+			return effective, base, nil
+		} else {
+			base.Conflict = true
+			if err := repository.commit(tx); err != nil {
+				return ValidationResult{}, job.TerminalResultOutcome{}, err
+			}
+			return ValidationResult{}, base, nil
+		}
+	} else if phase != job.CommandPhaseStartAuthorized && phase != job.CommandPhaseRunning && phase != job.CommandPhaseCancelling {
+		return rollback(job.ErrConflict)
+	}
+	if !terminalConnectionStatus(state.Status) {
+		if err := applyValidationResultTx(ctx, tx, scope, state, effective, input.At); err != nil {
+			return rollback(err)
+		}
+	}
+	update, err := tx.ExecContext(ctx, `UPDATE command_outbox SET command_phase=$1,command_status=$2,terminal_result_digest=$3,terminal_at=COALESCE(terminal_at,$4),execution_deadline_at=NULL,recovery_lease_expires_at=NULL,recovery_claim_token=NULL,recovery_claimed_deadline=NULL,recovery_claimed_revision=NULL,cancellation_lease_expires_at=NULL WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND execution_token_hash=$9 AND execution_revision=$10`, string(effectiveStatus), string(effectiveStatus), input.ResultDigest[:], input.At.UTC(), scope.TenantID, scope.ProjectID, commandID, jobID, input.TokenHash[:], input.ExpectedExecutionRevision)
+	if err != nil {
+		return rollback(mapPostgresError(err))
+	}
+	if rows, rowsErr := update.RowsAffected(); rowsErr != nil || rows != 1 {
+		return rollback(job.ErrConflict)
+	}
+	if err := repository.commit(tx); err != nil {
+		return ValidationResult{}, job.TerminalResultOutcome{}, err
+	}
+	return effective, job.TerminalResultOutcome{CommandID: commandID, JobID: jobID, TargetID: targetID, Status: effectiveStatus, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+
+func validationCommandOutcome(result *agentv1.CommandResult) (ValidationResult, job.CommandStatus, error) {
+	if result == nil || len(result.GetArtifacts()) != 0 || result.GetMetricTemplateTrialResult() != nil {
+		return ValidationResult{}, "", ErrInvalid
+	}
+	switch result.GetState() {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED:
+		if result.GetErrorCode() != "" {
+			return ValidationResult{}, "", ErrInvalid
+		}
+		return ValidationResult{Status: ConnectionSucceeded}, job.CommandSucceeded, nil
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED:
+		outcome := ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}
+		switch result.GetErrorCode() {
+		case "instance_authentication_failed":
+			outcome = ValidationResult{Status: ConnectionAuthenticationFailed, ErrorCode: ConnectionErrorAuthentication}
+		case "instance_tls_failed":
+			outcome = ValidationResult{Status: ConnectionTLSFailed, ErrorCode: ConnectionErrorTLS}
+		case "instance_unreachable":
+			outcome = ValidationResult{Status: ConnectionUnreachable, ErrorCode: ConnectionErrorUnreachable}
+		case "database_version_unsupported":
+			outcome = ValidationResult{Status: ConnectionUnsupportedVersion, ErrorCode: ConnectionErrorUnsupportedVersion}
+		case "plugin_failed":
+		default:
+			return ValidationResult{}, "", ErrInvalid
+		}
+		return outcome, job.CommandFailed, nil
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		return ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}, job.CommandCancelled, nil
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}, job.CommandTimedOut, nil
+	default:
+		return ValidationResult{}, "", ErrInvalid
+	}
+}
+
+func effectiveValidationCommandStatus(incoming agentv1.CommandResultState, effective ValidationResult) job.CommandStatus {
+	switch incoming {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		return job.CommandCancelled
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return job.CommandTimedOut
+	}
+	if effective.Status == ConnectionSucceeded {
+		return job.CommandSucceeded
+	}
+	return job.CommandFailed
+}
+
 func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, outcome ValidationResult, at time.Time) error {
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -211,19 +372,26 @@ func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Con
 	if !validationFenceCurrent(ctx, tx, scope, state) {
 		outcome = ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}
 	}
+	if err := applyValidationResultTx(ctx, tx, scope, state, outcome, at); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func applyValidationResultTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, state validationState, outcome ValidationResult, at time.Time) error {
 	management := managementForValidation(outcome.Status, state.PreviousManagementStatus)
 	capability := CapabilityPluginAvailable
 	if outcome.Status == ConnectionPluginFailed {
 		capability = CapabilityPluginFailed
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state=$1,connection_test_status=$2,connection_test_error_code=$3,connection_test_at=$4,management_status=$5,connection_validation_job_id='',connection_validation_command_id='',revision=revision+1,updated_at=$4 WHERE tenant_id=$6 AND project_id=$7 AND instance_id=$8 AND connection_test_status IN ('queued','running') AND management_status<>'retired' AND connection_validation_job_id=$9 AND connection_validation_command_id=$10`, capability, outcome.Status, outcome.ErrorCode, at, management, scope.TenantID, scope.ProjectID, state.InstanceID, jobID, commandID)
+	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state=$1,connection_test_status=$2,connection_test_error_code=$3,connection_test_at=$4,management_status=$5,connection_validation_job_id='',connection_validation_command_id='',revision=revision+1,updated_at=$4 WHERE tenant_id=$6 AND project_id=$7 AND instance_id=$8 AND connection_test_status IN ('queued','running') AND management_status<>'retired' AND connection_validation_job_id=$9 AND connection_validation_command_id=$10`, capability, outcome.Status, outcome.ErrorCode, at, management, scope.TenantID, scope.ProjectID, state.InstanceID, state.JobID, state.CommandID)
 	if err != nil {
 		return mapPostgresError(err)
 	}
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 1 {
 		return ErrConflict
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE database_instance_validations SET status=$1,error_code=$2,started_at=COALESCE(started_at,$3),completed_at=$3 WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND command_id=$7 AND status IN ('queued','running')`, outcome.Status, outcome.ErrorCode, at, scope.TenantID, scope.ProjectID, jobID, commandID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE database_instance_validations SET status=$1,error_code=$2,started_at=COALESCE(started_at,$3),completed_at=$3 WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND command_id=$7 AND status IN ('queued','running')`, outcome.Status, outcome.ErrorCode, at, scope.TenantID, scope.ProjectID, state.JobID, state.CommandID); err != nil {
 		return mapPostgresError(err)
 	}
 	instance, err := getInstanceTx(ctx, tx, scope, state.InstanceID)
@@ -235,10 +403,10 @@ func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Con
 		action, auditResult = "database_instance.connection_test_succeeded", "success"
 	}
 	target := ValidationTarget{AssignmentID: state.AssignmentID, ConfigurationRevision: state.ConfigurationRevision, OperationRevision: state.OperationRevision}
-	if err := insertValidationAudit(ctx, tx, instance, state.Audit, jobID, commandID, target, action, auditResult, outcome.ErrorCode, at); err != nil {
+	if err := insertValidationAudit(ctx, tx, instance, state.Audit, state.JobID, state.CommandID, target, action, auditResult, outcome.ErrorCode, at); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (repository *PostgresRepository) ReconcileValidationTerminals(ctx context.Context, at time.Time, limit int) (int, error) {
