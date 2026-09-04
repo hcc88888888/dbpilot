@@ -46,6 +46,7 @@ type DispatchRepository interface {
 	PendingTerminalAuditsForAgent(context.Context, string, int) ([]OutboxMessage, error)
 	MarkTerminalAuditRecorded(context.Context, platformscope.Scope, string, string, time.Time) error
 	PersistTerminalResult(context.Context, TerminalResultCAS) (TerminalResultOutcome, error)
+	CorrectValidationTerminalStatus(context.Context, platformscope.Scope, string, [32]byte, CommandStatus, CommandStatus, time.Time) error
 	ClaimPendingCancellations(context.Context, int, time.Time) ([]OutboxMessage, error)
 	DeferCancellation(context.Context, platformscope.Scope, string, time.Time) error
 	AcknowledgeCommand(context.Context, platformscope.Scope, string, CommandStatus, time.Time, *time.Time) error

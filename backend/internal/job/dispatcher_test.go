@@ -1209,6 +1209,47 @@ func TestDatabaseInstanceValidationEffectiveFencedOutcomeOwnsCommandJobAndAudit(
 	require.Equal(t, "failure", fixture.audit.events[len(fixture.audit.events)-1].Result)
 }
 
+func TestDatabaseInstanceValidationExecutionCASPrecedesProjectionMutation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		timeout bool
+	}{
+		{name: "wrong token"},
+		{name: "timeout beats late success", timeout: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSingleTargetCommandLifecycleFixture(t)
+			recorder := &recordingDatabaseValidationRecorder{}
+			fixture.lifecycle.databaseInstanceResults = recorder
+			fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+			payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+			require.NoError(t, err)
+			message := fixture.message(t, "command-validation-cas", "agent-a")
+			message.Payload = payload
+			fixture.persistence.messages[message.ID] = message
+			token := fixture.fenceMessage(t, message.ID)
+			if test.timeout {
+				message = fixture.persistence.messages[message.ID]
+				message.CommandStatus = CommandTimedOut
+				message.Phase = CommandPhaseTimedOut
+				message.TerminalAt = timePointer(fixture.now)
+				fixture.persistence.messages[message.ID] = message
+			} else {
+				token = bytes.Repeat([]byte{0xee}, sha256.Size)
+			}
+
+			outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, Summary: "database instance connection validation succeeded", ExecutionToken: token, LeaseRevision: 1})
+
+			if test.timeout {
+				require.False(t, outcome.Persisted)
+			} else {
+				require.Error(t, err)
+			}
+			require.Zero(t, recorder.resultCalls, "execution CAS failure must not mutate the validation projection")
+		})
+	}
+}
+
 func TestDatabaseInstanceValidationTerminalizationDoesNotReauthorizeMutableTarget(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	recorder := &recordingDatabaseValidationRecorder{}
@@ -1935,6 +1976,19 @@ func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, 
 	message.RecoveryClaimedRevision = 0
 	store.messages[input.CommandID] = message
 	return TerminalResultOutcome{CommandID: input.CommandID, JobID: message.JobID, TargetID: message.TargetID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+func (store *memoryCommandPersistence) CorrectValidationTerminalStatus(_ context.Context, scope platformscope.Scope, commandID string, digest [32]byte, from, to CommandStatus, at time.Time) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	message, ok := store.messages[commandID]
+	if !ok || message.Scope != scope || message.CommandStatus != from || !bytes.Equal(message.TerminalResultDigest, digest[:]) {
+		return ErrConflict
+	}
+	message.CommandStatus = to
+	message.Phase = phaseForCommandStatus(to)
+	message.TerminalAt = timePointer(at)
+	store.messages[commandID] = message
+	return nil
 }
 func (store *memoryCommandPersistence) LookupCommand(_ context.Context, id string) (OutboxMessage, error) {
 	store.mu.Lock()

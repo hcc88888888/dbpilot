@@ -1079,21 +1079,7 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	validationResult := result
 	if validationCommand != nil {
 		validationResult = canonicalDatabaseInstanceValidationResult(result)
-		validationResult, err = lifecycle.databaseInstanceResults.FinalizeDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, validationCommand, validationResult, at)
-		if err != nil {
-			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
-		}
 		target = databaseInstanceValidationTarget(message.TargetID, validationResult, at)
-		switch target.Status {
-		case TargetSucceeded:
-			commandStatus, auditResult = CommandSucceeded, "success"
-		case TargetCancelled:
-			commandStatus, auditResult = CommandCancelled, "failure"
-		case TargetTimedOut:
-			commandStatus, auditResult = CommandTimedOut, "failure"
-		default:
-			commandStatus, auditResult = CommandFailed, "failure"
-		}
 	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if lifecycle.typedResultRecorder == nil {
@@ -1130,6 +1116,29 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, recordErr
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
+	}
+	if validationCommand != nil {
+		persistedStatus := commandStatus
+		validationResult, err = lifecycle.databaseInstanceResults.FinalizeDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, validationCommand, validationResult, at)
+		if err != nil {
+			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+		}
+		target = databaseInstanceValidationTarget(message.TargetID, validationResult, at)
+		switch target.Status {
+		case TargetSucceeded:
+			commandStatus, auditResult = CommandSucceeded, "success"
+		case TargetCancelled:
+			commandStatus, auditResult = CommandCancelled, "failure"
+		case TargetTimedOut:
+			commandStatus, auditResult = CommandTimedOut, "failure"
+		default:
+			commandStatus, auditResult = CommandFailed, "failure"
+		}
+		if commandStatus != persistedStatus {
+			if err := lifecycle.dispatchRepository.CorrectValidationTerminalStatus(ctx, message.Scope, message.ID, resultDigest, persistedStatus, commandStatus, at); err != nil {
+				return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
+			}
+		}
 	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if err := lifecycle.typedResultRecorder.RecordMetricTemplateTrial(ctx, message.Scope, message.JobID, message.ID, trialCommand, result, at); err != nil {
