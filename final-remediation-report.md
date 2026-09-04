@@ -762,3 +762,31 @@ tables exist. No runtime topology, Agent, plugin, browser, or teardown path
 changed.
 
 Acceptance commit: `7c18d8f` `fix(instances): preserve matching terminal audit evidence`.
+
+## Final NULL-shape acceptance
+
+Status: **DONE** on product HEAD `9ba8cfa`.
+
+The terminal Audit classifier now uses `CASE ... END IS NOT TRUE`, so
+PostgreSQL NULL three-valued logic cannot let an object with a missing required
+key bypass fail-closed validation. Runtime `command.result` additionally
+requires a numeric `artifact_count`; database-instance validation Audit uses
+separate required-key shapes for historical and runtime dedupe families.
+
+The real PostgreSQL negative matrix covers missing required keys for
+`command.result`, `command.acknowledged`, delivery/prepared/execution timeout,
+cancellation, historical recovery, and database-instance validation Audit.
+All eight cases fail closed after the fix, while the complete positive
+dispatcher/reconciler matrix remains green.
+
+Final gates:
+
+| Gate | Result |
+| --- | --- |
+| Full Job PostgreSQL suite | PASS, 17.839s |
+| Full database-instance PostgreSQL suite | PASS, 47.442s |
+| `go test ./... -count=1` | PASS |
+| `go vet ./...` | PASS |
+| Task17 static lifecycle contract | PASS, 13/13 |
+
+Acceptance commit: `9ba8cfa` `fix(instances): reject incomplete terminal audit shapes`.
