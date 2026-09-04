@@ -238,11 +238,14 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 		wantValidation       ConnectionTestStatus
 		wantErrorCode        ConnectionTestErrorCode
 		wantJob              job.Status
+		wantCommand          job.CommandStatus
 		wantQuarantineReason string
 	}{
-		{name: "succeeded target evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded},
-		{name: "typed failure target evidence", commandStatus: job.CommandFailed, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed},
-		{name: "raw command without independent evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetRunning, wantValidation: ConnectionQueued, wantJob: job.StatusRunning, wantQuarantineReason: "missing_effective_outcome_evidence"},
+		{name: "matching succeeded evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded},
+		{name: "succeeded target overrides failed raw outbox", commandStatus: job.CommandFailed, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded},
+		{name: "failed target overrides succeeded raw outbox", commandStatus: job.CommandSucceeded, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
+		{name: "matching typed failure evidence", commandStatus: job.CommandFailed, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
+		{name: "raw command without independent evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetRunning, wantValidation: ConnectionQueued, wantJob: job.StatusRunning, wantCommand: job.CommandSucceeded, wantQuarantineReason: "missing_effective_outcome_evidence"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := seedHistoricalValidation(t, ctx, dsn, test.name, false)
@@ -276,6 +279,9 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 			storedJob, err := job.NewPostgresRepository(fixture.database).Get(ctx, fixture.scope, fixture.jobID)
 			require.NoError(t, err)
 			require.Equal(t, test.wantJob, storedJob.Status)
+			storedCommand, err := job.NewPostgresRepository(fixture.database).LookupCommand(ctx, fixture.commandID)
+			require.NoError(t, err)
+			require.Equal(t, test.wantCommand, storedCommand.CommandStatus)
 			if test.wantQuarantineReason != "" {
 				require.True(t, quarantinedAt.Valid)
 				require.Equal(t, test.wantQuarantineReason, quarantineReason)
@@ -293,6 +299,44 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 			require.Equal(t, 1, auditCount)
 		})
 	}
+}
+
+func TestValidationTargetBridgeRepairsAlreadyAppliedJobSchemaIdempotently(t *testing.T) {
+	if os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	fixture := seedHistoricalValidation(t, ctx, dsn, "already-applied-target-bridge", false)
+	_, err := fixture.database.ExecContext(ctx, `UPDATE jobs SET status='running',version=2,dispatched_at=$1,started_at=$1 WHERE id=$2`, fixture.now.Add(-time.Second), fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE job_targets SET status='succeeded',error_summary='',result_summary='database instance connection validation succeeded',finished_at=$1 WHERE job_id=$2`, fixture.now, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='succeeded',command_phase='succeeded',terminal_at=$1,published_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
+	require.NoError(t, err)
+	require.NoError(t, job.RunMigrations(ctx, fixture.database))
+	require.NoError(t, RunMigrations(ctx, fixture.database))
+
+	_, err = fixture.database.ExecContext(ctx, `UPDATE database_instance_validations SET status='queued',error_code='',completed_at=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE job_id=$1`, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE managed_database_instances SET management_status='connection_testing',connection_test_status='queued',connection_test_error_code='',connection_validation_job_id=$1,connection_validation_command_id=$2 WHERE instance_id=$3`, fixture.jobID, fixture.commandID, fixture.instanceID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE jobs SET status='running',outcome='none',version=4,completed_targets=0,failed_targets=0,result_summary='',finished_at=NULL WHERE id=$1`, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed',terminal_reconcile_pending=TRUE,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE id=$1`, fixture.commandID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `DELETE FROM dbpilot_schema_migrations WHERE name='job/migrations/0007b_validation_target_outbox_bridge.sql'`)
+	require.NoError(t, err)
+
+	require.NoError(t, job.RunMigrations(ctx, fixture.database))
+	require.NoError(t, job.RunMigrations(ctx, fixture.database), "bridge restart must be idempotent")
+	stored, err := job.NewPostgresRepository(fixture.database).LookupCommand(ctx, fixture.commandID)
+	require.NoError(t, err)
+	require.Equal(t, job.CommandSucceeded, stored.CommandStatus)
 }
 
 func TestRetiredValidationOneSidedWinnersSurviveMigrationOrder(t *testing.T) {
