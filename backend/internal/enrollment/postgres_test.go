@@ -269,6 +269,12 @@ func TestRunMigrationsCreatesHashOnlyEnrollmentTable(t *testing.T) {
 	mock.ExpectExec("(?s)CREATE TABLE agent_credential_imports.*credential_generation.*verified_mtls.*managed_hosts_active_certificate_fingerprint_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0005_generation_zero_import.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("enrollment/migrations/0006_generation_zero_import_immutability.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE FUNCTION dbpilot_reject_agent_credential_import_mutation.*CREATE TRIGGER agent_credential_imports_immutable").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("enrollment/migrations/0006_generation_zero_import_immutability.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	mock.ExpectQuery("SELECT issuance.token_hash").WillReturnRows(sqlmock.NewRows([]string{"token_hash", "certificate_pem", "generation", "tenant_id", "project_id", "host_id", "agent_id", "issued_at"}))
 
 	err = RunMigrations(context.Background(), database)
