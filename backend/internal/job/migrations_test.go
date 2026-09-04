@@ -92,6 +92,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_reconcile_claim_token.*command_outbox_terminal_reconcile_claim_check").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0010_terminal_reconcile_claim_fence.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0011_applied_validation_target_repair.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)DO \\$migration\\$.*recorded historical validation Audit conflicts with target evidence.*UPDATE command_outbox").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0011_applied_validation_target_repair.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	mock.ExpectQuery("(?s)SELECT value.job_type,outbox.payload.*historical_recovery").WillReturnRows(sqlmock.NewRows([]string{"job_type", "payload"}))
 
 	require.NoError(t, RunMigrations(context.Background(), database))
@@ -165,5 +171,10 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	require.NoError(t, err)
 	for _, required := range []string{"terminal_reconcile_claim_token", "octet_length(terminal_reconcile_claim_token) = 32", "terminal_reconcile_lease_expires_at = NULL"} {
 		require.Contains(t, string(claimFence), required)
+	}
+	appliedValidationRepair, err := migrationFiles.ReadFile("migrations/0011_applied_validation_target_repair.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"dbpilot_applied_validation_target_repair", "recorded historical validation Audit conflicts with target evidence", "terminal_reconcile_claim_token = NULL", "terminal_target_status = repair.target_status"} {
+		require.Contains(t, string(appliedValidationRepair), required)
 	}
 }

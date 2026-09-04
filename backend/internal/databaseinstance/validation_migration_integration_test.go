@@ -1,8 +1,12 @@
 package databaseinstance
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/discovery"
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/job"
@@ -247,7 +252,7 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 		{name: "succeeded target and Job override failed raw outbox", commandStatus: job.CommandFailed, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded, existingJobWinner: job.StatusSucceeded},
 		{name: "failed target overrides succeeded raw outbox", commandStatus: job.CommandSucceeded, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
 		{name: "matching typed failure evidence", commandStatus: job.CommandFailed, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
-		{name: "rejected raw preserves rejected semantics", commandStatus: job.CommandRejected, targetStatus: job.TargetFailed, targetError: "plugin_failed", wantValidation: ConnectionPluginFailed, wantErrorCode: ConnectionErrorPlugin, wantJob: job.StatusFailed, wantCommand: job.CommandRejected},
+		{name: "rejected raw preserves rejected semantics", commandStatus: job.CommandRejected, targetStatus: job.TargetFailed, targetError: "command_rejected", wantValidation: ConnectionPluginFailed, wantErrorCode: ConnectionErrorPlugin, wantJob: job.StatusFailed, wantCommand: job.CommandRejected},
 		{name: "raw command without independent evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetRunning, wantValidation: ConnectionQueued, wantJob: job.StatusRunning, wantCommand: job.CommandSucceeded, wantQuarantineReason: "missing_effective_outcome_evidence"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -289,6 +294,9 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 			storedCommand, err := job.NewPostgresRepository(fixture.database).LookupCommand(ctx, fixture.commandID)
 			require.NoError(t, err)
 			require.Equal(t, test.wantCommand, storedCommand.CommandStatus)
+			if test.wantCommand == job.CommandRejected {
+				require.Equal(t, "command_rejected", storedCommand.TerminalTargetError)
+			}
 			if test.wantQuarantineReason != "" {
 				require.True(t, quarantinedAt.Valid)
 				require.Equal(t, test.wantQuarantineReason, quarantineReason)
@@ -344,6 +352,121 @@ func TestValidationTargetBridgeRepairsAlreadyAppliedJobSchemaIdempotently(t *tes
 	stored, err := job.NewPostgresRepository(fixture.database).LookupCommand(ctx, fixture.commandID)
 	require.NoError(t, err)
 	require.Equal(t, job.CommandSucceeded, stored.CommandStatus)
+}
+
+func TestAppliedHistoricalValidationRepairUsesTargetBeforeDispatcher(t *testing.T) {
+	if os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	t.Run("opposite unrecorded descriptors converge before dispatcher", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "dispatcher-repair", "")
+		require.NoError(t, job.RunMigrations(ctx, fixture.database))
+		require.NoError(t, RunMigrations(ctx, fixture.database))
+		require.NoError(t, job.RunMigrations(ctx, fixture.database), "repair migration restart must be idempotent")
+
+		jobRepository := job.NewPostgresRepository(fixture.database)
+		_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		signer, err := job.NewEd25519CommandSigner(privateKey)
+		require.NoError(t, err)
+		protector, err := job.NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x7c}, 32))
+		require.NoError(t, err)
+		lifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
+			DispatchRepository: jobRepository,
+			Jobs:               jobRepository,
+			Agents:             migrationNoopDispatcher{},
+			Signer:             signer,
+			Audit:              audit.NewService(audit.NewPostgresStore(fixture.database)),
+			TokenProtector:     protector,
+			ClaimLimit:         8,
+			DatabaseInstanceResults: migrationValidationRecorder{
+				store: NewPostgresRepository(fixture.database),
+			},
+		})
+		require.NoError(t, err)
+		_, err = lifecycle.DispatchPending(ctx, fixture.now.Add(time.Minute))
+		require.NoError(t, err)
+
+		storedJob, err := jobRepository.Get(ctx, fixture.scope, fixture.jobID)
+		require.NoError(t, err)
+		require.Equal(t, job.StatusSucceeded, storedJob.Status)
+		require.Equal(t, job.TargetSucceeded, storedJob.TargetResults[0].Status)
+		storedCommand, err := jobRepository.LookupCommand(ctx, fixture.commandID)
+		require.NoError(t, err)
+		require.Equal(t, job.CommandSucceeded, storedCommand.CommandStatus)
+		require.Equal(t, job.TargetSucceeded, storedCommand.TerminalTargetStatus)
+		require.False(t, storedCommand.TerminalReconcilePending)
+		require.False(t, storedCommand.TerminalAuditPending)
+		require.NotNil(t, storedCommand.TerminalAuditRecordedAt)
+		require.Equal(t, "success", storedCommand.TerminalAuditResult)
+		require.Equal(t, map[string]any{"command_action": "database_instance.validate", "historical_recovery": true, "terminal_status": "succeeded"}, storedCommand.TerminalAuditDetail)
+		var validationStatus ConnectionTestStatus
+		var instanceStatus ConnectionTestStatus
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT status FROM database_instance_validations WHERE job_id=$1`, fixture.jobID).Scan(&validationStatus))
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT connection_test_status FROM managed_database_instances WHERE instance_id=$1`, fixture.instanceID).Scan(&instanceStatus))
+		require.Equal(t, ConnectionSucceeded, validationStatus)
+		require.Equal(t, ConnectionSucceeded, instanceStatus)
+		var auditCount int
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id=$1 AND dedupe_key=$2 AND result='success' AND detail->>'terminal_status'='succeeded'`, fixture.commandID, "command.result:"+fixture.commandID).Scan(&auditCount))
+		require.Equal(t, 1, auditCount)
+	})
+
+	t.Run("opposite recorded Audit fails migration closed", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "recorded-audit-conflict", "recorded")
+		err := job.RunMigrations(ctx, fixture.database)
+		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
+		err = job.RunMigrations(ctx, fixture.database)
+		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence", "fail-closed restart must remain deterministic")
+		var commandStatus job.CommandStatus
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT command_status FROM command_outbox WHERE id=$1`, fixture.commandID).Scan(&commandStatus))
+		require.Equal(t, job.CommandFailed, commandStatus, "a fail-closed migration must roll back every repair")
+	})
+
+	t.Run("opposite Audit event without recorded marker fails migration closed", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "event-only-audit-conflict", "event-only")
+		err := job.RunMigrations(ctx, fixture.database)
+		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
+	})
+}
+
+func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, dsn, suffix, auditState string) *historicalValidationFixture {
+	t.Helper()
+	fixture := seedHistoricalValidation(t, ctx, dsn, suffix, false)
+	_, err := fixture.database.ExecContext(ctx, `UPDATE jobs SET status='running',version=2,dispatched_at=$1,started_at=$1 WHERE id=$2`, fixture.now.Add(-time.Second), fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE job_targets SET status='succeeded',error_summary='',result_summary='database instance connection validation succeeded',artifacts='[]'::jsonb,finished_at=$1 WHERE job_id=$2`, fixture.now, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='succeeded',command_phase='succeeded',terminal_at=$1,published_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
+	require.NoError(t, err)
+	require.NoError(t, job.RunMigrations(ctx, fixture.database))
+	require.NoError(t, RunMigrations(ctx, fixture.database))
+
+	_, err = fixture.database.ExecContext(ctx, `UPDATE database_instance_validations SET status='queued',error_code='',completed_at=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE job_id=$1`, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE managed_database_instances SET management_status='connection_testing',connection_test_status='queued',connection_test_error_code='',connection_validation_job_id=$1,connection_validation_command_id=$2 WHERE instance_id=$3`, fixture.jobID, fixture.commandID, fixture.instanceID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE jobs SET status='running',outcome='none',version=10,completed_targets=0,failed_targets=0,skipped_targets=0,error_summary='',result_summary='',artifacts='[]'::jsonb,finished_at=NULL WHERE id=$1`, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed',terminal_target_status='failed',terminal_target_error_summary='plugin_failed',terminal_target_result_summary='database instance connection validation failed',terminal_target_artifacts='[]'::jsonb,terminal_reconcile_pending=TRUE,terminal_reconcile_available_at=$1,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_claim_token=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='',terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.result',terminal_audit_result='failure',terminal_audit_detail='{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}'::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_recorded_at=NULL WHERE id=$3`, fixture.now, "command.result:"+fixture.commandID, fixture.commandID)
+	require.NoError(t, err)
+	if auditState != "" {
+		_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,'command.result','system','agent-control','job_target',$5,'failure',$6,$7,$8,$9,$10,'{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}'::jsonb,$4)`, "audit-opposite-"+suffix, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, fixture.agentID, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, "command.result:"+fixture.commandID)
+		require.NoError(t, err)
+		if auditState == "recorded" {
+			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_pending=FALSE,terminal_audit_recorded_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
+			require.NoError(t, err)
+		}
+	}
+	_, err = fixture.database.ExecContext(ctx, `DELETE FROM dbpilot_schema_migrations WHERE name='job/migrations/0011_applied_validation_target_repair.sql'`)
+	require.NoError(t, err)
+	return fixture
 }
 
 func TestRetiredValidationOneSidedWinnersSurviveMigrationOrder(t *testing.T) {
@@ -514,6 +637,45 @@ func seedHistoricalValidation(t *testing.T, ctx context.Context, dsn, suffix str
 type allowMigrationTarget struct{}
 
 func (allowMigrationTarget) AuthorizeTarget(context.Context, string, string) error { return nil }
+
+type migrationValidationRecorder struct{ store *PostgresRepository }
+
+func (recorder migrationValidationRecorder) RecordDatabaseInstanceValidationProgress(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, at time.Time) error {
+	return recorder.store.RecordValidationProgress(ctx, scope, jobID, commandID, command, at)
+}
+
+func (recorder migrationValidationRecorder) FinalizeDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, time.Time) (*agentv1.CommandResult, error) {
+	return nil, errors.New("unexpected validation result finalization")
+}
+
+func (recorder migrationValidationRecorder) PersistDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, job.TerminalResultCAS) (*agentv1.CommandResult, job.TerminalResultOutcome, error) {
+	return nil, job.TerminalResultOutcome{}, errors.New("unexpected validation result persistence")
+}
+
+func (recorder migrationValidationRecorder) ReconcileDatabaseInstanceValidationTerminals(ctx context.Context, at time.Time, limit int) (int, error) {
+	return recorder.store.ReconcileValidationTerminals(ctx, at, limit)
+}
+
+type migrationNoopDispatcher struct{}
+
+func (migrationNoopDispatcher) Dispatch(context.Context, string, *agentv1.CommandEnvelope) error {
+	return errors.New("unexpected command dispatch")
+}
+func (migrationNoopDispatcher) Start(context.Context, string, *agentv1.CommandStart) error {
+	return errors.New("unexpected command start")
+}
+func (migrationNoopDispatcher) ReplayStart(context.Context, string, *agentv1.CommandStart) error {
+	return errors.New("unexpected command replay")
+}
+func (migrationNoopDispatcher) Cancel(context.Context, string, string) error {
+	return errors.New("unexpected command cancellation")
+}
+func (migrationNoopDispatcher) CancelPrepared(context.Context, string, string, string) error {
+	return errors.New("unexpected prepared cancellation")
+}
+func (migrationNoopDispatcher) CancelExecution(context.Context, string, string, []byte, uint64, string) error {
+	return errors.New("unexpected execution cancellation")
+}
 
 func real0004ValidationDatabase(t *testing.T, ctx context.Context, dsn, suffix string) (*sql.DB, platformscope.Scope, string, string) {
 	t.Helper()
