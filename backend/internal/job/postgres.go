@@ -233,6 +233,35 @@ func (repository *PostgresRepository) ReconcileTerminalCommands(ctx context.Cont
 	if repository == nil || repository.db == nil || ctx == nil || limit < 1 || limit > 1024 || at.IsZero() {
 		return 0, ErrInvalidCommandPayload
 	}
+	values, err := repository.claimTerminalCommands(ctx, limit, at.UTC())
+	if err != nil {
+		return 0, err
+	}
+	var reconcileErrors []error
+	reconciled := 0
+	for _, value := range values {
+		if err := repository.reconcileTerminalCommand(ctx, value, at.UTC()); err != nil {
+			releaseErr := repository.recordTerminalReconcileFailure(ctx, value, at.UTC(), err)
+			reconcileErrors = append(reconcileErrors, errors.Join(fmt.Errorf("reconcile terminal command %q: %w", value.commandID, err), releaseErr))
+			continue
+		}
+		reconciled++
+	}
+	return reconciled, errors.Join(reconcileErrors...)
+}
+
+type terminalReconcileClaim struct {
+	scope            platformscope.Scope
+	jobID, commandID string
+	token            []byte
+	leaseExpiresAt   time.Time
+}
+
+func (repository *PostgresRepository) claimTerminalCommands(ctx context.Context, limit int, at time.Time) ([]terminalReconcileClaim, error) {
+	token := make([]byte, sha256.Size)
+	if _, err := rand.Read(token); err != nil {
+		return nil, fmt.Errorf("generate terminal reconciliation claim: %w", err)
+	}
 	rows, err := repository.db.QueryContext(ctx, `
 		WITH candidates AS (
 			SELECT outbox.id
@@ -250,49 +279,36 @@ func (repository *PostgresRepository) ReconcileTerminalCommands(ctx context.Cont
 		), claimed AS (
 			UPDATE command_outbox outbox
 			SET terminal_reconcile_lease_expires_at=$3,
+			    terminal_reconcile_claim_token=$4,
 			    terminal_reconcile_attempts=outbox.terminal_reconcile_attempts+1
 			FROM candidates
 			WHERE outbox.id=candidates.id
-			RETURNING outbox.tenant_id,outbox.project_id,outbox.job_id,outbox.id,
+			RETURNING outbox.tenant_id,outbox.project_id,outbox.job_id,outbox.id,outbox.terminal_reconcile_lease_expires_at,
 			          COALESCE(outbox.terminal_reconcile_available_at,outbox.terminal_at,outbox.created_at) AS claim_key
 		)
-		SELECT tenant_id,project_id,job_id,id
+		SELECT tenant_id,project_id,job_id,id,terminal_reconcile_lease_expires_at
 		FROM claimed
 		ORDER BY claim_key,id
-	`, at.UTC(), limit, at.UTC().Add(terminalReconcileLease))
+	`, at.UTC(), limit, at.UTC().Add(terminalReconcileLease), token)
 	if err != nil {
-		return 0, classifyReadError("list terminal commands for reconciliation", err)
+		return nil, classifyReadError("list terminal commands for reconciliation", err)
 	}
-	type candidate struct {
-		scope            platformscope.Scope
-		jobID, commandID string
-	}
-	values := make([]candidate, 0, limit)
+	values := make([]terminalReconcileClaim, 0, limit)
 	for rows.Next() {
-		var value candidate
-		if err := rows.Scan(&value.scope.TenantID, &value.scope.ProjectID, &value.jobID, &value.commandID); err != nil {
+		value := terminalReconcileClaim{token: append([]byte(nil), token...)}
+		if err := rows.Scan(&value.scope.TenantID, &value.scope.ProjectID, &value.jobID, &value.commandID, &value.leaseExpiresAt); err != nil {
 			_ = rows.Close()
-			return 0, classifyReadError("scan terminal command reconciliation", err)
+			return nil, classifyReadError("scan terminal command reconciliation", err)
 		}
 		values = append(values, value)
 	}
 	if err := rows.Close(); err != nil {
-		return 0, classifyReadError("close terminal command reconciliation", err)
+		return nil, classifyReadError("close terminal command reconciliation", err)
 	}
-	var reconcileErrors []error
-	reconciled := 0
-	for _, value := range values {
-		if err := repository.reconcileTerminalCommand(ctx, value.scope, value.jobID, value.commandID, at.UTC()); err != nil {
-			releaseErr := repository.recordTerminalReconcileFailure(ctx, value.scope, value.commandID, at.UTC(), err)
-			reconcileErrors = append(reconcileErrors, errors.Join(fmt.Errorf("reconcile terminal command %q: %w", value.commandID, err), releaseErr))
-			continue
-		}
-		reconciled++
-	}
-	return reconciled, errors.Join(reconcileErrors...)
+	return values, nil
 }
 
-func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Context, scope platformscope.Scope, jobID, commandID string, at time.Time) error {
+func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Context, claim terminalReconcileClaim, at time.Time) error {
 	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return err
@@ -301,11 +317,11 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 		_ = tx.Rollback()
 		return cause
 	}
-	current, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, scope.TenantID, scope.ProjectID, jobID))
+	current, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, claim.scope.TenantID, claim.scope.ProjectID, claim.jobID))
 	if err != nil {
 		return rollback(classifyReadError("lock Job for terminal command reconciliation", err))
 	}
-	current.TargetResults, err = getTargetsFrom(ctx, tx, scope, jobID)
+	current.TargetResults, err = getTargetsFrom(ctx, tx, claim.scope, claim.jobID)
 	if err != nil {
 		return rollback(err)
 	}
@@ -313,9 +329,17 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 	for index := range current.TargetResults {
 		current.TargetResourceIDs[index] = current.TargetResults[index].TargetID
 	}
-	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL+` FOR UPDATE`, commandID, scope.TenantID, scope.ProjectID, jobID))
+	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL+` FOR UPDATE`, claim.commandID, claim.scope.TenantID, claim.scope.ProjectID, claim.jobID))
 	if err != nil {
 		return rollback(classifyReadError("lock terminal command for reconciliation", err))
+	}
+	var storedToken []byte
+	var ownsLease bool
+	if err := tx.QueryRowContext(ctx, `SELECT terminal_reconcile_claim_token,COALESCE(terminal_reconcile_lease_expires_at=$5,FALSE) FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 AND job_id=$4`, claim.scope.TenantID, claim.scope.ProjectID, claim.commandID, claim.jobID, claim.leaseExpiresAt).Scan(&storedToken, &ownsLease); err != nil {
+		return rollback(classifyReadError("verify terminal reconciliation claim", err))
+	}
+	if len(claim.token) != sha256.Size || len(storedToken) != sha256.Size || subtle.ConstantTimeCompare(claim.token, storedToken) != 1 || !ownsLease {
+		return rollback(ErrConflict)
 	}
 	if !terminalCommandStatus(message.CommandStatus) || message.TerminalAt == nil || !containsTarget(current.TargetResourceIDs, message.TargetID) {
 		return rollback(ErrConflict)
@@ -334,7 +358,7 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 		return rollback(ErrConflict)
 	} else {
 		if current.Status == StatusQueued {
-			current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
+			current, err = transitionInTx(ctx, tx, Transition{Scope: claim.scope, JobID: claim.jobID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
 			if err != nil {
 				return rollback(err)
 			}
@@ -343,14 +367,14 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 		if current.Status == StatusCancelling {
 			to, actor = StatusCancelling, current.CancelRequestedBy
 		}
-		current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: to, Actor: actor, TargetResults: []TargetResult{target}, At: at})
+		current, err = transitionInTx(ctx, tx, Transition{Scope: claim.scope, JobID: claim.jobID, CurrentVersion: current.Version, To: to, Actor: actor, TargetResults: []TargetResult{target}, At: at})
 		if err != nil {
 			return rollback(err)
 		}
 	}
 	if allTargetsTerminal(current) && !isTerminal(current.Status) {
 		terminalStatus := terminalJobStatus(current)
-		current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: terminalStatus, Artifacts: collectArtifacts(current.TargetResults), ResultSummary: "Agent commands completed", At: at})
+		current, err = transitionInTx(ctx, tx, Transition{Scope: claim.scope, JobID: claim.jobID, CurrentVersion: current.Version, To: terminalStatus, Artifacts: collectArtifacts(current.TargetResults), ResultSummary: "Agent commands completed", At: at})
 		if err != nil {
 			return rollback(err)
 		}
@@ -362,7 +386,7 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 	if err != nil {
 		return rollback(ErrInvalidCommandPayload)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=FALSE,terminal_reconcile_available_at=NULL,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND command_status=$9`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, scope.TenantID, scope.ProjectID, commandID, jobID, string(message.CommandStatus))
+	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=FALSE,terminal_reconcile_available_at=NULL,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_claim_token=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND command_status=$9 AND terminal_reconcile_claim_token=$10 AND terminal_reconcile_lease_expires_at=$11`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, claim.scope.TenantID, claim.scope.ProjectID, claim.commandID, claim.jobID, string(message.CommandStatus), claim.token, claim.leaseExpiresAt)
 	if err != nil {
 		return rollback(classifyWriteError("complete terminal command reconciliation", err))
 	}
@@ -375,7 +399,7 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 	return nil
 }
 
-func (repository *PostgresRepository) recordTerminalReconcileFailure(ctx context.Context, scope platformscope.Scope, commandID string, at time.Time, cause error) error {
+func (repository *PostgresRepository) recordTerminalReconcileFailure(ctx context.Context, claim terminalReconcileClaim, at time.Time, cause error) error {
 	reason := ""
 	switch {
 	case errors.Is(cause, ErrConflict):
@@ -386,6 +410,7 @@ func (repository *PostgresRepository) recordTerminalReconcileFailure(ctx context
 	result, err := repository.db.ExecContext(ctx, `
 		UPDATE command_outbox
 		SET terminal_reconcile_lease_expires_at=NULL,
+		    terminal_reconcile_claim_token=NULL,
 		    terminal_reconcile_available_at=CASE
 		        WHEN $1::text<>'' OR terminal_reconcile_attempts >= $2 THEN terminal_reconcile_available_at
 		        ELSE $3::timestamptz + LEAST(terminal_reconcile_attempts,60) * INTERVAL '1 second'
@@ -401,7 +426,9 @@ func (repository *PostgresRepository) recordTerminalReconcileFailure(ctx context
 		    END
 		WHERE tenant_id=$4 AND project_id=$5 AND id=$6
 		  AND command_status IN ('succeeded','failed','cancelled','timed_out','rejected')
-	`, reason, terminalReconcileMaxAttempts, at, scope.TenantID, scope.ProjectID, commandID)
+		  AND terminal_reconcile_claim_token=$7
+		  AND terminal_reconcile_lease_expires_at=$8
+	`, reason, terminalReconcileMaxAttempts, at, claim.scope.TenantID, claim.scope.ProjectID, claim.commandID, claim.token, claim.leaseExpiresAt)
 	if err != nil {
 		return classifyWriteError("record terminal reconciliation failure", err)
 	}

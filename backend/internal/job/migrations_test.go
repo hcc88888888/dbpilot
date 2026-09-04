@@ -86,6 +86,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_reconcile_available_at.*unknown historical terminal command action.*command_outbox_terminal_reconcile_claim_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0009_historical_terminal_recovery.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0010_terminal_reconcile_claim_fence.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_reconcile_claim_token.*command_outbox_terminal_reconcile_claim_check").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0010_terminal_reconcile_claim_fence.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	mock.ExpectQuery("(?s)SELECT value.job_type,outbox.payload.*historical_recovery").WillReturnRows(sqlmock.NewRows([]string{"job_type", "payload"}))
 
 	require.NoError(t, RunMigrations(context.Background(), database))
@@ -154,5 +160,10 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	require.NoError(t, err)
 	for _, required := range []string{"terminal_reconcile_available_at", "terminal_reconcile_lease_expires_at", "terminal_reconcile_attempts", "terminal_reconcile_quarantined_at", "unknown historical terminal command action", "command.historical_terminal"} {
 		require.Contains(t, string(historicalTerminal), required)
+	}
+	claimFence, err := migrationFiles.ReadFile("migrations/0010_terminal_reconcile_claim_fence.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"terminal_reconcile_claim_token", "octet_length(terminal_reconcile_claim_token) = 32", "terminal_reconcile_lease_expires_at = NULL"} {
+		require.Contains(t, string(claimFence), required)
 	}
 }

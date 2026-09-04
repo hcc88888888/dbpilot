@@ -46,7 +46,7 @@ func TestTwoPhaseLegacyActiveUpgradeRepairsJobAndAuditWithoutReexecution(t *test
 	require.NoError(t, err)
 
 	applyJobMigrationFiles(t, ctx, database, "0005_two_phase_execution.sql")
-	applyJobMigrationFiles(t, ctx, database, "0006_cancellation_response_snapshot.sql", "0007_inspection_concurrency.sql", "0008_terminal_reconciliation.sql", "0009_historical_terminal_recovery.sql")
+	applyJobMigrationFiles(t, ctx, database, "0006_cancellation_response_snapshot.sql", "0007_inspection_concurrency.sql", "0007_retired_validation_winner_marker.sql", "0007a_retired_validation_terminal_winner.sql", "0007b_validation_target_outbox_bridge.sql", "0008_terminal_reconciliation.sql", "0009_historical_terminal_recovery.sql", "0010_terminal_reconcile_claim_fence.sql")
 	upgradedAt := time.Now().UTC()
 	stored, err := repository.LookupCommand(ctx, message.ID)
 	require.NoError(t, err)
@@ -846,6 +846,130 @@ func TestPostgresTerminalReconcilerQuarantinesPermanentConflictWithoutStarvation
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_quarantined_at,terminal_reconcile_quarantine_reason FROM command_outbox WHERE id=$1`, conflictCommand.ID).Scan(&quarantinedAt, &reason))
 	require.True(t, quarantinedAt.Valid, reason)
 	require.Equal(t, "terminal_state_conflict", reason)
+}
+
+func TestPostgresTerminalReconcileClaimFencesExpiredAndReclaimedWorkers(t *testing.T) {
+	for _, lateOperation := range []string{"success", "failure"} {
+		t.Run(lateOperation, func(t *testing.T) {
+			ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			value, message := integrationPersistenceFixture("terminal-claim-fence-"+lateOperation, platformscope.Scope{TenantID: "tenant-terminal-claim-fence-" + lateOperation, ProjectID: "project-terminal-claim-fence"}, now.Add(-time.Minute))
+			require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+			require.NoError(t, repository.PersistTerminalCommand(ctx, TerminalCommand{
+				Scope: value.Scope, CommandID: message.ID, Status: CommandSucceeded,
+				Target: TargetResult{TargetID: message.TargetID, Status: TargetSucceeded, ResultSummary: "Agent command succeeded", FinishedAt: timePointer(now)},
+				Audit:  TerminalAudit{DedupeKey: "command.result:" + message.ID, Action: "command.result", Result: "success", Detail: map[string]any{"state": "succeeded"}}, At: now,
+			}))
+
+			claimsA, err := repository.claimTerminalCommands(ctx, 1, now)
+			require.NoError(t, err)
+			require.Len(t, claimsA, 1)
+			require.Len(t, claimsA[0].token, 32)
+			_, err = database.ExecContext(ctx, `UPDATE command_outbox SET terminal_reconcile_lease_expires_at=$1 WHERE id=$2`, now.Add(-time.Second), message.ID)
+			require.NoError(t, err)
+
+			if lateOperation == "success" {
+				err = repository.reconcileTerminalCommand(ctx, claimsA[0], now.Add(time.Second))
+			} else {
+				err = repository.recordTerminalReconcileFailure(ctx, claimsA[0], now.Add(time.Second), errors.New("late worker failure"))
+			}
+			require.ErrorIs(t, err, ErrConflict, "an expired owner must not mutate reconciliation state")
+
+			claimsB, err := repository.claimTerminalCommands(ctx, 1, now.Add(time.Minute))
+			require.NoError(t, err)
+			require.Len(t, claimsB, 1)
+			require.Len(t, claimsB[0].token, 32)
+			require.NotEqual(t, claimsA[0].token, claimsB[0].token)
+
+			var token []byte
+			var leasedUntil sql.NullTime
+			var attempts int
+			var quarantinedAt sql.NullTime
+			var quarantineReason string
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_claim_token,terminal_reconcile_lease_expires_at,terminal_reconcile_attempts,terminal_reconcile_quarantined_at,terminal_reconcile_quarantine_reason FROM command_outbox WHERE id=$1`, message.ID).Scan(&token, &leasedUntil, &attempts, &quarantinedAt, &quarantineReason))
+			require.Equal(t, claimsB[0].token, token)
+			require.True(t, leasedUntil.Valid)
+			require.Equal(t, 2, attempts)
+			require.False(t, quarantinedAt.Valid)
+			require.Empty(t, quarantineReason)
+
+			start := make(chan struct{})
+			staleResult := make(chan error, 1)
+			currentResult := make(chan error, 1)
+			go func() {
+				<-start
+				if lateOperation == "success" {
+					staleResult <- repository.reconcileTerminalCommand(ctx, claimsA[0], now.Add(time.Minute))
+					return
+				}
+				staleResult <- repository.recordTerminalReconcileFailure(ctx, claimsA[0], now.Add(time.Minute), ErrConflict)
+			}()
+			go func() {
+				<-start
+				currentResult <- repository.reconcileTerminalCommand(ctx, claimsB[0], now.Add(time.Minute))
+			}()
+			close(start)
+			require.Error(t, <-staleResult, "a reclaimed row must reject its former owner")
+			require.NoError(t, <-currentResult, "the current owner must complete despite a concurrent stale worker")
+			repaired, err := repository.Get(ctx, value.Scope, value.ID)
+			require.NoError(t, err)
+			require.Equal(t, StatusSucceeded, repaired.Status)
+
+			if lateOperation == "success" {
+				err = repository.reconcileTerminalCommand(ctx, claimsA[0], now.Add(2*time.Minute))
+			} else {
+				err = repository.recordTerminalReconcileFailure(ctx, claimsA[0], now.Add(2*time.Minute), ErrConflict)
+			}
+			require.ErrorIs(t, err, ErrConflict, "a completed newer owner must remain final")
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_claim_token,terminal_reconcile_lease_expires_at,terminal_reconcile_attempts,terminal_reconcile_quarantined_at,terminal_reconcile_quarantine_reason FROM command_outbox WHERE id=$1`, message.ID).Scan(&token, &leasedUntil, &attempts, &quarantinedAt, &quarantineReason))
+			require.Empty(t, token)
+			require.False(t, leasedUntil.Valid)
+			require.Equal(t, 2, attempts)
+			require.False(t, quarantinedAt.Valid)
+			require.Empty(t, quarantineReason)
+		})
+	}
+}
+
+func TestTerminalReconcileClaimFenceMigrationReleasesUnownedLegacyLeaseOnce(t *testing.T) {
+	ctx, database := openUnmigratedJobIntegrationDatabase(t)
+	resetJobIntegrationSchema(t, ctx, database)
+	applyJobMigrationFiles(t, ctx, database,
+		"0001_jobs_outbox.sql", "0002_command_payload_bytea.sql", "0003_prepared_command_envelope.sql",
+		"0004_command_execution_recovery.sql", "0005_two_phase_execution.sql", "0006_cancellation_response_snapshot.sql",
+		"0007_inspection_concurrency.sql", "0007_retired_validation_winner_marker.sql",
+		"0007a_retired_validation_terminal_winner.sql", "0007b_validation_target_outbox_bridge.sql",
+		"0008_terminal_reconciliation.sql", "0009_historical_terminal_recovery.sql",
+	)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	value, message := integrationPersistenceFixture("legacy-terminal-claim", platformscope.Scope{TenantID: "tenant-legacy-terminal-claim", ProjectID: "project-legacy-terminal-claim"}, now.Add(-time.Minute))
+	repository := NewPostgresRepository(database)
+	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+	require.NoError(t, repository.PersistTerminalCommand(ctx, TerminalCommand{
+		Scope: value.Scope, CommandID: message.ID, Status: CommandSucceeded,
+		Target: TargetResult{TargetID: message.TargetID, Status: TargetSucceeded, ResultSummary: "Agent command succeeded", FinishedAt: timePointer(now)},
+		Audit:  TerminalAudit{DedupeKey: "command.result:" + message.ID, Action: "command.result", Result: "success", Detail: map[string]any{"state": "succeeded"}}, At: now,
+	}))
+	_, err := database.ExecContext(ctx, `UPDATE command_outbox SET terminal_reconcile_lease_expires_at=$1,terminal_reconcile_attempts=1 WHERE id=$2`, now.Add(time.Hour), message.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, RunMigrations(ctx, database))
+	var token []byte
+	var leasedUntil sql.NullTime
+	var attempts int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_claim_token,terminal_reconcile_lease_expires_at,terminal_reconcile_attempts FROM command_outbox WHERE id=$1`, message.ID).Scan(&token, &leasedUntil, &attempts))
+	require.Empty(t, token)
+	require.False(t, leasedUntil.Valid)
+	require.Equal(t, 1, attempts)
+
+	claims, err := repository.claimTerminalCommands(ctx, 1, now)
+	require.NoError(t, err)
+	require.Len(t, claims, 1)
+	require.NoError(t, RunMigrations(ctx, database), "an applied migration must not clear a live fenced claim")
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_claim_token,terminal_reconcile_lease_expires_at,terminal_reconcile_attempts FROM command_outbox WHERE id=$1`, message.ID).Scan(&token, &leasedUntil, &attempts))
+	require.Equal(t, claims[0].token, token)
+	require.True(t, leasedUntil.Valid)
+	require.Equal(t, 2, attempts)
 }
 
 func TestTimeoutFenceConcurrentHeartbeatResultAndTimeoutStress(t *testing.T) {
