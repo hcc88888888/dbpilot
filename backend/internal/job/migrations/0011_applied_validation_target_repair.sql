@@ -158,32 +158,107 @@ BEGIN
             USING ERRCODE = '23514';
     END IF;
 
+    CREATE TEMP TABLE dbpilot_applied_validation_command_audit (
+        tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        action TEXT NOT NULL,
+        result TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        detail JSONB NOT NULL
+    ) ON COMMIT DROP;
+
     IF to_regclass('audit_events') IS NOT NULL THEN
+        EXECUTE $command_audits$
+            INSERT INTO dbpilot_applied_validation_command_audit
+            SELECT event.tenant_id,event.project_id,event.job_id,event.command_id,
+                   event.occurred_at,event.action,event.result,event.dedupe_key,event.detail
+            FROM dbpilot_applied_validation_target_repair repair
+            JOIN audit_events event
+              ON event.tenant_id = repair.tenant_id
+             AND event.project_id = repair.project_id
+             AND event.job_id = repair.job_id
+             AND event.command_id = repair.command_id
+             AND event.action IN (
+                 'command.result', 'command.acknowledged',
+                 'command.undelivered_timed_out', 'command.prepared_timed_out',
+                 'command.cancelled_before_start', 'command.cancelled_before_dispatch',
+                 'command.delivery_timed_out', 'command.execution_timed_out',
+                 'command.prepared_envelope_expired',
+                 'command.validation_cancelled_on_retire', 'command.historical_terminal'
+             )
+        $command_audits$;
+
         EXECUTE $command_audit_conflict$
             SELECT EXISTS (
                 SELECT 1
                 FROM dbpilot_applied_validation_target_repair repair
-                JOIN audit_events event
+                JOIN dbpilot_applied_validation_command_audit event
                   ON event.tenant_id = repair.tenant_id
                  AND event.project_id = repair.project_id
                  AND event.job_id = repair.job_id
                  AND event.command_id = repair.command_id
-                 AND event.action IN (
-                     'command.result',
-                     'command.execution_timed_out',
-                     'command.validation_cancelled_on_retire',
-                     'command.historical_terminal'
-                 )
-                WHERE event.dedupe_key <> repair.expected_audit_action || ':' || repair.command_id
-                   OR event.action <> repair.expected_audit_action
-                   OR event.result <> repair.expected_audit_result
-                   OR event.detail <> jsonb_build_object(
-                        'command_action', 'database_instance.validate',
-                        'historical_recovery', TRUE,
-                        'terminal_status', repair.target_status
-                      )
+                WHERE event.dedupe_key <> event.action || ':' || repair.command_id
+                   OR jsonb_typeof(event.detail) <> 'object'
+                   OR NOT CASE event.action
+                      WHEN 'command.result' THEN
+                          (repair.target_status = 'succeeded' AND event.result = 'success'
+                           AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_SUCCEEDED','succeeded'))
+                          OR (repair.target_status = 'failed' AND event.result = 'failure'
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_FAILED','failed'))
+                          OR (repair.target_status = 'cancelled' AND event.result = 'failure'
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_CANCELLED','cancelled'))
+                          OR (repair.target_status = 'timed_out' AND event.result = 'failure'
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_TIMED_OUT','COMMAND_RESULT_STATE_INTERRUPTED','timed_out'))
+                          OR (event.detail @> jsonb_build_object('historical_recovery',TRUE,'terminal_status',repair.target_status)
+                              AND event.result = CASE repair.target_status WHEN 'succeeded' THEN 'success' ELSE 'failure' END)
+                      WHEN 'command.acknowledged' THEN
+                          repair.target_status = 'failed'
+                          AND repair.expected_command_status = 'rejected'
+                          AND event.result = 'failure'
+                          AND event.detail->>'state' = 'rejected'
+                          AND event.detail->>'reason_code' = repair.target_error_summary
+                      WHEN 'command.undelivered_timed_out' THEN
+                          repair.target_status = 'timed_out' AND event.result = 'failure' AND event.detail ? 'phase'
+                      WHEN 'command.prepared_timed_out' THEN
+                          repair.target_status = 'timed_out' AND event.result = 'failure' AND event.detail ? 'phase'
+                      WHEN 'command.cancelled_before_start' THEN
+                          repair.target_status = 'cancelled' AND event.result = 'success' AND event.detail ? 'phase'
+                      WHEN 'command.cancelled_before_dispatch' THEN
+                          repair.target_status = 'cancelled' AND event.result = 'success' AND event.detail->>'reason' = 'job_cancellation'
+                      WHEN 'command.delivery_timed_out' THEN
+                          repair.target_status = 'timed_out' AND event.result = 'failure' AND event.detail->>'reason' = 'delivery_deadline'
+                      WHEN 'command.execution_timed_out' THEN
+                          repair.target_status = 'timed_out' AND event.result = 'failure' AND event.detail->>'reason' = 'execution_deadline'
+                      WHEN 'command.prepared_envelope_expired' THEN
+                          repair.target_status = 'timed_out' AND event.result = 'failure'
+                          AND event.detail->>'reason' = 'prepare_envelope_expiry' AND event.detail ? 'expires_at'
+                      WHEN 'command.validation_cancelled_on_retire' THEN
+                          repair.target_status = 'cancelled' AND event.result = 'failure' AND event.detail->>'reason' = 'instance_retired'
+                      WHEN 'command.historical_terminal' THEN
+                          event.result = CASE repair.target_status WHEN 'succeeded' THEN 'success' ELSE 'failure' END
+                          AND event.detail @> jsonb_build_object(
+                              'command_action','database_instance.validate',
+                              'historical_recovery',TRUE,
+                              'terminal_status',repair.target_status
+                          )
+                      ELSE FALSE
+                   END
             )
         $command_audit_conflict$ INTO conflict_exists;
+        IF conflict_exists THEN
+            RAISE EXCEPTION 'recorded historical validation Audit conflicts with target evidence'
+                USING ERRCODE = '23514';
+        END IF;
+
+        EXECUTE $duplicate_command_audit$
+            SELECT EXISTS (
+                SELECT 1 FROM dbpilot_applied_validation_command_audit
+                GROUP BY tenant_id,project_id,job_id,command_id HAVING count(*) > 1
+            )
+        $duplicate_command_audit$ INTO conflict_exists;
         IF conflict_exists THEN
             RAISE EXCEPTION 'recorded historical validation Audit conflicts with target evidence'
                 USING ERRCODE = '23514';
@@ -200,9 +275,18 @@ BEGIN
                  AND event.command_id = repair.command_id
                  AND event.action IN (
                      'database_instance.connection_test_succeeded',
-                     'database_instance.connection_test_failed'
-                 )
+                     'database_instance.connection_test_failed',
+                     'database_instance.connection_test_cancelled_on_retire'
+                )
                 WHERE event.result <> CASE repair.target_status WHEN 'succeeded' THEN 'success' ELSE 'failure' END
+                   OR NOT (
+                       (repair.target_status = 'succeeded' AND event.action = 'database_instance.connection_test_succeeded')
+                       OR (repair.target_status = 'cancelled' AND event.action IN (
+                           'database_instance.connection_test_failed',
+                           'database_instance.connection_test_cancelled_on_retire'
+                       ))
+                       OR (repair.target_status IN ('failed','timed_out') AND event.action = 'database_instance.connection_test_failed')
+                   )
             )
         $validation_audit_conflict$ INTO conflict_exists;
         IF conflict_exists THEN
@@ -211,53 +295,21 @@ BEGIN
         END IF;
     END IF;
 
-    EXECUTE 'SELECT EXISTS (SELECT 1 FROM dbpilot_applied_validation_target_repair WHERE terminal_audit_recorded_at IS NOT NULL)'
-        INTO conflict_exists;
+    EXECUTE $missing_recorded_audit$
+        SELECT EXISTS (
+            SELECT 1
+            FROM dbpilot_applied_validation_target_repair repair
+            WHERE repair.terminal_audit_recorded_at IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM dbpilot_applied_validation_command_audit event
+                  WHERE event.tenant_id=repair.tenant_id AND event.project_id=repair.project_id
+                    AND event.job_id=repair.job_id AND event.command_id=repair.command_id
+              )
+        )
+    $missing_recorded_audit$ INTO conflict_exists;
     IF conflict_exists THEN
-        IF to_regclass('audit_events') IS NULL THEN
-            RAISE EXCEPTION 'recorded historical validation Audit conflicts with target evidence'
-                USING ERRCODE = '23514';
-        END IF;
-        EXECUTE $audit_conflict$
-            SELECT EXISTS (
-                SELECT 1
-                FROM dbpilot_applied_validation_target_repair repair
-                JOIN command_outbox outbox
-                  ON outbox.tenant_id = repair.tenant_id
-                 AND outbox.project_id = repair.project_id
-                 AND outbox.id = repair.command_id
-                WHERE repair.terminal_audit_recorded_at IS NOT NULL
-                  AND (
-                      outbox.terminal_audit_action IS DISTINCT FROM repair.expected_audit_action
-                      OR outbox.terminal_audit_result IS DISTINCT FROM repair.expected_audit_result
-                      OR outbox.terminal_audit_detail IS DISTINCT FROM jsonb_build_object(
-                            'command_action', 'database_instance.validate',
-                            'historical_recovery', TRUE,
-                            'terminal_status', repair.target_status
-                         )
-                      OR NOT EXISTS (
-                          SELECT 1
-                          FROM audit_events event
-                          WHERE event.tenant_id = repair.tenant_id
-                            AND event.project_id = repair.project_id
-                            AND event.job_id = repair.job_id
-                            AND event.command_id = repair.command_id
-                            AND event.dedupe_key = repair.expected_audit_action || ':' || repair.command_id
-                            AND event.action = repair.expected_audit_action
-                            AND event.result = repair.expected_audit_result
-                            AND event.detail = jsonb_build_object(
-                                'command_action', 'database_instance.validate',
-                                'historical_recovery', TRUE,
-                                'terminal_status', repair.target_status
-                            )
-                      )
-                  )
-            )
-        $audit_conflict$ INTO conflict_exists;
-        IF conflict_exists THEN
-            RAISE EXCEPTION 'recorded historical validation Audit conflicts with target evidence'
-                USING ERRCODE = '23514';
-        END IF;
+        RAISE EXCEPTION 'recorded historical validation Audit conflicts with target evidence'
+            USING ERRCODE = '23514';
     END IF;
 
     EXECUTE $jobs$
@@ -314,19 +366,25 @@ BEGIN
             terminal_reconcile_claim_token = NULL,
             terminal_reconcile_quarantined_at = NULL,
             terminal_reconcile_quarantine_reason = '',
-            terminal_audit_pending = repair.terminal_audit_recorded_at IS NULL,
-            terminal_audit_dedupe_key = repair.expected_audit_action || ':' || repair.command_id,
-            terminal_audit_action = repair.expected_audit_action,
-            terminal_audit_result = repair.expected_audit_result,
-            terminal_audit_detail = jsonb_build_object(
+            terminal_audit_pending = event.command_id IS NULL AND repair.terminal_audit_recorded_at IS NULL,
+            terminal_audit_dedupe_key = COALESCE(event.dedupe_key, repair.expected_audit_action || ':' || repair.command_id),
+            terminal_audit_action = COALESCE(event.action, repair.expected_audit_action),
+            terminal_audit_result = COALESCE(event.result, repair.expected_audit_result),
+            terminal_audit_detail = COALESCE(event.detail, jsonb_build_object(
                 'command_action', 'database_instance.validate',
                 'historical_recovery', TRUE,
                 'terminal_status', repair.target_status
-            ),
+            )),
             terminal_audit_lease_expires_at = NULL,
-            terminal_audit_attempts = CASE WHEN repair.terminal_audit_recorded_at IS NULL THEN 0 ELSE outbox.terminal_audit_attempts END,
-            terminal_audit_recorded_at = repair.terminal_audit_recorded_at
+            terminal_audit_attempts = CASE WHEN event.command_id IS NULL THEN 0 ELSE outbox.terminal_audit_attempts END,
+            terminal_audit_recorded_at = CASE
+                WHEN event.command_id IS NOT NULL THEN COALESCE(repair.terminal_audit_recorded_at,event.occurred_at)
+                ELSE repair.terminal_audit_recorded_at
+            END
         FROM dbpilot_applied_validation_target_repair repair
+        LEFT JOIN dbpilot_applied_validation_command_audit event
+          ON event.tenant_id=repair.tenant_id AND event.project_id=repair.project_id
+         AND event.job_id=repair.job_id AND event.command_id=repair.command_id
         WHERE outbox.tenant_id = repair.tenant_id
           AND outbox.project_id = repair.project_id
           AND outbox.id = repair.command_id

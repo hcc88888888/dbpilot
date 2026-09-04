@@ -444,6 +444,67 @@ func TestAppliedHistoricalValidationRepairUsesTargetBeforeDispatcher(t *testing.
 		require.NotNil(t, stored.TerminalAuditRecordedAt)
 		require.False(t, stored.TerminalAuditPending)
 	})
+
+	t.Run("runtime success event with missing marker is preserved", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "runtime-success-marker-null", "runtime-success")
+		repository := runAppliedValidationDispatcher(t, ctx, fixture)
+		stored, err := repository.LookupCommand(ctx, fixture.commandID)
+		require.NoError(t, err)
+		require.Equal(t, "command.result", stored.TerminalAuditAction)
+		require.Equal(t, map[string]any{"artifact_count": float64(0), "state": "COMMAND_RESULT_STATE_SUCCEEDED"}, stored.TerminalAuditDetail)
+		require.NotNil(t, stored.TerminalAuditRecordedAt)
+		var count int
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id=$1 AND action='command.result'`, fixture.commandID).Scan(&count))
+		require.Equal(t, 1, count)
+	})
+
+	t.Run("matching rejected acknowledgement with missing marker is preserved", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "matching-rejected-ack-marker-null", "matching-rejected-ack")
+		repository := runAppliedValidationDispatcher(t, ctx, fixture)
+		stored, err := repository.LookupCommand(ctx, fixture.commandID)
+		require.NoError(t, err)
+		require.Equal(t, job.CommandRejected, stored.CommandStatus)
+		require.Equal(t, "command.acknowledged", stored.TerminalAuditAction)
+		require.Equal(t, map[string]any{"reason_code": "plugin_failed", "state": "rejected"}, stored.TerminalAuditDetail)
+		require.NotNil(t, stored.TerminalAuditRecordedAt)
+		var count int
+		require.NoError(t, fixture.database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id=$1 AND action='command.acknowledged'`, fixture.commandID).Scan(&count))
+		require.Equal(t, 1, count)
+	})
+
+	t.Run("opposite acknowledgement with missing marker fails closed", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "opposite-ack-marker-null", "opposite-ack")
+		err := job.RunMigrations(ctx, fixture.database)
+		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
+	})
+
+	t.Run("validation action and result mismatch fails closed", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "wrong-validation-action", "wrong-validation")
+		err := job.RunMigrations(ctx, fixture.database)
+		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
+	})
+}
+
+func runAppliedValidationDispatcher(t *testing.T, ctx context.Context, fixture *historicalValidationFixture) *job.PostgresRepository {
+	t.Helper()
+	require.NoError(t, job.RunMigrations(ctx, fixture.database))
+	require.NoError(t, RunMigrations(ctx, fixture.database))
+	jobRepository := job.NewPostgresRepository(fixture.database)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	signer, err := job.NewEd25519CommandSigner(privateKey)
+	require.NoError(t, err)
+	protector, err := job.NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x7d}, 32))
+	require.NoError(t, err)
+	lifecycle, err := job.NewCommandLifecycle(job.CommandLifecycleConfig{
+		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: migrationNoopDispatcher{}, Signer: signer,
+		Audit: audit.NewService(audit.NewPostgresStore(fixture.database)), TokenProtector: protector, ClaimLimit: 8,
+		DatabaseInstanceResults: migrationValidationRecorder{store: NewPostgresRepository(fixture.database)},
+	})
+	require.NoError(t, err)
+	_, err = lifecycle.DispatchPending(ctx, fixture.now.Add(time.Minute))
+	require.NoError(t, err)
+	return jobRepository
 }
 
 func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, dsn, suffix, auditState string) *historicalValidationFixture {
@@ -455,6 +516,12 @@ func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, 
 	require.NoError(t, err)
 	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='succeeded',command_phase='succeeded',terminal_at=$1,published_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
 	require.NoError(t, err)
+	if auditState == "matching-rejected-ack" {
+		_, err = fixture.database.ExecContext(ctx, `UPDATE job_targets SET status='failed',error_summary='plugin_failed',result_summary='database instance connection validation failed' WHERE job_id=$1`, fixture.jobID)
+		require.NoError(t, err)
+		_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed' WHERE id=$1`, fixture.commandID)
+		require.NoError(t, err)
+	}
 	require.NoError(t, job.RunMigrations(ctx, fixture.database))
 	require.NoError(t, RunMigrations(ctx, fixture.database))
 
@@ -467,13 +534,38 @@ func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, 
 	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed',terminal_target_status='failed',terminal_target_error_summary='plugin_failed',terminal_target_result_summary='database instance connection validation failed',terminal_target_artifacts='[]'::jsonb,terminal_reconcile_pending=TRUE,terminal_reconcile_available_at=$1,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_claim_token=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='',terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.result',terminal_audit_result='failure',terminal_audit_detail='{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}'::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_recorded_at=NULL WHERE id=$3`, fixture.now, "command.result:"+fixture.commandID, fixture.commandID)
 	require.NoError(t, err)
 	if auditState != "" {
-		auditResult, auditTerminal := "failure", "failed"
-		if auditState == "matching-recorded" {
-			auditResult, auditTerminal = "success", "succeeded"
-			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_result='success',terminal_audit_detail='{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"succeeded"}'::jsonb WHERE id=$1`, fixture.commandID)
+		action, auditResult := "command.result", "failure"
+		detail := `{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}`
+		resourceType, resourceID := "job_target", fixture.agentID
+		switch auditState {
+		case "matching-recorded":
+			auditResult = "success"
+			detail = `{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"succeeded"}`
+		case "runtime-success":
+			auditResult = "success"
+			detail = `{"artifact_count":0,"state":"COMMAND_RESULT_STATE_SUCCEEDED"}`
+		case "matching-rejected-ack":
+			action = "command.acknowledged"
+			detail = `{"reason_code":"plugin_failed","state":"rejected"}`
+			_, err = fixture.database.ExecContext(ctx, `UPDATE job_targets SET status='failed',error_summary='plugin_failed',result_summary='database instance connection validation failed',finished_at=$1 WHERE job_id=$2`, fixture.now, fixture.jobID)
+			require.NoError(t, err)
+			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='rejected',command_phase='rejected',terminal_target_status='failed',terminal_target_error_summary='plugin_failed',terminal_target_result_summary='database instance connection validation failed' WHERE id=$1`, fixture.commandID)
+			require.NoError(t, err)
+		case "opposite-ack":
+			action = "command.acknowledged"
+			detail = `{"reason_code":"plugin_failed","state":"rejected"}`
+		case "wrong-validation":
+			action = "database_instance.connection_test_failed"
+			auditResult = "success"
+			detail = `{"error_code":"plugin_failed"}`
+			resourceType, resourceID = "database_instance", fixture.instanceID
+		}
+		dedupe := action + ":" + fixture.commandID
+		if strings.HasPrefix(action, "command.") {
+			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_dedupe_key=$1,terminal_audit_action=$2,terminal_audit_result=$3,terminal_audit_detail=$4::jsonb WHERE id=$5`, dedupe, action, auditResult, detail, fixture.commandID)
 			require.NoError(t, err)
 		}
-		_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,'command.result','system','agent-control','job_target',$5,$6,$7,$8,$9,$10,$11,jsonb_build_object('command_action','database_instance.validate','historical_recovery',TRUE,'terminal_status',$12::text),$4)`, "audit-opposite-"+suffix, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, fixture.agentID, auditResult, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, "command.result:"+fixture.commandID, auditTerminal)
+		_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,$5,'system','agent-control',$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$4)`, "audit-opposite-"+suffix, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, action, resourceType, resourceID, auditResult, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, dedupe, detail)
 		require.NoError(t, err)
 		if auditState == "recorded" || auditState == "matching-recorded" {
 			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_pending=FALSE,terminal_audit_recorded_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
