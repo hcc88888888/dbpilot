@@ -52,8 +52,16 @@ BEGIN
           AND value.job_type = 'database_instance.validate'
           AND validation.status IN ('queued', 'running')
           AND instance.management_status <> 'retired'
-          AND value.status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')
           AND target.status IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+          AND (
+              value.status NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+              OR value.status = CASE target.status
+                  WHEN 'succeeded' THEN 'succeeded'
+                  WHEN 'cancelled' THEN 'cancelled'
+                  WHEN 'timed_out' THEN 'timed_out'
+                  ELSE 'failed'
+                END
+          )
           AND outbox.command_status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'rejected')
           AND outbox.command_status <> CASE target.status
                 WHEN 'succeeded' THEN 'succeeded'

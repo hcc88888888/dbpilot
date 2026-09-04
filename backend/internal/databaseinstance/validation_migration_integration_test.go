@@ -239,10 +239,12 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 		wantErrorCode        ConnectionTestErrorCode
 		wantJob              job.Status
 		wantCommand          job.CommandStatus
+		existingJobWinner    job.Status
 		wantQuarantineReason string
 	}{
 		{name: "matching succeeded evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded},
 		{name: "succeeded target overrides failed raw outbox", commandStatus: job.CommandFailed, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded},
+		{name: "succeeded target and Job override failed raw outbox", commandStatus: job.CommandFailed, targetStatus: job.TargetSucceeded, wantValidation: ConnectionSucceeded, wantJob: job.StatusSucceeded, wantCommand: job.CommandSucceeded, existingJobWinner: job.StatusSucceeded},
 		{name: "failed target overrides succeeded raw outbox", commandStatus: job.CommandSucceeded, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
 		{name: "matching typed failure evidence", commandStatus: job.CommandFailed, targetStatus: job.TargetFailed, targetError: "instance_authentication_failed", wantValidation: ConnectionAuthenticationFailed, wantErrorCode: ConnectionErrorAuthentication, wantJob: job.StatusFailed, wantCommand: job.CommandFailed},
 		{name: "raw command without independent evidence", commandStatus: job.CommandSucceeded, targetStatus: job.TargetRunning, wantValidation: ConnectionQueued, wantJob: job.StatusRunning, wantCommand: job.CommandSucceeded, wantQuarantineReason: "missing_effective_outcome_evidence"},
@@ -263,6 +265,10 @@ func TestPreAtomicValidationMigrationUsesIndependentTargetEvidenceOrQuarantines(
 			require.NoError(t, err)
 			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status=$1,command_phase=$1,terminal_at=$2,published_at=$2 WHERE tenant_id=$3 AND project_id=$4 AND id=$5`, string(test.commandStatus), fixture.now, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.commandID)
 			require.NoError(t, err)
+			if test.existingJobWinner == job.StatusSucceeded {
+				_, err = fixture.database.ExecContext(ctx, `UPDATE jobs SET status='succeeded',outcome='complete',completed_targets=1,failed_targets=0,skipped_targets=0,result_summary='database instance connection validation succeeded',finished_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND id=$4`, fixture.now, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.jobID)
+				require.NoError(t, err)
+			}
 
 			require.NoError(t, job.RunMigrations(ctx, fixture.database))
 			require.NoError(t, RunMigrations(ctx, fixture.database))
