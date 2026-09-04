@@ -202,16 +202,20 @@ BEGIN
                  AND event.command_id = repair.command_id
                 WHERE event.dedupe_key <> event.action || ':' || repair.command_id
                    OR jsonb_typeof(event.detail) <> 'object'
-                   OR NOT CASE event.action
+                   OR (CASE event.action
                       WHEN 'command.result' THEN
                           (repair.target_status = 'succeeded' AND event.result = 'success'
-                           AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_SUCCEEDED','succeeded'))
+                           AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_SUCCEEDED','succeeded')
+                           AND jsonb_typeof(event.detail->'artifact_count') = 'number')
                           OR (repair.target_status = 'failed' AND event.result = 'failure'
-                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_FAILED','failed'))
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_FAILED','failed')
+                              AND jsonb_typeof(event.detail->'artifact_count') = 'number')
                           OR (repair.target_status = 'cancelled' AND event.result = 'failure'
-                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_CANCELLED','cancelled'))
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_CANCELLED','cancelled')
+                              AND jsonb_typeof(event.detail->'artifact_count') = 'number')
                           OR (repair.target_status = 'timed_out' AND event.result = 'failure'
-                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_TIMED_OUT','COMMAND_RESULT_STATE_INTERRUPTED','timed_out'))
+                              AND event.detail->>'state' IN ('COMMAND_RESULT_STATE_TIMED_OUT','COMMAND_RESULT_STATE_INTERRUPTED','timed_out')
+                              AND jsonb_typeof(event.detail->'artifact_count') = 'number')
                           OR (event.detail @> jsonb_build_object('historical_recovery',TRUE,'terminal_status',repair.target_status)
                               AND event.result = CASE repair.target_status WHEN 'succeeded' THEN 'success' ELSE 'failure' END)
                       WHEN 'command.acknowledged' THEN
@@ -245,7 +249,7 @@ BEGIN
                               'terminal_status',repair.target_status
                           )
                       ELSE FALSE
-                   END
+                   END) IS NOT TRUE
             )
         $command_audit_conflict$ INTO conflict_exists;
         IF conflict_exists THEN
@@ -287,6 +291,17 @@ BEGIN
                        ))
                        OR (repair.target_status IN ('failed','timed_out') AND event.action = 'database_instance.connection_test_failed')
                    )
+                   OR (
+                       (event.dedupe_key LIKE 'database-instance-validation-history:%'
+                        AND jsonb_typeof(event.detail->'error_code') = 'string')
+                       OR (event.dedupe_key LIKE 'database-instance-validation:%'
+                           AND jsonb_typeof(event.detail->'job_id') = 'string'
+                           AND jsonb_typeof(event.detail->'command_id') = 'string'
+                           AND jsonb_typeof(event.detail->'assignment_id') = 'string'
+                           AND jsonb_typeof(event.detail->'configuration_revision') = 'number'
+                           AND jsonb_typeof(event.detail->'operation_revision') = 'number'
+                           AND jsonb_typeof(event.detail->'error_code') = 'string')
+                   ) IS NOT TRUE
             )
         $validation_audit_conflict$ INTO conflict_exists;
         IF conflict_exists THEN

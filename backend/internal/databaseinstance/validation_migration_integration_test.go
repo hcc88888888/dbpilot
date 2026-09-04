@@ -485,6 +485,59 @@ func TestAppliedHistoricalValidationRepairUsesTargetBeforeDispatcher(t *testing.
 	})
 }
 
+func TestAppliedValidationAuditMissingRequiredShapeFailsClosed(t *testing.T) {
+	if os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_DATABASE_INSTANCE_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_DATABASE_INSTANCE_POSTGRES_DSN is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	for _, test := range []struct {
+		name, action, result, target, command, targetError, detail string
+		validationEvent                                            bool
+	}{
+		{name: "command result missing artifact count", action: "command.result", result: "success", target: "succeeded", command: "succeeded", detail: `{"state":"COMMAND_RESULT_STATE_SUCCEEDED"}`},
+		{name: "acknowledged rejection missing reason code", action: "command.acknowledged", result: "failure", target: "failed", command: "rejected", targetError: "plugin_failed", detail: `{"state":"rejected"}`},
+		{name: "delivery timeout missing reason", action: "command.delivery_timed_out", result: "failure", target: "timed_out", command: "timed_out", detail: `{}`},
+		{name: "prepared timeout missing phase", action: "command.prepared_timed_out", result: "failure", target: "timed_out", command: "timed_out", detail: `{}`},
+		{name: "execution timeout missing reason", action: "command.execution_timed_out", result: "failure", target: "timed_out", command: "timed_out", detail: `{}`},
+		{name: "cancel missing reason", action: "command.cancelled_before_dispatch", result: "success", target: "cancelled", command: "cancelled", detail: `{}`},
+		{name: "historical missing recovery marker", action: "command.historical_terminal", result: "success", target: "succeeded", command: "succeeded", detail: `{"command_action":"database_instance.validate","terminal_status":"succeeded"}`},
+		{name: "database validation missing error code", action: "database_instance.connection_test_succeeded", result: "success", target: "succeeded", command: "succeeded", detail: `{}`, validationEvent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := seedMissingShapeValidationAudit(t, ctx, dsn, test.name, test.action, test.result, test.target, test.command, test.targetError, test.detail, test.validationEvent)
+			err := job.RunMigrations(ctx, fixture.database)
+			require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
+		})
+	}
+}
+
+func seedMissingShapeValidationAudit(t *testing.T, ctx context.Context, dsn, suffix, action, result, targetStatus, commandStatus, targetError, detail string, validationEvent bool) *historicalValidationFixture {
+	t.Helper()
+	fixture := seedHistoricalValidation(t, ctx, dsn, suffix, false)
+	require.NoError(t, job.RunMigrations(ctx, fixture.database))
+	require.NoError(t, RunMigrations(ctx, fixture.database))
+	_, err := fixture.database.ExecContext(ctx, `UPDATE jobs SET status='running',version=2,dispatched_at=$1,started_at=$1 WHERE id=$2`, fixture.now.Add(-time.Second), fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE job_targets SET status=$1,error_summary=$2,result_summary='terminal target evidence',finished_at=$3 WHERE job_id=$4`, targetStatus, targetError, fixture.now, fixture.jobID)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status=$1,command_phase=$1,terminal_at=$2,published_at=$2,terminal_target_status='failed',terminal_target_error_summary='opposite_descriptor',terminal_target_result_summary='opposite descriptor',terminal_reconcile_pending=TRUE,terminal_reconcile_available_at=$2,terminal_audit_pending=TRUE,terminal_audit_dedupe_key='command.historical_terminal:'||id,terminal_audit_action='command.historical_terminal',terminal_audit_result='failure',terminal_audit_detail='{"historical_recovery":true,"terminal_status":"failed"}'::jsonb,terminal_audit_recorded_at=NULL WHERE id=$3`, commandStatus, fixture.now, fixture.commandID)
+	require.NoError(t, err)
+	resourceType, resourceID := "job_target", fixture.agentID
+	if validationEvent {
+		resourceType, resourceID = "database_instance", fixture.instanceID
+	}
+	_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,$5,'system','agent-control',$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$4)`, "audit-missing-shape-"+strings.NewReplacer(" ", "-", "/", "-").Replace(suffix), fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, action, resourceType, resourceID, result, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, action+":"+fixture.commandID, detail)
+	require.NoError(t, err)
+	_, err = fixture.database.ExecContext(ctx, `DELETE FROM dbpilot_schema_migrations WHERE name='job/migrations/0011_applied_validation_target_repair.sql'`)
+	require.NoError(t, err)
+	return fixture
+}
+
 func runAppliedValidationDispatcher(t *testing.T, ctx context.Context, fixture *historicalValidationFixture) *job.PostgresRepository {
 	t.Helper()
 	require.NoError(t, job.RunMigrations(ctx, fixture.database))
