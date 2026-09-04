@@ -3,10 +3,11 @@ BEGIN;
 -- A pre-atomic validation could durably finish its Job target before the raw
 -- Command status was committed with the opposite terminal classification.
 -- 0008 deliberately rejects that conflict, so bridge only the narrow case
--- where the non-retired validation is still active, the Job is nonterminal,
--- and the independently persisted target is terminal. The target is the sole
--- effective-outcome evidence; an evidence-free row remains for the later
--- database-instance quarantine migration.
+-- where the non-retired validation is still active, the independently
+-- persisted target is terminal, and the Job is either nonterminal or agrees
+-- with that target. Compare effective winners so raw `rejected` remains a
+-- rejected Command when it already agrees with a failed target. An
+-- evidence-free row remains for the later database-instance quarantine.
 DO $migration$
 BEGIN
     IF to_regclass('database_instance_validations') IS NULL
@@ -63,7 +64,7 @@ BEGIN
                 END
           )
           AND outbox.command_status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'rejected')
-          AND outbox.command_status <> CASE target.status
+          AND CASE outbox.command_status WHEN 'rejected' THEN 'failed' ELSE outbox.command_status END <> CASE target.status
                 WHEN 'succeeded' THEN 'succeeded'
                 WHEN 'cancelled' THEN 'cancelled'
                 WHEN 'timed_out' THEN 'timed_out'
