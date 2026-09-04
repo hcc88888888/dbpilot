@@ -48,9 +48,15 @@ type DispatchRepository interface {
 	PersistTerminalResult(context.Context, TerminalResultCAS) (TerminalResultOutcome, error)
 	ClaimPendingCancellations(context.Context, int, time.Time) ([]OutboxMessage, error)
 	DeferCancellation(context.Context, platformscope.Scope, string, time.Time) error
-	AcknowledgeCommand(context.Context, platformscope.Scope, string, CommandStatus, time.Time, *time.Time) error
 	RenewCommandLease(context.Context, platformscope.Scope, string, time.Time, time.Time) error
 	ClaimExpiredCommands(context.Context, int, time.Time) ([]OutboxMessage, error)
+	PersistTerminalCommand(context.Context, TerminalCommand) error
 	MarkCommandTerminal(context.Context, platformscope.Scope, string, CommandStatus, time.Time) error
 	PendingCancellationsForAgent(context.Context, string, int) ([]OutboxMessage, error)
+}
+
+// TerminalCommandReconciler repairs the durable Command/Outbox winner into
+// Job target and aggregate state without depending on an in-memory claim.
+type TerminalCommandReconciler interface {
+	ReconcileTerminalCommands(context.Context, int, time.Time) (int, error)
 }

@@ -1133,7 +1133,9 @@ func (recorder *recordingDatabaseValidationRecorder) PersistDatabaseInstanceVali
 		effective = proto.Clone(recorder.effective).(*agentv1.CommandResult)
 		effective.CommandId = result.GetCommandId()
 	}
-	switch databaseInstanceValidationTarget("target", effective, input.At).Status {
+	effectiveTarget := databaseInstanceValidationTarget(input.Target.TargetID, effective, input.At)
+	input.Target = effectiveTarget
+	switch effectiveTarget.Status {
 	case TargetSucceeded:
 		input.Status = CommandSucceeded
 	case TargetCancelled:
@@ -1143,6 +1145,15 @@ func (recorder *recordingDatabaseValidationRecorder) PersistDatabaseInstanceVali
 	default:
 		input.Status = CommandFailed
 	}
+	detail := map[string]any{"artifact_count": 0, "state": effective.GetState().String()}
+	if effective.GetState() != result.GetState() {
+		detail["incoming_state"] = result.GetState().String()
+	}
+	auditResult := "failure"
+	if effectiveTarget.Status == TargetSucceeded {
+		auditResult = "success"
+	}
+	input.Audit = TerminalAudit{DedupeKey: "command.result:" + input.CommandID, Action: "command.result", Result: auditResult, Detail: detail}
 	terminal, err := recorder.persistence.PersistTerminalResult(context.Background(), input)
 	if err != nil || terminal.Conflict {
 		return nil, terminal, err
@@ -1307,6 +1318,25 @@ func TestDatabaseInstanceValidationProjectionFailureDoesNotCommitRawCommandWinne
 	require.ErrorContains(t, err, "projection transaction failed")
 	require.Equal(t, CommandActive, fixture.persistence.messages[message.ID].CommandStatus, "validation projection and Command CAS must roll back together")
 	require.Empty(t, fixture.persistence.currentJob().TargetResults)
+}
+
+func TestTerminalCommandCrashPersistsGenericRecoveryDescriptorBeforeJobMutation(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	message := fixture.message(t, "command-terminal-crash", "agent-a")
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.conflicts = commandTransitionAttempts
+
+	err := fixture.lifecycle.timeoutUndelivered(context.Background(), message, fixture.now)
+
+	require.ErrorIs(t, err, ErrConflict)
+	stored := fixture.persistence.messages[message.ID]
+	require.Equal(t, CommandTimedOut, stored.CommandStatus)
+	require.Equal(t, TargetTimedOut, stored.TerminalTargetStatus)
+	require.Equal(t, "Job timeout elapsed before delivery", stored.TerminalTargetError)
+	require.True(t, stored.TerminalReconcilePending)
+	require.True(t, stored.TerminalAuditPending)
+	require.Equal(t, "command.undelivered_timed_out", stored.TerminalAuditAction)
+	require.Equal(t, "command.undelivered_timed_out:"+message.ID, stored.TerminalAuditDedupeKey)
 }
 
 func TestDatabaseInstanceValidationTerminalizationDoesNotReauthorizeMutableTarget(t *testing.T) {
@@ -1667,6 +1697,9 @@ func (store *memoryCommandPersistence) ClaimOutbox(context.Context, int, time.Ti
 	defer store.mu.Unlock()
 	claimed := append([]OutboxMessage(nil), store.claimed...)
 	for index := range claimed {
+		if _, exists := store.messages[claimed[index].ID]; !exists {
+			store.messages[claimed[index].ID] = claimed[index]
+		}
 		claimed[index].PreparedEnvelope = append([]byte(nil), store.prepared[claimed[index].ID]...)
 	}
 	return claimed, nil
@@ -1881,6 +1914,10 @@ func (store *memoryCommandPersistence) FinalizeExpiredExecution(_ context.Contex
 	message.TerminalAuditAction = "command.execution_timed_out"
 	message.TerminalAuditResult = "failure"
 	message.TerminalAuditDetail = map[string]any{"reason": "execution_deadline"}
+	message.TerminalTargetStatus = TargetTimedOut
+	message.TerminalTargetError = "execution lease expired"
+	message.TerminalTargetArtifacts = []ArtifactReference{}
+	message.TerminalReconcilePending = false
 	store.jobs[message.JobID] = next
 	store.messages[claim.CommandID] = message
 	return nil
@@ -1916,6 +1953,10 @@ func (store *memoryCommandPersistence) FinalizeExpiredPrepared(_ context.Context
 	message.TerminalAuditAction = "command.prepared_envelope_expired"
 	message.TerminalAuditResult = "failure"
 	message.TerminalAuditDetail = map[string]any{"reason": "prepare_envelope_expiry", "expires_at": expiresAt.UTC()}
+	message.TerminalTargetStatus = TargetTimedOut
+	message.TerminalTargetError = "execution lease expired"
+	message.TerminalTargetArtifacts = []ArtifactReference{}
+	message.TerminalReconcilePending = false
 	store.jobs[message.JobID] = next
 	store.messages[commandID] = message
 	return nil
@@ -2002,6 +2043,10 @@ func (store *memoryCommandPersistence) MarkTerminalAuditRecorded(_ context.Conte
 func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	terminalInput := TerminalCommand{Scope: input.Scope, CommandID: input.CommandID, Status: input.Status, Target: input.Target, Audit: input.Audit, At: input.At}
+	if validateTerminalCommand(terminalInput) != nil {
+		return TerminalResultOutcome{CommandID: input.CommandID}, ErrInvalidCommandPayload
+	}
 	message, ok := store.messages[input.CommandID]
 	if !ok || message.Scope != input.Scope {
 		return TerminalResultOutcome{CommandID: input.CommandID}, ErrNotFound
@@ -2011,7 +2056,18 @@ func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, 
 		if !bytes.Equal(message.ExecutionTokenHash, input.TokenHash[:]) || message.ExecutionRevision != input.ExpectedExecutionRevision {
 			return outcome, ErrConflict
 		}
+		if message.CommandStatus == CommandTimedOut && len(message.TerminalResultDigest) == 0 && input.AllowTimedOutDigestAttach {
+			message.TerminalResultDigest = append([]byte(nil), input.ResultDigest[:]...)
+			store.messages[input.CommandID] = message
+			outcome.Status, outcome.ResultDigest, outcome.Persisted, outcome.Duplicate = CommandTimedOut, input.ResultDigest, true, true
+			return outcome, nil
+		}
 		if message.CommandStatus == input.Status && bytes.Equal(message.TerminalResultDigest, input.ResultDigest[:]) {
+			if !terminalEvidenceCompatible(message, terminalInput) {
+				return outcome, ErrConflict
+			}
+			applyMemoryTerminalEvidence(&message, terminalInput)
+			store.messages[input.CommandID] = message
 			outcome.Status = input.Status
 			outcome.ResultDigest = input.ResultDigest
 			outcome.Persisted = true
@@ -2033,8 +2089,22 @@ func (store *memoryCommandPersistence) PersistTerminalResult(_ context.Context, 
 	message.RecoveryClaimToken = nil
 	message.RecoveryClaimedDeadline = nil
 	message.RecoveryClaimedRevision = 0
+	applyMemoryTerminalEvidence(&message, terminalInput)
 	store.messages[input.CommandID] = message
 	return TerminalResultOutcome{CommandID: input.CommandID, JobID: message.JobID, TargetID: message.TargetID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+
+func applyMemoryTerminalEvidence(message *OutboxMessage, input TerminalCommand) {
+	message.TerminalTargetStatus = input.Target.Status
+	message.TerminalTargetError = input.Target.ErrorSummary
+	message.TerminalTargetResult = input.Target.ResultSummary
+	message.TerminalTargetArtifacts = append([]ArtifactReference(nil), input.Target.Artifacts...)
+	message.TerminalReconcilePending = true
+	message.TerminalAuditPending = message.TerminalAuditRecordedAt == nil
+	message.TerminalAuditDedupeKey = input.Audit.DedupeKey
+	message.TerminalAuditAction = input.Audit.Action
+	message.TerminalAuditResult = input.Audit.Result
+	message.TerminalAuditDetail = input.Audit.Detail
 }
 func (store *memoryCommandPersistence) LookupCommand(_ context.Context, id string) (OutboxMessage, error) {
 	store.mu.Lock()
@@ -2083,35 +2153,6 @@ func (store *memoryCommandPersistence) DeferCancellation(_ context.Context, _ pl
 	store.messages[id] = message
 	return nil
 }
-func (store *memoryCommandPersistence) AcknowledgeCommand(_ context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time, deadline *time.Time) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if status == CommandActive {
-		return nil
-	}
-	store.markCalls++
-	if len(store.markErrors) > 0 {
-		err := store.markErrors[0]
-		store.markErrors = store.markErrors[1:]
-		if err != nil {
-			return err
-		}
-	}
-	message := store.messages[id]
-	message.CommandStatus = status
-	message.AcknowledgedAt = &at
-	if status == CommandActive {
-		message.LastHeartbeatAt = &at
-		if message.StartEnqueuedAt == nil {
-			message.StartEnqueuedAt = timePointer(at.UTC())
-		}
-	}
-	message.ExecutionDeadline = deadline
-	message.PublishedAt = &at
-	store.messages[id] = message
-	store.published = append(store.published, publishedCommand{scope: scope, id: id})
-	return nil
-}
 func (store *memoryCommandPersistence) RenewCommandLease(_ context.Context, _ platformscope.Scope, id string, at, deadline time.Time) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -2143,6 +2184,46 @@ func (store *memoryCommandPersistence) MarkCommandTerminal(_ context.Context, sc
 	message.ExecutionDeadline = nil
 	store.messages[id] = message
 	store.published = append(store.published, publishedCommand{scope: scope, id: id})
+	return nil
+}
+func (store *memoryCommandPersistence) PersistTerminalCommand(_ context.Context, input TerminalCommand) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.markCalls++
+	if len(store.markErrors) > 0 {
+		err := store.markErrors[0]
+		store.markErrors = store.markErrors[1:]
+		if err != nil {
+			return err
+		}
+	}
+	if validateTerminalCommand(input) != nil {
+		return ErrInvalidCommandPayload
+	}
+	message, ok := store.messages[input.CommandID]
+	if !ok || message.Scope != input.Scope || message.TargetID != input.Target.TargetID {
+		return ErrNotFound
+	}
+	if terminalCommandStatus(message.CommandStatus) && message.CommandStatus != input.Status {
+		return ErrConflict
+	}
+	message.CommandStatus = input.Status
+	message.Phase = phaseForCommandStatus(input.Status)
+	message.PublishedAt = timePointer(input.At.UTC())
+	message.TerminalAt = timePointer(input.At.UTC())
+	message.ExecutionDeadline = nil
+	message.TerminalTargetStatus = input.Target.Status
+	message.TerminalTargetError = input.Target.ErrorSummary
+	message.TerminalTargetResult = input.Target.ResultSummary
+	message.TerminalTargetArtifacts = append([]ArtifactReference(nil), input.Target.Artifacts...)
+	message.TerminalReconcilePending = true
+	message.TerminalAuditPending = true
+	message.TerminalAuditDedupeKey = input.Audit.DedupeKey
+	message.TerminalAuditAction = input.Audit.Action
+	message.TerminalAuditResult = input.Audit.Result
+	message.TerminalAuditDetail = input.Audit.Detail
+	store.messages[input.CommandID] = message
+	store.published = append(store.published, publishedCommand{scope: input.Scope, id: input.CommandID})
 	return nil
 }
 func (store *memoryCommandPersistence) PendingCancellationsForAgent(_ context.Context, agentID string, _ int) ([]OutboxMessage, error) {

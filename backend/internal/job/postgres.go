@@ -25,8 +25,8 @@ const DefaultOutboxLease = 30 * time.Second
 const DefaultCancellationRetry = 30 * time.Second
 
 const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id, max_concurrency, target_timeout_seconds"
-const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at, terminal_audit_pending, terminal_audit_dedupe_key, terminal_audit_action, terminal_audit_result, terminal_audit_detail, terminal_audit_lease_expires_at, terminal_audit_attempts, terminal_audit_recorded_at"
-const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at, o.terminal_audit_pending, o.terminal_audit_dedupe_key, o.terminal_audit_action, o.terminal_audit_result, o.terminal_audit_detail, o.terminal_audit_lease_expires_at, o.terminal_audit_attempts, o.terminal_audit_recorded_at"
+const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at, terminal_audit_pending, terminal_audit_dedupe_key, terminal_audit_action, terminal_audit_result, terminal_audit_detail, terminal_audit_lease_expires_at, terminal_audit_attempts, terminal_audit_recorded_at, terminal_target_status, terminal_target_error_summary, terminal_target_result_summary, terminal_target_artifacts, terminal_reconcile_pending"
+const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at, o.terminal_audit_pending, o.terminal_audit_dedupe_key, o.terminal_audit_action, o.terminal_audit_result, o.terminal_audit_detail, o.terminal_audit_lease_expires_at, o.terminal_audit_attempts, o.terminal_audit_recorded_at, o.terminal_target_status, o.terminal_target_error_summary, o.terminal_target_result_summary, o.terminal_target_artifacts, o.terminal_reconcile_pending"
 const insertJobSQL = "INSERT INTO jobs (" + jobColumnsSQL + ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)"
 const insertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
 const upsertTargetSQL = "INSERT INTO job_targets (tenant_id, project_id, job_id, target_id, status, error_summary, result_summary, artifacts, finished_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (tenant_id, project_id, job_id, target_id) DO UPDATE SET status = EXCLUDED.status, error_summary = EXCLUDED.error_summary, result_summary = EXCLUDED.result_summary, artifacts = EXCLUDED.artifacts, finished_at = EXCLUDED.finished_at"
@@ -45,7 +45,6 @@ const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope =
 const requestCommandCancellationSQL = "UPDATE command_outbox SET cancellation_requested_at = COALESCE(cancellation_requested_at, $4), cancellation_reason = CASE WHEN cancellation_requested_at IS NULL THEN $5 ELSE cancellation_reason END, cancellation_available_at = COALESCE(cancellation_available_at, $4), lease_expires_at = NULL, command_phase = CASE WHEN command_phase IN ('start_authorized', 'running', 'cancelling') THEN 'cancelling' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND command_status IN ('pending', 'active')"
 const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling') AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
 const deferCancellationSQL = "UPDATE command_outbox SET cancellation_available_at = $1, cancellation_lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4 AND cancellation_requested_at IS NOT NULL AND command_status IN ('pending', 'active')"
-const acknowledgeCommandSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL, command_status = $2, command_phase = CASE WHEN $2 = 'active' THEN CASE WHEN command_phase = 'cancelling' THEN 'cancelling' ELSE 'running' END ELSE 'rejected' END, acknowledged_at = COALESCE(acknowledged_at, $1), execution_deadline_at = $3, execution_last_heartbeat_at = CASE WHEN $2 = 'active' THEN $1 ELSE execution_last_heartbeat_at END, start_enqueued_at = CASE WHEN $2 = 'active' THEN COALESCE(start_enqueued_at, $1) ELSE start_enqueued_at END, terminal_at = CASE WHEN $2 = 'rejected' THEN $1 ELSE terminal_at END WHERE tenant_id = $4 AND project_id = $5 AND id = $6 AND command_status IN ('pending', 'active', 'rejected') AND (($2 = 'active' AND command_phase IN ('start_authorized', 'running', 'cancelling')) OR ($2 = 'rejected' AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'rejected')))"
 const renewCommandLeaseSQL = "UPDATE command_outbox SET execution_last_heartbeat_at = $1, execution_deadline_at = $2, recovery_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND command_status = 'active'"
 const claimExpiredCommandsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE published_at IS NOT NULL AND command_status IN ('pending', 'active') AND execution_deadline_at IS NOT NULL AND execution_deadline_at <= $1 AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at <= $1) ORDER BY execution_deadline_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET recovery_lease_expires_at = $3 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY execution_deadline_at, id"
 const markCommandTerminalSQL = "UPDATE command_outbox SET command_status = $1, command_phase = $1, terminal_at = COALESCE(terminal_at, $2), published_at = COALESCE(published_at, $2), lease_expires_at = NULL, execution_deadline_at = NULL, recovery_lease_expires_at = NULL, recovery_claim_token = NULL, recovery_claimed_deadline = NULL, recovery_claimed_revision = NULL, cancellation_lease_expires_at = NULL WHERE tenant_id = $3 AND project_id = $4 AND id = $5 AND (command_status IN ('pending', 'active', 'rejected') OR command_status = $1)"
@@ -225,6 +224,188 @@ func (repository *PostgresRepository) GetOperation(ctx context.Context, scope pl
 		return Job{}, OutboxMessage{}, fmt.Errorf("commit operation snapshot: %w", err)
 	}
 	return value, message, nil
+}
+
+func (repository *PostgresRepository) ReconcileTerminalCommands(ctx context.Context, limit int, at time.Time) (int, error) {
+	if repository == nil || repository.db == nil || ctx == nil || limit < 1 || limit > 1024 || at.IsZero() {
+		return 0, ErrInvalidCommandPayload
+	}
+	rows, err := repository.db.QueryContext(ctx, `
+		SELECT outbox.tenant_id,outbox.project_id,outbox.job_id,outbox.id
+		FROM command_outbox outbox
+		JOIN jobs value ON value.tenant_id=outbox.tenant_id AND value.project_id=outbox.project_id AND value.id=outbox.job_id
+		JOIN job_targets target ON target.tenant_id=outbox.tenant_id AND target.project_id=outbox.project_id AND target.job_id=outbox.job_id AND target.target_id=outbox.target_id
+		WHERE outbox.command_status IN ('succeeded','failed','cancelled','timed_out','rejected')
+		  AND (outbox.terminal_reconcile_pending OR value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR target.status NOT IN ('succeeded','failed','skipped','cancelled','timed_out'))
+		ORDER BY outbox.terminal_at,outbox.created_at,outbox.id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return 0, classifyReadError("list terminal commands for reconciliation", err)
+	}
+	type candidate struct {
+		scope            platformscope.Scope
+		jobID, commandID string
+	}
+	values := make([]candidate, 0, limit)
+	for rows.Next() {
+		var value candidate
+		if err := rows.Scan(&value.scope.TenantID, &value.scope.ProjectID, &value.jobID, &value.commandID); err != nil {
+			_ = rows.Close()
+			return 0, classifyReadError("scan terminal command reconciliation", err)
+		}
+		values = append(values, value)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, classifyReadError("close terminal command reconciliation", err)
+	}
+	var reconcileErrors []error
+	reconciled := 0
+	for _, value := range values {
+		if err := repository.reconcileTerminalCommand(ctx, value.scope, value.jobID, value.commandID, at.UTC()); err != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile terminal command %q: %w", value.commandID, err))
+			continue
+		}
+		reconciled++
+	}
+	return reconciled, errors.Join(reconcileErrors...)
+}
+
+func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Context, scope platformscope.Scope, jobID, commandID string, at time.Time) error {
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	current, err := scanJob(tx.QueryRowContext(ctx, selectJobForUpdateSQL, scope.TenantID, scope.ProjectID, jobID))
+	if err != nil {
+		return rollback(classifyReadError("lock Job for terminal command reconciliation", err))
+	}
+	current.TargetResults, err = getTargetsFrom(ctx, tx, scope, jobID)
+	if err != nil {
+		return rollback(err)
+	}
+	current.TargetResourceIDs = make([]string, len(current.TargetResults))
+	for index := range current.TargetResults {
+		current.TargetResourceIDs[index] = current.TargetResults[index].TargetID
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL+` FOR UPDATE`, commandID, scope.TenantID, scope.ProjectID, jobID))
+	if err != nil {
+		return rollback(classifyReadError("lock terminal command for reconciliation", err))
+	}
+	if !terminalCommandStatus(message.CommandStatus) || message.TerminalAt == nil || !containsTarget(current.TargetResourceIDs, message.TargetID) {
+		return rollback(ErrConflict)
+	}
+	target, hasDescriptor, err := terminalTargetFromOutbox(message)
+	if err != nil {
+		return rollback(err)
+	}
+	existing, found := targetFor(current.TargetResults, message.TargetID)
+	if found && isTerminalTarget(existing.Status) {
+		if existing.Status != target.Status || hasDescriptor && !matchingTerminalTarget(existing, target) {
+			return rollback(ErrConflict)
+		}
+		target = existing
+	} else if isTerminal(current.Status) {
+		return rollback(ErrConflict)
+	} else {
+		if current.Status == StatusQueued {
+			current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
+			if err != nil {
+				return rollback(err)
+			}
+		}
+		to, actor := StatusRunning, ""
+		if current.Status == StatusCancelling {
+			to, actor = StatusCancelling, current.CancelRequestedBy
+		}
+		current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: to, Actor: actor, TargetResults: []TargetResult{target}, At: at})
+		if err != nil {
+			return rollback(err)
+		}
+	}
+	if allTargetsTerminal(current) && !isTerminal(current.Status) {
+		terminalStatus := terminalJobStatus(current)
+		current, err = transitionInTx(ctx, tx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: terminalStatus, Artifacts: collectArtifacts(current.TargetResults), ResultSummary: "Agent commands completed", At: at})
+		if err != nil {
+			return rollback(err)
+		}
+	}
+	if isTerminal(current.Status) && current.Status != terminalJobStatus(current) {
+		return rollback(ErrConflict)
+	}
+	artifacts, err := json.Marshal(target.Artifacts)
+	if err != nil {
+		return rollback(ErrInvalidCommandPayload)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=FALSE WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND command_status=$9`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, scope.TenantID, scope.ProjectID, commandID, jobID, string(message.CommandStatus))
+	if err != nil {
+		return rollback(classifyWriteError("complete terminal command reconciliation", err))
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit terminal command reconciliation: %w", err)
+	}
+	return nil
+}
+
+func terminalTargetFromOutbox(message OutboxMessage) (TargetResult, bool, error) {
+	if !terminalCommandStatus(message.CommandStatus) || message.TerminalAt == nil {
+		return TargetResult{}, false, ErrInvalidCommandPayload
+	}
+	target := TargetResult{TargetID: message.TargetID, Status: message.TerminalTargetStatus, ErrorSummary: message.TerminalTargetError, ResultSummary: message.TerminalTargetResult, Artifacts: append([]ArtifactReference(nil), message.TerminalTargetArtifacts...), FinishedAt: timePointer(message.TerminalAt.UTC())}
+	hasDescriptor := target.Status != ""
+	if !hasDescriptor {
+		switch message.CommandStatus {
+		case CommandSucceeded:
+			target.Status, target.ResultSummary = TargetSucceeded, "Agent command succeeded"
+		case CommandCancelled:
+			target.Status, target.ResultSummary = TargetCancelled, "Agent command cancelled"
+		case CommandTimedOut:
+			target.Status, target.ErrorSummary, target.ResultSummary = TargetTimedOut, "command_timed_out", "Agent command failed"
+		case CommandRejected:
+			target.Status, target.ErrorSummary, target.ResultSummary = TargetFailed, "command_rejected", "Agent command failed"
+		default:
+			target.Status, target.ErrorSummary, target.ResultSummary = TargetFailed, "command_failed", "Agent command failed"
+		}
+	}
+	if !isTerminalTarget(target.Status) || !terminalTargetMatchesCommand(target.Status, message.CommandStatus) {
+		return TargetResult{}, false, ErrConflict
+	}
+	return target, hasDescriptor, nil
+}
+
+func terminalTargetMatchesCommand(target TargetStatus, command CommandStatus) bool {
+	switch command {
+	case CommandSucceeded:
+		return target == TargetSucceeded
+	case CommandCancelled:
+		return target == TargetCancelled
+	case CommandTimedOut:
+		return target == TargetTimedOut
+	case CommandFailed, CommandRejected:
+		return target == TargetFailed
+	default:
+		return false
+	}
+}
+
+func terminalJobStatus(value Job) Status {
+	if value.Progress.CompletedTargets > 0 {
+		return StatusSucceeded
+	}
+	if allTargetsCancelled(value.TargetResults) {
+		return StatusCancelled
+	}
+	if hasTimedOutTarget(value.TargetResults) {
+		return StatusTimedOut
+	}
+	return StatusFailed
 }
 
 // UpgradeOperationIdempotencyKey binds a verified legacy operation snapshot to
@@ -728,32 +909,6 @@ func (repository *PostgresRepository) DeferCancellation(ctx context.Context, sco
 	return repository.execScopedCommand(ctx, deferCancellationSQL, []any{availableAt.UTC(), scope.TenantID, scope.ProjectID, id})
 }
 
-func (repository *PostgresRepository) AcknowledgeCommand(ctx context.Context, scope platformscope.Scope, id string, status CommandStatus, at time.Time, deadline *time.Time) error {
-	if repository == nil || repository.db == nil {
-		return errors.New("job PostgreSQL repository is unavailable")
-	}
-	if ctx == nil || scope.Validate() != nil || strings.TrimSpace(id) == "" {
-		return ErrInvalidCommandPayload
-	}
-	if status != CommandActive && status != CommandRejected {
-		return ErrInvalidCommandPayload
-	}
-	if at.IsZero() {
-		return ErrInvalidCommandPayload
-	}
-	if status == CommandActive {
-		return nil
-	}
-	if deadline != nil {
-		return ErrInvalidCommandPayload
-	}
-	var deadlineValue any
-	if deadline != nil {
-		deadlineValue = deadline.UTC()
-	}
-	return repository.execScopedCommand(ctx, acknowledgeCommandSQL, []any{at.UTC(), string(status), deadlineValue, scope.TenantID, scope.ProjectID, id})
-}
-
 func (repository *PostgresRepository) RenewCommandLease(ctx context.Context, scope platformscope.Scope, id string, at, deadline time.Time) error {
 	if at.IsZero() || !deadline.After(at) {
 		return ErrInvalidCommandPayload
@@ -766,6 +921,123 @@ func (repository *PostgresRepository) MarkCommandTerminal(ctx context.Context, s
 		return ErrInvalidCommandPayload
 	}
 	return repository.execScopedCommand(ctx, markCommandTerminalSQL, []any{string(status), at.UTC(), scope.TenantID, scope.ProjectID, id})
+}
+
+func (repository *PostgresRepository) PersistTerminalCommand(ctx context.Context, input TerminalCommand) error {
+	if repository == nil || repository.db == nil || ctx == nil || validateTerminalCommand(input) != nil {
+		return ErrInvalidCommandPayload
+	}
+	artifacts, err := json.Marshal(input.Target.Artifacts)
+	if err != nil {
+		return ErrInvalidCommandPayload
+	}
+	detail, err := json.Marshal(input.Audit.Detail)
+	if err != nil {
+		return ErrInvalidCommandPayload
+	}
+	var jobID string
+	if err := repository.db.QueryRowContext(ctx, `SELECT job_id FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID).Scan(&jobID); err != nil {
+		return classifyReadError("lookup terminal command Job", err)
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	rollback := func(cause error) error {
+		_ = tx.Rollback()
+		return cause
+	}
+	var lockedJobID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND id=$3 FOR UPDATE`, input.Scope.TenantID, input.Scope.ProjectID, jobID).Scan(&lockedJobID); err != nil {
+		return rollback(classifyReadError("lock terminal command Job", err))
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, `SELECT `+outboxColumnsSQL+` FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 FOR UPDATE`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(ErrNotFound)
+	}
+	if err != nil {
+		return rollback(classifyReadError("lock terminal command", err))
+	}
+	if message.JobID != lockedJobID || message.TargetID != input.Target.TargetID {
+		return rollback(ErrConflict)
+	}
+	if message.TerminalTargetStatus != "" && (message.TerminalTargetStatus != input.Target.Status || message.TerminalTargetError != input.Target.ErrorSummary || message.TerminalTargetResult != input.Target.ResultSummary || !artifactReferencesEqual(message.TerminalTargetArtifacts, input.Target.Artifacts)) {
+		return rollback(ErrConflict)
+	}
+	if message.TerminalAuditDedupeKey != "" && (message.TerminalAuditDedupeKey != input.Audit.DedupeKey || message.TerminalAuditAction != input.Audit.Action || message.TerminalAuditResult != input.Audit.Result || !terminalAuditDetailsEqual(message.TerminalAuditDetail, input.Audit.Detail)) {
+		return rollback(ErrConflict)
+	}
+	if terminalCommandStatus(message.CommandStatus) {
+		if message.CommandStatus != input.Status {
+			return rollback(ErrConflict)
+		}
+	} else if input.Status == CommandRejected {
+		if message.CancellationRequestedAt != nil || message.Phase != "" && message.Phase != CommandPhasePending && message.Phase != CommandPhasePreparing && message.Phase != CommandPhasePrepared {
+			return rollback(ErrConflict)
+		}
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET command_status=$1,command_phase=$1,terminal_at=COALESCE(terminal_at,$2),published_at=COALESCE(published_at,$2),
+			acknowledged_at=CASE WHEN $1='rejected' THEN COALESCE(acknowledged_at,$2) ELSE acknowledged_at END,
+			lease_expires_at=NULL,execution_deadline_at=NULL,recovery_lease_expires_at=NULL,
+			recovery_claim_token=NULL,recovery_claimed_deadline=NULL,recovery_claimed_revision=NULL,cancellation_lease_expires_at=NULL,
+			terminal_target_status=$3,terminal_target_error_summary=$4,terminal_target_result_summary=$5,terminal_target_artifacts=$6,
+			terminal_reconcile_pending=TRUE,terminal_audit_pending=(terminal_audit_recorded_at IS NULL),
+			terminal_audit_dedupe_key=$7,terminal_audit_action=$8,terminal_audit_result=$9,terminal_audit_detail=$10,
+			terminal_audit_lease_expires_at=CASE WHEN terminal_audit_recorded_at IS NULL THEN NULL ELSE terminal_audit_lease_expires_at END
+		WHERE tenant_id=$11 AND project_id=$12 AND id=$13
+	`, string(input.Status), input.At.UTC(), string(input.Target.Status), input.Target.ErrorSummary, input.Target.ResultSummary, artifacts, input.Audit.DedupeKey, input.Audit.Action, input.Audit.Result, detail, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID)
+	if err != nil {
+		return rollback(classifyWriteError("persist terminal command", err))
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return rollback(ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit terminal command: %w: %w", ErrAmbiguousCommit, err)
+	}
+	return nil
+}
+
+func validateTerminalCommand(input TerminalCommand) error {
+	if input.Scope.Validate() != nil || strings.TrimSpace(input.CommandID) == "" || !terminalCommandStatus(input.Status) || input.At.IsZero() || input.Target.TargetID == "" || !isTerminalTarget(input.Target.Status) || !terminalTargetMatchesCommand(input.Target.Status, input.Status) || strings.TrimSpace(input.Audit.DedupeKey) == "" || strings.TrimSpace(input.Audit.Action) == "" || input.Audit.Result != "success" && input.Audit.Result != "failure" {
+		return ErrInvalidCommandPayload
+	}
+	for _, value := range []string{input.Target.ErrorSummary, input.Target.ResultSummary} {
+		if len(value) > maximumInlineResultSummary || strings.ContainsAny(value, "\r\n\t") {
+			return ErrInvalidCommandPayload
+		}
+	}
+	for _, value := range []string{input.Audit.DedupeKey, input.Audit.Action} {
+		if len(value) > 512 || strings.ContainsAny(value, "\r\n\t") {
+			return ErrInvalidCommandPayload
+		}
+	}
+	for _, artifact := range input.Target.Artifacts {
+		if strings.TrimSpace(artifact.ArtifactID) == "" || strings.TrimSpace(artifact.Kind) == "" {
+			return ErrInvalidCommandPayload
+		}
+	}
+	return nil
+}
+
+func artifactReferencesEqual(left, right []ArtifactReference) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func terminalAuditDetailsEqual(left, right map[string]any) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func CancelValidationInTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, jobID, commandID, agentID string, at time.Time) error {
@@ -803,7 +1075,7 @@ func CancelValidationInTx(ctx context.Context, tx *sql.Tx, scope platformscope.S
 		return ErrConflict
 	}
 	detail := `{"reason":"instance_retired"}`
-	result, err = tx.ExecContext(ctx, `UPDATE command_outbox SET command_status='cancelled',command_phase='cancelled',terminal_at=$1,published_at=COALESCE(published_at,$1),lease_expires_at=NULL,execution_deadline_at=NULL,recovery_lease_expires_at=NULL,recovery_claim_token=NULL,recovery_claimed_deadline=NULL,recovery_claimed_revision=NULL,cancellation_lease_expires_at=NULL,terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.validation_cancelled_on_retire',terminal_audit_result='failure',terminal_audit_detail=$3::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_attempts=0,terminal_audit_recorded_at=NULL WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND id=$7 AND command_status IN ('pending','active','rejected')`, at.UTC(), "command.validation_cancelled_on_retire:"+commandID, detail, scope.TenantID, scope.ProjectID, jobID, commandID)
+	result, err = tx.ExecContext(ctx, `UPDATE command_outbox SET command_status='cancelled',command_phase='cancelled',terminal_at=$1,published_at=COALESCE(published_at,$1),lease_expires_at=NULL,execution_deadline_at=NULL,recovery_lease_expires_at=NULL,recovery_claim_token=NULL,recovery_claimed_deadline=NULL,recovery_claimed_revision=NULL,cancellation_lease_expires_at=NULL,terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.validation_cancelled_on_retire',terminal_audit_result='failure',terminal_audit_detail=$3::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_attempts=0,terminal_audit_recorded_at=NULL,terminal_target_status='cancelled',terminal_target_error_summary='',terminal_target_result_summary='database instance connection validation cancelled',terminal_target_artifacts='[]'::jsonb,terminal_reconcile_pending=FALSE WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND id=$7 AND command_status IN ('pending','active','rejected')`, at.UTC(), "command.validation_cancelled_on_retire:"+commandID, detail, scope.TenantID, scope.ProjectID, jobID, commandID)
 	if err != nil {
 		return classifyWriteError("cancel validation command on retirement", err)
 	}
@@ -841,7 +1113,7 @@ func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Conte
 				if current.Status != terminalJobStatusForTarget(target.Status) {
 					return ErrConflict
 				}
-				return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+				return repository.persistValidationRepairCommand(ctx, scope, commandID, target, commandStatus, at)
 			}
 			if current.Status != StatusRunning && current.Status != StatusCancelling {
 				return ErrConflict
@@ -853,13 +1125,13 @@ func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Conte
 			if err != nil {
 				return err
 			}
-			return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+			return repository.persistValidationRepairCommand(ctx, scope, commandID, target, commandStatus, at)
 		}
 		if isTerminal(current.Status) {
 			if !found || !matchingTerminalTarget(existing, target) || current.Status != terminalJobStatusForTarget(target.Status) {
 				return ErrConflict
 			}
-			return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+			return repository.persistValidationRepairCommand(ctx, scope, commandID, target, commandStatus, at)
 		}
 		if current.Status == StatusQueued {
 			_, err = repository.Transition(ctx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
@@ -891,9 +1163,41 @@ func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Conte
 		if err != nil {
 			return err
 		}
-		return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+		return repository.persistValidationRepairCommand(ctx, scope, commandID, target, commandStatus, at)
 	}
 	return ErrConflict
+}
+
+func (repository *PostgresRepository) persistValidationRepairCommand(ctx context.Context, scope platformscope.Scope, commandID string, target TargetResult, status CommandStatus, at time.Time) error {
+	stored, err := repository.LookupCommand(ctx, commandID)
+	if err != nil {
+		return err
+	}
+	if stored.Scope != scope {
+		return ErrConflict
+	}
+	if terminalCommandStatus(stored.CommandStatus) {
+		if stored.CommandStatus != status {
+			return ErrConflict
+		}
+		if stored.TerminalTargetStatus != "" {
+			if stored.TerminalTargetStatus != target.Status || stored.TerminalTargetError != target.ErrorSummary || stored.TerminalTargetResult != target.ResultSummary || !artifactReferencesEqual(stored.TerminalTargetArtifacts, target.Artifacts) {
+				return ErrConflict
+			}
+			return nil
+		}
+	}
+	state := agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED.String()
+	auditResult := "failure"
+	switch status {
+	case CommandSucceeded:
+		state, auditResult = agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED.String(), "success"
+	case CommandCancelled:
+		state = agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED.String()
+	case CommandTimedOut:
+		state = agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT.String()
+	}
+	return repository.PersistTerminalCommand(ctx, TerminalCommand{Scope: scope, CommandID: commandID, Status: status, Target: target, Audit: TerminalAudit{DedupeKey: "command.result:" + commandID, Action: "command.result", Result: auditResult, Detail: map[string]any{"artifact_count": len(target.Artifacts), "state": state}}, At: at})
 }
 
 func terminalJobStatusForTarget(status TargetStatus) Status {
@@ -1344,7 +1648,10 @@ func (repository *PostgresRepository) FinalizeExpiredExecution(ctx context.Conte
 			terminal_audit_pending = TRUE, terminal_audit_dedupe_key = $8,
 			terminal_audit_action = 'command.execution_timed_out', terminal_audit_result = 'failure',
 			terminal_audit_detail = $9, terminal_audit_lease_expires_at = NULL,
-			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL
+			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL,
+			terminal_target_status = 'timed_out', terminal_target_error_summary = 'execution lease expired',
+			terminal_target_result_summary = '', terminal_target_artifacts = '[]'::jsonb,
+			terminal_reconcile_pending = FALSE
 		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
 			AND command_phase IN ('start_authorized', 'running', 'cancelling')
 			AND recovery_claim_token = $5 AND execution_deadline_at = $6
@@ -1432,7 +1739,10 @@ func (repository *PostgresRepository) FinalizeExpiredPrepared(ctx context.Contex
 			terminal_audit_pending = TRUE, terminal_audit_dedupe_key = $5,
 			terminal_audit_action = 'command.prepared_envelope_expired', terminal_audit_result = 'failure',
 			terminal_audit_detail = $6, terminal_audit_lease_expires_at = NULL,
-			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL
+			terminal_audit_attempts = 0, terminal_audit_recorded_at = NULL,
+			terminal_target_status = 'timed_out', terminal_target_error_summary = 'execution lease expired',
+			terminal_target_result_summary = '', terminal_target_artifacts = '[]'::jsonb,
+			terminal_reconcile_pending = FALSE
 		WHERE tenant_id = $2 AND project_id = $3 AND id = $4
 			AND command_phase = 'prepared' AND prepare_digest = $7
 	`, at, scope.TenantID, scope.ProjectID, commandID, dedupeKey, auditDetail, expectedDigest[:])
@@ -1510,8 +1820,13 @@ func timeoutJobTargetInTx(ctx context.Context, tx *sql.Tx, current Job, message 
 
 func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context, input TerminalResultCAS) (TerminalResultOutcome, error) {
 	base := TerminalResultOutcome{CommandID: input.CommandID}
-	if repository == nil || repository.db == nil || ctx == nil || input.Scope.Validate() != nil || strings.TrimSpace(input.CommandID) == "" || input.ExpectedExecutionRevision == 0 || !terminalCommandStatus(input.Status) || input.Status == CommandRejected || (input.AllowTimedOutDigestAttach && input.Status != CommandTimedOut) || input.At.IsZero() {
+	terminalInput := TerminalCommand{Scope: input.Scope, CommandID: input.CommandID, Status: input.Status, Target: input.Target, Audit: input.Audit, At: input.At}
+	if repository == nil || repository.db == nil || ctx == nil || input.ExpectedExecutionRevision == 0 || input.Status == CommandRejected || (input.AllowTimedOutDigestAttach && input.Status != CommandTimedOut) || validateTerminalCommand(terminalInput) != nil {
 		return base, ErrInvalidCommandPayload
+	}
+	var jobID string
+	if err := repository.db.QueryRowContext(ctx, `SELECT job_id FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID).Scan(&jobID); err != nil {
+		return base, classifyReadError("lookup command terminal result Job", err)
 	}
 	tx, err := repository.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1521,30 +1836,27 @@ func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context,
 		_ = tx.Rollback()
 		return base, cause
 	}
-	var phase CommandPhase
-	var storedStatus CommandStatus
-	var storedTokenHash, storedDigest []byte
-	var storedExecutionRevision uint64
-	err = tx.QueryRowContext(ctx, `
-		SELECT job_id, target_id, command_phase, command_status, execution_token_hash,
-			execution_revision, terminal_result_digest
-		FROM command_outbox
-		WHERE tenant_id = $1 AND project_id = $2 AND id = $3
-		FOR UPDATE
-	`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID).Scan(&base.JobID, &base.TargetID, &phase, &storedStatus, &storedTokenHash, &storedExecutionRevision, &storedDigest)
+	var lockedJobID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND id=$3 FOR UPDATE`, input.Scope.TenantID, input.Scope.ProjectID, jobID).Scan(&lockedJobID); err != nil {
+		return rollback(classifyReadError("lock command terminal result Job", err))
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, `SELECT `+outboxColumnsSQL+` FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 FOR UPDATE`, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID))
 	if err != nil {
 		return rollback(classifyReadError("lock command terminal result", err))
 	}
-	base.Status = storedStatus
-	if len(storedDigest) == sha256.Size {
-		copy(base.ResultDigest[:], storedDigest)
+	base.JobID, base.TargetID, base.Status = message.JobID, message.TargetID, message.CommandStatus
+	if message.JobID != lockedJobID || message.TargetID != input.Target.TargetID {
+		return rollback(ErrConflict)
 	}
-	fenceMatches := len(storedTokenHash) == sha256.Size && subtle.ConstantTimeCompare(storedTokenHash, input.TokenHash[:]) == 1 && storedExecutionRevision == input.ExpectedExecutionRevision
-	if phase == CommandPhaseSucceeded || phase == CommandPhaseFailed || phase == CommandPhaseCancelled || phase == CommandPhaseTimedOut || phase == CommandPhaseRejected {
+	if len(message.TerminalResultDigest) == sha256.Size {
+		copy(base.ResultDigest[:], message.TerminalResultDigest)
+	}
+	fenceMatches := len(message.ExecutionTokenHash) == sha256.Size && subtle.ConstantTimeCompare(message.ExecutionTokenHash, input.TokenHash[:]) == 1 && message.ExecutionRevision == input.ExpectedExecutionRevision
+	if message.Phase == CommandPhaseSucceeded || message.Phase == CommandPhaseFailed || message.Phase == CommandPhaseCancelled || message.Phase == CommandPhaseTimedOut || message.Phase == CommandPhaseRejected {
 		if !fenceMatches {
 			return rollback(ErrConflict)
 		}
-		if phase == CommandPhaseTimedOut && storedStatus == CommandTimedOut && len(storedDigest) == 0 && input.AllowTimedOutDigestAttach {
+		if message.Phase == CommandPhaseTimedOut && message.CommandStatus == CommandTimedOut && len(message.TerminalResultDigest) == 0 && input.AllowTimedOutDigestAttach {
 			result, updateErr := tx.ExecContext(ctx, `
 				UPDATE command_outbox
 				SET terminal_result_digest = $1
@@ -1571,7 +1883,13 @@ func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context,
 			}
 			return base, nil
 		}
-		if storedStatus == input.Status && len(storedDigest) == sha256.Size && subtle.ConstantTimeCompare(storedDigest, input.ResultDigest[:]) == 1 {
+		if message.CommandStatus == input.Status && len(message.TerminalResultDigest) == sha256.Size && subtle.ConstantTimeCompare(message.TerminalResultDigest, input.ResultDigest[:]) == 1 {
+			if !terminalEvidenceCompatible(message, terminalInput) {
+				return rollback(ErrConflict)
+			}
+			if err := persistTerminalEvidenceTx(ctx, tx, terminalInput); err != nil {
+				return rollback(err)
+			}
 			base.Persisted = true
 			base.Duplicate = true
 			if err := tx.Commit(); err != nil {
@@ -1585,10 +1903,10 @@ func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context,
 		}
 		return base, nil
 	}
-	if !fenceMatches || (phase != CommandPhaseStartAuthorized && phase != CommandPhaseRunning && phase != CommandPhaseCancelling) {
+	if !fenceMatches || (message.Phase != CommandPhaseStartAuthorized && message.Phase != CommandPhaseRunning && message.Phase != CommandPhaseCancelling) {
 		return rollback(ErrConflict)
 	}
-	phase = phaseForCommandStatus(input.Status)
+	phase := phaseForCommandStatus(input.Status)
 	result, err := tx.ExecContext(ctx, `
 		UPDATE command_outbox
 		SET command_phase = $1, command_status = $2, terminal_result_digest = $3, terminal_at = $4,
@@ -1609,10 +1927,38 @@ func (repository *PostgresRepository) PersistTerminalResult(ctx context.Context,
 	if updated != 1 {
 		return rollback(ErrConflict)
 	}
+	if err := persistTerminalEvidenceTx(ctx, tx, terminalInput); err != nil {
+		return rollback(err)
+	}
 	if err := tx.Commit(); err != nil {
 		return TerminalResultOutcome{}, fmt.Errorf("commit terminal result: %w: %w", ErrAmbiguousCommit, err)
 	}
 	return TerminalResultOutcome{CommandID: input.CommandID, JobID: base.JobID, TargetID: base.TargetID, Status: input.Status, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+
+func terminalEvidenceCompatible(message OutboxMessage, input TerminalCommand) bool {
+	targetCompatible := message.TerminalTargetStatus == "" || message.TerminalTargetStatus == input.Target.Status && message.TerminalTargetError == input.Target.ErrorSummary && message.TerminalTargetResult == input.Target.ResultSummary && artifactReferencesEqual(message.TerminalTargetArtifacts, input.Target.Artifacts)
+	auditCompatible := message.TerminalAuditDedupeKey == "" || message.TerminalAuditDedupeKey == input.Audit.DedupeKey && message.TerminalAuditAction == input.Audit.Action && message.TerminalAuditResult == input.Audit.Result && terminalAuditDetailsEqual(message.TerminalAuditDetail, input.Audit.Detail)
+	return targetCompatible && auditCompatible
+}
+
+func persistTerminalEvidenceTx(ctx context.Context, tx *sql.Tx, input TerminalCommand) error {
+	artifacts, err := json.Marshal(input.Target.Artifacts)
+	if err != nil {
+		return ErrInvalidCommandPayload
+	}
+	detail, err := json.Marshal(input.Audit.Detail)
+	if err != nil {
+		return ErrInvalidCommandPayload
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=TRUE,terminal_audit_pending=(terminal_audit_recorded_at IS NULL),terminal_audit_dedupe_key=$5,terminal_audit_action=$6,terminal_audit_result=$7,terminal_audit_detail=$8,terminal_audit_lease_expires_at=CASE WHEN terminal_audit_recorded_at IS NULL THEN NULL ELSE terminal_audit_lease_expires_at END WHERE tenant_id=$9 AND project_id=$10 AND id=$11 AND command_status=$12 AND terminal_at IS NOT NULL`, string(input.Target.Status), input.Target.ErrorSummary, input.Target.ResultSummary, artifacts, input.Audit.DedupeKey, input.Audit.Action, input.Audit.Result, detail, input.Scope.TenantID, input.Scope.ProjectID, input.CommandID, string(input.Status))
+	if err != nil {
+		return classifyWriteError("persist terminal command evidence", err)
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return ErrConflict
+	}
+	return nil
 }
 
 func phaseForCommandStatus(status CommandStatus) CommandPhase {
@@ -1707,7 +2053,7 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	var leased, published, acknowledged, executionDeadline, lastHeartbeat, recoveryLeased, cancelRequested, cancelAvailable, cancelLeased sql.NullTime
 	var prepared, startDeadline, startEnqueued, claimedDeadline, terminal, terminalAuditLeased, terminalAuditRecorded sql.NullTime
 	var claimedRevision sql.NullInt64
-	var terminalAuditDetail []byte
+	var terminalAuditDetail, terminalTargetArtifacts []byte
 	err := row.Scan(
 		&value.ID, &value.Scope.TenantID, &value.Scope.ProjectID, &value.JobID, &value.TargetID, &value.Type,
 		&value.Payload, &value.PreparedEnvelope, &value.AvailableAt, &value.CreatedAt, &leased, &published, &value.Attempts,
@@ -1718,6 +2064,7 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 		&claimedDeadline, &claimedRevision, &value.TerminalResultDigest, &terminal,
 		&value.TerminalAuditPending, &value.TerminalAuditDedupeKey, &value.TerminalAuditAction, &value.TerminalAuditResult,
 		&terminalAuditDetail, &terminalAuditLeased, &value.TerminalAuditAttempts, &terminalAuditRecorded,
+		&value.TerminalTargetStatus, &value.TerminalTargetError, &value.TerminalTargetResult, &terminalTargetArtifacts, &value.TerminalReconcilePending,
 	)
 	if err != nil {
 		return OutboxMessage{}, err
@@ -1749,6 +2096,12 @@ func scanOutbox(row rowScanner) (OutboxMessage, error) {
 	if err := json.Unmarshal(terminalAuditDetail, &value.TerminalAuditDetail); err != nil {
 		return OutboxMessage{}, fmt.Errorf("decode terminal audit detail: %w", err)
 	}
+	if len(terminalTargetArtifacts) == 0 {
+		terminalTargetArtifacts = []byte("[]")
+	}
+	if err := json.Unmarshal(terminalTargetArtifacts, &value.TerminalTargetArtifacts); err != nil {
+		return OutboxMessage{}, fmt.Errorf("decode terminal target artifacts: %w", err)
+	}
 	value.PrepareDigest = append([]byte(nil), value.PrepareDigest...)
 	value.ExecutionTokenHash = append([]byte(nil), value.ExecutionTokenHash...)
 	value.ExecutionTokenCiphertext = append([]byte(nil), value.ExecutionTokenCiphertext...)
@@ -1771,7 +2124,7 @@ func validateNewJob(value Job) error {
 }
 
 func validateOutboxMessage(ctx context.Context, value Job, message OutboxMessage, authorizer commandvalidation.TargetAuthorizer) error {
-	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 || message.Phase != "" || len(message.PrepareDigest) != 0 || message.PreparedAt != nil || len(message.ExecutionTokenHash) != 0 || len(message.ExecutionTokenCiphertext) != 0 || message.ExecutionRevision != 0 || message.RecoveryRevision != 0 || message.StartDeadline != nil || message.StartEnqueuedAt != nil || len(message.RecoveryClaimToken) != 0 || message.RecoveryClaimedDeadline != nil || message.RecoveryClaimedRevision != 0 || len(message.TerminalResultDigest) != 0 || message.TerminalAt != nil || message.TerminalAuditPending || message.TerminalAuditDedupeKey != "" || message.TerminalAuditAction != "" || message.TerminalAuditResult != "" || len(message.TerminalAuditDetail) != 0 || message.TerminalAuditLeasedUntil != nil || message.TerminalAuditAttempts != 0 || message.TerminalAuditRecordedAt != nil {
+	if ctx == nil || strings.TrimSpace(message.ID) == "" || message.ID != strings.TrimSpace(message.ID) || message.Type != commandOutboxType || message.JobID != value.ID || message.Scope != value.Scope || !containsTarget(value.TargetResourceIDs, message.TargetID) || message.CreatedAt.IsZero() || message.AvailableAt.IsZero() || len(message.Payload) == 0 || len(message.PreparedEnvelope) != 0 || message.LeasedUntil != nil || message.PublishedAt != nil || message.Attempts != 0 || message.CommandStatus != "" || message.AcknowledgedAt != nil || message.ExecutionDeadline != nil || message.LastHeartbeatAt != nil || message.RecoveryLeasedUntil != nil || message.CancellationRequestedAt != nil || message.CancellationReason != "" || message.CancellationAvailableAt != nil || message.CancellationLeasedUntil != nil || message.CancellationAttempts != 0 || message.Phase != "" || len(message.PrepareDigest) != 0 || message.PreparedAt != nil || len(message.ExecutionTokenHash) != 0 || len(message.ExecutionTokenCiphertext) != 0 || message.ExecutionRevision != 0 || message.RecoveryRevision != 0 || message.StartDeadline != nil || message.StartEnqueuedAt != nil || len(message.RecoveryClaimToken) != 0 || message.RecoveryClaimedDeadline != nil || message.RecoveryClaimedRevision != 0 || len(message.TerminalResultDigest) != 0 || message.TerminalAt != nil || message.TerminalAuditPending || message.TerminalAuditDedupeKey != "" || message.TerminalAuditAction != "" || message.TerminalAuditResult != "" || len(message.TerminalAuditDetail) != 0 || message.TerminalAuditLeasedUntil != nil || message.TerminalAuditAttempts != 0 || message.TerminalAuditRecordedAt != nil || message.TerminalTargetStatus != "" || message.TerminalTargetError != "" || message.TerminalTargetResult != "" || len(message.TerminalTargetArtifacts) != 0 || message.TerminalReconcilePending {
 		return fmt.Errorf("create outbox message: %w", ErrInvalidCommandPayload)
 	}
 	envelope := new(agentv1.CommandEnvelope)

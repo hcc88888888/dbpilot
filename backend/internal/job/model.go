@@ -203,6 +203,11 @@ type OutboxMessage struct {
 	TerminalAuditLeasedUntil *time.Time          `json:"terminal_audit_leased_until,omitempty"`
 	TerminalAuditAttempts    int                 `json:"terminal_audit_attempts"`
 	TerminalAuditRecordedAt  *time.Time          `json:"terminal_audit_recorded_at,omitempty"`
+	TerminalTargetStatus     TargetStatus        `json:"terminal_target_status,omitempty"`
+	TerminalTargetError      string              `json:"terminal_target_error_summary,omitempty"`
+	TerminalTargetResult     string              `json:"terminal_target_result_summary,omitempty"`
+	TerminalTargetArtifacts  []ArtifactReference `json:"terminal_target_artifacts,omitempty"`
+	TerminalReconcilePending bool                `json:"terminal_reconcile_pending"`
 }
 
 type CommandPhase string
@@ -248,7 +253,25 @@ type TerminalResultCAS struct {
 	Status                    CommandStatus
 	ResultDigest              [32]byte
 	AllowTimedOutDigestAttach bool
+	Target                    TargetResult
+	Audit                     TerminalAudit
 	At                        time.Time
+}
+
+type TerminalAudit struct {
+	DedupeKey string
+	Action    string
+	Result    string
+	Detail    map[string]any
+}
+
+type TerminalCommand struct {
+	Scope     platformscope.Scope
+	CommandID string
+	Status    CommandStatus
+	Target    TargetResult
+	Audit     TerminalAudit
+	At        time.Time
 }
 
 type TerminalResultOutcome struct {

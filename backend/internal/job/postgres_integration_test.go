@@ -31,8 +31,13 @@ func TestTwoPhaseLegacyActiveUpgradeRepairsJobAndAuditWithoutReexecution(t *test
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	value, message := integrationPersistenceFixture("legacy-active", platformscope.Scope{TenantID: "tenant-legacy", ProjectID: "project-legacy"}, now.Add(-5*time.Minute))
 	repository := NewPostgresRepository(database)
-	require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
-	_, err := database.ExecContext(ctx, `UPDATE jobs SET status = 'running', version = 2, dispatched_at = $1, started_at = $1 WHERE id = $2`, now.Add(-4*time.Minute), value.ID)
+	_, err := database.ExecContext(ctx, `INSERT INTO jobs (id,tenant_id,project_id,job_type,status,outcome,instance_id,initiated_by,source_resource_type,source_resource_id,idempotency_key,version,total_targets,completed_targets,failed_targets,skipped_targets,error_summary,result_summary,artifacts,created_at,timeout_at,request_id,trace_id) VALUES ($1,$2,$3,$4,'queued','none','',$5,$6,$7,$8,1,1,0,0,0,'','','[]'::jsonb,$9,$10,$11,$12)`, value.ID, value.Scope.TenantID, value.Scope.ProjectID, value.Type, value.InitiatedBy, value.SourceResource.ResourceType, value.SourceResource.ResourceID, value.IdempotencyKey, value.CreatedAt, value.TimeoutAt, value.RequestID, value.TraceID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `INSERT INTO job_targets (tenant_id,project_id,job_id,target_id,status,artifacts) VALUES ($1,$2,$3,$4,'queued','[]'::jsonb)`, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `INSERT INTO command_outbox (id,tenant_id,project_id,job_id,target_id,message_type,payload,available_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, message.ID, value.Scope.TenantID, value.Scope.ProjectID, value.ID, message.TargetID, message.Type, message.Payload, message.AvailableAt, message.CreatedAt)
+	require.NoError(t, err)
+	_, err = database.ExecContext(ctx, `UPDATE jobs SET status = 'running', version = 2, dispatched_at = $1, started_at = $1 WHERE id = $2`, now.Add(-4*time.Minute), value.ID)
 	require.NoError(t, err)
 	_, err = database.ExecContext(ctx, `UPDATE job_targets SET status = 'running' WHERE job_id = $1 AND target_id = $2`, value.ID, message.TargetID)
 	require.NoError(t, err)
@@ -40,6 +45,7 @@ func TestTwoPhaseLegacyActiveUpgradeRepairsJobAndAuditWithoutReexecution(t *test
 	require.NoError(t, err)
 
 	applyJobMigrationFiles(t, ctx, database, "0005_two_phase_execution.sql")
+	applyJobMigrationFiles(t, ctx, database, "0006_cancellation_response_snapshot.sql", "0007_inspection_concurrency.sql", "0008_terminal_reconciliation.sql")
 	upgradedAt := time.Now().UTC()
 	stored, err := repository.LookupCommand(ctx, message.ID)
 	require.NoError(t, err)
@@ -303,7 +309,7 @@ func TestResultFenceTerminalResultInvalidatesTimeoutClaimAndIsIdempotent(t *test
 	require.Len(t, claims, 1)
 
 	resultDigest := sha256.Sum256([]byte("result-succeeded"))
-	input := TerminalResultCAS{Scope: value.Scope, CommandID: message.ID, TokenHash: token, ExpectedExecutionRevision: grant.ExecutionRevision, Status: CommandSucceeded, ResultDigest: resultDigest, At: now.Add(2 * time.Second)}
+	input := TerminalResultCAS{Scope: value.Scope, CommandID: message.ID, TokenHash: token, ExpectedExecutionRevision: grant.ExecutionRevision, Status: CommandSucceeded, ResultDigest: resultDigest, Target: TargetResult{TargetID: message.TargetID, Status: TargetSucceeded, ResultSummary: "Agent command succeeded", Artifacts: []ArtifactReference{{ArtifactID: "artifact-result-fence", Kind: "report"}}, FinishedAt: timePointer(now.Add(2 * time.Second))}, Audit: TerminalAudit{DedupeKey: "command.result:" + message.ID, Action: "command.result", Result: "success", Detail: map[string]any{"state": "succeeded", "artifact_count": 1}}, At: now.Add(2 * time.Second)}
 	outcome, err := repository.PersistTerminalResult(ctx, input)
 	require.NoError(t, err)
 	require.True(t, outcome.Persisted)
@@ -314,6 +320,9 @@ func TestResultFenceTerminalResultInvalidatesTimeoutClaimAndIsIdempotent(t *test
 	contradictory := input
 	contradictory.Status = CommandFailed
 	contradictory.ResultDigest = contradictoryDigest
+	contradictory.Target = TargetResult{TargetID: message.TargetID, Status: TargetFailed, ErrorSummary: "command_failed", ResultSummary: "Agent command failed", FinishedAt: timePointer(now.Add(2 * time.Second))}
+	contradictory.Audit.Result = "failure"
+	contradictory.Audit.Detail = map[string]any{"state": "failed", "artifact_count": 0}
 	conflict, err := repository.PersistTerminalResult(ctx, contradictory)
 	require.NoError(t, err)
 	require.True(t, conflict.Conflict)
@@ -327,6 +336,14 @@ func TestResultFenceTerminalResultInvalidatesTimeoutClaimAndIsIdempotent(t *test
 	require.NoError(t, err)
 	require.True(t, duplicate.Persisted)
 	require.True(t, duplicate.Duplicate)
+	reconciled, err := repository.ReconcileTerminalCommands(ctx, 8, now.Add(3*time.Second))
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	repaired, err := repository.Get(ctx, value.Scope, value.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusSucceeded, repaired.Status)
+	require.Equal(t, input.Target.Artifacts, repaired.TargetResults[0].Artifacts)
+	require.Equal(t, input.Target.Artifacts, repaired.Artifacts)
 }
 
 func TestResultFenceResultWinsBeforeAtomicTimeoutAndKeepsJobConsistent(t *testing.T) {
@@ -550,6 +567,82 @@ func TestTimeoutFenceAuditFailureRepairsAfterRestartWithoutJobMutation(t *testin
 	require.False(t, repairedCommand.TerminalAuditPending)
 	require.NotNil(t, repairedCommand.TerminalAuditRecordedAt)
 	require.Len(t, auditRecorder.events, 1)
+}
+
+func TestPostgresGenericTerminalReconcilerRepairsCrashWindowsAndAuditOnce(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		prepare       bool
+		cancel        bool
+		commandStatus CommandStatus
+		wantJob       Status
+		wantTarget    TargetStatus
+	}{
+		{name: "undelivered-timeout", commandStatus: CommandTimedOut, wantJob: StatusTimedOut, wantTarget: TargetTimedOut},
+		{name: "cancel", cancel: true, commandStatus: CommandCancelled, wantJob: StatusCancelled, wantTarget: TargetCancelled},
+		{name: "prepared-timeout", prepare: true, commandStatus: CommandTimedOut, wantJob: StatusTimedOut, wantTarget: TargetTimedOut},
+		{name: "rejection", commandStatus: CommandRejected, wantJob: StatusFailed, wantTarget: TargetFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+			require.NoError(t, platformdb.RunMigrations(ctx, database))
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			value, message := integrationPersistenceFixture("generic-"+test.name, platformscope.Scope{TenantID: "tenant-generic-" + test.name, ProjectID: "project-generic-" + test.name}, now.Add(-time.Minute))
+			require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+			if test.cancel {
+				value, err := repository.RequestCancel(ctx, value.Scope, value.ID, "operator", value.Version, now)
+				require.NoError(t, err)
+				require.Equal(t, StatusCancelling, value.Status)
+			}
+			if test.prepare {
+				digest := sha256.Sum256([]byte("prepared-generic-" + test.name))
+				require.NoError(t, repository.MarkPrepared(ctx, value.Scope, message.ID, digest, now))
+			}
+			action := "command.test_terminal_" + strings.ReplaceAll(test.name, "-", "_")
+			dedupeKey := action + ":" + message.ID
+			target := TargetResult{TargetID: message.TargetID, Status: test.wantTarget, ResultSummary: "Agent command failed", FinishedAt: timePointer(now.Add(time.Second))}
+			switch test.wantTarget {
+			case TargetCancelled:
+				target.ResultSummary = "Agent command cancelled"
+			case TargetTimedOut:
+				target.ErrorSummary = "command_timed_out"
+			case TargetFailed:
+				target.ErrorSummary = "command_rejected"
+			}
+			require.NoError(t, repository.PersistTerminalCommand(ctx, TerminalCommand{Scope: value.Scope, CommandID: message.ID, Status: test.commandStatus, Target: target, Audit: TerminalAudit{DedupeKey: dedupeKey, Action: action, Result: "failure", Detail: map[string]any{"reason": "injected_crash"}}, At: now.Add(time.Second)}))
+			strandedCommand, err := repository.LookupCommand(ctx, message.ID)
+			require.NoError(t, err)
+			require.True(t, strandedCommand.TerminalReconcilePending)
+			require.True(t, strandedCommand.TerminalAuditPending)
+			require.Equal(t, test.wantTarget, strandedCommand.TerminalTargetStatus)
+			_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			require.NoError(t, err)
+			signer, err := NewEd25519CommandSigner(privateKey)
+			require.NoError(t, err)
+			protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x7a}, 32))
+			require.NoError(t, err)
+			lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{DispatchRepository: repository, Jobs: repository, Agents: &recordingCommandDispatcher{}, Signer: signer, Audit: audit.NewService(audit.NewPostgresStore(database)), TokenProtector: protector, ClaimLimit: 8, Now: func() time.Time { return now.Add(2 * time.Second) }})
+			require.NoError(t, err)
+
+			_, err = lifecycle.DispatchPending(ctx, now.Add(2*time.Second))
+
+			require.NoError(t, err)
+			repaired, err := repository.Get(ctx, value.Scope, value.ID)
+			require.NoError(t, err)
+			require.Equal(t, test.wantJob, repaired.Status)
+			require.Len(t, repaired.TargetResults, 1)
+			require.Equal(t, test.wantTarget, repaired.TargetResults[0].Status)
+			version := repaired.Version
+			_, err = lifecycle.DispatchPending(ctx, now.Add(DefaultOutboxLease+3*time.Second))
+			require.NoError(t, err)
+			replayed, err := repository.Get(ctx, value.Scope, value.ID)
+			require.NoError(t, err)
+			require.Equal(t, version, replayed.Version)
+			var auditCount int
+			require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id=$1 AND action=$2`, message.ID, action).Scan(&auditCount))
+			require.Equal(t, 1, auditCount)
+		})
+	}
 }
 
 func TestTimeoutFenceConcurrentHeartbeatResultAndTimeoutStress(t *testing.T) {

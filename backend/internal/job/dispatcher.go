@@ -199,6 +199,14 @@ func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.
 			maintenanceErrors = append(maintenanceErrors, err)
 		}
 	}
+	if reconciler, ok := lifecycle.dispatchRepository.(TerminalCommandReconciler); ok {
+		if _, err := reconciler.ReconcileTerminalCommands(ctx, lifecycle.claimLimit, at); err != nil {
+			maintenanceErrors = append(maintenanceErrors, err)
+		}
+	}
+	if err := lifecycle.repairPendingTerminalAudits(ctx, at); err != nil {
+		maintenanceErrors = append(maintenanceErrors, err)
+	}
 	messages, err := lifecycle.dispatchRepository.ClaimOutbox(ctx, lifecycle.claimLimit, at)
 	if err != nil {
 		return 0, errors.Join(append(maintenanceErrors, err)...)
@@ -302,18 +310,15 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 
 func (lifecycle *CommandLifecycle) timeoutUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "Job timeout elapsed before delivery", FinishedAt: timePointer(at)}
-	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); err != nil {
+	detail := map[string]any{"phase": string(message.Phase)}
+	if err := lifecycle.dispatchRepository.PersistTerminalCommand(ctx, TerminalCommand{Scope: message.Scope, CommandID: message.ID, Status: CommandTimedOut, Target: target, Audit: TerminalAudit{DedupeKey: "command.undelivered_timed_out:" + message.ID, Action: "command.undelivered_timed_out", Result: "failure", Detail: detail}, At: at}); err != nil {
 		return err
 	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
 	}
-	event := lifecycle.auditEvent(value, message, "command.undelivered_timed_out", "failure", map[string]any{"phase": string(message.Phase)}, at, "command.undelivered_timed_out:"+message.ID)
-	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
-		return err
-	}
-	return nil
+	return lifecycle.recordTerminalAudit(ctx, value, message, "command.undelivered_timed_out", "failure", detail, at, "command.undelivered_timed_out:"+message.ID)
 }
 
 func (lifecycle *CommandLifecycle) recoverPreparedCommands(ctx context.Context, at time.Time) error {
@@ -381,18 +386,15 @@ func (lifecycle *CommandLifecycle) terminalizePreparedCommand(ctx context.Contex
 	if status == TargetTimedOut {
 		target.ErrorSummary = "Job timeout elapsed before Start"
 	}
-	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatus, at); err != nil {
+	detail := map[string]any{"phase": string(message.Phase)}
+	if err := lifecycle.dispatchRepository.PersistTerminalCommand(ctx, TerminalCommand{Scope: message.Scope, CommandID: message.ID, Status: commandStatus, Target: target, Audit: TerminalAudit{DedupeKey: action + ":" + message.ID, Action: action, Result: auditResult, Detail: detail}, At: at}); err != nil {
 		return err
 	}
 	updated, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
 	}
-	event := lifecycle.auditEvent(updated, message, action, auditResult, map[string]any{"phase": string(message.Phase)}, at, action+":"+message.ID)
-	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
-		return err
-	}
-	return nil
+	return lifecycle.recordTerminalAudit(ctx, updated, message, action, auditResult, detail, at, action+":"+message.ID)
 }
 
 func (lifecycle *CommandLifecycle) dispatchCancellations(ctx context.Context, at time.Time) error {
@@ -449,18 +451,15 @@ func (lifecycle *CommandLifecycle) dispatchCancellation(ctx context.Context, mes
 
 func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetCancelled, ResultSummary: "cancelled before Agent execution", FinishedAt: timePointer(at)}
-	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandCancelled, at); err != nil {
+	detail := map[string]any{"reason": "job_cancellation"}
+	if err := lifecycle.dispatchRepository.PersistTerminalCommand(ctx, TerminalCommand{Scope: message.Scope, CommandID: message.ID, Status: CommandCancelled, Target: target, Audit: TerminalAudit{DedupeKey: "command.cancelled_before_dispatch:" + message.ID, Action: "command.cancelled_before_dispatch", Result: "success", Detail: detail}, At: at}); err != nil {
 		return err
 	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
 	}
-	event := lifecycle.auditEvent(value, message, "command.cancelled_before_dispatch", "success", map[string]any{"reason": "job_cancellation"}, at, "command.cancelled_before_dispatch:"+message.ID)
-	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
-		return err
-	}
-	return nil
+	return lifecycle.recordTerminalAudit(ctx, value, message, "command.cancelled_before_dispatch", "success", detail, at, "command.cancelled_before_dispatch:"+message.ID)
 }
 
 func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time.Time) error {
@@ -538,17 +537,15 @@ func (lifecycle *CommandLifecycle) repairTerminalAuditMessages(ctx context.Conte
 
 func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "delivery deadline exceeded", FinishedAt: timePointer(at)}
-	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); err != nil {
+	detail := map[string]any{"reason": "delivery_deadline"}
+	if err := lifecycle.dispatchRepository.PersistTerminalCommand(ctx, TerminalCommand{Scope: message.Scope, CommandID: message.ID, Status: CommandTimedOut, Target: target, Audit: TerminalAudit{DedupeKey: "command.delivery_timed_out:" + message.ID, Action: "command.delivery_timed_out", Result: "failure", Detail: detail}, At: at}); err != nil {
 		return err
 	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
 	}
-	if _, err := lifecycle.audit.RecordOnce(ctx, lifecycle.auditEvent(value, message, "command.delivery_timed_out", "failure", map[string]any{"reason": "delivery_deadline"}, at, "command.delivery_timed_out:"+message.ID)); err != nil {
-		return err
-	}
-	return nil
+	return lifecycle.recordTerminalAudit(ctx, value, message, "command.delivery_timed_out", "failure", detail, at, "command.delivery_timed_out:"+message.ID)
 }
 
 func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvelope, stored []byte) (*agentv1.CommandEnvelope, error) {
@@ -962,7 +959,9 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		return
 	}
 	target.TargetID = message.TargetID
-	if err := lifecycle.dispatchRepository.AcknowledgeCommand(ctx, message.Scope, message.ID, commandStatus, at, nil); err != nil {
+	reasonCode := target.ErrorSummary
+	detail := map[string]any{"state": "rejected", "reason_code": reasonCode}
+	if err := lifecycle.dispatchRepository.PersistTerminalCommand(ctx, TerminalCommand{Scope: message.Scope, CommandID: message.ID, Status: commandStatus, Target: target, Audit: TerminalAudit{DedupeKey: "command.acknowledged:" + message.ID, Action: "command.acknowledged", Result: auditResult, Detail: detail}, At: at}); err != nil {
 		lifecycle.onError(err)
 		return
 	}
@@ -971,10 +970,7 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		lifecycle.onError(err)
 		return
 	}
-	reasonCode := target.ErrorSummary
-	detail := map[string]any{"state": "rejected", "reason_code": reasonCode}
-	event := lifecycle.auditEvent(value, message, "command.acknowledged", auditResult, detail, at, "command.acknowledged:"+message.ID)
-	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+	if err := lifecycle.recordTerminalAudit(ctx, value, message, "command.acknowledged", auditResult, detail, at, "command.acknowledged:"+message.ID); err != nil {
 		lifecycle.onError(err)
 		return
 	}
@@ -1115,7 +1111,8 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	terminalInput := TerminalResultCAS{
 		Scope: message.Scope, CommandID: message.ID, TokenHash: tokenHash,
 		ExpectedExecutionRevision: result.GetLeaseRevision(), Status: commandStatus, ResultDigest: resultDigest,
-		AllowTimedOutDigestAttach: result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED, At: at,
+		AllowTimedOutDigestAttach: result.GetState() == agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED,
+		Target:                    target, Audit: TerminalAudit{DedupeKey: "command.result:" + message.ID, Action: "command.result", Result: auditResult, Detail: map[string]any{"artifact_count": len(target.Artifacts), "state": result.GetState().String()}}, At: at,
 	}
 	incomingCommandStatus := commandStatus
 	var terminal TerminalResultOutcome
@@ -1193,8 +1190,7 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 		}
 	}
 	detail["state"] = effectiveState.String()
-	event := lifecycle.auditEvent(value, message, "command.result", auditResult, detail, at, "command.result:"+message.ID)
-	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
+	if err := lifecycle.recordTerminalAudit(ctx, value, message, "command.result", auditResult, detail, at, "command.result:"+message.ID); err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
 	return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], Persisted: true, ReasonCode: "PERSISTED"}, nil
@@ -1471,6 +1467,13 @@ func (lifecycle *CommandLifecycle) recordAudit(ctx context.Context, value Job, m
 func (lifecycle *CommandLifecycle) recordAuditAt(ctx context.Context, value Job, message OutboxMessage, action, result string, detail map[string]any, at time.Time) error {
 	_, err := lifecycle.audit.Record(ctx, lifecycle.auditEvent(value, message, action, result, detail, at, ""))
 	return err
+}
+
+func (lifecycle *CommandLifecycle) recordTerminalAudit(ctx context.Context, value Job, message OutboxMessage, action, result string, detail map[string]any, at time.Time, dedupeKey string) error {
+	if _, err := lifecycle.audit.RecordOnce(ctx, lifecycle.auditEvent(value, message, action, result, detail, at, dedupeKey)); err != nil {
+		return err
+	}
+	return lifecycle.dispatchRepository.MarkTerminalAuditRecorded(ctx, message.Scope, message.ID, dedupeKey, at)
 }
 
 func (lifecycle *CommandLifecycle) auditEvent(value Job, message OutboxMessage, action, result string, detail map[string]any, at time.Time, dedupeKey string) audit.Event {

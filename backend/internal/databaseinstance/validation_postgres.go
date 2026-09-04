@@ -223,9 +223,11 @@ func (repository *PostgresRepository) persistValidationResultWithCommandCASOnce(
 	var phase job.CommandPhase
 	var storedStatus job.CommandStatus
 	var targetID string
-	var storedTokenHash, storedDigest []byte
+	var storedTokenHash, storedDigest, storedTargetArtifacts, storedAuditDetail []byte
 	var storedExecutionRevision uint64
-	err = tx.QueryRowContext(ctx, `SELECT target_id,command_phase,command_status,execution_token_hash,execution_revision,terminal_result_digest FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 AND job_id=$4 FOR UPDATE`, scope.TenantID, scope.ProjectID, commandID, jobID).Scan(&targetID, &phase, &storedStatus, &storedTokenHash, &storedExecutionRevision, &storedDigest)
+	var storedTargetStatus job.TargetStatus
+	var storedTargetError, storedTargetResult, storedAuditDedupe, storedAuditAction, storedAuditResult string
+	err = tx.QueryRowContext(ctx, `SELECT target_id,command_phase,command_status,execution_token_hash,execution_revision,terminal_result_digest,terminal_target_status,terminal_target_error_summary,terminal_target_result_summary,terminal_target_artifacts,terminal_audit_dedupe_key,terminal_audit_action,terminal_audit_result,terminal_audit_detail FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND id=$3 AND job_id=$4 FOR UPDATE`, scope.TenantID, scope.ProjectID, commandID, jobID).Scan(&targetID, &phase, &storedStatus, &storedTokenHash, &storedExecutionRevision, &storedDigest, &storedTargetStatus, &storedTargetError, &storedTargetResult, &storedTargetArtifacts, &storedAuditDedupe, &storedAuditAction, &storedAuditResult, &storedAuditDetail)
 	if errors.Is(err, sql.ErrNoRows) {
 		return rollback(job.ErrNotFound)
 	}
@@ -258,6 +260,10 @@ func (repository *PostgresRepository) persistValidationResultWithCommandCASOnce(
 		}
 	}
 	effectiveStatus := effectiveValidationCommandStatus(incomingState, effective)
+	terminalTarget, terminalAudit := validationTerminalEvidence(commandID, targetID, incomingState, effective, input.At)
+	if !validationTerminalEvidenceCompatible(storedTargetStatus, storedTargetError, storedTargetResult, storedTargetArtifacts, storedAuditDedupe, storedAuditAction, storedAuditResult, storedAuditDetail, terminalTarget, terminalAudit) {
+		return rollback(job.ErrConflict)
+	}
 	terminalPhase := phase == job.CommandPhaseSucceeded || phase == job.CommandPhaseFailed || phase == job.CommandPhaseCancelled || phase == job.CommandPhaseTimedOut || phase == job.CommandPhaseRejected
 	if terminalPhase {
 		if phase == job.CommandPhaseTimedOut && storedStatus == job.CommandTimedOut && len(storedDigest) == 0 && input.AllowTimedOutDigestAttach && effectiveStatus == job.CommandTimedOut {
@@ -268,6 +274,9 @@ func (repository *PostgresRepository) persistValidationResultWithCommandCASOnce(
 				if err := applyValidationResultTx(ctx, tx, scope, state, effective, input.At); err != nil {
 					return rollback(err)
 				}
+			}
+			if err := persistValidationCommandEvidenceTx(ctx, tx, scope, commandID, effectiveStatus, terminalTarget, terminalAudit); err != nil {
+				return rollback(err)
 			}
 			base.Status, base.ResultDigest, base.Persisted, base.Duplicate = effectiveStatus, input.ResultDigest, true, true
 			if err := repository.commit(tx); err != nil {
@@ -296,10 +305,79 @@ func (repository *PostgresRepository) persistValidationResultWithCommandCASOnce(
 	if rows, rowsErr := update.RowsAffected(); rowsErr != nil || rows != 1 {
 		return rollback(job.ErrConflict)
 	}
+	if err := persistValidationCommandEvidenceTx(ctx, tx, scope, commandID, effectiveStatus, terminalTarget, terminalAudit); err != nil {
+		return rollback(err)
+	}
 	if err := repository.commit(tx); err != nil {
 		return ValidationResult{}, job.TerminalResultOutcome{}, err
 	}
 	return effective, job.TerminalResultOutcome{CommandID: commandID, JobID: jobID, TargetID: targetID, Status: effectiveStatus, ResultDigest: input.ResultDigest, Persisted: true}, nil
+}
+
+func validationTerminalEvidence(commandID, targetID string, incoming agentv1.CommandResultState, effective ValidationResult, at time.Time) (job.TargetResult, job.TerminalAudit) {
+	state := agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED
+	finishedAt := at.UTC()
+	target := job.TargetResult{TargetID: targetID, Status: job.TargetFailed, ErrorSummary: string(effective.ErrorCode), ResultSummary: "database instance connection validation failed", FinishedAt: &finishedAt}
+	switch incoming {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		state = agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED
+		target.Status, target.ErrorSummary, target.ResultSummary = job.TargetCancelled, "", "database instance connection validation cancelled"
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		state = agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT
+		target.Status, target.ErrorSummary, target.ResultSummary = job.TargetTimedOut, "", "database instance connection validation timed out"
+	default:
+		if effective.Status == ConnectionSucceeded {
+			state = agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
+			target.Status, target.ErrorSummary, target.ResultSummary = job.TargetSucceeded, "", "database instance connection validation succeeded"
+		}
+	}
+	detail := map[string]any{"artifact_count": 0, "state": state.String()}
+	if state != incoming {
+		detail["incoming_state"] = incoming.String()
+	}
+	auditResult := "failure"
+	if target.Status == job.TargetSucceeded {
+		auditResult = "success"
+	}
+	return target, job.TerminalAudit{DedupeKey: "command.result:" + commandID, Action: "command.result", Result: auditResult, Detail: detail}
+}
+
+func validationTerminalEvidenceCompatible(storedStatus job.TargetStatus, storedError, storedResult string, storedArtifacts []byte, storedAuditDedupe, storedAuditAction, storedAuditResult string, storedAuditDetail []byte, target job.TargetResult, terminalAudit job.TerminalAudit) bool {
+	if storedStatus != "" {
+		var artifacts []job.ArtifactReference
+		if json.Unmarshal(storedArtifacts, &artifacts) != nil || storedStatus != target.Status || storedError != target.ErrorSummary || storedResult != target.ResultSummary || len(artifacts) != 0 {
+			return false
+		}
+	}
+	if storedAuditDedupe == "" {
+		return true
+	}
+	var detail map[string]any
+	if json.Unmarshal(storedAuditDetail, &detail) != nil {
+		return false
+	}
+	left, leftErr := json.Marshal(detail)
+	right, rightErr := json.Marshal(terminalAudit.Detail)
+	return leftErr == nil && rightErr == nil && storedAuditDedupe == terminalAudit.DedupeKey && storedAuditAction == terminalAudit.Action && storedAuditResult == terminalAudit.Result && string(left) == string(right)
+}
+
+func persistValidationCommandEvidenceTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, commandID string, status job.CommandStatus, target job.TargetResult, terminalAudit job.TerminalAudit) error {
+	artifacts, err := json.Marshal(target.Artifacts)
+	if err != nil {
+		return ErrInvalid
+	}
+	detail, err := json.Marshal(terminalAudit.Detail)
+	if err != nil {
+		return ErrInvalid
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=TRUE,terminal_audit_pending=(terminal_audit_recorded_at IS NULL),terminal_audit_dedupe_key=$5,terminal_audit_action=$6,terminal_audit_result=$7,terminal_audit_detail=$8,terminal_audit_lease_expires_at=CASE WHEN terminal_audit_recorded_at IS NULL THEN NULL ELSE terminal_audit_lease_expires_at END WHERE tenant_id=$9 AND project_id=$10 AND id=$11 AND command_status=$12 AND terminal_at IS NOT NULL`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, terminalAudit.DedupeKey, terminalAudit.Action, terminalAudit.Result, detail, scope.TenantID, scope.ProjectID, commandID, string(status))
+	if err != nil {
+		return mapPostgresError(err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return job.ErrConflict
+	}
+	return nil
 }
 
 func validationCommandOutcome(result *agentv1.CommandResult) (ValidationResult, job.CommandStatus, error) {

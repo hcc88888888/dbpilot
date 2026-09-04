@@ -56,6 +56,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE jobs.*max_concurrency.*target_timeout_seconds.*command_outbox_job_phase_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0007_inspection_concurrency.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0008_terminal_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_target_status.*terminal_reconcile_pending.*command_outbox_terminal_reconcile_pending_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0008_terminal_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -103,5 +109,10 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	require.NoError(t, err)
 	for _, required := range []string{"max_concurrency", "target_timeout_seconds", "command_outbox_job_phase_idx", "inspection.collect"} {
 		require.Contains(t, string(concurrency), required)
+	}
+	terminalReconciliation, err := migrationFiles.ReadFile("migrations/0008_terminal_reconciliation.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"terminal_target_status", "terminal_target_artifacts", "terminal_reconcile_pending", "conflicting terminal Command and Job target winner", "command_outbox_terminal_reconcile_pending_idx"} {
+		require.Contains(t, string(terminalReconciliation), required)
 	}
 }
