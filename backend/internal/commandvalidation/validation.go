@@ -47,6 +47,13 @@ func ValidateShape(envelope *agentv1.CommandEnvelope) error {
 	return Validate(context.Background(), envelope, structuralTargetAuthorizer{})
 }
 
+func ValidateAcknowledgement(acknowledgement *agentv1.CommandAcknowledgement) error {
+	if acknowledgement == nil || !validIdentifier(acknowledgement.GetCommandId()) || acknowledgement.GetReasonCode() != "" && !validIdentifier(acknowledgement.GetReasonCode()) {
+		return ErrInvalidCommand
+	}
+	return nil
+}
+
 func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer TargetAuthorizer) error {
 	if ctx == nil || envelope == nil || !validIdentifier(envelope.GetAgentId()) || envelope.GetCommand() == nil {
 		return ErrInvalidCommand

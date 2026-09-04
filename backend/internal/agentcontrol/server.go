@@ -323,8 +323,8 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, message
 	case *agentv1.AgentMessage_Heartbeat:
 		s.observer.Heartbeat(ctx, agentID, typed.Heartbeat)
 	case *agentv1.AgentMessage_CommandAcknowledgement:
-		if typed.CommandAcknowledgement == nil {
-			return status.Error(codes.InvalidArgument, "command acknowledgement is required")
+		if commandvalidation.ValidateAcknowledgement(typed.CommandAcknowledgement) != nil {
+			return status.Error(codes.InvalidArgument, "command acknowledgement is invalid")
 		}
 		s.observer.Acknowledged(ctx, agentID, typed.CommandAcknowledgement)
 	case *agentv1.AgentMessage_CommandPrepared:

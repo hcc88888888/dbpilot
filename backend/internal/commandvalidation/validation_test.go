@@ -3,6 +3,7 @@ package commandvalidation
 import (
 	"context"
 	"crypto/sha256"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,22 @@ func TestStartValidationRequiresFencingTokenRevisionLeaseAndFutureDeadline(t *te
 			candidate := proto.Clone(valid).(*agentv1.CommandStart)
 			mutate(candidate)
 			require.ErrorIs(t, ValidateStart(candidate, now), ErrInvalidCommand)
+		})
+	}
+}
+
+func TestAcknowledgementReasonCodeIsGloballyBoundedAndTokenized(t *testing.T) {
+	valid := &agentv1.CommandAcknowledgement{CommandId: "command-a", State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, ReasonCode: "plugin_busy"}
+	require.NoError(t, ValidateAcknowledgement(valid))
+	for name, reason := range map[string]string{
+		"secret shaped": "password=raw",
+		"line break":    "plugin_busy\nsecret",
+		"oversize":      strings.Repeat("a", 129),
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := proto.Clone(valid).(*agentv1.CommandAcknowledgement)
+			candidate.ReasonCode = reason
+			require.ErrorIs(t, ValidateAcknowledgement(candidate), ErrInvalidCommand)
 		})
 	}
 }

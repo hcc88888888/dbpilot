@@ -879,7 +879,7 @@ func (lifecycle *CommandLifecycle) renewExecutionLeases(ctx context.Context, age
 }
 
 func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID string, acknowledgement *agentv1.CommandAcknowledgement) {
-	if acknowledgement == nil || strings.TrimSpace(acknowledgement.GetCommandId()) == "" {
+	if commandvalidation.ValidateAcknowledgement(acknowledgement) != nil {
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
 	}
@@ -935,7 +935,15 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 			lifecycle.onError(ErrConflict)
 			return
 		}
-		target = TargetResult{Status: TargetFailed, ErrorSummary: acknowledgement.GetReasonCode(), FinishedAt: timePointer(at)}
+		reasonCode := acknowledgement.GetReasonCode()
+		if reasonCode == "" {
+			reasonCode = "command_rejected"
+		}
+		target = TargetResult{Status: TargetFailed, ErrorSummary: reasonCode, FinishedAt: timePointer(at)}
+		if envelope.GetValidateDatabaseInstance() != nil {
+			target.ErrorSummary = "plugin_failed"
+			target.ResultSummary = "database instance connection validation failed"
+		}
 	default:
 		lifecycle.onError(ErrInvalidCommandPayload)
 		return
@@ -946,7 +954,8 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		lifecycle.onError(err)
 		return
 	}
-	detail := map[string]any{"state": "rejected", "reason_code": acknowledgement.GetReasonCode()}
+	reasonCode := target.ErrorSummary
+	detail := map[string]any{"state": "rejected", "reason_code": reasonCode}
 	event := lifecycle.auditEvent(value, message, "command.acknowledged", auditResult, detail, at, "command.acknowledged:"+message.ID)
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		lifecycle.onError(err)

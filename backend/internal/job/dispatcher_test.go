@@ -808,6 +808,36 @@ func TestRejectedAcknowledgementDurablyTerminalizesTargetBeforePublication(t *te
 	require.Equal(t, "failure", fixture.audit.events[0].Result)
 }
 
+func TestValidationRejectedAcknowledgementPersistsOnlyFixedOutcome(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-validation-rejected", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.jobs[fixture.value.ID] = transitionForTest(t, fixture.value, StatusDispatched, fixture.now)
+
+	fixture.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: message.ID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, ReasonCode: "plugin_busy"})
+
+	require.Empty(t, fixture.observerErrors())
+	target := fixture.persistence.currentJob().TargetResults[0]
+	require.Equal(t, "plugin_failed", target.ErrorSummary)
+	require.Equal(t, "database instance connection validation failed", target.ResultSummary)
+	require.Equal(t, "plugin_failed", fixture.audit.events[0].Detail["reason_code"])
+	require.NotContains(t, fmt.Sprintf("%+v", fixture.persistence.currentJob()), "plugin_busy")
+
+	malicious := newSingleTargetCommandLifecycleFixture(t)
+	maliciousMessage := malicious.message(t, "command-malicious-rejection", "agent-a")
+	malicious.persistence.messages[maliciousMessage.ID] = maliciousMessage
+	malicious.persistence.jobs[malicious.value.ID] = transitionForTest(t, malicious.value, StatusDispatched, malicious.now)
+	malicious.lifecycle.Acknowledged(context.Background(), "agent-a", &agentv1.CommandAcknowledgement{CommandId: maliciousMessage.ID, State: agentv1.CommandAcknowledgementState_COMMAND_ACKNOWLEDGEMENT_STATE_REJECTED, ReasonCode: "password=raw-secret"})
+	require.NotEmpty(t, malicious.observerErrors())
+	require.Empty(t, malicious.persistence.currentJob().TargetResults)
+	require.Empty(t, malicious.audit.events)
+}
+
 func TestAcceptedAcknowledgementCannotCreateExecutionFenceOrDeadline(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	timeout := fixture.now.Add(10 * time.Second)
