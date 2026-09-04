@@ -221,7 +221,15 @@ func (s *Server) Connect(stream agentv1.AgentControl_ConnectServer) error {
 		}
 		return status.Error(codes.Internal, err.Error())
 	}
-	current, _ := s.registry.liveSession(agentID)
+	current, ok := s.registry.liveSession(agentID)
+	if !ok || current == nil {
+		cancel()
+		return status.Error(codes.Internal, "Agent session registration failed")
+	}
+	if s.credentialsAuthorizer != nil && s.credentialsAuthorizer.AuthorizeAgentCredential(stream.Context(), agentID, credentialFingerprint, credentialSerial) != nil {
+		s.registry.terminateSession(agentID, current)
+		return status.Error(codes.Unauthenticated, "Agent credential is not active")
+	}
 	defer func() {
 		cancel()
 		s.registry.unregister(agentID, current)

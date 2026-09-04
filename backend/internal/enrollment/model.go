@@ -34,6 +34,7 @@ var (
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var labelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 var fingerprintPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+var certificateSerialPattern = regexp.MustCompile(`^[0-9a-f]+$`)
 
 type EnrollmentToken struct {
 	TokenHash          [sha256.Size]byte
@@ -169,8 +170,19 @@ func (key EnrollmentAttemptKey) Validate() error {
 }
 
 type EnrollmentResolution struct {
-	Grant    EnrollmentGrant
-	Response *EnrollResult
+	Grant                 EnrollmentGrant
+	Response              *EnrollResult
+	SupersededCredentials []AgentCredential
+}
+
+type AgentCredential struct {
+	Generation  uint64
+	Fingerprint [sha256.Size]byte
+	Serial      string
+}
+
+func (credential AgentCredential) valid() bool {
+	return credential.Generation > 0 && credential.Fingerprint != ([sha256.Size]byte{}) && certificateSerialPattern.MatchString(credential.Serial)
 }
 
 type EnrollmentCompletion struct {
@@ -186,7 +198,12 @@ type EnrollmentStore interface {
 	Replace(context.Context, EnrollmentToken, uint64) (EnrollmentTokenCreation, error)
 	ResolveReplacement(context.Context, platformscope.Scope, ReplacementLookup) (ReplacementState, error)
 	Resolve(context.Context, EnrollmentAttemptKey) (EnrollmentResolution, error)
-	Complete(context.Context, EnrollmentCompletion) (EnrollResult, error)
+	Complete(context.Context, EnrollmentCompletion) (EnrollmentCompletionResult, error)
+}
+
+type EnrollmentCompletionResult struct {
+	Response              EnrollResult
+	SupersededCredentials []AgentCredential
 }
 
 type EnrollmentTokenCreation struct {

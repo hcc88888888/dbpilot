@@ -163,16 +163,40 @@ func (r *Registry) Terminate(agentID string) bool {
 	return false
 }
 
-// TerminateSuperseded cancels only a session authenticated with a credential
-// other than the newly committed leaf. This preserves a new-certificate
-// reconnect that races the post-commit replacement cleanup.
-func (r *Registry) TerminateSuperseded(agentID string, activeFingerprint [sha256.Size]byte) bool {
-	if r == nil || strings.TrimSpace(agentID) == "" || activeFingerprint == ([sha256.Size]byte{}) {
+// TerminateCredential removes and cancels only the live session authenticated
+// with the exact database-confirmed leaf. Late cleanup for an older credential
+// therefore cannot terminate a replacement session.
+func (r *Registry) TerminateCredential(agentID string, fingerprint [sha256.Size]byte, serial string) bool {
+	if r == nil || strings.TrimSpace(agentID) == "" || fingerprint == ([sha256.Size]byte{}) || serial == "" {
 		return false
 	}
 	r.mu.Lock()
 	current := r.sessions[agentID]
-	if current == nil || current.credentialLeaf == activeFingerprint {
+	if current == nil || current.credentialLeaf != fingerprint || len(current.credentialSerial) != len(serial) || subtle.ConstantTimeCompare([]byte(current.credentialSerial), []byte(serial)) != 1 {
+		r.mu.Unlock()
+		return false
+	}
+	delete(r.sessions, agentID)
+	for {
+		select {
+		case message := <-current.send:
+			clearCredentialLeaseResponse(message.GetCredentialLeaseResponse())
+			clearMetricTemplateLeaseResponse(message.GetMetricTemplateLeaseResponse())
+		default:
+			r.mu.Unlock()
+			current.cancel()
+			return true
+		}
+	}
+}
+
+func (r *Registry) terminateSession(agentID string, expected *session) bool {
+	if r == nil || expected == nil {
+		return false
+	}
+	r.mu.Lock()
+	current := r.sessions[agentID]
+	if current == nil || current != expected {
 		r.mu.Unlock()
 		return false
 	}

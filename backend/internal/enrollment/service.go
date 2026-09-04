@@ -30,7 +30,7 @@ type ApplicationService struct {
 }
 
 type CredentialSessionTerminator interface {
-	TerminateSuperseded(string, [sha256.Size]byte) bool
+	TerminateCredential(string, [sha256.Size]byte, string) bool
 }
 
 func (service ApplicationService) Create(ctx context.Context, scope platformscope.Scope, request CreateRequest) (CreatedEnrollment, error) {
@@ -147,7 +147,7 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 		if err := validateEnrollmentResult(*resolution.Response, grant); err != nil {
 			return EnrollResult{}, errors.New("stored Agent enrollment response is invalid")
 		}
-		service.terminatePriorSession(grant.AgentID, resolution.Response.CertificateFingerprint)
+		service.terminateConfirmedCredentials(grant.AgentID, resolution.SupersededCredentials)
 		return cloneEnrollmentResult(*resolution.Response), nil
 	}
 	certificatePEM, chainPEM, expiresAt, err := service.Certificates.SignAgentCSR(ctx, grant, request.CSRPEM)
@@ -167,25 +167,30 @@ func (service ApplicationService) Enroll(ctx context.Context, request EnrollRequ
 	observation.HostID = grant.HostID
 	completed, err := service.Tokens.Complete(ctx, EnrollmentCompletion{Key: key, Grant: grant, Observation: observation, Result: result, CompletedAt: now})
 	if err == nil {
-		if validateEnrollmentResult(completed, grant) != nil {
+		if validateEnrollmentResult(completed.Response, grant) != nil {
 			return EnrollResult{}, errors.New("completed Agent enrollment response is invalid")
 		}
-		service.terminatePriorSession(grant.AgentID, completed.CertificateFingerprint)
-		return cloneEnrollmentResult(completed), nil
+		service.terminateConfirmedCredentials(grant.AgentID, completed.SupersededCredentials)
+		return cloneEnrollmentResult(completed.Response), nil
 	}
 	// A connection loss can make COMMIT outcome unknown. Resolve by the exact
 	// token/CSR/Agent/Host key before reporting failure or asking for a new token.
 	recovered, resolveErr := service.Tokens.Resolve(ctx, key)
 	if resolveErr == nil && recovered.Response != nil && validateEnrollmentResult(*recovered.Response, grant) == nil {
-		service.terminatePriorSession(grant.AgentID, recovered.Response.CertificateFingerprint)
+		service.terminateConfirmedCredentials(grant.AgentID, recovered.SupersededCredentials)
 		return cloneEnrollmentResult(*recovered.Response), nil
 	}
 	return EnrollResult{}, errors.New("complete Agent enrollment attempt")
 }
 
-func (service ApplicationService) terminatePriorSession(agentID string, activeFingerprint [sha256.Size]byte) {
-	if service.Sessions != nil {
-		service.Sessions.TerminateSuperseded(agentID, activeFingerprint)
+func (service ApplicationService) terminateConfirmedCredentials(agentID string, credentials []AgentCredential) {
+	if service.Sessions == nil {
+		return
+	}
+	for _, credential := range credentials {
+		if credential.valid() {
+			service.Sessions.TerminateCredential(agentID, credential.Fingerprint, credential.Serial)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
@@ -133,20 +134,28 @@ func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) 
 	labels, err := json.Marshal(grant.Labels)
 	require.NoError(t, err)
 	columns := enrollmentResolutionColumns()
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT.*t.consumed_at.*expires_at > CURRENT_TIMESTAMP.*LEFT JOIN agent_enrollment_issuances`).
 		WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
-		nil, true, 1, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		nil, true, 1, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	))
+	mock.ExpectCommit()
 	issuedAt := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	expiresAt := issuedAt.Add(time.Hour)
 	certificate, _ := testCertificateAuthority(t, issuedAt)
 	fingerprint, serial, err := enrollmentCertificateIdentity(certificate)
 	require.NoError(t, err)
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(columns).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
 		issuedAt, false, 1, csrDigest[:], certificate, certificate, expiresAt, issuedAt, grant.EnrollmentRevision, 1, fingerprint[:], serial,
+		nil, string(hostinventory.HostOnline), 1, fingerprint[:], serial, nil,
 	))
+	mock.ExpectQuery(`(?s)SELECT credential_generation,certificate_fingerprint,certificate_serial.*agent_enrollment_issuances`).
+		WithArgs(grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.Generation).
+		WillReturnRows(sqlmock.NewRows([]string{"credential_generation", "certificate_fingerprint", "certificate_serial"}))
+	mock.ExpectCommit()
 	repository := NewPostgresRepository(database)
 
 	first, err := repository.Resolve(context.Background(), key)
@@ -160,6 +169,40 @@ func TestPostgresResolveReturnsActiveGrantAndExactCommittedReplay(t *testing.T) 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresResolveReadsActiveReplayAndSupersededLeavesInOneSnapshot(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = database.Close() })
+	hash := HashToken([]byte("replacement-token"))
+	csrDigest := sha256.Sum256([]byte("replacement-csr"))
+	key := EnrollmentAttemptKey{TokenHash: hash, CSRDigest: csrDigest, AgentID: "agent-1", HostID: "host-1"}
+	grant := EnrollmentGrant{Scope: platformscope.Scope{TenantID: "tenant-1", ProjectID: "project-1"}, HostID: key.HostID, AgentID: key.AgentID, DisplayName: "Primary database host", Labels: map[string]string{}, EnrollmentRevision: 1, Generation: 2}
+	labels, err := json.Marshal(grant.Labels)
+	require.NoError(t, err)
+	issuedAt := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	certificate, _ := testCertificateAuthority(t, issuedAt)
+	fingerprint, serial, err := enrollmentCertificateIdentity(certificate)
+	require.NoError(t, err)
+	oldFingerprint := sha256.Sum256([]byte("old-leaf"))
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances.*LEFT JOIN managed_hosts`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(enrollmentResolutionColumns()).AddRow(
+		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
+		issuedAt, false, grant.Generation, csrDigest[:], certificate, certificate, issuedAt.Add(time.Hour), issuedAt, grant.EnrollmentRevision, grant.Generation, fingerprint[:], serial,
+		nil, string(hostinventory.HostOnline), grant.Generation, fingerprint[:], serial, nil,
+	))
+	mock.ExpectQuery(`(?s)SELECT credential_generation,certificate_fingerprint,certificate_serial.*agent_enrollment_issuances`).
+		WithArgs(grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.Generation).
+		WillReturnRows(sqlmock.NewRows([]string{"credential_generation", "certificate_fingerprint", "certificate_serial"}).AddRow(1, oldFingerprint[:], "01"))
+	mock.ExpectCommit()
+
+	resolution, err := NewPostgresRepository(database).Resolve(context.Background(), key)
+
+	require.NoError(t, err)
+	require.Equal(t, []AgentCredential{{Generation: 1, Fingerprint: oldFingerprint, Serial: "01"}}, resolution.SupersededCredentials)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 	database, mock, err := sqlmock.New()
 	require.NoError(t, err)
@@ -169,10 +212,12 @@ func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 	key := EnrollmentAttemptKey{TokenHash: hash, CSRDigest: csrDigest, AgentID: "agent-1"}
 	grant := validEnrollmentToken(hash, time.Now().UTC()).Grant()
 	labels, _ := json.Marshal(grant.Labels)
+	mock.ExpectBegin()
 	mock.ExpectQuery(`(?s)SELECT.*LEFT JOIN agent_enrollment_issuances`).WithArgs(hash[:]).WillReturnRows(sqlmock.NewRows(enrollmentResolutionColumns()).AddRow(
 		grant.Scope.TenantID, grant.Scope.ProjectID, grant.HostID, grant.AgentID, grant.DisplayName, labels, grant.EnrollmentRevision,
-		nil, false, grant.Generation, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		nil, false, grant.Generation, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
 	))
+	mock.ExpectRollback()
 
 	_, err = NewPostgresRepository(database).Resolve(context.Background(), key)
 
@@ -184,7 +229,8 @@ func TestPostgresResolveMapsExpiredOrMissingTokenToFixedError(t *testing.T) {
 func enrollmentResolutionColumns() []string {
 	return []string{
 		"tenant_id", "project_id", "host_id", "agent_id", "display_name", "labels", "enrollment_revision",
-		"consumed_at", "active", "generation", "csr_digest", "certificate_pem", "certificate_chain_pem", "expires_at", "issued_at", "issuance_revision", "credential_generation", "certificate_fingerprint", "certificate_serial",
+		"consumed_at", "active", "generation", "csr_digest", "certificate_pem", "certificate_chain_pem", "expires_at", "issued_at", "issuance_revision", "credential_generation", "certificate_fingerprint", "certificate_serial", "revoked_at",
+		"host_status", "host_credential_generation", "host_certificate_fingerprint", "host_certificate_serial", "host_credential_revoked_at",
 	}
 }
 

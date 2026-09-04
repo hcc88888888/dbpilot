@@ -132,16 +132,16 @@ func TestEnrollmentPostgresIntegrationConcurrentCompletionExpiryAndLostResponseR
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			result, completeErr := repository.Complete(ctx, completion)
+			completed, completeErr := repository.Complete(ctx, completion)
 			if completeErr != nil {
 				resolved, resolveErr := repository.Resolve(ctx, key)
 				if resolveErr != nil || resolved.Response == nil {
 					errorsChannel <- errors.Join(completeErr, resolveErr)
 					return
 				}
-				result = *resolved.Response
+				completed.Response = *resolved.Response
 			}
-			results <- result
+			results <- completed.Response
 		}()
 	}
 	wait.Wait()
@@ -228,6 +228,8 @@ func TestEnrollmentPostgresCredentialGenerationRejectsOldLeafAfterReplacementAnd
 	second, err := service.Enroll(ctx, signedEnrollRequest(t, replacement.Token, agentID, now))
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), second.CredentialGeneration)
+	_, err = service.Enroll(ctx, firstRequest)
+	require.ErrorIs(t, err, ErrEnrollmentTokenInvalid, "a revoked issuance must never be replayed after replacement")
 	require.Error(t, repository.AuthorizeAgentCredential(ctx, agentID, first.CertificateFingerprint, first.CertificateSerial))
 	require.NoError(t, repository.AuthorizeAgentCredential(ctx, agentID, second.CertificateFingerprint, second.CertificateSerial))
 	require.Error(t, repository.AuthorizeAgentCredential(ctx, "agent-other-"+suffix, second.CertificateFingerprint, second.CertificateSerial), "a leaf must not authorize another tenant or Agent identity")
@@ -247,8 +249,9 @@ func TestEnrollmentPostgresCredentialGenerationRejectsOldLeafAfterReplacementAnd
 	var currentRevoked bool
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT revoked_at IS NOT NULL FROM agent_enrollment_issuances WHERE credential_generation=2 AND tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, hostID).Scan(&currentRevoked))
 	require.True(t, currentRevoked, "decommission must revoke the current issuance in the same database transaction")
-	require.Equal(t, []string{agentID, agentID}, sessions.agents, "each committed generation performs superseded-session cleanup")
-	require.Equal(t, [][32]byte{first.CertificateFingerprint, second.CertificateFingerprint}, sessions.fingerprints)
+	require.Equal(t, []string{agentID}, sessions.agents, "only the exact database-confirmed prior leaf is terminated")
+	require.Equal(t, [][32]byte{first.CertificateFingerprint}, sessions.fingerprints)
+	require.Equal(t, []string{first.CertificateSerial}, sessions.serials)
 }
 
 func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
@@ -321,7 +324,7 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 	observation := hostinventory.Observation{HostID: token.HostID, AgentID: token.AgentID, Revision: 1, AgentVersion: "upgrade", Hostname: "upgrade.example", OS: "linux", Architecture: "amd64", LogicalCPUCount: 1, MemoryCapacityBytes: 1 << 20, NetworkAddresses: []string{}, Capabilities: []string{}, ObservedAt: now}
 	completed, err := repository.Complete(ctx, EnrollmentCompletion{Key: key, Grant: resolved.Grant, Observation: observation, Result: result, CompletedAt: now})
 	require.NoError(t, err)
-	require.Equal(t, result, completed)
+	require.Equal(t, result, completed.Response)
 }
 
 func openEnrollmentUpgradeDatabase(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {

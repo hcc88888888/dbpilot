@@ -34,8 +34,7 @@ func TestWrongAgentDoesNotBurnTokenAndCorrectAgentCanRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), parseLeafCertificate(t, result.CertificatePEM).SerialNumber.Int64())
 	require.Equal(t, 1, store.completeCalls)
-	require.Equal(t, []string{"agent-1"}, sessions.agents)
-	require.Equal(t, [][32]byte{result.CertificateFingerprint}, sessions.fingerprints)
+	require.Empty(t, sessions.agents, "an initial enrollment has no database-confirmed superseded leaf")
 }
 
 func TestEnrollmentResultRejectsFingerprintThatDoesNotMatchLeafCertificate(t *testing.T) {
@@ -94,6 +93,25 @@ func TestLostResponseRetryReturnsExactStoredPublicIssuance(t *testing.T) {
 	require.Equal(t, 1, issuer.calls, "durable replay must not issue a second certificate")
 }
 
+func TestStoredEnrollmentReplayDoesNotTerminateWithoutConfirmedSupersededCredential(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	raw := []byte("0123456789abcdef0123456789abcdef")
+	request := signedEnrollRequest(t, raw, "agent-1", now)
+	store := newAttemptMemoryStore(validEnrollmentToken(HashToken(raw), now).Grant())
+	sessions := &recordingCredentialSessions{}
+	service := ApplicationService{Tokens: store, Certificates: &sequenceIssuer{}, Sessions: sessions, Now: func() time.Time { return now }}
+
+	first, err := service.Enroll(context.Background(), request)
+	require.NoError(t, err)
+	sessions.agents = nil
+	sessions.fingerprints = nil
+
+	replayed, err := service.Enroll(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, first, replayed)
+	require.Empty(t, sessions.agents, "a stored response is not proof that any live credential was superseded")
+}
+
 type attemptMemoryStore struct {
 	mu              sync.Mutex
 	grant           EnrollmentGrant
@@ -137,26 +155,26 @@ func (store *attemptMemoryStore) Resolve(_ context.Context, key EnrollmentAttemp
 	return EnrollmentResolution{Grant: store.grant}, nil
 }
 
-func (store *attemptMemoryStore) Complete(_ context.Context, completion EnrollmentCompletion) (EnrollResult, error) {
+func (store *attemptMemoryStore) Complete(_ context.Context, completion EnrollmentCompletion) (EnrollmentCompletionResult, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.completeCalls++
 	if len(store.completeErrors) > 0 {
 		err := store.completeErrors[0]
 		store.completeErrors = store.completeErrors[1:]
-		return EnrollResult{}, err
+		return EnrollmentCompletionResult{}, err
 	}
 	key := completion.Key
 	key.HostID = completion.Grant.HostID
 	if existing, ok := store.stored[key]; ok {
-		return existing, nil
+		return EnrollmentCompletionResult{Response: existing}, nil
 	}
 	store.stored[key] = completion.Result
 	if store.commitThenError {
 		store.commitThenError = false
-		return EnrollResult{}, errors.New("commit outcome unknown")
+		return EnrollmentCompletionResult{}, errors.New("commit outcome unknown")
 	}
-	return completion.Result, nil
+	return EnrollmentCompletionResult{Response: completion.Result}, nil
 }
 
 type sequenceIssuer struct {
@@ -193,10 +211,12 @@ var _ EnrollmentStore = (*attemptMemoryStore)(nil)
 type recordingCredentialSessions struct {
 	agents       []string
 	fingerprints [][32]byte
+	serials      []string
 }
 
-func (sessions *recordingCredentialSessions) TerminateSuperseded(agentID string, fingerprint [32]byte) bool {
+func (sessions *recordingCredentialSessions) TerminateCredential(agentID string, fingerprint [32]byte, serial string) bool {
 	sessions.agents = append(sessions.agents, agentID)
 	sessions.fingerprints = append(sessions.fingerprints, fingerprint)
+	sessions.serials = append(sessions.serials, serial)
 	return true
 }

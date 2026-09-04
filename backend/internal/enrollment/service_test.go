@@ -214,8 +214,8 @@ func (store *memoryTokenStore) Resolve(context.Context, EnrollmentAttemptKey) (E
 	return EnrollmentResolution{}, ErrEnrollmentTokenInvalid
 }
 
-func (store *memoryTokenStore) Complete(context.Context, EnrollmentCompletion) (EnrollResult, error) {
-	return EnrollResult{}, ErrEnrollmentTokenInvalid
+func (store *memoryTokenStore) Complete(context.Context, EnrollmentCompletion) (EnrollmentCompletionResult, error) {
+	return EnrollmentCompletionResult{}, ErrEnrollmentTokenInvalid
 }
 
 func (store *memoryTokenStore) Replace(context.Context, EnrollmentToken, uint64) (EnrollmentTokenCreation, error) {
