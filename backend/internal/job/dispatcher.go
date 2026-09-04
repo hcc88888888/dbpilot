@@ -1185,7 +1185,15 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	if !found || !matchingTerminalTarget(storedTarget, target) {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrConflict
 	}
-	detail := map[string]any{"state": result.GetState().String(), "artifact_count": len(target.Artifacts)}
+	effectiveState := result.GetState()
+	detail := map[string]any{"artifact_count": len(target.Artifacts)}
+	if validationCommand != nil {
+		effectiveState = validationResult.GetState()
+		if effectiveState != result.GetState() {
+			detail["incoming_state"] = result.GetState().String()
+		}
+	}
+	detail["state"] = effectiveState.String()
 	event := lifecycle.auditEvent(value, message, "command.result", auditResult, detail, at, "command.result:"+message.ID)
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err

@@ -1206,7 +1206,10 @@ func TestDatabaseInstanceValidationEffectiveFencedOutcomeOwnsCommandJobAndAudit(
 	require.Equal(t, TargetFailed, fixture.persistence.currentJob().TargetResults[0].Status)
 	require.Equal(t, "plugin_failed", fixture.persistence.currentJob().TargetResults[0].ErrorSummary)
 	require.Equal(t, "database instance connection validation failed", fixture.persistence.currentJob().TargetResults[0].ResultSummary)
-	require.Equal(t, "failure", fixture.audit.events[len(fixture.audit.events)-1].Result)
+	event := fixture.audit.events[len(fixture.audit.events)-1]
+	require.Equal(t, "failure", event.Result)
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED.String(), event.Detail["state"])
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED.String(), event.Detail["incoming_state"])
 }
 
 func TestDatabaseInstanceValidationExecutionCASPrecedesProjectionMutation(t *testing.T) {
