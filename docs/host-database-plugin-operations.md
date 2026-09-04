@@ -52,6 +52,51 @@ Re-enrollment creates a new one-time token and certificate generation. Do not
 copy an Agent data directory, private key, spool, or journal to another host or
 Agent identity.
 
+### One-time generation-zero upgrade window
+
+Use this window only for a pre-feature Host that is already persisted with
+credential generation `0`, has no enrollment issuance, and still owns its
+original CA-trusted Agent leaf. Prefer canonical re-enrollment whenever the
+Agent can receive a one-time token.
+
+1. Back up PostgreSQL and record the exact `agent_id`, `tenant_id`,
+   `project_id`, and persisted `host_id` for every eligible active Host. Do not
+   use labels, hostnames, globs, or a tenant-wide switch as import scope.
+2. Add `enrollment.generation_zero_import.enabled: true` and one exact entry
+   under `targets` for each recorded Agent. The Agent must also exist in the
+   static `agents` map with the same tenant and project. Run the offline
+   configuration check:
+
+   ```bash
+   dbpilot-controlplane --config /etc/dbpilot/controlplane.yaml --check-config
+   ```
+
+3. Restart the Server. After migrations, startup preflight verifies each
+   target is either an eligible generation-zero Host with no issuance/import,
+   or the same already-imported generation-one Host. A missing, moved,
+   decommissioned, normally enrolled, or later-generation target prevents
+   listeners from opening.
+4. Start one listed Agent at a time with its existing client certificate. The
+   normal mTLS chain verification and unique `spiffe://dbpilot.local/agent/...`
+   SAN check run before import. PostgreSQL atomically claims that exact leaf's
+   SHA-256 fingerprint and serial as generation `1`, writes one
+   `agent_credential_imports` record, and writes the fixed
+   `host.credential_generation_zero_imported` Audit event. A competing leaf,
+   Agent, scope, or concurrent claim fails closed.
+5. Verify the listed Host is generation `1`, its AgentControl session and
+   Artifact requests succeed only with the claimed leaf, and the import/Audit
+   counts are exactly one. Restart once while the window is still enabled to
+   verify the persisted claim is accepted without a second import.
+6. Close the window immediately: stop the Server, set `enabled: false`, remove
+   every target, rerun `--check-config`, and restart. Keep it closed. Exact-leaf
+   admission remains available from the persisted Host projection; a different
+   leaf now requires canonical replacement enrollment.
+
+Never reopen the window for a decommissioned Host, delete an import record to
+retry a different certificate, or copy the claimed private key to another
+Agent. Investigate a failed preflight from the scoped Host/import/issuance and
+Audit records without printing certificate material.
+
 ## Plugin publishers and packages
 
 Configure at least one Ed25519 publisher public key before enabling the plugin

@@ -140,6 +140,25 @@ func TestExampleConfigurationStrictlyDecodes(t *testing.T) {
 	require.Equal(t, "env://DBPILOT_COMMAND_EXECUTION_TOKEN_KEY", config.Command.ExecutionTokenKeyRef)
 }
 
+func TestGenerationZeroImportWindowIsExplicitAndPreflightValidated(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "config", "controlplane.yaml.example"))
+	require.NoError(t, err)
+	configured := strings.Replace(string(contents), "  observation_delivery_timeout: 5s", `  observation_delivery_timeout: 5s
+  generation_zero_import:
+    enabled: true
+    targets:
+      spiffe-agent-id:
+        tenant_id: tenant-1
+        project_id: project-1
+        host_id: host-legacy-1`, 1)
+	path := filepath.Join(t.TempDir(), "controlplane.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(configured), 0o600))
+
+	config, err := loadConfig(path)
+	require.NoError(t, err)
+	require.NoError(t, validateConfig(config))
+}
+
 func TestPublisherKeysForConfigDecodesOnlyCanonicalEd25519PublicKeys(t *testing.T) {
 	// Break caught: malformed or duplicate configured trust roots must stop
 	// startup rather than silently disabling package signature verification.
@@ -672,6 +691,43 @@ func TestRunMigrationFailureOccursBeforeListeners(t *testing.T) {
 	require.ErrorIs(t, err, want)
 	require.Zero(t, listens)
 	require.False(t, server.ready.Load())
+}
+
+func TestRunGenerationZeroImportPreflightOccursAfterMigrationsBeforeListeners(t *testing.T) {
+	config := validServerConfig()
+	migrations, listens := 0, 0
+	config.Ping = func(context.Context) error { return nil }
+	config.Migrate = func(context.Context) error { migrations++; return nil }
+	config.Listen = func(string, string) (net.Listener, error) { listens++; return newBlockingListener(), nil }
+	server, err := NewServer(config)
+	require.NoError(t, err)
+	server.importPreflight = func(context.Context) error { return errors.New("legacy host mismatch") }
+
+	err = server.Run(context.Background())
+
+	require.EqualError(t, err, "generation-zero credential import preflight failed")
+	require.Equal(t, 1, migrations)
+	require.Zero(t, listens)
+}
+
+func TestGenerationZeroImportConfigRejectsDormantOrUnscopedWindows(t *testing.T) {
+	for name, mutate := range map[string]func(*Config){
+		"dormant targets": func(config *Config) {
+			config.Enrollment.GenerationZeroImport.Targets = map[string]GenerationZeroImportTargetSettings{"agent-a": {TenantID: "tenant-a", ProjectID: "project-a", HostID: "host-a"}}
+		},
+		"empty enabled window": func(config *Config) {
+			config.Enrollment.GenerationZeroImport.Enabled = true
+		},
+		"scope mismatch": func(config *Config) {
+			config.Enrollment.GenerationZeroImport = GenerationZeroImportSettings{Enabled: true, Targets: map[string]GenerationZeroImportTargetSettings{"agent-a": {TenantID: "tenant-other", ProjectID: "project-a", HostID: "host-a"}}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := validServerConfig()
+			mutate(&config)
+			require.ErrorContains(t, validateConfig(config), "generation-zero")
+		})
+	}
 }
 
 func TestConfigRequiresValidatedInspectionTargetMetadata(t *testing.T) {

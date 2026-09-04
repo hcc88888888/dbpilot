@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"dbpilot.local/platform/internal/hostinventory"
 	"dbpilot.local/platform/internal/platformscope"
@@ -52,10 +53,17 @@ LEFT JOIN agent_enrollment_issuances i ON i.token_hash = t.token_hash
 LEFT JOIN managed_hosts h ON h.tenant_id=t.tenant_id AND h.project_id=t.project_id AND h.host_id=t.host_id AND h.agent_id=t.agent_id
 WHERE t.token_hash = $1`
 
-const resolveSupersededCredentialsSQL = `SELECT credential_generation,certificate_fingerprint,certificate_serial
-FROM agent_enrollment_issuances
-WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4
-  AND credential_generation<$5 AND revoked_at IS NOT NULL
+const resolveSupersededCredentialsSQL = `SELECT credential_generation,certificate_fingerprint,certificate_serial FROM (
+    SELECT credential_generation,certificate_fingerprint,certificate_serial
+    FROM agent_enrollment_issuances
+    WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4
+      AND credential_generation<$5 AND revoked_at IS NOT NULL
+    UNION ALL
+    SELECT credential_generation,certificate_fingerprint,certificate_serial
+    FROM agent_credential_imports
+    WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4
+      AND credential_generation<$5
+) credentials
 ORDER BY credential_generation DESC`
 
 const insertIssuanceSQL = `INSERT INTO agent_enrollment_issuances (
@@ -85,10 +93,63 @@ type enrollmentRowQuerier interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-type PostgresRepository struct{ database postgresDatabase }
+type generationZeroImportTarget struct {
+	scope  platformscope.Scope
+	hostID string
+}
+
+type PostgresRepository struct {
+	database              postgresDatabase
+	generationZeroMu      sync.RWMutex
+	generationZeroImports map[string]generationZeroImportTarget
+}
 
 func NewPostgresRepository(database postgresDatabase) *PostgresRepository {
 	return &PostgresRepository{database: database}
+}
+
+func (repository *PostgresRepository) ConfigureGenerationZeroImport(agentID string, scope platformscope.Scope, hostID string) error {
+	if repository == nil || repository.database == nil || !identifierPattern.MatchString(agentID) || scope.Validate() != nil || !identifierPattern.MatchString(hostID) {
+		return ErrEnrollmentRequestInvalid
+	}
+	target := generationZeroImportTarget{scope: scope, hostID: hostID}
+	repository.generationZeroMu.Lock()
+	defer repository.generationZeroMu.Unlock()
+	if repository.generationZeroImports == nil {
+		repository.generationZeroImports = make(map[string]generationZeroImportTarget)
+	}
+	if existing, ok := repository.generationZeroImports[agentID]; ok && existing != target {
+		return ErrEnrollmentConflict
+	}
+	repository.generationZeroImports[agentID] = target
+	return nil
+}
+
+func (repository *PostgresRepository) ValidateGenerationZeroImports(ctx context.Context) error {
+	if repository == nil || repository.database == nil || ctx == nil {
+		return ErrEnrollmentRequestInvalid
+	}
+	repository.generationZeroMu.RLock()
+	targets := make(map[string]generationZeroImportTarget, len(repository.generationZeroImports))
+	for agentID, target := range repository.generationZeroImports {
+		targets[agentID] = target
+	}
+	repository.generationZeroMu.RUnlock()
+	for agentID, target := range targets {
+		var status string
+		var generation int64
+		var fingerprint []byte
+		var serial string
+		var revokedAt sql.NullTime
+		var imported, issued bool
+		err := repository.database.QueryRowContext(ctx, `SELECT host.status,host.credential_generation,host.active_certificate_fingerprint,host.active_certificate_serial,host.credential_revoked_at,EXISTS(SELECT 1 FROM agent_credential_imports imported WHERE imported.tenant_id=host.tenant_id AND imported.project_id=host.project_id AND imported.host_id=host.host_id AND imported.agent_id=host.agent_id),EXISTS(SELECT 1 FROM agent_enrollment_issuances issuance WHERE issuance.tenant_id=host.tenant_id AND issuance.project_id=host.project_id AND issuance.host_id=host.host_id AND issuance.agent_id=host.agent_id) FROM managed_hosts host WHERE host.tenant_id=$1 AND host.project_id=$2 AND host.host_id=$3 AND host.agent_id=$4`, target.scope.TenantID, target.scope.ProjectID, target.hostID, agentID).Scan(&status, &generation, &fingerprint, &serial, &revokedAt, &imported, &issued)
+		generationZero := err == nil && status != string(hostinventory.HostDecommissioned) && generation == 0 && len(fingerprint) == 0 && serial == "" && !revokedAt.Valid && !imported && !issued
+		persistedImport := err == nil && status != string(hostinventory.HostDecommissioned) && generation == 1 && len(fingerprint) == sha256.Size && certificateSerialPattern.MatchString(serial) && !revokedAt.Valid && imported && !issued
+		if !generationZero && !persistedImport {
+			return ErrEnrollmentRequestInvalid
+		}
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) Create(ctx context.Context, token EnrollmentToken) (EnrollmentTokenCreation, error) {
@@ -159,8 +220,19 @@ func (repository *PostgresRepository) Replace(ctx context.Context, token Enrollm
 	var generation int64
 	err = transaction.QueryRowContext(ctx, findEnrollmentTokenReplacementSQL, token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).Scan(&existingHash, &consumedAt, &generation)
 	if errors.Is(err, sql.ErrNoRows) {
-		rollback()
-		return EnrollmentTokenCreation{}, ErrEnrollmentNotFound
+		var status, serial string
+		var fingerprint []byte
+		var revokedAt sql.NullTime
+		var imported bool
+		err = transaction.QueryRowContext(ctx, `SELECT host.status,host.credential_generation,host.active_certificate_fingerprint,host.active_certificate_serial,host.credential_revoked_at,EXISTS(SELECT 1 FROM agent_credential_imports imported WHERE imported.tenant_id=host.tenant_id AND imported.project_id=host.project_id AND imported.host_id=host.host_id AND imported.agent_id=host.agent_id AND imported.credential_generation=host.credential_generation AND imported.certificate_fingerprint=host.active_certificate_fingerprint AND imported.certificate_serial=host.active_certificate_serial) FROM managed_hosts host WHERE host.tenant_id=$1 AND host.project_id=$2 AND host.host_id=$3 AND host.agent_id=$4 FOR UPDATE`, token.Scope.TenantID, token.Scope.ProjectID, token.HostID, token.AgentID).Scan(&status, &generation, &fingerprint, &serial, &revokedAt, &imported)
+		if err != nil || status == string(hostinventory.HostDecommissioned) || generation != 1 || expectedGeneration != 1 || len(fingerprint) != sha256.Size || !certificateSerialPattern.MatchString(serial) || revokedAt.Valid || !imported {
+			rollback()
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return EnrollmentTokenCreation{}, mapPostgresError(err)
+			}
+			return EnrollmentTokenCreation{}, ErrEnrollmentNotFound
+		}
+		consumedAt.Valid = true
 	}
 	if err != nil {
 		rollback()
@@ -278,9 +350,28 @@ func (repository *PostgresRepository) Resolve(ctx context.Context, key Enrollmen
 }
 
 func (repository *PostgresRepository) AuthorizeAgentCredential(ctx context.Context, agentID string, fingerprint [sha256.Size]byte, serial string) error {
-	if repository == nil || repository.database == nil || ctx == nil || !identifierPattern.MatchString(agentID) || fingerprint == ([sha256.Size]byte{}) || serial == "" {
+	if repository == nil || repository.database == nil || ctx == nil || !identifierPattern.MatchString(agentID) || fingerprint == ([sha256.Size]byte{}) || !certificateSerialPattern.MatchString(serial) {
 		return ErrEnrollmentTokenInvalid
 	}
+	if err := repository.authorizeCurrentAgentCredential(ctx, agentID, fingerprint, serial); err == nil {
+		return nil
+	}
+	repository.generationZeroMu.RLock()
+	target, configured := repository.generationZeroImports[agentID]
+	repository.generationZeroMu.RUnlock()
+	if !configured {
+		return ErrEnrollmentTokenInvalid
+	}
+	for attempt := 0; attempt < 16; attempt++ {
+		err := repository.importGenerationZeroCredentialOnce(ctx, agentID, target, fingerprint, serial)
+		if !errors.Is(err, ErrEnrollmentGenerationConflict) {
+			return err
+		}
+	}
+	return ErrEnrollmentTokenInvalid
+}
+
+func (repository *PostgresRepository) authorizeCurrentAgentCredential(ctx context.Context, agentID string, fingerprint [sha256.Size]byte, serial string) error {
 	var status string
 	var generation int64
 	var storedFingerprint []byte
@@ -291,6 +382,66 @@ func (repository *PostgresRepository) AuthorizeAgentCredential(ctx context.Conte
 		return ErrEnrollmentTokenInvalid
 	}
 	return nil
+}
+
+func (repository *PostgresRepository) importGenerationZeroCredentialOnce(ctx context.Context, agentID string, target generationZeroImportTarget, fingerprint [sha256.Size]byte, serial string) error {
+	transaction, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return ErrEnrollmentTokenInvalid
+	}
+	rollback := func() { _ = transaction.Rollback() }
+	result, err := transaction.ExecContext(ctx, `UPDATE managed_hosts SET credential_generation=1,active_certificate_fingerprint=$1,active_certificate_serial=$2,credential_revoked_at=NULL,version=version+1,updated_at=CURRENT_TIMESTAMP WHERE tenant_id=$3 AND project_id=$4 AND host_id=$5 AND agent_id=$6 AND status<>'decommissioned' AND credential_generation=0 AND octet_length(active_certificate_fingerprint)=0 AND active_certificate_serial='' AND credential_revoked_at IS NULL`, fingerprint[:], serial, target.scope.TenantID, target.scope.ProjectID, target.hostID, agentID)
+	if err != nil {
+		rollback()
+		if isEnrollmentSerializationFailure(err) {
+			return ErrEnrollmentGenerationConflict
+		}
+		return ErrEnrollmentTokenInvalid
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		rollback()
+		return ErrEnrollmentTokenInvalid
+	}
+	if rows == 0 {
+		rollback()
+		if err := repository.authorizeCurrentAgentCredential(ctx, agentID, fingerprint, serial); err != nil {
+			return ErrEnrollmentTokenInvalid
+		}
+		return nil
+	}
+	if rows != 1 {
+		rollback()
+		return ErrEnrollmentConflict
+	}
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO agent_credential_imports (tenant_id,project_id,host_id,agent_id,credential_generation,certificate_fingerprint,certificate_serial,imported_at,import_source) VALUES ($1,$2,$3,$4,1,$5,$6,CURRENT_TIMESTAMP,'verified_mtls')`, target.scope.TenantID, target.scope.ProjectID, target.hostID, agentID, fingerprint[:], serial); err != nil {
+		rollback()
+		if isEnrollmentSerializationFailure(err) {
+			return ErrEnrollmentGenerationConflict
+		}
+		return ErrEnrollmentTokenInvalid
+	}
+	identity := sha256.Sum256(append([]byte(target.scope.Key()+"\x00"+target.hostID+"\x00"+agentID+"\x00"), fingerprint[:]...))
+	detail, _ := json.Marshal(map[string]any{"credential_generation": 1, "source": "verified_mtls"})
+	if _, err := transaction.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,CURRENT_TIMESTAMP,'host.credential_generation_zero_imported','system','generation-zero-import','host',$4,'success','','','','',$5,$6,CURRENT_TIMESTAMP) ON CONFLICT (tenant_id,project_id,dedupe_key) WHERE dedupe_key<>'' DO NOTHING`, "audit-agent-import-"+hex.EncodeToString(identity[:16]), target.scope.TenantID, target.scope.ProjectID, target.hostID, "agent-credential-import:"+hex.EncodeToString(identity[:]), detail); err != nil {
+		rollback()
+		if isEnrollmentSerializationFailure(err) {
+			return ErrEnrollmentGenerationConflict
+		}
+		return ErrEnrollmentTokenInvalid
+	}
+	if err := transaction.Commit(); err != nil {
+		if isEnrollmentSerializationFailure(err) {
+			return ErrEnrollmentGenerationConflict
+		}
+		return ErrEnrollmentTokenInvalid
+	}
+	return nil
+}
+
+func isEnrollmentSerializationFailure(err error) bool {
+	var postgresError *pq.Error
+	return errors.As(err, &postgresError) && (postgresError.Code == "40001" || postgresError.Code == "40P01")
 }
 
 func (repository *PostgresRepository) Complete(ctx context.Context, completion EnrollmentCompletion) (EnrollmentCompletionResult, error) {

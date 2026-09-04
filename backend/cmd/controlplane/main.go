@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -162,12 +163,26 @@ type DiscoveryRulePolicySettings struct {
 }
 
 type EnrollmentSettings struct {
-	Listener                   ListenerConfig `yaml:"listener"`
-	AgentCA                    TLSMaterial    `yaml:"agent_ca"`
-	CertificateLifetime        time.Duration  `yaml:"certificate_lifetime,omitempty"`
-	MaximumPendingHosts        int            `yaml:"maximum_pending_hosts,omitempty"`
-	ObservationDeliveryTimeout time.Duration  `yaml:"observation_delivery_timeout,omitempty"`
+	Listener                   ListenerConfig               `yaml:"listener"`
+	AgentCA                    TLSMaterial                  `yaml:"agent_ca"`
+	CertificateLifetime        time.Duration                `yaml:"certificate_lifetime,omitempty"`
+	MaximumPendingHosts        int                          `yaml:"maximum_pending_hosts,omitempty"`
+	ObservationDeliveryTimeout time.Duration                `yaml:"observation_delivery_timeout,omitempty"`
+	GenerationZeroImport       GenerationZeroImportSettings `yaml:"generation_zero_import,omitempty"`
 }
+
+type GenerationZeroImportSettings struct {
+	Enabled bool                                          `yaml:"enabled"`
+	Targets map[string]GenerationZeroImportTargetSettings `yaml:"targets,omitempty"`
+}
+
+type GenerationZeroImportTargetSettings struct {
+	TenantID  string `yaml:"tenant_id"`
+	ProjectID string `yaml:"project_id"`
+	HostID    string `yaml:"host_id"`
+}
+
+var generationZeroImportIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 func (settings MonitoringSettings) limits() monitoring.QueryLimits {
 	return monitoring.QueryLimits{MaximumInstances: settings.MaximumInstances, MaximumMetrics: settings.MaximumMetrics, MaximumLabels: settings.MaximumLabels, MaximumSamples: settings.MaximumSamples, MaximumResponseBytes: settings.MaximumResponseBytes}
@@ -249,6 +264,7 @@ type Server struct {
 	enrollmentTLS           *tls.Config
 	ping                    func(context.Context) error
 	migrate                 func(context.Context) error
+	importPreflight         func(context.Context) error
 	listen                  func(string, string) (net.Listener, error)
 	scopes                  []alert.Scope
 	ready                   *atomic.Bool
@@ -444,6 +460,19 @@ func NewServer(config Config) (*Server, error) {
 	repository := alert.NewPostgresRepository(database)
 	hostRepository := hostinventory.NewPostgresRepository(database)
 	agentCredentialRepository := enrollment.NewPostgresRepository(database)
+	if config.Enrollment.GenerationZeroImport.Enabled {
+		agentIDs := make([]string, 0, len(config.Enrollment.GenerationZeroImport.Targets))
+		for agentID := range config.Enrollment.GenerationZeroImport.Targets {
+			agentIDs = append(agentIDs, agentID)
+		}
+		sort.Strings(agentIDs)
+		for _, agentID := range agentIDs {
+			target := config.Enrollment.GenerationZeroImport.Targets[agentID]
+			if err := agentCredentialRepository.ConfigureGenerationZeroImport(agentID, platformscope.Scope{TenantID: target.TenantID, ProjectID: target.ProjectID}, target.HostID); err != nil {
+				return nil, errors.New("configure generation-zero credential import")
+			}
+		}
+	}
 	resolver := runtimeAgentResolver{configured: buildConfiguredAgentResolver(config.Agents), enrolled: hostRepository}
 	metricConsumer := controlplane.NewMetricConsumer(resolver, repository)
 	ingestService := ingest.NewDurableService(resolver, postgresLogBatchDeduplicator{database: database}, metricConsumer)
@@ -842,7 +871,11 @@ func NewServer(config Config) (*Server, error) {
 		commandObserver = commandLifecycle
 	}
 	telemetryv1.RegisterAgentControlServer(grpcServer, agentcontrol.NewServer(agentRegistry, commandObserver, agentcontrol.WithHostObserver(hostObservations), agentcontrol.WithDiscoveryObserver(discoveryObservations), agentcontrol.WithPluginObserver(pluginObservations), agentcontrol.WithPluginArtifactLeaseIssuer(pluginArtifactLeaseIssuer), agentcontrol.WithCredentialLeaseIssuer(credentialLeaseIssuer), agentcontrol.WithMetricTemplateLeaseIssuer(metricTemplateLeaseWire), agentcontrol.WithAgentCredentialAuthorizer(agentCredentialRepository)))
-	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, metricTemplateLeases: metricTemplateLeases, failMetricTrials: func(ctx context.Context, at time.Time) error {
+	importPreflight := func(context.Context) error { return nil }
+	if config.Enrollment.GenerationZeroImport.Enabled {
+		importPreflight = agentCredentialRepository.ValidateGenerationZeroImports
+	}
+	return &Server{config: config, database: database, ownsDatabase: ownsDatabase, repository: repository, evaluator: evaluator, dispatcher: dispatcher, httpServer: httpServer, grpcServer: grpcServer, enrollmentGRPCServer: enrollmentGRPCServer, httpTLS: httpTLS.Clone(), grpcTLS: grpcTLS.Clone(), enrollmentTLS: enrollmentTLS, ping: ping, migrate: migrate, importPreflight: importPreflight, listen: listen, scopes: configuredScopes(config), ready: ready, evaluateScope: evaluator.EvaluateScope, listEvents: repository.ListEvents, dispatch: dispatcher.Dispatch, retryDue: dispatcher.RetryDue, agentRegistry: agentRegistry, commandObserver: commandObserver, commandLifecycle: commandLifecycle, hostObservations: hostObservations, credentialLeases: leaseService, metricTemplateLeases: metricTemplateLeases, failMetricTrials: func(ctx context.Context, at time.Time) error {
 		if metricRepository == nil {
 			return nil
 		}
@@ -1027,6 +1060,22 @@ func validateConfig(config Config) error {
 	}
 	if config.Enrollment.MaximumPendingHosts < 0 || config.Enrollment.ObservationDeliveryTimeout < 0 {
 		return errors.New("enrollment Host observation delivery settings are invalid")
+	}
+	importSettings := config.Enrollment.GenerationZeroImport
+	if !importSettings.Enabled && len(importSettings.Targets) != 0 {
+		return errors.New("enrollment generation-zero import targets require an enabled migration window")
+	}
+	if importSettings.Enabled {
+		if len(importSettings.Targets) == 0 || len(importSettings.Targets) > 1024 {
+			return errors.New("enrollment generation-zero import window requires bounded explicit targets")
+		}
+		for agentID, target := range importSettings.Targets {
+			scope := platformscope.Scope{TenantID: target.TenantID, ProjectID: target.ProjectID}
+			configured, exists := config.Agents[agentID]
+			if !generationZeroImportIdentifierPattern.MatchString(agentID) || !generationZeroImportIdentifierPattern.MatchString(target.HostID) || scope.Validate() != nil || !exists || configured.TenantID != target.TenantID || configured.ProjectID != target.ProjectID {
+				return errors.New("enrollment generation-zero import target is invalid or does not match the configured Agent scope")
+			}
+		}
 	}
 	if config.Enrollment.Listener.Address != "" {
 		if config.Enrollment.Listener.Address != strings.TrimSpace(config.Enrollment.Listener.Address) || config.Enrollment.Listener.Address == config.HTTP.Address || config.Enrollment.Listener.Address == config.GRPC.Address {
@@ -1330,6 +1379,12 @@ func (server *Server) Run(ctx context.Context) error {
 	if err := server.migrate(ctx); err != nil {
 		server.closeResources()
 		return fmt.Errorf("run migrations: %w", err)
+	}
+	if server.importPreflight != nil {
+		if err := server.importPreflight(ctx); err != nil {
+			server.closeResources()
+			return errors.New("generation-zero credential import preflight failed")
+		}
 	}
 	httpListener, err := server.listen("tcp", server.config.HTTP.Address)
 	if err != nil {

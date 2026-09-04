@@ -289,13 +289,15 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 
 	require.NoError(t, RunMigrations(ctx, database))
 	require.NoError(t, RunMigrations(ctx, database), "migration rerun must be idempotent")
-	var generationColumn, issuanceTable bool
+	var generationColumn, issuanceTable, importTable bool
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT EXISTS (
         SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'agent_enrollment_tokens' AND column_name = 'generation'
     )`).Scan(&generationColumn))
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT to_regclass('agent_enrollment_issuances') IS NOT NULL`).Scan(&issuanceTable))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT to_regclass('agent_credential_imports') IS NOT NULL`).Scan(&importTable))
 	require.True(t, generationColumn)
 	require.True(t, issuanceTable)
+	require.True(t, importTable)
 	var activeLegacy int
 	require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM agent_enrollment_tokens WHERE tenant_id = $1 AND project_id = $2 AND consumed_at IS NULL", legacyScope.TenantID, legacyScope.ProjectID).Scan(&activeLegacy))
 	require.Equal(t, 1, activeLegacy, "0002 must deterministically revoke duplicate legacy active grants before adding uniqueness")
@@ -325,6 +327,151 @@ func TestEnrollmentPostgresUpgradeFromOriginal0001(t *testing.T) {
 	completed, err := repository.Complete(ctx, EnrollmentCompletion{Key: key, Grant: resolved.Grant, Observation: observation, Result: result, CompletedAt: now})
 	require.NoError(t, err)
 	require.Equal(t, result, completed.Response)
+}
+
+func TestEnrollmentPostgresGenerationZeroImportIsScopedAtomicAuditedAndPersistent(t *testing.T) {
+	if os.Getenv("DBPILOT_ENROLLMENT_POSTGRES_INTEGRATION") != "1" {
+		t.Skip("set DBPILOT_ENROLLMENT_POSTGRES_INTEGRATION=1 to run")
+	}
+	dsn := os.Getenv("DBPILOT_ENROLLMENT_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DBPILOT_ENROLLMENT_POSTGRES_DSN is required")
+	}
+	database, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	ctx := context.Background()
+	require.NoError(t, platformdb.RunMigrations(ctx, database))
+	require.NoError(t, hostinventory.RunMigrations(ctx, database))
+	require.NoError(t, RunMigrations(ctx, database))
+	suffix := fmt.Sprintf("generation-zero-%d", time.Now().UnixNano())
+	scope := platformscope.Scope{TenantID: "tenant-" + suffix, ProjectID: "project-" + suffix}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	t.Cleanup(func() {
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM audit_events WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_credential_imports WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_issuances WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM host_observations WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_tokens WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+	})
+	recordGenerationZeroHost := func(targetScope platformscope.Scope, hostID, agentID string) {
+		observation := hostinventory.Observation{HostID: hostID, AgentID: agentID, Revision: 1, AgentVersion: "legacy", Hostname: hostID + ".example", OS: "linux", Architecture: "amd64", LogicalCPUCount: 1, MemoryCapacityBytes: 1 << 20, NetworkAddresses: []string{}, Capabilities: []string{}, ObservedAt: now}
+		_, recordErr := hostinventory.NewPostgresRepository(database).RecordEnrollment(ctx, targetScope, hostinventory.Enrollment{HostID: hostID, AgentID: agentID, DisplayName: "Legacy host", Labels: map[string]string{}, Revision: 1, EnrolledAt: now}, observation, now)
+		require.NoError(t, recordErr)
+	}
+
+	repository := NewPostgresRepository(database)
+	configurer, ok := any(repository).(interface {
+		ConfigureGenerationZeroImport(string, platformscope.Scope, string) error
+		ValidateGenerationZeroImports(context.Context) error
+	})
+	require.True(t, ok, "enrollment repository must expose an explicit generation-zero import window")
+	if !ok {
+		return
+	}
+	hostID, agentID := "host-current-"+suffix, "agent-current-"+suffix
+	recordGenerationZeroHost(scope, hostID, agentID)
+	require.NoError(t, configurer.ConfigureGenerationZeroImport(agentID, scope, hostID))
+	require.NoError(t, configurer.ValidateGenerationZeroImports(ctx))
+	certificate, caKey := testCertificateAuthority(t, now)
+	fingerprint, serial, err := enrollmentCertificateIdentity(certificate)
+	require.NoError(t, err)
+	require.NoError(t, repository.AuthorizeAgentCredential(ctx, agentID, fingerprint, serial))
+
+	var generation int64
+	var storedFingerprint []byte
+	var storedSerial string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT credential_generation,active_certificate_fingerprint,active_certificate_serial FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4`, scope.TenantID, scope.ProjectID, hostID, agentID).Scan(&generation, &storedFingerprint, &storedSerial))
+	require.Equal(t, int64(1), generation)
+	require.Equal(t, fingerprint[:], storedFingerprint)
+	require.Equal(t, serial, storedSerial)
+	var importCount, auditCount int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM agent_credential_imports WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4`, scope.TenantID, scope.ProjectID, hostID, agentID).Scan(&importCount))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND project_id=$2 AND resource_id=$3 AND action='host.credential_generation_zero_imported'`, scope.TenantID, scope.ProjectID, hostID).Scan(&auditCount))
+	require.Equal(t, 1, importCount)
+	require.Equal(t, 1, auditCount)
+	require.NoError(t, configurer.ValidateGenerationZeroImports(ctx), "an already imported exact target must survive a restart during the bounded window")
+	require.NoError(t, NewPostgresRepository(database).AuthorizeAgentCredential(ctx, agentID, fingerprint, serial), "exact leaf admission must persist after restart with the import window closed")
+	competing := sha256.Sum256([]byte("competing-current-leaf"))
+	require.Error(t, NewPostgresRepository(database).AuthorizeAgentCredential(ctx, agentID, competing, "02"))
+
+	issuer, err := NewAgentCertificateIssuer(certificate, caKey, time.Hour, func() time.Time { return now }, rand.Reader)
+	require.NoError(t, err)
+	sessions := &recordingCredentialSessions{}
+	service := ApplicationService{Tokens: repository, Certificates: issuer, Sessions: sessions, Random: bytes.NewReader(bytes.Repeat([]byte{7}, EnrollmentTokenBytes)), Now: func() time.Time { return now }}
+	replacementRequest := CreateRequest{HostID: hostID, AgentID: agentID, DisplayName: "Legacy host", Labels: map[string]string{}, ExpiresIn: time.Hour, IssuedBy: "operator", IdempotencyKey: "replace-imported", RequestFingerprint: "sha256:" + fmt.Sprintf("%064x", 501), Audit: EnrollmentAudit{Actor: "operator", RequestID: "request-replace-imported", OperationID: "replaceHostEnrollment", IdempotencyKey: "replace-imported"}}
+	replacement, err := service.Replace(ctx, scope, replacementRequest, 1)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), replacement.Generation)
+	replaced, err := service.Enroll(ctx, signedEnrollRequest(t, replacement.Token, agentID, now))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), replaced.CredentialGeneration)
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, agentID, fingerprint, serial))
+	require.NoError(t, repository.AuthorizeAgentCredential(ctx, agentID, replaced.CertificateFingerprint, replaced.CertificateSerial))
+	require.Equal(t, [][sha256.Size]byte{fingerprint}, sessions.fingerprints, "canonical replacement must terminate the exact imported leaf")
+	require.Equal(t, []string{serial}, sessions.serials)
+	require.Error(t, configurer.ValidateGenerationZeroImports(ctx), "a later generation requires closing and removing the migration target")
+
+	concurrentHost, concurrentAgent := "host-concurrent-"+suffix, "agent-concurrent-"+suffix
+	recordGenerationZeroHost(scope, concurrentHost, concurrentAgent)
+	require.NoError(t, configurer.ConfigureGenerationZeroImport(concurrentAgent, scope, concurrentHost))
+	firstFingerprint := sha256.Sum256([]byte("first-import-leaf-" + suffix))
+	secondFingerprint := sha256.Sum256([]byte("second-import-leaf-" + suffix))
+	type importAttempt struct {
+		fingerprint [sha256.Size]byte
+		err         error
+	}
+	attempts := make(chan importAttempt, 24)
+	start := make(chan struct{})
+	for index := 0; index < 24; index++ {
+		candidate, candidateSerial := firstFingerprint, "11"
+		if index%2 == 1 {
+			candidate, candidateSerial = secondFingerprint, "12"
+		}
+		go func() {
+			<-start
+			attempts <- importAttempt{fingerprint: candidate, err: repository.AuthorizeAgentCredential(ctx, concurrentAgent, candidate, candidateSerial)}
+		}()
+	}
+	close(start)
+	completedAttempts := make([]importAttempt, 0, 24)
+	for index := 0; index < 24; index++ {
+		completedAttempts = append(completedAttempts, <-attempts)
+	}
+	var concurrentGeneration int64
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT credential_generation,active_certificate_fingerprint FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4`, scope.TenantID, scope.ProjectID, concurrentHost, concurrentAgent).Scan(&concurrentGeneration, &storedFingerprint))
+	successes := 0
+	failed := map[string]int{}
+	for _, attempt := range completedAttempts {
+		if attempt.err == nil {
+			successes++
+			require.Equal(t, storedFingerprint, attempt.fingerprint[:])
+		} else {
+			failed[attempt.err.Error()]++
+		}
+	}
+	require.Greater(t, successes, 0, "generation=%d fingerprint=%x failures=%v", concurrentGeneration, storedFingerprint, failed)
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM agent_credential_imports WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3`, scope.TenantID, scope.ProjectID, concurrentHost).Scan(&importCount))
+	require.Equal(t, 1, importCount)
+
+	crossScope := platformscope.Scope{TenantID: scope.TenantID + "-other", ProjectID: scope.ProjectID + "-other"}
+	crossHost, crossAgent := "host-cross-"+suffix, "agent-cross-"+suffix
+	recordGenerationZeroHost(crossScope, crossHost, crossAgent)
+	require.NoError(t, configurer.ConfigureGenerationZeroImport(crossAgent, crossScope, crossHost))
+	winnerFingerprint, winnerSerial := firstFingerprint, "11"
+	if bytes.Equal(storedFingerprint, secondFingerprint[:]) {
+		winnerFingerprint, winnerSerial = secondFingerprint, "12"
+	}
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, crossAgent, winnerFingerprint, winnerSerial), "one imported leaf cannot be claimed by another tenant or Agent")
+
+	decommissionedHost, decommissionedAgent := "host-decommissioned-"+suffix, "agent-decommissioned-"+suffix
+	recordGenerationZeroHost(scope, decommissionedHost, decommissionedAgent)
+	require.NoError(t, configurer.ConfigureGenerationZeroImport(decommissionedAgent, scope, decommissionedHost))
+	_, err = database.ExecContext(ctx, `UPDATE managed_hosts SET status='decommissioned',credential_generation=1,active_certificate_fingerprint=''::bytea,active_certificate_serial='',credential_revoked_at=$1,version=version+1,updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND host_id=$4`, now.Add(time.Second), scope.TenantID, scope.ProjectID, decommissionedHost)
+	require.NoError(t, err)
+	decommissionedFingerprint := sha256.Sum256([]byte("decommissioned-leaf"))
+	require.Error(t, repository.AuthorizeAgentCredential(ctx, decommissionedAgent, decommissionedFingerprint, "21"))
 }
 
 func openEnrollmentUpgradeDatabase(t *testing.T, ctx context.Context, dsn string) (*sql.DB, string) {

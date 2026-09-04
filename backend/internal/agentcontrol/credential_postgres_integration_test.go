@@ -46,6 +46,7 @@ func TestAgentCredentialPostgresMTLSReplacementRaceAndArtifactAdmission(t *testi
 	hostID, agentID := "host-"+suffix, "agent-"+suffix
 	t.Cleanup(func() {
 		_, _ = database.ExecContext(context.Background(), "DELETE FROM audit_events WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
+		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_credential_imports WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
 		_, _ = database.ExecContext(context.Background(), "DELETE FROM agent_enrollment_issuances WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
 		_, _ = database.ExecContext(context.Background(), "DELETE FROM host_observations WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
 		_, _ = database.ExecContext(context.Background(), "DELETE FROM managed_hosts WHERE tenant_id=$1 AND project_id=$2", scope.TenantID, scope.ProjectID)
@@ -67,7 +68,6 @@ func TestAgentCredentialPostgresMTLSReplacementRaceAndArtifactAdmission(t *testi
 	serverCertificate := testPluginLeaseCertificate(t, ca, caKey, "server", "", false)
 	oldCertificate := testPluginLeaseCertificate(t, ca, caKey, "old-"+suffix, agentID, true)
 	currentCertificate := testPluginLeaseCertificate(t, ca, caKey, "current-"+suffix, agentID, true)
-	oldLeaf := parsedTLSLeaf(t, oldCertificate)
 	currentLeaf := parsedTLSLeaf(t, currentCertificate)
 	activateCredential := func(generation uint64, leaf *x509.Certificate) {
 		fingerprint := sha256.Sum256(leaf.Raw)
@@ -77,22 +77,17 @@ func TestAgentCredentialPostgresMTLSReplacementRaceAndArtifactAdmission(t *testi
 		require.NoError(t, rowsErr)
 		require.Equal(t, int64(1), rows)
 	}
-	activateCredential(1, oldLeaf)
-
 	repository := enrollment.NewPostgresRepository(database)
-	barrier := &postgresCredentialBarrier{delegate: repository, called: make(chan struct{}, 8)}
+	require.NoError(t, repository.ConfigureGenerationZeroImport(agentID, scope, hostID))
+	require.NoError(t, repository.ValidateGenerationZeroImports(ctx))
 	registry := NewRegistry(4)
-	server := NewServer(registry, NoopObserver{}, WithAgentCredentialAuthorizer(barrier))
-	oldStream := newTestConnectStream(tlsContextForLeaf(t, oldCertificate))
-	connectResult := make(chan error, 1)
-	go func() { connectResult <- server.Connect(oldStream) }()
-	barrier.wait(t)
-	activateCredential(2, currentLeaf)
-	oldStream.push(helloMessage(agentID, ProtocolVersion, "collect_now"))
-	oldStream.closeReceive()
-	require.Equal(t, codes.Unauthenticated, status.Code(<-connectResult), "replacement in the pre-Hello window must reject the stale leaf")
-	_, admitted := registry.Session(agentID)
-	require.False(t, admitted)
+	initialServer := NewServer(registry, NoopObserver{}, WithAgentCredentialAuthorizer(repository))
+	initialStream := newTestConnectStream(tlsContextForLeaf(t, oldCertificate), helloMessage(agentID, ProtocolVersion, "collect_now"))
+	initialStream.closeReceive()
+	require.NoError(t, initialServer.Connect(initialStream), "the first CA-verified SPIFFE session must claim and admit the generation-zero leaf")
+	var imported int
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM agent_credential_imports WHERE tenant_id=$1 AND project_id=$2 AND host_id=$3 AND agent_id=$4`, scope.TenantID, scope.ProjectID, hostID, agentID).Scan(&imported))
+	require.Equal(t, 1, imported)
 
 	fixture := newLeaseIssuerFixture(t)
 	fixture.authorizer.agentID = agentID
@@ -107,6 +102,21 @@ func TestAgentCredentialPostgresMTLSReplacementRaceAndArtifactAdmission(t *testi
 	request, err := http.NewRequest(http.MethodGet, httpServer.URL+pluginArtifactPathPrefix+lease.GetLeaseId(), nil)
 	require.NoError(t, err)
 	request.Header.Set(pluginArtifactLeaseHeader, lease.GetRequestHeaders()[pluginArtifactLeaseHeader])
+	require.Equal(t, http.StatusOK, artifactStatus(t, roots, oldCertificate, request), "the imported exact leaf may download artifacts")
+
+	barrier := &postgresCredentialBarrier{delegate: repository, called: make(chan struct{}, 8)}
+	server := NewServer(registry, NoopObserver{}, WithAgentCredentialAuthorizer(barrier))
+	oldStream := newTestConnectStream(tlsContextForLeaf(t, oldCertificate))
+	connectResult := make(chan error, 1)
+	go func() { connectResult <- server.Connect(oldStream) }()
+	barrier.wait(t)
+	activateCredential(2, currentLeaf)
+	oldStream.push(helloMessage(agentID, ProtocolVersion, "collect_now"))
+	oldStream.closeReceive()
+	require.Equal(t, codes.Unauthenticated, status.Code(<-connectResult), "replacement in the pre-Hello window must reject the stale leaf")
+	_, admitted := registry.Session(agentID)
+	require.False(t, admitted)
+
 	require.Equal(t, http.StatusForbidden, artifactStatus(t, roots, oldCertificate, request), "replaced leaf must not download artifacts")
 	require.Equal(t, http.StatusOK, artifactStatus(t, roots, currentCertificate, request), "current exact leaf may download artifacts")
 

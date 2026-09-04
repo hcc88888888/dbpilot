@@ -35,6 +35,14 @@ enrollment:
   certificate_lifetime: 24h
   maximum_pending_hosts: 1024
   observation_delivery_timeout: 5s
+  # Temporary upgrade window for pre-feature Agents only. Keep omitted during
+  # normal operation. When needed, set enabled: true and list every exact
+  # agent_id with tenant_id, project_id, and persisted host_id under targets.
+  # Remove all targets and set enabled: false immediately after every listed
+  # Host has one audited generation-1 import.
+  # generation_zero_import:
+  #   enabled: false
+  #   targets: {}
 
 webhook_allowlist:
   - "hooks.example.com"
