@@ -64,7 +64,7 @@ func (repository *PostgresRepository) StartValidation(ctx context.Context, scope
 		return job.Job{}, err
 	}
 	previousStatus := instance.ManagementStatus
-	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state='plugin_available',connection_test_status='queued',connection_test_error_code='',connection_test_at=$1,management_status='connection_testing',revision=revision+1,updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND instance_id=$4 AND revision=$5 AND management_status<>'retired'`, created.CreatedAt, scope.TenantID, scope.ProjectID, instanceID, instance.Revision)
+	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state='plugin_available',connection_test_status='queued',connection_test_error_code='',connection_test_at=$1,management_status='connection_testing',connection_validation_job_id=$6,connection_validation_command_id=$7,revision=revision+1,updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND instance_id=$4 AND revision=$5 AND management_status<>'retired' AND connection_validation_job_id='' AND connection_validation_command_id=''`, created.CreatedAt, scope.TenantID, scope.ProjectID, instanceID, instance.Revision, created.ID, message.ID)
 	if err != nil {
 		rollback()
 		return job.Job{}, mapPostgresError(err)
@@ -149,7 +149,7 @@ func (repository *PostgresRepository) RecordValidationProgress(ctx context.Conte
 	if _, err := tx.ExecContext(ctx, `UPDATE database_instance_validations SET status='running',started_at=COALESCE(started_at,$1) WHERE tenant_id=$2 AND project_id=$3 AND job_id=$4 AND command_id=$5 AND status='queued'`, at, scope.TenantID, scope.ProjectID, jobID, commandID); err != nil {
 		return mapPostgresError(err)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET connection_test_status='running',connection_test_error_code='',connection_test_at=$1,management_status='connection_testing',revision=revision+1,updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND instance_id=$4 AND connection_test_status='queued' AND management_status<>'retired'`, at, scope.TenantID, scope.ProjectID, state.InstanceID)
+	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET connection_test_status='running',connection_test_error_code='',connection_test_at=$1,management_status='connection_testing',revision=revision+1,updated_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND instance_id=$4 AND connection_test_status='queued' AND management_status<>'retired' AND connection_validation_job_id=$5 AND connection_validation_command_id=$6`, at, scope.TenantID, scope.ProjectID, state.InstanceID, jobID, commandID)
 	if err != nil {
 		return mapPostgresError(err)
 	}
@@ -163,6 +163,18 @@ func (repository *PostgresRepository) RecordValidationResult(ctx context.Context
 	if repository == nil || repository.database == nil || ctx == nil || scope.Validate() != nil || !identifierPattern.MatchString(jobID) || !identifierPattern.MatchString(commandID) || command == nil || outcome.Validate() != nil || !validUTC(at) {
 		return ErrInvalid
 	}
+	var last error
+	for attempt := 0; attempt < 16; attempt++ {
+		err := repository.recordValidationResultOnce(ctx, scope, jobID, commandID, command, outcome, at)
+		if !isSerializationFailure(err) {
+			return err
+		}
+		last = err
+	}
+	return last
+}
+
+func (repository *PostgresRepository) recordValidationResultOnce(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, outcome ValidationResult, at time.Time) error {
 	tx, err := repository.database.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return err
@@ -184,7 +196,7 @@ func (repository *PostgresRepository) RecordValidationResult(ctx context.Context
 	if state.Status != ConnectionQueued && state.Status != ConnectionRunning {
 		return ErrConflict
 	}
-	if outcome.Status == ConnectionSucceeded && !validationFenceCurrent(ctx, tx, scope, state) {
+	if !validationFenceCurrent(ctx, tx, scope, state) {
 		outcome = ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}
 	}
 	management := managementForValidation(outcome.Status, state.PreviousManagementStatus)
@@ -192,11 +204,11 @@ func (repository *PostgresRepository) RecordValidationResult(ctx context.Context
 	if outcome.Status == ConnectionPluginFailed {
 		capability = CapabilityPluginFailed
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state=$1,connection_test_status=$2,connection_test_error_code=$3,connection_test_at=$4,management_status=$5,revision=revision+1,updated_at=$4 WHERE tenant_id=$6 AND project_id=$7 AND instance_id=$8 AND connection_test_status IN ('queued','running') AND management_status<>'retired'`, capability, outcome.Status, outcome.ErrorCode, at, management, scope.TenantID, scope.ProjectID, state.InstanceID)
+	result, err := tx.ExecContext(ctx, `UPDATE managed_database_instances SET capability_state=$1,connection_test_status=$2,connection_test_error_code=$3,connection_test_at=$4,management_status=$5,connection_validation_job_id='',connection_validation_command_id='',revision=revision+1,updated_at=$4 WHERE tenant_id=$6 AND project_id=$7 AND instance_id=$8 AND connection_test_status IN ('queued','running') AND management_status<>'retired' AND connection_validation_job_id=$9 AND connection_validation_command_id=$10`, capability, outcome.Status, outcome.ErrorCode, at, management, scope.TenantID, scope.ProjectID, state.InstanceID, jobID, commandID)
 	if err != nil {
 		return mapPostgresError(err)
 	}
-	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 1 {
 		return ErrConflict
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE database_instance_validations SET status=$1,error_code=$2,started_at=COALESCE(started_at,$3),completed_at=$3 WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND command_id=$7 AND status IN ('queued','running')`, outcome.Status, outcome.ErrorCode, at, scope.TenantID, scope.ProjectID, jobID, commandID); err != nil {
@@ -217,7 +229,60 @@ func (repository *PostgresRepository) RecordValidationResult(ctx context.Context
 	return tx.Commit()
 }
 
+func (repository *PostgresRepository) ReconcileValidationTerminals(ctx context.Context, at time.Time, limit int) (int, error) {
+	if repository == nil || repository.database == nil || ctx == nil || !validUTC(at) || limit < 1 || limit > 1024 {
+		return 0, ErrInvalid
+	}
+	rows, err := repository.database.QueryContext(ctx, `SELECT validation.tenant_id,validation.project_id,validation.job_id,validation.command_id,validation.assignment_id,validation.instance_id,validation.configuration_revision,value.status,outbox.command_status FROM database_instance_validations validation JOIN jobs value ON value.tenant_id=validation.tenant_id AND value.project_id=validation.project_id AND value.id=validation.job_id JOIN command_outbox outbox ON outbox.tenant_id=validation.tenant_id AND outbox.project_id=validation.project_id AND outbox.id=validation.command_id WHERE validation.status IN ('queued','running') AND (value.status IN ('succeeded','failed','cancelled','timed_out') OR outbox.command_status IN ('succeeded','failed','cancelled','timed_out','rejected')) ORDER BY validation.requested_at,validation.tenant_id,validation.project_id,validation.job_id LIMIT $1`, limit)
+	if err != nil {
+		return 0, mapPostgresError(err)
+	}
+	type terminalValidation struct {
+		scope                                      platformscope.Scope
+		jobID, commandID, assignmentID, instanceID string
+		configurationRevision                      uint64
+		jobStatus, commandStatus                   string
+	}
+	values := make([]terminalValidation, 0, limit)
+	for rows.Next() {
+		var value terminalValidation
+		var configuration int64
+		if err := rows.Scan(&value.scope.TenantID, &value.scope.ProjectID, &value.jobID, &value.commandID, &value.assignmentID, &value.instanceID, &configuration, &value.jobStatus, &value.commandStatus); err != nil {
+			_ = rows.Close()
+			return 0, mapPostgresError(err)
+		}
+		if configuration < 1 {
+			_ = rows.Close()
+			return 0, ErrInvalid
+		}
+		value.configurationRevision = uint64(configuration)
+		values = append(values, value)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, mapPostgresError(err)
+	}
+	var reconcileErrors []error
+	reconciled := 0
+	for _, value := range values {
+		outcome := ValidationResult{Status: ConnectionPluginFailed, ErrorCode: ConnectionErrorPlugin}
+		if value.jobStatus == string(job.StatusSucceeded) && value.commandStatus == string(job.CommandSucceeded) {
+			outcome = ValidationResult{Status: ConnectionSucceeded}
+		}
+		command := &agentv1.ValidateDatabaseInstance{AssignmentId: value.assignmentID, InstanceId: value.instanceID, ConfigurationRevision: value.configurationRevision}
+		if err := repository.RecordValidationResult(ctx, value.scope, value.jobID, value.commandID, command, outcome, at); err != nil {
+			if !errors.Is(err, ErrConflict) {
+				reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile database instance validation %q: %w", value.jobID, err))
+			}
+			continue
+		}
+		reconciled++
+	}
+	return reconciled, errors.Join(reconcileErrors...)
+}
+
 type validationState struct {
+	JobID                    string
+	CommandID                string
 	InstanceID               string
 	AssignmentID             string
 	ConfigurationRevision    uint64
@@ -233,7 +298,7 @@ func (state validationState) matches(command *agentv1.ValidateDatabaseInstance) 
 }
 
 func loadValidationState(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, jobID, commandID string) (validationState, error) {
-	var state validationState
+	state := validationState{JobID: jobID, CommandID: commandID}
 	var configuration, operation int64
 	err := tx.QueryRowContext(ctx, `SELECT instance_id,assignment_id,configuration_revision,operation_revision,previous_management_status,status,error_code,actor_id,operation_id,idempotency_key,request_fingerprint,request_id,trace_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3 AND command_id=$4 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID, commandID).Scan(&state.InstanceID, &state.AssignmentID, &configuration, &operation, &state.PreviousManagementStatus, &state.Status, &state.ErrorCode, &state.Audit.Actor, &state.Audit.OperationID, &state.Audit.IdempotencyKey, &state.Audit.RequestFingerprint, &state.Audit.RequestID, &state.Audit.TraceID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -252,7 +317,7 @@ func loadValidationState(ctx context.Context, tx *sql.Tx, scope platformscope.Sc
 func validationFenceCurrent(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, state validationState) bool {
 	var configuration, operation int64
 	var desiredState, processState, health string
-	err := tx.QueryRowContext(ctx, `SELECT assignment.configuration_revision,assignment.operation_revision,assignment.desired_state,observation.process_state,observation.health FROM plugin_assignments assignment JOIN plugin_observations observation ON observation.tenant_id=assignment.tenant_id AND observation.project_id=assignment.project_id AND observation.assignment_id=assignment.assignment_id WHERE assignment.tenant_id=$1 AND assignment.project_id=$2 AND assignment.assignment_id=$3`, scope.TenantID, scope.ProjectID, state.AssignmentID).Scan(&configuration, &operation, &desiredState, &processState, &health)
+	err := tx.QueryRowContext(ctx, `SELECT assignment.configuration_revision,assignment.operation_revision,assignment.desired_state,observation.process_state,observation.health FROM plugin_assignment_instances binding JOIN plugin_assignments assignment ON assignment.tenant_id=binding.tenant_id AND assignment.project_id=binding.project_id AND assignment.assignment_id=binding.assignment_id JOIN plugin_observations observation ON observation.tenant_id=assignment.tenant_id AND observation.project_id=assignment.project_id AND observation.assignment_id=assignment.assignment_id JOIN managed_database_instances instance ON instance.tenant_id=binding.tenant_id AND instance.project_id=binding.project_id AND instance.instance_id=binding.instance_id WHERE binding.tenant_id=$1 AND binding.project_id=$2 AND binding.assignment_id=$3 AND binding.instance_id=$4 AND instance.connection_validation_job_id=$5 AND instance.connection_validation_command_id=$6`, scope.TenantID, scope.ProjectID, state.AssignmentID, state.InstanceID, state.JobID, state.CommandID).Scan(&configuration, &operation, &desiredState, &processState, &health)
 	return err == nil && configuration == int64(state.ConfigurationRevision) && operation == int64(state.OperationRevision) && desiredState == "running" && processState == "running" && health == "healthy"
 }
 

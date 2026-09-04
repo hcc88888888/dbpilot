@@ -205,6 +205,10 @@ func TestDatabaseInstanceValidationPostgresLifecycleIsFencedIdempotentAndClassif
 	require.Equal(t, first.ID, replayed.ID)
 	var commandID string
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, first.ID).Scan(&commandID))
+	var activeValidationJobID, activeValidationCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT connection_validation_job_id,connection_validation_command_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, instance.ID).Scan(&activeValidationJobID, &activeValidationCommandID))
+	require.Equal(t, first.ID, activeValidationJobID)
+	require.Equal(t, commandID, activeValidationCommandID)
 	command := &agentv1.ValidateDatabaseInstance{AssignmentId: assignment.ID, InstanceId: instance.ID, ConfigurationRevision: assignment.ConfigurationRevision}
 	require.NoError(t, instances.RecordValidationProgress(ctx, scope, first.ID, commandID, command, now.Add(time.Second)))
 	require.NoError(t, instances.RecordValidationResult(ctx, scope, first.ID, commandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(2*time.Second)))
@@ -267,6 +271,128 @@ func TestDatabaseInstanceValidationPostgresLifecycleIsFencedIdempotentAndClassif
 	require.NotContains(t, strings.ToLower(auditDetails), "password")
 	require.NotContains(t, strings.ToLower(auditDetails), "secret://")
 	require.NotContains(t, auditDetails, instance.CredentialRef)
+}
+
+func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDelivery(t *testing.T) {
+	database, scope, hostID, agentID := pluginAssignmentPostgresFixture(t)
+	ctx := context.Background()
+	jobs := job.NewPostgresRepositoryWithTargetAuthorizer(database, pluginassignment.InstanceTargetAuthorizer{Database: database})
+	assignments := pluginassignment.NewPostgresRepository(database, jobs)
+	instances := databaseinstance.NewPostgresRepositoryWithRuntime(database, assignments, jobs)
+	candidateID, accept := insertAssignmentCandidate(t, database, scope, hostID, agentID, "candidate-validation-terminals", "127.0.0.1:3311", 16)
+	instance, err := instances.AcceptCandidate(ctx, scope, candidateID, accept)
+	require.NoError(t, err)
+	page, err := assignments.List(ctx, scope, pluginassignment.Filter{})
+	require.NoError(t, err)
+	require.Len(t, page.Items, 1)
+	assignment := page.Items[0]
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	observed := pluginassignment.ObservedState{AssignmentID: assignment.ID, PluginID: assignment.PluginID, DatabaseFamily: assignment.DatabaseFamily, InstalledVersion: assignment.DesiredVersion, ActiveSlot: pluginassignment.SlotA, ProcessState: pluginassignment.ProcessRunning, Health: pluginassignment.HealthHealthy, CircuitState: pluginassignment.CircuitClosed, BoundInstanceCount: 1, ActiveConfigurationRevision: assignment.ConfigurationRevision, ObservedOperationRevision: assignment.OperationRevision, ObservationRevision: 1, ObservedAt: now}
+	require.NoError(t, pluginassignment.NewService(assignments).RecordObservation(ctx, pluginassignment.ObservationReport{Scope: scope, HostID: hostID, AgentID: agentID, ObservationRevision: 1, Assignments: []pluginassignment.ObservedState{observed}, ObservedAt: now}))
+
+	reconciler, ok := any(instances).(interface {
+		ReconcileValidationTerminals(context.Context, time.Time, int) (int, error)
+	})
+	require.True(t, ok, "database instance repository must repair terminal Jobs that delivered no Agent result")
+	if !ok {
+		return
+	}
+	command := &agentv1.ValidateDatabaseInstance{AssignmentId: assignment.ID, InstanceId: instance.ID, ConfigurationRevision: assignment.ConfigurationRevision}
+	staleFenceRequest := databaseinstance.ValidationRequest{Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "testDatabaseInstanceConnection", IdempotencyKey: "validate-stale-fence", RequestFingerprint: "sha256:abababababababababababababababababababababababababababababababab", RequestID: "request-stale-fence", TraceID: "trace-stale-fence"}}
+	staleFence, err := instances.StartValidation(ctx, scope, instance.ID, staleFenceRequest)
+	require.NoError(t, err)
+	var staleFenceCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, staleFence.ID).Scan(&staleFenceCommandID))
+	_, err = database.ExecContext(ctx, `UPDATE plugin_assignments SET operation_revision=operation_revision+1 WHERE tenant_id=$1 AND project_id=$2 AND assignment_id=$3`, scope.TenantID, scope.ProjectID, assignment.ID)
+	require.NoError(t, err)
+	require.NoError(t, instances.RecordValidationResult(ctx, scope, staleFence.ID, staleFenceCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(time.Second)))
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionPluginFailed, instance.ConnectionTestStatus, "every failure classification must pass the current assignment and operation fence")
+	require.Equal(t, databaseinstance.ConnectionErrorPlugin, instance.ConnectionTestErrorCode)
+	_, err = database.ExecContext(ctx, `UPDATE plugin_assignments SET operation_revision=$1 WHERE tenant_id=$2 AND project_id=$3 AND assignment_id=$4`, assignment.OperationRevision, scope.TenantID, scope.ProjectID, assignment.ID)
+	require.NoError(t, err)
+
+	request := databaseinstance.ValidationRequest{Audit: databaseinstance.MutationAudit{Actor: "operator", OperationID: "testDatabaseInstanceConnection", IdempotencyKey: "validate-timeout", RequestFingerprint: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", RequestID: "request-timeout", TraceID: "trace-timeout"}}
+	timedOut, err := instances.StartValidation(ctx, scope, instance.ID, request)
+	require.NoError(t, err)
+	var timedOutCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, timedOut.ID).Scan(&timedOutCommandID))
+	markValidationJobTerminal(t, ctx, jobs, timedOut, timedOutCommandID, agentID, job.TargetTimedOut, now.Add(time.Second))
+	reconciled, err := reconciler.ReconcileValidationTerminals(ctx, now.Add(2*time.Second), 8)
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionPluginFailed, instance.ConnectionTestStatus)
+	require.NotEqual(t, databaseinstance.StatusConnectionTesting, instance.ManagementStatus)
+
+	request.Audit.IdempotencyKey = "validate-after-timeout"
+	request.Audit.RequestFingerprint = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	request.Audit.RequestID = "request-after-timeout"
+	retry, err := instances.StartValidation(ctx, scope, instance.ID, request)
+	require.NoError(t, err, "a no-result timeout must release the instance for retry")
+	var retryCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, retry.ID).Scan(&retryCommandID))
+
+	err = instances.RecordValidationResult(ctx, scope, timedOut.ID, timedOutCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionAuthenticationFailed, ErrorCode: databaseinstance.ConnectionErrorAuthentication}, now.Add(3*time.Second))
+	require.ErrorIs(t, err, databaseinstance.ErrConflict)
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionQueued, instance.ConnectionTestStatus, "a stale failure must not overwrite the newer validation generation")
+
+	markValidationJobTerminal(t, ctx, jobs, retry, retryCommandID, agentID, job.TargetCancelled, now.Add(4*time.Second))
+	reconciled, err = reconciler.ReconcileValidationTerminals(ctx, now.Add(5*time.Second), 8)
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionPluginFailed, instance.ConnectionTestStatus)
+	require.NotEqual(t, databaseinstance.StatusConnectionTesting, instance.ManagementStatus)
+
+	request.Audit.IdempotencyKey = "validate-concurrent-terminal"
+	request.Audit.RequestFingerprint = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	request.Audit.RequestID = "request-concurrent-terminal"
+	concurrent, err := instances.StartValidation(ctx, scope, instance.ID, request)
+	require.NoError(t, err)
+	var concurrentCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, concurrent.ID).Scan(&concurrentCommandID))
+	start := make(chan struct{})
+	terminalErrors := make(chan error, 16)
+	for index := 0; index < 16; index++ {
+		go func() {
+			<-start
+			terminalErrors <- instances.RecordValidationResult(ctx, scope, concurrent.ID, concurrentCommandID, command, databaseinstance.ValidationResult{Status: databaseinstance.ConnectionUnreachable, ErrorCode: databaseinstance.ConnectionErrorUnreachable}, now.Add(6*time.Second))
+		}()
+	}
+	close(start)
+	for index := 0; index < 16; index++ {
+		require.NoError(t, <-terminalErrors)
+	}
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.ConnectionUnreachable, instance.ConnectionTestStatus)
+}
+
+func markValidationJobTerminal(t *testing.T, ctx context.Context, jobs *job.PostgresRepository, value job.Job, commandID, agentID string, targetStatus job.TargetStatus, at time.Time) {
+	t.Helper()
+	current, err := jobs.Transition(ctx, job.Transition{Scope: value.Scope, JobID: value.ID, CurrentVersion: value.Version, To: job.StatusDispatched, At: at})
+	require.NoError(t, err)
+	if targetStatus == job.TargetCancelled {
+		current, err = jobs.RequestCancel(ctx, current.Scope, current.ID, "operator", current.Version, at)
+		require.NoError(t, err)
+		current, err = jobs.Transition(ctx, job.Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: job.StatusCancelling, TargetResults: []job.TargetResult{{TargetID: agentID, Status: targetStatus, FinishedAt: &at}}, Actor: "operator", At: at})
+		require.NoError(t, err)
+		_, err = jobs.Transition(ctx, job.Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: job.StatusCancelled, ResultSummary: "Agent commands completed", At: at})
+		require.NoError(t, err)
+		require.NoError(t, jobs.MarkCommandTerminal(ctx, value.Scope, commandID, job.CommandCancelled, at))
+		return
+	}
+	current, err = jobs.Transition(ctx, job.Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: job.StatusRunning, TargetResults: []job.TargetResult{{TargetID: agentID, Status: targetStatus, ErrorSummary: "execution timeout", FinishedAt: &at}}, At: at})
+	require.NoError(t, err)
+	_, err = jobs.Transition(ctx, job.Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: job.StatusTimedOut, ResultSummary: "Agent commands completed", At: at})
+	require.NoError(t, err)
+	require.NoError(t, jobs.MarkCommandTerminal(ctx, value.Scope, commandID, job.CommandTimedOut, at))
 }
 
 func TestPluginAssignmentLegacyKylinAndCentOSHostsSelectLinuxPackage(t *testing.T) {

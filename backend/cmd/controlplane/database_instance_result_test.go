@@ -46,3 +46,6 @@ func (store *recordingValidationResultStore) RecordValidationResult(_ context.Co
 	store.result = result
 	return nil
 }
+func (store *recordingValidationResultStore) ReconcileValidationTerminals(context.Context, time.Time, int) (int, error) {
+	return 0, nil
+}

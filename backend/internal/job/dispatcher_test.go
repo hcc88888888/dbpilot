@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -1022,7 +1023,7 @@ func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCod
 	token := fixture.fenceMessage(t, message.ID)
 
 	fixture.lifecycle.Progress(context.Background(), "agent-a", &agentv1.CommandProgress{CommandId: message.ID, Percent: 10, ExecutionToken: token, LeaseRevision: 1})
-	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "instance_authentication_failed", ExecutionToken: token, LeaseRevision: 1})
+	outcome, err := fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: message.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "instance_authentication_failed", Summary: "password=raw-agent-summary", ExecutionToken: token, LeaseRevision: 1})
 
 	require.NoError(t, err)
 	require.True(t, outcome.Persisted)
@@ -1030,6 +1031,9 @@ func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCod
 	require.Equal(t, 1, recorder.resultCalls)
 	require.Equal(t, "instance-a", recorder.command.GetInstanceId())
 	require.Equal(t, "instance_authentication_failed", recorder.result.GetErrorCode())
+	require.Equal(t, "database instance connection validation failed", recorder.result.GetSummary())
+	require.Equal(t, "database instance connection validation failed", fixture.persistence.currentJob().TargetResults[0].ResultSummary)
+	require.NotContains(t, fmt.Sprintf("%+v", fixture.persistence.currentJob()), "password=raw-agent-summary")
 
 	raw := fixture.message(t, "command-instance-raw", "agent-a")
 	raw.Payload = payload
@@ -1038,6 +1042,14 @@ func TestDatabaseInstanceValidationProgressAndResultUseTypedRecorderWithFixedCod
 	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: raw.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "password=raw", ExecutionToken: rawToken, LeaseRevision: 1})
 	require.ErrorIs(t, err, ErrInvalidCommandPayload)
 	require.Equal(t, CommandActive, fixture.persistence.messages[raw.ID].CommandStatus)
+
+	artifact := fixture.message(t, "command-instance-artifact", "agent-a")
+	artifact.Payload = payload
+	fixture.persistence.messages[artifact.ID] = artifact
+	artifactToken := fixture.fenceMessage(t, artifact.ID)
+	_, err = fixture.lifecycle.Result(context.Background(), "agent-a", &agentv1.CommandResult{CommandId: artifact.ID, State: agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, ErrorCode: "plugin_failed", Summary: "secret://must-not-persist", Artifacts: []*agentv1.ArtifactReference{{ArtifactId: "artifact-a", Kind: "raw"}}, ExecutionToken: artifactToken, LeaseRevision: 1})
+	require.ErrorIs(t, err, ErrInvalidCommandPayload)
+	require.Equal(t, CommandActive, fixture.persistence.messages[artifact.ID].CommandStatus)
 }
 
 type recordingDatabaseValidationRecorder struct {
@@ -1057,6 +1069,78 @@ func (recorder *recordingDatabaseValidationRecorder) RecordDatabaseInstanceValid
 	recorder.command = proto.Clone(command).(*agentv1.ValidateDatabaseInstance)
 	recorder.result = proto.Clone(result).(*agentv1.CommandResult)
 	return nil
+}
+func (recorder *recordingDatabaseValidationRecorder) ReconcileDatabaseInstanceValidationTerminals(context.Context, time.Time, int) (int, error) {
+	return 0, nil
+}
+
+func TestDatabaseInstanceValidationProjectionFinalizesForEveryTerminalTarget(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		target      TargetResult
+		wantState   agentv1.CommandResultState
+		wantCode    string
+		wantSummary string
+	}{
+		{"success", TargetResult{TargetID: "agent-a", Status: TargetSucceeded}, agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED, "", "database instance connection validation succeeded"},
+		{"failure", TargetResult{TargetID: "agent-a", Status: TargetFailed, ErrorSummary: "instance_tls_failed"}, agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED, "instance_tls_failed", "database instance connection validation failed"},
+		{"cancel", TargetResult{TargetID: "agent-a", Status: TargetCancelled}, agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, "", "database instance connection validation cancelled"},
+		{"timeout", TargetResult{TargetID: "agent-a", Status: TargetTimedOut}, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, "", "database instance connection validation timed out"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSingleTargetCommandLifecycleFixture(t)
+			recorder := &recordingDatabaseValidationRecorder{}
+			fixture.lifecycle.databaseInstanceResults = recorder
+			fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+			payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+			require.NoError(t, err)
+			message := fixture.message(t, "command-validation-terminal", "agent-a")
+			message.Payload = payload
+			fixture.persistence.messages[message.ID] = message
+			if test.target.Status == TargetCancelled {
+				current := fixture.persistence.currentJob()
+				_, err = fixture.persistence.RequestCancel(context.Background(), fixture.scope, current.ID, "operator", current.Version, fixture.now)
+				require.NoError(t, err)
+				message = fixture.persistence.messages[message.ID]
+			}
+
+			_, _, err = fixture.lifecycle.applyTarget(context.Background(), message, test.target, fixture.now)
+
+			require.NoError(t, err)
+			require.Equal(t, 1, recorder.resultCalls)
+			require.Equal(t, test.wantState, recorder.result.GetState())
+			require.Equal(t, test.wantCode, recorder.result.GetErrorCode())
+			require.Equal(t, test.wantSummary, recorder.result.GetSummary())
+		})
+	}
+}
+
+func TestDatabaseInstanceValidationExecutionExpiryFinalizesProjection(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	fixture.lifecycle.targetAuthorizer = allowTrialTarget{}
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-a", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-validation-expired", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	fixture.fenceMessage(t, message.ID)
+	message = fixture.persistence.messages[message.ID]
+	deadline := fixture.now.Add(-time.Second)
+	message.ExecutionDeadline = &deadline
+	fixture.persistence.messages[message.ID] = message
+	fixture.persistence.expired = []OutboxMessage{message}
+	current := transitionForTest(t, fixture.value, StatusDispatched, fixture.now.Add(-time.Minute))
+	current, err = ApplyTransition(current, Transition{Scope: current.Scope, JobID: current.ID, CurrentVersion: current.Version, To: StatusRunning, TargetResults: []TargetResult{{TargetID: "agent-a", Status: TargetRunning}}, At: fixture.now.Add(-time.Minute)})
+	require.NoError(t, err)
+	fixture.persistence.jobs[current.ID] = current
+
+	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, recorder.resultCalls)
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, recorder.result.GetState())
 }
 
 func TestFailedHighCardinalityTrialTerminalizesRunningJob(t *testing.T) {

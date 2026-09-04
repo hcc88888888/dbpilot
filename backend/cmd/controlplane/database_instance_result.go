@@ -42,3 +42,10 @@ func (recorder databaseInstanceResultRecorder) RecordDatabaseInstanceValidationR
 	}
 	return recorder.Store.RecordValidationResult(ctx, scope, jobID, commandID, command, outcome, at)
 }
+
+func (recorder databaseInstanceResultRecorder) ReconcileDatabaseInstanceValidationTerminals(ctx context.Context, at time.Time, limit int) (int, error) {
+	if recorder.Store == nil {
+		return 0, errors.New("database instance validation result store is unavailable")
+	}
+	return recorder.Store.ReconcileValidationTerminals(ctx, at, limit)
+}

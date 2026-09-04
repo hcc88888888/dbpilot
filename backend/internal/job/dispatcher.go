@@ -116,6 +116,7 @@ type CommandTypedResultRecorder interface {
 type CommandDatabaseInstanceResultRecorder interface {
 	RecordDatabaseInstanceValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
 	RecordDatabaseInstanceValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, *agentv1.CommandResult, time.Time) error
+	ReconcileDatabaseInstanceValidationTerminals(context.Context, time.Time, int) (int, error)
 }
 
 // CommandLifecycle is both the periodic transactional-outbox worker and the
@@ -191,6 +192,11 @@ func (lifecycle *CommandLifecycle) DispatchPending(ctx context.Context, at time.
 	}
 	if err := lifecycle.expireExecutions(ctx, at); err != nil {
 		maintenanceErrors = append(maintenanceErrors, err)
+	}
+	if lifecycle.databaseInstanceResults != nil {
+		if _, err := lifecycle.databaseInstanceResults.ReconcileDatabaseInstanceValidationTerminals(ctx, at, lifecycle.claimLimit); err != nil {
+			maintenanceErrors = append(maintenanceErrors, err)
+		}
 	}
 	messages, err := lifecycle.dispatchRepository.ClaimOutbox(ctx, lifecycle.claimLimit, at)
 	if err != nil {
@@ -459,6 +465,15 @@ func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time
 				continue
 			}
 			result = append(result, fmt.Errorf("fence expired command %q: %w", claim.CommandID, err))
+			continue
+		}
+		message, lookupErr := lifecycle.dispatchRepository.LookupCommand(ctx, claim.CommandID)
+		if lookupErr != nil {
+			result = append(result, fmt.Errorf("load expired command %q: %w", claim.CommandID, lookupErr))
+			continue
+		}
+		if terminalErr := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, TargetResult{TargetID: message.TargetID, Status: TargetTimedOut}, at); terminalErr != nil {
+			result = append(result, fmt.Errorf("finalize expired database validation %q: %w", claim.CommandID, terminalErr))
 		}
 	}
 	if err := lifecycle.repairPendingTerminalAudits(ctx, at); err != nil {
@@ -1041,6 +1056,11 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	if validationCommand != nil && (lifecycle.databaseInstanceResults == nil || !validDatabaseInstanceValidationResult(result)) {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
 	}
+	validationResult := result
+	if validationCommand != nil {
+		validationResult = canonicalDatabaseInstanceValidationResult(result)
+		target = databaseInstanceValidationTarget(message.TargetID, validationResult, at)
+	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if lifecycle.typedResultRecorder == nil {
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, ErrInvalidCommandPayload
@@ -1076,11 +1096,6 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, recordErr
 		}
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:], ReasonCode: "RESULT_CONFLICT"}, nil
-	}
-	if validationCommand != nil {
-		if err := lifecycle.databaseInstanceResults.RecordDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, validationCommand, result, at); err != nil {
-			return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
-		}
 	}
 	if trialCommand != nil && trialCommand.GetTrial() {
 		if err := lifecycle.typedResultRecorder.RecordMetricTemplateTrial(ctx, message.Scope, message.JobID, message.ID, trialCommand, result, at); err != nil {
@@ -1119,7 +1134,7 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 }
 
 func validDatabaseInstanceValidationResult(result *agentv1.CommandResult) bool {
-	if result == nil {
+	if result == nil || len(result.GetArtifacts()) != 0 || result.GetMetricTemplateTrialResult() != nil {
 		return false
 	}
 	switch result.GetState() {
@@ -1132,10 +1147,84 @@ func validDatabaseInstanceValidationResult(result *agentv1.CommandResult) bool {
 		default:
 			return false
 		}
-	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
-		return true
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT:
+		return result.GetErrorCode() == ""
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		return result.GetErrorCode() == "" || result.GetErrorCode() == "EXECUTION_INTERRUPTED"
 	default:
 		return false
+	}
+}
+
+func canonicalDatabaseInstanceValidationResult(result *agentv1.CommandResult) *agentv1.CommandResult {
+	canonical := &agentv1.CommandResult{CommandId: result.GetCommandId(), State: result.GetState(), ErrorCode: result.GetErrorCode(), ExecutionToken: append([]byte(nil), result.GetExecutionToken()...), LeaseRevision: result.GetLeaseRevision()}
+	switch result.GetState() {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED:
+		canonical.Summary = "database instance connection validation succeeded"
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED:
+		canonical.Summary = "database instance connection validation failed"
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		canonical.Summary = "database instance connection validation cancelled"
+		canonical.ErrorCode = ""
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, agentv1.CommandResultState_COMMAND_RESULT_STATE_INTERRUPTED:
+		canonical.Summary = "database instance connection validation timed out"
+		canonical.ErrorCode = ""
+	}
+	return canonical
+}
+
+func databaseInstanceValidationTarget(targetID string, result *agentv1.CommandResult, at time.Time) TargetResult {
+	target := TargetResult{TargetID: targetID, ResultSummary: result.GetSummary(), FinishedAt: timePointer(at)}
+	switch result.GetState() {
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED:
+		target.Status = TargetSucceeded
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED:
+		target.Status, target.ErrorSummary = TargetFailed, result.GetErrorCode()
+	case agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED:
+		target.Status = TargetCancelled
+	default:
+		target.Status = TargetTimedOut
+	}
+	return target
+}
+
+func (lifecycle *CommandLifecycle) finalizeDatabaseInstanceValidationTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) error {
+	if !isTerminalTarget(target.Status) {
+		return nil
+	}
+	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	if err != nil {
+		return err
+	}
+	command := envelope.GetValidateDatabaseInstance()
+	if command == nil {
+		return nil
+	}
+	if lifecycle.databaseInstanceResults == nil {
+		return ErrInvalidCommandPayload
+	}
+	result := &agentv1.CommandResult{CommandId: message.ID}
+	switch target.Status {
+	case TargetSucceeded:
+		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_SUCCEEDED
+	case TargetFailed:
+		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_FAILED
+		result.ErrorCode = fixedDatabaseInstanceValidationError(target.ErrorSummary)
+	case TargetCancelled:
+		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_CANCELLED
+	case TargetTimedOut:
+		result.State = agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT
+	}
+	result = canonicalDatabaseInstanceValidationResult(result)
+	return lifecycle.databaseInstanceResults.RecordDatabaseInstanceValidationResult(ctx, message.Scope, message.JobID, message.ID, command, result, at)
+}
+
+func fixedDatabaseInstanceValidationError(value string) string {
+	switch value {
+	case "instance_authentication_failed", "instance_tls_failed", "instance_unreachable", "database_version_unsupported", "plugin_failed":
+		return value
+	default:
+		return "plugin_failed"
 	}
 }
 
@@ -1189,6 +1278,9 @@ func (lifecycle *CommandLifecycle) observe(ctx context.Context, agentID, command
 }
 
 func (lifecycle *CommandLifecycle) applyTarget(ctx context.Context, message OutboxMessage, target TargetResult, at time.Time) (Job, bool, error) {
+	if err := lifecycle.finalizeDatabaseInstanceValidationTarget(ctx, message, target, at); err != nil {
+		return Job{}, false, err
+	}
 	mutated := false
 	for attempt := 0; attempt < commandTransitionAttempts; attempt++ {
 		current, err := lifecycle.jobs.Get(ctx, message.Scope, message.JobID)

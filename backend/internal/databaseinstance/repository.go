@@ -70,4 +70,5 @@ func (result ValidationResult) Validate() error {
 type ValidationResultRecorder interface {
 	RecordValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error
 	RecordValidationResult(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, ValidationResult, time.Time) error
+	ReconcileValidationTerminals(context.Context, time.Time, int) (int, error)
 }
