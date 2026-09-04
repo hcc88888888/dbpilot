@@ -663,7 +663,7 @@ the final Round 5 PostgreSQL residual count is zero.
 
 ## Post-review closure
 
-Status: **DONE** on product HEAD `dc8ac1e`. The final review's two functional
+Status: **DONE** on product HEAD `b13df20`. The final review's two functional
 findings were reproduced and closed before integration.
 
 1. The still-unreleased Round 5 migration
@@ -697,14 +697,15 @@ Strict TDD evidence:
   recorded opposite Audit was accepted;
 - GREEN: unrecorded evidence converges through the real dispatcher/reconciler;
   recorded opposite Audit and event-without-marker both fail closed on every
-  restart without partial repair.
+  restart without partial repair; a matching recorded Audit permits the
+  remaining state to be repaired while retaining its recorded marker.
 
 Final gates:
 
 | Gate | Result |
 | --- | --- |
-| Full Job PostgreSQL suite | PASS, 17.694s |
-| Full database-instance PostgreSQL suite | PASS, 35.451s |
+| Full Job PostgreSQL suite | PASS, 18.177s |
+| Full database-instance PostgreSQL suite | PASS, 36.300s |
 | `go test ./... -count=1` | PASS |
 | `go vet ./...` | PASS |
 | Task17 static lifecycle contract | PASS, 13/13 |
@@ -719,3 +720,4 @@ Post-review product commits:
 
 1. `7dd9d5f` `fix(instances): preserve historical command rejection`
 2. `dc8ac1e` `fix(instances): repair applied validation terminal evidence`
+3. `b13df20` `fix(instances): repair matching recorded audit state`
