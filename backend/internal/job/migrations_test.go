@@ -58,6 +58,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0007_retired_validation_winner_marker.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)CREATE TABLE IF NOT EXISTS dbpilot_retired_validation_winner_markers.*conflicting retired validation Job and Outbox terminal winners.*UPDATE command_outbox").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0007_retired_validation_winner_marker.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0007a_retired_validation_terminal_winner.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec("(?s)DO \\$\\$.*conflicting retired validation Job and Outbox terminal winners.*UPDATE job_targets").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0007a_retired_validation_terminal_winner.sql").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -68,6 +74,13 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_target_status.*terminal_reconcile_pending.*command_outbox_terminal_reconcile_pending_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0008_terminal_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0009_historical_terminal_recovery.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_reconcile_available_at.*unknown historical terminal command action.*command_outbox_terminal_reconcile_claim_idx").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0009_historical_terminal_recovery.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectQuery("(?s)SELECT value.job_type,outbox.payload.*historical_recovery").WillReturnRows(sqlmock.NewRows([]string{"job_type", "payload"}))
 
 	require.NoError(t, RunMigrations(context.Background(), database))
 	require.NoError(t, mock.ExpectationsWereMet())
@@ -125,5 +138,10 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	require.NoError(t, err)
 	for _, required := range []string{"terminal_target_status", "terminal_target_artifacts", "terminal_reconcile_pending", "conflicting terminal Command and Job target winner", "command_outbox_terminal_reconcile_pending_idx"} {
 		require.Contains(t, string(terminalReconciliation), required)
+	}
+	historicalTerminal, err := migrationFiles.ReadFile("migrations/0009_historical_terminal_recovery.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"terminal_reconcile_available_at", "terminal_reconcile_lease_expires_at", "terminal_reconcile_attempts", "terminal_reconcile_quarantined_at", "unknown historical terminal command action", "command.historical_terminal"} {
+		require.Contains(t, string(historicalTerminal), required)
 	}
 }

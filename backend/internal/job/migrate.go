@@ -1,6 +1,7 @@
 package job
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -9,6 +10,10 @@ import (
 	"io/fs"
 	"sort"
 	"strings"
+
+	agentv1 "dbpilot.local/platform/gen/agent/v1"
+	"dbpilot.local/platform/internal/commandvalidation"
+	"google.golang.org/protobuf/proto"
 )
 
 //go:embed migrations/*.sql
@@ -68,5 +73,64 @@ func RunMigrations(ctx context.Context, database *sql.DB) error {
 			return fmt.Errorf("commit job migration %s: %w", path, err)
 		}
 	}
+	if err := validateHistoricalTerminalCommandActions(ctx, database); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateHistoricalTerminalCommandActions(ctx context.Context, database *sql.DB) error {
+	rows, err := database.QueryContext(ctx, `
+		SELECT value.job_type,outbox.payload
+		FROM command_outbox outbox
+		JOIN jobs value
+		  ON value.tenant_id=outbox.tenant_id
+		 AND value.project_id=outbox.project_id
+		 AND value.id=outbox.job_id
+		WHERE outbox.terminal_audit_detail @> '{"historical_recovery":true}'::jsonb
+		ORDER BY outbox.id
+	`)
+	if err != nil {
+		return fmt.Errorf("list historical terminal command actions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var jobType string
+		var payload []byte
+		if err := rows.Scan(&jobType, &payload); err != nil {
+			return fmt.Errorf("scan historical terminal command action: %w", err)
+		}
+		envelope := new(agentv1.CommandEnvelope)
+		if err := proto.Unmarshal(payload, envelope); err != nil || len(envelope.ProtoReflect().GetUnknown()) != 0 || commandvalidation.ValidateShape(envelope) != nil {
+			return errors.New("historical terminal command action is inconsistent")
+		}
+		canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+		if err != nil || !bytes.Equal(canonical, payload) || !historicalCommandActionMatches(jobType, envelope) {
+			return errors.New("historical terminal command action is inconsistent")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate historical terminal command actions: %w", err)
+	}
+	return nil
+}
+
+func historicalCommandActionMatches(jobType string, envelope *agentv1.CommandEnvelope) bool {
+	if envelope == nil {
+		return false
+	}
+	switch jobType {
+	case "host.rediscover":
+		return envelope.GetDiscoverDatabases() != nil
+	case "database_instance.validate":
+		return envelope.GetValidateDatabaseInstance() != nil
+	case "plugin.reconcile":
+		return envelope.GetReconcilePlugin() != nil
+	case "inspection.collect":
+		return envelope.GetCollectNow() != nil
+	case "metric_template.trial":
+		return envelope.GetCollectDatabaseMetrics() != nil
+	default:
+		return false
+	}
 }

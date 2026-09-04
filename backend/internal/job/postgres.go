@@ -24,6 +24,9 @@ import (
 const DefaultOutboxLease = 30 * time.Second
 const DefaultCancellationRetry = 30 * time.Second
 
+const terminalReconcileLease = 30 * time.Second
+const terminalReconcileMaxAttempts = 8
+
 const jobColumnsSQL = "id, tenant_id, project_id, job_type, status, outcome, instance_id, initiated_by, source_resource_type, source_resource_id, idempotency_key, version, total_targets, completed_targets, failed_targets, skipped_targets, error_summary, result_summary, artifacts, created_at, dispatched_at, started_at, finished_at, timeout_at, cancel_requested_by, cancel_requested_at, request_id, trace_id, max_concurrency, target_timeout_seconds"
 const outboxColumnsSQL = "id, tenant_id, project_id, job_id, target_id, message_type, payload, prepared_envelope, available_at, created_at, lease_expires_at, published_at, attempts, command_status, acknowledged_at, execution_deadline_at, execution_last_heartbeat_at, recovery_lease_expires_at, cancellation_requested_at, cancellation_reason, cancellation_available_at, cancellation_lease_expires_at, cancellation_attempts, command_phase, prepare_digest, prepared_at, execution_token_hash, execution_token_ciphertext, execution_revision, recovery_revision, start_deadline_at, start_enqueued_at, recovery_claim_token, recovery_claimed_deadline, recovery_claimed_revision, terminal_result_digest, terminal_at, terminal_audit_pending, terminal_audit_dedupe_key, terminal_audit_action, terminal_audit_result, terminal_audit_detail, terminal_audit_lease_expires_at, terminal_audit_attempts, terminal_audit_recorded_at, terminal_target_status, terminal_target_error_summary, terminal_target_result_summary, terminal_target_artifacts, terminal_reconcile_pending"
 const outboxColumnsAliasedSQL = "o.id, o.tenant_id, o.project_id, o.job_id, o.target_id, o.message_type, o.payload, o.prepared_envelope, o.available_at, o.created_at, o.lease_expires_at, o.published_at, o.attempts, o.command_status, o.acknowledged_at, o.execution_deadline_at, o.execution_last_heartbeat_at, o.recovery_lease_expires_at, o.cancellation_requested_at, o.cancellation_reason, o.cancellation_available_at, o.cancellation_lease_expires_at, o.cancellation_attempts, o.command_phase, o.prepare_digest, o.prepared_at, o.execution_token_hash, o.execution_token_ciphertext, o.execution_revision, o.recovery_revision, o.start_deadline_at, o.start_enqueued_at, o.recovery_claim_token, o.recovery_claimed_deadline, o.recovery_claimed_revision, o.terminal_result_digest, o.terminal_at, o.terminal_audit_pending, o.terminal_audit_dedupe_key, o.terminal_audit_action, o.terminal_audit_result, o.terminal_audit_detail, o.terminal_audit_lease_expires_at, o.terminal_audit_attempts, o.terminal_audit_recorded_at, o.terminal_target_status, o.terminal_target_error_summary, o.terminal_target_result_summary, o.terminal_target_artifacts, o.terminal_reconcile_pending"
@@ -231,15 +234,32 @@ func (repository *PostgresRepository) ReconcileTerminalCommands(ctx context.Cont
 		return 0, ErrInvalidCommandPayload
 	}
 	rows, err := repository.db.QueryContext(ctx, `
-		SELECT outbox.tenant_id,outbox.project_id,outbox.job_id,outbox.id
-		FROM command_outbox outbox
-		JOIN jobs value ON value.tenant_id=outbox.tenant_id AND value.project_id=outbox.project_id AND value.id=outbox.job_id
-		JOIN job_targets target ON target.tenant_id=outbox.tenant_id AND target.project_id=outbox.project_id AND target.job_id=outbox.job_id AND target.target_id=outbox.target_id
-		WHERE outbox.command_status IN ('succeeded','failed','cancelled','timed_out','rejected')
-		  AND (outbox.terminal_reconcile_pending OR value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR target.status NOT IN ('succeeded','failed','skipped','cancelled','timed_out'))
-		ORDER BY outbox.terminal_at,outbox.created_at,outbox.id
-		LIMIT $1
-	`, limit)
+		WITH candidates AS (
+			SELECT outbox.id
+			FROM command_outbox outbox
+			JOIN jobs value ON value.tenant_id=outbox.tenant_id AND value.project_id=outbox.project_id AND value.id=outbox.job_id
+			JOIN job_targets target ON target.tenant_id=outbox.tenant_id AND target.project_id=outbox.project_id AND target.job_id=outbox.job_id AND target.target_id=outbox.target_id
+			WHERE outbox.command_status IN ('succeeded','failed','cancelled','timed_out','rejected')
+			  AND outbox.terminal_reconcile_quarantined_at IS NULL
+			  AND COALESCE(outbox.terminal_reconcile_available_at,outbox.terminal_at,outbox.created_at) <= $1
+			  AND (outbox.terminal_reconcile_lease_expires_at IS NULL OR outbox.terminal_reconcile_lease_expires_at <= $1)
+			  AND (outbox.terminal_reconcile_pending OR value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR target.status NOT IN ('succeeded','failed','skipped','cancelled','timed_out'))
+			ORDER BY COALESCE(outbox.terminal_reconcile_available_at,outbox.terminal_at,outbox.created_at),outbox.terminal_at,outbox.created_at,outbox.id
+			FOR UPDATE OF outbox SKIP LOCKED
+			LIMIT $2
+		), claimed AS (
+			UPDATE command_outbox outbox
+			SET terminal_reconcile_lease_expires_at=$3,
+			    terminal_reconcile_attempts=outbox.terminal_reconcile_attempts+1
+			FROM candidates
+			WHERE outbox.id=candidates.id
+			RETURNING outbox.tenant_id,outbox.project_id,outbox.job_id,outbox.id,
+			          COALESCE(outbox.terminal_reconcile_available_at,outbox.terminal_at,outbox.created_at) AS claim_key
+		)
+		SELECT tenant_id,project_id,job_id,id
+		FROM claimed
+		ORDER BY claim_key,id
+	`, at.UTC(), limit, at.UTC().Add(terminalReconcileLease))
 	if err != nil {
 		return 0, classifyReadError("list terminal commands for reconciliation", err)
 	}
@@ -263,7 +283,8 @@ func (repository *PostgresRepository) ReconcileTerminalCommands(ctx context.Cont
 	reconciled := 0
 	for _, value := range values {
 		if err := repository.reconcileTerminalCommand(ctx, value.scope, value.jobID, value.commandID, at.UTC()); err != nil {
-			reconcileErrors = append(reconcileErrors, fmt.Errorf("reconcile terminal command %q: %w", value.commandID, err))
+			releaseErr := repository.recordTerminalReconcileFailure(ctx, value.scope, value.commandID, at.UTC(), err)
+			reconcileErrors = append(reconcileErrors, errors.Join(fmt.Errorf("reconcile terminal command %q: %w", value.commandID, err), releaseErr))
 			continue
 		}
 		reconciled++
@@ -341,7 +362,7 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 	if err != nil {
 		return rollback(ErrInvalidCommandPayload)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=FALSE WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND command_status=$9`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, scope.TenantID, scope.ProjectID, commandID, jobID, string(message.CommandStatus))
+	result, err := tx.ExecContext(ctx, `UPDATE command_outbox SET terminal_target_status=$1,terminal_target_error_summary=$2,terminal_target_result_summary=$3,terminal_target_artifacts=$4,terminal_reconcile_pending=FALSE,terminal_reconcile_available_at=NULL,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='' WHERE tenant_id=$5 AND project_id=$6 AND id=$7 AND job_id=$8 AND command_status=$9`, string(target.Status), target.ErrorSummary, target.ResultSummary, artifacts, scope.TenantID, scope.ProjectID, commandID, jobID, string(message.CommandStatus))
 	if err != nil {
 		return rollback(classifyWriteError("complete terminal command reconciliation", err))
 	}
@@ -350,6 +371,42 @@ func (repository *PostgresRepository) reconcileTerminalCommand(ctx context.Conte
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit terminal command reconciliation: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) recordTerminalReconcileFailure(ctx context.Context, scope platformscope.Scope, commandID string, at time.Time, cause error) error {
+	reason := ""
+	switch {
+	case errors.Is(cause, ErrConflict):
+		reason = "terminal_state_conflict"
+	case errors.Is(cause, ErrInvalidCommandPayload), errors.Is(cause, ErrNotFound):
+		reason = "invalid_terminal_state"
+	}
+	result, err := repository.db.ExecContext(ctx, `
+		UPDATE command_outbox
+		SET terminal_reconcile_lease_expires_at=NULL,
+		    terminal_reconcile_available_at=CASE
+		        WHEN $1::text<>'' OR terminal_reconcile_attempts >= $2 THEN terminal_reconcile_available_at
+		        ELSE $3::timestamptz + LEAST(terminal_reconcile_attempts,60) * INTERVAL '1 second'
+		    END,
+		    terminal_reconcile_quarantined_at=CASE
+		        WHEN $1::text<>'' OR terminal_reconcile_attempts >= $2 THEN COALESCE(terminal_reconcile_quarantined_at,$3::timestamptz)
+		        ELSE NULL
+		    END,
+		    terminal_reconcile_quarantine_reason=CASE
+		        WHEN $1::text<>'' THEN $1::text
+		        WHEN terminal_reconcile_attempts >= $2 THEN 'retry_exhausted'
+		        ELSE ''
+		    END
+		WHERE tenant_id=$4 AND project_id=$5 AND id=$6
+		  AND command_status IN ('succeeded','failed','cancelled','timed_out','rejected')
+	`, reason, terminalReconcileMaxAttempts, at, scope.TenantID, scope.ProjectID, commandID)
+	if err != nil {
+		return classifyWriteError("record terminal reconciliation failure", err)
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return ErrConflict
 	}
 	return nil
 }

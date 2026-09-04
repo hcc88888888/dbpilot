@@ -20,6 +20,7 @@ import (
 	"dbpilot.local/platform/internal/audit"
 	"dbpilot.local/platform/internal/platformdb"
 	"dbpilot.local/platform/internal/platformscope"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -45,7 +46,7 @@ func TestTwoPhaseLegacyActiveUpgradeRepairsJobAndAuditWithoutReexecution(t *test
 	require.NoError(t, err)
 
 	applyJobMigrationFiles(t, ctx, database, "0005_two_phase_execution.sql")
-	applyJobMigrationFiles(t, ctx, database, "0006_cancellation_response_snapshot.sql", "0007_inspection_concurrency.sql", "0008_terminal_reconciliation.sql")
+	applyJobMigrationFiles(t, ctx, database, "0006_cancellation_response_snapshot.sql", "0007_inspection_concurrency.sql", "0008_terminal_reconciliation.sql", "0009_historical_terminal_recovery.sql")
 	upgradedAt := time.Now().UTC()
 	stored, err := repository.LookupCommand(ctx, message.ID)
 	require.NoError(t, err)
@@ -643,6 +644,208 @@ func TestPostgresGenericTerminalReconcilerRepairsCrashWindowsAndAuditOnce(t *tes
 			require.Equal(t, 1, auditCount)
 		})
 	}
+}
+
+func TestHistoricalTerminalUpgradeBackfillsFixedAuditAndRejectsUnknownAction(t *testing.T) {
+	ctx, database := openUnmigratedJobIntegrationDatabase(t)
+
+	t.Run("known action repairs Job and Audit exactly once", func(t *testing.T) {
+		resetJobIntegrationSchema(t, ctx, database)
+		applyJobMigrationFiles(t, ctx, database,
+			"0001_jobs_outbox.sql", "0002_command_payload_bytea.sql", "0003_prepared_command_envelope.sql",
+			"0004_command_execution_recovery.sql", "0005_two_phase_execution.sql", "0006_cancellation_response_snapshot.sql",
+			"0007_inspection_concurrency.sql",
+		)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		unique := fmt.Sprintf("%d", time.Now().UnixNano())
+		value, message := integrationPersistenceFixture("historical-terminal-audit-"+unique, platformscope.Scope{TenantID: "tenant-historical-audit-" + unique, ProjectID: "project-historical-audit"}, now.Add(-time.Minute))
+		value.Type = "inspection.collect"
+		value.MaxConcurrency = 1
+		value.TargetTimeout = 30 * time.Second
+		repository := NewPostgresRepository(database)
+		require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+		_, err := database.ExecContext(ctx, `UPDATE command_outbox SET command_status='succeeded',command_phase='succeeded',terminal_at=$1,published_at=$1 WHERE id=$2`, now, message.ID)
+		require.NoError(t, err)
+
+		require.NoError(t, RunMigrations(ctx, database))
+		require.NoError(t, platformdb.RunMigrations(ctx, database))
+		_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		signer, err := NewEd25519CommandSigner(privateKey)
+		require.NoError(t, err)
+		protector, err := NewAES256GCMTokenProtector(bytes.Repeat([]byte{0x7b}, 32))
+		require.NoError(t, err)
+		lifecycle, err := NewCommandLifecycle(CommandLifecycleConfig{
+			DispatchRepository: repository, Jobs: repository, Agents: &recordingCommandDispatcher{}, Signer: signer,
+			Audit: audit.NewService(audit.NewPostgresStore(database)), TokenProtector: protector, ClaimLimit: 4, Now: func() time.Time { return now.Add(time.Second) },
+		})
+		require.NoError(t, err)
+
+		_, err = lifecycle.DispatchPending(ctx, now.Add(time.Second))
+		require.NoError(t, err)
+		repaired, err := repository.Get(ctx, value.Scope, value.ID)
+		require.NoError(t, err)
+		require.Equal(t, StatusSucceeded, repaired.Status)
+		stored, err := repository.LookupCommand(ctx, message.ID)
+		require.NoError(t, err)
+		require.False(t, stored.TerminalAuditPending)
+		require.Equal(t, "command.historical_terminal", stored.TerminalAuditAction)
+		require.Equal(t, map[string]any{"command_action": "inspection.collect", "historical_recovery": true, "terminal_status": "succeeded"}, stored.TerminalAuditDetail)
+
+		_, err = lifecycle.DispatchPending(ctx, now.Add(DefaultOutboxLease+2*time.Second))
+		require.NoError(t, err)
+		var auditCount int
+		require.NoError(t, database.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE command_id=$1 AND action='command.historical_terminal'`, message.ID).Scan(&auditCount))
+		require.Equal(t, 1, auditCount)
+	})
+
+	t.Run("unknown action fails migration closed", func(t *testing.T) {
+		resetJobIntegrationSchema(t, ctx, database)
+		applyJobMigrationFiles(t, ctx, database,
+			"0001_jobs_outbox.sql", "0002_command_payload_bytea.sql", "0003_prepared_command_envelope.sql",
+			"0004_command_execution_recovery.sql", "0005_two_phase_execution.sql", "0006_cancellation_response_snapshot.sql",
+			"0007_inspection_concurrency.sql",
+		)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		unique := fmt.Sprintf("%d", time.Now().UnixNano())
+		value, message := integrationPersistenceFixture("historical-unknown-action-"+unique, platformscope.Scope{TenantID: "tenant-historical-unknown-" + unique, ProjectID: "project-historical-unknown"}, now.Add(-time.Minute))
+		value.Type = "unknown.action"
+		repository := NewPostgresRepository(database)
+		require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+		_, err := database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed',terminal_at=$1,published_at=$1 WHERE id=$2`, now, message.ID)
+		require.NoError(t, err)
+
+		err = RunMigrations(ctx, database)
+		require.ErrorContains(t, err, "unknown historical terminal command action")
+	})
+
+	t.Run("known metadata with mismatched command action fails closed", func(t *testing.T) {
+		resetJobIntegrationSchema(t, ctx, database)
+		applyJobMigrationFiles(t, ctx, database,
+			"0001_jobs_outbox.sql", "0002_command_payload_bytea.sql", "0003_prepared_command_envelope.sql",
+			"0004_command_execution_recovery.sql", "0005_two_phase_execution.sql", "0006_cancellation_response_snapshot.sql",
+			"0007_inspection_concurrency.sql",
+		)
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		unique := fmt.Sprintf("%d", time.Now().UnixNano())
+		value, message := integrationPersistenceFixture("historical-mismatched-action-"+unique, platformscope.Scope{TenantID: "tenant-historical-mismatch-" + unique, ProjectID: "project-historical-mismatch"}, now.Add(-time.Minute))
+		value.Type = "inspection.collect"
+		value.MaxConcurrency = 1
+		value.TargetTimeout = 30 * time.Second
+		payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(&agentv1.CommandEnvelope{AgentId: message.TargetID, LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_DiscoverDatabases{DiscoverDatabases: &agentv1.DiscoverDatabases{HostId: "host-mismatch", RuleRevision: 1, IncludeNative: true}}})
+		require.NoError(t, err)
+		message.Payload = payload
+		repository := NewPostgresRepository(database)
+		require.NoError(t, repository.CreateWithOutbox(ctx, value, []OutboxMessage{message}))
+		_, err = database.ExecContext(ctx, `UPDATE command_outbox SET command_status='succeeded',command_phase='succeeded',terminal_at=$1,published_at=$1 WHERE id=$2`, now, message.ID)
+		require.NoError(t, err)
+
+		err = RunMigrations(ctx, database)
+		require.ErrorContains(t, err, "historical terminal command action is inconsistent")
+	})
+}
+
+func TestPostgresTerminalReconcilerBackoffLetsLaterRowsProgress(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	firstJob, firstCommand := integrationPersistenceFixture("terminal-backoff-first", platformscope.Scope{TenantID: "tenant-terminal-backoff", ProjectID: "project-terminal-backoff"}, now.Add(-2*time.Minute))
+	secondJob, secondCommand := integrationPersistenceFixture("terminal-backoff-second", platformscope.Scope{TenantID: "tenant-terminal-backoff", ProjectID: "project-terminal-backoff"}, now.Add(-time.Minute))
+	require.NoError(t, repository.CreateWithOutbox(ctx, firstJob, []OutboxMessage{firstCommand}))
+	require.NoError(t, repository.CreateWithOutbox(ctx, secondJob, []OutboxMessage{secondCommand}))
+	for _, input := range []struct {
+		value   Job
+		message OutboxMessage
+		at      time.Time
+	}{{firstJob, firstCommand, now.Add(-2 * time.Second)}, {secondJob, secondCommand, now.Add(-time.Second)}} {
+		require.NoError(t, repository.PersistTerminalCommand(ctx, TerminalCommand{
+			Scope: input.value.Scope, CommandID: input.message.ID, Status: CommandSucceeded,
+			Target: TargetResult{TargetID: input.message.TargetID, Status: TargetSucceeded, ResultSummary: "Agent command succeeded", FinishedAt: timePointer(input.at)},
+			Audit:  TerminalAudit{DedupeKey: "command.result:" + input.message.ID, Action: "command.result", Result: "success", Detail: map[string]any{"state": "succeeded"}}, At: input.at,
+		}))
+	}
+	_, err := database.ExecContext(ctx, fmt.Sprintf(`
+		CREATE FUNCTION fail_first_terminal_reconcile() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF OLD.id = %s AND NEW.status <> OLD.status THEN RAISE EXCEPTION 'injected terminal reconcile failure'; END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER fail_first_terminal_reconcile BEFORE UPDATE ON jobs
+		FOR EACH ROW EXECUTE FUNCTION fail_first_terminal_reconcile();
+	`, pq.QuoteLiteral(firstJob.ID)))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = database.Exec(`DROP TRIGGER IF EXISTS fail_first_terminal_reconcile ON jobs`)
+		_, _ = database.Exec(`DROP FUNCTION IF EXISTS fail_first_terminal_reconcile()`)
+	})
+
+	reconciled, err := repository.ReconcileTerminalCommands(ctx, 1, now)
+	require.Zero(t, reconciled)
+	require.ErrorContains(t, err, "injected terminal reconcile failure")
+	reconciled, err = repository.ReconcileTerminalCommands(ctx, 1, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled, "backoff must move the failed oldest row out of the current keyset")
+	repairedSecond, err := repository.Get(ctx, secondJob.Scope, secondJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusSucceeded, repairedSecond.Status)
+
+	var attempts int
+	var availableAt sql.NullTime
+	var leasedUntil sql.NullTime
+	var quarantineReason string
+	var quarantinedAt sql.NullTime
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_attempts,terminal_reconcile_available_at,terminal_reconcile_lease_expires_at,terminal_reconcile_quarantined_at,terminal_reconcile_quarantine_reason FROM command_outbox WHERE id=$1`, firstCommand.ID).Scan(&attempts, &availableAt, &leasedUntil, &quarantinedAt, &quarantineReason))
+	require.Equal(t, 1, attempts)
+	require.True(t, availableAt.Valid)
+	require.True(t, availableAt.Time.After(now))
+	require.False(t, leasedUntil.Valid)
+	require.False(t, quarantinedAt.Valid, quarantineReason)
+	require.NoError(t, func() error {
+		_, dropErr := database.ExecContext(ctx, `DROP TRIGGER fail_first_terminal_reconcile ON jobs; DROP FUNCTION fail_first_terminal_reconcile()`)
+		return dropErr
+	}())
+	reconciled, err = repository.ReconcileTerminalCommands(ctx, 1, now.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	repairedFirst, err := repository.Get(ctx, firstJob.Scope, firstJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusSucceeded, repairedFirst.Status)
+}
+
+func TestPostgresTerminalReconcilerQuarantinesPermanentConflictWithoutStarvation(t *testing.T) {
+	ctx, database, repository := openTwoPhaseIntegrationRepository(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	conflictJob, conflictCommand := integrationPersistenceFixture("terminal-conflict-first", platformscope.Scope{TenantID: "tenant-terminal-conflict", ProjectID: "project-terminal-conflict"}, now.Add(-2*time.Minute))
+	validJob, validCommand := integrationPersistenceFixture("terminal-conflict-second", platformscope.Scope{TenantID: "tenant-terminal-conflict", ProjectID: "project-terminal-conflict"}, now.Add(-time.Minute))
+	require.NoError(t, repository.CreateWithOutbox(ctx, conflictJob, []OutboxMessage{conflictCommand}))
+	require.NoError(t, repository.CreateWithOutbox(ctx, validJob, []OutboxMessage{validCommand}))
+	for _, input := range []struct {
+		value   Job
+		message OutboxMessage
+		at      time.Time
+	}{{conflictJob, conflictCommand, now.Add(-2 * time.Second)}, {validJob, validCommand, now.Add(-time.Second)}} {
+		require.NoError(t, repository.PersistTerminalCommand(ctx, TerminalCommand{
+			Scope: input.value.Scope, CommandID: input.message.ID, Status: CommandSucceeded,
+			Target: TargetResult{TargetID: input.message.TargetID, Status: TargetSucceeded, ResultSummary: "Agent command succeeded", FinishedAt: timePointer(input.at)},
+			Audit:  TerminalAudit{DedupeKey: "command.result:" + input.message.ID, Action: "command.result", Result: "success", Detail: map[string]any{"state": "succeeded"}}, At: input.at,
+		}))
+	}
+	_, err := database.ExecContext(ctx, `UPDATE job_targets SET status='failed',error_summary='fixed_conflict',result_summary='conflicting durable target',finished_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND job_id=$4`, now.Add(-2*time.Second), conflictJob.Scope.TenantID, conflictJob.Scope.ProjectID, conflictJob.ID)
+	require.NoError(t, err)
+
+	reconciled, err := repository.ReconcileTerminalCommands(ctx, 1, now)
+	require.Zero(t, reconciled)
+	require.ErrorIs(t, err, ErrConflict)
+	reconciled, err = repository.ReconcileTerminalCommands(ctx, 1, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	repaired, err := repository.Get(ctx, validJob.Scope, validJob.ID)
+	require.NoError(t, err)
+	require.Equal(t, StatusSucceeded, repaired.Status)
+	var quarantinedAt sql.NullTime
+	var reason string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT terminal_reconcile_quarantined_at,terminal_reconcile_quarantine_reason FROM command_outbox WHERE id=$1`, conflictCommand.ID).Scan(&quarantinedAt, &reason))
+	require.True(t, quarantinedAt.Valid, reason)
+	require.Equal(t, "terminal_state_conflict", reason)
 }
 
 func TestTimeoutFenceConcurrentHeartbeatResultAndTimeoutStress(t *testing.T) {
