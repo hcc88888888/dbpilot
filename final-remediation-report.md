@@ -660,3 +660,62 @@ The dedicated PostgreSQL container
 `dbpilot-final-remediation-r5-pg` was verified by exact full ID and
 `dbpilot.owner=final-remediation-r5` before removal with its anonymous volume;
 the final Round 5 PostgreSQL residual count is zero.
+
+## Post-review closure
+
+Status: **DONE** on product HEAD `dc8ac1e`. The final review's two functional
+findings were reproduced and closed before integration.
+
+1. The still-unreleased Round 5 migration
+   `0007b_validation_target_outbox_bridge.sql` now compares effective winners:
+   raw `rejected` is equivalent to a failed target for conflict detection, but
+   the stored Command remains `rejected`. The production migration regression
+   proves `0008` retains the fixed `command_rejected` target evidence.
+2. New post-`0010` forward migration
+   `0011_applied_validation_target_repair.sql` repairs deployments that already
+   recorded Job `0008`/`0009` and database-instance `0006`. From the trusted
+   terminal target it atomically aligns the Job, raw Command status/phase,
+   target descriptor, generic reconcile state, pending command Audit
+   descriptor, validation projection, and managed-instance projection before
+   dispatcher workers start. It runs only when the already-applied
+   database-instance correlation/quarantine columns exist; earlier or new
+   schemas remain owned by the original ordered migrations.
+
+The migration fails startup only for an irreparably polluted state where an
+append-only Audit event already persists semantics opposite to the trusted
+target. This includes the crash window where `audit_events` was written but
+the Outbox recorded marker was not. Unrecorded opposite descriptors are
+repaired automatically and do not block startup.
+
+Strict TDD evidence:
+
+- RED: failed target plus raw `rejected` was rewritten to `failed`;
+- GREEN: raw `rejected` and `command_rejected` survive the real PostgreSQL
+  production migration sequence;
+- RED: an already-applied opposite descriptor caused the dispatcher to project
+  the wrong validation outcome and generic reconciliation conflict, while a
+  recorded opposite Audit was accepted;
+- GREEN: unrecorded evidence converges through the real dispatcher/reconciler;
+  recorded opposite Audit and event-without-marker both fail closed on every
+  restart without partial repair.
+
+Final gates:
+
+| Gate | Result |
+| --- | --- |
+| Full Job PostgreSQL suite | PASS, 17.694s |
+| Full database-instance PostgreSQL suite | PASS, 35.451s |
+| `go test ./... -count=1` | PASS |
+| `go vet ./...` | PASS |
+| Task17 static lifecycle contract | PASS, 13/13 |
+
+Kylin full-stack was not rerun for this closure: on a fresh full-stack database
+the Job migrations run before database-instance tables exist, so `0011` is a
+deliberate no-op and the changed branch is unreachable. The earlier Round 5
+Kylin full-stack and exact cleanup remain the relevant evidence; the fresh
+Task17 static contract confirms the topology and teardown paths are unchanged.
+
+Post-review product commits:
+
+1. `7dd9d5f` `fix(instances): preserve historical command rejection`
+2. `dc8ac1e` `fix(instances): repair applied validation terminal evidence`
