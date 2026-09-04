@@ -37,6 +37,16 @@ type TargetAuthorizer interface {
 	AuthorizeTarget(context.Context, string, string) error
 }
 
+type structuralTargetAuthorizer struct{}
+
+func (structuralTargetAuthorizer) AuthorizeTarget(context.Context, string, string) error { return nil }
+
+// ValidateShape validates immutable command semantics without consulting
+// mutable target ownership. Admission and dispatch must still call Validate.
+func ValidateShape(envelope *agentv1.CommandEnvelope) error {
+	return Validate(context.Background(), envelope, structuralTargetAuthorizer{})
+}
+
 func Validate(ctx context.Context, envelope *agentv1.CommandEnvelope, authorizer TargetAuthorizer) error {
 	if ctx == nil || envelope == nil || !validIdentifier(envelope.GetAgentId()) || envelope.GetCommand() == nil {
 		return ErrInvalidCommand

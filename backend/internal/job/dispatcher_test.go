@@ -1179,6 +1179,32 @@ func TestDatabaseInstanceValidationEffectiveFencedOutcomeOwnsCommandJobAndAudit(
 	require.Equal(t, "failure", fixture.audit.events[len(fixture.audit.events)-1].Result)
 }
 
+func TestDatabaseInstanceValidationTerminalizationDoesNotReauthorizeMutableTarget(t *testing.T) {
+	fixture := newSingleTargetCommandLifecycleFixture(t)
+	recorder := &recordingDatabaseValidationRecorder{}
+	fixture.lifecycle.databaseInstanceResults = recorder
+	fixture.lifecycle.targetAuthorizer = rejectingValidationTarget{}
+	payload, err := proto.Marshal(&agentv1.CommandEnvelope{AgentId: "agent-a", LeaseSeconds: 30, Command: &agentv1.CommandEnvelope_ValidateDatabaseInstance{ValidateDatabaseInstance: &agentv1.ValidateDatabaseInstance{AssignmentId: "assignment-a", InstanceId: "instance-detached", ConfigurationRevision: 7}}})
+	require.NoError(t, err)
+	message := fixture.message(t, "command-validation-detached", "agent-a")
+	message.Payload = payload
+	fixture.persistence.messages[message.ID] = message
+	target := TargetResult{TargetID: "agent-a", Status: TargetTimedOut, FinishedAt: &fixture.now}
+
+	value, _, err := fixture.lifecycle.applyTarget(context.Background(), message, target, fixture.now)
+
+	require.NoError(t, err)
+	require.Equal(t, StatusTimedOut, value.Status)
+	require.Equal(t, 1, recorder.resultCalls)
+	require.Equal(t, agentv1.CommandResultState_COMMAND_RESULT_STATE_TIMED_OUT, recorder.result.GetState())
+}
+
+type rejectingValidationTarget struct{}
+
+func (rejectingValidationTarget) AuthorizeTarget(context.Context, string, string) error {
+	return errors.New("instance detached after admission")
+}
+
 func TestFailedHighCardinalityTrialTerminalizesRunningJob(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	recorder := &orderingTrialRecorder{persistence: fixture.persistence, commandID: "command-high-cardinality"}

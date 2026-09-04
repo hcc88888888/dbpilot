@@ -567,6 +567,17 @@ func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvel
 }
 
 func decodeUnsignedCommand(ctx context.Context, message OutboxMessage, authorizer commandvalidation.TargetAuthorizer) (*agentv1.CommandEnvelope, error) {
+	envelope, err := decodeUnsignedCommandShape(message)
+	if err != nil {
+		return nil, err
+	}
+	if err := commandvalidation.Validate(ctx, envelope, authorizer); err != nil {
+		return nil, ErrInvalidCommandPayload
+	}
+	return envelope, nil
+}
+
+func decodeUnsignedCommandShape(message OutboxMessage) (*agentv1.CommandEnvelope, error) {
 	if message.Scope.Validate() != nil || strings.TrimSpace(message.ID) == "" || strings.TrimSpace(message.JobID) == "" || message.Type != commandOutboxType || strings.TrimSpace(message.TargetID) == "" || len(message.Payload) == 0 {
 		return nil, ErrInvalidCommandPayload
 	}
@@ -580,7 +591,7 @@ func decodeUnsignedCommand(ctx context.Context, message OutboxMessage, authorize
 	if envelope.GetCommand() == nil || envelope.GetLeaseSeconds() == 0 || envelope.GetLeaseSeconds() > commandvalidation.MaximumTimeoutSeconds || strings.TrimSpace(envelope.GetAgentId()) == "" || envelope.GetAgentId() != message.TargetID {
 		return nil, ErrInvalidCommandPayload
 	}
-	if err := commandvalidation.Validate(ctx, envelope, authorizer); err != nil {
+	if err := commandvalidation.ValidateShape(envelope); err != nil {
 		return nil, ErrInvalidCommandPayload
 	}
 	return envelope, nil
@@ -877,7 +888,7 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		lifecycle.onError(err)
 		return
 	}
-	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	envelope, err := decodeUnsignedCommandShape(message)
 	if err != nil {
 		lifecycle.onError(err)
 		return
@@ -1033,7 +1044,7 @@ func (lifecycle *CommandLifecycle) Result(ctx context.Context, agentID string, r
 	if err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
-	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	envelope, err := decodeUnsignedCommandShape(message)
 	if err != nil {
 		return agentcontrol.ResultPersistence{CommandID: result.GetCommandId(), ResultDigest: resultDigest[:]}, err
 	}
@@ -1210,7 +1221,7 @@ func (lifecycle *CommandLifecycle) finalizeDatabaseInstanceValidationTarget(ctx 
 	if !isTerminalTarget(target.Status) {
 		return target, nil
 	}
-	envelope, err := decodeUnsignedCommand(ctx, message, lifecycle.targetAuthorizer)
+	envelope, err := decodeUnsignedCommandShape(message)
 	if err != nil {
 		return TargetResult{}, err
 	}
