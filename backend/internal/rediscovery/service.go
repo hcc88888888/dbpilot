@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"regexp"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	discoverydomain "dbpilot.local/platform/internal/discovery"
@@ -39,6 +41,7 @@ type HostReader interface {
 type JobStore interface {
 	CreateWithOutbox(context.Context, job.Job, []job.OutboxMessage) error
 	Get(context.Context, platformscope.Scope, string) (job.Job, error)
+	GetOperation(context.Context, platformscope.Scope, string, string) (job.Job, job.OutboxMessage, error)
 }
 
 type CapabilitySource interface {
@@ -54,7 +57,7 @@ type RediscoveryRequest struct {
 }
 
 func (request RediscoveryRequest) valid() bool {
-	return identifierPattern.MatchString(request.Actor) && identifierPattern.MatchString(request.IdempotencyKey) && fingerprintPattern.MatchString(request.RequestFingerprint) && identifierPattern.MatchString(request.RequestID) && identifierPattern.MatchString(request.TraceID)
+	return boundedText(request.Actor, 256) && boundedText(request.IdempotencyKey, 128) && fingerprintPattern.MatchString(request.RequestFingerprint) && boundedText(request.RequestID, 256) && boundedText(request.TraceID, 256)
 }
 
 type RediscoveryCoordinator struct {
@@ -67,8 +70,17 @@ type RediscoveryCoordinator struct {
 }
 
 func (service *RediscoveryCoordinator) Start(ctx context.Context, scope platformscope.Scope, hostID string, request RediscoveryRequest) (job.Job, error) {
-	if service == nil || ctx == nil || service.Hosts == nil || service.Jobs == nil || service.Capabilities == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !request.valid() {
+	if service == nil || ctx == nil || service.Jobs == nil || scope.Validate() != nil || !identifierPattern.MatchString(hostID) || !request.valid() {
 		return job.Job{}, ErrInvalid
+	}
+	jobID, commandID, _ := rediscoveryOperationIdentity(scope, hostID, request)
+	if stored, found, err := service.resolveImmutableOperation(ctx, scope, hostID, jobID, commandID, request); err != nil {
+		return job.Job{}, err
+	} else if found {
+		return stored, nil
+	}
+	if service.Hosts == nil || service.Capabilities == nil {
+		return job.Job{}, ErrRediscoveryUnavailable
 	}
 	now := time.Now().UTC()
 	if service.Now != nil {
@@ -101,13 +113,33 @@ func (service *RediscoveryCoordinator) Start(ctx context.Context, scope platform
 		return job.Job{}, err
 	}
 	if err := service.Jobs.CreateWithOutbox(ctx, value, []job.OutboxMessage{message}); err != nil {
-		stored, getErr := service.Jobs.Get(ctx, scope, value.ID)
-		if getErr == nil && sameRediscoveryJob(stored, value) {
+		stored, found, resolveErr := service.resolveImmutableOperation(ctx, scope, hostID, value.ID, message.ID, request)
+		if resolveErr == nil && found {
 			return stored, nil
+		}
+		if resolveErr != nil && !errors.Is(resolveErr, job.ErrNotFound) {
+			return job.Job{}, resolveErr
 		}
 		return job.Job{}, err
 	}
 	return value, nil
+}
+
+func (service *RediscoveryCoordinator) resolveImmutableOperation(ctx context.Context, scope platformscope.Scope, hostID, jobID, commandID string, request RediscoveryRequest) (job.Job, bool, error) {
+	value, message, err := service.Jobs.GetOperation(ctx, scope, jobID, commandID)
+	if errors.Is(err, job.ErrNotFound) {
+		return job.Job{}, false, nil
+	}
+	if errors.Is(err, job.ErrConflict) {
+		return job.Job{}, false, ErrRediscoveryUnavailable
+	}
+	if err != nil {
+		return job.Job{}, false, err
+	}
+	if !sameRediscoveryOperation(value, message, scope, hostID, jobID, commandID, request) {
+		return job.Job{}, false, ErrRediscoveryUnavailable
+	}
+	return value, true, nil
 }
 
 func (service *RediscoveryCoordinator) currentPolicy(now time.Time) (discoverydomain.RuleAttestation, error) {
@@ -135,10 +167,7 @@ func buildRediscoveryJob(host hostinventory.Host, ruleRevision uint64, includeNa
 	if host.Validate() != nil || host.Status != hostinventory.HostOnline || ruleRevision == 0 || (!includeNative && !includeDocker) || !request.valid() || at.IsZero() || at.Location() != time.UTC {
 		return job.Job{}, job.OutboxMessage{}, ErrInvalid
 	}
-	identity := host.Scope.Key() + "\x00" + host.ID + "\x00" + request.Actor + "\x00" + request.IdempotencyKey + "\x00" + request.RequestFingerprint
-	digest := sha256.Sum256([]byte(identity))
-	suffix := hex.EncodeToString(digest[:16])
-	jobID, commandID := "job-host-rediscover-"+suffix, "command-host-rediscover-"+suffix
+	jobID, commandID, suffix := rediscoveryOperationIdentity(host.Scope, host.ID, request)
 	envelope := &agentv1.CommandEnvelope{AgentId: host.AgentID, LeaseSeconds: uint32(rediscoveryLease / time.Second), Command: &agentv1.CommandEnvelope_DiscoverDatabases{DiscoverDatabases: &agentv1.DiscoverDatabases{HostId: host.ID, RuleRevision: ruleRevision, IncludeNative: includeNative, IncludeDocker: includeDocker}}}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
 	if err != nil {
@@ -150,8 +179,28 @@ func buildRediscoveryJob(host hostinventory.Host, ruleRevision uint64, includeNa
 	return value, message, nil
 }
 
-func sameRediscoveryJob(left, right job.Job) bool {
-	return left.ID == right.ID && left.Type == right.Type && left.Scope == right.Scope && left.InitiatedBy == right.InitiatedBy && left.SourceResource == right.SourceResource && left.IdempotencyKey == right.IdempotencyKey && len(left.TargetResourceIDs) == 1 && len(right.TargetResourceIDs) == 1 && left.TargetResourceIDs[0] == right.TargetResourceIDs[0]
+func rediscoveryOperationIdentity(scope platformscope.Scope, hostID string, request RediscoveryRequest) (string, string, string) {
+	identity := scope.Key() + "\x00" + hostID + "\x00" + request.Actor + "\x00" + request.IdempotencyKey + "\x00" + request.RequestFingerprint
+	digest := sha256.Sum256([]byte(identity))
+	suffix := hex.EncodeToString(digest[:16])
+	return "job-host-rediscover-" + suffix, "command-host-rediscover-" + suffix, suffix
+}
+
+func sameRediscoveryOperation(value job.Job, message job.OutboxMessage, scope platformscope.Scope, hostID, jobID, commandID string, request RediscoveryRequest) bool {
+	if value.ID != jobID || value.Type != "host.rediscover" || value.Scope != scope || value.InitiatedBy != request.Actor || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || value.IdempotencyKey != "host-rediscover-"+strings.TrimPrefix(jobID, "job-host-rediscover-") || value.Version < 1 || value.RequestID != request.RequestID || value.TraceID != request.TraceID || len(value.TargetResourceIDs) != 1 ||
+		message.ID != commandID || message.Scope != scope || message.JobID != jobID || message.TargetID != value.TargetResourceIDs[0] || message.Type != "agent.command" {
+		return false
+	}
+	envelope := new(agentv1.CommandEnvelope)
+	if proto.Unmarshal(message.Payload, envelope) != nil || envelope.GetAgentId() != message.TargetID {
+		return false
+	}
+	command := envelope.GetDiscoverDatabases()
+	return command != nil && command.GetHostId() == hostID && command.GetRuleRevision() > 0 && (command.GetIncludeNative() || command.GetIncludeDocker())
+}
+
+func boundedText(value string, maximum int) bool {
+	return value != "" && value == strings.TrimSpace(value) && utf8.ValidString(value) && utf8.RuneCountInString(value) <= maximum && len(value) <= maximum*4 && !strings.ContainsAny(value, "\r\n\t")
 }
 
 func hostCapability(host hostinventory.Host, name string) bool {

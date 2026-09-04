@@ -237,17 +237,24 @@ func (api platformAPI) RediscoverHost(ctx context.Context, request openapi.Redis
 		return nil, err
 	}
 	key := idempotency.Key{Scope: scope, Actor: principal.Subject, OperationID: "rediscoverHost", IdempotencyKey: request.Params.IdempotencyKey}
-	auditPayload, reconcile, err := httpActionAuditReconciliation(ctx, api.services.Audit, scope, principal, "host.rediscovery_requested", "host", request.HostId, "success", key.OperationID, key.IdempotencyKey)
+	auditPayload, reconcileAudit, err := httpActionAuditReconciliation(ctx, api.services.Audit, scope, principal, "host.rediscovery_requested", "host", request.HostId, "success", key.OperationID, key.IdempotencyKey)
 	if err != nil {
 		return nil, err
 	}
-	recovery := hostRediscoveryRecovery{RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx)}
+	recovery := hostRediscoveryRecovery{RequestID: requestIDFromContext(ctx), TraceID: traceIDFromContext(ctx), Audit: append(json.RawMessage(nil), auditPayload...)}
 	if metadata, ok := ctx.Value(platformRequestMetadataContextKey{}).(platformRequestMetadata); ok {
 		recovery.Instance = metadata.Path
 	}
 	recoveryJSON, err := json.Marshal(recovery)
 	if err != nil {
 		return nil, err
+	}
+	reconcile := func(reconcileContext context.Context, response idempotency.Response, payload []byte) error {
+		var original hostRediscoveryRecovery
+		if json.Unmarshal(payload, &original) != nil || original.RequestID == "" || original.TraceID == "" || !json.Valid(original.Audit) {
+			return idempotency.ErrInvalid
+		}
+		return reconcileAudit(reconcileContext, response, original.Audit)
 	}
 	run := func(callContext context.Context, value hostRediscoveryRecovery) (idempotency.Response, error) {
 		created, startErr := api.services.HostRediscovery.Start(callContext, scope, request.HostId, rediscovery.RediscoveryRequest{Actor: principal.Subject, IdempotencyKey: request.Params.IdempotencyKey, RequestFingerprint: fingerprint, RequestID: value.RequestID, TraceID: value.TraceID})
@@ -304,7 +311,7 @@ func (api platformAPI) RediscoverHost(ctx context.Context, request openapi.Redis
 		}
 		return nil, err
 	}
-	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, auditPayload, reconcile)
+	completed, err := api.services.Idempotency.Complete(ctx, key, fingerprint, claim.OwnerToken, stored, recoveryJSON, reconcile)
 	if err != nil {
 		return nil, err
 	}
@@ -312,9 +319,10 @@ func (api platformAPI) RediscoverHost(ctx context.Context, request openapi.Redis
 }
 
 type hostRediscoveryRecovery struct {
-	RequestID string `json:"request_id"`
-	TraceID   string `json:"trace_id"`
-	Instance  string `json:"instance,omitempty"`
+	RequestID string          `json:"request_id"`
+	TraceID   string          `json:"trace_id"`
+	Instance  string          `json:"instance,omitempty"`
+	Audit     json.RawMessage `json:"audit"`
 }
 
 type hostRediscoveryPreMutationError struct{ err error }

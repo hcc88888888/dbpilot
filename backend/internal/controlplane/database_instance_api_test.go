@@ -163,8 +163,9 @@ func TestDatabaseInstanceConnectionTestReturnsDurableJobAndMapsInternalRunningSt
 	get = servePlatformRequest(Services{DatabaseInstances: service}, principalWith(platformTestScope, openapi.PermissionGetDatabaseInstance), httptest.NewRequest(http.MethodGet, platformBasePath+"/database-instances/instance-1", nil))
 	require.Equal(t, http.StatusOK, get.Code, get.Body.String())
 	require.NoError(t, json.Unmarshal(get.Body.Bytes(), &body))
-	require.Equal(t, openapi.ConnectionTestStatusNotTested, body.ConnectionTestStatus, "the v1 contract has no plugin failure member; capability and management state carry that failure")
+	require.Equal(t, openapi.ConnectionTestStatusUnreachable, body.ConnectionTestStatus, "the attempted validation was unavailable and must never be serialized as not_tested")
 	require.Contains(t, body.Capabilities, "plugin_failed")
+	require.Contains(t, body.Capabilities, "connection_error:plugin_failed")
 }
 
 type databaseInstanceAPIService struct {

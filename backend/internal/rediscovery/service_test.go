@@ -42,20 +42,31 @@ func TestRediscoveryCreatesOneScopedTypedJobFromCurrentPolicyAndLiveCapabilities
 }
 
 func TestRediscoveryRecoversUnknownCommitAndRejectsOfflineOrUnnegotiatedHost(t *testing.T) {
-	fixture := newRediscoveryFixture()
 	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-a", RequestFingerprint: "sha256:" + repeatHex("a"), RequestID: "request-a", TraceID: "trace-a"}
-	fixture.jobs.failAfterCreate = errors.New("connection lost after commit")
+	for name, mutate := range map[string]func(*rediscoveryFixture){
+		"host offline": func(fixture *rediscoveryFixture) { fixture.hosts.value.Status = hostinventory.HostOffline },
+		"policy changed": func(fixture *rediscoveryFixture) {
+			fixture.service.Policies = nil
+			fixture.service.RuleKeys = nil
+		},
+		"capability disappeared": func(fixture *rediscoveryFixture) { delete(fixture.capabilities.allowed, "discovery_report_ack_v1") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newRediscoveryFixture()
+			fixture.jobs.failAfterCreate = errors.New("connection lost after commit")
+			first, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+			require.NoError(t, err)
+			mutate(&fixture)
+			second, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+			require.NoError(t, err)
+			require.Equal(t, first.ID, second.ID)
+			require.Equal(t, 1, fixture.jobs.created, "lost response replay must not create a second Job")
+		})
+	}
 
-	first, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
-	require.NoError(t, err)
-	second, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
-	require.NoError(t, err)
-	require.Equal(t, first.ID, second.ID)
-	require.Equal(t, 1, fixture.jobs.created, "lost response replay must not create a second Job")
-
-	fixture = newRediscoveryFixture()
+	fixture := newRediscoveryFixture()
 	fixture.hosts.value.Status = hostinventory.HostOffline
-	_, err = fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+	_, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
 	require.ErrorIs(t, err, ErrHostNotOnline)
 	require.Zero(t, fixture.jobs.created)
 
@@ -64,6 +75,35 @@ func TestRediscoveryRecoversUnknownCommitAndRejectsOfflineOrUnnegotiatedHost(t *
 	_, err = fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
 	require.ErrorIs(t, err, ErrRediscoveryUnavailable)
 	require.Zero(t, fixture.jobs.created)
+}
+
+func TestRediscoveryAcceptsBoundedGlobalSubjectAndOpenAPIIdempotencyKey(t *testing.T) {
+	fixture := newRediscoveryFixture()
+	key := "rediscover /?=+_"
+	for len(key) < 128 {
+		key += "x"
+	}
+	request := RediscoveryRequest{Actor: "https://issuer.example/subjects/user|tenant@example.com", IdempotencyKey: key, RequestFingerprint: "sha256:" + repeatHex("b"), RequestID: "request-global-subject", TraceID: "trace-global-subject"}
+
+	created, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+
+	require.NoError(t, err)
+	require.Equal(t, request.Actor, created.InitiatedBy)
+}
+
+func TestRediscoveryReplayRejectsJobWithoutExactImmutableOutboxCorrelation(t *testing.T) {
+	fixture := newRediscoveryFixture()
+	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-corrupt", RequestFingerprint: "sha256:" + repeatHex("c"), RequestID: "request-corrupt", TraceID: "trace-corrupt"}
+	created, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+	require.NoError(t, err)
+	require.Len(t, fixture.jobs.messages, 1)
+	fixture.jobs.messages[0].JobID = "job-other"
+
+	_, err = fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+
+	require.ErrorIs(t, err, ErrRediscoveryUnavailable)
+	require.Equal(t, 1, fixture.jobs.created)
+	require.NotEmpty(t, created.ID)
 }
 
 type rediscoveryFixture struct {
@@ -128,6 +168,18 @@ func (store *memoryRediscoveryJobs) Get(_ context.Context, scope platformscope.S
 		return job.Job{}, job.ErrNotFound
 	}
 	return value, nil
+}
+func (store *memoryRediscoveryJobs) GetOperation(ctx context.Context, scope platformscope.Scope, jobID, commandID string) (job.Job, job.OutboxMessage, error) {
+	value, err := store.Get(ctx, scope, jobID)
+	if err != nil {
+		return job.Job{}, job.OutboxMessage{}, err
+	}
+	for _, message := range store.messages {
+		if message.ID == commandID && message.Scope == scope && message.JobID == jobID {
+			return value, message, nil
+		}
+	}
+	return job.Job{}, job.OutboxMessage{}, job.ErrConflict
 }
 
 func repeatHex(value string) string {

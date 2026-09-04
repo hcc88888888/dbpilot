@@ -279,10 +279,11 @@ func openAPIManagedDatabaseInstance(value databaseinstance.Instance) (openapi.Ma
 	}
 	status := openapi.DatabaseManagementStatus(value.ManagementStatus)
 	connection := openapi.ConnectionTestStatus(value.ConnectionTestStatus)
+	pluginFailed := value.ConnectionTestStatus == databaseinstance.ConnectionPluginFailed
 	if value.ConnectionTestStatus == databaseinstance.ConnectionQueued || value.ConnectionTestStatus == databaseinstance.ConnectionRunning {
 		connection = openapi.ConnectionTestStatusPending
-	} else if value.ConnectionTestStatus == databaseinstance.ConnectionPluginFailed {
-		connection = openapi.ConnectionTestStatusNotTested
+	} else if pluginFailed {
+		connection = openapi.ConnectionTestStatusUnreachable
 	}
 	if !status.Valid() || !connection.Valid() {
 		return openapi.ManagedDatabaseInstance{}, databaseinstance.ErrInvalid
@@ -290,6 +291,9 @@ func openAPIManagedDatabaseInstance(value databaseinstance.Instance) (openapi.Ma
 	capabilities := append([]string(nil), value.Capabilities...)
 	if value.CapabilityState != "" {
 		capabilities = append(capabilities, string(value.CapabilityState))
+	}
+	if pluginFailed {
+		capabilities = append(capabilities, "connection_error:plugin_failed")
 	}
 	result := openapi.ManagedDatabaseInstance{InstanceId: value.ID, TenantId: value.Scope.TenantID, ProjectId: value.Scope.ProjectID, HostId: value.HostID, AgentId: value.AgentID, DatabaseFamily: value.DatabaseFamily, DatabaseVariant: value.DatabaseVariant, DisplayName: value.DisplayName, CredentialRef: value.CredentialRef, Labels: cloneStringMap(value.Labels), Capabilities: capabilities, ConnectionTestStatus: connection, PluginAssignmentRevision: int64(value.PluginAssignmentRevision), ManagementStatus: status, Etag: entityTag(int64(value.Revision))}
 	if value.Endpoint != "" {

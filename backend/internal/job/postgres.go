@@ -40,6 +40,7 @@ const claimPreparedCommandsSQL = "WITH candidates AS (SELECT id FROM command_out
 const claimPendingTerminalAuditsSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE terminal_audit_pending AND (terminal_audit_lease_expires_at IS NULL OR terminal_audit_lease_expires_at <= $1) ORDER BY terminal_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET terminal_audit_lease_expires_at = $3, terminal_audit_attempts = o.terminal_audit_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY terminal_at, id"
 const markOutboxPublishedSQL = "UPDATE command_outbox SET published_at = COALESCE(published_at, $1), lease_expires_at = NULL WHERE tenant_id = $2 AND project_id = $3 AND id = $4"
 const selectOutboxByIDSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE id = $1"
+const selectOperationOutboxSQL = "SELECT " + outboxColumnsSQL + " FROM command_outbox WHERE id = $1 AND tenant_id = $2 AND project_id = $3 AND job_id = $4"
 const prepareCommandEnvelopeSQL = "UPDATE command_outbox SET prepared_envelope = COALESCE(prepared_envelope, $4), command_phase = CASE WHEN command_phase = 'pending' THEN 'preparing' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND id = $3 AND cancellation_requested_at IS NULL AND command_phase IN ('pending', 'preparing') RETURNING prepared_envelope"
 const requestCommandCancellationSQL = "UPDATE command_outbox SET cancellation_requested_at = COALESCE(cancellation_requested_at, $4), cancellation_reason = CASE WHEN cancellation_requested_at IS NULL THEN $5 ELSE cancellation_reason END, cancellation_available_at = COALESCE(cancellation_available_at, $4), lease_expires_at = NULL, command_phase = CASE WHEN command_phase IN ('start_authorized', 'running', 'cancelling') THEN 'cancelling' ELSE command_phase END WHERE tenant_id = $1 AND project_id = $2 AND job_id = $3 AND command_status IN ('pending', 'active')"
 const claimCancellationSQL = "WITH candidates AS (SELECT id FROM command_outbox WHERE cancellation_requested_at IS NOT NULL AND command_phase IN ('pending', 'preparing', 'prepared', 'start_authorized', 'running', 'cancelling') AND cancellation_available_at <= $1 AND (cancellation_lease_expires_at IS NULL OR cancellation_lease_expires_at <= $1) ORDER BY created_at, id FOR UPDATE SKIP LOCKED LIMIT $2), claimed AS (UPDATE command_outbox AS o SET cancellation_lease_expires_at = $3, cancellation_attempts = o.cancellation_attempts + 1 FROM candidates AS c WHERE o.id = c.id RETURNING " + outboxColumnsAliasedSQL + ") SELECT " + outboxColumnsSQL + " FROM claimed ORDER BY created_at, id"
@@ -175,6 +176,48 @@ func (repository *PostgresRepository) Get(ctx context.Context, scope platformsco
 		return Job{}, fmt.Errorf("commit job snapshot: %w", err)
 	}
 	return value, nil
+}
+
+func (repository *PostgresRepository) GetOperation(ctx context.Context, scope platformscope.Scope, jobID, commandID string) (Job, OutboxMessage, error) {
+	if repository == nil || repository.db == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" {
+		return Job{}, OutboxMessage{}, ErrNotFound
+	}
+	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return Job{}, OutboxMessage{}, fmt.Errorf("begin operation snapshot: %w", err)
+	}
+	rollback := func(cause error) (Job, OutboxMessage, error) {
+		_ = tx.Rollback()
+		return Job{}, OutboxMessage{}, cause
+	}
+	value, err := scanJob(tx.QueryRowContext(ctx, selectJobSQL, scope.TenantID, scope.ProjectID, jobID))
+	if err != nil {
+		return rollback(classifyReadError("get operation job", err))
+	}
+	results, err := getTargetsFrom(ctx, tx, scope, jobID)
+	if err != nil {
+		return rollback(err)
+	}
+	value.TargetResults = results
+	value.TargetResourceIDs = make([]string, len(results))
+	for index := range results {
+		value.TargetResourceIDs[index] = results[index].TargetID
+	}
+	value = normalizeJobUTC(value)
+	if err := ValidateTargets(value); err != nil {
+		return rollback(fmt.Errorf("validate operation Job targets: %w", err))
+	}
+	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL, commandID, scope.TenantID, scope.ProjectID, jobID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return rollback(ErrConflict)
+	}
+	if err != nil {
+		return rollback(classifyReadError("get operation outbox", err))
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, OutboxMessage{}, fmt.Errorf("commit operation snapshot: %w", err)
+	}
+	return value, message, nil
 }
 
 func (repository *PostgresRepository) Transition(ctx context.Context, transition Transition) (Job, error) {

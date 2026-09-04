@@ -43,6 +43,25 @@ func TestRediscoverHostCreatesOneRecoverableAuditedJobWithExactETag(t *testing.T
 	require.Equal(t, "host.rediscovery_requested", audits.records[0].Action)
 }
 
+func TestRediscoverHostAcceptsGlobalOIDCSubjectAndOpenAPIIdempotencyKey(t *testing.T) {
+	now := time.Date(2026, 9, 4, 4, 0, 0, 0, time.UTC)
+	value := job.Job{ID: "job-rediscover-global", Type: "host.rediscover", Scope: platformTestScope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{"agent-1"}, InitiatedBy: "https://issuer.example/subjects/user|tenant@example.com", SourceResource: job.ResourceReference{ResourceType: "host", ResourceID: "host-1"}, IdempotencyKey: "internal-global", Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: now, RequestID: "request-global", TraceID: "trace-global"}
+	service := &recordingHostRediscovery{value: value}
+	services := Services{HostRediscovery: service, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Audit: &recordingAuditService{}}
+	principal := principalWith(platformTestScope, openapi.PermissionRediscoverHost)
+	principal.Subject = value.InitiatedBy
+	key := "rediscover /?=+_"
+	for len(key) < 128 {
+		key += "x"
+	}
+
+	response := servePlatformRequest(services, principal, newRediscoverHostRequest(key))
+
+	require.Equal(t, http.StatusAccepted, response.Code, response.Body.String())
+	require.Equal(t, principal.Subject, service.request.Actor)
+	require.Equal(t, key, service.request.IdempotencyKey)
+}
+
 func TestRediscoverHostPermissionAndCapabilityFailureDoNotCreateJob(t *testing.T) {
 	service := &recordingHostRediscovery{err: rediscovery.ErrRediscoveryUnavailable}
 	services := Services{HostRediscovery: service, Idempotency: idempotency.NewService(newHTTPIdempotencyStore()), Audit: &recordingAuditService{}}
