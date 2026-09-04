@@ -207,6 +207,13 @@ func (repository *PostgresRepository) GetOperation(ctx context.Context, scope pl
 	if err := ValidateTargets(value); err != nil {
 		return rollback(fmt.Errorf("validate operation Job targets: %w", err))
 	}
+	var outboxCount int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, jobID).Scan(&outboxCount); err != nil {
+		return rollback(classifyReadError("count operation outbox", err))
+	}
+	if outboxCount != 1 {
+		return rollback(ErrConflict)
+	}
 	message, err := scanOutbox(tx.QueryRowContext(ctx, selectOperationOutboxSQL, commandID, scope.TenantID, scope.ProjectID, jobID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return rollback(ErrConflict)

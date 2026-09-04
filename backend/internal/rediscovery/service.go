@@ -3,6 +3,7 @@
 package rediscovery
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -174,7 +175,8 @@ func buildRediscoveryJob(host hostinventory.Host, ruleRevision uint64, includeNa
 		return job.Job{}, job.OutboxMessage{}, ErrInvalid
 	}
 	timeout := at.Add(rediscoveryTimeout)
-	value := job.Job{ID: jobID, Type: "host.rediscover", Scope: host.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{host.AgentID}, InitiatedBy: request.Actor, SourceResource: job.ResourceReference{ResourceType: "host", ResourceID: host.ID}, IdempotencyKey: "host-rediscover-" + suffix, Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at, TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: rediscoveryLease, RequestID: request.RequestID, TraceID: request.TraceID}
+	payloadDigest := sha256.Sum256(payload)
+	value := job.Job{ID: jobID, Type: "host.rediscover", Scope: host.Scope, Status: job.StatusQueued, Outcome: job.OutcomeNone, TargetResourceIDs: []string{host.AgentID}, InitiatedBy: request.Actor, SourceResource: job.ResourceReference{ResourceType: "host", ResourceID: host.ID}, IdempotencyKey: "host-rediscover-" + suffix + "-command-sha256-" + hex.EncodeToString(payloadDigest[:]), Version: 1, Progress: job.Progress{TotalTargets: 1}, Artifacts: []job.ArtifactReference{}, CreatedAt: at, TimeoutAt: &timeout, MaxConcurrency: 1, TargetTimeout: rediscoveryLease, RequestID: request.RequestID, TraceID: request.TraceID}
 	message := job.OutboxMessage{ID: commandID, Scope: host.Scope, JobID: jobID, TargetID: host.AgentID, Type: "agent.command", Payload: payload, AvailableAt: at, CreatedAt: at}
 	return value, message, nil
 }
@@ -187,12 +189,22 @@ func rediscoveryOperationIdentity(scope platformscope.Scope, hostID string, requ
 }
 
 func sameRediscoveryOperation(value job.Job, message job.OutboxMessage, scope platformscope.Scope, hostID, jobID, commandID string, request RediscoveryRequest) bool {
-	if value.ID != jobID || value.Type != "host.rediscover" || value.Scope != scope || value.InitiatedBy != request.Actor || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || value.IdempotencyKey != "host-rediscover-"+strings.TrimPrefix(jobID, "job-host-rediscover-") || value.Version < 1 || value.RequestID != request.RequestID || value.TraceID != request.TraceID || len(value.TargetResourceIDs) != 1 ||
+	requestSuffix := strings.TrimPrefix(jobID, "job-host-rediscover-")
+	keyPrefix := "host-rediscover-" + requestSuffix + "-command-sha256-"
+	if value.ID != jobID || value.Type != "host.rediscover" || value.Scope != scope || value.InitiatedBy != request.Actor || value.SourceResource != (job.ResourceReference{ResourceType: "host", ResourceID: hostID}) || !strings.HasPrefix(value.IdempotencyKey, keyPrefix) || len(value.IdempotencyKey) != len(keyPrefix)+sha256.Size*2 || value.Version < 1 || value.RequestID != request.RequestID || value.TraceID != request.TraceID || len(value.TargetResourceIDs) != 1 ||
 		message.ID != commandID || message.Scope != scope || message.JobID != jobID || message.TargetID != value.TargetResourceIDs[0] || message.Type != "agent.command" {
 		return false
 	}
 	envelope := new(agentv1.CommandEnvelope)
-	if proto.Unmarshal(message.Payload, envelope) != nil || envelope.GetAgentId() != message.TargetID {
+	if proto.Unmarshal(message.Payload, envelope) != nil || len(envelope.ProtoReflect().GetUnknown()) != 0 || envelope.GetAgentId() != message.TargetID || envelope.GetCommandId() != "" || envelope.GetJobId() != "" || envelope.GetIssuedAt() != nil || envelope.GetExpiresAt() != nil || len(envelope.GetNonce()) != 0 || len(envelope.GetSignature()) != 0 || envelope.GetLeaseSeconds() != uint32(rediscoveryLease/time.Second) {
+		return false
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	if err != nil || !bytes.Equal(canonical, message.Payload) {
+		return false
+	}
+	payloadDigest := sha256.Sum256(canonical)
+	if value.IdempotencyKey != keyPrefix+hex.EncodeToString(payloadDigest[:]) {
 		return false
 	}
 	command := envelope.GetDiscoverDatabases()

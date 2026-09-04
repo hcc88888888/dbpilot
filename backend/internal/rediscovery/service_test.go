@@ -106,6 +106,54 @@ func TestRediscoveryReplayRejectsJobWithoutExactImmutableOutboxCorrelation(t *te
 	require.NotEmpty(t, created.ID)
 }
 
+func TestRediscoveryReplayRejectsNoncanonicalChangedOrMultipleOutbox(t *testing.T) {
+	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-integrity", RequestFingerprint: "sha256:" + repeatHex("d"), RequestID: "request-integrity", TraceID: "trace-integrity"}
+	for name, corrupt := range map[string]func(*memoryRediscoveryJobs){
+		"unknown field": func(store *memoryRediscoveryJobs) {
+			store.messages[0].Payload = append(store.messages[0].Payload, 0xa0, 0x06, 0x01)
+		},
+		"changed lease": func(store *memoryRediscoveryJobs) {
+			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.LeaseSeconds++ })
+		},
+		"changed rule": func(store *memoryRediscoveryJobs) {
+			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.GetDiscoverDatabases().RuleRevision++ })
+		},
+		"changed include": func(store *memoryRediscoveryJobs) {
+			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.GetDiscoverDatabases().IncludeDocker = false })
+		},
+		"envelope authority": func(store *memoryRediscoveryJobs) {
+			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.CommandId = "payload-command" })
+		},
+		"second outbox": func(store *memoryRediscoveryJobs) {
+			duplicate := store.messages[0]
+			duplicate.ID = "command-extra"
+			store.messages = append(store.messages, duplicate)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newRediscoveryFixture()
+			_, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+			require.NoError(t, err)
+			corrupt(fixture.jobs)
+
+			_, err = fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+
+			require.ErrorIs(t, err, ErrRediscoveryUnavailable)
+			require.Equal(t, 1, fixture.jobs.created)
+		})
+	}
+}
+
+func mutateRediscoveryEnvelope(t *testing.T, store *memoryRediscoveryJobs, mutate func(*agentv1.CommandEnvelope)) {
+	t.Helper()
+	envelope := new(agentv1.CommandEnvelope)
+	require.NoError(t, proto.Unmarshal(store.messages[0].Payload, envelope))
+	mutate(envelope)
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(envelope)
+	require.NoError(t, err)
+	store.messages[0].Payload = payload
+}
+
 type rediscoveryFixture struct {
 	scope        platformscope.Scope
 	hosts        *memoryRediscoveryHosts
@@ -174,10 +222,18 @@ func (store *memoryRediscoveryJobs) GetOperation(ctx context.Context, scope plat
 	if err != nil {
 		return job.Job{}, job.OutboxMessage{}, err
 	}
+	correlated := 0
+	var found job.OutboxMessage
 	for _, message := range store.messages {
-		if message.ID == commandID && message.Scope == scope && message.JobID == jobID {
-			return value, message, nil
+		if message.Scope == scope && message.JobID == jobID {
+			correlated++
 		}
+		if message.ID == commandID && message.Scope == scope && message.JobID == jobID {
+			found = message
+		}
+	}
+	if correlated == 1 && found.ID != "" {
+		return value, found, nil
 	}
 	return job.Job{}, job.OutboxMessage{}, job.ErrConflict
 }
