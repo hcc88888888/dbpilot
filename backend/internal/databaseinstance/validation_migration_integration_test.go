@@ -434,6 +434,16 @@ func TestAppliedHistoricalValidationRepairUsesTargetBeforeDispatcher(t *testing.
 		err := job.RunMigrations(ctx, fixture.database)
 		require.ErrorContains(t, err, "recorded historical validation Audit conflicts with target evidence")
 	})
+
+	t.Run("matching recorded Audit permits provable state repair", func(t *testing.T) {
+		fixture := seedAppliedOppositeValidationDescriptor(t, ctx, dsn, "matching-recorded-audit", "matching-recorded")
+		require.NoError(t, job.RunMigrations(ctx, fixture.database))
+		stored, err := job.NewPostgresRepository(fixture.database).LookupCommand(ctx, fixture.commandID)
+		require.NoError(t, err)
+		require.Equal(t, job.CommandSucceeded, stored.CommandStatus)
+		require.NotNil(t, stored.TerminalAuditRecordedAt)
+		require.False(t, stored.TerminalAuditPending)
+	})
 }
 
 func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, dsn, suffix, auditState string) *historicalValidationFixture {
@@ -457,9 +467,15 @@ func seedAppliedOppositeValidationDescriptor(t *testing.T, ctx context.Context, 
 	_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET command_status='failed',command_phase='failed',terminal_target_status='failed',terminal_target_error_summary='plugin_failed',terminal_target_result_summary='database instance connection validation failed',terminal_target_artifacts='[]'::jsonb,terminal_reconcile_pending=TRUE,terminal_reconcile_available_at=$1,terminal_reconcile_lease_expires_at=NULL,terminal_reconcile_claim_token=NULL,terminal_reconcile_quarantined_at=NULL,terminal_reconcile_quarantine_reason='',terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.result',terminal_audit_result='failure',terminal_audit_detail='{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}'::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_recorded_at=NULL WHERE id=$3`, fixture.now, "command.result:"+fixture.commandID, fixture.commandID)
 	require.NoError(t, err)
 	if auditState != "" {
-		_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,'command.result','system','agent-control','job_target',$5,'failure',$6,$7,$8,$9,$10,'{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"failed"}'::jsonb,$4)`, "audit-opposite-"+suffix, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, fixture.agentID, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, "command.result:"+fixture.commandID)
+		auditResult, auditTerminal := "failure", "failed"
+		if auditState == "matching-recorded" {
+			auditResult, auditTerminal = "success", "succeeded"
+			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_result='success',terminal_audit_detail='{"command_action":"database_instance.validate","historical_recovery":true,"terminal_status":"succeeded"}'::jsonb WHERE id=$1`, fixture.commandID)
+			require.NoError(t, err)
+		}
+		_, err = fixture.database.ExecContext(ctx, `INSERT INTO audit_events (id,tenant_id,project_id,occurred_at,action,actor_type,actor_id,resource_type,resource_id,result,request_id,trace_id,job_id,command_id,dedupe_key,detail,created_at) VALUES ($1,$2,$3,$4,'command.result','system','agent-control','job_target',$5,$6,$7,$8,$9,$10,$11,jsonb_build_object('command_action','database_instance.validate','historical_recovery',TRUE,'terminal_status',$12::text),$4)`, "audit-opposite-"+suffix, fixture.scope.TenantID, fixture.scope.ProjectID, fixture.now, fixture.agentID, auditResult, "request-"+fixture.jobID, "trace-"+fixture.jobID, fixture.jobID, fixture.commandID, "command.result:"+fixture.commandID, auditTerminal)
 		require.NoError(t, err)
-		if auditState == "recorded" {
+		if auditState == "recorded" || auditState == "matching-recorded" {
 			_, err = fixture.database.ExecContext(ctx, `UPDATE command_outbox SET terminal_audit_pending=FALSE,terminal_audit_recorded_at=$1 WHERE id=$2`, fixture.now, fixture.commandID)
 			require.NoError(t, err)
 		}

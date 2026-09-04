@@ -298,7 +298,6 @@ BEGIN
         WHERE value.tenant_id = repair.tenant_id
           AND value.project_id = repair.project_id
           AND value.id = repair.job_id
-          AND repair.terminal_audit_recorded_at IS NULL
     $jobs$;
 
     EXECUTE $outbox$
@@ -315,7 +314,7 @@ BEGIN
             terminal_reconcile_claim_token = NULL,
             terminal_reconcile_quarantined_at = NULL,
             terminal_reconcile_quarantine_reason = '',
-            terminal_audit_pending = TRUE,
+            terminal_audit_pending = repair.terminal_audit_recorded_at IS NULL,
             terminal_audit_dedupe_key = repair.expected_audit_action || ':' || repair.command_id,
             terminal_audit_action = repair.expected_audit_action,
             terminal_audit_result = repair.expected_audit_result,
@@ -325,13 +324,12 @@ BEGIN
                 'terminal_status', repair.target_status
             ),
             terminal_audit_lease_expires_at = NULL,
-            terminal_audit_attempts = 0,
-            terminal_audit_recorded_at = NULL
+            terminal_audit_attempts = CASE WHEN repair.terminal_audit_recorded_at IS NULL THEN 0 ELSE outbox.terminal_audit_attempts END,
+            terminal_audit_recorded_at = repair.terminal_audit_recorded_at
         FROM dbpilot_applied_validation_target_repair repair
         WHERE outbox.tenant_id = repair.tenant_id
           AND outbox.project_id = repair.project_id
           AND outbox.id = repair.command_id
-          AND repair.terminal_audit_recorded_at IS NULL
     $outbox$;
 
     EXECUTE $validation$
@@ -359,7 +357,6 @@ BEGIN
           AND validation.project_id = repair.project_id
           AND validation.job_id = repair.job_id
           AND validation.command_id = repair.command_id
-          AND repair.terminal_audit_recorded_at IS NULL
     $validation$;
 
     EXECUTE $instance$
@@ -405,7 +402,6 @@ BEGIN
         WHERE instance.tenant_id = repair.tenant_id
           AND instance.project_id = repair.project_id
           AND instance.instance_id = repair.instance_id
-          AND repair.terminal_audit_recorded_at IS NULL
     $instance$;
 END
 $migration$;
