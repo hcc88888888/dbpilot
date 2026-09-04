@@ -222,11 +222,11 @@ func rediscoveryOperationKey(value job.Job, message job.OutboxMessage, scope pla
 	if command == nil || command.GetHostId() != hostID || command.GetRuleRevision() == 0 || (!command.GetIncludeNative() && !command.GetIncludeDocker()) {
 		return "", false, false
 	}
-	currentKey, legacyDigestKey, legacyKey := rediscoveryIdempotencyKeys(requestSuffix, canonical)
+	currentKey, legacyDigestKey, _ := rediscoveryIdempotencyKeys(requestSuffix, canonical)
 	switch value.IdempotencyKey {
 	case currentKey:
 		return currentKey, false, true
-	case legacyDigestKey, legacyKey:
+	case legacyDigestKey:
 		return currentKey, true, true
 	default:
 		return "", false, false

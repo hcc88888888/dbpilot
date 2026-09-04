@@ -412,7 +412,7 @@ func terminalJobStatus(value Job) Status {
 // a stronger key without allowing the Job or its sole Outbox payload to change
 // between verification and the one-way update.
 func (repository *PostgresRepository) UpgradeOperationIdempotencyKey(ctx context.Context, expected Job, expectedMessage OutboxMessage, currentKey string) (Job, OutboxMessage, error) {
-	if repository == nil || repository.db == nil || ctx == nil || expected.Scope.Validate() != nil || strings.TrimSpace(expected.ID) == "" || strings.TrimSpace(expectedMessage.ID) == "" || expectedMessage.Scope != expected.Scope || expectedMessage.JobID != expected.ID || strings.TrimSpace(expected.IdempotencyKey) == "" || strings.TrimSpace(currentKey) == "" || currentKey == expected.IdempotencyKey {
+	if repository == nil || repository.db == nil || ctx == nil || expected.Scope.Validate() != nil || strings.TrimSpace(expected.ID) == "" || strings.TrimSpace(expectedMessage.ID) == "" || expectedMessage.Scope != expected.Scope || expectedMessage.JobID != expected.ID || strings.TrimSpace(expected.IdempotencyKey) == "" || strings.TrimSpace(currentKey) == "" || currentKey == expected.IdempotencyKey || expected.Version < 1 {
 		return Job{}, OutboxMessage{}, ErrConflict
 	}
 	tx, err := repository.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
@@ -457,8 +457,15 @@ func (repository *PostgresRepository) UpgradeOperationIdempotencyKey(ctx context
 	if !sameOperationUpgradeSnapshot(value, message, expected, expectedMessage) || value.IdempotencyKey != expected.IdempotencyKey && value.IdempotencyKey != currentKey {
 		return rollback(ErrConflict)
 	}
-	if value.IdempotencyKey != currentKey {
-		result, updateErr := tx.ExecContext(ctx, `UPDATE jobs SET idempotency_key=$1 WHERE tenant_id=$2 AND project_id=$3 AND id=$4 AND idempotency_key=$5`, currentKey, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID, expected.IdempotencyKey)
+	if value.IdempotencyKey == currentKey {
+		if value.Version != expected.Version+1 {
+			return rollback(ErrConflict)
+		}
+	} else {
+		if value.Version != expected.Version {
+			return rollback(ErrConflict)
+		}
+		result, updateErr := tx.ExecContext(ctx, `UPDATE jobs SET idempotency_key=$1,version=version+1 WHERE tenant_id=$2 AND project_id=$3 AND id=$4 AND idempotency_key=$5 AND version=$6`, currentKey, expected.Scope.TenantID, expected.Scope.ProjectID, expected.ID, expected.IdempotencyKey, expected.Version)
 		if updateErr != nil {
 			return rollback(classifyWriteError("upgrade operation idempotency key", updateErr))
 		}
@@ -466,6 +473,7 @@ func (repository *PostgresRepository) UpgradeOperationIdempotencyKey(ctx context
 			return rollback(ErrConflict)
 		}
 		value.IdempotencyKey = currentKey
+		value.Version++
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, OutboxMessage{}, fmt.Errorf("commit operation key upgrade: %w", err)

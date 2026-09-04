@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -52,7 +53,8 @@ func TestPostgresRediscoverHostLostResponseReplaysOneJobOutboxAndAudit(t *testin
 	committedJob, committedMessage, snapshotErr := jobRepository.GetOperation(ctx, platformTestScope, committedJobID, committedCommandID)
 	require.NoError(t, snapshotErr)
 	require.Equal(t, committedJob.ID, committedMessage.JobID)
-	legacyKey := "host-rediscover-" + strings.TrimPrefix(committedJobID, "job-host-rediscover-")
+	payloadDigest := sha256.Sum256(committedMessage.Payload)
+	legacyKey := "host-rediscover-" + strings.TrimPrefix(committedJobID, "job-host-rediscover-") + "-command-sha256-" + hex.EncodeToString(payloadDigest[:])
 	_, err := database.ExecContext(ctx, `UPDATE jobs SET idempotency_key=$1 WHERE id=$2`, legacyKey, committedJobID)
 	require.NoError(t, err)
 	var processingState string
@@ -63,15 +65,18 @@ func TestPostgresRediscoverHostLostResponseReplaysOneJobOutboxAndAudit(t *testin
 	var idempotencyState string
 	var responseStatus int
 	var upgradedKey string
+	var upgradedVersion int64
 	require.NoError(t, database.QueryRowContext(ctx, `SELECT state,response_status FROM idempotency_records WHERE operation_id='rediscoverHost'`).Scan(&idempotencyState, &responseStatus))
-	require.NoError(t, database.QueryRowContext(ctx, `SELECT idempotency_key FROM jobs WHERE id=$1`, committedJobID).Scan(&upgradedKey))
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT idempotency_key,version FROM jobs WHERE id=$1`, committedJobID).Scan(&upgradedKey, &upgradedVersion))
 	require.Equal(t, "completed", idempotencyState)
 	require.Equal(t, 202, responseStatus)
 	require.True(t, strings.HasPrefix(upgradedKey, "host-rediscover-v2-"), upgradedKey)
 	require.NotEqual(t, legacyKey, upgradedKey)
+	require.Equal(t, committedJob.Version+1, upgradedVersion)
 
 	require.Equal(t, 500, first.Code, first.Body.String())
 	require.Equal(t, 202, retry.Code, retry.Body.String())
+	require.Equal(t, `"2"`, retry.Header().Get("ETag"))
 	for table := range map[string]struct{}{"jobs": {}, "command_outbox": {}, "audit_events": {}} {
 		var count int
 		require.NoError(t, database.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count))

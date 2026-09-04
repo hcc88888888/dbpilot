@@ -109,61 +109,67 @@ func TestRediscoveryReplayRejectsJobWithoutExactImmutableOutboxCorrelation(t *te
 	require.NotEmpty(t, created.ID)
 }
 
-func TestRediscoveryUpgradesCanonicalLegacyReplayWithoutMutableReauthorization(t *testing.T) {
+func TestRediscoveryUpgradesUnversionedDigestReplayAndIncrementsJobVersionOnce(t *testing.T) {
 	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-legacy", RequestFingerprint: "sha256:" + repeatHex("e"), RequestID: "request-legacy", TraceID: "trace-legacy"}
-	for _, legacyDigest := range []bool{false, true} {
-		name := "pre-digest"
-		if legacyDigest {
-			name = "unversioned-digest"
-		}
-		t.Run(name, func(t *testing.T) {
-			fixture := newRediscoveryFixture()
-			created, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
-			require.NoError(t, err)
-			stored := fixture.jobs.values[created.ID]
-			suffix := strings.TrimPrefix(created.ID, "job-host-rediscover-")
-			legacyKey := "host-rediscover-" + suffix
-			if legacyDigest {
-				digest := sha256.Sum256(fixture.jobs.messages[0].Payload)
-				legacyKey += "-command-sha256-" + hex.EncodeToString(digest[:])
-			}
-			stored.IdempotencyKey = legacyKey
-			fixture.jobs.values[created.ID] = stored
-			fixture.hosts.value.Status = hostinventory.HostOffline
-			fixture.service.Policies = nil
-			fixture.service.RuleKeys = nil
-			fixture.capabilities.allowed = map[string]bool{}
+	fixture := newRediscoveryFixture()
+	created, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+	require.NoError(t, err)
+	stored := fixture.jobs.values[created.ID]
+	digest := sha256.Sum256(fixture.jobs.messages[0].Payload)
+	legacyKey := "host-rediscover-" + strings.TrimPrefix(created.ID, "job-host-rediscover-") + "-command-sha256-" + hex.EncodeToString(digest[:])
+	stored.IdempotencyKey = legacyKey
+	fixture.jobs.values[created.ID] = stored
+	fixture.hosts.value.Status = hostinventory.HostOffline
+	fixture.service.Policies = nil
+	fixture.service.RuleKeys = nil
+	fixture.capabilities.allowed = map[string]bool{}
 
-			replayed, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+	replayed, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
 
-			require.NoError(t, err)
-			require.Equal(t, created.ID, replayed.ID)
-			require.True(t, strings.HasPrefix(replayed.IdempotencyKey, "host-rediscover-v2-"), replayed.IdempotencyKey)
-			require.NotEqual(t, legacyKey, replayed.IdempotencyKey)
-			replayedAgain, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
-			require.NoError(t, err)
-			require.Equal(t, replayed.IdempotencyKey, replayedAgain.IdempotencyKey)
-			require.Equal(t, 1, fixture.jobs.upgrades, "legacy upgrade must be one-way")
-		})
-	}
+	require.NoError(t, err)
+	require.Equal(t, created.ID, replayed.ID)
+	require.True(t, strings.HasPrefix(replayed.IdempotencyKey, "host-rediscover-v2-"), replayed.IdempotencyKey)
+	require.NotEqual(t, legacyKey, replayed.IdempotencyKey)
+	require.Equal(t, created.Version+1, replayed.Version)
+	replayedAgain, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
+	require.NoError(t, err)
+	require.Equal(t, replayed.IdempotencyKey, replayedAgain.IdempotencyKey)
+	require.Equal(t, replayed.Version, replayedAgain.Version)
+	require.Equal(t, 1, fixture.jobs.upgrades, "legacy upgrade must be one-way")
 }
 
-func TestRediscoveryLegacyReplayRejectsDetectableCorruptionWithoutUpgrade(t *testing.T) {
+func TestRediscoveryPreDigestReplayFailsClosedWithoutIndependentEvidence(t *testing.T) {
 	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-legacy-corrupt", RequestFingerprint: "sha256:" + repeatHex("f"), RequestID: "request-legacy-corrupt", TraceID: "trace-legacy-corrupt"}
-	for name, corrupt := range map[string]func(*memoryRediscoveryJobs){
-		"unknown field": func(store *memoryRediscoveryJobs) {
-			store.messages[0].Payload = append(store.messages[0].Payload, 0xa0, 0x06, 0x01)
+	for name, corrupt := range map[string]func(*rediscoveryFixture){
+		"canonical": func(*rediscoveryFixture) {},
+		"unknown field": func(fixture *rediscoveryFixture) {
+			fixture.jobs.messages[0].Payload = append(fixture.jobs.messages[0].Payload, 0xa0, 0x06, 0x01)
 		},
-		"changed lease": func(store *memoryRediscoveryJobs) {
-			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.LeaseSeconds++ })
+		"changed lease": func(fixture *rediscoveryFixture) {
+			mutateRediscoveryEnvelope(t, fixture.jobs, func(envelope *agentv1.CommandEnvelope) { envelope.LeaseSeconds++ })
 		},
-		"envelope authority": func(store *memoryRediscoveryJobs) {
-			mutateRediscoveryEnvelope(t, store, func(envelope *agentv1.CommandEnvelope) { envelope.CommandId = "payload-command" })
+		"changed rule": func(fixture *rediscoveryFixture) {
+			mutateRediscoveryEnvelope(t, fixture.jobs, func(envelope *agentv1.CommandEnvelope) { envelope.GetDiscoverDatabases().RuleRevision++ })
 		},
-		"second outbox": func(store *memoryRediscoveryJobs) {
-			duplicate := store.messages[0]
+		"changed include": func(fixture *rediscoveryFixture) {
+			mutateRediscoveryEnvelope(t, fixture.jobs, func(envelope *agentv1.CommandEnvelope) { envelope.GetDiscoverDatabases().IncludeDocker = false })
+		},
+		"changed agent and target": func(fixture *rediscoveryFixture) {
+			mutateRediscoveryEnvelope(t, fixture.jobs, func(envelope *agentv1.CommandEnvelope) { envelope.AgentId = "agent-b" })
+			message := fixture.jobs.messages[0]
+			message.TargetID = "agent-b"
+			fixture.jobs.messages[0] = message
+			stored := fixture.jobs.values[message.JobID]
+			stored.TargetResourceIDs = []string{"agent-b"}
+			fixture.jobs.values[message.JobID] = stored
+		},
+		"envelope authority": func(fixture *rediscoveryFixture) {
+			mutateRediscoveryEnvelope(t, fixture.jobs, func(envelope *agentv1.CommandEnvelope) { envelope.CommandId = "payload-command" })
+		},
+		"second outbox": func(fixture *rediscoveryFixture) {
+			duplicate := fixture.jobs.messages[0]
 			duplicate.ID = "command-extra"
-			store.messages = append(store.messages, duplicate)
+			fixture.jobs.messages = append(fixture.jobs.messages, duplicate)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -173,7 +179,7 @@ func TestRediscoveryLegacyReplayRejectsDetectableCorruptionWithoutUpgrade(t *tes
 			stored := fixture.jobs.values[created.ID]
 			stored.IdempotencyKey = "host-rediscover-" + strings.TrimPrefix(created.ID, "job-host-rediscover-")
 			fixture.jobs.values[created.ID] = stored
-			corrupt(fixture.jobs)
+			corrupt(&fixture)
 
 			_, err = fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
 
@@ -183,13 +189,14 @@ func TestRediscoveryLegacyReplayRejectsDetectableCorruptionWithoutUpgrade(t *tes
 	}
 }
 
-func TestRediscoveryLegacyUpgradeRejectsPayloadTOCTOU(t *testing.T) {
+func TestRediscoveryUnversionedDigestUpgradeRejectsPayloadTOCTOU(t *testing.T) {
 	fixture := newRediscoveryFixture()
 	request := RediscoveryRequest{Actor: "operator-a", IdempotencyKey: "rediscover-legacy-race", RequestFingerprint: "sha256:" + repeatHex("1"), RequestID: "request-legacy-race", TraceID: "trace-legacy-race"}
 	created, err := fixture.service.Start(context.Background(), fixture.scope, "host-a", request)
 	require.NoError(t, err)
 	stored := fixture.jobs.values[created.ID]
-	stored.IdempotencyKey = "host-rediscover-" + strings.TrimPrefix(created.ID, "job-host-rediscover-")
+	digest := sha256.Sum256(fixture.jobs.messages[0].Payload)
+	stored.IdempotencyKey = "host-rediscover-" + strings.TrimPrefix(created.ID, "job-host-rediscover-") + "-command-sha256-" + hex.EncodeToString(digest[:])
 	fixture.jobs.values[created.ID] = stored
 	fixture.jobs.beforeUpgrade = func() {
 		fixture.jobs.messages[0].Payload = append(fixture.jobs.messages[0].Payload, 0xa0, 0x06, 0x01)
@@ -348,9 +355,15 @@ func (store *memoryRediscoveryJobs) UpgradeOperationIdempotencyKey(ctx context.C
 		return job.Job{}, job.OutboxMessage{}, job.ErrConflict
 	}
 	if value.IdempotencyKey != currentKey {
+		if value.Version != expected.Version {
+			return job.Job{}, job.OutboxMessage{}, job.ErrConflict
+		}
 		value.IdempotencyKey = currentKey
+		value.Version++
 		store.values[value.ID] = value
 		store.upgrades++
+	} else if value.Version != expected.Version+1 {
+		return job.Job{}, job.OutboxMessage{}, job.ErrConflict
 	}
 	return value, message, nil
 }
