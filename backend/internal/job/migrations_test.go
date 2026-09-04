@@ -58,6 +58,12 @@ func TestRunMigrationsAppliesEmbeddedSchemaThroughSharedRegistry(t *testing.T) {
 	mock.ExpectCommit()
 	mock.ExpectBegin()
 	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0007a_retired_validation_terminal_winner.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+	mock.ExpectExec("(?s)DO \\$\\$.*conflicting retired validation Job and Outbox terminal winners.*UPDATE job_targets").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0007a_retired_validation_terminal_winner.sql").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	mock.ExpectBegin()
+	mock.ExpectExec("SELECT pg_advisory_xact_lock").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT EXISTS").WithArgs("job/migrations/0008_terminal_reconciliation.sql").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
 	mock.ExpectExec("(?s)ALTER TABLE command_outbox.*terminal_target_status.*terminal_reconcile_pending.*command_outbox_terminal_reconcile_pending_idx").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec("INSERT INTO dbpilot_schema_migrations").WithArgs("job/migrations/0008_terminal_reconciliation.sql").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -109,6 +115,11 @@ func TestEmbeddedMigrationDefinesScopeIdempotencyAndLeaseIndexes(t *testing.T) {
 	require.NoError(t, err)
 	for _, required := range []string{"max_concurrency", "target_timeout_seconds", "command_outbox_job_phase_idx", "inspection.collect"} {
 		require.Contains(t, string(concurrency), required)
+	}
+	retiredWinner, err := migrationFiles.ReadFile("migrations/0007a_retired_validation_terminal_winner.sql")
+	require.NoError(t, err)
+	for _, required := range []string{"conflicting retired validation Job and Outbox terminal winners", "management_status = 'retired'", "UPDATE job_targets"} {
+		require.Contains(t, string(retiredWinner), required)
 	}
 	terminalReconciliation, err := migrationFiles.ReadFile("migrations/0008_terminal_reconciliation.sql")
 	require.NoError(t, err)
