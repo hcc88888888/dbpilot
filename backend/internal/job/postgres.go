@@ -703,7 +703,7 @@ func (repository *PostgresRepository) CorrectValidationTerminalStatus(ctx contex
 }
 
 func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Context, scope platformscope.Scope, jobID, commandID, agentID string, target TargetResult, commandStatus CommandStatus, at time.Time) error {
-	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || target.TargetID != agentID || !isTerminalTarget(target.Status) || !terminalCommandStatus(commandStatus) || commandStatus == CommandRejected || at.IsZero() {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || target.TargetID != agentID || !isTerminalTarget(target.Status) || !terminalCommandStatus(commandStatus) || at.IsZero() {
 		return ErrInvalidCommandPayload
 	}
 	message, err := repository.LookupCommand(ctx, commandID)
@@ -721,9 +721,31 @@ func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Conte
 		if len(current.TargetResourceIDs) != 1 || current.TargetResourceIDs[0] != agentID {
 			return ErrConflict
 		}
+		existing, found := targetFor(current.TargetResults, agentID)
+		if found && isTerminalTarget(existing.Status) {
+			if !matchingTerminalTarget(existing, target) {
+				return ErrConflict
+			}
+			if isTerminal(current.Status) {
+				if current.Status != terminalJobStatusForTarget(target.Status) {
+					return ErrConflict
+				}
+				return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+			}
+			if current.Status != StatusRunning && current.Status != StatusCancelling {
+				return ErrConflict
+			}
+			_, err = repository.Transition(ctx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: terminalJobStatusForTarget(target.Status), ResultSummary: "Agent commands completed", At: at})
+			if errors.Is(err, ErrConflict) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+		}
 		if isTerminal(current.Status) {
-			stored, found := targetFor(current.TargetResults, agentID)
-			if !found || !matchingTerminalTarget(stored, target) || current.Status != terminalJobStatusForTarget(target.Status) {
+			if !found || !matchingTerminalTarget(existing, target) || current.Status != terminalJobStatusForTarget(target.Status) {
 				return ErrConflict
 			}
 			return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)

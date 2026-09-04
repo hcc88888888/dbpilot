@@ -301,6 +301,9 @@ func (lifecycle *CommandLifecycle) dispatchOne(ctx context.Context, message Outb
 
 func (lifecycle *CommandLifecycle) timeoutUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "Job timeout elapsed before delivery", FinishedAt: timePointer(at)}
+	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); err != nil {
+		return err
+	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
@@ -309,7 +312,7 @@ func (lifecycle *CommandLifecycle) timeoutUndelivered(ctx context.Context, messa
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		return err
 	}
-	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at)
+	return nil
 }
 
 func (lifecycle *CommandLifecycle) recoverPreparedCommands(ctx context.Context, at time.Time) error {
@@ -377,6 +380,9 @@ func (lifecycle *CommandLifecycle) terminalizePreparedCommand(ctx context.Contex
 	if status == TargetTimedOut {
 		target.ErrorSummary = "Job timeout elapsed before Start"
 	}
+	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatus, at); err != nil {
+		return err
+	}
 	updated, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
@@ -385,7 +391,7 @@ func (lifecycle *CommandLifecycle) terminalizePreparedCommand(ctx context.Contex
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		return err
 	}
-	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, commandStatus, at)
+	return nil
 }
 
 func (lifecycle *CommandLifecycle) dispatchCancellations(ctx context.Context, at time.Time) error {
@@ -442,6 +448,9 @@ func (lifecycle *CommandLifecycle) dispatchCancellation(ctx context.Context, mes
 
 func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetCancelled, ResultSummary: "cancelled before Agent execution", FinishedAt: timePointer(at)}
+	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandCancelled, at); err != nil {
+		return err
+	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
@@ -450,7 +459,7 @@ func (lifecycle *CommandLifecycle) cancelUndelivered(ctx context.Context, messag
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		return err
 	}
-	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandCancelled, at)
+	return nil
 }
 
 func (lifecycle *CommandLifecycle) expireExecutions(ctx context.Context, at time.Time) error {
@@ -528,6 +537,9 @@ func (lifecycle *CommandLifecycle) repairTerminalAuditMessages(ctx context.Conte
 
 func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message OutboxMessage, at time.Time) error {
 	target := TargetResult{TargetID: message.TargetID, Status: TargetTimedOut, ErrorSummary: "delivery deadline exceeded", FinishedAt: timePointer(at)}
+	if err := lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at); err != nil {
+		return err
+	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		return err
@@ -535,7 +547,7 @@ func (lifecycle *CommandLifecycle) expireDelivery(ctx context.Context, message O
 	if _, err := lifecycle.audit.RecordOnce(ctx, lifecycle.auditEvent(value, message, "command.delivery_timed_out", "failure", map[string]any{"reason": "delivery_deadline"}, at, "command.delivery_timed_out:"+message.ID)); err != nil {
 		return err
 	}
-	return lifecycle.dispatchRepository.MarkCommandTerminal(ctx, message.Scope, message.ID, CommandTimedOut, at)
+	return nil
 }
 
 func decodePreparedCommand(message OutboxMessage, unsigned *agentv1.CommandEnvelope, stored []byte) (*agentv1.CommandEnvelope, error) {
@@ -949,6 +961,10 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 		return
 	}
 	target.TargetID = message.TargetID
+	if err := lifecycle.dispatchRepository.AcknowledgeCommand(ctx, message.Scope, message.ID, commandStatus, at, nil); err != nil {
+		lifecycle.onError(err)
+		return
+	}
 	value, _, err := lifecycle.applyTarget(ctx, message, target, at)
 	if err != nil {
 		lifecycle.onError(err)
@@ -960,9 +976,6 @@ func (lifecycle *CommandLifecycle) Acknowledged(ctx context.Context, agentID str
 	if _, err := lifecycle.audit.RecordOnce(ctx, event); err != nil {
 		lifecycle.onError(err)
 		return
-	}
-	if err := lifecycle.dispatchRepository.AcknowledgeCommand(ctx, message.Scope, message.ID, commandStatus, at, nil); err != nil {
-		lifecycle.onError(err)
 	}
 }
 

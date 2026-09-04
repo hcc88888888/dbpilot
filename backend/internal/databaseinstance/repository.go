@@ -65,6 +65,7 @@ type ValidationJobRepair struct {
 	CommandID string
 	AgentID   string
 	Result    ValidationResult
+	Cause     job.CommandStatus
 	At        time.Time
 }
 

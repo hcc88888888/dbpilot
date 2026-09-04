@@ -93,21 +93,32 @@ func (recorder databaseInstanceResultRecorder) ReconcileDatabaseInstanceValidati
 	if len(repairs) > 0 && recorder.Jobs == nil {
 		return reconciled, errors.New("database instance validation Job repair is unavailable")
 	}
+	var repairErrors []error
 	for _, repair := range repairs {
 		target := job.TargetResult{TargetID: repair.AgentID, Status: job.TargetFailed, ErrorSummary: string(repair.Result.ErrorCode), ResultSummary: "database instance connection validation failed", FinishedAt: timePointer(repair.At)}
-		commandStatus := job.CommandFailed
-		if repair.Result.Status == databaseinstance.ConnectionSucceeded {
+		commandStatus := repair.Cause
+		switch repair.Cause {
+		case job.CommandSucceeded:
 			target.Status = job.TargetSucceeded
 			target.ErrorSummary = ""
 			target.ResultSummary = "database instance connection validation succeeded"
-			commandStatus = job.CommandSucceeded
+		case job.CommandCancelled:
+			target.Status = job.TargetCancelled
+			target.ErrorSummary = ""
+			target.ResultSummary = "database instance connection validation cancelled"
+		case job.CommandTimedOut:
+			target.Status = job.TargetTimedOut
+			target.ErrorSummary = ""
+			target.ResultSummary = "database instance connection validation timed out"
+		case job.CommandRejected, job.CommandFailed:
 		}
 		if err := recorder.Jobs.RepairValidationTerminal(ctx, repair.Scope, repair.JobID, repair.CommandID, repair.AgentID, target, commandStatus, repair.At); err != nil {
-			return reconciled, err
+			repairErrors = append(repairErrors, err)
+			continue
 		}
 		reconciled++
 	}
-	return reconciled, nil
+	return reconciled, errors.Join(repairErrors...)
 }
 
 func timePointer(value time.Time) *time.Time {

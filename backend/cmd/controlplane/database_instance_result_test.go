@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func TestDatabaseInstanceResultRecorderReturnsEffectiveFencedOutcome(t *testing.
 }
 
 func TestDatabaseInstanceResultRecorderDoesNotIgnoreProjectionTerminalJobHalfCommit(t *testing.T) {
-	store := &recordingValidationResultStore{repairs: []databaseinstance.ValidationJobRepair{{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}}}
+	store := &recordingValidationResultStore{repairs: []databaseinstance.ValidationJobRepair{{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, Cause: job.CommandFailed, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}}}
 	recorder := databaseInstanceResultRecorder{Store: store}
 
 	_, err := recorder.ReconcileDatabaseInstanceValidationTerminals(context.Background(), time.Date(2026, 9, 4, 7, 1, 0, 0, time.UTC), 8)
@@ -66,7 +67,7 @@ func TestDatabaseInstanceResultRecorderDoesNotIgnoreProjectionTerminalJobHalfCom
 }
 
 func TestDatabaseInstanceResultRecorderRepairsProjectionTerminalJobHalfCommit(t *testing.T) {
-	repair := databaseinstance.ValidationJobRepair{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}
+	repair := databaseinstance.ValidationJobRepair{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, Cause: job.CommandFailed, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}
 	store := &recordingValidationResultStore{repairs: []databaseinstance.ValidationJobRepair{repair}}
 	jobs := &recordingValidationJobRepairer{}
 	recorder := databaseInstanceResultRecorder{Store: store, Jobs: jobs}
@@ -79,6 +80,25 @@ func TestDatabaseInstanceResultRecorderRepairsProjectionTerminalJobHalfCommit(t 
 	require.Equal(t, job.TargetFailed, jobs.target.Status)
 	require.Equal(t, "plugin_failed", jobs.target.ErrorSummary)
 	require.Equal(t, job.CommandFailed, jobs.commandStatus)
+}
+
+func TestDatabaseInstanceResultRecorderPreservesTerminalCauseAndDoesNotStarveRepairs(t *testing.T) {
+	at := time.Date(2026, 9, 4, 8, 0, 0, 0, time.UTC)
+	repairs := []databaseinstance.ValidationJobRepair{
+		{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-timeout", CommandID: "command-timeout", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, Cause: job.CommandTimedOut, At: at},
+		{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-cancel", CommandID: "command-cancel", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, Cause: job.CommandCancelled, At: at.Add(time.Second)},
+	}
+	store := &recordingValidationResultStore{repairs: repairs}
+	jobs := &recordingValidationJobRepairer{errors: []error{errors.New("first repair unavailable"), nil}}
+	recorder := databaseInstanceResultRecorder{Store: store, Jobs: jobs}
+
+	reconciled, err := recorder.ReconcileDatabaseInstanceValidationTerminals(context.Background(), at.Add(time.Minute), 8)
+
+	require.ErrorContains(t, err, "first repair unavailable")
+	require.Equal(t, 1, reconciled)
+	require.Equal(t, 2, jobs.calls)
+	require.Equal(t, []job.TargetStatus{job.TargetTimedOut, job.TargetCancelled}, jobs.targetStatuses)
+	require.Equal(t, []job.CommandStatus{job.CommandTimedOut, job.CommandCancelled}, jobs.commandStatuses)
 }
 
 type recordingValidationResultStore struct {
@@ -113,14 +133,24 @@ func (store *recordingValidationResultStore) ListValidationJobRepairs(context.Co
 }
 
 type recordingValidationJobRepairer struct {
-	calls         int
-	target        job.TargetResult
-	commandStatus job.CommandStatus
+	calls           int
+	target          job.TargetResult
+	commandStatus   job.CommandStatus
+	errors          []error
+	targetStatuses  []job.TargetStatus
+	commandStatuses []job.CommandStatus
 }
 
 func (repairer *recordingValidationJobRepairer) RepairValidationTerminal(_ context.Context, _ platformscope.Scope, _, _, _ string, target job.TargetResult, status job.CommandStatus, _ time.Time) error {
 	repairer.calls++
 	repairer.target = target
 	repairer.commandStatus = status
+	repairer.targetStatuses = append(repairer.targetStatuses, target.Status)
+	repairer.commandStatuses = append(repairer.commandStatuses, status)
+	if len(repairer.errors) > 0 {
+		err := repairer.errors[0]
+		repairer.errors = repairer.errors[1:]
+		return err
+	}
 	return nil
 }

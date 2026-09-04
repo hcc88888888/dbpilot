@@ -677,7 +677,7 @@ func TestExpiredPreparedCommandTimesOutTargetPublishesAndAuditsWithoutDispatch(t
 	require.Equal(t, "delivery_deadline", fixture.audit.events[len(fixture.audit.events)-1].Detail["reason"])
 }
 
-func TestExpiredPreparedCommandAuditFailureLeavesUnpublishedAndRetryRecordsOnce(t *testing.T) {
+func TestExpiredPreparedCommandAuditFailureKeepsDurableCauseAndRetryRecordsOnce(t *testing.T) {
 	fixture := newSingleTargetCommandLifecycleFixture(t)
 	message := fixture.messageWithLease(t, "command-a", "agent-a", 1)
 	fixture.persistence.claimed = []OutboxMessage{message}
@@ -689,7 +689,7 @@ func TestExpiredPreparedCommandAuditFailureLeavesUnpublishedAndRetryRecordsOnce(
 	require.Error(t, err)
 	first := fixture.persistence.currentJob()
 	require.Equal(t, StatusTimedOut, first.Status)
-	require.Empty(t, fixture.persistence.published)
+	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 	require.Len(t, fixture.audit.events, 1)
 
 	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+DefaultOutboxLease+2*time.Second))
@@ -697,7 +697,7 @@ func TestExpiredPreparedCommandAuditFailureLeavesUnpublishedAndRetryRecordsOnce(
 	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
 	require.Len(t, fixture.audit.events, 2)
 	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[1].Action)
-	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
+	require.Len(t, fixture.persistence.published, 2, "terminal cause publication is idempotently replayable")
 }
 
 func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *testing.T) {
@@ -711,14 +711,14 @@ func TestExpiredPreparedCommandRetriesPublicationWithoutSecondJobMutation(t *tes
 	_, err = fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+time.Second))
 	require.Error(t, err)
 	first := fixture.persistence.currentJob()
-	require.Equal(t, StatusTimedOut, first.Status)
+	require.Equal(t, StatusDispatched, first.Status)
 	require.Empty(t, fixture.persistence.published)
-	require.Len(t, fixture.audit.events, 2, "timeout audit must exist before publication")
+	require.Len(t, fixture.audit.events, 1, "terminal cause must persist before Job and Audit mutation")
 
 	dispatched, err := fixture.lifecycle.DispatchPending(context.Background(), fixture.now.Add(DefaultCommandDeliveryTTL+DefaultOutboxLease+2*time.Second))
 	require.NoError(t, err)
 	require.Zero(t, dispatched)
-	require.Equal(t, first.Version, fixture.persistence.currentJob().Version)
+	require.Greater(t, fixture.persistence.currentJob().Version, first.Version)
 	require.Equal(t, []publishedCommand{{scope: fixture.scope, id: "command-a"}}, fixture.persistence.published)
 	require.Equal(t, "command.delivery_timed_out", fixture.audit.events[len(fixture.audit.events)-1].Action)
 	require.Len(t, fixture.audit.events, 2, "RecordOnce must not duplicate timeout evidence")

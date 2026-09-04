@@ -296,7 +296,7 @@ func (repository *PostgresRepository) ListValidationJobRepairs(ctx context.Conte
 	if repository == nil || repository.database == nil || ctx == nil || !validUTC(at) || limit < 1 || limit > 1024 {
 		return nil, ErrInvalid
 	}
-	rows, err := repository.database.QueryContext(ctx, `SELECT validation.tenant_id,validation.project_id,validation.job_id,validation.command_id,outbox.target_id,validation.status,validation.error_code,validation.completed_at FROM database_instance_validations validation JOIN jobs value ON value.tenant_id=validation.tenant_id AND value.project_id=validation.project_id AND value.id=validation.job_id JOIN command_outbox outbox ON outbox.tenant_id=validation.tenant_id AND outbox.project_id=validation.project_id AND outbox.id=validation.command_id AND outbox.job_id=validation.job_id WHERE validation.status IN ('succeeded','authentication_failed','tls_failed','unreachable','unsupported_version','plugin_failed') AND (value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR outbox.command_status NOT IN ('succeeded','failed','cancelled','timed_out','rejected')) ORDER BY validation.completed_at,validation.tenant_id,validation.project_id,validation.job_id LIMIT $1`, limit)
+	rows, err := repository.database.QueryContext(ctx, `SELECT validation.tenant_id,validation.project_id,validation.job_id,validation.command_id,outbox.target_id,validation.status,validation.error_code,validation.completed_at,value.status,outbox.command_status FROM database_instance_validations validation JOIN jobs value ON value.tenant_id=validation.tenant_id AND value.project_id=validation.project_id AND value.id=validation.job_id JOIN command_outbox outbox ON outbox.tenant_id=validation.tenant_id AND outbox.project_id=validation.project_id AND outbox.id=validation.command_id AND outbox.job_id=validation.job_id WHERE validation.status IN ('succeeded','authentication_failed','tls_failed','unreachable','unsupported_version','plugin_failed') AND (value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR outbox.command_status NOT IN ('succeeded','failed','cancelled','timed_out','rejected')) ORDER BY validation.completed_at,validation.tenant_id,validation.project_id,validation.job_id LIMIT $1`, limit)
 	if err != nil {
 		return nil, mapPostgresError(err)
 	}
@@ -304,11 +304,14 @@ func (repository *PostgresRepository) ListValidationJobRepairs(ctx context.Conte
 	repairs := make([]ValidationJobRepair, 0, limit)
 	for rows.Next() {
 		var repair ValidationJobRepair
-		if err := rows.Scan(&repair.Scope.TenantID, &repair.Scope.ProjectID, &repair.JobID, &repair.CommandID, &repair.AgentID, &repair.Result.Status, &repair.Result.ErrorCode, &repair.At); err != nil {
+		var jobStatus job.Status
+		var commandStatus job.CommandStatus
+		if err := rows.Scan(&repair.Scope.TenantID, &repair.Scope.ProjectID, &repair.JobID, &repair.CommandID, &repair.AgentID, &repair.Result.Status, &repair.Result.ErrorCode, &repair.At, &jobStatus, &commandStatus); err != nil {
 			return nil, mapPostgresError(err)
 		}
+		repair.Cause = validationRepairCause(jobStatus, commandStatus)
 		repair.At = repair.At.UTC()
-		if repair.Scope.Validate() != nil || !identifierPattern.MatchString(repair.JobID) || !identifierPattern.MatchString(repair.CommandID) || !identifierPattern.MatchString(repair.AgentID) || repair.Result.Validate() != nil || !validUTC(repair.At) {
+		if repair.Scope.Validate() != nil || !identifierPattern.MatchString(repair.JobID) || !identifierPattern.MatchString(repair.CommandID) || !identifierPattern.MatchString(repair.AgentID) || repair.Result.Validate() != nil || !validUTC(repair.At) || repair.Cause == "" {
 			return nil, ErrInvalid
 		}
 		repairs = append(repairs, repair)
@@ -317,6 +320,25 @@ func (repository *PostgresRepository) ListValidationJobRepairs(ctx context.Conte
 		return nil, mapPostgresError(err)
 	}
 	return repairs, nil
+}
+
+func validationRepairCause(jobStatus job.Status, commandStatus job.CommandStatus) job.CommandStatus {
+	switch commandStatus {
+	case job.CommandSucceeded, job.CommandFailed, job.CommandCancelled, job.CommandTimedOut, job.CommandRejected:
+		return commandStatus
+	}
+	switch jobStatus {
+	case job.StatusSucceeded:
+		return job.CommandSucceeded
+	case job.StatusCancelled:
+		return job.CommandCancelled
+	case job.StatusTimedOut:
+		return job.CommandTimedOut
+	case job.StatusFailed:
+		return job.CommandFailed
+	default:
+		return job.CommandFailed
+	}
 }
 
 type validationState struct {
