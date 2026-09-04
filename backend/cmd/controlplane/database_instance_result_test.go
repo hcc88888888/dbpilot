@@ -7,6 +7,7 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/databaseinstance"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/stretchr/testify/require"
 )
@@ -54,10 +55,38 @@ func TestDatabaseInstanceResultRecorderReturnsEffectiveFencedOutcome(t *testing.
 	require.Equal(t, "database instance connection validation failed", effective.GetSummary())
 }
 
+func TestDatabaseInstanceResultRecorderDoesNotIgnoreProjectionTerminalJobHalfCommit(t *testing.T) {
+	store := &recordingValidationResultStore{repairs: []databaseinstance.ValidationJobRepair{{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}}}
+	recorder := databaseInstanceResultRecorder{Store: store}
+
+	_, err := recorder.ReconcileDatabaseInstanceValidationTerminals(context.Background(), time.Date(2026, 9, 4, 7, 1, 0, 0, time.UTC), 8)
+
+	require.ErrorContains(t, err, "repair")
+	require.Equal(t, 1, store.listRepairCalls)
+}
+
+func TestDatabaseInstanceResultRecorderRepairsProjectionTerminalJobHalfCommit(t *testing.T) {
+	repair := databaseinstance.ValidationJobRepair{Scope: platformscope.Scope{TenantID: "tenant-a", ProjectID: "project-a"}, JobID: "job-a", CommandID: "command-a", AgentID: "agent-a", Result: databaseinstance.ValidationResult{Status: databaseinstance.ConnectionPluginFailed, ErrorCode: databaseinstance.ConnectionErrorPlugin}, At: time.Date(2026, 9, 4, 7, 0, 0, 0, time.UTC)}
+	store := &recordingValidationResultStore{repairs: []databaseinstance.ValidationJobRepair{repair}}
+	jobs := &recordingValidationJobRepairer{}
+	recorder := databaseInstanceResultRecorder{Store: store, Jobs: jobs}
+
+	reconciled, err := recorder.ReconcileDatabaseInstanceValidationTerminals(context.Background(), repair.At.Add(time.Minute), 8)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	require.Equal(t, 1, jobs.calls)
+	require.Equal(t, job.TargetFailed, jobs.target.Status)
+	require.Equal(t, "plugin_failed", jobs.target.ErrorSummary)
+	require.Equal(t, job.CommandFailed, jobs.commandStatus)
+}
+
 type recordingValidationResultStore struct {
-	progressCalls int
-	result        databaseinstance.ValidationResult
-	effective     databaseinstance.ValidationResult
+	progressCalls   int
+	result          databaseinstance.ValidationResult
+	effective       databaseinstance.ValidationResult
+	repairs         []databaseinstance.ValidationJobRepair
+	listRepairCalls int
 }
 
 func (store *recordingValidationResultStore) RecordValidationProgress(context.Context, platformscope.Scope, string, string, *agentv1.ValidateDatabaseInstance, time.Time) error {
@@ -77,4 +106,21 @@ func (store *recordingValidationResultStore) FinalizeValidationResult(_ context.
 }
 func (store *recordingValidationResultStore) ReconcileValidationTerminals(context.Context, time.Time, int) (int, error) {
 	return 0, nil
+}
+func (store *recordingValidationResultStore) ListValidationJobRepairs(context.Context, time.Time, int) ([]databaseinstance.ValidationJobRepair, error) {
+	store.listRepairCalls++
+	return append([]databaseinstance.ValidationJobRepair(nil), store.repairs...), nil
+}
+
+type recordingValidationJobRepairer struct {
+	calls         int
+	target        job.TargetResult
+	commandStatus job.CommandStatus
+}
+
+func (repairer *recordingValidationJobRepairer) RepairValidationTerminal(_ context.Context, _ platformscope.Scope, _, _, _ string, target job.TargetResult, status job.CommandStatus, _ time.Time) error {
+	repairer.calls++
+	repairer.target = target
+	repairer.commandStatus = status
+	return nil
 }

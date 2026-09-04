@@ -677,6 +677,80 @@ func (repository *PostgresRepository) MarkCommandTerminal(ctx context.Context, s
 	return repository.execScopedCommand(ctx, markCommandTerminalSQL, []any{string(status), at.UTC(), scope.TenantID, scope.ProjectID, id})
 }
 
+func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Context, scope platformscope.Scope, jobID, commandID, agentID string, target TargetResult, commandStatus CommandStatus, at time.Time) error {
+	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || target.TargetID != agentID || !isTerminalTarget(target.Status) || !terminalCommandStatus(commandStatus) || commandStatus == CommandRejected || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	message, err := repository.LookupCommand(ctx, commandID)
+	if err != nil {
+		return err
+	}
+	if message.Scope != scope || message.JobID != jobID || message.TargetID != agentID {
+		return ErrConflict
+	}
+	for attempt := 0; attempt < commandTransitionAttempts; attempt++ {
+		current, err := repository.Get(ctx, scope, jobID)
+		if err != nil {
+			return err
+		}
+		if len(current.TargetResourceIDs) != 1 || current.TargetResourceIDs[0] != agentID {
+			return ErrConflict
+		}
+		if isTerminal(current.Status) {
+			stored, found := targetFor(current.TargetResults, agentID)
+			if !found || !matchingTerminalTarget(stored, target) || current.Status != terminalJobStatusForTarget(target.Status) {
+				return ErrConflict
+			}
+			return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+		}
+		if current.Status == StatusQueued {
+			_, err = repository.Transition(ctx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: StatusDispatched, At: at})
+			if errors.Is(err, ErrConflict) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		transitionTo := StatusRunning
+		actor := ""
+		if current.Status == StatusCancelling {
+			transitionTo = StatusCancelling
+			actor = current.CancelRequestedBy
+		}
+		next, err := repository.Transition(ctx, Transition{Scope: scope, JobID: jobID, CurrentVersion: current.Version, To: transitionTo, TargetResults: []TargetResult{target}, Actor: actor, At: at})
+		if errors.Is(err, ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		_, err = repository.Transition(ctx, Transition{Scope: scope, JobID: jobID, CurrentVersion: next.Version, To: terminalJobStatusForTarget(target.Status), ResultSummary: "Agent commands completed", At: at})
+		if errors.Is(err, ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return repository.MarkCommandTerminal(ctx, scope, commandID, commandStatus, at)
+	}
+	return ErrConflict
+}
+
+func terminalJobStatusForTarget(status TargetStatus) Status {
+	switch status {
+	case TargetSucceeded:
+		return StatusSucceeded
+	case TargetCancelled:
+		return StatusCancelled
+	case TargetTimedOut:
+		return StatusTimedOut
+	default:
+		return StatusFailed
+	}
+}
+
 func (repository *PostgresRepository) PendingCancellationsForAgent(ctx context.Context, agentID string, limit int) ([]OutboxMessage, error) {
 	if repository == nil || repository.db == nil || ctx == nil || strings.TrimSpace(agentID) == "" || limit <= 0 {
 		return nil, ErrInvalidCommandPayload

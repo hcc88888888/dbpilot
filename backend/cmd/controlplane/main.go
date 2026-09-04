@@ -854,7 +854,7 @@ func NewServer(config Config) (*Server, error) {
 		DispatchRepository: jobRepository, Jobs: jobRepository, Agents: agentRegistry, Signer: commandSigner, Audit: auditService,
 		TargetAuthorizer: targetAuthorizer, TokenProtector: commandTokenProtector,
 		TypedResultRecorder:     metricTrialResultRecorder{Store: metricRepository},
-		DatabaseInstanceResults: databaseInstanceResultRecorder{Store: databaseInstanceRepository},
+		DatabaseInstanceResults: databaseInstanceResultRecorder{Store: databaseInstanceRepository, Jobs: jobRepository},
 		OnError:                 func(err error) { log.Printf("command lifecycle event failed: %v", err) },
 	})
 	if err != nil {

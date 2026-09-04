@@ -59,6 +59,19 @@ type ValidationResult struct {
 	ErrorCode ConnectionTestErrorCode
 }
 
+type ValidationJobRepair struct {
+	Scope     platformscope.Scope
+	JobID     string
+	CommandID string
+	AgentID   string
+	Result    ValidationResult
+	At        time.Time
+}
+
+type ValidationJobRepairSource interface {
+	ListValidationJobRepairs(context.Context, time.Time, int) ([]ValidationJobRepair, error)
+}
+
 func (result ValidationResult) Validate() error {
 	now := time.Now().UTC()
 	if !validConnectionTestState(result.Status, result.ErrorCode, &now) || result.Status == ConnectionQueued || result.Status == ConnectionRunning || result.Status == ConnectionNotTested {

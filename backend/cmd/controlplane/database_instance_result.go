@@ -7,11 +7,17 @@ import (
 
 	agentv1 "dbpilot.local/platform/gen/agent/v1"
 	"dbpilot.local/platform/internal/databaseinstance"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 )
 
 type databaseInstanceResultRecorder struct {
 	Store databaseinstance.ValidationResultRecorder
+	Jobs  validationJobRepairer
+}
+
+type validationJobRepairer interface {
+	RepairValidationTerminal(context.Context, platformscope.Scope, string, string, string, job.TargetResult, job.CommandStatus, time.Time) error
 }
 
 func (recorder databaseInstanceResultRecorder) RecordDatabaseInstanceValidationProgress(ctx context.Context, scope platformscope.Scope, jobID, commandID string, command *agentv1.ValidateDatabaseInstance, at time.Time) error {
@@ -72,5 +78,39 @@ func (recorder databaseInstanceResultRecorder) ReconcileDatabaseInstanceValidati
 	if recorder.Store == nil {
 		return 0, errors.New("database instance validation result store is unavailable")
 	}
-	return recorder.Store.ReconcileValidationTerminals(ctx, at, limit)
+	reconciled, err := recorder.Store.ReconcileValidationTerminals(ctx, at, limit)
+	if err != nil {
+		return reconciled, err
+	}
+	source, ok := recorder.Store.(databaseinstance.ValidationJobRepairSource)
+	if !ok {
+		return reconciled, nil
+	}
+	repairs, err := source.ListValidationJobRepairs(ctx, at, limit)
+	if err != nil {
+		return reconciled, err
+	}
+	if len(repairs) > 0 && recorder.Jobs == nil {
+		return reconciled, errors.New("database instance validation Job repair is unavailable")
+	}
+	for _, repair := range repairs {
+		target := job.TargetResult{TargetID: repair.AgentID, Status: job.TargetFailed, ErrorSummary: string(repair.Result.ErrorCode), ResultSummary: "database instance connection validation failed", FinishedAt: timePointer(repair.At)}
+		commandStatus := job.CommandFailed
+		if repair.Result.Status == databaseinstance.ConnectionSucceeded {
+			target.Status = job.TargetSucceeded
+			target.ErrorSummary = ""
+			target.ResultSummary = "database instance connection validation succeeded"
+			commandStatus = job.CommandSucceeded
+		}
+		if err := recorder.Jobs.RepairValidationTerminal(ctx, repair.Scope, repair.JobID, repair.CommandID, repair.AgentID, target, commandStatus, repair.At); err != nil {
+			return reconciled, err
+		}
+		reconciled++
+	}
+	return reconciled, nil
+}
+
+func timePointer(value time.Time) *time.Time {
+	value = value.UTC()
+	return &value
 }

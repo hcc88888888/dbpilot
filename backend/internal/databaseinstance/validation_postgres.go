@@ -292,6 +292,33 @@ func (repository *PostgresRepository) ReconcileValidationTerminals(ctx context.C
 	return reconciled, errors.Join(reconcileErrors...)
 }
 
+func (repository *PostgresRepository) ListValidationJobRepairs(ctx context.Context, at time.Time, limit int) ([]ValidationJobRepair, error) {
+	if repository == nil || repository.database == nil || ctx == nil || !validUTC(at) || limit < 1 || limit > 1024 {
+		return nil, ErrInvalid
+	}
+	rows, err := repository.database.QueryContext(ctx, `SELECT validation.tenant_id,validation.project_id,validation.job_id,validation.command_id,outbox.target_id,validation.status,validation.error_code,validation.completed_at FROM database_instance_validations validation JOIN jobs value ON value.tenant_id=validation.tenant_id AND value.project_id=validation.project_id AND value.id=validation.job_id JOIN command_outbox outbox ON outbox.tenant_id=validation.tenant_id AND outbox.project_id=validation.project_id AND outbox.id=validation.command_id AND outbox.job_id=validation.job_id WHERE validation.status IN ('succeeded','authentication_failed','tls_failed','unreachable','unsupported_version','plugin_failed') AND (value.status NOT IN ('succeeded','failed','cancelled','timed_out') OR outbox.command_status NOT IN ('succeeded','failed','cancelled','timed_out','rejected')) ORDER BY validation.completed_at,validation.tenant_id,validation.project_id,validation.job_id LIMIT $1`, limit)
+	if err != nil {
+		return nil, mapPostgresError(err)
+	}
+	defer rows.Close()
+	repairs := make([]ValidationJobRepair, 0, limit)
+	for rows.Next() {
+		var repair ValidationJobRepair
+		if err := rows.Scan(&repair.Scope.TenantID, &repair.Scope.ProjectID, &repair.JobID, &repair.CommandID, &repair.AgentID, &repair.Result.Status, &repair.Result.ErrorCode, &repair.At); err != nil {
+			return nil, mapPostgresError(err)
+		}
+		repair.At = repair.At.UTC()
+		if repair.Scope.Validate() != nil || !identifierPattern.MatchString(repair.JobID) || !identifierPattern.MatchString(repair.CommandID) || !identifierPattern.MatchString(repair.AgentID) || repair.Result.Validate() != nil || !validUTC(repair.At) {
+			return nil, ErrInvalid
+		}
+		repairs = append(repairs, repair)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapPostgresError(err)
+	}
+	return repairs, nil
+}
+
 type validationState struct {
 	JobID                    string
 	CommandID                string
@@ -385,3 +412,4 @@ func insertValidationAudit(ctx context.Context, tx *sql.Tx, instance Instance, a
 }
 
 var _ ValidationResultRecorder = (*PostgresRepository)(nil)
+var _ ValidationJobRepairSource = (*PostgresRepository)(nil)
