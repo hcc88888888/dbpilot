@@ -569,3 +569,91 @@ PostgreSQL container `dbpilot-final-remediation-r4-pg` was verified by full ID
 and ownership label, then removed with its one anonymous volume; its temporary
 test data is not recoverable. An independent residual check found zero Round 4
 or Task17-owned Docker resources.
+
+## Fix round 5
+
+Status: **DONE** on product HEAD `3b8d306`. The final two rereview findings
+were reproduced first and closed with two additive migrations. No existing
+migration or protected contract/generated/proto/foundation path changed.
+
+### Resolved findings
+
+1. New forward migration
+   `job/migrations/0007b_validation_target_outbox_bridge.sql` sorts after the
+   retired-winner migrations and before the existing `0008`. For an active,
+   non-retired historical validation whose Job is still nonterminal, an
+   independently terminal Job target is the sole effective-outcome evidence.
+   The migration normalizes an opposite raw Outbox terminal status/phase to
+   that target before `0008` evaluates its conflict guard. Matching evidence is
+   unchanged, while a nonterminal target supplies no evidence and remains for
+   the later two-sided quarantine migration. The bridge also runs safely when
+   the old Job schema is already recorded as applied and is idempotent on
+   restart.
+2. New forward migration
+   `job/migrations/0010_terminal_reconcile_claim_fence.sql` adds a 32-byte
+   random claim token paired with each reconciliation lease. Pre-fence leases
+   have no provable owner and are released exactly once during migration. The
+   claim, success, transient-failure release/backoff, permanent-failure
+   quarantine, and completion paths now compare both the unguessable token and
+   exact lease generation. A stale worker therefore cannot clear a newer
+   lease, increment attempts, back off, quarantine, or complete the Job. The
+   Job-to-Outbox lock order is unchanged.
+
+### Round 5 TDD and PostgreSQL evidence
+
+Material REDs included: target-succeeded/Outbox-failed and
+target-failed/Outbox-succeeded rows both caused the old `0008` migration to
+raise `conflicting terminal Command and Job target winner`; an already-applied
+Job schema retained the wrong raw Outbox status; and the ownership test failed
+to compile because no claim token/API existed. A first GREEN stress run also
+exposed that wall-clock lease validation broke existing deterministic logical
+clock tests, so the fence was narrowed to an exact token plus lease-generation
+CAS.
+
+Focused GREEN and real PostgreSQL runs prove:
+
+- target success/failure overrides the opposite raw Outbox status before
+  `0008`, matching evidence remains unchanged, and evidence-free rows retain
+  the expected validation and Command quarantine;
+- the bridge repairs both pre-`0008` and already-applied schemas, and repeated
+  migration startup is idempotent;
+- lease expiry followed by worker B reclaim gives B a different random token;
+  worker A's concurrent late success or failure cannot mutate B's lease,
+  attempts or quarantine, while B completes successfully;
+- the concurrent reclaim test passed 20/20 stress repetitions;
+- a legacy unowned lease is released once, then restart preserves the new
+  live token and lease.
+
+### Round 5 final gates
+
+| Gate | Result |
+| --- | --- |
+| `go test ./... -count=1` | PASS, all Go packages |
+| `go vet ./...` | PASS |
+| Full Job PostgreSQL migration/failpoint/reconciler suite | PASS, 25.621s |
+| Full database-instance PostgreSQL historical migration suite | PASS, 27.914s |
+| Full plugin-assignment PostgreSQL suite | PASS, 28.055s |
+| Terminal claim concurrent stress | PASS, 20/20 |
+| Task17 lifecycle contract | PASS, fresh 13/13 after focused teardown 5/5 |
+| Kylin V10SP1 amd64 host-plugin full-stack | PASS |
+| Task17 cleanup | PASS; 28 containers / 4 networks / 23 volumes / 1 image / temporary directory removed |
+| `git diff --check f96d1eb...HEAD` | PASS |
+| Protected contract/generated/proto/Buf/OpenAPI/foundation paths | PASS, 0 changed |
+| Existing SQL migrations modified | PASS, 0; exactly 2 forward migrations added |
+| Final Docker residual audit | PASS, all Round 5 and Task17 ownership-label counts are 0 |
+
+The first Task17 contract run was 12/13 because one unchanged `pwsh` process
+exceeded its two-second fail-closed assertion. The exact failing teardown test
+then passed 5/5 focused repetitions and the complete contract passed 13/13;
+there is no stable regression evidence, and no unrelated teardown code was
+changed.
+
+Round 5 product commits:
+
+1. `f63a91f` `fix(instances): bridge historical validation target outcomes`
+2. `3b8d306` `fix(jobs): fence terminal reconciliation claims`
+
+The dedicated PostgreSQL container
+`dbpilot-final-remediation-r5-pg` was verified by exact full ID and
+`dbpilot.owner=final-remediation-r5` before removal with its anonymous volume;
+the final Round 5 PostgreSQL residual count is zero.
