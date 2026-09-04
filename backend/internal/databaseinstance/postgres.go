@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"dbpilot.local/platform/internal/discovery"
+	"dbpilot.local/platform/internal/job"
 	"dbpilot.local/platform/internal/platformscope"
 	"github.com/lib/pq"
 )
@@ -388,6 +389,10 @@ func (repository *PostgresRepository) Retire(ctx context.Context, scope platform
 			return ErrConflict
 		}
 		value.ManagementStatus = StatusRetired
+		if value.ConnectionTestStatus == ConnectionQueued || value.ConnectionTestStatus == ConnectionRunning {
+			value.ConnectionTestStatus = ConnectionPluginFailed
+			value.ConnectionTestErrorCode = ConnectionErrorPlugin
+		}
 		return nil
 	})
 }
@@ -441,6 +446,10 @@ func (repository *PostgresRepository) mutateOnce(ctx context.Context, scope plat
 	if action == "retire" {
 		retired := now
 		value.RetiredAt = &retired
+		if err := repository.retireActiveValidationTx(ctx, transaction, scope, instanceID, &value, now); err != nil {
+			rollback()
+			return Instance{}, err
+		}
 	}
 	if value.Validate() != nil {
 		rollback()
@@ -472,6 +481,42 @@ func (repository *PostgresRepository) mutateOnce(ctx context.Context, scope plat
 		return Instance{}, err
 	}
 	return value, nil
+}
+
+func (repository *PostgresRepository) retireActiveValidationTx(ctx context.Context, transaction *sql.Tx, scope platformscope.Scope, instanceID string, value *Instance, at time.Time) error {
+	var jobID, commandID string
+	if err := transaction.QueryRowContext(ctx, `SELECT connection_validation_job_id,connection_validation_command_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3 FOR UPDATE`, scope.TenantID, scope.ProjectID, instanceID).Scan(&jobID, &commandID); err != nil {
+		return mapPostgresError(err)
+	}
+	if jobID == "" && commandID == "" {
+		return nil
+	}
+	if !identifierPattern.MatchString(jobID) || !identifierPattern.MatchString(commandID) || value == nil {
+		return ErrInvalid
+	}
+	state, err := loadValidationState(ctx, transaction, scope, jobID, commandID)
+	if err != nil {
+		return err
+	}
+	if state.InstanceID != instanceID || state.Status != ConnectionQueued && state.Status != ConnectionRunning {
+		return ErrConflict
+	}
+	var agentID string
+	if err := transaction.QueryRowContext(ctx, `SELECT agent_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, instanceID).Scan(&agentID); err != nil {
+		return mapPostgresError(err)
+	}
+	if err := job.CancelValidationInTx(ctx, transaction, scope, jobID, commandID, agentID, at); err != nil {
+		return err
+	}
+	result, err := transaction.ExecContext(ctx, `UPDATE database_instance_validations SET status='plugin_failed',error_code='plugin_failed',started_at=COALESCE(started_at,$1),completed_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND job_id=$4 AND command_id=$5 AND status IN ('queued','running')`, at, scope.TenantID, scope.ProjectID, jobID, commandID)
+	if err != nil {
+		return mapPostgresError(err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return ErrConflict
+	}
+	target := ValidationTarget{AssignmentID: state.AssignmentID, ConfigurationRevision: state.ConfigurationRevision, OperationRevision: state.OperationRevision}
+	return insertValidationAudit(ctx, transaction, *value, state.Audit, jobID, commandID, target, "database_instance.connection_test_failed", "failure", ConnectionErrorPlugin, at)
 }
 
 func (repository *PostgresRepository) commitTransaction(ctx context.Context, transaction *sql.Tx, scope platformscope.Scope, audit MutationAudit, action, resourceID string, expected *Instance) error {

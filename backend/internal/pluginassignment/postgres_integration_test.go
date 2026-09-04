@@ -405,6 +405,33 @@ func TestDatabaseInstanceValidationPostgresReconcilesNoResultTerminalsAndStaleDe
 	instance, err = instances.Get(ctx, scope, instance.ID)
 	require.NoError(t, err)
 	require.Equal(t, databaseinstance.ConnectionUnreachable, instance.ConnectionTestStatus)
+
+	request.Audit.IdempotencyKey = "validate-retire-active"
+	request.Audit.RequestFingerprint = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	request.Audit.RequestID = "request-retire-active"
+	activeAtRetire, err := instances.StartValidation(ctx, scope, instance.ID, request)
+	require.NoError(t, err)
+	var retireCommandID string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT command_id FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, activeAtRetire.ID).Scan(&retireCommandID))
+	instance, err = instances.Get(ctx, scope, instance.ID)
+	require.NoError(t, err)
+	retired, err := instances.Retire(ctx, scope, instance.ID, instance.Revision, databaseinstance.MutationAudit{Actor: "operator", OperationID: "retireDatabaseInstance", IdempotencyKey: "retire-active-validation", RequestFingerprint: "sha256:1212121212121212121212121212121212121212121212121212121212121212", RequestID: "request-retire-active"})
+	require.NoError(t, err)
+	require.Equal(t, databaseinstance.StatusRetired, retired.ManagementStatus)
+	require.Equal(t, databaseinstance.ConnectionPluginFailed, retired.ConnectionTestStatus)
+	var validationStatus, validationCode, activeJobCorrelation, activeCommandCorrelation string
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT status,error_code FROM database_instance_validations WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3`, scope.TenantID, scope.ProjectID, activeAtRetire.ID).Scan(&validationStatus, &validationCode))
+	require.Equal(t, string(databaseinstance.ConnectionPluginFailed), validationStatus)
+	require.Equal(t, string(databaseinstance.ConnectionErrorPlugin), validationCode)
+	retiredJob, err := jobs.Get(ctx, scope, activeAtRetire.ID)
+	require.NoError(t, err)
+	require.Equal(t, job.StatusCancelled, retiredJob.Status)
+	retiredCommand, err := jobs.LookupCommand(ctx, retireCommandID)
+	require.NoError(t, err)
+	require.Equal(t, job.CommandCancelled, retiredCommand.CommandStatus)
+	require.NoError(t, database.QueryRowContext(ctx, `SELECT connection_validation_job_id,connection_validation_command_id FROM managed_database_instances WHERE tenant_id=$1 AND project_id=$2 AND instance_id=$3`, scope.TenantID, scope.ProjectID, instance.ID).Scan(&activeJobCorrelation, &activeCommandCorrelation))
+	require.Empty(t, activeJobCorrelation)
+	require.Empty(t, activeCommandCorrelation)
 }
 
 func markValidationJobTerminal(t *testing.T, ctx context.Context, jobs *job.PostgresRepository, value job.Job, commandID, agentID string, targetStatus job.TargetStatus, at time.Time) {

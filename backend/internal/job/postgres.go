@@ -702,6 +702,51 @@ func (repository *PostgresRepository) CorrectValidationTerminalStatus(ctx contex
 	return nil
 }
 
+func CancelValidationInTx(ctx context.Context, tx *sql.Tx, scope platformscope.Scope, jobID, commandID, agentID string, at time.Time) error {
+	if ctx == nil || tx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || at.IsZero() {
+		return ErrInvalidCommandPayload
+	}
+	var jobType string
+	var status Status
+	var totalTargets int
+	if err := tx.QueryRowContext(ctx, `SELECT job_type,status,total_targets FROM jobs WHERE tenant_id=$1 AND project_id=$2 AND id=$3 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID).Scan(&jobType, &status, &totalTargets); err != nil {
+		return classifyReadError("lock validation Job for retirement", err)
+	}
+	if jobType != "database_instance.validate" || totalTargets != 1 || isTerminal(status) {
+		return ErrConflict
+	}
+	var targetID string
+	if err := tx.QueryRowContext(ctx, `SELECT target_id FROM command_outbox WHERE tenant_id=$1 AND project_id=$2 AND job_id=$3 AND id=$4 FOR UPDATE`, scope.TenantID, scope.ProjectID, jobID, commandID).Scan(&targetID); err != nil {
+		return classifyReadError("lock validation command for retirement", err)
+	}
+	if targetID != agentID {
+		return ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE job_targets SET status='cancelled',error_summary='',result_summary='database instance connection validation cancelled',artifacts='[]'::jsonb,finished_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND job_id=$4 AND target_id=$5`, at.UTC(), scope.TenantID, scope.ProjectID, jobID, agentID)
+	if err != nil {
+		return classifyWriteError("cancel validation target on retirement", err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return ErrConflict
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE jobs SET status='cancelled',outcome='none',version=version+1,completed_targets=0,failed_targets=1,skipped_targets=0,error_summary='',result_summary='database instance connection validation cancelled',artifacts='[]'::jsonb,finished_at=$1,cancel_requested_by='instance-retire',cancel_requested_at=$1 WHERE tenant_id=$2 AND project_id=$3 AND id=$4 AND status IN ('queued','dispatched','running','cancelling')`, at.UTC(), scope.TenantID, scope.ProjectID, jobID)
+	if err != nil {
+		return classifyWriteError("cancel validation Job on retirement", err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return ErrConflict
+	}
+	detail := `{"reason":"instance_retired"}`
+	result, err = tx.ExecContext(ctx, `UPDATE command_outbox SET command_status='cancelled',command_phase='cancelled',terminal_at=$1,published_at=COALESCE(published_at,$1),lease_expires_at=NULL,execution_deadline_at=NULL,recovery_lease_expires_at=NULL,recovery_claim_token=NULL,recovery_claimed_deadline=NULL,recovery_claimed_revision=NULL,cancellation_lease_expires_at=NULL,terminal_audit_pending=TRUE,terminal_audit_dedupe_key=$2,terminal_audit_action='command.validation_cancelled_on_retire',terminal_audit_result='failure',terminal_audit_detail=$3::jsonb,terminal_audit_lease_expires_at=NULL,terminal_audit_attempts=0,terminal_audit_recorded_at=NULL WHERE tenant_id=$4 AND project_id=$5 AND job_id=$6 AND id=$7 AND command_status IN ('pending','active','rejected')`, at.UTC(), "command.validation_cancelled_on_retire:"+commandID, detail, scope.TenantID, scope.ProjectID, jobID, commandID)
+	if err != nil {
+		return classifyWriteError("cancel validation command on retirement", err)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) RepairValidationTerminal(ctx context.Context, scope platformscope.Scope, jobID, commandID, agentID string, target TargetResult, commandStatus CommandStatus, at time.Time) error {
 	if repository == nil || repository.db == nil || ctx == nil || scope.Validate() != nil || strings.TrimSpace(jobID) == "" || strings.TrimSpace(commandID) == "" || strings.TrimSpace(agentID) == "" || target.TargetID != agentID || !isTerminalTarget(target.Status) || !terminalCommandStatus(commandStatus) || at.IsZero() {
 		return ErrInvalidCommandPayload
